@@ -1,0 +1,1381 @@
+---
+title: 'Unicode, String, Buffer, Blob — Hiểu sâu binary và text trong JavaScript frontend'
+description: 'Vì sao `"🇻🇳".length === 4`? Bài này đào sâu Unicode code point, surrogate pair, grapheme cluster, và cách JS xử lý binary qua ArrayBuffer, TypedArray, DataView, Blob, TextEncoder — kèm use case frontend thực chiến.'
+pubDate: 2026-05-07
+tags: [javascript, frontend, fundamentals, typescript, unicode, binary]
+draft: false
+---
+
+Hãy thử đoán kết quả của 3 dòng JS này:
+
+```ts
+'🇻🇳'.length;            // ?
+'café'.length;          // ?
+'café'.normalize('NFD').length; // ?
+```
+
+Đáp án lần lượt là **4**, **4**, và **5**. Cùng một chữ "café" trông giống
+hệt nhau nhưng có thể có 2 độ dài khác nhau, và một quốc kỳ Việt Nam đứng
+một mình lại đếm thành 4. Nếu bạn đang viết form validation đếm `maxLength`
+hoặc slugify URL, đây là những bug **rất khó debug** mà gốc rễ đều đến từ
+một thứ: **JavaScript String không phải mảng ký tự — nó là mảng UTF-16
+code unit**.
+
+Đào tiếp xuống dưới layer chữ, ta gặp **binary primitives**: `ArrayBuffer`,
+`TypedArray`, `DataView`, `Blob`. Đây là nơi browser thật sự xử lý dữ liệu —
+upload file, hash mật khẩu, stream video, decode WebSocket frame. Hai thế
+giới text và binary gặp nhau qua một cây cầu duy nhất: `TextEncoder` /
+`TextDecoder`.
+
+Bài này dành cho frontend / fullstack engineer đã quen TypeScript, muốn
+hiểu chính xác vì sao `.length` "sai", khi nào dùng `Uint8Array` thay vì
+`Blob`, và cách 2 thế giới này nối với nhau trong các use case thực tế.
+
+---
+
+## Mục lục
+
+1. [Vì sao bài này quan trọng — câu chuyện một quốc kỳ và một dấu sắc](#1-vì-sao-bài-này-quan-trọng--câu-chuyện-một-quốc-kỳ-và-một-dấu-sắc)
+
+**Part I — Text & Unicode**
+
+2. [Unicode 101 — code point, scalar value, plane](#2-unicode-101--code-point-scalar-value-plane)
+3. [Encoding — UTF-8 vs UTF-16 vs UTF-32, vì sao JS chọn UTF-16](#3-encoding--utf-8-vs-utf-16-vs-utf-32-vì-sao-js-chọn-utf-16)
+4. [JavaScript String quirks — surrogate pair, codePointAt, normalize](#4-javascript-string-quirks--surrogate-pair-codepointat-normalize)
+5. [Grapheme cluster và iteration đúng theo từng cấp](#5-grapheme-cluster-và-iteration-đúng-theo-từng-cấp)
+6. [Use cases frontend với Unicode](#6-use-cases-frontend-với-unicode)
+
+**Part II — Binary primitives**
+
+7. [`ArrayBuffer` — bộ nhớ thô không truy cập trực tiếp](#7-arraybuffer--bộ-nhớ-thô-không-truy-cập-trực-tiếp)
+8. [`TypedArray` — view có kiểu lên `ArrayBuffer`](#8-typedarray--view-có-kiểu-lên-arraybuffer)
+9. [`DataView` — đọc binary structured với endianness control](#9-dataview--đọc-binary-structured-với-endianness-control)
+10. [`Blob` & `File` — high-level file-like, immutable, lazy IO](#10-blob--file--high-level-file-like-immutable-lazy-io)
+
+**Part III — Bridge & use cases**
+
+11. [`TextEncoder` / `TextDecoder` — cây cầu giữa String và Uint8Array](#11-textencoder--textdecoder--cây-cầu-giữa-string-và-uint8array)
+12. [Use cases thực chiến](#12-use-cases-thực-chiến)
+13. [Cheat sheet conversion + Kết luận](#13-cheat-sheet-conversion--kết-luận)
+
+---
+
+## 1. Vì sao bài này quan trọng — câu chuyện một quốc kỳ và một dấu sắc
+
+Quay lại 3 dòng đầu bài. Lý do thật sự đứng sau từng kết quả:
+
+```ts
+'🇻🇳'.length === 4;
+// Quốc kỳ là "Regional Indicator Symbol Letter V" + "Letter N"
+// Mỗi ký tự là 1 code point > 0xFFFF → cần 2 UTF-16 code unit (surrogate pair)
+// → 2 ký tự × 2 code unit = 4
+
+'café'.length === 4;
+// 'c', 'a', 'f', 'é' — mỗi ký tự 1 code point ≤ 0xFFFF → 1 code unit/ký tự
+
+'café'.normalize('NFD').length === 5;
+// NFD tách 'é' thành 'e' + combining acute accent (U+0301)
+// → 'c', 'a', 'f', 'e', '◌́' = 5 code unit
+```
+
+Vấn đề thực tế phát sinh:
+
+| Trường hợp                       | Bug              | Hậu quả                                                                |
+| -------------------------------- | ---------------- | ---------------------------------------------------------------------- |
+| `maxLength={140}` cho tweet      | `.length` sai    | User nhập 70 emoji thì block, dù Twitter cho phép 140 "ký tự"          |
+| Slugify URL có tiếng Việt        | `.split('')` sai | "phở-bò" thành "ph%E1%BB%9F-b%C3%B2" hoặc tệ hơn — split vỡ surrogate  |
+| Search "café" === "café"         | `===` sai        | Một là NFC, một là NFD → cùng nhìn nhưng khác bytes                    |
+| Truncate caption ở 50 "ký tự"    | `.slice(0, 50)`  | Cắt giữa surrogate pair → render thành ký tự lỗi `�`                   |
+| Đếm bytes upload                 | `.length × 2`    | Sai vì UTF-8 (network) ≠ UTF-16 (in-memory) — phải dùng `TextEncoder`  |
+
+Tất cả đều xuất phát từ một sự nhầm lẫn căn bản: **String không phải
+mảng ký tự**. Để fix đúng, ta cần biết **code unit**, **code point**, và
+**grapheme cluster** khác nhau ở đâu.
+
+---
+
+## 2. Unicode 101 — code point, scalar value, plane
+
+**Unicode** là một **bảng tra số ↔ ký tự**. Mỗi ký tự được gán một số nguyên
+gọi là **code point**, viết theo convention `U+XXXX` (hex). Ví dụ:
+
+```text
+U+0041  → 'A'
+U+00E9  → 'é'
+U+1F600 → '😀'
+U+1F1FB → '🇻' (Regional Indicator V)
+U+1F1F3 → '🇳' (Regional Indicator N)
+```
+
+Bảng Unicode chia thành **17 plane**, mỗi plane có 65 536 (2¹⁶) code point:
+
+```text
+ Plane 0  (U+0000   – U+FFFF)    BMP — Basic Multilingual Plane
+                                  Chứa hầu hết ký tự thông dụng:
+                                  Latin, CJK, Cyrillic, Hebrew...
+ Plane 1  (U+10000  – U+1FFFF)   SMP — Supplementary Multilingual Plane
+                                  Emoji 😀, ký tự cổ, ký hiệu toán
+ Plane 2-16 (U+20000 – U+10FFFF)  Hiếm dùng: hieroglyph, private use...
+```
+
+Code point **tối đa** là `U+10FFFF` (= 1 114 111 trong decimal). Đây là
+**rule cứng** của spec — không phải giới hạn implementation. Lý do? Vì
+UTF-16 encoding không thể biểu diễn quá range này (xem section 3).
+
+> **Code point ≠ ký tự hiển thị.** Một "ký tự" mà người dùng thấy
+> (gọi là **grapheme cluster**) có thể gồm 1 hoặc nhiều code point. Quốc
+> kỳ 🇻🇳 = 2 code point. Emoji gia đình 👨‍👩‍👧‍👦 = 7 code point. Việc
+> đếm "số ký tự đúng" cần `Intl.Segmenter` — sẽ nói ở section 5.
+
+---
+
+## 3. Encoding — UTF-8 vs UTF-16 vs UTF-32, vì sao JS chọn UTF-16
+
+Code point là số trừu tượng. Để **lưu trữ và truyền** code point qua
+network/disk, ta cần **encoding** — quy tắc chuyển code point thành chuỗi
+byte. Có 3 encoding chuẩn:
+
+| Encoding | Code unit size | Bytes per code point  | Ưu                                                  | Nhược                                  |
+| -------- | -------------- | --------------------- | --------------------------------------------------- | -------------------------------------- |
+| UTF-32   | 32-bit         | luôn 4                | Random access O(1) bằng index                       | Tốn 4× cho ASCII → web không dùng     |
+| UTF-16   | 16-bit         | 2 (BMP) hoặc 4 (SMP+) | Cân bằng cho text Á + Latin                         | ASCII vẫn tốn 2 byte                   |
+| UTF-8    | 8-bit          | 1, 2, 3, hoặc 4       | ASCII = 1 byte (tương thích), tiết kiệm cho web    | Index O(n)                             |
+
+UTF-8 thắng cho **web/network** (HTTP body, JSON, file source) vì compact
+và backward-compatible với ASCII. Đây là lý do **`TextEncoder` mặc định
+encode UTF-8** — không có option khác (xem section 11).
+
+Vậy **vì sao JavaScript String là UTF-16?** Lịch sử:
+
+- ECMAScript được spec năm **1995-1997**, cùng thời với Java và Windows NT.
+- Lúc đó Unicode mới có 1 plane (BMP, ≤ U+FFFF), 16-bit là **đủ cho mọi
+  ký tự**. UCS-2 (predecessor của UTF-16) là chuẩn de facto.
+- Năm 2001, Unicode mở rộng lên 17 plane → UTF-16 thêm cơ chế **surrogate
+  pair** để encode code point > U+FFFF.
+- ECMAScript không thể đổi → giữ UTF-16 đến tận bây giờ.
+
+Hệ quả: **`String[i]` trả về 1 code unit, không phải 1 code point**. Nếu
+ký tự là supplementary (như emoji), nó chiếm 2 code unit và bạn sẽ "thấy
+nó từ 2 góc khác nhau" khi index từng vị trí.
+
+### Surrogate pair hoạt động ra sao
+
+Code point > U+FFFF (như 😀 = U+1F600) được encode thành **2 code unit**:
+
+```text
+Code point: U+1F600
+Trừ 0x10000:  0x0F600
+Tách 20-bit thành 10-bit cao + 10-bit thấp: 0x03D, 0x200
+High surrogate: 0xD800 + 0x03D = 0xD83D
+Low surrogate:  0xDC00 + 0x200 = 0xDE00
+
+Final UTF-16: 0xD83D 0xDE00 (2 code unit, 4 byte)
+```
+
+Range surrogate được **reserve** trong Unicode:
+
+- High surrogate: `U+D800` – `U+DBFF` (1024 giá trị)
+- Low surrogate:  `U+DC00` – `U+DFFF` (1024 giá trị)
+- Tổ hợp: 1024 × 1024 = **1 048 576** = đúng số code point từ U+10000 đến U+10FFFF
+
+Đây là lý do `U+10FFFF` là max — UTF-16 không có thêm bit để encode.
+
+---
+
+## 4. JavaScript String quirks — surrogate pair, `codePointAt`, normalize
+
+### 4.1 `length` đếm code unit, không đếm ký tự
+
+```ts
+'A'.length;          // 1   (BMP)
+'é'.length;          // 1   (BMP)
+'😀'.length;         // 2   (surrogate pair)
+'𝕊'.length;          // 2   (math S, U+1D54A — supplementary)
+'🇻🇳'.length;        // 4   (2 regional indicators × 2 code unit)
+'👨‍👩‍👧'.length;       // 8   (3 emoji + 2 ZWJ × code unit)
+```
+
+`String.length` thực chất là **số UTF-16 code unit**, không phải "số ký tự
+mà mắt người đếm được". Đây là spec, không phải bug. Mọi tài liệu MDN dùng
+từ "characters" ở đây đều là **shortcut từ thời ES3** — đừng hiểu literal.
+
+### 4.2 `charCodeAt` vs `codePointAt`
+
+```ts
+const s = '😀A';
+
+s.charCodeAt(0);   // 55357 (= 0xD83D, high surrogate — KHÔNG phải code point thật)
+s.charCodeAt(1);   // 56832 (= 0xDE00, low surrogate)
+s.charCodeAt(2);   // 65    (= 'A')
+
+s.codePointAt(0);  // 128512 (= 0x1F600, đúng code point của 😀)
+s.codePointAt(1);  // 56832 (low surrogate cô lập — output này thường vô nghĩa)
+s.codePointAt(2);  // 65
+```
+
+`charCodeAt` là API cũ từ ES3, trả **code unit** UTF-16. `codePointAt` (ES2015)
+biết detect surrogate pair và trả về **code point đầy đủ**.
+
+```ts
+function isHighSurrogate(unit: number): boolean {
+  return unit >= 0xd800 && unit <= 0xdbff;
+}
+
+function isLowSurrogate(unit: number): boolean {
+  return unit >= 0xdc00 && unit <= 0xdfff;
+}
+
+// Khi nào nên dùng codePointAt thay vì charCodeAt?
+// → MỌI lúc, trừ khi bạn đang implement encoder UTF-16 và cần raw code unit.
+function codePointAtSafe(s: string, i: number): number | undefined {
+  return s.codePointAt(i);
+}
+```
+
+### 4.3 `String.fromCodePoint` vs `String.fromCharCode`
+
+Tương tự cặp trên, nhưng theo chiều ngược:
+
+```ts
+String.fromCharCode(0x1f600);   // '?' — sai, vì char code chỉ nhận 16-bit
+String.fromCodePoint(0x1f600);  // '😀' — đúng, tự encode thành surrogate pair
+
+// Build string từ array code point — pattern hay dùng khi sinh ID, captcha
+const codepoints = [0x48, 0x69, 0x1f44b];
+String.fromCodePoint(...codepoints); // 'Hi👋'
+```
+
+### 4.4 Normalize — NFC vs NFD vs NFKC vs NFKD
+
+Một số ký tự có **2 cách biểu diễn** giống nhau về visual:
+
+```ts
+const composed = '\u00E9';        // 'é' — 1 code point pre-composed (NFC)
+const decomposed = 'e\u0301';     // 'é' — 'e' + combining acute (NFD)
+
+composed === decomposed;          // false 😱
+composed.length;                  // 1
+decomposed.length;                // 2
+
+// Nguồn của decomposed: copy từ macOS file system, một số keyboard layout,
+// API HTTP của Apple. Nếu user copy-paste tên file sang form, bạn có 2
+// "café" trông y hệt nhưng compare khác.
+
+// Fix: normalize về cùng form trước khi compare
+composed.normalize('NFC') === decomposed.normalize('NFC'); // true
+```
+
+4 form normalize:
+
+- **NFC** (Canonical Composition): gộp về dạng pre-composed nếu có. Mặc
+  định nên dùng cho **text web** (W3C khuyến nghị).
+- **NFD** (Canonical Decomposition): tách ra. Dùng khi cần xử lý dấu
+  riêng (ví dụ: bỏ dấu tiếng Việt cho slug).
+- **NFKC / NFKD**: như NFC/NFD nhưng "compatibility" — gộp cả các biểu
+  diễn khác nhau về hình thức, ví dụ chữ "ﬁ" (ligature) thành "fi".
+  Dùng khi cần search "lossy".
+
+```ts
+// Bỏ dấu tiếng Việt — pattern siêu thông dụng cho slugify
+function removeVietnameseAccents(s: string): string {
+  return s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // strip tất cả combining mark
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D');
+}
+
+removeVietnameseAccents('Phở Bò'); // 'Pho Bo'
+```
+
+---
+
+## 5. Grapheme cluster và iteration đúng theo từng cấp
+
+Section trước cho ta 2 đơn vị: **code unit** (UTF-16 storage, `length`)
+và **code point** (Unicode character ID, `codePointAt`). Còn một đơn vị
+thứ 3 quan trọng nhất khi viết UI cho người dùng: **grapheme cluster**.
+
+### Grapheme cluster là gì?
+
+Định nghĩa formal từ spec Unicode:
+
+> A grapheme cluster is the smallest unit of text that a user perceives
+> as a single character.
+> — UAX #29: Unicode Text Segmentation
+
+Nói đơn giản: **grapheme cluster là cái mà mắt người đọc xem là "1 ký tự"**.
+Tại sao không phải code point? Vì 1 "ký tự" hiển thị có thể được build từ
+**nhiều code point** kết hợp:
+
+```text
+ Hiển thị     Cấu tạo                                            # Code points
+ ─────────   ──────────────────────────────────────────────     ─────────────
+    é         'e' (U+0065) + COMBINING ACUTE ACCENT (U+0301)            2
+    🇻🇳         '🇻' (U+1F1FB) + '🇳' (U+1F1F3) — Regional Indicators       2
+    👨‍👩‍👧       '👨' + ZWJ + '👩' + ZWJ + '👧'                             5
+    ñ̈         'n' + COMBINING DIAERESIS + COMBINING TILDE              3
+    가         'ᄀ' + 'ᅡ' (Hangul jamo decomposed)                       2
+    👋🏽         '👋' + EMOJI MODIFIER FITZPATRICK TYPE-4                  2
+    🏴󠁧󠁢󠁳󠁣󠁴󠁿         '🏴' + 6 tag chars (Scotland regional flag)              7
+```
+
+Mỗi dòng trên — dù gồm **2-7 code points** — vẫn là **1 grapheme cluster**.
+Nếu dùng `[...string].length` (đếm code point), bạn sẽ ra số sai 100% so
+với cảm nhận của người dùng.
+
+### Các "rule" tạo nên grapheme cluster
+
+Unicode UAX #29 định nghĩa nhiều rule precise; đây là 6 rule phổ biến nhất
+mà frontend developer cần biết:
+
+1. **Combining marks** — dấu phụ gắn vào ký tự cơ sở. Phổ biến nhất là
+   tiếng Việt (dấu sắc/huyền/hỏi/ngã/nặng), accent của tiếng châu Âu
+   (acute, grave, tilde, diaeresis). Ví dụ `'a' + '\u0301'` = `á`.
+2. **Emoji modifier (skin tone)** — `U+1F3FB`–`U+1F3FF` gắn vào emoji có
+   da người để đổi màu. `👋` + `🏽` = `👋🏽`. 5 skin tone × ~150 emoji
+   tương thích → ~750 sequence cần handle.
+3. **ZWJ sequence** — Zero-Width Joiner (`U+200D`) ghép nhiều emoji thành
+   1 "emoji phức". Đây là cách build emoji gia đình, nghề nghiệp, giới tính:
+   - `👨` + ZWJ + `👩` + ZWJ + `👧` = `👨‍👩‍👧` (gia đình)
+   - `👨` + ZWJ + `💻` = `👨‍💻` (nam lập trình viên)
+   - `🏳` + ZWJ + `🌈` = `🏳️‍🌈` (cờ cầu vồng)
+4. **Regional Indicator pairs** — 2 ký tự `U+1F1E6`–`U+1F1FF` (A-Z bản
+   regional) ghép thành cờ quốc gia. `🇻🇳 = 🇻 + 🇳`. Có **đúng 26² = 676**
+   tổ hợp khả dĩ, nhưng chỉ ~250 là cờ thật, còn lại render thành 2 ký tự
+   chữ rời.
+5. **Hangul syllable** — chữ Hàn 한국어 có thể decompose thành nhiều jamo
+   (consonant + vowel + final). `가` có thể là 1 hoặc 2-3 code point tuỳ
+   form NFC/NFD.
+6. **Tag sequence** — flags vùng (regional flag), ví dụ `🏴󠁧󠁢󠁳󠁣󠁴󠁿` (Scotland)
+   = 1 emoji `🏴` + 6 tag character + 1 cancel tag. Tổng 7 code point.
+
+Kết quả: **số "ký tự người dùng đếm" thường nhỏ hơn số code point, và
+nhỏ hơn nữa so với số code unit**. Càng nhiều emoji hiện đại trong text,
+khoảng cách giữa 3 đơn vị càng lớn.
+
+### So sánh trực quan 3 đơn vị
+
+```ts
+const examples = [
+  '🇻🇳',        // 1 cờ
+  'café',      // 4 chữ (NFC)
+  'cafe\u0301', // 4 chữ (NFD — 'e' + combining acute)
+  '👨‍👩‍👧',     // 1 emoji gia đình
+  '👋🏽',        // 1 vẫy tay với skin tone
+  '🏴󠁧󠁢󠁳󠁣󠁴󠁿',    // 1 cờ Scotland
+];
+
+const seg = new Intl.Segmenter('en', { granularity: 'grapheme' });
+
+for (const e of examples) {
+  const cu = e.length;                    // code unit
+  const cp = [...e].length;                // code point
+  const gc = [...seg.segment(e)].length;   // grapheme cluster
+  console.log(`${e}  → ${cu} CU / ${cp} CP / ${gc} GC`);
+}
+
+// Output:
+//  🇻🇳   →  4 CU / 2 CP / 1 GC
+// café  →  4 CU / 4 CP / 4 GC
+// café  →  5 CU / 5 CP / 4 GC   (NFD)
+// 👨‍👩‍👧  →  8 CU / 5 CP / 1 GC
+// 👋🏽   →  4 CU / 2 CP / 1 GC
+// 🏴󠁧󠁢󠁳󠁣󠁴󠁿  → 14 CU / 7 CP / 1 GC
+```
+
+> Quy tắc nhớ đời: **CU ≥ CP ≥ GC**, dấu `=` chỉ xảy ra với pure ASCII.
+> Khi text có dấu/emoji, chênh lệch xuất hiện và hầu hết bug "đếm sai
+> ký tự" đều ở chỗ này.
+
+### Iterate đúng trên cả 3 cấp độ
+
+```ts
+const s = '👨‍👩‍👧';
+
+// Sai: index theo code unit, vỡ surrogate pair
+for (let i = 0; i < s.length; i++) {
+  console.log(s[i]); // '\uD83D', '\uDC68', '\uD83D', '\uDC69', '\u200D', ...
+}
+
+// Đúng cấp 1: iterate theo code point (for...of dùng iterator của String)
+for (const cp of s) {
+  console.log(cp); // '👨', '\u200D', '👩', '\u200D', '👧'  (5 phần tử)
+}
+
+// Đúng cấp 2: iterate theo grapheme cluster (đúng "ký tự người đọc thấy")
+const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
+for (const { segment } of segmenter.segment(s)) {
+  console.log(segment); // '👨‍👩‍👧'  (1 grapheme duy nhất!)
+}
+```
+
+Bảng tổng hợp 3 cấp:
+
+```text
+              Code unit          Code point         Grapheme cluster
+              (length, [i])      (for...of)         (Intl.Segmenter)
+              ────────────       ──────────         ──────────────────
+'😀A'              2 + 1 = 3            2                    2
+'🇻🇳'                  4                2                    1   ← user "thấy"
+'café' (NFD)          5                5                    4
+'👨‍👩‍👧'                8                5                    1
+```
+
+### `Intl.Segmenter` — API chính cho grapheme cluster
+
+`Intl.Segmenter` (Baseline 2024, đã hỗ trợ rộng từ 2021) là API duy nhất
+trong JS trả về đúng số ký tự mà mắt người đếm:
+
+```ts
+// User-facing length — dùng cho maxLength, truncate, count "ký tự" thật
+function userLength(s: string): number {
+  const seg = new Intl.Segmenter('en', { granularity: 'grapheme' });
+  let count = 0;
+  for (const _ of seg.segment(s)) count++;
+  return count;
+}
+
+userLength('🇻🇳');     // 1
+userLength('café');   // 4 (cả NFC lẫn NFD)
+userLength('👨‍👩‍👧');  // 1
+userLength('🏴󠁧󠁢󠁳󠁣󠁴󠁿');   // 1
+
+// Polyfill cho môi trường cũ (IE / old Safari ≤ 14.1):
+// dùng `grapheme-splitter` hoặc `graphemer` từ npm
+```
+
+### Khi nào cần grapheme cluster trong code thực tế?
+
+- **UI counter**: textarea "còn lại 280 ký tự" — phải đếm grapheme,
+  không thì user gõ 70 emoji bị block dù chỉ "có cảm giác" 70 ký tự.
+- **Cursor movement**: trong contenteditable, `←` `→` di chuyển 1 grapheme;
+  Backspace xoá 1 grapheme trọn vẹn (không vỡ giữa surrogate hay ZWJ pair).
+- **Truncate caption**: cắt ở **grapheme boundary** để không bao giờ
+  render ký tự lỗi `�` hoặc emoji vỡ.
+- **Search & highlight**: highlight đúng "1 ký tự" cho user khi tìm kiếm.
+- **Random ID / captcha**: pick `n` ký tự "thực sự" thay vì `n` code point
+  (tránh trường hợp sample ra nửa surrogate pair).
+
+Hầu hết logic xử lý text **hướng người dùng** đều nên dùng grapheme.
+Backend (DB, log, network) thường vẫn thao tác trên byte/code unit cho
+perf — đó là lý do cần biết cả 3 cấp.
+
+`granularity: 'word'` và `'sentence'` cũng hữu ích cho đếm từ
+(reading-time estimator), text-to-speech (split câu đúng), search
+highlight (match theo word boundary).
+
+---
+
+## 6. Use cases frontend với Unicode
+
+### 6.1 Form validation — đếm `maxLength` đúng
+
+```tsx
+// React component — đếm "ký tự thật" cho Twitter-like input
+import { useMemo } from 'react';
+
+const SEG = new Intl.Segmenter('en', { granularity: 'grapheme' });
+
+function countGraphemes(s: string): number {
+  let n = 0;
+  for (const _ of SEG.segment(s)) n++;
+  return n;
+}
+
+export function TweetInput({ value, max = 280 }: { value: string; max?: number }) {
+  const used = useMemo(() => countGraphemes(value), [value]);
+  const remaining = max - used;
+
+  return (
+    <div>
+      <textarea value={value} aria-invalid={remaining < 0} />
+      <small data-state={remaining < 0 ? 'over' : 'ok'}>
+        {remaining} characters left
+      </small>
+    </div>
+  );
+}
+```
+
+`useMemo` ở đây có lý do thực sự — `Intl.Segmenter` không siêu nhanh,
+recompute mỗi keystroke trên text dài có thể nhả frame. Cache lại theo
+`value`.
+
+### 6.2 Slugify URL — không vỡ với tiếng Việt và emoji
+
+```ts
+// src/lib/slugify.ts
+// Trả về slug ASCII-safe, ưu tiên giữ tiếng Việt readable bằng cách
+// strip dấu thay vì percent-encode (trải nghiệm copy URL tốt hơn).
+export function slugify(input: string): string {
+  return input
+    .normalize('NFD')                       // tách dấu khỏi chữ
+    .replace(/[\u0300-\u036f]/g, '')         // strip combining mark
+    .replace(/đ/gi, (m) => (m === 'Đ' ? 'D' : 'd'))
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')             // emoji + ký tự lạ → '-'
+    .replace(/^-+|-+$/g, '');                // trim '-' đầu/cuối
+}
+
+slugify('Phở Bò 🍜 Hà Nội'); // 'pho-bo-ha-noi'
+```
+
+### 6.3 Truncate giữ trọn emoji
+
+```ts
+// Sai: cắt giữa surrogate pair → render lỗi
+'Hello 😀 World'.slice(0, 7); // 'Hello \uD83D' — output: 'Hello �'
+
+// Đúng: cắt theo code point
+function truncateCodePoints(s: string, maxCp: number): string {
+  const arr = [...s]; // spread iterate theo code point
+  return arr.slice(0, maxCp).join('');
+}
+
+truncateCodePoints('Hello 😀 World', 7); // 'Hello 😀'
+
+// Đúng nhất: cắt theo grapheme cluster
+function truncateGraphemes(s: string, maxG: number): string {
+  const seg = new Intl.Segmenter('en', { granularity: 'grapheme' });
+  let out = '';
+  let n = 0;
+  for (const { segment } of seg.segment(s)) {
+    if (n >= maxG) break;
+    out += segment;
+    n++;
+  }
+  return out;
+}
+```
+
+### 6.4 Encode URL params an toàn
+
+`encodeURIComponent` đã xử lý đúng UTF-8, không bị vỡ surrogate. Bug
+duy nhất là **lone surrogate** (chuỗi không hợp lệ):
+
+```ts
+encodeURIComponent('Phở');         // 'Ph%E1%BB%9F' — OK
+encodeURIComponent('\uD83D');      // throws URIError: malformed URI sequence
+
+// Nếu nhận user input từ paste / clipboard / IME, có thể có lone surrogate.
+// Defensive code:
+function encodeURISafe(s: string): string {
+  try {
+    return encodeURIComponent(s);
+  } catch {
+    return encodeURIComponent(s.replace(/[\uD800-\uDFFF]/g, '\uFFFD'));
+  }
+}
+```
+
+---
+
+## 7. `ArrayBuffer` — bộ nhớ thô không truy cập trực tiếp
+
+Sang Part II. `ArrayBuffer` là **block bộ nhớ liên tục** với độ dài cố định,
+**không có kiểu, không index trực tiếp được**:
+
+```ts
+const buf = new ArrayBuffer(16);  // cấp 16 byte
+buf.byteLength;                    // 16
+buf[0];                            // undefined — KHÔNG access được trực tiếp
+buf[0] = 0xff;                     // im lặng nuốt — ArrayBuffer không có index setter
+```
+
+Để **đọc/ghi**, phải tạo một **view** lên buffer đó:
+
+```text
+       ArrayBuffer (16 byte raw memory)
+       ┌─────────────────────────────────────┐
+       │ 00 00 00 00 00 00 00 00 00 00 ...   │
+       └─────────────────────────────────────┘
+              │              │
+              │              │
+       ┌──────▼──────┐  ┌────▼────────┐
+       │ Uint8Array  │  │  DataView   │
+       │ (typed view)│  │ (any type,  │
+       │             │  │  any offset)│
+       └─────────────┘  └─────────────┘
+```
+
+Mental model: `ArrayBuffer` là **bộ nhớ vô danh**, view là **kính đọc**
+bộ nhớ đó theo một format. Cùng 1 buffer có thể có **nhiều view** đè lên
+cùng range, mỗi view "thấy" dữ liệu theo kiểu của mình.
+
+```ts
+const buf = new ArrayBuffer(4);
+const u8 = new Uint8Array(buf);
+const u32 = new Uint32Array(buf);
+
+u8[0] = 0x78;
+u8[1] = 0x56;
+u8[2] = 0x34;
+u8[3] = 0x12;
+
+// Cùng 4 byte, nhưng đọc qua Uint32Array trên máy little-endian:
+u32[0]; // 0x12345678 — bytes đảo ngược (LE)
+```
+
+Đây là chi tiết quan trọng: **TypedArray dùng native endianness của CPU**.
+Hầu hết máy hiện đại (x86, ARM mobile) là little-endian. Nếu bạn parse
+một file format chuẩn network byte order (BE) — như PNG, MP4 — thì phải
+dùng **`DataView`** (section 9) để có endianness control, không dùng
+`TypedArray`.
+
+> Liên quan: bài [Frontend có tin được khi validate file upload](/blog/frontend-file-upload-validation-magic-numbers/)
+> đào sâu pattern parse PNG bằng `DataView` để check magic number và CRC.
+
+---
+
+## 8. `TypedArray` — view có kiểu lên `ArrayBuffer`
+
+`TypedArray` là 1 family 11 class:
+
+| Class                | Kích thước | Range / Note                    |
+| -------------------- | ---------- | ------------------------------- |
+| `Int8Array`          | 1 byte     | -128 → 127                      |
+| `Uint8Array`         | 1 byte     | 0 → 255 (phổ biến nhất)         |
+| `Uint8ClampedArray`  | 1 byte     | 0 → 255, nhưng saturate (canvas)|
+| `Int16Array`         | 2 byte     | -32 768 → 32 767                |
+| `Uint16Array`        | 2 byte     | 0 → 65 535                      |
+| `Int32Array`         | 4 byte     | int32 signed                    |
+| `Uint32Array`        | 4 byte     | int32 unsigned                  |
+| `Float16Array`       | 2 byte     | half precision (Baseline 2024)  |
+| `Float32Array`       | 4 byte     | single precision                |
+| `Float64Array`       | 8 byte     | double precision                |
+| `BigInt64Array`      | 8 byte     | int64 (BigInt values)           |
+| `BigUint64Array`     | 8 byte     | uint64                          |
+
+90% use case frontend chỉ cần **`Uint8Array`** — vì hầu hết binary protocol
+(file, network, crypto) thao tác ở mức byte. `Uint8ClampedArray` là special
+case cho `<canvas>`: nếu set `pixel = -10`, nó saturate về 0 thay vì wrap
+về 246.
+
+### 3 cách tạo TypedArray
+
+```ts
+// 1. Allocate buffer mới
+const a = new Uint8Array(8);
+a.byteLength;       // 8
+a.buffer;           // ArrayBuffer(8) — backing buffer
+
+// 2. View lên buffer có sẵn (zero-copy!)
+const buf = new ArrayBuffer(16);
+const view = new Uint8Array(buf, 4, 8);  // offset=4, length=8 byte
+view.byteLength;    // 8
+view.buffer === buf; // true — chia sẻ memory
+
+// 3. Copy từ array thường
+const c = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+c[0]; // 0xde
+```
+
+### Performance: tại sao TypedArray nhanh hơn `Array`
+
+```ts
+// Array — heterogeneous, mỗi phần tử là tagged value (số / object / undefined)
+const a: number[] = new Array(1_000_000).fill(0);
+// Engine phải boxing/unboxing, alloc lung tung trong heap
+
+// TypedArray — homogeneous, contiguous memory, no boxing
+const t = new Uint32Array(1_000_000);
+// 4 MB contiguous, đọc ghi đúng kiểu CPU op trực tiếp
+```
+
+Với image processing, audio buffer, hash, parse binary — luôn ưu tiên
+`TypedArray`. V8 có hot path riêng cho nó.
+
+### Sub-array zero-copy
+
+```ts
+const big = new Uint8Array(1024 * 1024); // 1 MB
+const head = big.subarray(0, 16);         // KHÔNG copy — view lên big
+head[0] = 0x42;
+big[0]; // 0x42 — đã thay đổi luôn!
+
+// Vs slice() — COPY
+const headCopy = big.slice(0, 16);
+headCopy[1] = 0xff;
+big[1]; // 0 — không bị ảnh hưởng
+```
+
+Phân biệt `subarray` (view) vs `slice` (copy) là **rất quan trọng** khi
+parse file lớn — slice nhầm chỗ là OOM ngay.
+
+---
+
+## 9. `DataView` — đọc binary structured với endianness control
+
+`DataView` là **view tổng quát** — không có kiểu cố định, mỗi lần đọc bạn
+chọn kiểu và endianness:
+
+```ts
+const buf = new ArrayBuffer(8);
+const dv = new DataView(buf);
+
+dv.setUint32(0, 0x12345678, false); // offset=0, value, littleEndian=false (BE)
+dv.setFloat64(0, 3.14159, true);    // overwrite, LE
+
+dv.getUint8(0);                     // đọc 1 byte
+dv.getInt16(0, true);               // đọc int16 LE
+dv.getUint32(4, false);             // đọc uint32 BE
+dv.getFloat32(0);                   // mặc định BE (chú ý!)
+```
+
+**Quy tắc khi nào dùng DataView vs TypedArray**:
+
+| Tình huống                                  | Nên dùng                                   |
+| ------------------------------------------- | ------------------------------------------ |
+| Đọc/ghi đồng nhất 1 kiểu (RGB pixel, audio) | `Uint8Array` / `Float32Array`              |
+| Parse file format (PNG, MP4, ZIP, WAV)      | `DataView` — cần BE/LE control             |
+| Network protocol (BE byte order)            | `DataView` với `littleEndian = false`      |
+| Crypto digest output                        | `Uint8Array` (luôn byte-level)             |
+| Performance critical loop                   | `TypedArray` — JIT inline tốt hơn          |
+
+```ts
+// Ví dụ thực tế: parse WAV file header
+interface WavHeader {
+  channels: number;
+  sampleRate: number;
+  bitsPerSample: number;
+  dataSize: number;
+}
+
+export function parseWavHeader(buffer: ArrayBuffer): WavHeader {
+  const dv = new DataView(buffer);
+
+  // Magic check: "RIFF" ở offset 0, "WAVE" ở offset 8
+  const riff = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
+  if (riff !== 'RIFF') throw new Error('Not a WAV file');
+
+  // WAV header dùng little-endian (Microsoft convention) — TRÁI với network BE
+  return {
+    channels:       dv.getUint16(22, true),
+    sampleRate:     dv.getUint32(24, true),
+    bitsPerSample:  dv.getUint16(34, true),
+    dataSize:       dv.getUint32(40, true),
+  };
+}
+```
+
+---
+
+## 10. `Blob` & `File` — high-level file-like, immutable, lazy IO
+
+`ArrayBuffer` / `TypedArray` luôn ở **trong RAM**. `Blob` là level cao
+hơn — đại diện cho **một mảng dữ liệu file-like, immutable, có thể trên
+disk hoặc memory hoặc URL**:
+
+```ts
+// Tạo Blob từ string / ArrayBuffer / Uint8Array / Blob khác
+const text = new Blob(['Hello, world'], { type: 'text/plain' });
+text.size;       // 12
+text.type;       // 'text/plain'
+
+const png = new Blob([pngBytes], { type: 'image/png' });
+const merged = new Blob([header, body, footer]); // concat zero-copy
+```
+
+Đặc điểm quan trọng:
+
+- **Immutable**: tạo xong không sửa được nội dung. Muốn đổi → tạo Blob mới.
+- **Lazy**: nội dung có thể chưa load vào RAM. Browser chỉ thực sự đọc khi
+  bạn gọi `.arrayBuffer()`, `.text()`, `.stream()`, hoặc bind vào fetch/upload.
+- **`slice()` zero-copy**: `blob.slice(0, 1024)` không copy bytes, chỉ
+  tạo Blob mới reference cùng underlying data với offset/length khác.
+
+```ts
+// File 2GB — KHÔNG load vào RAM, chỉ chunk khi cần upload
+const file: File = pickedFile; // từ <input type="file">
+const CHUNK = 5 * 1024 * 1024;
+
+for (let offset = 0; offset < file.size; offset += CHUNK) {
+  const chunk = file.slice(offset, offset + CHUNK);   // zero-copy reference
+  await fetch('/upload', { method: 'POST', body: chunk });
+  // chunk được serialize ra HTTP body lazily — không tăng RAM peak
+}
+```
+
+`File` extends `Blob` — thêm `name`, `lastModified`, `webkitRelativePath`.
+Mọi method của Blob đều hoạt động trên File.
+
+### 4 cách đọc nội dung Blob
+
+```ts
+const blob = new Blob([/* ... */]);
+
+// 1. Async — get bytes
+const buf: ArrayBuffer = await blob.arrayBuffer();
+const u8 = new Uint8Array(buf);
+
+// 2. Async — get string (assumes UTF-8)
+const txt: string = await blob.text();
+
+// 3. Stream — đọc từng chunk, không cần load toàn bộ vào RAM
+const reader = blob.stream().getReader();
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  // value là Uint8Array của chunk hiện tại
+}
+
+// 4. Object URL — dùng cho <img src>, download, video src
+const url = URL.createObjectURL(blob);
+img.src = url;
+// QUAN TRỌNG: revoke khi không cần nữa, tránh memory leak
+URL.revokeObjectURL(url);
+```
+
+> Pattern: lúc nào **không nên** dùng `URL.createObjectURL`?
+> Khi blob nhỏ và chỉ render 1 lần thoáng qua — `data:` URL hoặc base64
+> đủ nhanh và không cần revoke. Object URL phù hợp với blob lớn (file
+> upload preview, video, PDF) và phải nhớ revoke.
+
+---
+
+## 11. `TextEncoder` / `TextDecoder` — cây cầu giữa String và `Uint8Array`
+
+`TextEncoder` chuyển String (UTF-16 in-memory) thành `Uint8Array` UTF-8:
+
+```ts
+const enc = new TextEncoder();        // luôn UTF-8, không có option
+const bytes = enc.encode('Hello 😀'); // Uint8Array(10) [72,101,108,108,111,32,240,159,152,128]
+bytes.byteLength; // 10 — UTF-8 length, KHÁC string.length (= 8)
+```
+
+`TextDecoder` chiều ngược — nhận `Uint8Array` / `ArrayBuffer`, trả String:
+
+```ts
+const dec = new TextDecoder('utf-8');
+dec.decode(bytes); // 'Hello 😀'
+
+// TextDecoder hỗ trợ nhiều encoding hơn (legacy):
+new TextDecoder('iso-8859-1').decode(/* ... */); // Latin-1
+new TextDecoder('windows-1252').decode(/* ... */); // CP-1252
+new TextDecoder('shift-jis').decode(/* ... */);  // Japanese legacy
+
+// fatal: true → throw nếu bytes không hợp lệ thay vì replace bằng U+FFFD
+new TextDecoder('utf-8', { fatal: true }).decode(badBytes); // throws TypeError
+```
+
+### Đếm bytes UTF-8 đúng
+
+```ts
+// Nếu bạn cần biết "string này upload sẽ tốn bao nhiêu byte network"
+function utf8ByteLength(s: string): number {
+  return new TextEncoder().encode(s).byteLength;
+}
+
+utf8ByteLength('Hello');    // 5
+utf8ByteLength('Phở');      // 5 ('P'=1 + 'h'=1 + 'ở'=3)
+utf8ByteLength('😀');       // 4
+utf8ByteLength('🇻🇳');      // 8 (4 + 4)
+
+// SAI: 's.length * 2' (giả định UTF-16 hết) — chỉ đúng cho BMP, sai với emoji
+// SAI: 's.length' — không đúng cho ký tự non-ASCII
+```
+
+### Stream encode/decode
+
+`TextDecoder` có chế độ stream cho dữ liệu chunked (websocket, fetch
+ReadableStream):
+
+```ts
+const dec = new TextDecoder('utf-8');
+const reader = response.body!.getReader();
+let text = '';
+
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) {
+    // Flush phần còn lại — quan trọng nếu chunk cuối cắt giữa multi-byte char
+    text += dec.decode();
+    break;
+  }
+  // stream: true → giữ state khi byte sequence chưa đủ thành 1 code point
+  text += dec.decode(value, { stream: true });
+}
+```
+
+`{ stream: true }` là detail dễ miss: nếu chunk byte cắt giữa 1 ký tự
+multi-byte UTF-8, decoder sẽ buffer phần thiếu và chờ chunk sau. Nếu bỏ
+flag, mỗi chunk decode độc lập → có ký tự `�` ở biên.
+
+---
+
+## 12. Use cases thực chiến
+
+### 12.1 Hash mật khẩu / file qua Web Crypto
+
+```ts
+// SubtleCrypto chỉ ăn ArrayBuffer / TypedArray, không ăn String trực tiếp
+async function sha256(text: string): Promise<string> {
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  // digest là ArrayBuffer — chuyển sang hex để in ra
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+await sha256('hello'); // '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824'
+```
+
+### 12.2 Generate file blob để download
+
+```ts
+// Pattern: tạo file CSV trong browser, trigger download không cần backend
+function downloadCsv(rows: string[][], filename: string) {
+  const csv = rows.map((r) => r.map(quoteCsv).join(',')).join('\n');
+
+  // BOM (\uFEFF) ở đầu để Excel detect UTF-8 đúng — nếu không, "Phở" sẽ
+  // hiển thị thành "PhÆ¡" trên Excel Windows.
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' });
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function quoteCsv(s: string): string {
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+```
+
+### 12.3 Stream upload file lớn với chunked Blob.slice
+
+```ts
+async function uploadInChunks(
+  file: File,
+  url: string,
+  chunkSize = 5 * 1024 * 1024
+) {
+  const total = Math.ceil(file.size / chunkSize);
+
+  for (let i = 0; i < total; i++) {
+    const start = i * chunkSize;
+    const end = Math.min(start + chunkSize, file.size);
+    const chunk = file.slice(start, end); // zero-copy
+
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Range': `bytes ${start}-${end - 1}/${file.size}`,
+        'X-Chunk-Index': String(i),
+        'X-Chunk-Total': String(total),
+      },
+      body: chunk, // Blob được serialize lazy → không peak RAM
+    });
+  }
+}
+```
+
+Lý do dùng `slice` chứ không `arrayBuffer()` toàn file: file 2GB load vào
+RAM sẽ crash mobile. `slice` chỉ giữ reference + offset, đến lúc fetch mới
+read disk lazily.
+
+### 12.4 Base64 — encode/decode string đúng cách
+
+Base64 là cách biểu diễn binary thành chuỗi ASCII (`A-Z`, `a-z`, `0-9`,
+`+`, `/`, `=`). Mỗi **3 byte** input → **4 ký tự** output. Lý do tồn tại:
+nhiều giao thức cũ chỉ truyền ASCII an toàn (email MIME, URL, JSON, JWT),
+không cho byte `0x00` hay `0xFF`.
+
+#### Vì sao `btoa` fail với Unicode
+
+`btoa` / `atob` có từ ES1 (1997). Spec định nghĩa input là "byte string" —
+mỗi ký tự phải là code unit `≤ 0xFF` (Latin-1). String JS có code unit
+> 0xFF → throw:
+
+```ts
+btoa('Phở'); // throws InvalidCharacterError 😱
+btoa('😀');  // throws — surrogate pair có code unit 0xD83D > 0xFF
+```
+
+#### Pattern đúng: encode UTF-8 trước, sau đó base64
+
+```ts
+export function base64EncodeUtf8(s: string): string {
+  const bytes = new TextEncoder().encode(s);
+  // Convert Uint8Array → binary string (Latin-1) → btoa
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+
+export function base64DecodeUtf8(b64: string): string {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+base64EncodeUtf8('Phở');      // 'UGjhu58='
+base64DecodeUtf8('UGjhu58='); // 'Phở'
+```
+
+#### Pitfall: `String.fromCharCode(...u8)` chết với array lớn
+
+`String.fromCharCode(...arr)` spread cả array thành argument list. JS
+engine giới hạn argument count (~65 535 trên V8). File ~100 KB là crash:
+
+```ts
+// SAI với buffer > ~65k byte
+String.fromCharCode(...largeUint8Array); // RangeError: Maximum call stack / too many arguments
+
+// ĐÚNG: build string theo chunk
+function bytesToBinaryString(u8: Uint8Array, chunk = 0x8000): string {
+  let s = '';
+  for (let i = 0; i < u8.length; i += chunk) {
+    // subarray() là view zero-copy — không alloc thêm memory
+    s += String.fromCharCode(...u8.subarray(i, i + chunk));
+  }
+  return s;
+}
+```
+
+Đây là bug **rất hay gặp** — code chạy ngon trên test 50 byte, vỡ ngay
+khi user upload ảnh 200 KB.
+
+#### Modern API: `Uint8Array.toBase64()` (Baseline 2024+)
+
+Spec mới đẩy logic vào engine — nhanh hơn nhiều và không bị giới hạn argument:
+
+```ts
+const bytes = new TextEncoder().encode('Phở');
+
+bytes.toBase64();                          // 'UGjhu58='
+bytes.toBase64({ alphabet: 'base64url' }); // URL-safe variant
+bytes.toBase64({ omitPadding: true });     // bỏ '=' cuối
+
+Uint8Array.fromBase64('UGjhu58=');
+Uint8Array.fromBase64('UGjhu58', { alphabet: 'base64url' });
+```
+
+Browser support (2026): Chrome 138+, Safari 18.2+, Firefox 133+. Nếu cần
+fallback cho Safari ≤ 18.1 → dùng helper `bytesToBinaryString` ở trên,
+hoặc check `'toBase64' in Uint8Array.prototype` rồi fork.
+
+---
+
+### 12.5 File ↔ Base64 — đọc và ghi file qua base64
+
+Pattern này phù hợp với:
+
+- Embed ảnh nhỏ trực tiếp trong JSON (icon, thumbnail) — tránh 1 roundtrip
+- Lưu file vào `localStorage` / `IndexedDB` (cả hai chỉ accept string,
+  IndexedDB cũng accept Blob nhưng base64 portable hơn khi export)
+- Truyền qua `postMessage` giữa iframe / worker (Blob bị clone tốn kém)
+- Embed trong JWT custom claim, OAuth callback URL
+
+> **Cảnh báo size**: base64 phình **+33%** so với raw binary (3 byte → 4
+> ký tự, cộng padding). Nếu file > vài MB, **đừng** convert base64 — dùng
+> `Blob` + `FormData` upload thay vào đó. Quy tắc cá nhân: < 100 KB mới
+> nghĩ tới base64.
+
+#### Đọc File → base64 string
+
+3 cách, từ legacy → modern:
+
+```ts
+// 1. FileReader (legacy, callback-style API qua event)
+//    Trả về DATA URL có prefix 'data:<mime>;base64,...' — phải split lấy phần sau.
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+// 2. async/await — chỉ raw base64 (không prefix), gọn cho API call
+async function fileToBase64(file: File): Promise<string> {
+  const buf = await file.arrayBuffer();
+  return bytesToBase64(new Uint8Array(buf));
+}
+
+// Helper: ưu tiên modern API, fallback chunked binary string
+function bytesToBase64(u8: Uint8Array): string {
+  if ('toBase64' in Uint8Array.prototype) {
+    return (u8 as Uint8Array & { toBase64: () => string }).toBase64();
+  }
+
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < u8.length; i += chunk) {
+    bin += String.fromCharCode(...u8.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+// Use case: upload preview kèm metadata trong cùng 1 JSON request
+const meta = {
+  filename: file.name,
+  size: file.size,
+  content: await fileToBase64(file), // ⚠️ chỉ làm với file < 100KB
+};
+await fetch('/api/upload', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify(meta),
+});
+```
+
+#### Ghi base64 → File / Blob (để download hoặc render)
+
+Chiều ngược lại — server trả về ảnh dưới dạng base64 (vì legacy
+JSON-only API), client phải convert thành Blob để download hoặc render:
+
+```ts
+function base64ToBlob(b64: string, type = 'application/octet-stream'): Blob {
+  // Strip data URL prefix nếu lỡ pass nguyên 'data:image/png;base64,...'
+  const pure = b64.startsWith('data:') ? b64.split(',', 2)[1]! : b64;
+
+  // Modern path — không alloc binary string trung gian
+  if ('fromBase64' in Uint8Array) {
+    const fromBase64 = (Uint8Array as unknown as {
+      fromBase64: (s: string) => Uint8Array;
+    }).fromBase64;
+    return new Blob([fromBase64(pure)], { type });
+  }
+
+  // Fallback
+  const binary = atob(pure);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type });
+}
+
+function downloadBase64File(b64: string, filename: string, mime: string) {
+  const blob = base64ToBlob(b64, mime);
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a); // Firefox cần element trong DOM mới fire click
+  a.click();
+  a.remove();
+
+  // Free memory ngay khi browser đã capture URL — không đợi GC
+  URL.revokeObjectURL(url);
+}
+
+// Render trực tiếp <img>, không convert qua Blob — chấp nhận overhead +33%
+const img = document.querySelector<HTMLImageElement>('#avatar')!;
+img.src = `data:image/png;base64,${b64FromApi}`;
+```
+
+---
+
+### 12.6 Data URL vs Object URL — chọn cái nào
+
+`data:` URL nhúng base64 thẳng vào URL string. Object URL (`blob:...`)
+là **reference** tới Blob trong memory:
+
+| Tiêu chí                          | Data URL                          | Object URL                          |
+| --------------------------------- | --------------------------------- | ----------------------------------- |
+| Format                            | `data:image/png;base64,iVBOR...`  | `blob:https://example.com/abc-123`  |
+| Size overhead                     | +33% (base64)                     | 0% (chỉ là pointer)                 |
+| Lifetime                          | Tự nhiên, có thể save vào HTML    | Cần `revokeObjectURL` để free RAM   |
+| Paste sang document khác          | ✅ self-contained                  | ❌ chỉ valid trong document tạo nó  |
+| Render `<img>` performance        | Chậm (decode base64 mỗi lần)      | Nhanh (direct memory reference)     |
+| Dùng trong CSS `background-image` | ✅                                 | ✅                                   |
+| Hỗ trợ `stream()`                 | ❌                                 | ✅ qua `blob.stream()`               |
+| Hỗ trợ `Range` request            | ❌                                 | ✅ (video seek, partial download)    |
+
+**Decision tree đơn giản**:
+
+- File **< 10 KB**, render 1 lần, cần self-contained → `data:` URL (favicon
+  inline, sprite icon, thumbnail trong email HTML)
+- File **lớn** hoặc render nhiều lần → Object URL
+- **Preview ảnh upload** trong form → Object URL (nhớ revoke khi unmount)
+- **Embed icon SVG vào CSS** → `data:` URL (build tool tự inline file < 4 KB)
+- **Video/PDF viewer** → Object URL (cần seek, stream)
+
+```ts
+// React: preview ảnh upload — Object URL pattern đúng
+import { useEffect, useState } from 'react';
+
+function ImagePreview({ file }: { file: File | null }) {
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!file) return;
+    const objectUrl = URL.createObjectURL(file);
+    setUrl(objectUrl);
+
+    // Cleanup: revoke khi component unmount HOẶC file đổi → tránh leak
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [file]);
+
+  return url ? <img src={url} alt="preview" /> : null;
+}
+```
+
+---
+
+### 12.7 URL-safe Base64 (base64url) — cho JWT, query param
+
+Base64 chuẩn dùng `+` và `/` — 2 ký tự **có ý nghĩa đặc biệt** trong URL
+(`+` decode thành space trong query). Put base64 thẳng vào URL → server
+parse sai.
+
+**Base64url** (RFC 4648 §5) thay thế:
+
+```text
+Base64       Base64url
+   +    →       -
+   /    →       _
+   =    →    (omit, không padding)
+```
+
+```ts
+function base64ToBase64url(b64: string): string {
+  return b64
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function base64urlToBase64(b64u: string): string {
+  // Restore padding để atob / Uint8Array.fromBase64 không complain
+  let s = b64u.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4 !== 0) s += '=';
+  return s;
+}
+```
+
+Modern API trực tiếp:
+
+```ts
+const bytes = new TextEncoder().encode('hello');
+const safe = bytes.toBase64({ alphabet: 'base64url' }); // 'aGVsbG8' (no padding)
+Uint8Array.fromBase64(safe, { alphabet: 'base64url' });
+```
+
+JWT là user phổ biến nhất — **header.payload.signature**, mỗi phần là
+base64url:
+
+```ts
+// Decode JWT payload (KHÔNG verify signature — chỉ debug / introspect claim)
+export function decodeJwtPayload<T = unknown>(jwt: string): T {
+  const [, payloadB64u] = jwt.split('.');
+  if (!payloadB64u) throw new Error('Invalid JWT format');
+
+  const padded = base64urlToBase64(payloadB64u);
+  const binary = atob(padded);
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  const json = new TextDecoder().decode(bytes);
+  return JSON.parse(json) as T;
+}
+
+const claim = decodeJwtPayload<{ sub: string; exp: number }>(token);
+console.log(claim.sub, new Date(claim.exp * 1000));
+```
+
+> Quan trọng: hàm này CHỈ decode để inspect — **đừng** dùng để
+> authenticate. Verify signature phải làm phía server, hoặc dùng
+> Web Crypto trên client với public key (`crypto.subtle.verify`).
+
+---
+
+### 12.8 Convert image File → resized Blob
+
+```ts
+// Pattern hay gặp: user upload ảnh 4K, ta resize về 1080p trước khi upload
+async function resizeImage(file: File, maxSide = 1080): Promise<Blob> {
+  const bitmap = await createImageBitmap(file);
+  const ratio = Math.min(maxSide / bitmap.width, maxSide / bitmap.height, 1);
+  const w = Math.round(bitmap.width * ratio);
+  const h = Math.round(bitmap.height * ratio);
+
+  const canvas = new OffscreenCanvas(w, h);
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(bitmap, 0, 0, w, h);
+
+  // OffscreenCanvas.convertToBlob — async, support quality
+  return canvas.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
+}
+```
+
+`OffscreenCanvas` chạy trong worker được, không block main thread — quan
+trọng khi resize batch.
+
+---
+
+## 13. Cheat sheet conversion + Kết luận
+
+### 13.1 Bảng convert giữa các kiểu
+
+| Từ → Đến                     | Cách làm                                                                |
+| ---------------------------- | ----------------------------------------------------------------------- |
+| `string` → `Uint8Array`      | `new TextEncoder().encode(s)`                                           |
+| `Uint8Array` → `string`      | `new TextDecoder().decode(u8)`                                          |
+| `string` → `Blob`            | `new Blob([s], { type: 'text/plain' })`                                 |
+| `Blob` → `string`            | `await blob.text()`                                                     |
+| `Uint8Array` → `Blob`        | `new Blob([u8])`                                                        |
+| `Blob` → `Uint8Array`        | `new Uint8Array(await blob.arrayBuffer())`                              |
+| `ArrayBuffer` → `Uint8Array` | `new Uint8Array(buf)` — zero-copy view                                  |
+| `Uint8Array` → `ArrayBuffer` | `u8.buffer` (chú ý `byteOffset` / `byteLength` nếu là sub-view!)        |
+| `string` → `base64`          | `base64EncodeUtf8(s)` hoặc `u8.toBase64()` (modern)                     |
+| `base64` → `string`          | `base64DecodeUtf8(b)` hoặc `Uint8Array.fromBase64(b)` rồi decode        |
+| `Uint8Array` → `base64`      | `u8.toBase64()` (Baseline 2024+) hoặc `bytesToBase64()` chunked         |
+| `base64` → `Uint8Array`      | `Uint8Array.fromBase64(b)` hoặc `atob` + loop                           |
+| `base64` ↔ `base64url`       | replace `+/=` ↔ `-_` (omit padding) — hoặc `{ alphabet: 'base64url' }`  |
+| `File` → `base64`            | `(await file.arrayBuffer()) → bytesToBase64()`                          |
+| `File` → `data: URL`         | `FileReader.readAsDataURL(file)` (legacy) — có prefix `data:...;base64,`|
+| `base64` → `Blob` (download) | `new Blob([Uint8Array.fromBase64(b)], { type })`                        |
+| `Blob` → Object URL          | `URL.createObjectURL(blob)` — nhớ `revokeObjectURL` để free             |
+| `string` → `code point[]`    | `[...s]` hoặc `Array.from(s)`                                           |
+| `string` → `grapheme[]`      | `[...new Intl.Segmenter('en', { granularity: 'grapheme' }).segment(s)]` |
+| `code point` → `char`        | `String.fromCodePoint(cp)`                                              |
+
+### 13.2 5 quy tắc nhớ đời
+
+1. **`string.length` không phải số ký tự.** Nó là số UTF-16 code unit.
+   Để đếm "ký tự người dùng thấy" → `Intl.Segmenter` với grapheme.
+2. **Compare string từ user input → `normalize('NFC')` trước.** Nếu
+   không, bạn sẽ có 2 chuỗi nhìn giống hệt nhưng `===` ra `false`.
+3. **`TypedArray` dùng native endianness, `DataView` cho phép control.**
+   Parse file format / network → dùng `DataView`. Tính toán đồng nhất →
+   `TypedArray` cho perf.
+4. **`Blob` là lazy + immutable + zero-copy slice.** Đừng load file lớn
+   vào `arrayBuffer()` rồi mới xử lý — slice trước, đọc sau.
+5. **`btoa` không chạy được với Unicode.** Luôn `TextEncoder` → bytes
+   → base64. Với array lớn (> 64 KB), tránh `String.fromCharCode(...arr)`
+   — split chunked hoặc dùng `Uint8Array.toBase64()` (Baseline 2024+).
+   Cần put base64 vào URL/JWT → dùng base64url variant (`-_`, không padding).
+
+### 13.3 Khi nào dùng cái gì
+
+```text
+"Tôi cần lưu / so sánh text"            → string + normalize('NFC')
+"Tôi cần đếm ký tự cho UI"              → Intl.Segmenter (grapheme)
+"Tôi cần raw bytes (hash/upload/parse)" → Uint8Array
+"Tôi cần parse file format có struct"   → DataView (endianness control)
+"Tôi cần đại diện file-like để upload"  → Blob / File (lazy + slice)
+"Tôi cần text → bytes (network/crypto)" → TextEncoder
+"Tôi cần bytes → text (decode response)"→ TextDecoder
+"Tôi cần embed file nhỏ vào JSON/JWT"   → base64 (qua Uint8Array.toBase64)
+"Tôi cần preview file upload"           → URL.createObjectURL + revoke
+"Tôi cần inline icon/sprite trong HTML" → data: URL (chỉ nếu < 10 KB)
+"Tôi cần token an toàn cho URL/JWT"     → base64url ({ alphabet: 'base64url' })
+```
+
+---
+
+JS String và binary thoạt nhìn là 2 thế giới khác nhau, nhưng thật ra
+chỉ là **2 cách view lên cùng một thứ — chuỗi byte có cấu trúc**. Khi
+hiểu rõ code point ≠ code unit ≠ grapheme, và `ArrayBuffer` ≠ `TypedArray`
+≠ `Blob`, bạn sẽ tự nhận ra hầu hết bug "ký tự lạ" / "file vỡ" /
+"`length` sai" thực ra cùng một root cause: **đang đếm sai đơn vị**.
+
+Lần tới khi `'🇻🇳'.length === 4` lại bật ra ở console, bạn sẽ biết chính
+xác mình đang nhìn từ góc nào — và nên cầm kính nào để đọc đúng.

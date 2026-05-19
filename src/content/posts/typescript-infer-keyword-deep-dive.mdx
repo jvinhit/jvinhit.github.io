@@ -1,0 +1,983 @@
+---
+title: 'TypeScript `infer` — từ ReturnType tới recursive type, parse string ở compile time'
+description: '`infer` cho phép trích xuất type từ bất kỳ position nào trong type expression. Bài này đi từ ReturnType, Parameters cơ bản tới template literal parsing, recursive type, infer extends, và 5 use case thực chiến.'
+pubDate: 2026-05-07
+tags: [typescript, frontend, fundamentals, type-system]
+draft: false
+---
+
+Lần đầu nhìn vào dòng này, có lẽ bạn đã từng confuse:
+
+```ts
+type ReturnType<T extends (...args: any) => any> =
+  T extends (...args: any) => infer R ? R : any;
+```
+
+`infer R` ở đâu ra? Vì sao TS lại "tự biết" `R` chính là return type của
+hàm? Đây không phải magic — `infer` là **cơ chế bind type variable** cho
+phép TS extract một sub-type từ vị trí bất kỳ trong type expression. Khi
+đã hiểu nó, hàng loạt utility tưởng chừng huyền bí (`Parameters`, `Awaited`,
+`ConstructorParameters`) trở nên hiển nhiên.
+
+Đi xa hơn, `infer` là **xương sống** của những type magic mà các thư viện
+như `tRPC`, `Zod`, `react-hook-form`, `tanstack-router` dùng để cho IDE
+gợi ý chính xác từng key, từng param, từng route — tất cả ở compile time,
+không có runtime cost.
+
+Bài này dành cho TypeScript developer đã quen generic và conditional type,
+muốn hiểu sâu `infer` từ pattern cơ bản (`ReturnType`) tới advanced (parse
+string với template literal, recursive type, `infer extends`), và **biết
+khi nào nên dùng vs lạm dụng**.
+
+---
+
+## Mục lục
+
+1. [Câu chuyện vì sao `infer` xuất hiện](#1-câu-chuyện-vì-sao-infer-xuất-hiện)
+
+**Part I — Foundations**
+
+2. [Recap: conditional type `T extends U ? X : Y`](#2-recap-conditional-type-t-extends-u--x--y)
+3. [`infer` 101 — bind type variable trong vị trí bất kỳ](#3-infer-101--bind-type-variable-trong-vị-trí-bất-kỳ)
+4. [7 utility built-in dùng `infer`](#4-7-utility-built-in-dùng-infer)
+
+**Part II — Intermediate patterns**
+
+5. [Tuple / array manipulation: Head, Tail, Last, Reverse](#5-tuple--array-manipulation-head-tail-last-reverse)
+6. [Function infer: composition, curry, pipe](#6-function-infer-composition-curry-pipe)
+
+**Part III — Advanced patterns**
+
+7. [Template literal + `infer` — parse string ở compile time](#7-template-literal--infer--parse-string-ở-compile-time)
+8. [Recursive `infer` — DeepReadonly, Path, Get](#8-recursive-infer--deepreadonly-path-get)
+9. [`infer extends` (TS 4.7+) — constrained inference](#9-infer-extends-ts-47--constrained-inference)
+
+**Part IV — Real-world**
+
+10. [5 use case thực chiến](#10-5-use-case-thực-chiến)
+11. [Pitfalls, cheat sheet & Kết luận](#11-pitfalls-cheat-sheet--kết-luận)
+
+---
+
+## 1. Câu chuyện vì sao `infer` xuất hiện
+
+Trước TS 2.8 (2018), nếu muốn extract return type của một hàm, bạn phải
+viết utility `ReturnType` thủ công bằng overload trick — clunky và không
+work với arrow function generic. TS team thêm `infer` để giải quyết
+vấn đề **"tôi muốn đặt type variable trong vị trí bất kỳ và cho compiler
+auto-bind nó"**.
+
+Trước/sau khi có `infer`:
+
+```ts
+// Trước (TS < 2.8) — không thể viết kiểu này
+// Phải dùng overload + signature trick rất xấu
+
+// Sau (TS 2.8+) — declarative, đẹp
+type ReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
+
+function getUser() { return { id: 1, name: 'Vinh' }; }
+
+type User = ReturnType<typeof getUser>;
+//   ^? { id: number; name: string }
+```
+
+Cú pháp `// ^?` (Twoslash) là convention show inferred type ngay vị trí
+con trỏ. Trong VSCode bạn sẽ thấy tooltip này khi hover. Bài này dùng nó
+liên tục để show kết quả TS infer.
+
+> **Mental model**: `infer X` là **"đặt một biến type ở đây và đợi TS
+> điền giá trị vào"**. Compiler chạy unification giữa input type và
+> pattern, gán giá trị thực cho `X`.
+
+---
+
+## 2. Recap: conditional type `T extends U ? X : Y`
+
+`infer` chỉ xuất hiện trong **conditional type** — nên cần nắm vững
+foundation này trước.
+
+### Cú pháp cơ bản
+
+```ts
+type IsString<T> = T extends string ? 'yes' : 'no';
+
+type A = IsString<'hello'>; // 'yes'
+type B = IsString<42>;      // 'no'
+```
+
+### Distributive conditional type
+
+Khi `T` là **naked type parameter** (không bọc trong tuple/object) và là
+union, conditional type **distribute** qua từng phần tử của union:
+
+```ts
+type ToArray<T> = T extends any ? T[] : never;
+
+type R1 = ToArray<string | number>;
+//   ^? string[] | number[]    ← KHÔNG phải (string | number)[]
+
+// Tắt distribution: bọc T trong tuple [T]
+type ToArrayNoDist<T> = [T] extends [any] ? T[] : never;
+
+type R2 = ToArrayNoDist<string | number>;
+//   ^? (string | number)[]
+```
+
+Distribution là **cực kỳ quan trọng** khi dùng với `infer` — nhiều bug
+xuất phát từ việc quên rằng conditional type distribute.
+
+### Conditional kết hợp
+
+```ts
+type IsArray<T> = T extends readonly any[] ? true : false;
+
+type IsFunction<T> = T extends (...args: any) => any ? true : false;
+
+type IsPromise<T> = T extends Promise<any> ? true : false;
+```
+
+3 pattern này là tiền đề cho mọi `ReturnType`-style helper sau.
+
+---
+
+## 3. `infer` 101 — bind type variable trong vị trí bất kỳ
+
+`infer X` chỉ xuất hiện ở **bên trái** của conditional (sau `extends`).
+Nó bind một type variable mới chỉ visible trong nhánh `true`:
+
+```ts
+type ReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
+//                                                   ─┬─    ─
+//                                                    │     └── R có thể dùng ở đây
+//                                                    └── và chỉ ở đây
+
+type R1 = ReturnType<() => string>;        // string
+type R2 = ReturnType<(n: number) => User>; // User
+type R3 = ReturnType<'not a function'>;    // never (fallback branch)
+```
+
+### Multiple `infer` trong cùng pattern
+
+Có thể đặt nhiều `infer` cùng lúc — TS bind từng cái độc lập:
+
+```ts
+type FirstAndLast<T extends readonly any[]> =
+  T extends readonly [infer First, ...any[], infer Last]
+    ? [First, Last]
+    : T extends readonly [infer Only]
+      ? [Only, Only]
+      : never;
+
+type A = FirstAndLast<[1, 2, 3, 4]>;
+//   ^? [1, 4]
+
+type B = FirstAndLast<['only']>;
+//   ^? ['only', 'only']
+```
+
+### `infer` cùng tên xuất hiện 2 lần
+
+Khi `infer X` xuất hiện ở **co-variant position** (output, return) nhiều
+lần → TS lấy **union**. Khi ở **contra-variant position** (input, parameter)
+→ lấy **intersection**:
+
+```ts
+// Co-variant: union
+type Co<T> = T extends { a: infer U; b: infer U } ? U : never;
+type CoR = Co<{ a: string; b: number }>;
+//   ^? string | number
+
+// Contra-variant: intersection
+type Contra<T> = T extends {
+  a: (x: infer U) => void;
+  b: (x: infer U) => void;
+} ? U : never;
+type ContraR = Contra<{ a: (x: string) => void; b: (x: number) => void }>;
+//   ^? string & number  → never
+```
+
+Đây là detail đẹp nhưng khó gặp trong code thực tế. Nhớ rule **"co =
+union, contra = intersection"** là đủ.
+
+---
+
+## 4. 7 utility built-in dùng `infer`
+
+Hầu hết utility type "magic" trong `lib.es5.d.ts` đều là conditional +
+infer. Hiểu chúng là cách nhanh nhất để học pattern.
+
+### `ReturnType<T>`
+
+```ts
+type ReturnType<T extends (...args: any) => any> =
+  T extends (...args: any) => infer R ? R : any;
+
+type Fn = (a: number) => User;
+type R = ReturnType<Fn>;
+//   ^? User
+```
+
+### `Parameters<T>`
+
+```ts
+type Parameters<T extends (...args: any) => any> =
+  T extends (...args: infer P) => any ? P : never;
+
+type P = Parameters<(name: string, age: number) => void>;
+//   ^? [name: string, age: number]   ← labeled tuple, không phải [string, number]
+```
+
+Lưu ý: TS giữ **parameter label** (`name: string`) trong tuple — pattern
+này hữu ích khi forward args với type-safe naming.
+
+### `ConstructorParameters<T>`
+
+```ts
+type ConstructorParameters<T extends abstract new (...args: any) => any> =
+  T extends abstract new (...args: infer P) => any ? P : never;
+
+class Logger {
+  constructor(name: string, level: 'info' | 'debug') {}
+}
+
+type Args = ConstructorParameters<typeof Logger>;
+//   ^? [name: string, level: 'info' | 'debug']
+```
+
+### `InstanceType<T>`
+
+Lấy kiểu instance của một class constructor:
+
+```ts
+type InstanceType<T extends abstract new (...args: any) => any> =
+  T extends abstract new (...args: any) => infer R ? R : any;
+
+type LoggerInst = InstanceType<typeof Logger>;
+//   ^? Logger
+```
+
+### `Awaited<T>` (TS 4.5+) — recursive!
+
+Unwrap Promise lồng nhau bao nhiêu cấp cũng được:
+
+```ts
+type Awaited<T> = T extends null | undefined
+  ? T
+  : T extends object & { then(onfulfilled: infer F, ...args: infer _): any }
+    ? F extends ((value: infer V, ...args: infer _) => any) ? Awaited<V> : never
+    : T;
+
+type A = Awaited<Promise<Promise<Promise<string>>>>;
+//   ^? string
+```
+
+Đây là một trong những type recursive phức tạp nhất trong stdlib — sử
+dụng 4 `infer` lồng nhau để tách `then` callback và unwrap.
+
+### `ThisParameterType<T>` & `OmitThisParameter<T>`
+
+Extract / strip `this` parameter (chỉ áp dụng cho function dùng
+`function this: X`):
+
+```ts
+type ThisParameterType<T> =
+  T extends (this: infer U, ...args: never) => any ? U : unknown;
+
+function logName(this: { name: string }) {
+  console.log(this.name);
+}
+
+type T = ThisParameterType<typeof logName>;
+//   ^? { name: string }
+```
+
+> **Pattern chung của 7 utility trên**: dùng conditional kiểm tra hình
+> dạng (function / constructor / promise), rồi đặt `infer X` đúng vào
+> chỗ cần extract.
+
+---
+
+## 5. Tuple / array manipulation: Head, Tail, Last, Reverse
+
+Tuple type kết hợp với `infer` cho phép viết "list operation" ở type
+level — pattern phổ biến trong type-level programming.
+
+### Element của array
+
+```ts
+type ElementOf<T> = T extends readonly (infer U)[] ? U : never;
+
+type E1 = ElementOf<string[]>;          // string
+type E2 = ElementOf<readonly [1, 'a']>; // 1 | 'a'
+```
+
+### Head, Tail, Last, Init
+
+```ts
+type Head<T extends readonly any[]> =
+  T extends readonly [infer H, ...any[]] ? H : never;
+
+type Tail<T extends readonly any[]> =
+  T extends readonly [any, ...infer R] ? R : [];
+
+type Last<T extends readonly any[]> =
+  T extends readonly [...any[], infer L] ? L : never;
+
+type Init<T extends readonly any[]> =
+  T extends readonly [...infer I, any] ? I : [];
+
+type H = Head<[1, 2, 3]>; // 1
+type T = Tail<[1, 2, 3]>; // [2, 3]
+type L = Last<[1, 2, 3]>; // 3
+type I = Init<[1, 2, 3]>; // [1, 2]
+```
+
+### Reverse (recursive)
+
+```ts
+type Reverse<T extends readonly any[]> =
+  T extends readonly [infer H, ...infer R]
+    ? [...Reverse<R>, H]
+    : [];
+
+type R = Reverse<[1, 2, 3, 4]>;
+//   ^? [4, 3, 2, 1]
+```
+
+Recursive logic: lấy head, đệ quy tail, append head vào cuối kết quả. TS
+limit recursion ~999 levels — đủ cho 99% use case.
+
+### Length của tuple
+
+```ts
+type Length<T extends readonly any[]> = T['length'];
+
+type L1 = Length<[1, 2, 3]>;     // 3
+type L2 = Length<string[]>;       // number ← không xác định, fallback
+```
+
+### Concat (zero-cost ở type level)
+
+```ts
+type Concat<A extends readonly any[], B extends readonly any[]> =
+  [...A, ...B];
+
+type C = Concat<[1, 2], ['a', 'b']>;
+//   ^? [1, 2, 'a', 'b']
+```
+
+---
+
+## 6. Function infer: composition, curry, pipe
+
+Thư viện `lodash`, `ramda`, `effect-ts` đều dùng pattern này để type-safe
+function pipe.
+
+### Compose 2 hàm
+
+```ts
+type Compose<F, G> =
+  F extends (a: infer A) => infer B
+    ? G extends (b: B) => infer C
+      ? (a: A) => C
+      : never
+    : never;
+
+declare const toString: (n: number) => string;
+declare const toUpper: (s: string) => string;
+
+type Composed = Compose<typeof toString, typeof toUpper>;
+//   ^? (a: number) => string
+```
+
+### Curry
+
+```ts
+type Curry<F> =
+  F extends (...args: [infer A, ...infer Rest]) => infer R
+    ? Rest extends []
+      ? (a: A) => R
+      : (a: A) => Curry<(...args: Rest) => R>
+    : never;
+
+type Curried = Curry<(a: number, b: string, c: boolean) => User>;
+//   ^? (a: number) => (b: string) => (c: boolean) => User
+```
+
+### Pipe (variadic)
+
+```ts
+type Pipe<Fns extends readonly any[], Input> =
+  Fns extends readonly [(arg: Input) => infer Next, ...infer Rest]
+    ? Rest extends readonly any[]
+      ? Pipe<Rest, Next>
+      : never
+    : Input;
+
+type Step1 = (n: number) => string;
+type Step2 = (s: string) => boolean;
+type Step3 = (b: boolean) => null;
+
+type Out = Pipe<[Step1, Step2, Step3], number>;
+//   ^? null
+```
+
+Đây là kiểu Type-level recursion: mỗi step lấy first function, tính
+output, gọi `Pipe` với rest.
+
+---
+
+## 7. Template literal + `infer` — parse string ở compile time
+
+Đây là tính năng **mạnh nhất** của `infer` (xuất hiện từ TS 4.1, 2020).
+Cho phép pattern-match string literal type, biến string thành dữ liệu có
+cấu trúc ở compile time.
+
+### Cú pháp cơ bản
+
+```ts
+type StartsWith<S, P extends string> =
+  S extends `${P}${string}` ? true : false;
+
+type T1 = StartsWith<'hello world', 'hello'>; // true
+type T2 = StartsWith<'world', 'hello'>;        // false
+```
+
+`${string}` là wildcard match. `${infer X}` capture phần match đó.
+
+### Split string
+
+```ts
+type Split<S extends string, Sep extends string> =
+  S extends `${infer Head}${Sep}${infer Rest}`
+    ? [Head, ...Split<Rest, Sep>]
+    : [S];
+
+type Parts = Split<'a/b/c/d', '/'>;
+//   ^? ['a', 'b', 'c', 'd']
+```
+
+### Trim
+
+```ts
+type Whitespace = ' ' | '\n' | '\t';
+
+type TrimLeft<S extends string> =
+  S extends `${Whitespace}${infer R}` ? TrimLeft<R> : S;
+
+type TrimRight<S extends string> =
+  S extends `${infer R}${Whitespace}` ? TrimRight<R> : S;
+
+type Trim<S extends string> = TrimLeft<TrimRight<S>>;
+
+type T = Trim<'   hello world   \n'>;
+//   ^? 'hello world'
+```
+
+### CamelCase ↔ kebab-case
+
+```ts
+type KebabToCamel<S extends string> =
+  S extends `${infer Head}-${infer Tail}`
+    ? `${Head}${Capitalize<KebabToCamel<Tail>>}`
+    : S;
+
+type C1 = KebabToCamel<'background-color-primary'>;
+//   ^? 'backgroundColorPrimary'
+
+type CamelToKebab<S extends string> =
+  S extends `${infer C}${infer R}`
+    ? C extends Lowercase<C>
+      ? `${C}${CamelToKebab<R>}`
+      : `-${Lowercase<C>}${CamelToKebab<R>}`
+    : S;
+
+type K1 = CamelToKebab<'backgroundColorPrimary'>;
+//   ^? '-background-color-primary'  ← chú ý '-' đầu, cần helper bỏ
+```
+
+### Parse i18n placeholder
+
+```ts
+type ExtractPlaceholders<S extends string> =
+  S extends `${string}{${infer Key}}${infer Rest}`
+    ? Key | ExtractPlaceholders<Rest>
+    : never;
+
+type Keys = ExtractPlaceholders<'Hello {name}, you have {count} messages'>;
+//   ^? 'name' | 'count'
+```
+
+Bây giờ ta có thể bắt buộc caller cung cấp đúng key:
+
+```ts
+function t<S extends string>(
+  template: S,
+  args: Record<ExtractPlaceholders<S>, string | number>
+): string {
+  return template.replace(/\{(\w+)\}/g, (_, k) => String(args[k as keyof typeof args]));
+}
+
+t('Hello {name}, you have {count} messages', {
+  name: 'Vinh',
+  count: 3,
+}); // ✅
+
+t('Hello {name}', { wrong: 'x' });
+// ❌ Type error: missing 'name', 'wrong' is excess
+```
+
+---
+
+## 8. Recursive `infer` — DeepReadonly, Path, Get
+
+`infer` kết hợp với recursion cho phép walk vào cấu trúc lồng nhau ở
+compile time.
+
+### DeepReadonly
+
+```ts
+type DeepReadonly<T> =
+  T extends (infer U)[]
+    ? readonly DeepReadonly<U>[]
+    : T extends object
+      ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+      : T;
+
+type Config = {
+  api: { url: string; retry: { count: number } };
+  flags: string[];
+};
+
+type FrozenConfig = DeepReadonly<Config>;
+//   ^? {
+//        readonly api: {
+//          readonly url: string;
+//          readonly retry: { readonly count: number }
+//        };
+//        readonly flags: readonly string[];
+//      }
+```
+
+### DeepPartial
+
+```ts
+type DeepPartial<T> =
+  T extends Function
+    ? T
+    : T extends Array<infer U>
+      ? Array<DeepPartial<U>>
+      : T extends object
+        ? { [K in keyof T]?: DeepPartial<T[K]> }
+        : T;
+```
+
+### `Path<T>` — sinh union các "key.path"
+
+Đây là kỹ thuật nâng cao quan trọng — dùng trong `lodash.get` type-safe,
+form library, i18n key:
+
+```ts
+type Path<T, Prefix extends string = ''> =
+  T extends object
+    ? {
+        [K in keyof T & string]:
+          | (Prefix extends '' ? K : `${Prefix}.${K}`)
+          | Path<T[K], Prefix extends '' ? K : `${Prefix}.${K}`>;
+      }[keyof T & string]
+    : never;
+
+type Translations = {
+  home: {
+    title: string;
+    cta: { primary: string; secondary: string };
+  };
+  auth: {
+    login: string;
+    errors: { wrongPassword: string };
+  };
+};
+
+type Keys = Path<Translations>;
+//   ^? 'home' | 'home.title' | 'home.cta' | 'home.cta.primary'
+//      | 'home.cta.secondary' | 'auth' | 'auth.login' | 'auth.errors'
+//      | 'auth.errors.wrongPassword'
+```
+
+### `Get<T, P>` — lookup theo path
+
+Đôi khi ta chỉ cần leaf path (không có intermediate). Variant:
+
+```ts
+type LeafPath<T, Prefix extends string = ''> =
+  T extends object
+    ? {
+        [K in keyof T & string]:
+          T[K] extends object
+            ? LeafPath<T[K], Prefix extends '' ? K : `${Prefix}.${K}`>
+            : (Prefix extends '' ? K : `${Prefix}.${K}`);
+      }[keyof T & string]
+    : never;
+
+type Get<T, P extends string> =
+  P extends `${infer K}.${infer R}`
+    ? K extends keyof T
+      ? Get<T[K], R>
+      : never
+    : P extends keyof T
+      ? T[P]
+      : never;
+
+type V1 = Get<Translations, 'home.cta.primary'>;
+//   ^? string
+
+type V2 = Get<Translations, 'home.invalid'>;
+//   ^? never
+```
+
+Đây là pattern **tRPC** dùng để type-safe procedure path, **`react-hook-form`**
+dùng cho field path, **`i18next`** dùng cho translation key.
+
+---
+
+## 9. `infer extends` (TS 4.7+) — constrained inference
+
+TS 4.7 thêm `infer X extends C` — constrain biến infer phải extends một
+type cho trước. Hữu ích khi muốn narrow ngay trong infer:
+
+```ts
+// Trước TS 4.7 — phải check sau infer
+type ToNumberOld<S> = S extends `${infer N}`
+  ? N extends `${number}`
+    ? N
+    : never
+  : never;
+
+// Sau TS 4.7 — gọn hơn, narrow ngay
+type ToNumber<S> = S extends `${infer N extends number}` ? N : never;
+
+type N1 = ToNumber<'42'>;     // 42
+type N2 = ToNumber<'3.14'>;   // 3.14
+type N3 = ToNumber<'hello'>;  // never
+```
+
+### Use case: parse stringified JSON literal
+
+```ts
+type ParseInt<S> = S extends `${infer N extends number}` ? N : never;
+
+type ParseBool<S> =
+  S extends `${infer B extends boolean}` ? B : never;
+
+type R1 = ParseInt<'2026'>;    // 2026
+type R2 = ParseBool<'true'>;   // true
+type R3 = ParseBool<'maybe'>;  // never
+```
+
+### Use case: typed env variable
+
+```ts
+type EnvNumber<S> = S extends `${infer N extends number}` ? N : number;
+
+declare const PORT: EnvNumber<'3000'>;
+//             ^? 3000  ← literal type, chính xác
+
+declare const SOME: EnvNumber<string>;
+//             ^? number  ← fallback
+```
+
+`infer extends` chỉ work với một số type cụ thể: `number`, `bigint`,
+`boolean`, hoặc literal types. Không thể dùng với arbitrary type — đây là
+giới hạn intentional vì compiler phải narrow.
+
+---
+
+## 10. 5 use case thực chiến
+
+### 10.1 Type-safe i18n: parse placeholder ngay từ template
+
+Đã preview ở section 7, đây là phiên bản đầy đủ:
+
+```ts
+type Placeholders<S extends string> =
+  S extends `${string}{${infer K}}${infer R}`
+    ? K | Placeholders<R>
+    : never;
+
+// Hỗ trợ format `{name:string}` `{count:number}` để type-check args
+type ParsePlaceholder<S extends string> =
+  S extends `${infer K}:number`
+    ? { [P in K]: number }
+    : S extends `${infer K}:boolean`
+      ? { [P in K]: boolean }
+      : { [P in S]: string | number };
+
+type ArgsOf<S extends string> =
+  S extends `${string}{${infer P}}${infer Rest}`
+    ? ParsePlaceholder<P> & ArgsOf<Rest>
+    : {};
+
+function t<S extends string>(template: S, args: ArgsOf<S>): string {
+  return template.replace(/\{([^}]+)\}/g, (_, raw) => {
+    const [k] = raw.split(':');
+    return String((args as Record<string, unknown>)[k]);
+  });
+}
+
+t('Hello {name}, age {age:number}', { name: 'Vinh', age: 30 });    // ✅
+t('Hello {name}', { name: 123 });                                    // ✅ (number ok)
+// @ts-expect-error — missing 'name'
+t('Hello {name}', {});
+```
+
+### 10.2 Type-safe router: extract params từ path pattern
+
+Pattern này được `tanstack-router`, `next-intl`, `koa-router` dùng:
+
+```ts
+type ExtractParams<Path extends string> =
+  Path extends `${string}:${infer Param}/${infer Rest}`
+    ? Param | ExtractParams<`/${Rest}`>
+    : Path extends `${string}:${infer Param}`
+      ? Param
+      : never;
+
+type P1 = ExtractParams<'/users/:userId/posts/:postId'>;
+//   ^? 'userId' | 'postId'
+
+function navigate<Path extends string>(
+  path: Path,
+  params: Record<ExtractParams<Path>, string>
+): void {
+  // build URL từ pattern + params
+}
+
+navigate('/users/:userId/posts/:postId', {
+  userId: '42',
+  postId: '99',
+}); // ✅
+
+// @ts-expect-error — missing 'postId'
+navigate('/users/:userId/posts/:postId', { userId: '42' });
+```
+
+### 10.3 Type-safe RegExp groups
+
+```ts
+type RegexGroups<R extends string> =
+  R extends `${string}(?<${infer Name}>${string})${infer Rest}`
+    ? Record<Name, string> & RegexGroups<Rest>
+    : {};
+
+function exec<P extends string>(
+  pattern: P,
+  input: string
+): RegexGroups<P> | null {
+  const m = input.match(new RegExp(pattern));
+  return (m?.groups as RegexGroups<P>) ?? null;
+}
+
+const result = exec('(?<year>\\d{4})-(?<month>\\d{2})', '2026-05');
+if (result) {
+  result.year;  // ^? string
+  result.month; // ^? string
+  // @ts-expect-error — không có group
+  result.day;
+}
+```
+
+### 10.4 React component prop extraction
+
+```ts
+import type { ComponentProps, ComponentType } from 'react';
+
+// ComponentProps tự dùng infer bên trong
+type ButtonProps = ComponentProps<typeof MyButton>;
+//   ^? props của MyButton
+
+// Custom: extract event handler arg
+type EventHandlerArg<T> =
+  T extends (event: infer E) => any ? E : never;
+
+type ClickEvent = EventHandlerArg<React.MouseEventHandler>;
+//   ^? React.MouseEvent<Element, MouseEvent>
+
+// Forward ref props extraction
+type ForwardedProps<T> =
+  T extends React.ForwardRefExoticComponent<infer P>
+    ? P
+    : never;
+```
+
+### 10.5 State machine event union
+
+```ts
+type Event =
+  | { type: 'LOGIN'; payload: { email: string; password: string } }
+  | { type: 'LOGOUT' }
+  | { type: 'REFRESH'; payload: { token: string } };
+
+// Extract payload type của 1 event cụ thể
+type EventPayload<E extends Event, T extends E['type']> =
+  E extends { type: T; payload: infer P } ? P : never;
+
+type LoginPayload = EventPayload<Event, 'LOGIN'>;
+//   ^? { email: string; password: string }
+
+type LogoutPayload = EventPayload<Event, 'LOGOUT'>;
+//   ^? never  ← không có payload
+
+// Type-safe dispatch
+function dispatch<T extends Event['type']>(
+  type: T,
+  payload?: EventPayload<Event, T>
+): void {
+  // ...
+}
+
+dispatch('LOGIN', { email: 'a@b.c', password: 'x' }); // ✅
+dispatch('LOGOUT');                                    // ✅
+// @ts-expect-error — REFRESH cần payload
+dispatch('REFRESH');
+```
+
+---
+
+## 11. Pitfalls, cheat sheet & Kết luận
+
+### 11.1 Pitfalls thường gặp
+
+#### Pitfall 1 — `infer` chỉ bind ở **bên trái** của conditional
+
+```ts
+// ❌ Sai
+type Bad<T> = T extends infer X ? X : never;
+
+// Cú pháp này không sai về syntax nhưng vô nghĩa — `T extends T ? T : never`
+// chỉ là identity. `infer` trong vị trí này không capture gì khác T.
+```
+
+Đặt `infer` ở vị trí khớp pattern thực sự:
+
+```ts
+// ✅ Đúng
+type ElementOf<T> = T extends Array<infer E> ? E : never;
+```
+
+#### Pitfall 2 — Distribution unintended
+
+```ts
+type FirstChar<S> = S extends `${infer C}${string}` ? C : never;
+
+// Distribution: union vào → distribute từng phần tử
+type R = FirstChar<'hello' | 'world'>;
+//   ^? 'h' | 'w'   ← phải là 'h' nếu coi cả union là 1 string
+```
+
+Fix: bọc trong tuple để tắt distribution:
+
+```ts
+type FirstCharNoDist<S> =
+  [S] extends [`${infer C}${string}`] ? C : never;
+```
+
+#### Pitfall 3 — Recursion limit
+
+```ts
+type Repeat<T extends string, N extends number, Acc extends string = ''> =
+  Acc['length'] extends N ? Acc : Repeat<T, N, `${Acc}${T}`>;
+
+type R = Repeat<'a', 1000>; // Type instantiation is excessively deep
+```
+
+TS giới hạn ~999 levels recursion (có thể giảm tuỳ phiên bản). Với
+sequence dài, cần **tail recursion** hoặc **divide & conquer**:
+
+```ts
+// Tail-recursive: accumulator ở đầu, không expand stack frame
+type RepeatTail<T extends string, N extends number, Acc extends string = ''> =
+  Acc['length'] extends N ? Acc : RepeatTail<T, N, `${T}${Acc}`>;
+```
+
+#### Pitfall 4 — `infer` trong mapped type không hoạt động
+
+```ts
+// ❌ Không bind được
+type WrongMapped<T> = {
+  [K in keyof T]: T[K] extends infer V ? V[] : never;
+};
+```
+
+Lý do: `infer` cần conditional context **bên ngoài** mapped type. Fix:
+extract conditional type ra alias riêng.
+
+#### Pitfall 5 — `any` "ăn" mọi conditional
+
+```ts
+type Test<T> = T extends string ? 'yes' : 'no';
+
+type R = Test<any>;
+//   ^? 'yes' | 'no'   ← any match cả 2 nhánh!
+```
+
+Khi user pass `any`, conditional collapse thành union — bug rất khó debug.
+Defensive: dùng `IsAny` helper hoặc constrain generic.
+
+### 11.2 Cheat sheet
+
+| Mục đích                                | Pattern                                                      |
+| --------------------------------------- | ------------------------------------------------------------ |
+| Return type của function                | `T extends (...args: any) => infer R ? R : never`            |
+| Args của function                       | `T extends (...args: infer P) => any ? P : never`            |
+| Element của array                       | `T extends Array<infer U> ? U : never`                       |
+| Unwrap Promise                          | `T extends Promise<infer V> ? V : T`                         |
+| First / Last của tuple                  | `T extends [infer H, ...any[]] ? H : never`                  |
+| Tail / Init của tuple                   | `T extends [any, ...infer R] ? R : []`                       |
+| Reverse tuple (recursive)               | `T extends [infer H, ...infer R] ? [...Reverse<R>, H] : []`  |
+| Split string                            | `` S extends `${infer A}${Sep}${infer B}` ? [A, ...] : [S] `` |
+| Trim whitespace                         | `` S extends ` ${infer R}` ? Trim<R> : S `` (recursive)       |
+| Parse number literal                    | `` S extends `${infer N extends number}` ? N : never ``       |
+| `Path<T>` recursive                     | distribute keyof + recurse object value                       |
+| Tắt distribution                        | bọc trong tuple `[T]` 2 bên                                   |
+
+### 11.3 Khi nào nên dùng `infer`?
+
+**Nên** dùng khi:
+
+- Viết utility type tái sử dụng (`Awaited`, `EventPayload`, `ExtractParams`)
+- API surface yêu cầu inference từ input của user (form library, router,
+  i18n, RegExp)
+- Có cụm logic infer xuất hiện ≥ 2 lần — refactor thành helper
+
+**Không nên** lạm dụng khi:
+
+- Cấu trúc đã rõ ràng — viết type trực tiếp đọc dễ hơn
+- Type quá deep / recursive → IDE chậm, hover lag, error message tệ
+- Có cách viết không-conditional clean hơn (mapped type, simple intersection)
+
+> Quy tắc kinh nghiệm: nếu một junior cùng team không hiểu type của bạn
+> trong 30 giây hover, đã đến lúc cân nhắc rút gọn hoặc thêm comment giải
+> thích "vì sao" (xem [coding standards của blog này](/blog/cursor-rules-guide/)
+> về comment "why").
+
+### 11.4 Kết luận
+
+`infer` không phải magic — nó chỉ là một mechanism đơn giản: **đặt một
+type variable ở vị trí cần extract, để compiler unify**. Một khi đã
+internalize điều này, các utility nâng cao trở thành combinator của
+nguyên lý chung:
+
+- Conditional cho **branching**
+- `infer` cho **binding**
+- Recursion + template literal cho **walking structure**
+- `infer extends` cho **constraining**
+
+Lần tới khi gặp một API như `tRPC`, `Zod.infer<typeof schema>`, hay
+`PathOf<TConfig>` — bạn sẽ biết bên dưới chỉ là một chuỗi conditional +
+infer được sắp xếp khéo léo. Và khi cần viết utility tương tự cho codebase
+của mình, bạn đã có đủ pattern trong tay.
+
+Type-level programming có cái đẹp riêng: **mọi thứ đúng ở compile time
+là free ở runtime**. Đầu tư hiểu sâu một lần, lợi nhuận trả về mãi mãi
+trong từng dòng code mà compiler tự gợi ý chính xác cho bạn.
