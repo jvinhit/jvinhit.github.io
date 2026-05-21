@@ -1,0 +1,554 @@
+---
+title: 'Orchestrator Pattern — Điều phối multi-agent cho dự án lớn'
+description: 'Tại sao 1 agent không đủ cho dự án lớn, cách dùng Orchestrator pattern với 6 kiểu điều phối (fan-out, validation chain, specialist routing...), setup thực tế, và anti-patterns cần tránh.'
+pubDate: 2026-05-21
+tags: [ai, agent, architecture, coding-agent, workflow]
+draft: false
+---
+
+import OrchestratorPatternGuide from '~/components/blog/OrchestratorPatternGuide.astro';
+
+Bạn đang implement 1 feature phức tạp — cần sửa 15+ files, trải dài từ
+frontend qua API, xuống database, rồi viết test. Agent chạy được 5 phút,
+đọc xong Jira ticket + Confluence spec + explore codebase... thì context
+window đã cạn. Chưa kịp viết dòng code đầu tiên.
+
+Đây không phải lỗi của bạn hay của agent. Đây là **giới hạn kiến trúc**:
+một agent đơn lẻ có context window hữu hạn, và dự án lớn đòi hỏi nhiều
+domain knowledge hơn bất kỳ context window nào chứa nổi.
+
+Giải pháp? Thay vì ép 1 agent làm hết, ta **chia để trị**: một agent điều
+phối (orchestrator), nhiều agent chuyên biệt (specialist) thực thi. Mỗi
+agent có context riêng, chỉ nhận đúng phần việc cần thiết.
+
+Interactive reference bên dưới tổng hợp toàn bộ — từ 6 patterns, setup,
+workflow, đến anti-patterns. Bấm vào từng tab để khám phá chi tiết.
+
+<OrchestratorPatternGuide />
+
+---
+
+## 1. Tại sao cần Orchestrator?
+
+Một agent đơn lẻ hoạt động tốt khi task gọn: sửa 1-2 file, logic rõ
+ràng, scope nhỏ. Nhưng dự án thực có:
+
+- **Hàng chục files** cần đọc trước khi implement
+- **Tasks song song** nhau (frontend + backend + tests)
+- **Domain khác nhau** cần specialist knowledge
+- **Context window** bị chia sẻ giữa research và implementation
+
+```text
+┌─────────────────────────────────────────────┐
+│           Single Agent Context              │
+├─────────────────────────────────────────────┤
+│  Jira ticket           ~ 3K tokens          │
+│  Confluence spec       ~ 20K tokens         │
+│  Codebase exploration  ~ 30K tokens         │
+│  ──────────── ĐÃ HẾT CONTEXT ──────────── │
+│  Viết code?            ??? tokens           │
+│  Viết tests?           ??? tokens           │
+└─────────────────────────────────────────────┘
+```
+
+Orchestrator pattern giải quyết bằng cách **tách context**: orchestrator
+giữ bức tranh tổng thể (plan, dependencies, status), specialist agents
+nhận task cụ thể với context vừa đủ.
+
+```text
+Orchestrator (plan + coordinate — KHÔNG viết code)
+    │
+    ├── Frontend specialist  → src/components/
+    ├── Backend specialist   → src/api/
+    ├── DB specialist        → src/db/
+    └── Test writer          → tests/
+```
+
+Mỗi specialist có context window riêng, chỉ load files trong scope của
+mình. Không ai bị cạn context vì phải đọc code của domain khác.
+
+---
+
+## 2. Ba chế độ multi-agent
+
+Trước khi vào patterns, cần phân biệt 3 cách chạy multi-agent:
+
+| Chế độ | Đặc điểm | Khi dùng |
+|--------|----------|----------|
+| **Sub-agents** | Chạy trong 1 session, orchestrator spawn agent con | Tasks trong cùng project, có dependency |
+| **Parallel sessions** | Nhiều session độc lập, không chia sẻ context | Tasks hoàn toàn độc lập, khác domain/repo |
+| **Agent teams** | Agents giao tiếp trực tiếp với nhau | Experimental, rất tốn token |
+
+**Khuyến nghị thực tế**: bắt đầu với **sub-agents**. Đây là pattern
+cân bằng nhất giữa khả năng phối hợp và chi phí. Parallel sessions khi
+tasks thực sự không liên quan. Agent teams chỉ khi bạn có budget và thực
+sự cần agents "nói chuyện" với nhau.
+
+---
+
+## 3. Sáu kiểu điều phối
+
+### 3.1 Orchestrator → Specialists (phổ biến nhất)
+
+Orchestrator **không viết code**. Nhiệm vụ duy nhất: plan, delegate,
+review. Specialist agents nhận task cụ thể với file scope rõ ràng.
+
+```text
+Orchestrator (Opus — complex reasoning)
+    │
+    ├── frontend-agent (Sonnet) → src/components/
+    ├── backend-agent (Sonnet)  → src/api/
+    ├── db-agent (Sonnet)       → src/db/
+    └── test-agent (Haiku)      → tests/
+```
+
+Routing table giúp orchestrator quyết định gửi task cho ai:
+
+| Task type | Route to | File scope |
+|-----------|----------|------------|
+| React / UI | frontend-agent | `src/components/` |
+| API routes | backend-agent | `src/api/` |
+| DB / migrations | db-agent | `src/db/` |
+| Tests | test-agent | `tests/` |
+
+Ưu điểm lớn nhất: **mỗi agent chỉ cần đọc files trong scope của mình**.
+Frontend agent không cần biết database schema. DB agent không cần hiểu
+React component structure. Context được sử dụng hiệu quả tối đa.
+
+### 3.2 Fan-out / Fan-in (phân tích song song)
+
+Gửi nhiều agents đồng thời, mỗi cái analyze một phần codebase,
+orchestrator tổng hợp kết quả.
+
+```text
+Orchestrator
+├── Agent 1: analyze src/api/   → list missing validation
+├── Agent 2: analyze src/auth/  → list security issues
+├── Agent 3: analyze src/db/    → list N+1 queries
+└── Agent 4: analyze src/utils/ → list missing error handling
+    ↓ (tất cả return) ↓
+Orchestrator tổng hợp → prioritized action list
+```
+
+Pattern này cực kỳ hiệu quả cho **audit, review, hoặc exploration**
+tasks. 4 agents chạy song song nhanh gấp 4 lần 1 agent chạy tuần tự.
+
+Prompt mẫu:
+
+```text
+Chạy 4 sub-agents song song để audit codebase:
+
+Agent 1: Đọc src/api/ — liệt kê endpoints thiếu validation
+Agent 2: Đọc src/auth/ — tìm security anti-patterns
+Agent 3: Đọc src/db/ — tìm queries có N+1 problem
+Agent 4: Đọc src/utils/ — tìm functions thiếu error handling
+
+Sau khi tất cả xong: tổng hợp thành prioritized fix list.
+```
+
+> **Cảnh báo**: KHÔNG dùng fan-out khi các agents cần **sửa cùng 1 file**.
+> Mỗi agent sẽ viết version riêng → conflict. Fan-out chỉ hợp với
+> read-only analysis hoặc khi file scopes không overlap.
+
+### 3.3 Validation Chain (builder + validator)
+
+Agent viết code, agent khác review **độc lập** — không share assumptions,
+không bias.
+
+```text
+Builder Agent → viết code
+    ↓
+Validator Agent → đọc output, chạy tests, báo issues (KHÔNG sửa)
+    ↓ (nếu có issues)
+Builder Agent (lần 2) → fix issues
+    ↓
+Validator Agent (lần 2) → verify fixes
+```
+
+Điểm quan trọng: validator **không được sửa code**. Nếu validator vừa
+review vừa sửa, nó sẽ tự bias — tự đánh giá code của chính mình. Tách
+builder và validator đảm bảo 2 "đôi mắt" khác nhau nhìn cùng một output.
+
+Agent file mẫu cho builder:
+
+```markdown
+---
+name: builder
+description: Implement features. Use when task requires writing new code.
+tools: Read, Write, Edit, Bash
+---
+Viết code theo spec. Sau mỗi implementation:
+- Chạy tsc --noEmit để check TypeScript
+- Chạy tests liên quan
+- List files đã tạo/sửa
+```
+
+Agent file mẫu cho validator:
+
+```markdown
+---
+name: validator
+description: Validate code after builder finishes. Read-only review.
+tools: Read, Bash, Grep
+---
+Review code đã được viết. KHÔNG sửa file nào.
+Check:
+1. TypeScript types correct?
+2. Tests cover edge cases?
+3. Security issues?
+4. Pattern nhất quán với codebase?
+Report: Critical / Warning / Suggestion
+```
+
+### 3.4 Specialist Routing
+
+Mỗi domain có specialist riêng với **deep context** về domain đó. Khác
+với pattern 3.1 ở chỗ: specialist không chỉ nhận file scope, mà còn
+được "pre-load" kiến thức cụ thể.
+
+```markdown
+---
+name: react-specialist
+description: |
+  Use when creating or refactoring React components, hooks, or pages.
+  Trigger on: new component, component refactor, hooks integration.
+---
+Expert React + TypeScript cho project này.
+
+Trước khi viết: đọc docs/react-conventions.md
+Pattern rules: tham khảo src/components/UserTable/ làm reference
+Luôn: TypeScript strict, named exports, test song song
+```
+
+Pattern này shine khi project đã có conventions rõ ràng và mỗi domain
+cần follow rules riêng. Specialist "biết" conventions mà không cần
+orchestrator explain mỗi lần.
+
+### 3.5 Progressive Refinement
+
+Draft nhanh → refine từng chiều → polish. Mỗi pass tập trung vào
+một khía cạnh quality.
+
+```text
+Pass 1 (model nhỏ): Tạo draft nhanh, đúng logic cơ bản
+    ↓
+Pass 2 (model trung): Improve TypeScript types, error handling
+    ↓
+Pass 3 (model trung): Refactor cho readability, viết tests
+    ↓
+Pass 4 (model lớn, optional): Architecture review
+```
+
+Ý tưởng: pass đầu dùng model rẻ và nhanh để có skeleton, các pass sau
+dùng model đắt hơn để nâng chất lượng. Tổng chi phí thường thấp hơn
+việc dùng model đắt nhất từ đầu cho mọi thứ.
+
+**Khi dùng**: tính năng phức tạp cần chất lượng cao, code production.
+**Khi KHÔNG dùng**: prototyping, tasks đơn giản, hot-fix.
+
+### 3.6 Watchdog (monitor song song)
+
+Agent "giám sát" chạy song song với implementation agents, phát hiện vấn
+đề real-time.
+
+```markdown
+---
+name: watchdog
+description: |
+  Monitor code quality as other agents write. Trigger automatically
+  when multiple agents are working on the same feature.
+tools: Read, Bash
+---
+Monitor codebase thay đổi real-time.
+Sau mỗi 5 file thay đổi: check TypeScript + lint
+Nếu có lỗi: báo ngay cho orchestrator
+KHÔNG sửa — chỉ report
+```
+
+Watchdog chạy nhẹ (có thể dùng model rẻ nhất) vì chỉ cần đọc và chạy
+linter. Nhưng nó cực kỳ có giá trị khi nhiều agents cùng viết code — phát
+hiện TypeScript error hoặc lint violations ngay lập tức, thay vì đợi đến
+cuối mới validate.
+
+---
+
+## 4. Setup thực tế
+
+### Cấu trúc agent files
+
+Với một dự án React + TypeScript lớn, cấu trúc agents có thể trông như:
+
+```text
+.claude/agents/
+├── orchestrator-prompt.md     # instructions cho main session
+├── frontend-specialist.md     # React expert
+├── state-designer.md          # State management (Zustand/Redux)
+├── api-engineer.md            # REST API + React Query
+├── test-writer.md             # Vitest + RTL
+├── code-reviewer.md           # Read-only quality gate
+└── db-analyst.md              # Query optimization
+```
+
+Hoặc với Cursor:
+
+```text
+.cursor/rules/
+├── orchestrator.mdc           # routing table + quy trình
+└── ...
+
+# Sub-agents invoke qua Task tool trong conversation
+```
+
+### Routing table trong config
+
+Orchestrator cần một "bản đồ" rõ ràng để biết delegate cho ai:
+
+```markdown
+## Agent Routing
+
+Khi nhận feature request lớn (>3 files thay đổi):
+
+1. **PLAN**: Break down thành domain tasks
+2. **DELEGATE**: theo routing table
+3. **VALIDATE**: code-reviewer check toàn bộ
+4. **REPORT**: list files đã thay đổi, confirm TypeScript + tests pass
+
+| Task type     | Route to             | File scope       |
+|---------------|----------------------|------------------|
+| React / UI    | frontend-specialist  | src/components/  |
+| State logic   | state-designer       | src/stores/      |
+| API calls     | api-engineer         | src/api/         |
+| Tests         | test-writer          | tests/           |
+| Quality gate  | code-reviewer        | toàn bộ (read)   |
+```
+
+### Chọn model đúng để tiết kiệm
+
+Không phải task nào cũng cần model đắt nhất:
+
+| Vai trò | Model phù hợp | Lý do |
+|---------|---------------|-------|
+| Orchestrator | Lớn nhất (Opus) | Cần complex reasoning, judgment |
+| Implementation | Trung (Sonnet) | Balanced cost vs quality |
+| Search / explore | Nhỏ (Haiku) | Chỉ đọc, không cần sáng tạo |
+| Watchdog | Nhỏ (Haiku) | Chạy linter, report lỗi |
+| Architecture review | Lớn (Opus) | Cần hiểu big picture |
+
+Model nhỏ rẻ hơn model lớn **~25 lần**. Dùng model nhỏ cho search,
+explore, watch — tiết kiệm đáng kể mà không giảm chất lượng output
+cuối cùng.
+
+---
+
+## 5. Quy trình implement feature lớn
+
+Áp dụng Orchestrator pattern vào feature thực tế, quy trình 5 bước:
+
+### Bước 1: Exploration (đừng skip!)
+
+```text
+"Trước khi implement [feature], spawn Explore sub-agent để:
+1. List tất cả files liên quan
+2. Identify existing patterns để follow
+3. Flag potential conflicts
+KHÔNG edit gì trong phase này."
+```
+
+Phase này dùng model nhỏ, read-only. Output là danh sách files + patterns
++ constraints. Orchestrator dùng output này để plan chính xác.
+
+Đây là bước nhiều người bỏ qua — và hậu quả là agent viết code không
+follow conventions, hoặc duplicate logic đã có sẵn.
+
+### Bước 2: Planning
+
+```text
+"Dựa trên exploration:
+- Tasks list theo thứ tự dependency
+- File scope cho mỗi task
+- Agent nào phụ trách task nào
+Chờ approve trước khi bắt đầu."
+```
+
+Plan rõ ràng giúp tránh tình trạng 2 agents sửa cùng file hoặc agent
+frontend đợi backend chưa xong.
+
+### Bước 3: Implementation
+
+```text
+"Implement theo plan đã approve.
+Mỗi agent nhận: task cụ thể + file scope + relevant context.
+KHÔNG pass toàn bộ codebase — chỉ những gì agent cần."
+```
+
+Rule quan trọng nhất: **context isolation**. Mỗi agent chỉ biết đúng
+phần của mình. Không pass cả project context cho tất cả agents.
+
+### Bước 4: Validation
+
+```text
+"Sau khi implementation xong:
+1. code-reviewer check toàn bộ files đã thay đổi
+2. Fix Critical issues
+3. List Warning issues cho team review
+4. Confirm: TypeScript pass, tests pass"
+```
+
+Validation step không phải optional — nó là phần bắt buộc. Implementation
+agent có thể miss edge case mà reviewer agent (với "đôi mắt mới") sẽ bắt
+được.
+
+### Bước 5: Handoff
+
+Khi session kết thúc, ghi lại trạng thái để session tiếp theo pick up
+được. Viết vào file shared:
+
+```markdown
+# Handoff — [Feature name]
+
+## Đã xong
+- [x] Task 1: Frontend components
+- [x] Task 2: API endpoints
+
+## Còn lại
+- [ ] Task 3: Integration tests
+- [ ] Task 4: Performance tuning
+
+## Decisions made
+- Dùng React Query thay vì SWR vì cần mutation
+- Skip pagination cho v1, sẽ thêm sau
+
+## Gotchas
+- File X cần refactor trước khi thêm feature Y
+```
+
+---
+
+## 6. Anti-patterns — những sai lầm phổ biến
+
+### God orchestrator
+
+```text
+❌ Orchestrator tự viết code
+✅ Orchestrator chỉ plan, delegate, review
+```
+
+Khi orchestrator vừa coordinate vừa implement, nó sẽ tự fill context
+window bằng code chi tiết, mất khả năng giữ bức tranh tổng thể. Giống
+như project manager tự ngồi code — quên mất ai đang làm gì.
+
+### Agents sửa cùng file
+
+```text
+❌ Frontend và backend agent cùng sửa shared types file
+✅ Assign ownership: "types/ thuộc về backend-agent"
+```
+
+Hai agents sửa cùng file = guaranteed conflict. File scope phải **không
+overlap**. Nếu cần shared types, assign cho 1 agent duy nhất — các agent
+khác chỉ đọc.
+
+### Quá nhiều agents cho task đơn giản
+
+```text
+❌ Dùng 5 agents để thêm 1 button
+✅ Single agent cho tasks < 3 files
+```
+
+Rule thực tế: nếu 1 agent làm được trong dưới 5 phút → đừng orchestrate.
+Overhead của việc plan, delegate, sync, validate sẽ lớn hơn việc tự làm.
+
+### Thiếu context isolation
+
+```text
+❌ Pass toàn bộ codebase cho mỗi agent
+✅ Mỗi agent chỉ nhận context cần thiết
+```
+
+Nếu bạn pass cả project context cho tất cả specialist agents, bạn đang
+chạy nhiều single-agent với extra overhead — không phải orchestrator
+pattern. Mỗi agent chỉ cần biết đủ để hoàn thành task của nó.
+
+### Không validate trước khi merge
+
+```text
+❌ Accept output của implementation agent trực tiếp
+✅ Luôn có validation step (ít nhất TypeScript + tests)
+```
+
+Implementation agent có thể tự tin code của mình đúng — nhưng nó chỉ
+thấy scope của mình, không thấy bức tranh toàn cục. Validation step là
+đôi mắt thứ hai bắt buộc.
+
+---
+
+## 7. Shared state giữa agents
+
+Sub-agents không share memory. Giao tiếp duy nhất giữa chúng là qua
+**files trên disk**:
+
+```text
+.claude/
+├── SHARED_CONTEXT.md    # Orchestrator viết, agents đọc
+├── TASK_STATUS.md       # Track tiến độ
+└── HANDOFF.md           # Summary cuối session
+```
+
+Template cho shared context:
+
+```markdown
+# Shared context — [Feature name]
+
+## Decisions made
+- Dùng React Query cho data fetching (thay vì SWR)
+- Database: thêm index trên user.email
+
+## File ownership
+- src/components/ → frontend-specialist
+- src/stores/     → state-designer
+- src/api/        → api-engineer
+
+## Constraints
+- Không thay đổi public API của UserService
+- TypeScript strict, không dùng any
+
+## Current status
+- [x] Task 1: Design state shape
+- [ ] Task 2: Implement components
+- [ ] Task 3: Write tests
+```
+
+Orchestrator viết file này trước khi spawn agents. Mỗi agent đọc nó ở
+đầu để hiểu context chung, constraints, và ai đang làm gì. Khi agent
+xong, nó cập nhật status.
+
+Pattern đơn giản nhưng hiệu quả — vì file trên disk là thứ duy nhất mà
+mọi agent đều truy cập được.
+
+---
+
+## 8. Tổng kết
+
+- **Single agent** đủ cho task nhỏ (dưới 3 files). **Orchestrator pattern**
+  cần khi dự án đòi hỏi nhiều domain, nhiều files, hoặc context window
+  không đủ.
+- **6 patterns** phổ biến: Orchestrator → Specialists, Fan-out/Fan-in,
+  Validation Chain, Specialist Routing, Progressive Refinement, Watchdog.
+  Chọn pattern theo task type, không phải theo "cái nào phức tạp nhất".
+- **Context isolation** là nguyên tắc quan trọng nhất — mỗi agent chỉ
+  nhận đúng context cần thiết, không dump cả project.
+- **Orchestrator không viết code** — nó plan, delegate, review. Giống PM
+  giỏi: biết ai cần làm gì, không tự ngồi code.
+- **Validation step bắt buộc** — implementation agent luôn cần "đôi mắt
+  thứ hai" trước khi merge.
+- **Chọn model theo vai trò** để tối ưu chi phí: model lớn cho reasoning,
+  model nhỏ cho search và monitor.
+
+---
+
+### Đọc thêm
+
+- [Agent Architecture — Bên trong 1 AI agent là gì](/blog/agent-architecture-deep-dive) — kiến trúc agent loop, tool use, memory, planning
+- [Cursor Sub-agents — Delegate task nặng](/blog/cursor-sub-agents-guide) — cách Cursor implement sub-agents
+- [Working with Coding Agents](/blog/working-with-coding-agents) — từ autocomplete đến "đồng nghiệp" AI
+- [Customizing AI Agents — Rules, Skills, Personas](/blog/customizing-ai-agents) — cách customize agent behavior
