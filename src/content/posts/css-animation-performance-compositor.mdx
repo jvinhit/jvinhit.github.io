@@ -1,0 +1,314 @@
+---
+title: 'CSS Animation Performance — The Compositor, will-change, and 60fps'
+description: 'Senior guide to fast CSS animations: the render pipeline, compositor-only properties, will-change tradeoffs, avoiding layout thrash, and DevTools measurement.'
+pubDate: 2025-05-20
+tags: [css, animations, performance, css_10_batch2_maxmode]
+draft: false
+---
+
+Smooth animation is not about easing curves — it is about **which pixels the browser is forced to recompute on every frame**. \{Animation mượt không nằm ở đường cong easing — nó nằm ở việc browser buộc phải tính lại pixel nào trên mỗi frame.\} A 60fps target gives you ~16.7ms per frame; a 120fps display gives you ~8.3ms. \{Mục tiêu 60fps cho bạn ~16.7ms mỗi frame; màn 120fps chỉ còn ~8.3ms.\} Miss that budget and the user sees jank. \{Trượt ngân sách đó là người dùng thấy giật.\}
+
+This post is focused strictly on **animation** performance. \{Bài này tập trung hẳn vào hiệu năng animation.\} For general CSS optimization, see the separate post. \{Tối ưu CSS tổng quát đã có bài riêng.\}
+
+<iframe
+  src="/tools/css-animation-performance-demo/"
+  title="CSS animation performance interactive demo"
+  loading="lazy"
+  style="width:100%;height:780px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/css-animation-performance-demo/](/tools/css-animation-performance-demo/). Spawn hundreds of animated boxes, toggle compositor vs layout properties, and watch the live FPS meter drop when reflow kicks in. \{Spawn hàng trăm box animate, bật/tắt compositor vs layout, và xem FPS giảm khi reflow bắt đầu.\}
+
+## The render pipeline: style → layout → paint → composite
+
+Every visual update flows through a pipeline, and the further down you push work, the cheaper each frame becomes. \{Mỗi cập nhật hình ảnh chạy qua một pipeline, và càng đẩy việc xuống cuối thì mỗi frame càng rẻ.\}
+
+1. **Style** — the browser resolves which CSS rules apply and computes final values. \{Style — browser xác định rule nào áp dụng và tính giá trị cuối.\}
+2. **Layout** (reflow) — it calculates geometry: position and size of every box. \{Layout (reflow) — tính hình học: vị trí và kích thước của mọi box.\}
+3. **Paint** — it fills pixels: text, colors, borders, shadows into layers. \{Paint — tô pixel: chữ, màu, viền, bóng vào các layer.\}
+4. **Composite** — the GPU stitches painted layers together into the final image. \{Composite — GPU ghép các layer đã paint lại thành ảnh cuối.\}
+
+The key insight: **layout is the most expensive, composite is the cheapest.** \{Điểm mấu chốt: layout đắt nhất, composite rẻ nhất.\} An animation that only touches the composite step can run entirely on the GPU, off the main thread. \{Animation chỉ chạm bước composite có thể chạy hoàn toàn trên GPU, ngoài main thread.\}
+
+```text
+style ──> layout ──> paint ──> composite
+ │           │          │          │
+ every       triggers   triggers   GPU only,
+ frame       paint +    composite  off main thread
+             composite
+```
+
+## Which property triggers what
+
+The property you animate decides how much of the pipeline re-runs. \{Property bạn animate quyết định bao nhiêu phần pipeline chạy lại.\}
+
+### Layout-triggering (most expensive)
+
+Animating these forces a reflow, then paint, then composite — every frame. \{Animate những cái này ép reflow, rồi paint, rồi composite — mỗi frame.\}
+
+```css
+/* AVOID animating these — they trigger layout */
+.bad {
+  /* position & box geometry */
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: 100px;
+  height: 100px;
+  /* box model */
+  margin: 0;
+  padding: 0;
+  border-width: 1px;
+}
+```
+
+A layout change on one element can cascade to siblings and children, so the cost scales with the DOM. \{Một thay đổi layout ở một element có thể lan sang anh em và con, nên chi phí tỉ lệ với DOM.\}
+
+### Paint-triggering (medium cost)
+
+These skip layout but still repaint the affected area each frame. \{Những cái này bỏ qua layout nhưng vẫn repaint vùng bị ảnh hưởng mỗi frame.\}
+
+```css
+/* Costs a repaint each frame (no reflow) */
+.medium {
+  color: #c8ff00;
+  background-color: #111;
+  background-position: 0 0;
+  box-shadow: 0 0 10px #000;
+  border-radius: 8px;
+  outline-color: red;
+}
+```
+
+`box-shadow` and large `background` repaints are deceptively heavy because the painted area can be large. \{`box-shadow` và repaint `background` lớn nặng một cách bất ngờ vì vùng paint có thể rất rộng.\}
+
+### Composite-only (cheapest — the goal)
+
+These four can be animated by the compositor alone, no layout, no paint. \{Bốn cái này có thể animate bằng riêng compositor, không layout, không paint.\}
+
+```css
+/* PREFER these — compositor-only, GPU-accelerated */
+.good {
+  transform: translate3d(0, 0, 0) scale(1) rotate(0deg);
+  opacity: 1;
+  /* filter is composited in modern engines, but verify */
+  filter: blur(0);
+}
+```
+
+Want to move a box? Animate `transform: translateX()` instead of `left`. \{Muốn dời box? Animate `transform: translateX()` thay vì `left`.\} Want to resize? Animate `transform: scale()` instead of `width`/`height`. \{Muốn đổi size? Animate `transform: scale()` thay vì `width`/`height`.\}
+
+```css
+/* Move 200px: layout vs composite */
+
+/* ❌ reflow every frame */
+@keyframes slide-bad {
+  from { left: 0; }
+  to   { left: 200px; }
+}
+
+/* ✅ composite only */
+@keyframes slide-good {
+  from { transform: translateX(0); }
+  to   { transform: translateX(200px); }
+}
+```
+
+## Why compositor-only stays at 60/120fps
+
+Layout and paint run on the **main thread** — the same thread as JavaScript, event handling, and your `setTimeout`s. \{Layout và paint chạy trên main thread — cùng thread với JavaScript, xử lý sự kiện và `setTimeout`.\} If the main thread is busy parsing JSON or running a heavy handler, your layout-based animation stalls. \{Nếu main thread bận parse JSON hay chạy handler nặng, animation dựa trên layout sẽ khựng.\}
+
+Compositor-only animations (`transform`, `opacity`) can be handed to the **compositor thread** and the GPU. \{Animation chỉ-composite (`transform`, `opacity`) có thể giao cho compositor thread và GPU.\} They keep running smoothly even when the main thread is blocked. \{Chúng vẫn chạy mượt ngay cả khi main thread bị block.\} This is why a `transform` animation feels buttery while a `width` animation stutters under load. \{Đó là lý do animation `transform` mượt còn `width` giật khi tải nặng.\}
+
+```js
+// Demo: block the main thread, then watch which animation survives.
+document.querySelector('#block').addEventListener('click', () => {
+  const end = performance.now() + 500;
+  while (performance.now() < end) {
+    // Busy-wait 500ms on the main thread.
+  }
+});
+// A transform/opacity animation keeps ticking on the compositor.
+// A top/left/width animation freezes for the full 500ms.
+```
+
+## will-change: a scalpel, not a hammer
+
+`will-change` tells the browser "this property is about to animate, please prepare." \{`will-change` báo cho browser "property này sắp animate, chuẩn bị đi."\} In practice it promotes the element to its own compositor layer ahead of time, avoiding a paint hiccup when the animation starts. \{Thực tế nó thăng element lên layer compositor riêng từ trước, tránh khựng paint khi animation bắt đầu.\}
+
+```css
+/* Hint before the animation, so layer creation doesn't cost a frame */
+.card {
+  will-change: transform;
+}
+```
+
+### The memory cost
+
+Each promoted layer consumes GPU memory proportional to its size. \{Mỗi layer được thăng tốn bộ nhớ GPU tỉ lệ với kích thước của nó.\} A full-screen layer at high DPR can cost several megabytes. \{Một layer full-screen ở DPR cao có thể tốn vài megabyte.\} Apply `will-change` to hundreds of elements and you can exhaust GPU memory, ironically making everything slower. \{Áp `will-change` lên hàng trăm element thì có thể cạn bộ nhớ GPU, trớ trêu làm mọi thứ chậm hơn.\}
+
+### Rules for not overusing it
+
+- Apply it **just before** the animation and remove it after. \{Áp ngay trước animation rồi gỡ sau đó.\}
+- Never set `will-change: transform` globally on `*` or large selectors. \{Đừng bao giờ đặt `will-change: transform` toàn cục trên `*` hay selector lớn.\}
+- Prefer adding it on `:hover`/focus intent rather than permanently. \{Ưu tiên thêm lúc có ý định `:hover`/focus thay vì để vĩnh viễn.\}
+
+```css
+/* Add the hint on intent, drop it when idle */
+.btn {
+  transition: transform 150ms ease;
+}
+.btn:hover {
+  will-change: transform;
+}
+```
+
+```js
+// Or manage it imperatively for one-shot animations.
+function animateOnce(el) {
+  el.style.willChange = 'transform, opacity';
+  el.classList.add('run');
+  el.addEventListener(
+    'animationend',
+    () => { el.style.willChange = 'auto'; },
+    { once: true }
+  );
+}
+```
+
+If you have no plan to remove it, you probably should not add it. \{Nếu không có kế hoạch gỡ ra, có lẽ bạn không nên thêm vào.\}
+
+## Promoting elements to their own layer
+
+Before `will-change` existed, developers used the `translateZ(0)` / `translate3d(0,0,0)` "hack" to force a layer. \{Trước khi có `will-change`, dev dùng "hack" `translateZ(0)` / `translate3d(0,0,0)` để ép tạo layer.\}
+
+```css
+/* Legacy layer-promotion hack — prefer will-change today */
+.layer {
+  transform: translateZ(0);
+}
+```
+
+Layers are a tradeoff: a separate layer makes compositing cheap but creating, painting, and storing layers costs memory and upload time. \{Layer là sự đánh đổi: layer riêng làm composite rẻ nhưng tạo, paint và lưu layer tốn bộ nhớ và thời gian upload.\} Promote the few elements that actually animate — not entire sections. \{Chỉ thăng vài element thật sự animate — đừng thăng cả section.\}
+
+## Avoiding layout thrashing
+
+Layout thrashing happens when JS repeatedly **writes** then **reads** layout, forcing synchronous reflows in a loop. \{Layout thrashing xảy ra khi JS liên tục ghi rồi đọc layout, ép reflow đồng bộ trong vòng lặp.\}
+
+```js
+// ❌ Forced synchronous layout: read → write → read → write...
+const boxes = document.querySelectorAll('.box');
+boxes.forEach((box) => {
+  const w = box.offsetWidth;      // READ (forces layout)
+  box.style.width = w + 10 + 'px'; // WRITE (invalidates layout)
+});
+```
+
+Each read after a write forces the browser to recompute layout immediately. \{Mỗi lần đọc sau khi ghi ép browser tính lại layout ngay lập tức.\} The fix is to **batch reads, then batch writes.** \{Cách sửa là gom đọc trước, rồi gom ghi sau.\}
+
+```js
+// ✅ Batch all reads, then all writes — one layout pass.
+const boxes = document.querySelectorAll('.box');
+const widths = [...boxes].map((box) => box.offsetWidth); // READ phase
+boxes.forEach((box, i) => {
+  box.style.width = widths[i] + 10 + 'px';               // WRITE phase
+});
+```
+
+For animation loops, schedule writes in `requestAnimationFrame` and avoid reading layout inside the same frame after writing. \{Với vòng lặp animation, lên lịch ghi trong `requestAnimationFrame` và tránh đọc layout cùng frame sau khi ghi.\} Libraries like FastDOM formalize this read/write batching. \{Thư viện như FastDOM chuẩn hóa việc gom đọc/ghi này.\}
+
+## Reducing paint areas
+
+When a repaint is unavoidable, keep the painted region small. \{Khi không tránh được repaint, hãy giữ vùng paint nhỏ.\} A big invalidation rectangle means the GPU re-uploads more texture. \{Hình chữ nhật invalidate lớn nghĩa là GPU phải upload lại nhiều texture hơn.\}
+
+- Isolate animating elements so they do not invalidate their parents. \{Cô lập element đang animate để chúng không invalidate cha.\}
+- Use `transform`/`opacity` so there is no paint at all. \{Dùng `transform`/`opacity` để không có paint nào.\}
+- Use `contain` to scope layout/paint to a subtree. \{Dùng `contain` để giới hạn layout/paint trong một subtree.\}
+
+```css
+/* Tell the browser this subtree is self-contained */
+.widget {
+  contain: layout paint;
+}
+```
+
+`contain: layout paint` promises the browser that the element's internals will not affect outside geometry or pixels, so it can skip a lot of recalculation. \{`contain: layout paint` hứa với browser rằng nội bộ element không ảnh hưởng hình học hay pixel bên ngoài, nên nó bỏ qua được nhiều tính toán.\}
+
+## content-visibility, conceptually
+
+`content-visibility: auto` lets the browser **skip rendering work for off-screen content** until it scrolls near the viewport. \{`content-visibility: auto` cho browser bỏ qua việc render nội dung ngoài màn hình cho tới khi cuộn gần viewport.\}
+
+```css
+/* Skip layout/paint for off-screen sections */
+.section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 600px; /* reserve space to avoid scroll jumps */
+}
+```
+
+For animation, the relevance is indirect but real: by skipping layout/paint of off-screen sections, you free the main thread so on-screen animations hit their frame budget. \{Với animation, liên hệ là gián tiếp nhưng có thật: bỏ qua layout/paint của phần ngoài màn hình giúp giải phóng main thread để animation trên màn hình đạt ngân sách frame.\} `contain-intrinsic-size` is important so the scrollbar does not jump when content gets skipped. \{`contain-intrinsic-size` quan trọng để thanh cuộn không nhảy khi nội dung bị bỏ qua.\}
+
+## Measuring with DevTools
+
+Never optimize by guessing — measure. \{Đừng tối ưu bằng cách đoán — hãy đo.\}
+
+### Performance panel
+
+Record while the animation runs, then look for: \{Ghi lại trong lúc animation chạy, rồi tìm:\}
+
+- **Long purple bars** = Layout/Recalculate Style. \{Thanh tím dài = Layout/Recalculate Style.\}
+- **Green bars** = Paint. \{Thanh xanh lá = Paint.\}
+- **Frames dropping below your target FPS** in the frames track. \{Frame rớt dưới FPS mục tiêu trong track frames.\}
+
+```text
+DevTools → Performance → ⏺ Record → run animation → ⏹ Stop
+Look at: Main thread track, Frames track, "Summary" pie.
+Goal: each frame < 16.7ms (60fps) or < 8.3ms (120fps).
+```
+
+### Layers panel
+
+The Layers panel shows every compositor layer, its size, and **why** it was promoted. \{Tab Layers hiển thị mọi layer compositor, kích thước và lý do nó được thăng.\} Use it to catch accidental layers from a stray `will-change`. \{Dùng để bắt layer vô tình tạo bởi `will-change` lạc.\}
+
+### Paint flashing
+
+Enable paint flashing to see exactly which regions repaint. \{Bật paint flashing để thấy chính xác vùng nào repaint.\} Green flashes on every frame of your "smooth" animation mean it is still painting. \{Nháy xanh mỗi frame của animation "mượt" nghĩa là nó vẫn đang paint.\}
+
+```text
+DevTools → ⋮ → More tools → Rendering →
+  ✔ Paint flashing      (green = repaint regions)
+  ✔ Layer borders       (orange = compositor layers)
+  ✔ Frame Rendering Stats (live FPS meter)
+```
+
+A correct `transform`/`opacity` animation should show **no green flashing** during the animation. \{Animation `transform`/`opacity` đúng chuẩn sẽ không nháy xanh trong lúc chạy.\}
+
+## A practical decision checklist
+
+Before shipping any animation, run through this. \{Trước khi ship bất kỳ animation nào, soát qua danh sách này.\}
+
+1. **Can I express this with `transform` or `opacity`?** If yes, do that first. \{Có thể diễn đạt bằng `transform` hoặc `opacity` không? Có thì làm trước.\}
+2. **Am I animating layout properties** (`top`, `left`, `width`, `height`, `margin`)? Replace them. \{Có đang animate property layout không? Thay đi.\}
+3. **Is a repaint happening?** Check paint flashing; shrink the paint area or switch to composite-only. \{Có repaint không? Kiểm tra paint flashing; thu nhỏ vùng paint hoặc đổi sang chỉ-composite.\}
+4. **Did I add `will-change` with a plan to remove it?** If not, remove it. \{Có thêm `will-change` kèm kế hoạch gỡ không? Không thì bỏ.\}
+5. **Am I reading layout inside an animation loop?** Batch reads and writes. \{Có đọc layout trong vòng lặp animation không? Gom đọc và ghi.\}
+6. **Did I measure at the target FPS** on a real (mid-tier) device, not just my fast laptop? \{Đã đo ở FPS mục tiêu trên thiết bị thật (tầm trung) chưa, không chỉ laptop nhanh của mình?\}
+7. **Did I respect `prefers-reduced-motion`?** \{Đã tôn trọng `prefers-reduced-motion` chưa?\}
+
+```css
+/* Always honor reduced-motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+```
+
+## Wrap-up
+
+Fast CSS animation is mostly about **pushing work down the pipeline**: prefer composite over paint, prefer paint over layout, and ideally touch only `transform` and `opacity`. \{Animation CSS nhanh chủ yếu là đẩy việc xuống cuối pipeline: ưu tiên composite hơn paint, paint hơn layout, và lý tưởng là chỉ chạm `transform` và `opacity`.\} Use `will-change` surgically, batch your DOM reads/writes, and let DevTools — not intuition — confirm you are hitting 60/120fps. \{Dùng `will-change` có chủ đích, gom đọc/ghi DOM, và để DevTools — không phải trực giác — xác nhận bạn đạt 60/120fps.\}

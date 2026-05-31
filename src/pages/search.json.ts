@@ -40,34 +40,53 @@ export async function GET(_context: APIContext) {
 }
 
 /**
+ * Giới hạn độ dài body mỗi post trong search index.
+ *
+ * Index từng grow tuyến tính theo số bài (deep-dive posts rất dài) → file
+ * `/search.json` phình to. `title`/`description`/`tags` luôn được index đầy
+ * đủ (field riêng), nên việc cap body thành excerpt vẫn giữ recall tốt cho
+ * phần lớn truy vấn (tiêu đề, mô tả, heading đầu bài) mà chặn được worst-case
+ * payload. ~4000 ký tự ≈ vài đoạn đầu — đủ để match ngữ cảnh chính của bài.
+ */
+const BODY_EXCERPT_LIMIT = 4000;
+
+/**
  * Lọc bỏ MDX/Markdown syntax noise để substring search hoạt động trên
  * text thuần. Giữ lại nội dung code block và link text vì user có thể
  * search keyword code hoặc URL fragment.
  */
 function stripMdxForSearch(src: string): string {
-  return (
-    src
-      // ESM import/export ở đầu MDX — không có giá trị search.
-      .replace(/^\s*(import|export)\s.+$/gm, '')
-      // JSX tags (Astro/MDX components) — bỏ tag, giữ inner text qua
-      // pass tiếp theo (regex này chỉ kill tag opening/closing).
-      .replace(/<\/?[A-Z][^>]*\/?>/g, ' ')
-      // HTML/MDX self-closing tags lowercase (br, hr, img inline)
-      .replace(/<\/?(br|hr|img|input)[^>]*\/?>/gi, ' ')
-      // Markdown link [text](url) → giữ cả text và url cho search.
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 $2')
-      // Image ![alt](src) → giữ alt.
-      .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
-      // Heading hash markers
-      .replace(/^#+\s+/gm, '')
-      // Blockquote markers
-      .replace(/^>\s?/gm, '')
-      // Bold/italic/inline-code markers (1-3 ký tự `*` `_` `` ` ``)
-      .replace(/[*_`]{1,3}/g, '')
-      // Horizontal rule
-      .replace(/^-{3,}$/gm, '')
-      // Whitespace collapse
-      .replace(/\s+/g, ' ')
-      .trim()
-  );
+  const cleaned = src
+    // ESM import/export ở đầu MDX — không có giá trị search.
+    .replace(/^\s*(import|export)\s.+$/gm, '')
+    // Embedded HTML blocks (vd <iframe ...> demo) — attributes như `style`
+    // chứa CSS dài, là pure noise cho text search. Bỏ trọn block, giữ inner
+    // text nếu có. Chạy TRƯỚC strip JSX tag để gom cả multi-line elements.
+    .replace(/<(iframe|svg|style|script)[\s\S]*?<\/\1>/gi, ' ')
+    // JSX tags (Astro/MDX components) — bỏ tag, giữ inner text qua
+    // pass tiếp theo (regex này chỉ kill tag opening/closing).
+    .replace(/<\/?[A-Z][^>]*\/?>/g, ' ')
+    // HTML/MDX self-closing tags lowercase (br, hr, img inline)
+    .replace(/<\/?(br|hr|img|input|iframe)[^>]*\/?>/gi, ' ')
+    // Markdown link [text](url) → giữ cả text và url cho search.
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 $2')
+    // Image ![alt](src) → giữ alt.
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+    // Heading hash markers
+    .replace(/^#+\s+/gm, '')
+    // Blockquote markers
+    .replace(/^>\s?/gm, '')
+    // Bold/italic/inline-code markers (1-3 ký tự `*` `_` `` ` ``)
+    .replace(/[*_`]{1,3}/g, '')
+    // Horizontal rule
+    .replace(/^-{3,}$/gm, '')
+    // Whitespace collapse
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (cleaned.length <= BODY_EXCERPT_LIMIT) return cleaned;
+  // Cắt ở ranh giới từ gần nhất để không lủng từ giữa chừng.
+  const slice = cleaned.slice(0, BODY_EXCERPT_LIMIT);
+  const lastSpace = slice.lastIndexOf(' ');
+  return lastSpace > 0 ? slice.slice(0, lastSpace) : slice;
 }
