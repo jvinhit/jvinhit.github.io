@@ -1,0 +1,455 @@
+---
+title: 'Robust Data Fetching — fetch(), AbortController, Retry, and the Stale-Response Race'
+description: 'Client-side fetch resilience for seniors: HTTP gotchas, AbortController timeouts, exponential backoff, stale-response races, dedup, and a fetchJSON wrapper.'
+pubDate: 2025-10-30
+tags: [javascript, fetch, networking, resilience, js_10]
+draft: false
+---
+
+## Why `fetch` is not enough \{Tại sao `fetch` chưa đủ\}
+
+Every frontend eventually ships a data layer \{Mọi frontend cuối cùng đều cần một data layer\}. You call an API, show a spinner, render JSON \{Gọi API, hiện spinner, render JSON\}. In production, that loop breaks constantly \{Trong production, vòng lặp đó liên tục bị gãy\}: Wi-Fi drops mid-request \{Wi-Fi rớt giữa request\}, a CDN edge returns 502 \{CDN edge trả 502\}, a user types `"react hooks"` and `"react hooks advanced"` before the first response lands \{user gõ `"react hooks"` rồi `"react hooks advanced"` trước khi response đầu về\}.
+
+`fetch` is a thin transport primitive \{`fetch` chỉ là primitive transport mỏng\}. It does **not** give you timeouts, retries, deduplication, or stale-response protection \{nó **không** có timeout, retry, dedup, hay bảo vệ stale response\}. Those are **your** job \{Đó là việc **của bạn**\}.
+
+> **Mental model** \{Mô hình tư duy\}: treat `fetch` like `socket.write()` — reliable delivery requires policy on top \{coi `fetch` như `socket.write()` — giao hàng tin cậy cần policy phía trên\}.
+
+Try the interactive demo below \{Thử demo tương tác bên dưới\}: crank failure rate, set timeout below latency, burst search queries, then toggle the fix \{tăng failure rate, đặt timeout thấp hơn latency, burst search, rồi bật fix\}.
+
+<iframe
+  src="/tools/js-fetch-resilience-demo/"
+  title="Robust data fetching interactive demo"
+  loading="lazy"
+  style="width:100%;height:720px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/js-fetch-resilience-demo/](/tools/js-fetch-resilience-demo/).
+
+---
+
+## Gotcha #1 — `fetch` does NOT reject on HTTP errors \{Gotcha #1 — `fetch` KHÔNG reject khi HTTP lỗi\}
+
+This is the most common production bug \{Đây là bug production phổ biến nhất\}. A 404 or 500 **resolves** the Promise \{404 hay 500 **resolve** Promise\}; only network-level failures reject \{chỉ lỗi network mới reject\}.
+
+```js
+const res = await fetch('/api/user/42');
+
+// ❌ res.status may be 404 — code below still runs
+if (!res.ok) {
+  throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+}
+
+const user = await res.json();
+```
+
+| Situation | `fetch` Promise | What you must do |
+| --- | --- | --- |
+| DNS failure, offline, CORS block | **rejects** | `catch` network error |
+| HTTP 4xx / 5xx | **resolves** with `res.ok === false` | check `res.ok` or `res.status` |
+| HTTP 204 No Content | **resolves**, body empty | skip `.json()` |
+| Redirect 301/302 | **resolves** after following | inspect final `res.url` if needed |
+
+Always branch on `res.ok` before parsing \{Luôn kiểm tra `res.ok` trước khi parse\}. For APIs that return structured errors in JSON bodies \{Với API trả lỗi có cấu trúc trong JSON\}, read the body even on failure \{vẫn đọc body khi fail\}:
+
+```js
+async function parseResponse(res) {
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : null;
+
+  if (!res.ok) {
+    const err = new Error(data?.message ?? res.statusText);
+    err.status = res.status;
+    err.body = data;
+    throw err;
+  }
+  return data;
+}
+```
+
+---
+
+## Reading the body — once, and with care \{Đọc body — một lần, cẩn thận\}
+
+`res.body` is a **ReadableStream** \{`res.body` là **ReadableStream**\}. You can only consume it once \{Chỉ đọc được một lần\}. Calling both `res.json()` and `res.text()` throws \{Gọi cả `res.json()` lẫn `res.text()` sẽ lỗi\}.
+
+```js
+// ❌ second read throws
+await res.json();
+await res.text(); // TypeError: body already consumed
+
+// ✅ clone if you truly need two reads (rare)
+const clone = res.clone();
+const meta = await res.json();
+const raw = await clone.text();
+```
+
+For large payloads, prefer streaming \{Với payload lớn, nên stream\} — covered briefly at the end \{sẽ nói ngắn ở cuối\}.
+
+---
+
+## Timeouts with `AbortController` \{Timeout với `AbortController`\}
+
+`fetch` has no built-in timeout option \{`fetch` không có option timeout sẵn\}. Without one, a hung TCP connection leaves your UI spinning forever \{Không timeout thì TCP treo khiến UI quay mãi\}.
+
+### Modern: `AbortSignal.timeout()` \{Cách hiện đại: `AbortSignal.timeout()`\}
+
+```js
+const res = await fetch('/api/dashboard', {
+  signal: AbortSignal.timeout(8_000), // 8 s hard limit
+});
+```
+
+When the timer fires, `fetch` rejects with `AbortError` \{Khi hết giờ, `fetch` reject với `AbortError`\}. Treat that like any retryable network fault \{Coi như lỗi network có thể retry\} — unless the user navigated away \{trừ khi user đã rời trang\}.
+
+### Manual controller — compose signals \{Controller thủ công — gộp signal\}
+
+Useful when you need **both** a timeout and user cancellation \{Hữu ích khi cần **cả** timeout lẫn hủy bởi user\}:
+
+```js
+function fetchWithTimeout(url, opts = {}) {
+  const { timeoutMs = 8_000, signal: outer, ...rest } = opts;
+  const ctrl = new AbortController();
+
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  outer?.addEventListener('abort', () => ctrl.abort(), { once: true });
+
+  return fetch(url, { ...rest, signal: ctrl.signal }).finally(() => {
+    clearTimeout(timer);
+  });
+}
+```
+
+> **Production tip** \{Mẹo production\}: per-request timeout should differ by endpoint \{timeout mỗi request nên khác theo endpoint\}. Search autocomplete: 3–5 s \{Search autocomplete: 3–5 giây\}. File upload: minutes with progress \{Upload file: phút, có progress\}. Health check: 1 s \{Health check: 1 giây\}.
+
+---
+
+## Retry with exponential backoff + jitter \{Retry với exponential backoff + jitter\}
+
+Transient failures are normal at scale \{Lỗi tạm thời là bình thường ở quy mô lớn\}. Retrying immediately hammers a recovering server \{Retry ngay lập tức đập server đang hồi phục\}. Exponential backoff spaces attempts out \{Backoff theo cấp số nhân giãn các lần thử\}; **jitter** prevents synchronized retry storms \{**jitter** tránh bão retry đồng bộ\}.
+
+```js
+function backoffMs(attempt, base = 300) {
+  const exp = base * 2 ** attempt;
+  return Math.floor(exp * (0.5 + Math.random() * 0.5)); // full jitter
+}
+
+async function fetchWithRetry(url, opts = {}) {
+  const { maxRetries = 3, ...fetchOpts } = opts;
+  let lastErr;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetchWithTimeout(url, fetchOpts);
+      if (!res.ok) {
+        const err = new Error(`HTTP ${res.status}`);
+        err.status = res.status;
+        throw err;
+      }
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryable(err) || attempt === maxRetries) throw err;
+      await new Promise((r) => setTimeout(r, backoffMs(attempt)));
+    }
+  }
+  throw lastErr;
+}
+```
+
+### Which errors are safe to retry? \{Lỗi nào retry an toàn?\}
+
+| Error | Retry? | Why |
+| --- | --- | --- |
+| Network offline, `AbortError` (timeout) | ✅ | Transient |
+| HTTP 429 Too Many Requests | ✅ | Respect `Retry-After` header |
+| HTTP 502 / 503 / 504 | ✅ | Upstream glitch |
+| HTTP 408 Request Timeout | ✅ | Server gave up first |
+| HTTP 400 / 401 / 403 / 404 | ❌ | Client mistake — same request will fail |
+| HTTP 409 Conflict | ❌ | State conflict — needs user action |
+| POST creating a resource (non-idempotent) | ⚠️ | Only if server supports idempotency keys |
+
+```js
+function isRetryable(err) {
+  if (err.name === 'AbortError') return true;
+  if (!err.status) return true; // network-level
+  if (err.status === 429) return true;
+  if (err.status >= 500) return true;
+  return false;
+}
+```
+
+For **429**, honor `Retry-After` (seconds or HTTP-date) before your own backoff \{Với **429**, tuân `Retry-After` trước backoff tự tính\}:
+
+```js
+function retryAfterMs(res) {
+  const h = res.headers.get('Retry-After');
+  if (!h) return null;
+  const sec = Number(h);
+  if (!Number.isNaN(sec)) return sec * 1000;
+  const date = Date.parse(h);
+  return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
+}
+```
+
+> **Idempotency** \{Tính idempotent\}: safe to retry GET, HEAD, PUT (full replace), DELETE (usually) \{retry an toàn với GET, HEAD, PUT, DELETE (thường)\}. For POST payments or orders, send an `Idempotency-Key` header \{Với POST thanh toán/đơn hàng, gửi header `Idempotency-Key`\} — otherwise a retry may double-charge \{nếu không, retry có thể trừ tiền hai lần\}.
+
+---
+
+## The stale-response race \{Cuộc đua stale response\}
+
+Search-as-you-type is the classic failure mode \{Search-as-you-type là failure mode kinh điển\}. User types `"a"` → request #1 (slow) \{user gõ `"a"` → request #1 chậm\}. Then `"ab"` → request #2 (fast) \{rồi `"ab"` → request #2 nhanh\}. #2 renders `"ab"` results \{#2 render kết quả `"ab"`\}. Then #1 lands and **overwrites** with stale `"a"` data \{rồi #1 về và **ghi đè** data `"a"` cũ\}. User sees wrong results with no error \{User thấy kết quả sai mà không có lỗi\}.
+
+Two fixes — often combined \{Hai cách fix — thường kết hợp\}:
+
+### Fix A — Abort the previous request \{Fix A — Abort request trước\}
+
+```js
+let ctrl = null;
+
+input.addEventListener('input', async (e) => {
+  ctrl?.abort();
+  ctrl = new AbortController();
+
+  const q = e.target.value;
+  try {
+    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`, {
+      signal: ctrl.signal,
+    });
+    const data = await res.json();
+    render(data);
+  } catch (err) {
+    if (err.name === 'AbortError') return; // superseded — ignore
+    showError(err);
+  }
+});
+```
+
+### Fix B — Ignore stale responses by request id \{Fix B — Bỏ qua response cũ theo request id\}
+
+Abort is not always possible (older browsers, some libraries) \{Abort không lúc nào cũng được (browser cũ, một số thư viện)\}. Track the latest id instead \{Theo dõi id mới nhất thay thế\}:
+
+```js
+let latestId = 0;
+
+async function search(q) {
+  const id = ++latestId;
+  const data = await fetchJSON(`/api/search?q=${encodeURIComponent(q)}`);
+  if (id !== latestId) return; // stale — discard
+  render(data);
+}
+```
+
+In React, combine with an `useEffect` cleanup that aborts on unmount or deps change \{Trong React, kết hợp `useEffect` cleanup abort khi unmount hoặc deps đổi\}:
+
+```js
+useEffect(() => {
+  const ctrl = new AbortController();
+  fetchJSON('/api/profile', { signal: ctrl.signal })
+    .then(setProfile)
+    .catch((e) => {
+      if (e.name !== 'AbortError') setError(e);
+    });
+  return () => ctrl.abort();
+}, [userId]);
+```
+
+---
+
+## In-flight deduplication \{Dedup request đang bay\}
+
+Two components mount simultaneously and both fetch `/api/config` \{Hai component mount cùng lúc đều fetch `/api/config`\}. Without dedup you pay twice \{Không dedup thì trả giá gấp đôi\}. Keep a `Map<key, Promise>` of in-flight requests \{Giữ `Map<key, Promise>` các request đang bay\}:
+
+```js
+const inflight = new Map();
+
+function dedupedFetch(key, fn) {
+  if (inflight.has(key)) return inflight.get(key);
+
+  const p = fn().finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
+
+// usage
+const config = await dedupedFetch('config', () =>
+  fetchJSON('/api/config')
+);
+```
+
+This is **not** a cache \{Đây **không** phải cache\} — it only collapses concurrent identical calls \{chỉ gộp các gọi giống nhau đồng thời\}. For TTL caching see HTTP cache headers or a data library \{Với TTL cache xem HTTP cache headers hoặc thư viện data\}. Here we focus on transport resilience from scratch \{Ở đây tập trung transport resilience từ đầu\}.
+
+---
+
+## Error taxonomy & user-facing handling \{Phân loại lỗi & xử lý cho user\}
+
+Not every error deserves a toast \{Không phải lỗi nào cũng cần toast\}. Classify first \{Phân loại trước\}:
+
+| Class | Example | UX |
+| --- | --- | --- |
+| **Cancelled** | `AbortError`, unmount | Silent — no UI |
+| **Offline / timeout** | network fail, timeout | Retry button + offline banner |
+| **Auth** | 401 | Redirect to login |
+| **Forbidden** | 403 | Explain lack of permission |
+| **Not found** | 404 | Empty state |
+| **Validation** | 422 + field errors | Inline form errors |
+| **Rate limit** | 429 | Backoff message, disable submit briefly |
+| **Server** | 5xx | Generic error + support link |
+
+```js
+function classifyFetchError(err) {
+  if (err.name === 'AbortError') return 'cancelled';
+  if (!err.status) return 'network';
+  if (err.status === 401) return 'auth';
+  if (err.status === 403) return 'forbidden';
+  if (err.status === 404) return 'not_found';
+  if (err.status === 422) return 'validation';
+  if (err.status === 429) return 'rate_limit';
+  if (err.status >= 500) return 'server';
+  return 'client';
+}
+```
+
+Expose **actionable** copy \{Viết copy **có thể hành động**\}: "Connection timed out — check your network and try again" beats "Error 0" \{`"Kết nối hết thời gian — kiểm tra mạng và thử lại"` tốt hơn `"Error 0"`\}.
+
+---
+
+## `credentials` — cookies cross-origin \{`credentials` — cookie cross-origin\}
+
+Default is `credentials: 'same-origin'` \{Mặc định là `credentials: 'same-origin'`\}. For cookie-based auth on cross-origin APIs you need `'include'` **and** server `Access-Control-Allow-Credentials: true` with a specific origin (not `*`) \{Với auth cookie cross-origin cần `'include'` **và** server `Access-Control-Allow-Credentials: true` với origin cụ thể (không `*`)`}.
+
+```js
+await fetch('https://api.example.com/me', {
+  credentials: 'include',
+});
+```
+
+Misconfigured credentials cause silent 401 loops or CORS console errors \{Cấu hình sai gây vòng 401 im lặng hoặc lỗi CORS trên console\}. This article does not re-explain CORS mechanics \{Bài này không giải thích lại cơ chế CORS\} — only the fetch-side knob \{chỉ nút phía fetch\}.
+
+---
+
+## Streaming responses (brief) \{Streaming response (ngắn gọn)\}
+
+For NDJSON logs, SSE-like feeds, or LLM token streams \{Với log NDJSON, feed kiểu SSE, hay stream token LLM\}, skip `res.json()` and read the stream \{bỏ `res.json()`, đọc stream\}:
+
+```js
+const res = await fetch('/api/stream');
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  appendChunk(decoder.decode(value, { stream: true }));
+}
+```
+
+Combine with `AbortController` so navigation cancels the reader \{Kết hợp `AbortController` để điều hướng hủy reader\}. Backpressure matters for large downloads — consider `response.body.pipeTo(writable)` in modern browsers \{Backpressure quan trọng với download lớn — cân nhắc `response.body.pipeTo(writable)` trên browser hiện đại\}.
+
+---
+
+## A reusable `fetchJSON` wrapper \{Wrapper `fetchJSON` tái sử dụng\}
+
+Pull the patterns together \{Gom các pattern lại\}. This wrapper handles timeout, HTTP errors, JSON parse, retry, and optional signal composition \{Wrapper xử lý timeout, lỗi HTTP, parse JSON, retry, và gộp signal tùy chọn\}:
+
+```js
+class FetchError extends Error {
+  constructor(message, { status, body, cause } = {}) {
+    super(message, { cause });
+    this.name = 'FetchError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
+async function fetchJSON(url, opts = {}) {
+  const {
+    timeoutMs = 8_000,
+    maxRetries = 2,
+    signal,
+    parse = true,
+    ...init
+  } = opts;
+
+  let lastErr;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    signal?.addEventListener('abort', () => ctrl.abort(), { once: true });
+
+    try {
+      const res = await fetch(url, { ...init, signal: ctrl.signal });
+      const text = await res.text();
+      const data = text && parse ? JSON.parse(text) : text;
+
+      if (!res.ok) {
+        throw new FetchError(`HTTP ${res.status}`, {
+          status: res.status,
+          body: data,
+        });
+      }
+      return data;
+    } catch (err) {
+      lastErr = err;
+      const retryable =
+        err.name === 'AbortError' ||
+        !(err instanceof FetchError) ||
+        err.status === 429 ||
+        (err.status >= 500 && err.status <= 599);
+
+      if (!retryable || attempt === maxRetries) throw err;
+      await new Promise((r) => setTimeout(r, backoffMs(attempt)));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  throw lastErr;
+}
+```
+
+Usage in a search hook with stale protection \{Dùng trong search hook có bảo vệ stale\}:
+
+```js
+let searchCtrl = null;
+let searchGen = 0;
+
+async function onQueryChange(q) {
+  searchCtrl?.abort();
+  searchCtrl = new AbortController();
+  const gen = ++searchGen;
+
+  try {
+    const hits = await fetchJSON(`/api/search?q=${encodeURIComponent(q)}`, {
+      signal: searchCtrl.signal,
+      timeoutMs: 5_000,
+      maxRetries: 1,
+    });
+    if (gen !== searchGen) return;
+    renderHits(hits);
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    showSearchError(classifyFetchError(err), err);
+  }
+}
+```
+
+---
+
+## Checklist before shipping \{Checklist trước khi ship\}
+
+- [ ] Check `res.ok` (or status) on every response \{Kiểm tra `res.ok` mọi response\}
+- [ ] Timeouts on all user-initiated requests \{Timeout mọi request do user khởi tạo\}
+- [ ] Retry only retryable errors with backoff + jitter \{Chỉ retry lỗi retryable, có backoff + jitter\}
+- [ ] Abort or ignore stale responses in typeahead \{Abort hoặc bỏ qua stale response trong typeahead\}
+- [ ] Abort on component unmount / route change \{Abort khi unmount component / đổi route\}
+- [ ] Dedup identical in-flight GETs \{Dedup GET giống nhau đang bay\}
+- [ ] Map errors to actionable UX \{Map lỗi sang UX có thể hành động\}
+- [ ] Respect `Retry-After` on 429 \{Tuân `Retry-After` khi 429\}
+- [ ] Idempotency keys on mutating POSTs that retry \{Idempotency key cho POST mutate có retry\}
+
+---
+
+## Closing \{Kết luận\}
+
+`fetch` gives you bytes over HTTP \{`fetch` đưa bytes qua HTTP\}. Resilient frontends add **policy**: when to give up, when to try again, which response wins, and what the user sees when things fail \{Frontend resilient thêm **policy**: khi nào bỏ cuộc, khi nào thử lại, response nào thắng, user thấy gì khi fail\}. The demo above lets you feel timeout, backoff, and stale races without deploying to production \{Demo trên cho bạn cảm nhận timeout, backoff, và stale race mà không cần deploy production\}. Start with the checklist, wrap once in `fetchJSON`, and keep the stale-response guard on every debounced input \{Bắt đầu từ checklist, bọc một lần bằng `fetchJSON`, và giữ guard stale response trên mọi input debounce\}.

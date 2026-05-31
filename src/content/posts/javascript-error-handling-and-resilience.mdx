@@ -1,0 +1,524 @@
+---
+title: 'JavaScript Error Handling & Resilience — try/catch Limits, Global Handlers, and Production Patterns'
+description: 'Senior deep-dive: Error object anatomy, what try/catch cannot catch, custom errors with cause, async patterns, global handlers, retries, and monitoring.'
+pubDate: 2025-12-13
+tags: [javascript, error-handling, resilience, debugging, js_10]
+draft: false
+---
+
+## Why Error Handling Is a Senior Skill, Not a Syntax Exercise \{Vì sao xử lý lỗi là kỹ năng senior, không phải bài tập cú pháp\}
+
+Production frontends fail in boring, predictable ways \{Frontend production hỏng theo cách nhàm chán, dự đoán được\}: a third-party script throws inside a timer, a `fetch` rejects without `.catch`, a React child crashes the whole route, and your dashboard shows a blank screen with **no stack trace in the user's report** \{script bên thứ ba throw trong timer, `fetch` reject không `.catch`, React child crash cả route, dashboard trắng **không có stack trace trong báo cáo user**\}.
+
+The gap between junior and senior error handling is not knowing `try/catch` exists \{Khoảng cách junior–senior không phải biết `try/catch` tồn tại\} — it is knowing **what each layer catches, what slips through, and how to recover without hiding failures** \{mà biết **mỗi lớp bắt gì, gì lọt qua, và cách phục hồi mà không giấu lỗi**\}.
+
+> **Try it live** \{Thử trực tiếp\}: trigger sync throws, timer errors, unhandled rejections, async/await catches, custom errors with `cause`, and a retry loop — watch the captured-errors panel update in real time.
+
+<iframe
+  src="/tools/js-error-handling-demo/"
+  title="JavaScript error handling interactive demo"
+  loading="lazy"
+  style="width:100%;height:720px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/js-error-handling-demo/](/tools/js-error-handling-demo/).
+
+---
+
+## The Error Object — `name`, `message`, `stack` \{Đối tượng Error — `name`, `message`, `stack`\}
+
+Every thrown value in JavaScript can be *anything* \{Mọi giá trị throw trong JS có thể là *bất cứ thứ gì*\} — a string, a number, `null`. Production code should **always throw `Error` instances** (or subclasses) \{Production **luôn throw instance `Error`** (hoặc subclass)\} so tooling, monitoring, and `instanceof` checks work consistently \{để tooling, monitoring, và `instanceof` hoạt động nhất quán\}.
+
+```js
+const err = new Error("Payment gateway timeout");
+
+console.log(err.name);    // "Error"
+console.log(err.message); // "Payment gateway timeout"
+console.log(err.stack);   // multi-line stack trace (engine-dependent)
+```
+
+| Property \{Thuộc tính\} | Purpose \{Mục đích\} | Notes \{Ghi chú\} |
+|---|---|---|
+| `name` | Error category \{Loại lỗi\} | Built-in types set this automatically \{Built-in tự set\} |
+| `message` | Human-readable summary \{Tóm tắt cho người\} | Safe to show in UI *if sanitized* \{An toàn hiển thị UI *nếu sanitize*\} |
+| `stack` | Call-site chain \{Chuỗi call-site\} | Non-standard but universal; stripped in some prod builds \{Không chuẩn nhưng phổ biến; bị strip ở prod build\} |
+| `cause` | Chained root failure \{Lỗi gốc chuỗi\} | ES2022 — see below \{ES2022 — xem dưới\} |
+
+**Do not throw strings** \{Đừng throw string\}:
+
+```js
+// ❌ No stack trace, breaks instanceof, monitoring can't classify
+throw "something broke";
+
+// ✅ Proper Error instance
+throw new Error("something broke");
+```
+
+The `stack` property is invaluable during development \{`stack` vô giá khi dev\} but is often **minified or omitted** in production bundles \{thường **minify hoặc bỏ** trong bundle production\} — which is why source maps and error reporting services matter \{đó là lý do source map và dịch vụ báo lỗi quan trọng\}.
+
+---
+
+## Built-in Error Types \{Các loại Error built-in\}
+
+JavaScript ships typed errors for common failure modes \{JS có error typed cho failure phổ biến\}. Use the most specific type so callers and monitors can branch correctly \{Dùng type cụ th nhất để caller và monitor phân nhánh đúng\}.
+
+| Type | Typical use \{Dùng khi\} |
+|---|---|
+| `Error` | Generic application errors \{Lỗi app chung\} |
+| `TypeError` | Wrong type / illegal operation \{Sai type / thao tác không hợp lệ\} |
+| `RangeError` | Value out of allowed range \{Giá trị ngoài phạm vi\} |
+| `ReferenceError` | Invalid variable reference \{Biến không hợp lệ\} |
+| `SyntaxError` | Parse-time failure (rare at runtime in app code) \{Lỗi parse (hiếm runtime)\} |
+| `URIError` | Bad `encodeURI` / `decodeURI` usage |
+| `AggregateError` | Multiple errors (e.g. `Promise.any` rejection) |
+
+```js
+function parseAge(input) {
+  const n = Number(input);
+  if (Number.isNaN(n)) throw new TypeError(`Expected numeric age, got "${input}"`);
+  if (n < 0 || n > 150) throw new RangeError(`Age ${n} out of range`);
+  return n;
+}
+```
+
+DOM APIs add host-specific types like `DOMException` (with `name: "AbortError"`) \{DOM API thêm type như `DOMException` (`name: "AbortError"`)\} — always check `err.name`, not just `message` \{luôn check `err.name`, không chỉ `message`\}.
+
+---
+
+## `try` / `catch` / `finally` — Scope and Limits \{`try` / `catch` / `finally` — Phạm vi và giới hạn\}
+
+`try/catch` wraps **synchronous code in the current call stack** \{Bọc **code đồng bộ trong call stack hiện tại**\}. It is the first line of defense for code you control and can `await` \{Lớp phòng thủ đầu cho code bạn kiểm soát và có thể `await`\}.
+
+```js
+function chargeCard(amount) {
+  try {
+    validateAmount(amount);
+    return gateway.charge(amount);
+  } catch (err) {
+    logger.error("charge failed", { err, amount });
+    throw err; // re-throw after logging {log rồi re-throw}
+  } finally {
+    hideSpinner(); // always runs {luôn chạy}
+  }
+}
+```
+
+### What `try/catch` catches \{`try/catch` bắt được gì\}
+
+- Synchronous `throw` in the `try` block \{`throw` đồng bộ trong `try`\}
+- Errors from synchronous function calls inside `try` \{Lỗi từ gọi hàm đồng bộ trong `try`\}
+- Rejected promises when using `await` inside an `async` function's `try` \{Promise reject khi `await` trong `async` `try`\}
+
+### What `try/catch` does NOT catch — the #1 misconception \{`try/catch` KHÔNG bắt — hiểu lầm số 1\}
+
+| Scenario \{Tình huống\} | Why it escapes \{Vì sao lọt\} | Correct handler \{Handler đúng\} |
+|---|---|---|
+| `setTimeout` / `setInterval` callback throw | Runs on a **later** stack frame \{Chạy **stack frame sau**\} | `window.addEventListener('error')` |
+| Event listener throw | Separate invocation \{Gọi riêng\} | Global `error` listener |
+| `Promise.reject()` without `.catch` | Async; not in sync stack \{Async; không trong sync stack\} | `.catch()` or `unhandledrejection` |
+| Errors in another microtask before your catch attaches | Timing race \{Race thời điểm\} | Always chain `.catch` at creation |
+| Cross-origin script errors | Browser sanitizes message/stack \{Browser sanitize message/stack\} | `crossorigin` attribute + CORS headers |
+
+```js
+// ❌ Classic bug — try/catch looks like it should work
+try {
+  setTimeout(() => {
+    throw new Error("This escapes try/catch");
+  }, 0);
+} catch (err) {
+  // never runs {không bao giờ chạy}
+}
+
+// ✅ Catch inside the async callback, or use global handler
+setTimeout(() => {
+  try {
+    riskyWork();
+  } catch (err) {
+    report(err);
+  }
+}, 0);
+```
+
+> **Mental model** \{Mô hình tư duy\}: `try/catch` is a **stack-frame boundary**, not a **time boundary** \{`try/catch` là **ranh giới stack-frame**, không phải **ranh giới thời gian**\}. Anything scheduled for later needs its own handler or a global safety net \{Mọi thứ lên lịch sau cần handler riêng hoặc lưới an toàn global\}.
+
+---
+
+## Custom Error Classes and `Error` `cause` \{Custom Error class và `cause` của `Error`\}
+
+Domain-specific errors let you distinguish "user not found" from "database down" without parsing strings \{Error theo domain giúp phân biệt "user không tồn tại" và "database sập" mà không parse string\}.
+
+```js
+class ApiError extends Error {
+  constructor(message, { statusCode, cause } = {}) {
+    super(message, { cause });
+    this.name = "ApiError";
+    this.statusCode = statusCode;
+  }
+}
+
+class NotFoundError extends ApiError {
+  constructor(resource, id) {
+    super(`${resource} ${id} not found`, { statusCode: 404 });
+    this.name = "NotFoundError";
+  }
+}
+```
+
+ES2022 added the **`cause` option** \{ES2022 thêm **option `cause`**\} — wrap low-level failures without losing the original stack \{Bọc lỗi tầng thấp mà không mất stack gốc\}:
+
+```js
+async function loadProfile(userId) {
+  try {
+    const raw = await fetch(`/api/users/${userId}`).then((r) => r.json());
+    return normalizeProfile(raw);
+  } catch (err) {
+    throw new ApiError("Failed to load profile", {
+      statusCode: 502,
+      cause: err, // preserves original TypeError, network error, etc.
+    });
+  }
+}
+
+// Later in monitoring:
+// err.message → "Failed to load profile"
+// err.cause.message → "Unexpected token < in JSON..."
+```
+
+Use `instanceof` checks at boundaries \{Dùng `instanceof` ở biên\} — API layer throws `ApiError`, UI layer maps `NotFoundError` → 404 page, unknown errors → generic fallback \{API throw `ApiError`, UI map `NotFoundError` → trang 404, lỗi lạ → fallback chung\}.
+
+---
+
+## Async/Await vs Promises — Error Propagation \{Async/Await vs Promise — Lan truyền lỗi\}
+
+Both models represent the same async failure graph \{Cả hai mô hình cùng biểu diễn đồ thị failure async\}; the difference is **where** you attach handlers \{khác **chỗ** gắn handler\}.
+
+### Promises — explicit `.catch()` chain
+
+```js
+fetch("/api/data")
+  .then((r) => {
+    if (!r.ok) throw new ApiError("HTTP error", { statusCode: r.status });
+    return r.json();
+  })
+  .then(renderChart)
+  .catch((err) => {
+    showErrorBanner(err);
+    reportToSentry(err);
+  });
+```
+
+Forgetting `.catch` on any link creates an **unhandled rejection** \{Quên `.catch` ở bất kỳ mắt nào tạo **unhandled rejection**\}.
+
+### Async/await — try/catch reads like sync code
+
+```js
+async function loadDashboard() {
+  try {
+    const res = await fetch("/api/data");
+    if (!res.ok) throw new ApiError("HTTP error", { statusCode: res.status });
+    const data = await res.json();
+    renderChart(data);
+  } catch (err) {
+    showErrorBanner(err);
+    reportToSentry(err);
+  }
+}
+```
+
+**Critical trap** \{Bẫy quan trọng\}: `async` functions return Promises \{Hàm `async` trả Promise\}. If you call one without `await` or `.catch`, errors still escape \{Gọi không `await` hoặc `.catch`, lỗi vẫn lọt\}:
+
+```js
+// ❌ Fire-and-forget — rejection becomes unhandled
+loadDashboard();
+
+// ✅ Explicit handling
+loadDashboard().catch(reportToSentry);
+
+// ✅ Or await at the call site
+await loadDashboard();
+```
+
+| Pattern \{Pattern\} | Error handling \{Xử lý lỗi\} | Best for \{Tốt cho\} |
+|---|---|---|
+| `.then().catch()` | Per-chain | Callback-style pipelines |
+| `async` + `try/catch` | Per-function | Sequential async logic |
+| `Promise.all` | First rejection rejects all | All-or-nothing parallel |
+| `Promise.allSettled` | Never rejects; inspect each | Partial success bulk ops |
+
+---
+
+## Global Handlers — The Last Safety Net \{Handler global — Lưới an toàn cuối\}
+
+When errors escape local handlers, global listeners are your production backstop \{Khi lỗi lọt handler local, listener global là lớp cuối trên production\}. Use them for **logging and reporting**, not for silently swallowing bugs \{Dùng để **log và báo cáo**, không nuốt bug im lặng\}.
+
+### `window.addEventListener('error')`
+
+Fires for **uncaught exceptions** (including many timer/listener throws) and **resource load failures** \{Kích hoạt cho **exception không bắt** (gồm nhiều throw timer/listener) và **lỗi tải resource**\}.
+
+```js
+window.addEventListener("error", (event) => {
+  // Script error
+  if (event.error) {
+    reportToSentry(event.error);
+    return;
+  }
+
+  // Resource load error (script, img, link…) — event.error is null
+  if (event.target !== window) {
+    reportResourceFailure({
+      tag: event.target.tagName,
+      src: event.target.src || event.target.href,
+    });
+    return;
+  }
+
+  reportToSentry(new Error(event.message));
+});
+```
+
+Resource errors bubble as `error` events on the element \{Lỗi resource bubble `error` trên element\} — use capture phase on `window` to catch them \{dùng capture phase trên `window` để bắt\}:
+
+```js
+window.addEventListener(
+  "error",
+  (event) => {
+    if (event.target instanceof HTMLScriptElement) {
+      console.warn("Script failed:", event.target.src);
+    }
+  },
+  true // capture phase {phase capture}
+);
+```
+
+### `window.addEventListener('unhandledrejection')`
+
+Catches Promises rejected without a `.catch` at the end of the chain \{Bắt Promise reject không có `.catch` cuối chuỗi\}:
+
+```js
+window.addEventListener("unhandledrejection", (event) => {
+  reportToSentry(event.reason);
+  // Optionally prevent browser console noise in controlled scenarios
+  // event.preventDefault();
+});
+```
+
+> **Do not rely on globals alone** \{Đừng chỉ dựa global\}. They are a **net**, not a **strategy** \{Là **lưới**, không phải **chiến lược**\}. Every `async` entry point should still have local handling \{Mọi entry point `async` vẫn cần xử lý local\}.
+
+### Legacy `window.onerror`
+
+Still supported \{Vẫn hỗ trợ\}; returns `true` to suppress the default browser error UI in some engines \{trả `true` để ẩn UI lỗi browser ở một số engine\}. Prefer `addEventListener` for multiple subscribers \{Ưu tiên `addEventListener` cho nhiều subscriber\}.
+
+```js
+window.onerror = (message, source, lineno, colno, error) => {
+  reportToSentry(error ?? new Error(String(message)));
+  return false; // let browser also log {để browser log thêm}
+};
+```
+
+---
+
+## Fail-Safe Patterns — Degrade, Retry, Fallback \{Pattern an toàn — Degrade, Retry, Fallback\}
+
+Resilience means **the app keeps working at reduced capacity** when subsystems fail \{Resilience nghĩa là **app vẫn chạy ở công suất giảm** khi subsystem hỏng\}, not that errors disappear \{không phải lỗi biến mất\}.
+
+### Graceful degradation
+
+Show cached data, hide non-critical widgets, disable optional features \{Hiện data cache, ẩn widget phụ, tắt tính năng tùy chọn\}:
+
+```js
+async function renderRecommendations(userId) {
+  try {
+    const items = await fetchRecommendations(userId);
+    mountWidget(items);
+  } catch (err) {
+    logger.warn("recommendations unavailable", { err });
+    mountWidget([]); // empty state, not a crash {empty state, không crash}
+  }
+}
+```
+
+### Retries with backoff
+
+Retry **transient** failures (5xx, network blips), not **permanent** ones (4xx validation) \{Retry lỗi **tạm thời** (5xx, mạng giật), không retry **vĩnh viễn** (4xx validation)\}:
+
+```js
+async function fetchWithRetry(fn, { maxAttempts = 3, baseDelay = 200 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (!isRetryable(err) || attempt === maxAttempts - 1) throw err;
+      await delay(baseDelay * 2 ** attempt + Math.random() * 50);
+    }
+  }
+  throw lastError;
+}
+```
+
+See also the fetch resilience demo for timeout + stale-response patterns \{Xem demo fetch resilience cho timeout + stale response\}: [/tools/js-fetch-resilience-demo/](/tools/js-fetch-resilience-demo/).
+
+### Fallback values
+
+```js
+const config = await loadRemoteConfig().catch(() => DEFAULT_CONFIG);
+```
+
+Fallbacks are fine for **non-critical reads** \{Fallback ổn cho **đọc không quan trọng**\}; never silently fallback on **writes** (payments, deletes) \{không fallback im lặng trên **ghi** (thanh toán, xóa)\}.
+
+### Result / Either pattern (brief)
+
+Instead of throw-for-control-flow, return a discriminated union \{Thay vì throw cho control flow, trả union phân biệt\}:
+
+```js
+/** @returns {{ ok: true, value: T } | { ok: false, error: Error }} */
+async function safeParseJson(response) {
+  try {
+    const value = await response.json();
+    return { ok: true, value };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err : new Error(String(err)) };
+  }
+}
+
+const result = await safeParseJson(res);
+if (!result.ok) {
+  showParseError(result.error);
+  return;
+}
+useData(result.value);
+```
+
+Popular in TypeScript codebases that want **explicit error paths in types** \{Phổ biến trong TS khi muốn **đường lỗi rõ trong type**\}. Libraries like `neverthrow` formalize this \{Thư viện như `neverthrow` formalize\}.
+
+### React Error Boundaries (concept)
+
+React does not catch event-handler or async errors in the tree automatically \{React không tự bắt lỗi event handler hay async trong cây\}. **Error Boundaries** (class components with `static getDerivedStateFromError` / `componentDidCatch`) catch **render-phase and lifecycle errors in children** \{**Error Boundary** bắt **lỗi render và lifecycle ở con**\}:
+
+```jsx
+class ErrorBoundary extends React.Component {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error, info) {
+    reportToSentry(error, { componentStack: info.componentStack });
+  }
+
+  render() {
+    if (this.state.hasError) return <FallbackUI />;
+    return this.props.children;
+  }
+}
+```
+
+Wrap route-level or widget-level trees \{Bọc cấp route hoặc widget\}; combine with global handlers for everything outside React's render cycle \{Kết hợp handler global cho mọi thứ ngoài render cycle React\}.
+
+---
+
+## Reporting, Monitoring, and Source Maps \{Báo cáo, Monitoring, và Source Map\}
+
+Users report "it broke" with a screenshot, not a stack trace \{User báo "hỏng" bằng screenshot, không stack trace\}. Your job is to reconstruct context \{Việc của bạn là tái dạo context\}.
+
+### What to send to monitoring (Sentry, Datadog, etc.)
+
+- `error.name`, `error.message`, `error.stack`
+- `error.cause` chain (flatten recursively)
+- User/session id (never PII in messages)
+- Breadcrumbs: recent navigation, API calls, feature flags
+- Release version + environment (`production`, `staging`)
+
+```js
+function reportToSentry(err, extra = {}) {
+  Sentry.captureException(err, {
+    extra: {
+      ...extra,
+      causeChain: flattenCause(err),
+    },
+    tags: {
+      errorType: err.name,
+    },
+  });
+}
+
+function flattenCause(err) {
+  const chain = [];
+  let current = err;
+  while (current?.cause instanceof Error) {
+    chain.push({ name: current.cause.name, message: current.cause.message });
+    current = current.cause;
+  }
+  return chain;
+}
+```
+
+### Source maps
+
+Production bundles minify identifiers — stacks point to `a.b(c)` not your source \{Bundle production minify — stack trỏ `a.b(c)` không phải source\}. Upload source maps to your monitoring provider during CI \{Upload source map lên monitoring trong CI\} so reported stacks deobfuscate to real files and lines \{để stack báo cáo deobfuscate về file và dòng thật\}.
+
+> Never expose source maps publicly on your CDN unless intentionally \{Không public source map trên CDN trừ khi cố ý\} — they reveal your full source tree \{Chúng lộ toàn bộ cây source\}.
+
+---
+
+## Do Not Swallow Errors \{Đừng nuốt lỗi\}
+
+The worst error handling is the kind that **looks like success** \{Xử lý lỗi tệ nhất là **trông như thành công**\}:
+
+```js
+// ❌ Silent failure — debugging nightmare
+try {
+  await saveSettings(data);
+} catch (err) {
+  // nothing
+}
+
+// ❌ Log and pretend OK
+try {
+  return await fetchCriticalData();
+} catch (err) {
+  console.log(err);
+  return null; // caller can't distinguish "no data" from "fetch failed"
+}
+
+// ✅ Log, report, and propagate or return explicit Result
+try {
+  return await fetchCriticalData();
+} catch (err) {
+  logger.error("critical fetch failed", { err });
+  reportToSentry(err);
+  throw err; // or return { ok: false, error: err }
+}
+```
+
+Empty `catch` blocks and `.catch(() => {})` should trigger code review rejection \{`catch` rỗng và `.catch(() => {})` nên bị reject trong review\}. If you must suppress, document **why** and emit a metric \{Nếu phải suppress, ghi **vì sao** và emit metric\}.
+
+---
+
+## Decision Checklist for Production Code \{Checklist quyết định cho code production\}
+
+| Situation \{Tình huống\} | Recommended approach \{Cách khuyến nghị\} |
+|---|---|
+| Sync validation in your function | `try/catch` or early throw |
+| Timer / event listener callback | `try/catch` inside callback + global net |
+| Promise chain you own | `.catch()` at end or `async` try/catch |
+| Fire-and-forget async | `.catch(report)` on the returned Promise |
+| Third-party script failure | Global `error` listener + `crossorigin` |
+| Widget / route crash (React) | Error Boundary + fallback UI |
+| Transient network failure | Retry with backoff + circuit breaker |
+| User-facing message | Map error type → safe copy; never raw stack |
+
+---
+
+## Key Takeaways \{Điểm chính\}
+
+1. **Throw `Error` instances**, not strings — preserve `stack`, `name`, and `cause` \{**Throw instance `Error`**, không string — giữ `stack`, `name`, `cause`\}.
+2. **`try/catch` is synchronous** — timer callbacks and bare Promise rejections need separate handlers \{**`try/catch` là đồng bộ** — callback timer và Promise reject trần cần handler riêng\}.
+3. **Custom errors + `cause`** make multi-layer apps debuggable \{**Custom error + `cause`** giúp app nhiều lớp debug được\}.
+4. **Global handlers** (`error`, `unhandledrejection`) are the safety net — not the primary strategy \{**Handler global** là lưới an toàn — không phải chiến lược chính\}.
+5. **Resilience = degrade + retry + fallback**, with explicit failure visibility \{**Resilience = degrade + retry + fallback**, với failure hiện rõ\}.
+6. **Report with context** (release, breadcrumbs, source maps) and **never swallow** \{**Báo cáo có context** và **không nuốt lỗi**\}.
+
+Errors are not exceptional in distributed UIs — they are **part of the normal state machine** \{Lỗi không hiếm trên UI phân tán — là **phần state machine bình thường**\}. Design for them explicitly and your on-call pager stays quiet \{Thiết kế rõ ràng và pager on-call yên hơn\}.

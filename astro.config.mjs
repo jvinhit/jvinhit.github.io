@@ -1,6 +1,7 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
-import { copyFile } from 'node:fs/promises';
+import { copyFile, access } from 'node:fs/promises';
+import { join } from 'node:path';
 import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
 import tailwindcss from '@tailwindcss/vite';
@@ -54,6 +55,12 @@ function copySitemapAlias() {
 const SITE_URL = process.env.SITE_URL ?? SITE.url;
 const BASE_PATH = process.env.BASE_PATH ?? '/';
 
+// `astro dev` chạy lệnh con `dev` trong argv. Chỉ dev mới cần nới lỏng
+// trailing slash để link nội bộ thiếu `/` cuối không 404 (xem comment
+// `trailingSlash` bên dưới). Build/preview giữ `'always'` để sitemap +
+// canonical nhất quán cho production.
+const IS_DEV = process.argv.includes('dev');
+
 export default defineConfig({
   site: SITE_URL,
   base: BASE_PATH,
@@ -66,7 +73,12 @@ export default defineConfig({
   // Nếu giữ `'never'`, homepage URL trong sitemap thành
   // `https://jvinhit.github.io/jvinhit-blog` (không slash) → bị 301 → Google
   // báo "Sitemap could not be read".
-  trailingSlash: 'always',
+  //
+  // DEV ngoại lệ: dùng `'ignore'` khi `astro dev` để dev server phục vụ cả
+  // URL có và không có `/` cuối. Link nội bộ trong bài viết viết dạng
+  // `/blog/slug` (thiếu `/`) sẽ không còn 404 ở local. Production (GitHub
+  // Pages / Cloudflare) vốn tự 301 no-slash → slash, nên prod không đổi.
+  trailingSlash: IS_DEV ? 'ignore' : 'always',
 
   integrations: [
     mdx(),
@@ -82,7 +94,31 @@ export default defineConfig({
     // Astro bundles its own Vite; `@tailwindcss/vite` ships types
     // against top-level Vite → known TS mismatch ở strict mode (runtime OK).
     // Safe cast theo doc Astro 5 + Tailwind 4.
-    plugins: [/** @type {any} */ (tailwindcss())],
+    plugins: [
+      /** @type {any} */ (tailwindcss()),
+      {
+        name: 'public-dir-index-html',
+        configureServer(server) {
+          server.middlewares.use(async (req, res, next) => {
+            const url = req.url ?? '';
+            if (url.endsWith('/') && !url.startsWith('/@')) {
+              const filePath = join(
+                server.config.publicDir,
+                url,
+                'index.html'
+              );
+              try {
+                await access(filePath);
+                req.url = `${url}index.html`;
+              } catch {
+                // no index.html in public/ — fall through to Astro routing
+              }
+            }
+            next();
+          });
+        },
+      },
+    ],
   },
 
   markdown: {

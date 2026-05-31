@@ -1,0 +1,463 @@
+---
+title: 'Signals & Fine-Grained Reactivity — The Model Taking Over Frontend (2026)'
+description: 'Bilingual deep-dive: signals vs Virtual DOM, the three primitives, a ~30-line vanilla runtime, push/pull glitch-free updates, Solid/Angular/Svelte/Vue/Preact/TC39, React compiler angle, pitfalls.'
+pubDate: 2026-01-01
+tags: [frontend, reactivity, signals, javascript, frameworks]
+draft: false
+---
+
+## Why This Matters in 2026 \{Tại sao điều này quan trọng năm 2026\}
+
+For a decade, most UI libraries answered one question the same way: **when state changes, re-run the component and diff the tree** \{Trong một thập kỷ, hầu hết thư viện UI trả lời cùng một câu hỏi: **khi state đổi, chạy lại component và diff cây DOM**\}. That model powered React, and it still works \{Mô hình đó nuôi React, và vẫn dùng được\}. But in 2026, **signals and fine-grained reactivity** are no longer niche SolidJS trivia \{Nhưng năm 2026, **signals và fine-grained reactivity** không còn là kiến thức ngách của SolidJS\} — they are the default mental model in **Angular signals**, **Svelte 5 runes**, evolving **Vue** patterns, **Preact signals**, and an active **TC39 proposal** \{chúng là mô hình mặc định trong **Angular signals**, **Svelte 5 runes**, **Vue** đang tiến hóa, **Preact signals**, và **đề xuất TC39** đang active\}.
+
+If you only understand `useState` + re-render, you will misread modern docs, perf discussions, and compiler-oriented frameworks \{Nếu bạn chỉ hiểu `useState` + re-render, bạn sẽ đọc sai tài liệu hiện đại, thảo luận perf, và framework hướng compiler\}. This post gives you the **dependency-graph mental model**, a **minimal implementation**, and a **cross-framework map** \{Bài này cho bạn **mô hình đồ thị phụ thuộc**, **implementation tối giản**, và **bản đồ đa framework**\}.
+
+---
+
+## The Core Problem: Coarse-Grained Re-renders \{Vấn đề cốt lõi: Re-render thô\}
+
+### Virtual DOM diffing is subtree-oriented \{Virtual DOM diff theo cả subtree\}
+
+In React-style rendering, state lives in a component; when state updates, React **schedules a re-render of that component (and often its children)** \{Trong kiểu render React, state nằm trong component; khi state đổi, React **lên lịch re-render component đó (và thường cả con)**\}. The runtime then **diffs a virtual tree** and patches the real DOM \{Runtime **diff cây ảo** rồi vá DOM thật\}. Even with `memo` and `useMemo`, the default path is: **function runs again → JSX recreated → diff decides what changed** \{Dù có `memo` và `useMemo`, đường mặc định vẫn là: **hàm chạy lại → JSX tạo lại → diff quyết định gì đổi**\}.
+
+That is **coarse-grained**: the unit of work is often an entire component (or a memo boundary), not an individual DOM node or text node \{Đó là **coarse-grained**: đơn vị công việc thường là cả component (hoặc ranh giới memo), không phải từng node DOM hay text node\}.
+
+```text
+State change in <App>
+        │
+        ▼
+ Re-run App() ──► new VDOM subtree
+        │
+        ▼
+   Diff vs previous
+        │
+        ▼
+ Patch DOM (maybe skip some children via memo)
+```
+
+For large lists, nested charts, or editors with thousands of nodes, **re-running and diffing** can cost more than the actual DOM change \{Với list lớn, chart lồng nhau, hoặc editor hàng nghìn node, **chạy lại và diff** có thể tốn hơn thay đổi DOM thực sự\}. You optimize with splitting, virtualization, and memo — but the **default abstraction** still centers on **render passes** \{Bạn tối ưu bằng tách component, virtualization, memo — nhưng **abstraction mặc định** vẫn xoay quanh **lượt render**\}.
+
+### Fine-grained: update exactly what depends on the signal \{Fine-grained: chỉ cập nhật thứ phụ thuộc signal\}
+
+**Signals** flip the default: **state is a reactive cell; consumers subscribe; when the cell changes, only subscribed side effects run** \{**Signals** đảo mặc định: **state là ô reactive; consumer đăng ký; khi ô đổi, chỉ side effect đã subscribe chạy**\}. In SolidJS and similar systems, that often means **the DOM update is tied directly to the effect that created the node** — no full component re-execution, no whole-tree diff for that update \{Trong SolidJS và hệ tương tự, thường **cập nhật DOM gắn trực tiếp effect tạo node** — không re-execute cả component, không diff cả cây cho lần cập nhật đó\}.
+
+```text
+count.set(4)
+        │
+        ▼
+ Notify subscribers of `count` only
+        │
+        ├──► effect: text node "4"     (runs)
+        ├──► computed: double → 8      (recomputes if needed)
+        └──► unrelated effect          (does NOT run)
+```
+
+That is **fine-grained reactivity**: precision at the level of **dependencies**, not **component boundaries** \{Đó là **fine-grained reactivity**: độ chính xác ở mức **phụ thuộc**, không phải **ranh giới component**\}.
+
+---
+
+## The Three Primitives \{Ba primitive\}
+
+Every serious signals system converges on the same trio \{Mọi hệ signals nghiêm túc hội tụ về bộ ba giống nhau\}:
+
+| Primitive | Role | Typical names |
+| --- | --- | --- |
+| **Signal** | Mutable reactive source of truth | `signal`, `$state`, `ref`, `Signal.State` |
+| **Computed** | Derived value; memoized from dependencies | `computed`, `$derived`, `createMemo`, `Signal.Computed` |
+| **Effect** | Side effect that re-runs when deps change | `effect`, `$effect`, `createEffect`, `watchEffect` |
+
+### Signal — writable state \{Signal — state ghi được\}
+
+A **signal** holds a value and a **set of subscribers** (effects and computeds that read it last time) \{**Signal** giữ giá trị và **tập subscriber** (effect và computed đã đọc nó lần trước)\}. Reading the signal **registers the current observer**; writing **notifies subscribers** \{Đọc signal **đăng ký observer hiện tại**; ghi **báo subscriber**\}.
+
+### Computed — derived, cached, lazy \{Computed — dẫn xuất, cache, lazy\}
+
+A **computed** reads other signals/computeds, **caches** the result, and **recomputes only when a dependency changes** \{**Computed** đọc signal/computed khác, **cache** kết quả, **chỉ tính lại khi dependency đổi**\}. Multiple reads between changes return the cached value (lazy + memo) \{Nhiều lần đọc giữa các lần đổi trả cache (lazy + memo)\}.
+
+### Effect — side effects, not pure derivation \{Effect — side effect, không phải dẫn xuất thuần\}
+
+An **effect** runs a function **for its side effects** (DOM updates, logging, network, etc.) and **re-runs when any signal read during the last execution changes** \{**Effect** chạy hàm **vì side effect** (DOM, log, network…) và **chạy lại khi signal đọc trong lần chạy trước đổi**\}. Effects should not be your default “business logic” layer — prefer computeds for derived data \{Effect không nên là lớp “business logic” mặc định — ưu tiên computed cho dữ liệu dẫn xuất\}.
+
+### Dependency graph mental model \{Mô hình đồ thị phụ thuộc\}
+
+```text
+              ┌─────────────┐
+              │   signal    │
+              │   count     │
+              └──────┬──────┘
+                     │ read
+         ┌───────────┼───────────┐
+         ▼           ▼           ▼
+   ┌──────────┐ ┌──────────┐ ┌──────────┐
+   │ computed │ │ computed │ │  effect  │
+   │  double  │ │ isEven   │ │ set text │
+   └────┬─────┘ └──────────┘ └──────────┘
+        │ read
+        ▼
+   ┌──────────┐
+   │  effect  │
+   │ log 2x   │
+   └──────────┘
+```
+
+**Automatic tracking** means you do not manually declare `deps: [count]` — the runtime records **which signals were read while an effect/computed was active** \{**Automatic tracking** nghĩa là bạn không khai báo tay `deps: [count]` — runtime ghi **signal nào được đọc khi effect/computed đang active**\}. That is the magic and the footgun \{Đó là phép màu và cũng là cạm bẫy\}.
+
+---
+
+## Minimal Vanilla JS Runtime (~30 lines) \{Runtime Vanilla JS tối giản (~30 dòng)\}
+
+The snippet below is **educational**, not production-grade — but it matches how real engines structure **current observer**, **dependency sets**, and **subscriber lists** \{Đoạn dưới **để học**, không phải production — nhưng khớp cách engine thật tổ chức **observer hiện tại**, **tập dependency**, và **danh sách subscriber**\}.
+
+```js
+let active = null;
+
+function createSignal(initial) {
+  let value = initial;
+  const subs = new Set();
+
+  const read = () => {
+    if (active) subs.add(active);
+    return value;
+  };
+
+  const write = (next) => {
+    if (Object.is(value, next)) return;
+    value = next;
+    for (const sub of subs) sub.run();
+  };
+
+  return [read, write];
+}
+
+function createComputed(fn) {
+  const subs = new Set();
+  let value;
+  let dirty = true;
+
+  const comp = {
+    run() {
+      const prev = active;
+      active = comp;
+      if (dirty) {
+        value = fn();
+        dirty = false;
+      }
+      active = prev;
+      return value;
+    },
+  };
+
+  createEffect(() => {
+    fn();
+    dirty = true;
+    for (const sub of subs) sub.run();
+  });
+
+  return () => {
+    if (active) subs.add(active);
+    return comp.run();
+  };
+}
+
+function createEffect(fn) {
+  const effect = {
+    run() {
+      const prev = active;
+      active = effect;
+      fn();
+      active = prev;
+    },
+  };
+  effect.run();
+  return effect;
+}
+```
+
+**How to read this** \{Cách đọc\}:
+
+- `active` is the **current observer** (effect or computed) while a reactive function runs \{`active` là **observer hiện tại** khi hàm reactive chạy\}.
+- On `read()`, if `active` is set, the signal adds it to `subs` \{Khi `read()`, nếu có `active`, signal thêm vào `subs`\}.
+- On `write()`, only subscribers re-run — not the whole app \{Khi `write()`, chỉ subscriber chạy lại — không phải cả app\}.
+- Real implementations also **remove stale dependencies** each run (not shown above for brevity) \{Implementation thật còn **xóa dependency cũ** mỗi lần chạy (bỏ ở trên cho gọn)\}.
+
+```js
+const [count, setCount] = createSignal(0);
+const double = createComputed(() => count() * 2);
+
+createEffect(() => {
+  console.log('count', count(), 'double', double());
+});
+
+setCount(1); // logs once
+setCount(1); // Object.is → no-op
+setCount(2); // logs again
+```
+
+---
+
+## Push, Pull, Lazy Evaluation, and Glitch-Free Updates \{Push, pull, lazy, và cập nhật không glitch\}
+
+### Push vs pull \{Push vs pull\}
+
+- **Push**: a signal write **notifies** subscribers immediately (eager notification) \{**Push**: ghi signal **báo** subscriber ngay (thông báo eager)\}.
+- **Pull**: a computed **reads fresh values** when something asks for its value (often marking dirty first) \{**Pull**: computed **đọc giá trị mới** khi có thứ gì đó hỏi (thường đánh dấu dirty trước)\}.
+
+Most frameworks **combine** them: push dirty flags, pull on read, recompute lazily \{Hầu hết framework **kết hợp**: push cờ dirty, pull khi đọc, tính lại lazy\}. That avoids recomputing unused branches of the graph \{Tránh tính lại nhánh graph không dùng\}.
+
+### Glitch-free \{Không glitch\}
+
+A **glitch** is when observers briefly see **inconsistent intermediate states** — e.g. `a = 1; b = a + 1` and an effect reads `b` before `a` finishes propagating \{**Glitch** là khi observer thoáng thấy **trạng thái trung gian không nhất quán** — vd `a = 1; b = a + 1` và effect đọc `b` trước khi `a` propagate xong\}. Solid-style engines often use **topological ordering** or **two-phase updates** so effects run after the graph settles \{Engine kiểu Solid thường **sắp thứ tự topo** hoặc **cập nhật hai pha** để effect chạy sau khi graph ổn định\}. You rarely think about this until you build your own runtime — then it matters \{Bạn hiếm khi nghĩ đến cho đến khi tự build runtime — lúc đó rất quan trọng\}.
+
+---
+
+## Framework & Proposal Comparison \{So sánh framework và đề xuất\}
+
+| System | Writable | Derived | Side effect | Notes |
+| --- | --- | --- | --- | --- |
+| **SolidJS** | `createSignal` | `createMemo` | `createEffect` | JSX compiles to direct DOM bindings + effects |
+| **Angular** | `signal()` | `computed()` | `effect()` | Zoneless-friendly; integrates with change detection |
+| **Svelte 5** | `$state` | `$derived` | `$effect` | Runes are compile-time tracked |
+| **Vue 3** | `ref()` / `reactive()` | `computed()` | `watchEffect()` | Still component-render centric; refs are reactive cells |
+| **Preact** | `signal()` | `computed()` | `effect()` | `@preact/signals` integrates with VDOM via subscriptions |
+| **TC39 proposal** | `Signal.State` | `Signal.Computed` | (user effects via patterns) | Standard library shape; still Stage 1-ish |
+
+Naming differs; the **graph is the same** \{Tên khác; **graph giống nhau**\}.
+
+---
+
+## Code Across Ecosystems \{Code qua các hệ sinh thái\}
+
+### SolidJS \{SolidJS\}
+
+```tsx
+import { createSignal, createMemo, createEffect } from 'solid-js';
+
+function Counter() {
+  const [count, setCount] = createSignal(0);
+  const double = createMemo(() => count() * 2);
+
+  createEffect(() => {
+    console.log(count(), double());
+  });
+
+  return (
+    <button onClick={() => setCount((c) => c + 1)}>
+      {count()} × 2 = {double()}
+    </button>
+  );
+}
+```
+
+Solid’s JSX **does not re-run the whole function on every click** the way React does — fine-grained updates target the text and handlers wired at creation time \{JSX Solid **không chạy lại cả hàm mỗi click** như React — cập nhật fine-grained nhắm text và handler gắn lúc tạo\}.
+
+### Angular signals \{Angular signals\}
+
+```ts
+import { Component, computed, effect, signal } from '@angular/core';
+
+@Component({
+  selector: 'app-counter',
+  template: `
+    <button (click)="count.set(count() + 1)">
+      {{ count() }} × 2 = {{ double() }}
+    </button>
+  `,
+})
+export class CounterComponent {
+  count = signal(0);
+  double = computed(() => this.count() * 2);
+
+  constructor() {
+    effect(() => {
+      console.log(this.count(), this.double());
+    });
+  }
+}
+```
+
+### Svelte 5 runes \{Svelte 5 runes\}
+
+```svelte
+<script>
+  let count = $state(0);
+  let double = $derived(count * 2);
+
+  $effect(() => {
+    console.log(count, double);
+  });
+</script>
+
+<button onclick={() => count++}>
+  {count} × 2 = {double}
+</button>
+```
+
+The Svelte compiler **instruments reads/writes** so reactivity is deterministic without a runtime proxy soup \{Compiler Svelte **ghi nhận đọc/ghi** nên reactivity deterministic, không cần proxy runtime rối\}.
+
+### Vue refs (reactive cells + render) \{Vue ref (ô reactive + render)\}
+
+```js
+import { ref, computed, watchEffect } from 'vue';
+
+export function useCounter() {
+  const count = ref(0);
+  const double = computed(() => count.value * 2);
+
+  watchEffect(() => {
+    console.log(count.value, double.value);
+  });
+
+  return { count, double };
+}
+```
+
+Vue’s `ref` **is** a signal-like cell, but the component still **re-renders** when template deps change unless you lean on compile-time optimizations in Vue 3.5+ \{`ref` Vue **là** ô kiểu signal, nhưng component vẫn **re-render** khi deps template đổi trừ khi bạn dùng tối ưu compile Vue 3.5+\}.
+
+### Preact signals \{Preact signals\}
+
+```jsx
+import { signal, computed, effect } from '@preact/signals';
+
+const count = signal(0);
+const double = computed(() => count.value * 2);
+
+effect(() => {
+  console.log(count.value, double.value);
+});
+
+function Counter() {
+  return (
+    <button onClick={() => count.value++}>
+      {count} × 2 = {double}
+    </button>
+  );
+}
+```
+
+Preact integrates signals with **VDOM components** by tracking which components read which signals — a hybrid path \{Preact tích hợp signal với **component VDOM** bằng cách theo dõi component nào đọc signal nào — đường lai\}.
+
+### TC39 Signals proposal (Stage 1) \{Đề xuất TC39 Signals (Stage 1)\}
+
+```js
+import { Signal } from 'signal-polyfill'; // conceptual; API from proposal
+
+const count = Signal.State(0);
+const double = Signal.Computed(() => count.get() * 2);
+
+// Consumers would use framework glue or manual subscribe APIs
+console.log(double.get());
+count.set(1);
+console.log(double.get());
+```
+
+The proposal standardizes **interoperable reactive cells** across libraries — not a full UI framework \{Đề xuất chuẩn hóa **ô reactive tương tác được** giữa thư viện — không phải full UI framework\}. Frameworks may wrap `Signal.State` with ergonomics (`()`, `.value`, runes) \{Framework có thể bọc `Signal.State` bằng ergonomics (`()`, `.value`, runes)\}.
+
+---
+
+## Signals vs React’s Model \{Signals vs mô hình React\}
+
+React keeps **explicit render passes**: `useState` triggers a **re-render of the function component**, then reconciliation patches the DOM \{React giữ **lượt render tường minh**: `useState` kích **re-render function component**, rồi reconciliation vá DOM\}. React team has **not** adopted first-class signals in core for several intertwined reasons \{Team React **chưa** đưa signals first-class vào core vì nhiều lý do lẫn nhau\}:
+
+1. **API stability and mental model** — millions of apps think in “render = f(state)” \{**Ổn định API và mô hình** — triệu app nghĩ “render = f(state)”\}.
+2. **Concurrent features** — scheduling, transitions, and Suspense are built around **render work**, not dependency graphs \{**Concurrent** — scheduling, transition, Suspense xây quanh **công việc render**, không phải graph phụ thuộc\}.
+3. **Interop** — signals shine when the whole tree participates; React’s ecosystem is deeply render-centric \{**Interop** — signals mạnh khi cả cây tham gia; ecosystem React gắn chặt render\}.
+
+### React Compiler angle (accurate, brief) \{Góc React Compiler (ngắn, chính xác)\}
+
+**React Compiler** (formerly “React Forget”) analyzes components to **auto-memoize** and reduce unnecessary re-renders **without** you adopting signals \{**React Compiler** phân tích component để **tự memo** và giảm re-render **không** cần signals\}. It is a **compile-time optimization of the existing model**, not a switch to fine-grained DOM binding \{Đó là **tối ưu compile-time của mô hình hiện tại**, không phải chuyển sang gắn DOM fine-grained\}. Compiler + disciplined `useMemo`/`memo` closes much of the perf gap for many apps — but the **abstraction** remains render-first \{Compiler + `useMemo`/`memo` kỷ luật thu hẹp khoảng perf cho nhiều app — nhưng **abstraction** vẫn render-first\}.
+
+```jsx
+// Still: state change → schedule re-render → reconcile
+function Row({ item }) {
+  const [n, setN] = useState(0);
+  return <button onClick={() => setN((v) => v + 1)}>{item.label} {n}</button>;
+}
+```
+
+For greenfield libraries, signals are the native answer; for React, the bet is **better compilation + same API** \{Với thư viện mới, signals là câu trả lời native; với React, cược là **compile tốt hơn + API giữ nguyên**\}.
+
+---
+
+## Pitfalls Senior Devs Actually Hit \{Pitfall dev senior hay gặp\}
+
+### Effects that over-run \{Effect chạy quá nhiều\}
+
+Putting derived logic in `effect` instead of `computed` causes **extra runs and flicker** \{Đặt logic dẫn xuất trong `effect` thay vì `computed` gây **chạy thừa và nhấp nháy**\}. Rule: **compute data with computed; use effects for I/O and DOM** \{Quy tắc: **tính dữ liệu bằng computed; effect cho I/O và DOM**\}.
+
+### Untracked reads \{Đọc không được track\}
+
+Reading a signal **outside** an active effect/computed — or after `await` without wrapping in `effect` — **drops tracking** \{Đọc signal **ngoài** effect/computed active — hoặc sau `await` không bọc `effect` — **mất tracking**\}. In Solid, `untrack()` is explicit; in other frameworks, destructuring can break reactivity \{Trong Solid, `untrack()` tường minh; framework khác, destructuring có thể phá reactivity\}.
+
+```js
+// ❌ Untracked: read happens once at setup
+const v = count();
+
+createEffect(() => {
+  console.log(v); // stale
+});
+
+// ✅ Read inside the effect
+createEffect(() => {
+  console.log(count());
+});
+```
+
+### Stale closures in async code \{Stale closure trong async\}
+
+```js
+createEffect(() => {
+  const id = userId();
+  fetch(`/api/${id}`).then((data) => {
+    // userId() is NOT re-tracked here
+    renderProfile(data, userId()); // may be stale if userId changed
+  });
+});
+```
+
+Pattern: **re-read signals at the point of use**, or use framework helpers for async effects \{Pattern: **đọc lại signal tại chỗ dùng**, hoặc helper async effect của framework\}.
+
+### When NOT to reach for a signal \{Khi KHÔNG nên dùng signal\}
+
+- **Ephemeral form state** with no cross-component sharing — local variables or controlled inputs may suffice \{**State form tạm** không chia sẻ cross-component — biến local hoặc input controlled có thể đủ\}.
+- **One-shot initialization** — don’t wrap constants in signals \{**Khởi tạo một lần** — đừng bọc hằng số trong signal\}.
+- **Server data caches** — use a query/cache layer (TanStack Query, etc.); signals are not a replacement for HTTP caching semantics \{**Cache data server** — dùng lớp query/cache; signal không thay semantics cache HTTP\}.
+- **Replacing global state everywhere** — signals solve **reactivity**, not **architecture** \{**Thay state global khắp nơi** — signal giải **reactivity**, không phải **kiến trúc**\}.
+
+---
+
+## When to Use — Mental Model Wrap-Up \{Khi nào dùng — Tóm tắt mô hình\}
+
+Ask three questions before adopting signals in a codebase \{Hỏi ba câu trước khi áp signal vào codebase\}:
+
+1. **Is the cost in reactiving or in rendering?** CPU-heavy trees → fine-grained wins; rare updates → either model works \{**Chi phí ở reactive hay render?** Cây nặng CPU → fine-grained thắng; cập nhật hiếm → mô hình nào cũng được\}.
+2. **Is state fine-grained and shared across many leaves?** Signals excel when many DOM nodes depend on the same cells \{**State fine-grained và chia sẻ nhiều lá?** Signal mạnh khi nhiều DOM phụ thuộc cùng ô\}.
+3. **Does your framework already compile reactivity?** Svelte/Angular/Solid — lean in; React — weigh Compiler first \{**Framework đã compile reactivity?** Svelte/Angular/Solid — theo; React — cân nhắc Compiler trước\}.
+
+**One sentence to remember** \{Một câu nhớ\}: **Signals are reactive cells; computeds derive; effects synchronize the world with those cells — and only those cells’ subscribers pay the cost** \{**Signal là ô reactive; computed dẫn xuất; effect đồng bộ thế giới với các ô — và chỉ subscriber của các ô đó trả giá**\}.
+
+---
+
+## Quick Reference Cheatsheet \{Bảng tra nhanh\}
+
+| Task | Solid | Angular | Svelte 5 | Vue | Preact | TC39 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Create state | `createSignal(0)` | `signal(0)` | `$state(0)` | `ref(0)` | `signal(0)` | `Signal.State(0)` |
+| Read | `count()` | `count()` | `count` | `count.value` | `count.value` | `count.get()` |
+| Write | `setCount(1)` | `count.set(1)` | `count = 1` | `count.value = 1` | `count.value = 1` | `count.set(1)` |
+| Derive | `createMemo(() => …)` | `computed(() => …)` | `$derived(…)` | `computed(() => …)` | `computed(() => …)` | `Signal.Computed(() => …)` |
+| Side effect | `createEffect(() => …)` | `effect(() => …)` | `$effect(() => …)` | `watchEffect(() => …)` | `effect(() => …)` | (app-specific) |
+| Opt out of track | `untrack(() => …)` | `untracked(() => …)` | — | — | — | — |
+
+---
+
+## Further Reading \{Đọc thêm\}
+
+- [JavaScript Generators & yield](/blog/javascript-generators-and-yield) — another “lazy evaluation” mental model worth comparing \{— mô hình “lazy evaluation” khác đáng so sánh\}.
+- [Frontend Caching deep dive](/blog/frontend-caching-deep-dive) — orthogonal perf lever: skip work before it hits the UI layer \{— đòn bẩy perf khác: bỏ qua công việc trước khi chạm UI\}.
+- TC39 proposal: [Signals](https://github.com/tc39/proposal-signals) on GitHub \{Đề xuất TC39: [Signals](https://github.com/tc39/proposal-signals) trên GitHub\}.
+
+---
+
+## Summary \{Tóm tắt\}
+
+Virtual DOM frameworks **re-render and diff** by default — a coarse-grained unit of work \{Framework Virtual DOM **re-render và diff** mặc định — đơn vị công việc thô\}. **Signals** split state into tracked cells with **computed** derivation and **effect** synchronization, updating only what depends on what changed \{**Signals** tách state thành ô được track với **computed** dẫn xuất và **effect** đồng bộ, chỉ cập nhật thứ phụ thuộc thay đổi\}. A tiny vanilla runtime shows **automatic dependency tracking** is implementable in tens of lines \{Runtime vanilla nhỏ cho thấy **tracking phụ thuộc tự động** có thể implement vài chục dòng\}. In 2026, Solid, Angular, Svelte 5, Vue, Preact, and TC39 all point the same direction; React stays render-first but fights waste with the **Compiler** \{Năm 2026, Solid, Angular, Svelte 5, Vue, Preact, TC39 cùng hướng; React giữ render-first nhưng chống lãng phí bằng **Compiler**\}. Know which problem you are solving — **reactivity precision**, not magic — and you will pick the right tool \{Biết bạn giải bài toán gì — **độ chính xác reactivity**, không phải phép màu — rồi chọn đúng công cụ\}.

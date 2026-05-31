@@ -1,0 +1,500 @@
+---
+title: 'JavaScript Memory Management & Leak Hunting — V8 GC, DevTools, and Production Signals'
+description: 'How V8 garbage collection works, why leaks are reachability bugs, classic frontend leak patterns, WeakRef tradeoffs, and a DevTools hunting workflow.'
+pubDate: 2025-12-23
+tags: [javascript, memory, performance, debugging, v8]
+draft: false
+---
+
+Your tab feels fine for ten minutes, then fans spin up and scrolling stutters \{Tab chạy ổn mười phút, rồi quạt kêu và scroll giật\}. Heap size climbs in a sawtooth that never returns to baseline \{Heap tăng theo dạng răng cưa nhưng không hồi baseline\}. That is rarely "JavaScript is slow" — it is **unintentional reachability** keeping objects alive long after your mental model says they are gone \{Hiếm khi là "JavaScript chậm" — thường là **reachability ngoài ý muốn** giữ object sống sau khi mental model của bạn nghĩ chúng đã biến mất\}.
+
+This post is for engineers who already know closures and the event loop \{Bài này dành cho engineer đã biết closure và event loop\}. We go deeper: the V8 memory model, why GC languages still leak, how to hunt leaks with Chrome DevTools, and what you can measure in production without lying to yourself \{Chúng ta đi sâu hơn: memory model V8, vì sao ngôn ngữ GC vẫn leak, cách săn leak bằng Chrome DevTools, và đo lường production mà không tự lừa mình\}.
+
+---
+
+## Memory model — stack, heap, and the value graph \{Mô hình bộ nhớ — stack, heap, và value graph\}
+
+JavaScript values live in two places \{Giá trị JavaScript nằm ở hai nơi\}:
+
+| Location | Holds | Lifetime |
+| --- | --- | --- |
+| **Stack** (per call frame) | Primitives (`number`, `boolean`, `null`, `undefined`, `bigint`, `symbol`), references (pointers to heap objects) | Popped when the function returns |
+| **Heap** | Objects, arrays, closures, typed arrays, `Map`/`Set`, functions | Managed by the garbage collector |
+
+Primitives are copied by value \{Primitive được copy theo giá trị\}. Objects are copied by reference — assigning `b = a` does not clone the object; both variables point to the same heap node \{Object được copy theo reference — gán `b = a` không clone object; cả hai biến trỏ cùng một heap node\}.
+
+The runtime builds a **directed graph** of objects linked by properties, array slots, closure scopes, and internal edges (e.g. prototype links) \{Runtime xây **đồ thị có hướng** gồm object liên kết qua property, phần tử mảng, closure scope, và internal edge (vd prototype)\}. GC does not ask "is this object still useful to the programmer?" \{GC không hỏi "object này còn hữu ích với lập trình viên không?"\}. It asks: **is this object reachable from a root?** \{Nó hỏi: **object này có reachable từ root không?**\}
+
+### Roots — where reachability starts \{Root — nơi reachability bắt đầu\}
+
+**Roots** are entry points the engine must treat as always alive during a collection cycle \{**Root** là điểm vào engine phải coi là luôn sống trong một chu kỳ collection\}:
+
+- The current call stack and its local variables \{Call stack hiện tại và biến local\}
+- Global object (`globalThis`) and module scopes \{Global object (`globalThis`) và module scope\}
+- Handles registered with the embedder (e.g. DOM wrappers in a browser) \{Handle đăng ký với embedder (vd DOM wrapper trong browser)\}
+- Active timers, microtasks, and some internal VM tables \{Timer đang chạy, microtask, và một số bảng nội bộ VM\}
+
+If there is a path from any root to object `X`, `X` is **reachable** and will not be collected \{Nếu có đường từ bất kỳ root nào tới object `X`, `X` **reachable** và sẽ không bị thu gom\}. No path means **unreachable** — eligible for reclamation, even if you still have a variable name that *looks* like it should hold the value \{Không có đường nghĩa là **unreachable** — đủ điều kiện thu hồi, dù bạn vẫn có tên biến *trông* như còn giữ giá trị\}.
+
+```text
+  [Root: global] ──► moduleCache ──► { id: 1, payload: Array(1_000_000) }
+                              ▲
+  [Root: timer callback] ─────┘
+         (forgotten clearInterval — entire subgraph stays alive)
+```
+
+> **Principal insight** \{Nhận thức cấp principal\}: Memory is not "freed" by assignment to `null` unless that breaks the last retaining path \{Bộ nhớ không "được giải phóng" khi gán `null` trừ khi điều đó cắt đường retain cuối cùng\}. `obj = null` only removes one edge; another reference may still anchor the subgraph \{`obj = null` chỉ xóa một cạnh; reference khác vẫn có thể neo subgraph\}.
+
+---
+
+## How V8's garbage collector works \{Cách garbage collector V8 hoạt động\}
+
+V8 (Chrome, Node.js, Electron) uses a **generational** collector tuned for short-lived allocations — the dominant pattern in JS apps \{V8 (Chrome, Node.js, Electron) dùng collector **generational** tối ưu cho allocation sống ngắn — pattern chi phối trong app JS\}.
+
+### Young generation — Scavenge (copying GC) \{Young generation — Scavenge (copying GC)\}
+
+New objects allocate in the **new space** (often called nursery) \{Object mới allocate trong **new space** (thường gọi nursery)\}. When it fills, V8 runs a **Scavenge**:
+
+1. Start from roots, mark reachable objects in the young generation \{Bắt đầu từ root, đánh dấu object reachable trong young generation\}
+2. Copy survivors to **to-space**, compacting them \{Copy survivor sang **to-space**, compact chúng\}
+3. Drop the entire from-space in one shot — no per-object free list walk \{Bỏ toàn bộ from-space một lần — không duyệt free list từng object\}
+
+Scavenge is fast because the young generation is small and most objects die young (the **generational hypothesis**) \{Scavenge nhanh vì young generation nhỏ và hầu hết object chết sớm (**generational hypothesis**)\}. Objects that survive enough Scavenge cycles are **promoted** to the old generation \{Object sống qua đủ chu kỳ Scavenge được **promote** lên old generation\}.
+
+### Old generation — Mark-Sweep-Compact \{Old generation — Mark-Sweep-Compact\}
+
+Long-lived objects live in **old space** \{Object sống lâu nằm trong **old space**\}. Collection is **Mark-Sweep-Compact** (with variations):
+
+| Phase | What happens |
+| --- | --- |
+| **Mark** | Trace from roots; mark reachable old-space objects |
+| **Sweep** | Reclaim unmarked objects; may leave fragmentation |
+| **Compact** | Move live objects to reduce fragmentation (not every cycle) |
+
+Full old-gen collections are expensive on large heaps \{Full collection old-gen tốn kém trên heap lớn\}. V8 therefore uses **incremental marking** (slice work across idle/main-thread slices) and **concurrent marking** (helper threads mark while JS runs) to reduce pause times \{V8 vì vậy dùng **incremental marking** (chia nhỏ công việc qua các slice idle/main-thread) và **concurrent marking** (thread phụ mark trong khi JS chạy) để giảm pause\}.
+
+You still see **GC pauses** in DevTools — especially when promotion rate is high or a full collection is triggered \{Bạn vẫn thấy **GC pause** trong DevTools — nhất là khi promotion rate cao hoặc full collection bị kích hoạt\}. Pauses are not leaks; they are the cost of reclaiming unreachable memory \{Pause không phải leak; đó là chi phí thu hồi bộ nhớ unreachable\}. **Leaks** are when memory stays reachable so GC *cannot* reclaim it \{**Leak** là khi bộ nhớ vẫn reachable nên GC *không thể* thu hồi\}.
+
+### Orinoco and why "in use" ≠ "reachable" \{Orinoco và vì sao "in use" ≠ "reachable"\}
+
+V8's modern pipeline (project Orinoco) separates marking from sweeping and parallelizes where safe \{Pipeline hiện đại V8 (project Orinoco) tách marking khỏi sweeping và parallelize khi an toàn\}. From an application perspective, the rule is unchanged: **retained size** grows when your code keeps references alive — intentionally or not \{Từ góc application, quy tắc không đổi: **retained size** tăng khi code giữ reference sống — cố ý hay không\}.
+
+```js
+// "I'm done with user" in product terms — but GC disagrees
+let currentUser = loadHugeProfile(userId);
+
+function onRouteChange() {
+  // UI unmounts, DOM gone — yet currentUser still reachable from module scope
+  renderEmptyState();
+}
+
+// Fix: release the retaining edge when lifecycle ends
+function onRouteChangeFixed() {
+  renderEmptyState();
+  currentUser = null; // drops module-level edge; may be enough if no other retainers
+}
+```
+
+---
+
+## What a memory leak is in a GC language \{Memory leak là gì trong ngôn ngữ GC\}
+
+In C, a leak is memory you **cannot find** anymore \{Trong C, leak là bộ nhớ bạn **không tìm lại** được nữa\}. In JavaScript, a leak is memory you **can still find** — from a root you forgot about \{Trong JavaScript, leak là bộ nhớ bạn **vẫn tìm được** — từ root bạn quên mất\}.
+
+Formal definition for frontend work \{Định nghĩa cho công việc frontend\}:
+
+> A memory leak is a monotonic increase in **live heap size** (after GC) caused by objects that remain **reachable** but are no longer needed by the program's intended lifecycle.
+
+Symptoms \{Triệu chứng\}:
+
+- Heap baseline rises across route changes or modal open/close cycles \{Baseline heap tăng qua các lần đổi route hoặc mở/đóng modal\}
+- Detached DOM nodes count grows \{Số detached DOM node tăng\}
+- Mobile tabs reload or crash (OS memory pressure) \{Tab mobile reload hoặc crash (áp lực bộ nhớ OS)\}
+- Long tasks and jank correlate with full GC attempts \{Long task và jank tương quan với full GC\}
+
+Not every growth is a leak \{Không phải mọi tăng trưởng đều là leak\}. Caches, prefetch buffers, and legitimate singletons increase retained size by design \{Cache, prefetch buffer, và singleton hợp lệ tăng retained size theo thiết kế\}. The diagnostic question is: **does retained size return to a stable plateau when the feature is torn down?** \{Câu hỏi chẩn đoán: **retained size có về plateau ổn định khi feature bị teardown không?**\}
+
+---
+
+## Classic leak patterns — with code \{Các pattern leak kinh điển — kèm code\}
+
+### 1. Forgotten timers and intervals \{Timer và interval bị quên\}
+
+```js
+// ❌ Leak: interval holds closure over `data`, keeps firing after component "gone"
+function startPolling(data) {
+  setInterval(() => {
+    sendAnalytics(data); // `data` retained forever
+  }, 1000);
+}
+
+// ✅ Fix: store id, clear on teardown
+function startPollingFixed(data) {
+  const id = setInterval(() => sendAnalytics(data), 1000);
+  return () => clearInterval(id);
+}
+```
+
+`setTimeout`/`setInterval` callbacks are roots until they fire or are cleared \{Callback `setTimeout`/`setInterval` là root cho đến khi chạy hoặc bị clear\}. A one-shot timeout still retains its closure until execution \{Timeout một lần vẫn giữ closure cho đến khi thực thi\}.
+
+### 2. Dangling event listeners \{Event listener còn treo\}
+
+```js
+// ❌ Leak: listener on `document` captures huge `state`
+function mountWidget(state) {
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeWidget(state);
+  });
+  // never removeListener on unmount
+}
+
+// ✅ Fix: named handler + removeEventListener (same capture flag)
+function mountWidgetFixed(state) {
+  function onKeydown(e) {
+    if (e.key === 'Escape') closeWidget(state);
+  }
+  document.addEventListener('keydown', onKeydown);
+  return () => document.removeEventListener('keydown', onKeydown);
+}
+```
+
+Prefer **`AbortSignal`** for batch cleanup \{Ưu tiên **`AbortSignal`** để cleanup hàng loạt\}:
+
+```js
+const controller = new AbortController();
+
+window.addEventListener('resize', onResize, { signal: controller.signal });
+fetch('/api/x', { signal: controller.signal });
+
+// teardown
+controller.abort(); // removes all listeners registered with this signal
+```
+
+### 3. Detached DOM nodes held by JavaScript \{Detached DOM node bị JS giữ\}
+
+Removing a node from the document does **not** collect it if JS still references it \{Gỡ node khỏi document **không** thu gom nếu JS vẫn reference\}.
+
+```js
+// ❌ Leak: cache keeps detached subtree alive
+const elementCache = new Map();
+
+function destroyPanel(el) {
+  elementCache.set(el.id, el); // strong ref to DOM + listeners + expandos
+  el.remove();
+}
+
+// ✅ Fix: WeakMap keyed by logical id, or drop cache entry on destroy
+const elementCacheFixed = new WeakMap();
+
+function destroyPanelFixed(el, meta) {
+  elementCacheFixed.set(el, meta); // DOM key — entry dies when el is unreachable
+  el.remove();
+}
+```
+
+In DevTools, **Detached DOM tree** entries with growing count almost always mean a JS-side retainer (listener, cache, closure) — not a browser bug \{Trong DevTools, **Detached DOM tree** tăng gần như luôn nghĩa là retainer phía JS (listener, cache, closure) — không phải bug browser\}.
+
+### 4. Closures capturing large scope \{Closure giữ scope lớn\}
+
+```js
+function createHandler() {
+  const hugeBuffer = new Uint8Array(50 * 1024 * 1024); // 50 MB
+  const id = computeId(hugeBuffer);
+
+  // ❌ Leak pattern: returned function closes over entire scope including hugeBuffer
+  return function onClick() {
+    console.log(id);
+  };
+}
+
+// ✅ Fix: copy only what you need into minimal bindings
+function createHandlerFixed() {
+  const hugeBuffer = new Uint8Array(50 * 1024 * 1024);
+  const id = computeId(hugeBuffer);
+  hugeBuffer.fill(0); // optional: help young-gen reclaim sooner if no other refs
+
+  return function onClick() {
+    console.log(id); // closure retains `id` (small), not hugeBuffer
+  };
+}
+```
+
+V8 allocates closure context slots for captured variables \{V8 allocate slot context closure cho biến captured\}. Accidentally capturing a large object keeps the whole backing store reachable \{Vô tình capture object lớn giữ toàn bộ backing store reachable\}.
+
+### 5. Module-level caches and unbounded arrays \{Cache cấp module và mảng không giới hạn\}
+
+```js
+// ❌ Leak by design drift: cache never evicts
+const responseCache = new Map();
+
+export async function fetchUser(id) {
+  if (responseCache.has(id)) return responseCache.get(id);
+  const user = await api.getUser(id);
+  responseCache.set(id, user);
+  return user;
+}
+
+// ✅ Fix: LRU cap, TTL, or WeakRef for soft cache
+const MAX = 500;
+const responseCacheFixed = new Map();
+
+export async function fetchUserFixed(id) {
+  if (responseCacheFixed.has(id)) return responseCacheFixed.get(id);
+  const user = await api.getUser(id);
+  if (responseCacheFixed.size >= MAX) {
+    const firstKey = responseCacheFixed.keys().next().value;
+    responseCacheFixed.delete(firstKey);
+  }
+  responseCacheFixed.set(id, user);
+  return user;
+}
+```
+
+Module scope survives for the life of the JS realm (tab session) \{Module scope sống suốt đời JS realm (session tab)\}. Any `Map` at module top level is a permanent root unless you delete entries \{Mọi `Map` ở top-level module là root vĩnh viễn trừ khi bạn xóa entry\}.
+
+### 6. React-specific retainers \{Retainer đặc thù React\}
+
+React does not magically GC your effects \{React không tự GC effect của bạn\}. Missing cleanup is the #1 SPA leak source \{Thiếu cleanup là nguồn leak SPA số 1\}.
+
+```tsx
+// ❌ Subscription leak
+useEffect(() => {
+  const sub = eventBus.on('tick', handleTick);
+  // missing return () => sub.off(...)
+}, []);
+
+// ❌ Stale closure holding large props/state in long-lived subscription
+useEffect(() => {
+  const id = setInterval(() => {
+    process(largeDataset); // re-created effect may stack intervals if deps wrong
+  }, 1000);
+  return () => clearInterval(id);
+}, []); // empty deps — largeDataset from first render captured forever
+
+// ✅ Stable deps + cleanup + narrow capture
+useEffect(() => {
+  const id = setInterval(() => process(largeDataset), 1000);
+  return () => clearInterval(id);
+}, [largeDataset]);
+```
+
+**Stale closure** bugs often pair with leaks: an old callback still registered somewhere retains old state trees if your external bus stores callbacks strongly \{Bug **stale closure** thường đi cùng leak: callback cũ vẫn đăng ký đâu đó giữ state tree cũ nếu bus ngoài lưu callback mạnh\}. Audit third-party listeners (maps, charts, analytics) the mount/unmount symmetry \{Audit listener bên thứ ba (map, chart, analytics) theo đối xứng mount/unmount\}.
+
+| Pattern | Retainer | Fix |
+| --- | --- | --- |
+| Global `addEventListener` | Document/window root | `removeEventListener` or `AbortSignal` |
+| `setInterval` in module | Timer root | `clearInterval` on teardown |
+| Cache `Map` | Global/module root | Eviction policy |
+| Detached DOM | JS reference | Drop ref; `WeakMap` for metadata |
+| React effect | Closure + host subscription | Effect cleanup function |
+| `IntersectionObserver` | Observer + targets | `disconnect()` |
+
+---
+
+## WeakMap, WeakRef, and FinalizationRegistry \{WeakMap, WeakRef, và FinalizationRegistry\}
+
+ECMAScript provides **weak** references that do not create retaining edges for GC \{ECMAScript cung cấp reference **weak** không tạo cạnh retain cho GC\}. Use them when lifecycle should follow an object, not a string key \{Dùng khi lifecycle nên theo object, không phải string key\}.
+
+### WeakMap and WeakSet \{WeakMap và WeakSet\}
+
+- Keys must be objects (or registered symbols); values can be anything \{Key phải là object (hoặc registered symbol); value có thể là bất kỳ\}
+- If the key object becomes unreachable, the entry disappears **without deterministic timing** \{Nếu key object unreachable, entry biến mất **không có thời điểm xác định**\}
+- Ideal for **DOM metadata**, private fields, and associating data with elements without preventing collection \{Lý tưởng cho **metadata DOM**, private field, và gắn data với element mà không chặn collection\}
+
+```js
+const meta = new WeakMap();
+
+function enhance(el, options) {
+  meta.set(el, options);
+}
+
+function destroy(el) {
+  el.remove();
+  // no need to meta.delete(el) — when el is unreachable, entry is collected
+}
+```
+
+You **cannot iterate** a `WeakMap` — there is no `size` \{Bạn **không thể iterate** `WeakMap` — không có `size`\}. That is intentional: iteration would require strong references to keys \{Đó là cố ý: iteration sẽ cần strong reference tới key\}.
+
+### WeakRef \{WeakRef\}
+
+```js
+let cache = buildExpensiveModel();
+const weak = new WeakRef(cache);
+
+// drop strong reference when appropriate
+cache = null;
+
+// later — may return undefined if GC collected the target
+const revived = weak.deref();
+```
+
+`WeakRef` enables **soft caches** (recompute on miss) without guaranteeing retention \{`WeakRef` cho **soft cache** (tính lại khi miss) mà không đảm bảo giữ lại\}. Do not use for correctness-critical state — collection is nondeterministic \{Không dùng cho state quan trọng về correctness — collection không deterministic\}.
+
+### FinalizationRegistry \{FinalizationRegistry\}
+
+```js
+const registry = new FinalizationRegistry((heldValue) => {
+  // runs on a future turn, possibly much later — NOT a destructor
+  closeNativeHandle(heldValue);
+});
+
+registry.register(jsWrapper, nativeHandleId, jsWrapper);
+
+// when jsWrapper is collected, callback may run with heldValue
+```
+
+> **Caveats** \{Lưu ý\}: Finalizers may never run on fast tab close \{Finalizer có thể không bao giờ chạy khi đóng tab nhanh\}. They can run in arbitrary order \{Có thể chạy theo thứ tự bất kỳ\}. Never implement `close()`, `free()`, or UX-critical logic solely in a finalizer \{Không bao giờ implement `close()`, `free()`, hoặc logic UX quan trọng chỉ trong finalizer\}. Pair with explicit disposal \{Kết hợp với dispose tường minh\}.
+
+---
+
+## Diagnosing with Chrome DevTools \{Chẩn đoán bằng Chrome DevTools\}
+
+### Memory panel — heap snapshots \{Panel Memory — heap snapshot\}
+
+1. Open **DevTools → Memory** \{Mở **DevTools → Memory**\}
+2. Take a **Heap snapshot** (prefer "Summary" view first) \{Chụp **Heap snapshot** (ưu tiên view "Summary" trước)\}
+3. Filter by constructor (`Detached HTMLElement`, `(closure)`, `Array`, your class name) \{Lọc theo constructor (`Detached HTMLElement`, `(closure)`, `Array`, tên class của bạn)\}
+4. Inspect **Shallow size** vs **Retained size** \{Xem **Shallow size** vs **Retained size**\}
+
+| Metric | Meaning |
+| --- | --- |
+| **Shallow size** | Memory held by the object itself |
+| **Retained size** | Memory freed if *this* object were unreachable (includes dependents) |
+
+Click an instance → **Retainers** panel shows the **retainer path** up toward a root \{Click instance → panel **Retainers** hiện **retainer path** lên root\}. That path is your bug map \{Đường đó là bản đồ bug\}.
+
+### The three-snapshot technique \{Kỹ thuật ba snapshot\}
+
+For route-transition leaks \{Cho leak khi chuyển route\}:
+
+1. **Snapshot A** — baseline (home page settled) \{**Snapshot A** — baseline (home page ổn định)\}
+2. Perform action (open modal, navigate, repeat 5–10×) \{Thực hiện action (mở modal, navigate, lặp 5–10 lần)\}
+3. **Snapshot B** — peak \{**Snapshot B** — đỉnh\}
+4. Undo action (close modal, navigate back); force GC (trash icon in Memory panel) \{Hoàn tác (đóng modal, quay lại); force GC (icon thùng rác trong Memory panel)\}
+5. **Snapshot C** — after teardown + GC \{**Snapshot C** — sau teardown + GC\}
+6. Compare **C vs A** — look for objects that should not remain \{So **C vs A** — tìm object không nên còn\}
+
+In comparison mode, sort by **# Delta** or **Size Delta** \{Ở chế độ so sánh, sort theo **# Delta** hoặc **Size Delta**\}. `(closure)` growth tied to your component name is a smoking gun \{Tăng `(closure)` gắn tên component là dấu hiệu rõ\}.
+
+### Allocation instrumentation on timeline \{Allocation instrumentation trên timeline\}
+
+**Memory → Allocation instrumentation on timeline** records allocations over time \{**Memory → Allocation instrumentation on timeline** ghi allocation theo thời gian\}. Useful when you know *when* leak happens but not *what* \{Hữu ích khi biết *khi nào* leak xảy ra nhưng không biết *cái gì*\}. Narrow the blue allocation bars, inspect constructors in the bottom pane \{Thu hẹp thanh allocation xanh, xem constructor ở pane dưới\}.
+
+### Performance panel — memory track \{Panel Performance — memory track\}
+
+Record a Performance profile with **Memory** checked \{Ghi Performance profile với **Memory** được chọn\}. You see JS heap, DOM nodes, documents, and GPU memory (when applicable) correlated with Main thread activity \{Bạn thấy JS heap, DOM node, document, và GPU memory (nếu có) tương quan với hoạt động Main thread\}. Sawtooth that ratchets upward = leak or unbounded cache; tall vertical drops = GC pauses \{Răng cưa leo dần = leak hoặc cache không giới hạn; đỉnh thẳng đứng = GC pause\}.
+
+### `performance.memory` — dev-only caveats \{`performance.memory` — lưu ý chỉ dev\}
+
+```js
+if ('memory' in performance) {
+  // Chrome-only, non-standard, requires cross-origin isolation for some fields
+  const { usedJSHeapSize, totalJSHeapSize, jsHeapSizeLimit } = performance.memory;
+  console.log({ usedJSHeapSize, totalJSHeapSize, jsHeapSizeLimit });
+}
+```
+
+`performance.memory` is **not** available in all browsers and can be disabled \{`performance.memory` **không** có trên mọi browser và có thể bị tắt\}. Values are coarse and include engine internals you cannot attribute \{Giá trị thô và gồm phần nội bộ engine không thể gán nguồn\}. Use for rough local dashboards, not production SLAs \{Dùng cho dashboard local sơ bộ, không phải SLA production\}.
+
+---
+
+## Measuring in production (best-effort) \{Đo lường production (best-effort)\}
+
+### `measureUserAgentSpecificMemory()` \{`measureUserAgentSpecificMemory()`\}
+
+Chromium exposes **`performance.measureUserAgentSpecificMemory()`** — an async API that returns **breakdown** of memory attributed to your origin (with caveats) \{Chromium expose **`performance.measureUserAgentSpecificMemory()`** — API async trả **breakdown** bộ nhớ gán cho origin (có lưu ý)\}.
+
+Requirements and limits \{Yêu cầu và giới hạn\}:
+
+- Secure context (HTTPS) \{Secure context (HTTPS)\}
+- Cross-origin isolation (`Cross-Origin-Opener-Policy` + `Cross-Origin-Embedder-Policy`) for meaningful attribution in many setups \{Cross-origin isolation (`Cross-Origin-Opener-Policy` + `Cross-Origin-Embedder-Policy`) để attribution có nghĩa trong nhiều setup\}
+- Returns **approximate** bytes; throttle and batch calls \{Trả byte **xấp xỉ**; throttle và gom call\}
+- Not available in Safari/Firefox at time of writing — feature-detect \{Chưa có trên Safari/Firefox tại thời điểm viết — feature-detect\}
+
+```js
+async function sampleHeapBreakdown() {
+  if (!performance.measureUserAgentSpecificMemory) return null;
+
+  try {
+    const result = await performance.measureUserAgentSpecificMemory();
+    // result.bytes — total; result.breakdown — array of attribution entries
+    return result;
+  } catch (err) {
+    // throws if document is not ready or API constraints not met
+    console.warn('measureUserAgentSpecificMemory failed', err);
+    return null;
+  }
+}
+```
+
+Use this for **trend sampling** (e.g. p95 memory after session duration buckets), not per-navigation micro-metrics \{Dùng cho **lấy mẫu xu hướng** (vd p95 memory theo bucket thời lượng session), không phải micro-metric mỗi navigation\}. Pair with RUM signals you already trust: long task rate, crash rate, OOM reloads \{Kết hợp với tín hiệu RUM bạn đã tin: long task rate, crash rate, OOM reload\}.
+
+### What principal engineers instrument \{Principal engineer instrument gì\}
+
+| Signal | Production fit |
+| --- | --- |
+| Session duration vs crash/reload | High |
+| Long task / INP degradation over session time | High |
+| `measureUserAgentSpecificMemory` sampled | Medium (Chromium-only) |
+| `performance.memory` polling | Low (non-standard) |
+| Heap snapshots | Local/staging only |
+
+---
+
+## Leak-hunting workflow \{Quy trình săn leak\}
+
+```text
+  Reproduce → Bound scope → Snapshot diff → Read retainers → Fix → Verify
+      │            │              │              │           │        │
+      │            │              │              │           │        └─ 3-snapshot: C ≈ A
+      │            │              │              │           └─ remove edge / cleanup
+      │            │              │              └─ path to root (listener? map?)
+      │            │              └─ filter Detached / (closure) / yourClass
+      │            └─ one route, one modal, one feature flag
+      └─ incognito, extensions off, deterministic user script
+```
+
+### Step-by-step \{Từng bước\}
+
+1. **Reproduce deterministically** — write a 10-line Playwright or manual script; leaks are nondeterministic enough without chaos \{**Reproduce xác định** — viết script Playwright 10 dòng hoặc thủ công; leak đủ non-deterministic rồi, đừng thêm hỗn loạn\}
+2. **Isolate** — disable extensions; single tab; disable cache only if it confuses DOM bfcache (usually keep cache on for realism) \{**Cô lập** — tắt extension; một tab; chỉ tắt cache nếu làm rối DOM bfcache (thường giữ cache cho thực tế)\}
+3. **Capture** — three snapshots or timeline allocation around the suspect action \{**Chụp** — ba snapshot hoặc timeline allocation quanh action nghi ngờ\}
+4. **Identify constructor** — sort by retained size delta; do not chase 100 KB of `string` until you kill the 40 MB `(closure)` \{**Xác định constructor** — sort theo retained size delta; đừng đuổi 100 KB `string` trước khi xử lý `(closure)` 40 MB\}
+5. **Walk retainers** — the outermost unexpected frame is usually your code, not V8 internals \{**Duyệt retainers** — frame bất ngờ ngoài cùng thường là code bạn, không phải V8 internals\}
+6. **Fix and verify** — repeat snapshot C vs A; add a regression test that asserts listener count or mock bus unsubscribe if applicable \{**Sửa và verify** — lặp snapshot C vs A; thêm regression test assert listener count hoặc mock bus unsubscribe nếu có\}
+
+---
+
+## Prevention checklist for principal engineers \{Checklist phòng ngừa cho principal engineer\}
+
+### Design time \{Lúc thiết kế\}
+
+- Every long-lived registry (`Map`, event bus, singleton) gets an **eviction or weak-key policy** \{Mọi registry sống lâu (`Map`, event bus, singleton) có **chính sách eviction hoặc weak-key**\}
+- Side-effectful subscriptions declare **owner lifecycle** (who mounts, who disposes) \{Subscription có side-effect khai báo **lifecycle owner** (ai mount, ai dispose)\}
+- Large buffers pass through **narrow interfaces** — do not close over megabytes in UI callbacks \{Buffer lớn đi qua **interface hẹp** — không close over megabyte trong callback UI\}
+
+### Code review time \{Lúc code review\}
+
+- [ ] `addEventListener` / `on()` has symmetric remove / `AbortSignal` \{`addEventListener` / `on()` có remove đối xứng / `AbortSignal`\}
+- [ ] `setInterval` / `requestAnimationFrame` loops have teardown \{`setInterval` / `requestAnimationFrame` loop có teardown\}
+- [ ] Module caches bounded (LRU, TTL, max entries) \{Cache module có giới hạn (LRU, TTL, max entries)\}
+- [ ] React `useEffect` returns cleanup when touching external systems \{React `useEffect` return cleanup khi chạm hệ thống ngoài\}
+- [ ] Third-party widgets wrapped in adapter with `destroy()` \{Widget bên thứ ba bọc adapter có `destroy()`\}
+- [ ] No unbounded in-memory log buffers on `window` \{Không buffer log in-memory không giới hạn trên `window`\}
+
+### CI / staging \{CI / staging\}
+
+- Automated navigation soak (Playwright) + heap snapshot diff in CI nightly (Chromium job) \{Soak navigation tự động (Playwright) + diff heap snapshot trong CI nightly (job Chromium)\}
+- Bundle analysis for accidental **global** exports retaining graphs \{Phân tích bundle phát hiện export **global** vô tình giữ graph\}
+- Performance budget includes **post-GC heap** after scripted user journey \{Performance budget gồm **heap sau GC** sau user journey script\}
+
+---
+
+## Mental model summary \{Tóm tắt mental model\}
+
+Garbage collection reclaims **unreachable** objects, not **unused** ones \{GC thu hồi object **unreachable**, không phải **unused**\}. V8's generational collector makes short-lived allocation cheap but cannot save you from permanent roots \{Collector generational V8 làm allocation sống ngắn rẻ nhưng không cứu bạn khỏi root vĩnh viễn\}. Leaks in SPAs are almost always **forgotten edges**: listeners, timers, caches, closures, detached DOM \{Leak trong SPA hầu như luôn là **cạnh bị quên**: listener, timer, cache, closure, detached DOM\}.
+
+`WeakMap`/`WeakRef`/`FinalizationRegistry` help you align retention with object lifecycle — never as a substitute for explicit teardown \{`WeakMap`/`WeakRef`/`FinalizationRegistry` giúp căn retention với lifecycle object — không bao giờ thay teardown tường minh\}. Chrome DevTools retainer paths turn mystery growth into actionable fixes \{Retainer path Chrome DevTools biến tăng trưởng bí ẩn thành fix cụ thể\}. In production, sample coarse memory trends and treat leak fixes like any other perf regression: reproduce, measure, patch, guard \{Trong production, lấy mẫu xu hướng memory thô và xử lý fix leak như regression perf: reproduce, đo, patch, guard\}.
+
+If retained size after GC does not return to baseline when your feature tears down, you do not have a mystery — you have a reachability path waiting in the Retainers panel \{Nếu retained size sau GC không về baseline khi feature teardown, bạn không có bí ẩn — bạn có reachability path đang chờ trong panel Retainers\}.

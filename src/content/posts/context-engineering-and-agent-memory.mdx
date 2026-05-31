@@ -1,0 +1,377 @@
+---
+title: 'Context Engineering & Agent Memory — Packing the Window Without Losing the Thread'
+description: 'How senior engineers pack system prompts, tools, history, RAG, and output reserve into a fixed context window — and manage memory when the budget breaks.'
+pubDate: 2026-02-07
+tags: [ai, agents, context, memory, llm_10]
+draft: false
+---
+
+> Part 5 of the Building AI Agents series \{Phần 5\}. Previous \{Trước\}: [Stopping Criteria](/blog/llm-stopping-criteria-and-output-control/) · Next \{Tiếp\}: [Fine-tuning vs Prompting vs RAG](/blog/fine-tuning-vs-prompting-vs-rag/).
+
+Prompt engineering tells the model **what to do** \{Prompt engineering nói model **làm gì**\}. Sampling tells it **how creatively to answer** \{Sampling quyết định **trả lời sáng tạo đến mức nào**\}. Stopping criteria cap **how long it may run** \{Stopping criteria giới hạn **chạy bao lâu**\}. **Context engineering** is the skill that decides **what actually fits in the window** — and in what order — before any of those knobs matter \{**Context engineering** là kỹ năng quyết định **cái gì thực sự vừa window** — và theo thứ tự nào — trước khi các knob kia có ý nghĩa\}.
+
+If Part 1 taught you that tokens are RAM slots, this post teaches you how agents **allocate**, **evict**, and **retrieve** those slots under production pressure \{Nếu Phần 1 dạy token là ô RAM, bài này dạy agent **cấp phát**, **evict**, và **retrieve** các ô đó dưới áp lực production\}. Every multi-turn agent, every RAG pipeline, every tool-calling loop is ultimately a **context packing problem** \{Mọi agent multi-turn, mọi pipeline RAG, mọi vòng tool-calling cuối cùng đều là **bài toán pack context**\}.
+
+<iframe
+  src="/tools/context-window-demo/"
+  title="Context window packing interactive demo"
+  loading="lazy"
+  style="width:100%;height:720px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/context-window-demo/](/tools/context-window-demo/).
+
+---
+
+## The context window is working memory, not storage \{Context window là working memory, không phải storage\}
+
+An LLM has no persistent memory between API calls \{LLM không có persistent memory giữa các API call\}. Each request sends a fresh token sequence; the model attends to exactly what you provide \{Mỗi request gửi chuỗi token mới; model chỉ attend đúng những gì bạn cung cấp\}. That makes the context window the agent's **working memory** — volatile, size-capped, and shared by every competing concern \{Vì vậy context window là **working memory** của agent — volatile, giới hạn kích thước, và chia sẻ bởi mọi concern cạnh tranh\}.
+
+| Memory type | Where it lives | Lifetime | Agent pattern |
+| --- | --- | --- | --- |
+| **Short-term / working** | Context window (this request) | One inference call | Full conversation + tool results in prompt |
+| **Long-term** | External store (DB, vector index, file) | Persistent | Retrieve on demand, inject top-k into window |
+| **Episodic** | Session store + summarization | Session or user-scoped | Rolling summary + recent turns |
+| **Semantic** | Embeddings over documents | Persistent | RAG retrieval at query time |
+
+> **Design rule:** Treat the window as **cache**, not **database** \{**Quy tắc thiết kế:** Coi window như **cache**, không phải **database**\}.
+> Anything that must survive truncation belongs in external storage with a retrieval path \{Mọi thứ phải sống sót truncation thuộc external storage với đường retrieval\}.
+
+For token math and window sizing fundamentals, see [Tokens & Context Windows](/blog/ai-agents-tokens-and-context-windows/) — here we focus on **what to put in** and **what to drop** \{Về token math và window sizing, xem [Tokens & Context Windows](/blog/ai-agents-tokens-and-context-windows/) — ở đây tập trung **nhét gì vào** và **bỏ gì**\}.
+
+---
+
+## What consumes the budget: the packing list \{Cái gì tiêu budget: packing list\}
+
+Before you optimize, inventory every segment that lands in the prompt \{Trước khi optimize, kiểm kê mọi segment vào prompt\}. Agent prompts are rarely "just the user message" \{Prompt agent hiếm khi chỉ là "user message"\}.
+
+| Segment | Typical size | Stability | Notes |
+| --- | --- | --- | --- |
+| **System prompt** | 200–2,000 tokens | High | Persona, policies, output format, safety rules |
+| **Tool definitions** | 500–8,000+ tokens | High | JSON Schema / OpenAI function specs scale with tool count |
+| **Conversation history** | Unbounded | Low | Grows every turn; largest overflow source |
+| **Retrieved documents (RAG)** | 200–2,000 per chunk | Per-query | Top-k chunks × chunk size |
+| **Tool results / scratchpad** | Variable | Per-step | Raw JSON, logs, intermediate reasoning |
+| **Output reserve** | 256–8,192 tokens | Fixed policy | Space reserved for generation — not optional |
+
+```text
+┌────────────────────────────────────────────────────────────── context window ──┐
+│ SYSTEM │ TOOLS │ turn₁ │ turn₂ │ … │ RAG₁ │ RAG₂ │ … │ [OUTPUT RESERVE]     │
+└────────────────────────────────────────────────────────────────────────────────┘
+         ▲ stable prefix (cacheable)              ▲ volatile middle    ▲ reserved
+```
+
+### Reserve output budget first \{Reserve output budget trước\}
+
+A common production bug: pack input to 100% of the window, then the model truncates mid-generation or hits `max_tokens` with an incomplete tool call \{Bug production phổ biến: pack input 100% window, rồi model truncate giữa generation hoặc chạm `max_tokens` với tool call dở\}. **Always subtract output reserve before sizing input** \{**Luôn trừ output reserve trước khi size input**\}.
+
+```js
+const CONTEXT = 32_768;
+const OUTPUT_RESERVE = 2_048;
+const INPUT_BUDGET = CONTEXT - OUTPUT_RESERVE; // 30,720 tokens for everything else
+
+function fits(inputTokens) {
+  return inputTokens <= INPUT_BUDGET;
+}
+```
+
+If your agent emits long JSON tool arguments or chain-of-thought, the reserve must reflect worst-case output — not average \{Nếu agent emit JSON tool argument dài hoặc chain-of-thought, reserve phải phản ánh output worst-case — không phải trung bình\}.
+
+### Tool definitions are silent overhead \{Tool definitions là overhead âm thầm\}
+
+Ten well-documented tools can cost more tokens than the entire conversation \{Mười tool document kỹ có thể tốn nhiều token hơn cả conversation\}. Strategies:
+
+- **Tool routing** — classify intent first, inject only the 2–3 relevant tool schemas \{**Tool routing** — classify intent trước, inject chỉ 2–3 schema liên quan\}.
+- **Schema compression** — strip descriptions the model already knows; use `$ref` patterns \{**Schema compression** — bỏ mô tả model đã biết; dùng pattern `$ref`\}.
+- **Dynamic tool lists** — swap tool sets per workflow phase \{**Dynamic tool lists** — đổi tool set theo phase workflow\}.
+
+---
+
+## History management: when the conversation outgrows the window \{Quản lý history: khi conversation vượt window\}
+
+Multi-turn agents accumulate tokens linearly (or worse, if tool results are verbose) \{Agent multi-turn tích lũy token tuyến tính (hoặc tệ hơn nếu tool results dài)\}. When `sum(segments) > budget`, you need an explicit **eviction policy** — not hope the API silently truncates the right end \{Khi `sum(segments) > budget`, cần **eviction policy** rõ ràng — không hy vọng API âm thầm truncate đúng đầu\}.
+
+### 1. Truncation (drop oldest) \{Truncation (bỏ cũ nhất)\}
+
+Simplest strategy: keep system + tools + last N turns \{Chiến lược đơn giản nhất: giữ system + tools + N turn cuối\}. Fast, deterministic, but you lose early context — user preferences stated in turn 1 vanish \{Nhanh, deterministic, nhưng mất context sớm — preference user nói ở turn 1 biến mất\}.
+
+```js
+function truncateOldest(turns, maxTurns) {
+  return turns.slice(-maxTurns);
+}
+```
+
+Use when: short tasks, stateless Q&A, or when critical facts are re-retrieved from long-term memory \{Dùng khi: task ngắn, Q&A stateless, hoặc fact quan trọng được re-retrieve từ long-term memory\}.
+
+### 2. Rolling window with token cap \{Rolling window với token cap\}
+
+Instead of a turn count, cap by **tokens** — drop oldest messages until under budget \{Thay vì đếm turn, cap theo **token** — bỏ message cũ nhất đến khi dưới budget\}.
+
+```js
+function rollingWindow(turns, tokenBudget, countTokens) {
+  const kept = [];
+  let used = 0;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = countTokens(turns[i]);
+    if (used + t > tokenBudget) break;
+    kept.unshift(turns[i]);
+    used += t;
+  }
+  return kept;
+}
+```
+
+Prefer token cap over turn cap — one turn with a 4K tool result can blow a "last 10 turns" policy \{Ưu tiên token cap hơn turn cap — một turn với tool result 4K có thể phá policy "10 turn cuối"\}.
+
+### 3. Summarization / compaction \{Summarization / compaction\}
+
+Replace older turns with a compressed summary \{Thay turn cũ bằng summary nén\}. Typical pattern: every K turns or when history exceeds 60% of input budget, call a cheap/fast model to summarize \{Pattern thường gặp: mỗi K turn hoặc khi history vượt 60% input budget, gọi model rẻ/nhanh để summarize\}.
+
+```text
+[SYSTEM][TOOLS][SUMMARY of turns 1–18][turn 19][turn 20][RAG][user msg]
+```
+
+Trade-offs \{Trade-off\}:
+
+- **Pros** — retains semantic thread; smaller than raw history \{**Ưu** — giữ thread ngữ nghĩa; nhỏ hơn history thô\}.
+- **Cons** — summary latency + cost; risk of dropping nuance (IDs, exact quotes, user corrections) \{**Nhược** — latency + cost summary; rủi ro mất chi tiết (ID, quote chính xác, correction user)\}.
+
+> **Production tip:** Store the raw transcript externally; the summary is a **lossy cache** you can regenerate \{**Tip production:** Lưu transcript thô bên ngoài; summary là **cache lossy** có thể regenerate\}.
+
+### 4. Hierarchical memory \{Hierarchical memory\}
+
+Structure memory in layers \{Cấu trúc memory theo lớp\}:
+
+1. **Working** — last 2–4 turns verbatim in the window \{**Working** — 2–4 turn cuối nguyên văn trong window\}.
+2. **Session summary** — compact paragraph updated each compaction cycle \{**Session summary** — đoạn compact cập nhật mỗi chu kỳ compaction\}.
+3. **Long-term facts** — vector store or key-value (user prefs, project IDs) retrieved per turn \{**Long-term facts** — vector store hoặc key-value (pref user, project ID) retrieve mỗi turn\}.
+
+```json
+{
+  "working": ["turn_19", "turn_20"],
+  "session_summary": "User is debugging CORS on api.example.com. Prefers curl examples.",
+  "long_term": ["user_id: 42", "preferred_language: vi"]
+}
+```
+
+This mirrors how human engineers keep a sticky note (summary), open files (working), and a wiki (long-term) \{Giống cách engineer giữ sticky note (summary), file đang mở (working), và wiki (long-term)\}.
+
+---
+
+## Retrieval injection: RAG without duplicating the deep dive \{Retrieval injection: RAG không lặp deep dive\}
+
+RAG adds retrieved chunks to the prompt at query time \{RAG thêm chunk retrieve vào prompt lúc query\}. From a context-engineering lens, the decisions are:
+
+| Decision | Question |
+| --- | --- |
+| **How many chunks (k)?** | More recall vs. less room for history |
+| **Chunk size** | Larger context per doc vs. more docs |
+| **Ordering** | Where in the window — start, middle, or end? |
+| **Deduplication** | Overlapping chunks waste tokens |
+| **Re-ranking threshold** | Drop low-score chunks before injection |
+
+For embedding models, indexing, and chunking strategies, see [Vector Embeddings Deep Dive](/blog/vector-embeddings-deep-dive/) and [RAG: Retrieval-Augmented Generation Guide](/blog/rag-retrieval-augmented-generation-guide/) — this series assumes you know **how to retrieve** and focuses on **how to pack what you retrieved** \{Về embedding, indexing, chunking, xem [Vector Embeddings Deep Dive](/blog/vector-embeddings-deep-dive/) và [RAG Guide](/blog/rag-retrieval-augmented-generation-guide/) — loạt bài này giả định bạn biết **cách retrieve** và tập trung **cách pack phần đã retrieve**\}.
+
+```js
+function injectRag(promptParts, chunks, maxRagTokens, countTokens) {
+  const ranked = [...chunks].sort((a, b) => b.score - a.score);
+  const selected = [];
+  let used = 0;
+  for (const c of ranked) {
+    const t = countTokens(c.text);
+    if (used + t > maxRagTokens) continue;
+    if (c.score < 0.5) continue; // drop low-confidence
+    selected.push(c);
+    used += t;
+  }
+  return { ...promptParts, rag: selected };
+}
+```
+
+**Token-aware retrieval** — pass `maxRagTokens` into your retriever pipeline so you fetch fewer, higher-quality chunks instead of retrieving 20 and truncating 15 \{**Token-aware retrieval** — truyền `maxRagTokens` vào pipeline retriever để lấy ít chunk chất lượng cao thay vì retrieve 20 rồi truncate 15\}.
+
+---
+
+## Lost in the middle: positional attention degradation \{Lost in the middle: suy giảm attention theo vị trí\}
+
+Research and production experience show LLMs often **under-utilize information placed in the middle** of long contexts \{Nghiên cứu và kinh nghiệm production cho thấy LLM thường **dùng kém thông tin ở giữa** context dài\}. Attention is not uniform across positions — beginnings (system, initial instructions) and endings (latest user message, recent tool output) get disproportionate weight \{Attention không đều theo vị trí — đầu (system, instruction ban đầu) và cuối (user message mới nhất, tool output gần) được trọng số cao hơn\}.
+
+```text
+Attention strength (illustrative)
+  ▲
+  │ ████                              ████
+  │ ████                              ████
+  │ ████        ░░░░                  ████
+  └──────────────────────────────────────────► position
+    system/tools              RAG/old turns    latest user
+```
+
+Practical ordering strategies \{Chiến lược sắp xếp thực tế\}:
+
+1. **System + critical policies** — always at the start \{**System + policy quan trọng** — luôn ở đầu\}.
+2. **Tool definitions** — immediately after system (stable prefix) \{**Tool definitions** — ngay sau system (stable prefix)\}.
+3. **Retrieved docs** — prefer **after** recent history or interleave highest-score chunk **last** before the user message \{**Retrieved docs** — ưu tiên **sau** history gần hoặc interleave chunk score cao nhất **cuối** trước user message\}.
+4. **Latest user message** — always at the end \{**User message mới nhất** — luôn ở cuối\}.
+5. **Re-state the task** — one-line reminder after RAG: "Using the documents above, answer: …" \{**Nhắc lại task** — một dòng sau RAG: "Using the documents above, answer: …"\}.
+
+> **Anti-pattern:** Dump 8 RAG chunks between system prompt and user question, then wonder why the model ignores chunk 4 \{**Anti-pattern:** Nhét 8 chunk RAG giữa system prompt và câu hỏi user, rồi thắc mắc vì sao model bỏ qua chunk 4\}.
+
+---
+
+## Context rot: when more history makes answers worse \{Context rot: khi thêm history làm câu trả lời tệ hơn\}
+
+**Context rot** is the phenomenon where answer quality **degrades** as you fill the window — even before hard truncation \{**Context rot** là hiện tượng chất lượng câu trả lời **suy giảm** khi lấp window — kể cả trước hard truncation\}. Causes include:
+
+- **Distraction** — irrelevant old turns compete with the current task \{**Distraction** — turn cũ không liên quan cạnh tranh với task hiện tại\}.
+- **Contradiction** — outdated instructions in early turns conflict with later corrections \{**Contradiction** — instruction cũ mâu thuẫn correction sau\}.
+- **Middle-position decay** — facts buried mid-context are ignored \{**Middle-position decay** — fact chôn giữa context bị bỏ qua\}.
+- **Tool noise** — verbose stderr logs from turn 3 still in context at turn 30 \{**Tool noise** — log stderr dài từ turn 3 vẫn còn ở turn 30\}.
+
+Mitigations \{Cách giảm thiểu\}:
+
+| Symptom | Fix |
+| --- | --- |
+| Model repeats old wrong answers | Compact or drop pre-correction turns |
+| Ignores retrieved docs | Move top chunk closer to user message |
+| Forgets tool result | Re-inject critical tool output in latest turn |
+| Slow + expensive | Aggressive compaction; smaller k for RAG |
+
+Measure rot with **needle-in-haystack evals** — hide a fact at various depths and test recall rate \{Đo rot bằng **needle-in-haystack eval** — giấu fact ở các độ sâu khác nhau và test recall rate\}.
+
+---
+
+## Prompt caching and stable prefixes \{Prompt caching và stable prefix\}
+
+Providers like Anthropic and OpenAI offer **prompt caching** — repeated identical prefixes skip re-computation, cutting latency and cost \{Provider như Anthropic và OpenAI có **prompt caching** — prefix giống hệt lặp lại bỏ qua re-computation, giảm latency và cost\}. Cache hits require a **byte-identical stable prefix** \{Cache hit cần **stable prefix byte-identical**\}.
+
+Design your pack order for cacheability \{Thiết kế thứ tự pack để cache được\}:
+
+```text
+[CACHEABLE — never change mid-session]
+  system prompt
+  tool definitions (same set per session)
+  static few-shot examples
+
+[VOLATILE — changes every turn]
+  session summary
+  RAG chunks
+  conversation tail
+  user message
+```
+
+**Do not** inject timestamps, random IDs, or per-turn metadata into the system block — it busts the cache for the entire prefix \{**Đừng** inject timestamp, random ID, hoặc metadata per-turn vào system block — nó bust cache cho cả prefix\}.
+
+| Segment | Cache-friendly? |
+| --- | --- |
+| Static system prompt | Yes |
+| Tool schemas (fixed set) | Yes |
+| Session summary (updated often) | No — keep out of cached block |
+| RAG chunks | No |
+| Latest user turn | No |
+
+---
+
+## Cost and latency tradeoffs \{Trade-off cost và latency\}
+
+Every token has a price and a time cost \{Mỗi token có giá và cost thời gian\}. Context engineering is where **performance engineering meets ML** \{Context engineering là nơi **performance engineering gặp ML**\}.
+
+| Strategy | Latency impact | Cost impact | Quality impact |
+| --- | --- | --- | --- |
+| Full history, no compaction | High (long prefill) | High input tokens | Best short-term recall |
+| Rolling truncation | Low | Medium | Loses early context |
+| Summarization | +1 LLM call per cycle | Summary tokens + call | Good balance |
+| Smaller k RAG | Low | Low | Risk missing relevant docs |
+| Prompt caching | Lower prefill on hit | 50–90% off cached prefix | Neutral |
+| Smaller model for summary | Low | Much lower | Summary may lose detail |
+
+```text
+Agent turn cost ≈ input_tokens × input_price
+               + output_tokens × output_price
+               + retrieval_latency
+               + (optional) summarization_call
+```
+
+For a 32K-window agent at $3/M input tokens, shaving 8K tokens of redundant history saves **$0.024 per call** — trivial once, material at 100K calls/day \{Với agent window 32K ở $3/M input token, bỏ 8K token history thừa tiết kiệm **$0.024 mỗi call** — nhỏ một lần, đáng kể ở 100K call/ngày\}.
+
+---
+
+## A production packing algorithm \{Thuật toán pack production\}
+
+Putting it together — a reference flow you can adapt \{Tổng hợp — flow tham chiếu có thể adapt\}:
+
+```js
+async function buildAgentContext(session, userMessage, config) {
+  const { contextSize, outputReserve, maxRagTokens, maxHistoryTokens } = config;
+  const inputBudget = contextSize - outputReserve;
+
+  const system = session.systemPrompt;
+  const tools = selectToolsForIntent(userMessage, session.toolCatalog);
+  let history = session.turns;
+
+  // 1. Retrieve long-term + RAG
+  const facts = await session.longTermStore.getRelevant(session.userId, userMessage);
+  const ragChunks = await session.retriever.search(userMessage, { limit: 20 });
+
+  // 2. Compact history if needed
+  const fixedCost = countTokens(system) + countTokens(tools) + countTokens(facts);
+  const ragSelected = packRag(ragChunks, maxRagTokens);
+  const historyBudget = inputBudget - fixedCost - countTokens(ragSelected);
+
+  if (countTokens(history) > historyBudget) {
+    if (historyBudget > 800) {
+      history = await compactHistory(history, historyBudget);
+    } else {
+      history = rollingWindow(history, historyBudget, countTokens);
+    }
+  }
+
+  // 3. Order for attention + caching
+  return assemblePrompt({
+    system,
+    tools,
+    facts,
+    history,
+    rag: orderRagForAttention(ragSelected),
+    userMessage, // always last
+  });
+}
+```
+
+Checklist before shipping \{Checklist trước khi ship\}:
+
+- [ ] Output reserve subtracted from input budget
+- [ ] Token counting uses the **production tokenizer**, not chars ÷ 4
+- [ ] Eviction policy is explicit (truncate / compact / hierarchical)
+- [ ] RAG k and chunk size tuned to remaining budget
+- [ ] Critical facts not only in middle-position RAG
+- [ ] Stable prefix designed for prompt caching
+- [ ] Raw transcript persisted externally for audit and re-summarization
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+1. **Context engineering is the core agent skill** — it decides what the model can see, remember, and act on \{**Context engineering là kỹ năng agent cốt lõi** — quyết định model thấy, nhớ, và hành động trên gì\}.
+2. **Working memory ≠ long-term memory** — the window is a cache; persist externally and retrieve selectively \{**Working memory ≠ long-term memory** — window là cache; persist bên ngoài và retrieve có chọn lọc\}.
+3. **Reserve output tokens first** — input and output share one budget \{**Reserve output token trước** — input và output dùng chung một budget\}.
+4. **History needs an eviction policy** — truncation, rolling window, summarization, or hierarchy; never silent overflow \{**History cần eviction policy** — truncation, rolling window, summarization, hoặc hierarchy; không overflow âm thầm\}.
+5. **Position matters** — lost-in-the-middle means ordering is as important as retrieval quality \{**Vị trí quan trọng** — lost-in-the-middle nghĩa là ordering quan trọng ngang retrieval quality\}.
+6. **Context rot is real** — more tokens can mean worse answers; measure and compact \{**Context rot có thật** — nhiều token có thể nghĩa là câu trả lời tệ hơn; đo và compact\}.
+7. **Design for caching** — stable system + tools prefix saves latency and money at scale \{**Thiết kế cho caching** — prefix system + tools ổn định tiết kiệm latency và tiền ở scale\}.
+
+Use the demo above to stress-test packing decisions before they hit production traffic \{Dùng demo trên để stress-test quyết định pack trước khi lên production traffic\}. Next in the series: when context engineering is not enough — **Fine-tuning vs Prompting vs RAG** \{Tiếp theo trong loạt bài: khi context engineering chưa đủ — **Fine-tuning vs Prompting vs RAG**\}.
+
+---
+
+## The Building AI Agents series \{Loạt bài Building AI Agents\}
+
+1. [Tokens & Context Windows](/blog/ai-agents-tokens-and-context-windows/)
+2. [Sampling: temperature, top_p, top_k](/blog/llm-sampling-temperature-top-p-top-k/)
+3. [Prompt Engineering for Agents](/blog/prompt-engineering-for-agents/)
+4. [Stopping Criteria & Output Control](/blog/llm-stopping-criteria-and-output-control/)
+5. **[Context Engineering & Memory](/blog/context-engineering-and-agent-memory/)**
+6. [Fine-tuning vs Prompting vs RAG](/blog/fine-tuning-vs-prompting-vs-rag/)
+7. [Evaluating LLMs & Agents](/blog/evaluating-llms-and-agents/)
+8. [Choosing a Model](/blog/choosing-an-llm-model-framework/)
+9. [Function Calling & Tool Use](/blog/function-calling-and-tool-use/)
+10. [Agent Patterns: ReAct, Reflection, Planning](/blog/agent-design-patterns-react-reflection-planning/)

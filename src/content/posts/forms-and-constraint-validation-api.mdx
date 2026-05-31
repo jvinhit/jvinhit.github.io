@@ -1,0 +1,414 @@
+---
+title: 'Forms & the Constraint Validation API — Native Validation Done Right'
+description: 'Native HTML form validation deep-dive: ValidityState, setCustomValidity, async/cross-field patterns, ARIA errors, FormData — and why the server always wins.'
+pubDate: 2025-11-10
+tags: [javascript, forms, validation, accessibility, js_10]
+draft: false
+---
+
+## Why Native Validation Still Matters \{Tại sao validation native vẫn quan trọng\}
+
+Every signup flow, checkout form, and settings panel ends up validating user input \{Mọi luồng đăng ký, form checkout, và panel cài đặt đều phải validate input của user\}. Teams often reach for **React Hook Form**, **Zod**, or **Yup** first \{Team thường chọn **React Hook Form**, **Zod**, hoặc **Yup** trước\} — and those are excellent for complex apps \{và chúng rất tốt cho app phức tạp\}. But the browser already ships a **Constraint Validation API** \{Nhưng browser đã có sẵn **Constraint Validation API**\} that handles the boring 80%: required fields, email format, min/max length, pattern matching, and custom errors \{xử lý 80% việc nhàm chán: field bắt buộc, định dạng email, độ dài min/max, pattern, và lỗi tuỳ chỉnh\}.
+
+Understanding the native layer makes your library-based validation **better** \{Hiểu tầng native giúp validation dựa thư viện **tốt hơn\}: you know what the browser already enforces, what `:user-invalid` gives you for free, and how to wire accessible error messages without reinventing the wheel \{bạn biết browser đã enforce gì, `:user-invalid` cho bạn miễn phí gì, và cách gắn thông báo lỗi accessible mà không phát minh lại bánh xe\}.
+
+> **Progressive enhancement rule** \{Quy tắc progressive enhancement\}: client validation is **UX**, not security \{validation phía client là **UX**, không phải bảo mật\}. The server must always re-validate \{Server luôn phải validate lại\}. Never trust `FormData` from the wire \{Không bao giờ tin `FormData` từ mạng\}.
+
+---
+
+## HTML Constraint Attributes \{Thuộc tính ràng buộc HTML\}
+
+Browsers evaluate constraints **declaratively** on `<input>`, `<select>`, and `<textarea>` \{Browser đánh giá ràng buộc **khai báo** trên `<input>`, `<select>`, và `<textarea>`\}. You don't write regex for "is this an email?" — you set `type="email"` \{Bạn không viết regex cho "có phải email không?" — bạn đặt `type="email"`\}.
+
+| Attribute \{Thuộc tính\} | What it checks \{Kiểm tra gì\} | Example \{Ví dụ\} |
+|---|---|---|
+| `required` | Non-empty value \{Giá trị không rỗng\} | `<input required>` |
+| `type` | Format by input type \{Định dạng theo loại input\} | `email`, `url`, `number`, `date` |
+| `pattern` | Regex match \{Khớp regex\} | `pattern="[a-zA-Z0-9_]+"` |
+| `minlength` / `maxlength` | String length \{Độ dài chuỗi\} | `minlength="8"` |
+| `min` / `max` / `step` | Numeric/date bounds \{Giới hạn số/ngày\} | `min="0" max="100" step="5"` |
+
+```html
+<form>
+  <input name="username" required minlength="3" maxlength="20"
+         pattern="[a-zA-Z0-9_]+"
+         title="Letters, numbers, underscores only" />
+
+  <input name="email" type="email" required autocomplete="email" />
+
+  <input name="age" type="number" min="13" max="120" required />
+
+  <input name="password" type="password" required minlength="8"
+         autocomplete="new-password" />
+</form>
+```
+
+The `title` attribute on `pattern` fields becomes the default `validationMessage` in some browsers \{Thuộc tính `title` trên field `pattern` trở thành `validationMessage` mặc định ở một số browser\} — but you should override it in JS for consistent copy \{nhưng bạn nên ghi đè trong JS để copy nhất quán\}.
+
+### `novalidate` — when you take the wheel \{`novalidate` — khi bạn lái\}
+
+Add `novalidate` to `<form>` when you want **custom timing and messaging** \{Thêm `novalidate` vào `<form>` khi bạn muốn **thời điểm và thông báo tuỳ chỉnh**\} but still use the Constraint Validation API programmatically \{nhưng vẫn dùng Constraint Validation API theo code\}:
+
+```html
+<!-- Browser won't show native popup; you call reportValidity() yourself -->
+<!-- {Browser không hiện popup native; bạn tự gọi reportValidity()} -->
+<form id="signup" novalidate>...</form>
+```
+
+Without `novalidate`, the first failed `submit` shows the browser's built-in bubble \{Không có `novalidate`, lần `submit` fail đầu tiên hiện bubble built-in của browser\} — hard to style, inconsistent across engines, and poor for screen readers \{khó style, không nhất quán giữa engine, và kém cho screen reader\}.
+
+---
+
+## The Constraint Validation API \{Constraint Validation API\}
+
+Every form control that supports validation exposes two key properties \{Mọi form control hỗ trợ validation expose hai thuộc tính quan trọng\}:
+
+- **`validity`** — a read-only `ValidityState` object with boolean flags \{một object `ValidityState` read-only với các cờ boolean\}
+- **`validationMessage`** — a human-readable string (empty when valid) \{chuỗi human-readable (rỗng khi hợp lệ)\}
+
+And four methods \{Và bốn method\}:
+
+| Method \{Method\} | Purpose \{Mục đích\} |
+|---|---|
+| `checkValidity()` | Returns `true`/`false`; fires `invalid` event on failure \{Trả `true`/`false`; fire event `invalid` khi fail\} |
+| `reportValidity()` | Like `checkValidity()` + shows native UI (if not `novalidate`) \{Giống `checkValidity()` + hiện UI native (nếu không `novalidate`)\} |
+| `setCustomValidity(msg)` | Set or clear a custom error \{Đặt hoặc xoá lỗi tuỳ chỉnh\} |
+| `willValidate` | Whether the element participates in constraint validation \{Element có tham gia constraint validation không\} |
+
+### `ValidityState` flags \{Các cờ `ValidityState`\}
+
+```js
+const input = document.querySelector("#email");
+const v = input.validity;
+
+console.log({
+  valueMissing: v.valueMissing,     // required + empty {required + rỗng}
+  typeMismatch: v.typeMismatch,     // type="email" but not an email {type email nhưng không phải email}
+  patternMismatch: v.patternMismatch,
+  tooShort: v.tooShort,
+  tooLong: v.tooLong,
+  rangeUnderflow: v.rangeUnderflow, // below min {dưới min}
+  rangeOverflow: v.rangeOverflow,
+  stepMismatch: v.stepMismatch,
+  badInput: v.badInput,             // unparseable number/date {số/ngày không parse được}
+  customError: v.customError,       // setCustomValidity() was called {setCustomValidity() đã gọi}
+  valid: v.valid,                   // true only when ALL flags are false {true chỉ khi MỌI cờ false}
+});
+```
+
+Use flags — not string-matching `validationMessage` — to pick user-facing copy \{Dùng cờ — không match chuỗi `validationMessage` — để chọn copy hiển thị\}:
+
+```js
+function messageFor(input) {
+  const v = input.validity;
+  if (v.valueMissing) return "This field is required.";
+  if (v.typeMismatch && input.type === "email") return "Enter a valid email.";
+  if (v.tooShort) return `At least ${input.minLength} characters.`;
+  if (v.customError) return input.validationMessage;
+  return "";
+}
+```
+
+### `setCustomValidity` — the escape hatch \{`setCustomValidity` — lối thoát\}
+
+HTML attributes can't express **"passwords must match"** or **"username is taken"** \{Attribute HTML không diễn tả được **"password phải khớp"** hay **"username đã bị lấy"**\}. `setCustomValidity()` fills that gap \{`setCustomValidity()` lấp khoảng trống đó\}:
+
+```js
+// Clear custom error first — stale messages persist otherwise
+// {Xoá lỗi custom trước — message cũ sẽ tồn tại nếu không}
+confirmInput.setCustomValidity("");
+
+if (passwordInput.value !== confirmInput.value) {
+  confirmInput.setCustomValidity("Passwords do not match.");
+}
+```
+
+**Critical rule**: pass an **empty string** to clear \{Quy tắc quan trọng\}: pass **chuỗi rỗng** để xoá\}. A non-empty string sets `customError: true` and `valid: false` \{Chuỗi không rỗng đặt `customError: true` và `valid: false`\}.
+
+---
+
+## Live Demo \{Demo trực tiếp\}
+
+The demo below is a full signup form \{Demo dưới là form đăng ký đầy đủ\}: native constraints, cross-field password match, simulated async username check, blur/submit timing, inline ARIA errors, a live `ValidityState` inspector, and a `FormData` preview \{constraint native, khớp password cross-field, kiểm tra username async giả lập, timing blur/submit, lỗi ARIA inline, inspector `ValidityState` live, và preview `FormData`\}.
+
+<iframe
+  src="/tools/js-form-validation-demo/"
+  title="Forms and constraint validation interactive demo"
+  loading="lazy"
+  style="width:100%;height:720px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/js-form-validation-demo/](/tools/js-form-validation-demo/).
+
+---
+
+## Cross-Field Validation \{Validation cross-field\}
+
+Password confirmation is the canonical example \{Xác nhận password là ví dụ kinh điển\}. Neither field's HTML attributes alone can compare values \{Không attribute HTML nào so sánh giá trị hai field\}. The pattern:
+
+1. On every validation pass, **reset** custom validity on both fields \{Mỗi lần validate, **reset** custom validity trên cả hai field\}
+2. Compare values; call `setCustomValidity` on the failing field \{So sánh giá trị; gọi `setCustomValidity` trên field lỗi\}
+3. Re-run `checkValidity()` or your display logic \{Chạy lại `checkValidity()` hoặc logic hiển thị của bạn\}
+
+```js
+function syncPasswordMatch() {
+  const pw = passwordInput.value;
+  const confirm = confirmInput.value;
+
+  passwordInput.setCustomValidity("");
+  confirmInput.setCustomValidity("");
+
+  if (confirm && pw !== confirm) {
+    confirmInput.setCustomValidity("Passwords do not match.");
+  }
+}
+
+passwordInput.addEventListener("input", () => {
+  if (confirmInput.dataset.liveAfterError === "true") syncPasswordMatch();
+});
+confirmInput.addEventListener("blur", syncPasswordMatch);
+```
+
+Validate the **dependent field** (confirm), not just the source \{Validate **field phụ thuộc** (confirm), không chỉ nguồn\}. Users tab from password → confirm; the error should appear on confirm when they leave it \{User tab từ password → confirm; lỗi nên hiện trên confirm khi họ rời field\}.
+
+---
+
+## Async Validation Done Right \{Async validation làm đúng\}
+
+Username availability, email uniqueness, VAT number lookup — these need a server round-trip \{Kiểm tra username, email trùng, tra cứu mã VAT — cần round-trip server\}. Common mistakes \{Lỗi phổ biến\}:
+
+| Pitfall \{Cạm bẫy\} | Fix \{Sửa\} |
+|---|---|
+| Validating on every keystroke \{Validate mỗi keystroke\} | Debounce; validate on **blur** first \{Debounce; validate **blur** trước\} |
+| Race conditions (slow response overwrites fast) \{Race condition (response chậm ghi đè nhanh)\} | Abort token / increment request ID \{Token abort / tăng request ID\} |
+| Blocking submit while "checking…" \{Chặn submit khi "đang kiểm tra…"\} | Disable submit OR show spinner; re-check on submit \{Disable submit HOẶC spinner; kiểm tra lại khi submit\} |
+| Using `alert()` for errors \{Dùng `alert()` cho lỗi\} | Inline message + `aria-live` \{Thông báo inline + `aria-live`\} |
+
+```js
+let abortToken = null;
+
+async function checkUsername(name) {
+  const token = { aborted: false };
+  abortToken = token;
+
+  statusEl.textContent = "Checking…";
+  submitBtn.disabled = true;
+
+  await new Promise((r) => setTimeout(r, 600)); // simulated fetch {fetch giả lập}
+
+  if (token.aborted) return;
+
+  submitBtn.disabled = false;
+  usernameInput.setCustomValidity("");
+
+  if (takenSet.has(name.toLowerCase())) {
+    usernameInput.setCustomValidity("Username is already taken.");
+    statusEl.textContent = "✗ Taken";
+  } else {
+    statusEl.textContent = "✓ Available";
+  }
+
+  showError(usernameInput);
+}
+```
+
+On **submit**, always await pending async checks before calling `form.checkValidity()` \{Khi **submit**, luôn await async check đang chờ trước khi gọi `form.checkValidity()`\}. A user can blur username and immediately hit Enter \{User có thể blur username rồi ngay lập tức Enter\}.
+
+---
+
+## When to Validate — Timing That Feels Right \{Khi nào validate — timing cảm giác đúng\}
+
+Aggressive "validate on every keypress from page load" feels hostile \{Validate mỗi keypress ngay từ load trang cảm giác hostile\}. The pattern senior teams use \{Pattern team senior dùng\}:
+
+```text
+Phase 1 — pristine:     no errors shown while user types first time
+Phase 2 — touched:      validate on blur (field lost focus)
+Phase 3 — live:         after first error, re-validate on input (error clears as they fix)
+Phase 4 — submit:       validate ALL fields; focus first error
+```
+
+```js
+const state = { touched: false, liveAfterError: false };
+
+input.addEventListener("blur", () => {
+  state.touched = true;
+  validate(input);
+});
+
+input.addEventListener("input", () => {
+  if (state.liveAfterError) validate(input);
+});
+
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  state.liveAfterError = true;
+  if (!form.checkValidity()) {
+    focusFirstInvalid(form);
+    return;
+  }
+  // proceed {tiếp tục}
+});
+```
+
+This maps cleanly to `:user-invalid` in CSS \{Map gọn với `:user-invalid` trong CSS\} — the pseudo-class only applies **after** the user has interacted \{pseudo-class chỉ áp dụng **sau** khi user tương tác\}, so empty required fields aren't red on first paint \{nên field required rỗng không đỏ ngay lần render đầu\}.
+
+---
+
+## CSS: `:invalid` vs `:user-invalid` \{CSS: `:invalid` vs `:user-invalid`\}
+
+| Selector \{Selector\} | When it matches \{Khi nào khớp\} |
+|---|---|
+| `:invalid` | Any time constraints fail — **including untouched empty required** \{Bất cứ lúc nào constraint fail — **kể cả required rỗng chưa chạm**\} |
+| `:user-invalid` | After user interaction (focus + blur, or submit attempt) \{Sau tương tác user (focus + blur, hoặc thử submit)\} |
+
+```css
+/* Don't do this — empty required fields flash red on load */
+/* {Đừng làm — field required rỗng đỏ ngay khi load} */
+input:invalid { border-color: red; }
+
+/* Better — only show error styling after interaction */
+/* {Tốt hơn — chỉ style lỗi sau tương tác} */
+input:user-invalid {
+  border-color: var(--color-error);
+}
+
+input:user-valid:not(:placeholder-shown) {
+  border-color: var(--color-success);
+}
+```
+
+`:user-valid` is the symmetric counterpart \{`:user-valid` là đối trọng tương ứng\}. Support is solid in modern browsers; fall back to a `.is-invalid` class from JS if needed \{Hỗ trợ tốt trên browser hiện đại; fallback class `.is-invalid` từ JS nếu cần\}.
+
+---
+
+## Accessible Error Messages \{Thông báo lỗi accessible\}
+
+Native validation popups are not accessible enough for production UX \{Popup validation native không đủ accessible cho UX production\}. Wire errors explicitly \{Gắn lỗi rõ ràng\}:
+
+### `aria-invalid` + `aria-describedby`
+
+```html
+<input
+  id="email"
+  type="email"
+  required
+  aria-describedby="email-error"
+  aria-invalid="false"
+/>
+<p id="email-error" role="alert"></p>
+```
+
+```js
+function showError(input, message) {
+  const errorEl = document.getElementById(input.getAttribute("aria-describedby"));
+  errorEl.textContent = message;
+  input.setAttribute("aria-invalid", message ? "true" : "false");
+}
+```
+
+`role="alert"` on the error element announces changes immediately \{`role="alert"` trên element lỗi announce thay đổi ngay\}. For form-level summaries ("3 errors found"), use `aria-live="polite"` on a status region \{Cho tóm tắt cấp form ("3 lỗi"), dùng `aria-live="polite"` trên vùng status\}.
+
+After a failed submit, move focus to the **first invalid field** and announce via an `aria-live` region \{Sau submit fail, chuyển focus tới **field invalid đầu tiên** và announce qua vùng `aria-live`\}. Pair color with visible text — WCAG requires more than red borders alone \{Kết hợp màu với chữ hiển thị — WCAG yêu cầu hơn viền đỏ\}.
+
+---
+
+## `FormData`, Serialization & Submit \{`FormData`, serialize & submit\}
+
+### Building the payload
+
+```js
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (!form.checkValidity()) return;
+
+  const fd = new FormData(form);
+
+  // Object for JSON APIs {Object cho JSON API}
+  const body = Object.fromEntries(fd.entries());
+
+  // Or send as multipart (file uploads) {Hoặc gửi multipart (upload file)}
+  await fetch("/api/signup", { method: "POST", body: fd });
+
+  // Or URL-encoded {Hoặc URL-encoded}
+  await fetch("/api/signup", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(fd).toString(),
+  });
+});
+```
+
+`FormData` only includes **successful** controls (name + non-disabled + inside form) \{`FormData` chỉ gồm control **thành công** (có name + không disabled + trong form)\}. Unchecked checkboxes and unselected radio buttons are omitted \{Checkbox không tick và radio không chọn bị bỏ qua\} — handle defaults server-side \{xử lý default phía server\}.
+
+### `requestSubmit()` vs `submit()`
+
+```js
+// Fires submit event + constraint validation
+// {Fire event submit + constraint validation}
+form.requestSubmit();
+
+// Bypasses validation entirely — avoid for user actions
+// {Bỏ qua validation hoàn toàn — tránh cho hành động user}
+form.submit();
+```
+
+Use `requestSubmit()` when programmatically triggering a validated submit (e.g. multi-step wizard final step) \{Dùng `requestSubmit()` khi trigger submit có validate theo code (vd bước cuối wizard)\}.
+
+---
+
+## Progressive Enhancement & Server Validation \{Progressive enhancement & validation server\}
+
+Client-side validation gives **instant feedback** \{Validation client cho **phản hồi tức thì**\}. It does not give **security** \{Không cho **bảo mật**\}:
+
+```text
+Browser ──POST──▶ Server
+                  │
+                  ├─ Re-validate ALL fields (never trust client)
+                  ├─ Rate-limit async checks (username lookup)
+                  ├─ Return field-level errors (422 + JSON body)
+                  └─ Log suspicious bypass attempts
+```
+
+On `422`, map server field errors back via `setCustomValidity` and re-focus the first failure \{Khi `422`, map lỗi field server qua `setCustomValidity` và focus lại lỗi đầu\}. Without JS, server re-rendered HTML errors still work \{Không JS, lỗi HTML server render vẫn hoạt động\}.
+
+---
+
+## Common Pitfalls \{Lỗi thường gặp\}
+
+> **Forgetting to clear `setCustomValidity("")`** \{**Quên xoá `setCustomValidity("")`**\}
+> Once set, a custom error sticks until cleared — even if the user fixed the value \{Một khi set, lỗi custom dính đến khi xoá — kể cả user đã sửa giá trị\}.
+
+> **Calling `form.submit()` expecting validation** \{**Gọi `form.submit()` mong có validation**\}
+> Use `requestSubmit()` or manually call `checkValidity()` first \{Dùng `requestSubmit()` hoặc tự gọi `checkValidity()` trước\}.
+
+> **Matching `validationMessage` strings** \{**Match chuỗi `validationMessage`**\}
+> Messages vary by browser and locale \{Message khác nhau theo browser và locale\}. Use `ValidityState` flags \{Dùng cờ `ValidityState`\}.
+
+> **Double validation UX** \{**UX validation kép**\}
+> Don't show native bubble (`reportValidity`) **and** inline errors simultaneously \{Đừng hiện bubble native (`reportValidity`) **và** lỗi inline cùng lúc\}. Pick one with `novalidate` \{Chọn một với `novalidate`\}.
+
+> **Disabled submit as the only indicator** \{**Disable submit là chỉ báo duy nhất**\}
+> Disabled buttons aren't focusable — users can't discover *why* submit is blocked \{Nút disabled không focus được — user không biết *vì sao* bị chặn\}. Show inline errors instead \{Hiện lỗi inline thay vì\}.
+
+> **Validating hidden fields aggressively** \{**Validate field ẩn quá gắt**\}
+> Fields with `display:none` or `hidden` may still fail `checkValidity()` \{Field `display:none` hoặc `hidden` vẫn có thể fail `checkValidity()`\}. Remove `required` or disable them when hidden \{Bỏ `required` hoặc disable khi ẩn\}.
+
+---
+
+## Libraries vs Native \{Thư viện vs native\}
+
+Stay native for standard fields, zero bundle, and SSR-friendly markup \{Ở native cho field chuẩn, zero bundle, markup thân thiện SSR\}. Reach for **React Hook Form + Zod** or **TanStack Form** for nested field arrays, shared client/server schemas, or deep framework integration \{Dùng **React Hook Form + Zod** hoặc **TanStack Form** cho mảng field lồng, schema client/server chung, hoặc tích hợp framework sâu\}. Libraries compose with — not replace — the platform API \{Thư viện compose với — không thay — API platform\}.
+
+---
+
+## Key Takeaways \{Điểm chính\}
+
+1. **Declare what you can in HTML** — `required`, `type`, `pattern`, `minlength` \{**Khai báo trong HTML được gì** — `required`, `type`, `pattern`, `minlength`\}
+2. **Use `ValidityState` flags**, not message strings, for i18n-safe copy \{**Dùng cờ `ValidityState`**, không phải chuỗi message, cho copy an toàn i18n\}
+3. **`setCustomValidity("")` clears; non-empty sets `customError`** \{**`setCustomValidity("")` xoá; không rỗng set `customError`**\}
+4. **Validate on blur → live after first error → full check on submit** \{**Validate blur → live sau lỗi đầu → kiểm tra đầy đủ khi submit**\}
+5. **Wire `aria-invalid`, `aria-describedby`, focus first error, `aria-live`** \{**Gắn `aria-invalid`, `aria-describedby`, focus lỗi đầu, `aria-live`**\}
+6. **`:user-invalid` over `:invalid`** to avoid red fields on first paint \{**`:user-invalid` hơn `:invalid`** để tránh field đỏ lần render đầu\}
+7. **Server always validates** — client is UX, not a gatekeeper \{**Server luôn validate** — client là UX, không phải cổng bảo vệ\}
+
+Native form validation is not legacy — it's the **platform layer** your abstractions should respect \{Validation form native không lỗi thời — nó là **tầng platform** abstraction của bạn nên tôn trọng\}. Master it once; every framework change gets cheaper \{Nắm một lần; mỗi lần đổi framework rẻ hơn\}.

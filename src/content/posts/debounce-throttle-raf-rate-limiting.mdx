@@ -1,0 +1,525 @@
+---
+title: 'Debounce, Throttle & rAF — rate-limiting high-frequency browser events'
+description: 'Debounce vs throttle vs rAF — from-scratch implementations, leading/trailing/maxWait, passive listeners, scrollend, and React pitfalls.'
+pubDate: 2025-10-16
+tags: [javascript, performance, events, debounce, js_10]
+draft: false
+---
+
+High-frequency DOM events are one of the most common performance foot-guns in frontend code \{Các DOM event tần suất cao là một trong những bẫy performance phổ biến nhất trong frontend\}. `input`, `scroll`, `resize`, `mousemove`, `pointermove`, and `wheel` can fire **dozens to hundreds of times per second** \{`input`, `scroll`, `resize`, `mousemove`, `pointermove`, và `wheel` có thể fire **hàng chục đến hàng trăm lần mỗi giây**\}. If every firing triggers an API call, a layout read, or a React re-render, the main thread chokes \{Nếu mỗi lần fire đều kích hoạt API call, layout read, hoặc React re-render, main thread sẽ nghẽn\}.
+
+This post covers three coalescing strategies — **debounce**, **throttle**, and **rAF batching** — with production-correct implementations, when to pick each, and the bugs that still bite senior engineers \{Bài này cover ba chiến lược gom event — **debounce**, **throttle**, và **rAF batching** — kèm implementation đúng production, khi nào chọn cái nào, và các bug vẫn cắn senior engineer\}.
+
+<iframe
+  src="/tools/js-debounce-throttle-demo/"
+  title="Debounce vs throttle vs rAF interactive demo"
+  loading="lazy"
+  style="width:100%;height:720px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/js-debounce-throttle-demo/](/tools/js-debounce-throttle-demo/).
+
+---
+
+## Table of contents \{Mục lục\}
+
+1. [The problem — event storms](#1-the-problem--event-storms)
+2. [Debounce — wait for silence](#2-debounce--wait-for-silence)
+3. [Debounce from scratch — `this`, args, cancel, flush, maxWait](#3-debounce-from-scratch--this-args-cancel-flush-maxwait)
+4. [Throttle — cap the rate](#4-throttle--cap-the-rate)
+5. [Throttle from scratch — timestamp vs timer](#5-throttle-from-scratch--timestamp-vs-timer)
+6. [requestAnimationFrame — coalesce visual updates](#6-requestanimationframe--coalesce-visual-updates)
+7. [When NOT to debounce/throttle — native alternatives](#7-when-not-to-deouncethrottle--native-alternatives)
+8. [Passive listeners & scroll performance](#8-passive-listeners--scroll-performance)
+9. [Common bugs in production](#9-common-bugs-in-production)
+10. [Comparison table & decision guide](#10-comparison-table--decision-guide)
+11. [Checklist](#11-checklist)
+
+---
+
+## 1. The problem — event storms \{Vấn đề — bão event\}
+
+Consider a search box with `input` → fetch suggestions \{Xét một ô search với `input` → fetch gợi ý\}. A fast typist produces ~8–12 `input` events per second; paste can fire one event per character in a burst \{Người gõ nhanh tạo ~8–12 `input` event/giây; paste có thể fire một event mỗi ký tự trong một burst\}. Without coalescing, you send 12 HTTP requests for a 12-character query — 11 of them are wasted \{Không gom event, bạn gửi 12 HTTP request cho query 12 ký tự — 11 cái lãng phí\}.
+
+Scroll is worse \{Scroll còn tệ hơn\}. A single flick on a trackpad can emit **100+ `scroll` events** in under a second \{Một cú flick trên trackpad có thể emit **100+ `scroll` event** trong dưới 1 giây\}. Attaching a handler that reads `getBoundingClientRect()` or updates React state on every event is a recipe for jank \{Gắn handler đọc `getBoundingClientRect()` hoặc update React state mỗi event là công thức gây jank\}.
+
+```text
+User action          Events/sec (typical)    Naive handler cost
+─────────────────────────────────────────────────────────────────
+input (fast typing)  8–15                    N API calls
+scroll (trackpad)    60–120                  N layout reads + paints
+resize (drag)        30–60                   N reflows + chart redraws
+mousemove (drag)     60–120                  N DOM updates
+pointermove (touch)  30–90                   N hit-testing loops
+```
+
+The fix is not "remove the listener" — it is **coalesce** many events into fewer handler executions while preserving user-visible correctness \{Fix không phải "bỏ listener" — mà là **gom** nhiều event thành ít lần chạy handler hơn nhưng vẫn giữ đúng hành vi user thấy\}.
+
+> **Rule of thumb** \{Quy tắc ngón cái\}: if the handler does I/O, measures layout, or triggers a re-render, it almost certainly needs coalescing \{Nếu handler làm I/O, đo layout, hoặc trigger re-render, gần như chắc chắn cần gom event\}.
+
+---
+
+## 2. Debounce — wait for silence \{Debounce — đợi im lặng\}
+
+**Debounce** delays execution until events **stop arriving** for a configured `wait` period \{**Debounce** trì hoãn execution cho đến khi event **ngừng đến** trong khoảng `wait` cấu hình\}. Each new event resets the timer \{Mỗi event mới reset timer\}.
+
+```text
+Events:  ──x──x──x──x──x──────────────x──x────────
+                              ↑ quiet window
+Debounced handler fires:      ●                 ●
+```
+
+**Use debounce when** \{Dùng debounce khi\}:
+
+- Search-as-you-type (wait until user pauses) \{Search-as-you-type (đợi user dừng gõ)\}
+- Auto-save draft on `input` \{Auto-save draft trên `input`\}
+- `resize` → recalculate layout after drag ends \{`resize` → tính lại layout sau khi kéo xong\}
+- Window `resize` → rebuild chart after user stops dragging \{Window `resize` → rebuild chart sau khi user ngừng kéo\}
+
+**Do NOT debounce** when you need periodic feedback during continuous action — e.g. a scrollbar position indicator or a drag preview \{**Không debounce** khi cần phản hồi định kỳ trong hành động liên tục — vd indicator vị trí scrollbar hoặc drag preview\}. That is a throttle or rAF job \{Đó là việc của throttle hoặc rAF\}.
+
+### Leading vs trailing \{Leading vs trailing\}
+
+| Mode | Fires | Typical use |
+|------|-------|-------------|
+| **Trailing** (default) | After silence | Search, auto-save |
+| **Leading** | On first event, then suppress | Submit button double-click guard |
+| **Both** | First + last in a burst | Rare; prefer explicit UX |
+
+Most UI libraries default to **trailing** because it captures the final state \{Hầu hết UI library mặc định **trailing** vì nó capture state cuối cùng\}.
+
+---
+
+## 3. Debounce from scratch — `this`, args, cancel, flush, maxWait \{Debounce từ đầu — `this`, args, cancel, flush, maxWait\}
+
+A production debounce must preserve `this` context and arguments, and expose `cancel()` / `flush()` for cleanup and imperative triggers \{Debounce production phải giữ `this` context và arguments, và expose `cancel()` / `flush()` cho cleanup và trigger thủ công\}.
+
+```js
+function debounce(fn, wait, options = {}) {
+  let timerId = null;
+  let lastArgs = null;
+  let lastThis = null;
+  let lastCallTime = null;
+  let result;
+
+  const { leading = false, trailing = true, maxWait } = options;
+
+  function invokeFunc(time) {
+    const args = lastArgs;
+    const thisArg = lastThis;
+    lastArgs = lastThis = null;
+    lastCallTime = time;
+    result = fn.apply(thisArg, args);
+    return result;
+  }
+
+  function startTimer(pendingFunc, waitMs) {
+    timerId = setTimeout(pendingFunc, waitMs);
+  }
+
+  function cancel() {
+    if (timerId !== null) clearTimeout(timerId);
+    timerId = lastArgs = lastThis = lastCallTime = null;
+  }
+
+  function flush() {
+    if (timerId === null) return result;
+    clearTimeout(timerId);
+    return invokeFunc(Date.now());
+  }
+
+  function debounced(...args) {
+    const time = Date.now();
+    const isInvoking = timerId === null;
+
+    lastArgs = args;
+    lastThis = this;
+
+    if (isInvoking) {
+      lastCallTime = time;
+    }
+
+    const shouldCallLeading = leading && isInvoking;
+    const timeSinceLastCall = time - (lastCallTime ?? 0);
+    const shouldMaxWait =
+      maxWait != null &&
+      timeSinceLastCall >= maxWait &&
+      timerId !== null;
+
+    if (shouldCallLeading) {
+      invokeFunc(time);
+    }
+
+    if (timerId !== null) clearTimeout(timerId);
+
+    if (shouldMaxWait) {
+      invokeFunc(time);
+    } else if (trailing) {
+      startTimer(() => {
+        const trailingEdge = Date.now();
+        const shouldInvoke =
+          timerId !== null &&
+          trailing &&
+          lastArgs != null;
+        timerId = null;
+        if (shouldInvoke) invokeFunc(trailingEdge);
+      }, wait);
+    } else {
+      startTimer(() => { timerId = null; }, wait);
+    }
+
+    return result;
+  }
+
+  debounced.cancel = cancel;
+  debounced.flush = flush;
+  return debounced;
+}
+```
+
+### `maxWait` — the escape hatch \{`maxWait` — lối thoát\}
+
+Pure trailing debounce can wait forever if events never stop — e.g. a `mousemove` during drag or a live websocket pushing updates \{Debounce trailing thuần có thể đợi mãi nếu event không bao giờ dừng — vd `mousemove` khi drag hoặc websocket push liên tục\}. **`maxWait`** guarantees at least one call every N ms regardless of continuous input \{**`maxWait`** đảm bảo ít nhất một lần gọi mỗi N ms bất kể input liên tục\}.
+
+```js
+// Auto-save at most every 2s, but also after 300ms of silence
+const save = debounce(persistDraft, 300, { maxWait: 2000 });
+```
+
+### Cleanup pattern \{Pattern cleanup\}
+
+```js
+const onResize = debounce(relayout, 150);
+
+window.addEventListener('resize', onResize);
+
+// On teardown (SPA route change, component unmount):
+onResize.cancel();
+window.removeEventListener('resize', onResize);
+```
+
+> **Gotcha** \{Cạm bẫy\}: `flush()` before unmount if you must persist the last pending value — e.g. debounced auto-save on a form the user navigates away from mid-typing \{`flush()` trước khi unmount nếu phải persist giá trị pending cuối — vd auto-save debounced trên form user navigate away giữa chừng gõ\}.
+
+---
+
+## 4. Throttle — cap the rate \{Throttle — giới hạn tần suất\}
+
+**Throttle** guarantees the handler runs **at most once per `interval`**, regardless of how many events arrive \{**Throttle** đảm bảo handler chạy **tối đa một lần mỗi `interval`**, bất kể bao nhiêu event đến\}.
+
+```text
+Events:  ──x─x─x─x─x─x─x─x─x─x─x─x─x─x─x─x─x─x─x─x──
+Throttled (100ms): ●───────●───────●───────●───────●
+```
+
+**Use throttle when** \{Dùng throttle khi\}:
+
+- Scroll-position tracking (sticky header, progress bar) \{Theo dõi vị trí scroll (sticky header, progress bar)\}
+- `mousemove` → update drag ghost position \{`mousemove` → update vị trí drag ghost\}
+- Button spam / rate-limit user actions \{Spam nút / rate-limit hành động user\}
+- Analytics "user scrolled" beacons during active scroll \{Beacon analytics "user scrolled" trong lúc scroll active\}
+
+---
+
+## 5. Throttle from scratch — timestamp vs timer \{Throttle từ đầu — timestamp vs timer\}
+
+There are two classic implementations. The **timestamp** version is simpler and works well for leading-edge throttle \{Có hai implementation kinh điển. Phiên bản **timestamp** đơn giản hơn và phù hợp leading-edge throttle\}.
+
+### Timestamp throttle (leading) \{Timestamp throttle (leading)\}
+
+```js
+function throttleLeading(fn, wait) {
+  let lastCall = 0;
+
+  return function throttled(...args) {
+    const now = Date.now();
+    if (now - lastCall >= wait) {
+      lastCall = now;
+      return fn.apply(this, args);
+    }
+  };
+}
+```
+
+### Hybrid throttle (leading + optional trailing) \{Hybrid throttle (leading + trailing tùy chọn)\}
+
+This matches lodash-style behavior and is what most teams expect \{Khớp hành vi kiểu lodash và là thứ hầu hết team mong đợi\}.
+
+```js
+function throttle(fn, wait, options = {}) {
+  let lastCall = 0;
+  let timerId = null;
+  let lastArgs = null;
+  let lastThis = null;
+
+  const { leading = true, trailing = false } = options;
+
+  function invoke() {
+    lastCall = Date.now();
+    timerId = null;
+    fn.apply(lastThis, lastArgs);
+    lastArgs = lastThis = null;
+  }
+
+  function throttled(...args) {
+    const now = Date.now();
+    const remaining = wait - (now - lastCall);
+
+    lastArgs = args;
+    lastThis = this;
+
+    if (remaining <= 0 || remaining > wait) {
+      if (timerId !== null) {
+        clearTimeout(timerId);
+        timerId = null;
+      }
+      if (leading) {
+        invoke();
+      } else {
+        lastCall = now;
+      }
+    } else if (trailing && timerId === null) {
+      timerId = setTimeout(invoke, remaining);
+    }
+  }
+
+  throttled.cancel = () => {
+    if (timerId !== null) clearTimeout(timerId);
+    timerId = lastArgs = lastThis = null;
+    lastCall = 0;
+  };
+
+  return throttled;
+}
+```
+
+### Timestamp vs timer-only \{Timestamp vs chỉ timer\}
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Timestamp** | No drift; predictable rate | Trailing edge needs extra timer |
+| **Timer-only** (`setInterval`) | Simple mental model | Drifts under load; hard to cancel |
+| **Hybrid** | Leading + trailing options | Slightly more code |
+
+> **Prefer timestamp hybrid** for scroll/mousemove \{**Ưu tiên timestamp hybrid** cho scroll/mousemove\}. Timer-only throttle with `setInterval` is almost always wrong in event-driven code \{Throttle chỉ timer với `setInterval` gần như luôn sai trong code event-driven\}.
+
+---
+
+## 6. requestAnimationFrame — coalesce visual updates \{requestAnimationFrame — gom update visual\}
+
+`requestAnimationFrame` (rAF) schedules a callback **before the next paint**, at most ~60 times per second (or the display refresh rate) \{`requestAnimationFrame` (rAF) lên lịch callback **trước frame paint tiếp theo**, tối đa ~60 lần/giây (hoặc tần refresh màn hình)\}. It is the right tool when the handler **only mutates visuals** — DOM position, canvas draw, CSS transform \{Đúng công cụ khi handler **chỉ mutate visual** — vị trí DOM, vẽ canvas, CSS transform\}.
+
+```js
+function rafThrottle(fn) {
+  let scheduled = false;
+  let lastArgs = null;
+  let lastThis = null;
+
+  return function coalesced(...args) {
+    lastArgs = args;
+    lastThis = this;
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      fn.apply(lastThis, lastArgs);
+    });
+  };
+}
+```
+
+### rAF vs throttle for visuals \{rAF vs throttle cho visual\}
+
+| | rAF | Throttle (16ms) |
+|---|-----|-----------------|
+| Syncs with paint | Yes | No — may run between frames |
+| Fires when tab hidden | No (paused) | Yes — wastes work |
+| Best for | DOM/canvas visual updates | Non-visual side effects during scroll |
+
+Example — parallax on scroll \{Ví dụ — parallax khi scroll\}:
+
+```js
+let ticking = false;
+
+function onScroll() {
+  if (ticking) return;
+  ticking = true;
+  requestAnimationFrame(() => {
+    const y = window.scrollY;
+    hero.style.transform = `translateY(${y * 0.4}px)`;
+    ticking = false;
+  });
+}
+
+window.addEventListener('scroll', onScroll, { passive: true });
+```
+
+This is the **"rAF gate"** pattern — boolean flag + single rAF slot \{Đây là pattern **"rAF gate"** — cờ boolean + một slot rAF\}. Functionally identical to `rafThrottle` above \{Về chức năng giống hệt `rafThrottle` ở trên\}.
+
+> **Do not rAF-debounce API calls** \{**Đừng rAF-debounce API call**\}. rAF coalesces paint work; network I/O belongs in debounce/throttle or an abort-controller pattern \{rAF gom công việc paint; network I/O thuộc debounce/throttle hoặc pattern abort-controller\}.
+
+---
+
+## 7. When NOT to debounce/throttle — native alternatives \{Khi KHÔNG debounce/throttle — alternative native\}
+
+Sometimes the browser already solved the problem \{Đôi khi browser đã giải quyết vấn đề\}. Do not stack debounce on top without reason \{Đừng chồng debounce lên không có lý do\}.
+
+### `ResizeObserver` instead of `window.resize` \{`ResizeObserver` thay `window.resize`\}
+
+`window.resize` only fires when the **viewport** changes. Element-level size changes (sidebar collapse, flex reflow) need `ResizeObserver` — already batched and async by the engine \{`window.resize` chỉ fire khi **viewport** đổi. Thay đổi kích thước element (sidebar collapse, flex reflow) cần `ResizeObserver` — engine đã batch và async sẵn\}. See [Observer APIs deep dive](/posts/browser-observer-apis-deep-dive/) for full coverage \{Xem [Observer APIs deep dive](/posts/browser-observer-apis-deep-dive/) cho phần đầy đủ\}.
+
+```js
+const ro = new ResizeObserver((entries) => {
+  for (const entry of entries) {
+    chart.resize(entry.contentRect.width, entry.contentRect.height);
+  }
+});
+ro.observe(containerEl);
+```
+
+### `IntersectionObserver` instead of scroll + `getBoundingClientRect` \{`IntersectionObserver` thay scroll + `getBoundingClientRect`\}
+
+For lazy-load, infinite-scroll sentinels, and sticky analytics, `IntersectionObserver` replaces scroll listeners entirely \{Cho lazy-load, sentinel infinite-scroll, và sticky analytics, `IntersectionObserver` thay hẳn scroll listener\}. Covered in depth in [Infinite scroll & virtual scroll](/posts/infinite-scroll-and-virtual-scroll-deep-dive/) \{Chi tiết trong [Infinite scroll & virtual scroll](/posts/infinite-scroll-and-virtual-scroll-deep-dive/)\}.
+
+### `scrollend` event \{Event `scrollend`\}
+
+Chrome 114+ and Firefox 109+ fire `scrollend` when scrolling **completes** (including momentum) \{Chrome 114+ và Firefox 109+ fire `scrollend` khi scroll **hoàn tất** (kể cả momentum)\}. Use it for "user finished scrolling" side effects instead of debouncing `scroll` \{Dùng cho side effect "user scroll xong" thay vì debounce `scroll`\}.
+
+```js
+scrollContainer.addEventListener('scrollend', () => {
+  persistScrollPosition();
+  fireAnalyticsBeacon();
+});
+```
+
+Fallback for older browsers: debounce `scroll` with ~150ms wait \{Fallback browser cũ: debounce `scroll` với wait ~150ms\}.
+
+---
+
+## 8. Passive listeners & scroll performance \{Passive listener & scroll performance\}
+
+Scroll jank often comes from **blocking scroll listeners** \{Scroll jank thường do **scroll listener chặn**\}. Browsers assume `touchstart` / `touchmove` / `wheel` listeners **may** call `preventDefault()`, so they wait for JS before scrolling \{Browser giả định listener `touchstart` / `touchmove` / `wheel` **có thể** gọi `preventDefault()`, nên đợi JS trước khi scroll\}.
+
+Mark listeners `{ passive: true }` when you never prevent default \{Đánh dấu listener `{ passive: true }` khi không bao giờ prevent default\}:
+
+```js
+window.addEventListener('scroll', onScroll, { passive: true });
+window.addEventListener('wheel', onWheel, { passive: true });
+element.addEventListener('touchmove', onTouchMove, { passive: true });
+```
+
+> **You cannot `{ passive: true }` and call `preventDefault()`** — the browser ignores it and logs a violation \{**Không thể `{ passive: true }` rồi gọi `preventDefault()`** — browser bỏ qua và log violation\}. Custom scroll-lock overlays need `{ passive: false }` explicitly and sparingly \{Overlay khóa scroll custom cần `{ passive: false }` tường minh và dùng tiết kiệm\}.
+
+Passive + rAF/throttle is the standard combo for smooth scroll handlers \{Passive + rAF/throttle là combo chuẩn cho scroll handler mượt\}.
+
+---
+
+## 9. Common bugs in production \{Bug phổ biến trong production\}
+
+### Recreating the debounced function every render \{Tạo lại debounced function mỗi render\}
+
+```js
+// ❌ React — new function every render, timer never settles
+function SearchBox() {
+  const [q, setQ] = useState('');
+  const search = debounce((term) => fetchResults(term), 300);
+  return <input onChange={(e) => { setQ(e.target.value); search(e.target.value); }} />;
+}
+```
+
+```js
+// ✅ Stable reference via useMemo or useRef
+function SearchBox() {
+  const search = useMemo(
+    () => debounce((term) => fetchResults(term), 300),
+    []
+  );
+  useEffect(() => () => search.cancel(), [search]);
+  // ...
+}
+```
+
+`useRef` + lazy init is equally valid when you need the latest closure without remaking the debounced fn \{`useRef` + lazy init cũng hợp lệ khi cần closure mới nhất mà không tạo lại debounced fn\}.
+
+### Forgetting cleanup on unmount \{Quên cleanup khi unmount\}
+
+Timers leak and fire on unmounted components → "Can't perform a React state update on an unmounted component" \{Timer leak và fire trên component đã unmount → "Can't perform a React state update on an unmounted component"\}.
+
+```js
+useEffect(() => {
+  const onScroll = throttle(updateProgress, 100);
+  window.addEventListener('scroll', onScroll, { passive: true });
+  return () => {
+    onScroll.cancel();
+    window.removeEventListener('scroll', onScroll);
+  };
+}, []);
+```
+
+### Debouncing `scroll` when you need live feedback \{Debounce `scroll` khi cần phản hồi live\}
+
+Debounced scroll feels laggy for sticky headers and reading-progress bars \{Scroll debounced cảm giác trễ cho sticky header và progress bar đọc bài\}. Use **throttle or rAF** for live UI; reserve debounce/`scrollend` for post-scroll side effects \{Dùng **throttle hoặc rAF** cho UI live; giữ debounce/`scrollend` cho side effect sau scroll\}.
+
+### Stale closures in throttled API calls \{Stale closure trong API call throttle\}
+
+If the throttled fn closes over props/state from render N, it may send outdated filters \{Nếu fn throttle đóng gói props/state từ render N, có thể gửi filter lỗi thời\}. Pass fresh values as arguments (the implementations above always forward `...args`) or read from a ref \{Truyền giá trị mới qua arguments (implementation trên luôn forward `...args`) hoặc đọc từ ref\}.
+
+### Layout thrashing inside coalesced handlers \{Layout thrashing trong handler đã gom\}
+
+Coalescing reduces call count but does not fix read-write-read-write DOM patterns inside the handler \{Gom giảm số lần gọi nhưng không sửa pattern read-write-read-write DOM trong handler\}. Batch reads, then writes \{Batch read, rồi write\}.
+
+```js
+const onScroll = rafThrottle(() => {
+  // ❌ interleaved reads and writes
+  el.style.width = el.offsetWidth + 10 + 'px';
+
+  // ✅ read phase, then write phase
+  const w = el.offsetWidth;
+  el.style.width = w + 10 + 'px';
+});
+```
+
+---
+
+## 10. Comparison table & decision guide \{Bảng so sánh & hướng chọn\}
+
+| Strategy | Fires when | Call count (100 events / 1s) | Best for |
+|----------|-----------|------------------------------|----------|
+| **None (raw)** | Every event | ~100 | Debugging only |
+| **Debounce 200ms** | After 200ms silence | 1–5 | Search, auto-save, post-resize layout |
+| **Debounce + maxWait** | Silence OR max interval | Bounded | Live streams + must persist periodically |
+| **Throttle 100ms** | Every 100ms during stream | ~10 | Scroll tracking, drag move, analytics |
+| **rAF gate** | Once per frame (~16ms) | ~60 max | Visual DOM/canvas updates |
+| **scrollend** | Scroll completes | 1 per gesture | Persist position, post-scroll analytics |
+| **ResizeObserver** | Element size changes | Batched by engine | Component resize, charts |
+| **IntersectionObserver** | Visibility crosses threshold | Batched by engine | Lazy load, infinite scroll sentinel |
+
+```text
+                    Need live feedback during action?
+                              │
+                    ┌─────────┴─────────┐
+                   YES                  NO
+                    │                    │
+            Visual only?          Debounce (trailing)
+                    │             or scrollend / maxWait
+          ┌────────┴────────┐
+         YES                NO
+          │                  │
+       rAF gate          Throttle
+```
+
+---
+
+## 11. Checklist \{Checklist\}
+
+Before shipping a high-frequency handler \{Trước khi ship handler tần suất cao\}:
+
+- [ ] Identified the event source and typical fire rate \{Xác định nguồn event và tần suất fire điển hình\}
+- [ ] Chose debounce vs throttle vs rAF vs native observer — not "always debounce" \{Chọn debounce vs throttle vs rAF vs native observer — không "luôn debounce"\}
+- [ ] Handler preserves `this` and latest args \{Handler giữ `this` và args mới nhất\}
+- [ ] `cancel()` / `flush()` on unmount; listener removed \{`cancel()` / `flush()` khi unmount; listener đã remove\}
+- [ ] Scroll/touch/wheel listeners marked `{ passive: true }` unless preventing default \{Listener scroll/touch/wheel đánh dấu `{ passive: true }` trừ khi prevent default\}
+- [ ] No debounced/throttled fn recreated every React render \{Không tạo lại fn debounced/throttled mỗi React render\}
+- [ ] Visual updates use rAF; I/O uses debounce/throttle \{Update visual dùng rAF; I/O dùng debounce/throttle\}
+- [ ] Considered `scrollend`, `ResizeObserver`, `IntersectionObserver` before rolling custom \{Cân nhắc `scrollend`, `ResizeObserver`, `IntersectionObserver` trước khi tự viết\}
+
+Debounce, throttle, and rAF are not interchangeable utilities — they encode different contracts about **when** work runs relative to user input \{Debounce, throttle, và rAF không phải utility thay thế nhau — chúng encode contract khác nhau về **khi nào** công việc chạy so với input user\}. Pick the contract that matches the UX, implement it once with stable references and proper cleanup, and the event storm becomes a non-issue \{Chọn contract khớp UX, implement một lần với reference ổn định và cleanup đúng, và bão event không còn là vấn đề\}.

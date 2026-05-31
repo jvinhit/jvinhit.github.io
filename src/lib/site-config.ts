@@ -42,6 +42,7 @@ export const SITE = {
     { label: 'RESUME', href: '/about' },
     { label: 'ARCHIVE', href: '/blog' },
     { label: 'PROJECTS', href: '/projects' },
+    { label: 'TOOLS', href: '/tools' },
   ],
 } as const;
 

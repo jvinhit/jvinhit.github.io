@@ -1,0 +1,469 @@
+---
+title: 'Stopping Criteria & Output Control — When Generation Ends and What to Do About It'
+description: 'EOS tokens, max_tokens, stop sequences, and finish_reason handling for production LLM agents — streaming, truncation, and runaway cost guards.'
+pubDate: 2026-01-30
+tags: [ai, llm, agents, generation, llm_10]
+draft: false
+---
+
+Generation does not stop when the model "feels done" in human terms — it stops when a **mechanical condition** fires \{Generation không dừng khi model "cảm thấy xong" theo nghĩa con người — nó dừng khi một **điều kiện cơ học** kích hoạt\}.
+Every token your agent emits passes through a stopping gate: an end-of-sequence token, a configured `max_tokens` ceiling, a matched stop string, a tool-call boundary, or a safety filter \{Mỗi token agent phát ra đều qua cổng stopping: EOS token, trần `max_tokens`, chuỗi stop khớp, ranh giới tool-call, hoặc safety filter\}.
+Senior engineers treat **finish_reason** as a first-class contract — not logging trivia — because it determines whether you parse JSON, invoke a tool, retry, or append a continuation prompt \{Senior engineer coi **finish_reason** như contract hạng nhất — không phải trivia log — vì nó quyết định parse JSON, gọi tool, retry, hay append continuation prompt\}.
+
+This post is **Part 4** of the Building AI Agents series: how output ends, how to control it, and how agent loops depend on stopping at the right boundary \{Bài này là **Phần 4** loạt Building AI Agents: output kết thúc thế nào, điều khiển ra sao, và vòng lặp agent phụ thuộc dừng đúng ranh giới\}.
+
+> Part 4 of the Building AI Agents series \{Phần 4\}. Previous \{Trước\}: [Prompt Engineering](/blog/prompt-engineering-for-agents/) · Next \{Tiếp\}: [Context Engineering & Memory](/blog/context-engineering-and-agent-memory/).
+
+---
+
+## The generation loop in one sentence \{Vòng generation trong một câu\}
+
+Autoregressive models sample one token at a time until a stop condition fires; your API wrapper surfaces that outcome as `finish_reason` \{Model autoregressive sample từng token một đến khi điều kiện stop kích hoạt; API wrapper surface kết quả thành `finish_reason`\}.
+
+```text
+prompt tokens  →  [sample] → token₁ → [sample] → token₂ → … → STOP
+                                                      ↑
+                                    EOS | max_tokens | stop seq | tool_calls | content_filter
+```
+
+Three layers matter for agents \{Ba lớp quan trọng cho agent\}:
+
+1. **Model layer** — vocabulary includes special EOS / end-of-turn tokens \{**Model layer** — vocabulary có EOS / end-of-turn token đặc biệt\}.
+2. **API layer** — `max_tokens`, `stop`, `response_format`, tool schemas \{**API layer** — `max_tokens`, `stop`, `response_format`, tool schemas\}.
+3. **Agent layer** — your loop interprets `finish_reason` and decides the next step \{**Agent layer** — vòng lặp của bạn interpret `finish_reason` và quyết bước tiếp\}.
+
+Parts 1–3 covered the budget (tokens), the sampling distribution, and prompt structure \{Phần 1–3 đã cover budget (token), phân phối sampling, và cấu trúc prompt\}.
+This post closes the loop on **when generation ends** and **what your orchestrator must do next** \{Bài này khép vòng **khi generation kết thúc** và **orchestrator phải làm gì tiếp**\}.
+
+---
+
+## Interactive demo: watch stopping fire token-by-token \{Demo tương tác: xem stopping kích hoạt từng token\}
+
+The demo below simulates canned token streaming with configurable `max_tokens`, stop sequences, and natural EOS — no API keys, no network \{Demo dưới mô phỏng stream token canned với `max_tokens`, stop sequence, và EOS tự nhiên — không API key, không network\}.
+
+<iframe
+  src="/tools/llm-stopping-demo/"
+  title="LLM stopping criteria interactive demo"
+  loading="lazy"
+  style="width:100%;height:720px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/llm-stopping-demo/](/tools/llm-stopping-demo/).
+
+Try the **ReAct tool handoff** preset: the model stops *before* `Observation:` so your runtime can inject tool output — a pattern every tool-using agent relies on \{Thử preset **ReAct tool handoff**: model dừng *trước* `Observation:` để runtime inject tool output — pattern mọi agent dùng tool đều dựa vào\}.
+
+---
+
+## End-of-sequence (EOS) and end-of-turn tokens \{EOS và end-of-turn token\}
+
+During training, models learn a special **EOS token** (or family of end-of-turn markers) that signals "this completion is complete" \{Khi training, model học **EOS token** (hoặc họ end-of-turn marker) báo "completion này đã xong"\}.
+When the model samples EOS at inference, generation halts and the API reports `finish_reason: "stop"` \{Khi model sample EOS lúc inference, generation dừng và API báo `finish_reason: "stop"`\}.
+
+```text
+Vocabulary (simplified):
+  … " the"  " cat"  " sat"  <|endoftext|>  " on"  …
+                              ↑
+                         sampling this → generation ends
+```
+
+Important nuances for agent engineers \{Nuances quan trọng cho agent engineer\}:
+
+| Topic | What to know |
+| --- | --- |
+| EOS ≠ period | Models can emit `.` and continue; EOS is a dedicated token ID |
+| Chat templates | Instruction-tuned models use role-specific end markers (`<\|im_end\|>`, etc.) |
+| "Natural" stop | `finish_reason: "stop"` covers both EOS *and* matched stop sequences |
+| Suppressed EOS | Low temperature + forced prefixes can reduce early EOS — watch max_tokens |
+
+> **Mental model:** EOS is the model's **return statement** \{**Mental model:** EOS là **return statement** của model\}.
+> Stop sequences are your **breakpoint** inserted before the model reaches return \{Stop sequence là **breakpoint** bạn chèn trước khi model tới return\}.
+
+Some APIs expose `end_turn` separately (Anthropic) vs collapsing into `stop` (OpenAI) \{Một số API expose `end_turn` riêng (Anthropic) vs gom vào `stop` (OpenAI)\}.
+Normalize in your agent SDK so downstream code branches on **semantic intent**, not vendor string literals \{Chuẩn hóa trong agent SDK để code downstream branch theo **ý định ngữ nghĩa**, không phải string literal vendor\}.
+
+```js
+function normalizeFinishReason(raw, provider) {
+  if (provider === "anthropic" && raw === "end_turn") return "natural_stop";
+  if (raw === "stop") return "natural_stop";
+  if (raw === "length") return "truncated";
+  if (raw === "tool_calls") return "tool_pending";
+  if (raw === "content_filter") return "blocked";
+  return "unknown";
+}
+```
+
+---
+
+## max_tokens and max_completion_tokens \{max_tokens và max_completion_tokens\}
+
+`max_tokens` (OpenAI legacy) and `max_completion_tokens` (newer unified param) cap **output** length — not input \{`max_tokens` (OpenAI legacy) và `max_completion_tokens` (param thống nhất mới) giới hạn độ dài **output** — không phải input\}.
+When the cap is hit mid-generation, the API truncates and returns `finish_reason: "length"` \{Khi chạm trần giữa generation, API cắt và trả `finish_reason: "length"`\}.
+
+```json
+{
+  "choices": [{
+    "message": { "role": "assistant", "content": "Here is a detailed expl" },
+    "finish_reason": "length"
+  }],
+  "usage": { "completion_tokens": 8 }
+}
+```
+
+### Why agents must never ignore `length` \{Vì sao agent không được bỏ qua `length`\}
+
+Truncated output is **structurally invalid** more often than it is "good enough" \{Output bị cắt **invalid về cấu trúc** thường xuyên hơn là "đủ dùng"\}:
+
+- Half a JSON object → parse failure \{Nửa JSON object → parse fail\}
+- Incomplete function arguments → tool call error \{Argument function dở → lỗi tool call\}
+- Cut-off code block → syntax error on execution \{Code block cắt cụt → lỗi syntax khi chạy\}
+- Partial ReAct `Action Input:` → wrong tool payload \{ReAct `Action Input:` dở → payload tool sai\}
+
+> **Rule:** Treat `finish_reason: "length"` as a **hard failure** for structured outputs unless you have an explicit continuation strategy \{**Quy tắc:** Coi `finish_reason: "length"` là **hard failure** với structured output trừ khi có chiến lược continuation rõ\}.
+
+### Sizing max_tokens in agent loops \{Chọn max_tokens trong vòng agent\}
+
+| Use case | Typical range | Notes |
+| --- | --- | --- |
+| Tool-call-only turn | 256–512 | Model emits short JSON + stop |
+| ReAct reasoning step | 512–1024 | Thought + Action + Input |
+| User-facing prose | 1024–4096 | Reserve headroom for citations |
+| JSON schema extraction | 512–2048 | Size to worst-case schema |
+| Summarization sub-agent | 1024–8192 | Match target summary length |
+
+Budget against Part 1's context window: `input_tokens + max_completion_tokens ≤ context_limit` \{Budget theo context window Phần 1: `input_tokens + max_completion_tokens ≤ context_limit`\}.
+Oversizing `max_tokens` does not force verbosity — it sets a **ceiling**, not a target — but it does reserve billing headroom \{`max_tokens` lớn không ép verbose — nó đặt **trần**, không phải mục tiêu — nhưng reserve headroom billing\}.
+
+### Continuation after truncation \{Continuation sau truncation\}
+
+When truncation is unacceptable, append a continuation prompt and re-invoke \{Khi truncation không chấp nhận được, append continuation prompt và gọi lại\}:
+
+```js
+async function generateUntilComplete(client, messages, opts) {
+  let content = "";
+  for (let attempt = 0; attempt < opts.maxContinuations; attempt++) {
+    const res = await client.chat.completions.create({
+      ...opts,
+      messages: [
+        ...messages,
+        ...(content ? [{ role: "assistant", content }, { role: "user", content: "Continue exactly where you left off." }] : []),
+      ],
+    });
+    const delta = res.choices[0].message.content ?? "";
+    content += delta;
+    if (res.choices[0].finish_reason !== "length") return { content, finish_reason: res.choices[0].finish_reason };
+  }
+  throw new Error("Exceeded max continuation attempts");
+}
+```
+
+Guard continuations: each retry re-tokenizes the full prefix (Part 1 cost) and can loop if the model keeps hitting the same ceiling \{Bảo vệ continuation: mỗi retry re-tokenize full prefix (chi phí Phần 1) và có thể loop nếu model liên tục chạm cùng trần\}.
+
+---
+
+## Stop sequences: breakpoints for agent control \{Stop sequence: breakpoint điều khiển agent\}
+
+The `stop` parameter (string or array of up to four sequences) tells the API to halt generation when the **accumulated output** contains a match \{Param `stop` (string hoặc mảng tối đa bốn sequence) báo API dừng generation khi **output tích lũy** chứa match\}.
+
+```json
+{
+  "model": "gpt-4o",
+  "messages": [{ "role": "user", "content": "Plan a trip to Hanoi." }],
+  "stop": ["Observation:", "\n\nUser:"],
+  "max_tokens": 512
+}
+```
+
+### Include vs exclude stop text \{Include vs exclude stop text\}
+
+OpenAI **excludes** the matched stop sequence from `message.content` by default \{OpenAI **loại** stop sequence khớp khỏi `message.content` mặc định\}.
+Some local runtimes include it \{Một số runtime local include\}.
+Your parser must know which behavior your provider uses — off-by-one string bugs in ReAct parsers often trace to this \{Parser phải biết provider dùng behavior nào — bug string off-by-one trong ReAct parser thường từ đây\}.
+
+```text
+Generated (internal):  "Action Input: {\"city\":\"Hanoi\"}\nObservation:"
+stop = "Observation:"
+OpenAI content:        "Action Input: {\"city\":\"Hanoi\"}\n"   ← stop excluded
+```
+
+### Agent use cases for stop sequences \{Use case stop sequence cho agent\}
+
+| Pattern | Stop string | Why |
+| --- | --- | --- |
+| ReAct handoff | `Observation:` | Model plans + acts; runtime injects observation |
+| Multi-agent routing | `\n\nAssistant B:` | Prevent role bleed between agents |
+| JSON fence | `"```"` or `\n}` | End structured block before prose |
+| Few-shot delimiter | `\n\n---\n\n` | Prevent model from inventing new examples |
+| Human-in-the-loop | `\n\nAWAITING_APPROVAL:` | Pause before irreversible action |
+
+```text
+ReAct loop (simplified):
+
+  LLM → Thought/Action/Action Input  [stop: "Observation:"]
+         ↓ finish_reason: stop
+  Runtime → execute tool
+         ↓
+  Runtime → append "Observation: {result}"
+         ↓
+  LLM → next Thought …
+```
+
+> **Design tip:** Prefer stop sequences that are **unlikely in normal prose** but **explicit in your prompt template** \{**Mẹo thiết kế:** Ưu tiên stop sequence **hiếm trong prose thường** nhưng **rõ trong prompt template**\}.
+> `Observation:` is safe in ReAct because you never ask the model to emit observations — only the runtime does \{`Observation:` an toàn trong ReAct vì bạn không bao giờ yêu cầu model emit observation — chỉ runtime làm\}.
+
+### Stop sequence gotchas \{Gotcha stop sequence\}
+
+1. **Tokenization boundaries** — a stop string split across tokens may not match until the full string completes; this is usually fine but adds 0–N token latency \{**Biên tokenization** — stop string cắt qua token có thể chưa match đến khi đủ chuỗi; thường ổn nhưng thêm latency 0–N token\}.
+2. **Overlapping stops** — first match wins; order your array deliberately \{**Stop chồng** — match đầu thắng; sắp thứ tự mảng có chủ đích\}.
+3. **Empty stop** — no effect; rely on EOS or max_tokens instead \{**Stop rỗng** — không tác dụng; dựa EOS hoặc max_tokens\}.
+4. **Stop vs tool_calls** — native function calling supersedes text-based Action/Input parsing; stops still useful for hybrid or legacy parsers \{**Stop vs tool_calls** — function calling native thay text Action/Input; stop vẫn hữu ích cho hybrid hoặc parser legacy\}.
+
+---
+
+## finish_reason values and handling matrix \{Giá trị finish_reason và ma trận xử lý\}
+
+Providers converge on a small enum; normalize them in one place \{Provider hội tụ enum nhỏ; chuẩn hóa một chỗ\}.
+
+| finish_reason | Meaning | Agent action |
+| --- | --- | --- |
+| `stop` | EOS or stop sequence matched | Parse output; proceed to next loop phase |
+| `length` | `max_tokens` exhausted | Retry with continuation or increase cap; flag if structured |
+| `tool_calls` | Model emitted native tool invocation | Execute tools; append tool results; re-prompt |
+| `content_filter` | Safety system blocked output | Log, notify user, do not retry blindly |
+| `function_call` (legacy) | Older OpenAI tool format | Map to `tool_calls` handling |
+
+```js
+function handleCompletion(result, handlers) {
+  const reason = result.choices[0].finish_reason;
+  const msg = result.choices[0].message;
+
+  switch (reason) {
+    case "stop":
+      return handlers.onNaturalStop(msg.content);
+    case "length":
+      return handlers.onTruncated(msg.content);
+    case "tool_calls":
+      return handlers.onToolCalls(msg.tool_calls);
+    case "content_filter":
+      return handlers.onBlocked();
+    default:
+      return handlers.onUnknown(reason, msg);
+  }
+}
+```
+
+### content_filter in production \{content_filter trong production\}
+
+Do not silently swallow blocked generations \{Đừng nuốt generation bị block im lặng\}.
+Log the event (without storing harmful content), surface a user-safe message, and avoid immediate identical retries that trigger rate limits on moderation endpoints \{Log sự kiện (không lưu nội dung harmful), hiện message an toàn cho user, tránh retry giống hệt ngay lập tức gây rate limit moderation\}.
+
+### tool_calls vs text stops \{tool_calls vs text stop\}
+
+Modern agents should prefer **native tool calling** (Part 9) where the API emits structured `tool_calls` with `finish_reason: "tool_calls"` \{Agent hiện đại nên ưu tiên **native tool calling** (Phần 9) khi API emit `tool_calls` structured với `finish_reason: "tool_calls"`\}.
+Text-based ReAct with stop sequences remains valuable for models without reliable function-calling support or for debugging interpretability \{ReAct text với stop sequence vẫn có giá trị cho model không có function calling tin cậy hoặc debug interpretability\}.
+
+---
+
+## Streaming vs non-streaming: stopping mid-stream \{Streaming vs non-streaming: dừng giữa stream\}
+
+In **non-streaming** mode, you receive one final object with `finish_reason` after generation completes \{**Non-streaming**: nhận một object cuối với `finish_reason` sau khi generation xong\}.
+In **streaming** mode, tokens arrive incrementally; the final chunk carries `finish_reason` \{**Streaming**: token đến dần; chunk cuối mang `finish_reason`\}.
+
+```text
+Stream chunks:
+  data: {"choices":[{"delta":{"content":"Thought"}}]}
+  data: {"choices":[{"delta":{"content":": check"}}]}
+  …
+  data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+  data: [DONE]
+```
+
+Implications for agent UX and control \{Hệ quả cho UX và điều khiển agent\}:
+
+1. **Do not parse structured output until stream ends** — or until your stop sequence fully appears in the buffer \{**Đừng parse structured output đến khi stream kết thúc** — hoặc đến khi stop sequence hiện đủ trong buffer\}.
+2. **AbortController** — cancel fetch on user stop or timeout; partial content may lack `finish_reason` \{**AbortController** — hủy fetch khi user stop hoặc timeout; content partial có thể thiếu `finish_reason`\}.
+3. **Mid-stream stop detection** — mirror API behavior: check accumulated buffer for stop strings client-side if you need early tool dispatch \{**Phát hiện stop giữa stream** — mirror behavior API: kiểm buffer tích lũy cho stop string phía client nếu cần dispatch tool sớm\}.
+4. **TTFT vs total time** — streaming improves perceived latency; stopping logic is identical \{**TTFT vs total time** — streaming cải thiện latency cảm nhận; logic stopping giống nhau\}.
+
+```js
+async function streamWithStop(client, params, onToken) {
+  const stream = await client.chat.completions.create({ ...params, stream: true });
+  let buffer = "";
+  let finishReason = null;
+
+  for await (const chunk of stream) {
+    const choice = chunk.choices[0];
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+    const text = choice.delta?.content ?? "";
+    if (!text) continue;
+    buffer += text;
+    onToken(text, buffer);
+
+    for (const stop of params.stop ?? []) {
+      if (stop && buffer.includes(stop)) {
+        finishReason = "stop";
+        return { content: buffer.split(stop)[0], finish_reason: finishReason };
+      }
+    }
+  }
+  return { content: buffer, finish_reason: finishReason ?? "stop" };
+}
+```
+
+---
+
+## Controlling verbosity and length (beyond max_tokens) \{Điều khiển verbosity và độ dài (ngoài max_tokens)\}
+
+`max_tokens` is a hard ceiling; **prompting and sampling** shape typical length \{`max_tokens` là trần cứng; **prompting và sampling** định hình độ dài điển hình\}.
+
+| Technique | Effect |
+| --- | --- |
+| System instruction: "Answer in ≤3 sentences" | Soft cap; model may still hit max_tokens on ramble |
+| Lower temperature (Part 2) | Less digression; slightly shorter outputs |
+| Structured output / JSON schema | Constrains format; pair with sized max_tokens |
+| `stop` after required fields | End JSON/tool block early |
+| Post-hoc truncation | Last resort; loses semantic completeness |
+
+For user-facing agents, combine **soft prompt limits** with **hard max_tokens** and handle `length` explicitly \{Với agent user-facing, kết hợp **giới hạn prompt mềm** với **max_tokens cứng** và xử lý `length` rõ ràng\}.
+
+```text
+System: Respond in at most 150 words. If you need more, ask a clarifying question.
+API:    max_completion_tokens: 300   ← hard backstop (~2× soft target)
+Agent:  if finish_reason === "length" → "Response was cut short; retry with narrower question"
+```
+
+---
+
+## Structured output completion \{Hoàn thành structured output\}
+
+JSON mode, `response_format: \{ type: "json_schema", ... \}`, and constrained decoding reduce but do not eliminate truncation risk \{JSON mode, `response_format`, và constrained decoding giảm nhưng không loại hết rủi ro truncation\}.
+
+Checklist for schema-bound generations \{Checklist cho generation ràng buộc schema\}:
+
+- [ ] Set `max_tokens` to schema worst case (count keys × average value length) \{Đặt `max_tokens` theo worst case schema\}
+- [ ] Reject `finish_reason: "length"` — never `JSON.parse` truncated blobs \{Từ chối `finish_reason: "length"` — không `JSON.parse` blob cắt\}
+- [ ] Use provider validation errors as retry signals \{Dùng lỗi validation provider làm tín hiệu retry\}
+- [ ] Log schema version with each parse attempt \{Log schema version mỗi lần parse\}
+
+```js
+function parseStructured(content, finishReason) {
+  if (finishReason === "length") {
+    throw new TruncatedGenerationError("Output truncated before schema complete");
+  }
+  try {
+    return JSON.parse(content);
+  } catch (err) {
+    throw new MalformedJsonError("Invalid JSON despite natural stop", { cause: err });
+  }
+}
+```
+
+When providers offer **strict schema mode**, prefer it over prompt-only "return JSON" instructions — stopping and validation become partially enforced by the decoder \{Khi provider có **strict schema mode**, ưu tiên hơn instruction "return JSON" — stopping và validation được decoder enforce một phần\}.
+
+---
+
+## Guarding against runaway generation and cost \{Bảo vệ runaway generation và chi phí\}
+
+Agents loop; a missing stop condition can burn thousands of tokens per user message \{Agent lặp; thiếu điều kiện stop có thể đốt hàng nghìn token mỗi user message\}.
+
+Defense in depth \{Phòng thủ nhiều lớp\}:
+
+1. **Per-turn max_tokens** — never `null` or provider max in production \{**max_tokens mỗi turn** — không `null` hoặc max provider trong production\}
+2. **Per-session token budget** — cumulative counter across loop iterations (Part 1) \{**Budget token mỗi session** — counter tích lũy qua iteration (Phần 1)\}
+3. **Max loop iterations** — cap ReAct / planner cycles regardless of content \{**Max iteration vòng lặp** — giới hạn chu kỳ ReAct/planner bất kể content\}
+4. **Wall-clock timeout** — `AbortSignal` on fetch + server-side deadline \{**Timeout wall-clock** — `AbortSignal` trên fetch + deadline server\}
+5. **Repeated-output detector** — same n-gram loop → force stop \{**Detector output lặp** — loop n-gram giống → ép stop\}
+6. **Cost alerts** — anomaly on completion_tokens per request \{**Cảnh báo chi phí** — bất thường completion_tokens mỗi request\}
+
+```js
+const LIMITS = {
+  maxTokensPerTurn: 1024,
+  maxTokensPerSession: 32_000,
+  maxAgentSteps: 12,
+  wallClockMs: 120_000,
+};
+
+async function runAgentLoop(ctx) {
+  while (ctx.steps < LIMITS.maxAgentSteps && ctx.sessionTokens < LIMITS.maxTokensPerSession) {
+    const res = await generate(ctx, { max_tokens: LIMITS.maxTokensPerTurn, signal: ctx.signal });
+    ctx.sessionTokens += res.usage.completion_tokens;
+    ctx.steps += 1;
+    if (res.finish_reason === "tool_calls") {
+      await executeTools(res);
+      continue;
+    }
+    if (res.finish_reason === "stop") return res.message.content;
+    if (res.finish_reason === "length") throw new TruncatedGenerationError();
+  }
+  throw new AgentBudgetExceededError();
+}
+```
+
+> **Production lesson:** The most expensive agent incidents are not bad prompts — they are **unbounded loops** with no max_tokens and no step cap \{**Bài học production:** Sự cố agent đắt nhất không phải prompt tệ — là **vòng lặp không giới hạn** không max_tokens và không step cap\}.
+
+---
+
+## Agent loops that must stop a turn to call a tool \{Vòng agent phải dừng turn để gọi tool\}
+
+Tool-using agents depend on **turn boundaries** \{Agent dùng tool phụ thuộc **ranh giới turn**\}.
+Generation must stop *before* the model hallucinates tool results \{Generation phải dừng *trước* khi model bịa kết quả tool\}.
+
+Two architectures \{Hai kiến trúc\}:
+
+```text
+A) Native tool_calls (preferred)
+   LLM → finish_reason: tool_calls
+   Runtime → execute → append tool message → LLM
+
+B) Text ReAct + stop sequences
+   LLM → Thought/Action/Input [stop: "Observation:"]
+   Runtime → parse Action → execute → append Observation → LLM
+```
+
+For (B), your stop sequence **is** the contract between LLM output and runtime injection \{Với (B), stop sequence **là** contract giữa output LLM và injection runtime\}.
+If the model emits `Observation:` before you stop, it may fabricate tool output — a common failure mode in under-constrained ReAct \{Nếu model emit `Observation:` trước khi stop, nó có thể bịa tool output — failure mode phổ biến trong ReAct thiếu ràng buộc\}.
+
+Mitigations \{Giảm thiểu\}:
+
+- System prompt: "Never write Observation; the system provides it" \{System prompt: "Không bao giờ viết Observation; hệ thống cung cấp"\}
+- Stop at `Observation:` (exclude from content) \{Stop tại `Observation:` (loại khỏi content)\}
+- Validate parsed Action against an allowlist before execution \{Validate Action parse với allowlist trước khi execute\}
+
+---
+
+## Putting it together: stopping checklist \{Tổng hợp: checklist stopping\}
+
+Before shipping an agent loop, verify \{Trước khi ship vòng agent, xác minh\}:
+
+- [ ] Every LLM call sets explicit `max_tokens` / `max_completion_tokens` \{Mọi LLM call đặt `max_tokens` / `max_completion_tokens` rõ\}
+- [ ] `finish_reason` handled for `stop`, `length`, `tool_calls`, `content_filter` \{`finish_reason` xử lý cho `stop`, `length`, `tool_calls`, `content_filter`\}
+- [ ] Stop sequences aligned with prompt template and provider include/exclude behavior \{Stop sequence khớp prompt template và behavior include/exclude provider\}
+- [ ] Streaming parser waits for terminal chunk or confirmed stop match \{Streaming parser đợi chunk terminal hoặc stop match xác nhận\}
+- [ ] Truncated structured output triggers retry or error — never silent parse \{Structured output cắt trigger retry hoặc lỗi — không parse im lặng\}
+- [ ] Session-level token and step limits enforced outside the model \{Giới hạn token và step cấp session enforce ngoài model\}
+- [ ] Tool turns use native `tool_calls` or verified text stops — never unbounded Action loops \{Turn tool dùng `tool_calls` native hoặc text stop đã verify — không Action loop không giới hạn\}
+
+> **Bottom line:** Stopping criteria are the **control plane** of generation \{**Kết luận:** Stopping criteria là **control plane** của generation\}.
+> Sampling (Part 2) decides *which* token; stopping decides *when the sequence ends* — and your agent decides *what happens next* \{Sampling (Phần 2) quyết *token nào*; stopping quyết *khi nào chuỗi kết thúc* — agent quyết *bước tiếp theo*\}.
+
+---
+
+## What's next \{Tiếp theo\}
+
+Part 5 moves from **single-turn output control** to **multi-turn context engineering** — what you retain, compress, and retrieve across agent steps \{Phần 5 chuyển từ **điều khiển output single-turn** sang **context engineering multi-turn** — giữ, nén, và retrieve gì qua các bước agent\}.
+
+Continue to [Context Engineering & Memory](/blog/context-engineering-and-agent-memory/).
+
+---
+
+## The Building AI Agents series \{Loạt bài Building AI Agents\}
+
+1. [Tokens & Context Windows](/blog/ai-agents-tokens-and-context-windows/)
+2. [Sampling: temperature, top_p, top_k](/blog/llm-sampling-temperature-top-p-top-k/)
+3. [Prompt Engineering for Agents](/blog/prompt-engineering-for-agents/)
+4. **[Stopping Criteria & Output Control](/blog/llm-stopping-criteria-and-output-control/) (current)**
+5. [Context Engineering & Memory](/blog/context-engineering-and-agent-memory/)
+6. [Fine-tuning vs Prompting vs RAG](/blog/fine-tuning-vs-prompting-vs-rag/)
+7. [Evaluating LLMs & Agents](/blog/evaluating-llms-and-agents/)
+8. [Choosing a Model](/blog/choosing-an-llm-model-framework/)
+9. [Function Calling & Tool Use](/blog/function-calling-and-tool-use/)
+10. [Agent Patterns: ReAct, Reflection, Planning](/blog/agent-design-patterns-react-reflection-planning/)

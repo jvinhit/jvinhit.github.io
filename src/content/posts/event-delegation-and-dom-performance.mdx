@@ -1,0 +1,314 @@
+---
+title: 'Event Delegation & DOM Performance — Propagation, Batching, and Layout Thrashing'
+description: 'Senior guide to event delegation with closest(), addEventListener options, DocumentFragment batching, read/write separation, and when virtualization wins.'
+pubDate: 2025-11-17
+tags: [javascript, dom, performance, events, js_10]
+draft: false
+---
+
+## Why this matters on real projects \{Vì sao điều này quan trọng trên project thật\}
+
+A data table with 2,000 rows, a nested sidebar, or a feed that grows on scroll — each row needs clicks, keyboard focus, or drag handles \{Một bảng 2.000 dòng, sidebar lồng nhau, hoặc feed tăng khi scroll — mỗi dòng cần click, focus bàn phím, hoặc drag handle\}. Attach one listener per cell and you pay **memory**, **slow mount**, and **rebind cost** every time the list re-renders \{Gắn một listener mỗi cell và bạn trả **bộ nhớ**, **mount chậm**, và **chi phí rebind** mỗi lần list re-render\}. Append 500 nodes in a tight loop and the main thread spends time in **layout** instead of responding to input \{Append 500 node trong vòng lặp chặt và main thread dành thời gian cho **layout** thay vì phản hồi input\}.
+
+This post covers **event propagation and delegation** plus **DOM update patterns** that keep large UIs fast \{Bài này cover **event propagation và delegation** cùng **pattern cập nhật DOM** giữ UI lớn nhanh\}. For the full rendering pipeline (style, layout, paint, composite), see the [rendering pipeline deep dive](/posts/browser-rendering-pipeline-deep-dive/) — here we only touch reflow when it affects your update strategy \{Với pipeline render đầy đủ (style, layout, paint, composite), xem [rendering pipeline deep dive](/posts/browser-rendering-pipeline-deep-dive/) — ở đây chỉ chạm reflow khi ảnh hưởng chiến lược update\}. For list virtualization at scale, see [infinite scroll & virtual scroll](/posts/infinite-scroll-and-virtual-scroll-deep-dive/) \{Với list virtualization quy mô lớn, xem [infinite scroll & virtual scroll](/posts/infinite-scroll-and-virtual-scroll-deep-dive/)\}.
+
+> **Mental model** \{Mô hình tư duy\}: Events **travel** through the DOM tree; listeners are **cheap per registration** but **expensive at scale**; DOM writes **batch best** when reads and writes are separated \{Event **đi** qua cây DOM; listener **rẻ mỗi lần đăng ký** nhưng **đắt khi scale**; ghi DOM **batch tốt nhất** khi tách read và write\}.
+
+---
+
+## Interactive demo \{Demo tương tác\}
+
+Compare 500 direct listeners vs one delegated handler, then benchmark naive append vs `DocumentFragment` + `requestAnimationFrame` \{So sánh 500 listener trực tiếp vs một handler delegated, rồi benchmark append naive vs `DocumentFragment` + `requestAnimationFrame`\}.
+
+<iframe
+  src="/tools/js-event-delegation-demo/"
+  title="Event delegation and DOM performance interactive demo"
+  loading="lazy"
+  style="width:100%;height:720px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/js-event-delegation-demo/](/tools/js-event-delegation-demo/).
+
+---
+
+## Event propagation: capture → target → bubble \{Event propagation: capture → target → bubble\}
+
+When the user clicks a button inside a card inside a page, the browser does not call one handler and stop \{Khi user click button trong card trong page, browser không gọi một handler rồi dừng\}. It dispatches an event that moves **down** (capture phase), hits the **target**, then moves **up** (bubble phase) \{Nó dispatch event đi **xuống** (capture phase), chạm **target**, rồi đi **lên** (bubble phase)\}.
+
+```text
+window → document → html → body → … → parent → TARGET → … → body → window
+         [ capture: outer → inner ]     [ bubble: inner → outer ]
+```
+
+Most handlers run in the **bubble** phase (default) \{Hầu hết handler chạy ở phase **bubble** (mặc định)\}. Capture is useful when a parent must intercept before children — modal overlays, global shortcuts, or analytics that must see events even if a child calls `stopPropagation()` early in bubble \{Capture hữu ích khi parent phải chặn trước children — overlay modal, shortcut global, hoặc analytics cần thấy event dù child gọi `stopPropagation()` sớm ở bubble\}.
+
+```js
+parent.addEventListener('click', onParentCapture, { capture: true });
+child.addEventListener('click', onChildBubble); // default capture: false
+
+// Order on click(child): onParentCapture → onChildBubble → (bubble listeners on ancestors)
+```
+
+| Phase | Direction | Default listener? |
+|-------|-----------|-------------------|
+| Capture | Root → target | No (`capture: true` required) |
+| Target | On the element | Both capture and bubble listeners on target run in registration order |
+| Bubble | Target → root | Yes (default) |
+
+---
+
+## `addEventListener` options that matter in production \{Các option `addEventListener` quan trọng trên production\}
+
+The third argument is not just `useCapture` anymore — it is an **options object** \{Tham số thứ ba không chỉ `useCapture` — đó là **object options**\}.
+
+```js
+const controller = new AbortController();
+
+element.addEventListener('click', handler, {
+  capture: false,   // bubble phase (default)
+  once: true,       // auto-remove after first invoke
+  passive: true,    // will never call preventDefault() — critical for scroll/touch
+  signal: controller.signal, // remove all listeners tied to this signal
+});
+
+// Later: tear down every listener registered with this signal
+controller.abort();
+```
+
+**`once`** \{**`once`**\}: ideal for "click outside to close" or one-shot setup without manual `removeEventListener` \{lý tưởng cho "click outside để đóng" hoặc setup một lần không cần `removeEventListener` thủ công\}.
+
+**`passive: true`** \{**`passive: true`**\}: tells the browser your handler will not call `preventDefault()` \{báo browser handler không gọi `preventDefault()`\}. Scroll and touch listeners marked passive allow the compositor to scroll immediately — non-passive wheel handlers are a common jank source \{Listener scroll và touch passive cho phép compositor scroll ngay — wheel handler non-passive là nguồn jank phổ biến\}. Related timing patterns: [debounce, throttle, and rAF](/posts/debounce-throttle-raf-rate-limiting/) \{Pattern timing liên quan: [debounce, throttle, and rAF](/posts/debounce-throttle-raf-rate-limiting/)\}.
+
+**`signal` (AbortController)** \{**`signal` (AbortController)**\}: when a React/Vue component unmounts or a route changes, abort one signal instead of tracking every listener reference \{khi component React/Vue unmount hoặc route đổi, abort một signal thay vì theo dõi từng reference listener\}.
+
+```js
+function mountWidget(root, signal) {
+  root.addEventListener('keydown', onKey, { signal });
+  root.addEventListener('click', onClick, { signal });
+  // Both removed when signal aborts — no leaked listeners
+}
+```
+
+---
+
+## Event delegation pattern \{Pattern event delegation\}
+
+**Delegation** \{**Delegation**\}: attach **one** listener on a stable ancestor; on each event, decide which child was interacted with \{gắn **một** listener trên ancestor ổn định; mỗi event, quyết child nào được tương tác\}.
+
+```js
+const list = document.querySelector('[data-task-list]');
+
+list.addEventListener('click', (event) => {
+  const row = event.target.closest('[data-task-id]');
+  if (!row || !list.contains(row)) return;
+
+  const id = row.dataset.taskId;
+
+  if (event.target.closest('[data-action="delete"]')) {
+    deleteTask(id);
+    return;
+  }
+
+  if (event.target.closest('[data-action="toggle"]')) {
+    toggleTask(id);
+  }
+});
+```
+
+**`Element.closest(selector)`** walks up from `event.target` (the deepest node hit) until it finds a match or leaves the tree \{**`Element.closest(selector)`** đi lên từ `event.target` (node sâu nhất bị hit) đến khi khớp selector hoặc ra khỏi cây\}. Use it instead of assuming `event.target` is the row — users click icons, text nodes, or SVG paths inside the row \{Dùng thay vì giả định `event.target` là row — user click icon, text node, hoặc SVG path trong row\}.
+
+**`Element.matches(selector)`** tests the element itself; combine with `closest` when the handler is on the same element you care about \{**`Element.matches(selector)`** test chính element; kết hợp với `closest` khi handler trên cùng element bạn quan tâm\}.
+
+```js
+list.addEventListener('click', (event) => {
+  const btn = event.target.closest('button');
+  if (!btn?.matches('[data-action]')) return;
+  // ...
+});
+```
+
+### Why delegation scales \{Vì sao delegation scale\}
+
+| Approach | Listeners for N rows | New row via `innerHTML` / template |
+|----------|---------------------|-------------------------------------|
+| Per-row listener | N | Must rebind or use event delegation anyway |
+| Delegated on parent | 1 | Works immediately — no extra registration |
+
+Memory: each listener is a closure + host bookkeeping \{Bộ nhớ: mỗi listener là closure + bookkeeping của host\}. At thousands of nodes, DevTools shows retained handler graphs; delegation keeps that flat \{Ở hàng nghìn node, DevTools thấy graph handler retained; delegation giữ phẳng\}.
+
+Dynamic content (infinite scroll, SPA re-render, server-pushed HTML) is the killer use case \{Content động (infinite scroll, SPA re-render, HTML server push) là use case then chốt\}: the parent existed at bind time; children can come and go \{parent tồn tại lúc bind; children có thể đến và đi\}.
+
+### Caveats engineers miss \{Caveat engineer hay bỏ sót\}
+
+**Events that do not bubble** \{**Event không bubble**\}: `focus` and `blur` do not bubble — delegating them on a parent fails \{`focus` và `blur` không bubble — delegate trên parent sẽ fail\}. Use **`focusin` / `focusout`** (they bubble) or attach directly to focusable elements \{Dùng **`focusin` / `focusout`** (có bubble) hoặc gắn trực tiếp lên element focusable\}.
+
+```js
+// ❌ focus does not bubble — parent never sees child focus
+container.addEventListener('focus', onFocus);
+
+// ✅ focusin bubbles
+container.addEventListener('focusin', (e) => {
+  const field = e.target.closest('input, textarea, select');
+  if (field) highlight(field);
+});
+```
+
+**`stopPropagation()` pitfalls** \{Pitfall **`stopPropagation()`**\}: a child that stops propagation breaks delegated handlers on ancestors in the same phase \{child stop propagation làm hỏng delegated handler trên ancestor cùng phase\}. Prefer **`stopImmediatePropagation()`** only when you truly own the subtree; otherwise use data attributes and early returns in one delegated handler \{Chỉ dùng **`stopImmediatePropagation()`** khi thật sự sở hữu subtree; không thì dùng data attribute và return sớm trong một delegated handler\}.
+
+**Shadow DOM**: `event.target` may be retargeted to the host; `composedPath()` gives the full path including shadow roots when you need precise targeting \{**Shadow DOM**: `event.target` có thể retarget về host; `composedPath()` cho path đầy đủ gồm shadow root khi cần targeting chính xác\}.
+
+---
+
+## DOM update performance: minimize reflow work \{Hiệu năng cập nhật DOM: giảm công việc reflow\}
+
+Every DOM change **may** invalidate layout \{Mỗi thay đổi DOM **có thể** invalidate layout\}. The browser is smart about batching, but **synchronous JavaScript** that alternates **reads** (geometry) and **writes** (styles, DOM structure) forces **layout thrashing** — repeated sync layout in one frame \{Browser batch thông minh, nhưng **JavaScript đồng bộ** xen kẽ **read** (geometry) và **write** (style, cấu trúc DOM) gây **layout thrashing** — layout sync lặp trong một frame\}.
+
+```js
+// ❌ Layout thrash — read/write interleaved
+for (const el of items) {
+  const h = el.getBoundingClientRect().height; // READ → may force layout
+  el.style.height = h + 10 + 'px';             // WRITE → invalidates layout
+}
+
+// ✅ Batch reads, then batch writes
+const heights = items.map((el) => el.getBoundingClientRect().height);
+items.forEach((el, i) => {
+  el.style.height = heights[i] + 10 + 'px';
+});
+```
+
+You do not need to micro-optimize every toggle; **do** separate reads and writes in loops over many elements, scroll handlers, and resize observers \{Không cần micro-optimize mọi toggle; **cần** tách read và write trong vòng lặp nhiều element, scroll handler, và resize observer\}.
+
+---
+
+## Batching inserts with `DocumentFragment` \{Batch insert với `DocumentFragment`\}
+
+Appending one node at a time to a live container can trigger incremental layout work \{Append từng node vào container live có thể kích hoạt layout tăng dần\}. Build offline, commit once \{Build offline, commit một lần\}:
+
+```js
+function renderRows(data) {
+  const fragment = document.createDocumentFragment();
+
+  for (const row of data) {
+    const li = document.createElement('li');
+    li.textContent = row.label;
+    li.dataset.id = row.id;
+    fragment.appendChild(li);
+  }
+
+  list.replaceChildren(fragment);
+}
+```
+
+`DocumentFragment` holds nodes in memory; a single `appendChild(fragment)` moves all children into the tree — **one** structural update from the parent's perspective \{`DocumentFragment` giữ node trong memory; một `appendChild(fragment)` chuyển hết children vào cây — **một** cập nhật cấu trúc từ góc nhìn parent\}.
+
+Pair with **`requestAnimationFrame`** when work spans multiple logical steps but should paint once \{Kết hợp **`requestAnimationFrame`** khi công việc nhiều bước logic nhưng chỉ paint một lần\}:
+
+```js
+function scheduleHeavyRender(items) {
+  requestAnimationFrame(() => {
+    const fragment = document.createDocumentFragment();
+    for (const item of items) {
+      fragment.appendChild(createRow(item));
+    }
+    container.replaceChildren(fragment);
+  });
+}
+```
+
+This aligns DOM mutation with the next paint and keeps input handlers from blocking mid-construction \{Căn mutation DOM với paint kế tiếp và tránh handler input block giữa lúc dựng\}.
+
+---
+
+## `cloneNode`, HTML strings, and the XSS line \{`cloneNode`, chuỗi HTML, và ranh giới XSS\}
+
+**Template + `cloneNode(true)`** \{**Template + `cloneNode(true)`**\}: define markup once in `<template>`, clone per instance — good for repeated cards without `innerHTML` in a loop \{định nghĩa markup một lần trong `<template>`, clone mỗi instance — tốt cho card lặp không cần `innerHTML` trong vòng lặp\}.
+
+```html
+<template id="row-tpl">
+  <tr><td class="name"></td><td><button type="button">Edit</button></td></tr>
+</template>
+```
+
+```js
+const tpl = document.getElementById('row-tpl');
+
+function createRow(label) {
+  const row = tpl.content.firstElementChild.cloneNode(true);
+  row.querySelector('.name').textContent = label;
+  return row;
+}
+```
+
+**HTML strings + `innerHTML`** \{**Chuỗi HTML + `innerHTML`**\}: fast for bulk static markup, dangerous with **user-controlled** strings \{nhanh cho markup tĩnh bulk, nguy hiểm với chuỗi **do user kiểm soát**\}. Always sanitize or use `textContent` / `createElement` for untrusted data \{Luôn sanitize hoặc dùng `textContent` / `createElement` cho data không tin cậy\}. Security context: [frontend security architecture](/posts/frontend-security-architecture-deep-dive/) \{Ngữ cảnh bảo mật: [frontend security architecture](/posts/frontend-security-architecture-deep-dive/)\}.
+
+| Technique | Best for | Watch out |
+|-----------|----------|-----------|
+| `createElement` + APIs | Dynamic, untrusted text | Verbose |
+| `DocumentFragment` | Many nodes, one commit | Still build with safe APIs |
+| `<template>` + `cloneNode` | Repeated structure | Fill text via `textContent` |
+| `innerHTML` | Trusted static blobs | XSS if interpolated with user input |
+
+---
+
+## When delegation and batching are not enough \{Khi delegation và batching chưa đủ\}
+
+Delegation fixes **listener count**, not **node count** \{Delegation sửa **số listener**, không sửa **số node**\}. Ten thousand DOM nodes still cost memory, style recalc, and accessibility tree work even with one click handler \{Mười nghìn node DOM vẫn tốn memory, style recalc, và accessibility tree dù chỉ một click handler\}. That is when **virtualization** (render only visible rows) wins — covered in the [virtual scroll deep dive](/posts/infinite-scroll-and-virtual-scroll-deep-dive/) \{Đó là lúc **virtualization** (chỉ render row visible) thắng — chi tiết trong [virtual scroll deep dive](/posts/infinite-scroll-and-virtual-scroll-deep-dive/)\}.
+
+Practical decision tree \{Cây quyết định thực tế\}:
+
+1. **&lt; ~500 interactive nodes**, list stable or slowly growing → delegation + fragment batching \{**&lt; ~500 node tương tác**, list ổn định hoặc tăng chậm → delegation + fragment batching\}.
+2. **Frequent full re-render** (SPA) → delegation on a root that survives re-render, or framework event delegation \{**Re-render full thường xuyên** (SPA) → delegation trên root sống sót re-render, hoặc event delegation của framework\}.
+3. **Thousands of rows**, scroll-heavy → virtualize; keep one delegated listener on the viewport container \{**Hàng nghìn row**, scroll nặng → virtualize; giữ một delegated listener trên viewport container\}.
+
+---
+
+## Production checklist \{Checklist production\}
+
+| Check | Action |
+|-------|--------|
+| List / table clicks | One delegated listener + `closest('[data-…]')` |
+| Focus tracking | `focusin` / `focusout`, not `focus` / `blur` |
+| Cleanup on unmount | `AbortController.signal` on all listeners |
+| Bulk DOM insert | `DocumentFragment` or `replaceChildren`, not N appends |
+| Measure loops | Separate geometry reads from style/DOM writes |
+| Untrusted HTML | No raw `innerHTML`; sanitize or use text nodes |
+| Huge lists | Virtual scroll + delegation on scroll container |
+
+---
+
+## Real-world patterns \{Pattern thực tế\}
+
+**Data table with actions** \{**Bảng data có action**\}: delegate on `<tbody>`; use `data-action` on buttons so one handler routes delete, edit, and select \{delegate trên `<tbody>`; dùng `data-action` trên button để một handler route delete, edit, select\}.
+
+```js
+tbody.addEventListener('click', (e) => {
+  const action = e.target.closest('[data-action]');
+  if (!action) return;
+  const tr = action.closest('tr');
+  if (!tr) return;
+  const id = tr.dataset.id;
+
+  switch (action.dataset.action) {
+    case 'delete': return removeRow(id);
+    case 'edit': return openEditor(id);
+    default: break;
+  }
+});
+```
+
+**Keyboard shortcuts without polluting every input** \{**Keyboard shortcut không làm bẩn mọi input**\}: capture-phase listener on `document` for Escape / Cmd+K; ignore when `event.target` is an editable field unless intended \{listener capture phase trên `document` cho Escape / Cmd+K; bỏ qua khi `event.target` là field editable trừ khi cố ý\}.
+
+**Progressive list hydration** \{**Hydrate list dần**\}: first paint with skeleton rows from a fragment; swap in real rows in the next `requestAnimationFrame` so LCP is not blocked by 2,000 `createElement` calls in one task \{first paint với skeleton row từ fragment; thay row thật ở `requestAnimationFrame` kế tiếp để LCP không bị block bởi 2.000 lần `createElement` trong một task\}.
+
+> **Takeaway** \{**Kết luận**\}: Treat the DOM like a database you query in batches — **one listener on the container**, **many nodes in a fragment**, **reads before writes** — and reach for virtualization only when the node count itself is the bottleneck \{Coi DOM như database bạn query theo batch — **một listener trên container**, **nhiều node trong fragment**, **read trước write** — và chỉ virtualize khi chính số node là nút thắt\}.
+
+---
+
+## Further reading \{Đọc thêm\}
+
+- [MDN — Event delegation](https://developer.mozilla.org/en-US/docs/Learn_web_development/Core/Scripting/Event_delegation)
+- [MDN — `addEventListener` options](https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/addEventListener#options)
+- [Google Web Fundamentals — Avoid large, complex layouts and layout thrashing](https://web.dev/articles/avoid-large-complex-layouts-and-layout-thrashing)
+- [Infinite scroll & virtual scroll deep dive](/posts/infinite-scroll-and-virtual-scroll-deep-dive/) — when the DOM itself must shrink
+- [Browser rendering pipeline deep dive](/posts/browser-rendering-pipeline-deep-dive/) — where reflow fits in the full pipeline

@@ -1,0 +1,468 @@
+---
+title: 'JavaScript Async Patterns — Promises, Combinators, AbortController & Concurrency'
+description: 'Promise anatomy, sequential vs parallel pitfalls, all/allSettled/race/any semantics, cancellation, retries, concurrency pools, and error traps.'
+pubDate: 2025-10-09
+tags: [javascript, async, promises, abortcontroller, js_10]
+draft: false
+---
+
+## Why Async Still Trips Up Senior Engineers \{Vì sao async vẫn làm senior engineer vấp\}
+
+Every production frontend eventually hits the same wall \{Mọi frontend production đều chạm cùng một bức tường\}: three tabs open, a search debounce fires, a mutation retries, and suddenly you have **duplicate requests, stale UI, or a silent `UnhandledPromiseRejection`** \{ba tab mở, debounce search kích hoạt, mutation retry — đột nhiên **request trùng, UI cũ, hoặc `UnhandledPromiseRejection` im lặng**\}.
+
+Promises and `async/await` are not "syntax sugar over callbacks" \{Promise và `async/await` không chỉ là "cú pháp ngọt hơn callback"\} — they are a **contract about timing, failure, and cancellation** \{mà là **hợp đồng về thời điểm, lỗi, và huỷ bỏ**\}. This article maps that contract to the patterns you actually ship \{Bài này ánh xạ hợp đồng đó sang các pattern bạn thực sự ship\}.
+
+> **Try it live** \{Thử trực tiếp\}: run sequential vs parallel vs the four combinators on a visual timeline — toggle task failures and watch how each strategy behaves.
+
+<iframe
+  src="/tools/js-async-patterns-demo/"
+  title="JavaScript async patterns interactive demo"
+  loading="lazy"
+  style="width:100%;height:720px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/js-async-patterns-demo/](/tools/js-async-patterns-demo/).
+
+---
+
+## Promise Anatomy — States, Thenables, and the Microtask Queue \{Giải phẫu Promise — Trạng thái, Thenable, và Microtask Queue\}
+
+A Promise is a **future value container** with exactly three states \{Promise là **hộp chứa giá trị tương lai** với đúng ba trạng thái\}:
+
+| State \{Trạng thái\} | Meaning \{Nghĩa\} | Transition \{Chuyển\} |
+|---|---|---|
+| `pending` | Result not yet settled \{Kết quả chưa xác định\} | → `fulfilled` or `rejected` |
+| `fulfilled` | Success with a value \{Thành công với giá trị\} | terminal \{kết thúc\} |
+| `rejected` | Failure with a reason \{Thất bại với lý do\} | terminal \{kết thúc\} |
+
+Once settled, a Promise **never changes state** \{Khi đã settled, Promise **không bao giờ đổi trạng thái**\} — this immutability is what makes chaining predictable \{tính bất biến này khiến chuỗi `.then` dự đoán được\}.
+
+```js
+const p = fetch("/api/user/42");
+
+p.then((res) => res.json())   // runs when fulfilled {chạy khi fulfilled}
+ .catch((err) => console.error(err)) // runs when rejected {chạy khi rejected}
+ .finally(() => hideSpinner());      // always {luôn chạy}
+```
+
+Under the hood \{Bên trong\}: `.then` / `.catch` / `.finally` handlers are scheduled as **microtasks** \{**microtask**\}, which run **before the next paint** and **after the current synchronous stack** clears \{chạy **trước frame vẽ tiếp** và **sau khi stack đồng bộ hiện tại** kết thúc\}. That ordering explains classic bugs like "I logged before the fetch finished" \{Thứ tự đó giải thích bug kinh điển "log trước khi fetch xong"\}.
+
+```js
+console.log("1");
+Promise.resolve().then(() => console.log("2")); // microtask {microtask}
+console.log("3");
+// → 1, 3, 2
+```
+
+Anything with a `.then` method is a **thenable** \{Bất cứ thứ gì có `.then` đều là **thenable**\}; `Promise.resolve(foreignThenable)` assimilates it into a real Promise \{`Promise.resolve(foreignThenable)` hấp thụ nó thành Promise thật\}.
+
+---
+
+## `async/await` — Syntactic Sugar with Real Semantics \{`async/await` — Cú pháp ngọt nhưng có ngữ nghĩa thật\}
+
+An `async` function **always returns a Promise** \{Hàm `async` **luôn trả về Promise**\}, even if you `return 42` \{dù bạn `return 42`\}. `await` **pauses that function** until the awaited value settles \{**tạm dừng hàm đó** đến khi giá trị awaited settled\} — it does **not** block the main thread \{**không** chặn main thread\}.
+
+```js
+async function loadDashboard(userId) {
+  const user = await fetch(`/api/users/${userId}`).then((r) => r.json());
+  const orders = await fetch(`/api/users/${userId}/orders`).then((r) => r.json());
+  return { user, orders };
+}
+
+// Equivalent desugaring (simplified) {Tương đương desugar (đơn giản hoá)}
+function loadDashboard(userId) {
+  return fetch(`/api/users/${userId}`)
+    .then((r) => r.json())
+    .then((user) =>
+      fetch(`/api/users/${userId}/orders`)
+        .then((r) => r.json())
+        .then((orders) => ({ user, orders }))
+    );
+}
+```
+
+**Key insight** \{Insight quan trọng\}: `await` inside a loop creates **sequential** execution by default \{`await` trong vòng lặp tạo thực thi **tuần tự** mặc định\}. That is correct when step *B* depends on step *A* \{Đúng khi bước *B* phụ thuộc bước *A*\} — catastrophic when the steps are independent \{thảm họa khi các bước độc lập\}.
+
+---
+
+## Sequential vs Parallel — The `await`-in-a-Loop Bug \{Tuần tự vs Song song — Bug `await` trong vòng lặp\}
+
+This pattern appears in code review weekly \{Pattern này xuất hiện trong code review hàng tuần\}:
+
+```js
+// ❌ N requests × latency — dashboard takes forever
+// {N request × độ trễ — dashboard load mãi}
+async function fetchAllUserAvatars(userIds) {
+  const avatars = [];
+  for (const id of userIds) {
+    const res = await fetch(`/api/avatar/${id}`);
+    avatars.push(await res.blob());
+  }
+  return avatars;
+}
+```
+
+If each avatar takes 200 ms and you have 20 users \{Nếu mỗi avatar 200 ms và 20 user\}, this takes **4 seconds** \{mất **4 giây**\}. The fix is to **start all work first**, then await together \{Sửa bằng cách **khởi chạy mọi việc trước**, rồi await cùng lúc\}:
+
+```js
+// ✅ ~200 ms (bounded by slowest request) {~200 ms (giới hạn bởi request chậm nhất}
+async function fetchAllUserAvatars(userIds) {
+  const promises = userIds.map(async (id) => {
+    const res = await fetch(`/api/avatar/${id}`);
+    return res.blob();
+  });
+  return Promise.all(promises);
+}
+```
+
+| Pattern \{Pattern\} | When to use \{Khi nào dùng\} | Total time (N tasks × T ms) \{Tổng thời gian\} |
+|---|---|---|
+| Sequential `await` in loop | Each step needs previous result \{Mỗi bước cần kết quả trước\} | N × T |
+| Parallel `Promise.all` | Independent I/O \{I/O độc lập\} | ≈ T (slowest) |
+| Batched pool | Independent but rate-limited API \{Độc lập nhưng API giới hạn tốc độ\} | ≈ (N / concurrency) × T |
+
+> **Rule of thumb** \{Quy tắc kinh nghiệm\}: if you wrote `for … await` and the loop body does not use the *previous* iteration's result, you probably want parallelism or a concurrency pool \{nếu viết `for … await` mà thân vòng lặp không dùng kết quả lần trước, bạn có lẽ cần song song hoặc pool\}.
+
+---
+
+## The Four Combinators — Semantics That Matter in Production \{Bốn combinator — Ngữ nghĩa quan trọng trên production\}
+
+### `Promise.all` — Fail-fast, all-or-nothing success array
+
+Resolves when **every** input fulfills \{Resolve khi **mọi** input fulfilled\}; rejects on the **first** rejection \{reject ở **lần reject đầu**\}. Other promises **keep running** — they are not cancelled \{Promise khác **vẫn chạy** — không bị huỷ\}.
+
+```js
+const [user, prefs, flags] = await Promise.all([
+  fetchUser(id),
+  fetchPrefs(id),
+  fetchFeatureFlags(),
+]);
+// If fetchPrefs throws → entire Promise.all rejects
+// {Nếu fetchPrefs throw → cả Promise.all reject}
+// fetchFeatureFlags() still completes in the background
+// {fetchFeatureFlags() vẫn hoàn thành ở background}
+```
+
+**Use when** \{Dùng khi\}: you need **all** results and any failure should abort the composite operation \{cần **mọi** kết quả và lỗi bất kỳ nên huỷ thao tác tổng\} (e.g. bootstrapping a page) \{vd bootstrap trang\}.
+
+### `Promise.allSettled` — Never rejects; inspect each outcome
+
+Always resolves with an array of `\{ status, value? | reason? \}` \{Luôn resolve với mảng `\{ status, value? | reason? \}`\}. Ideal for bulk operations where partial success is acceptable \{Lý tưởng cho thao tác hàng loạt khi thành công một phần chấp nhận được\}.
+
+```js
+const results = await Promise.allSettled(
+  files.map((f) => uploadFile(f))
+);
+
+const ok = results.filter((r) => r.status === "fulfilled");
+const failed = results.filter((r) => r.status === "rejected");
+showRetryUI(failed.map((_, i) => files[i]));
+```
+
+**Use when** \{Dùng khi\}: reporting dashboards, batch imports, "best effort" fan-out \{dashboard báo cáo, import hàng loạt, fan-out "cố gắng hết mức"\}.
+
+### `Promise.race` — First settled wins (fulfill *or* reject)
+
+Settles with the **first** promise that fulfills **or** rejects \{Settle theo **promise đầu tiên** fulfilled **hoặc** rejected\}. If the fastest task fails, the whole race rejects \{Nếu task nhanh nhất fail, cả race reject\} — often surprising \{thường gây ngạc nhiên\}.
+
+```js
+const response = await Promise.race([
+  fetch("/api/data"),
+  sleep(5000).then(() => Promise.reject(new Error("timeout"))),
+]);
+```
+
+**Use when** \{Dùng khi\}: timeouts, picking the fastest CDN mirror, racing cache vs network \{timeout, chọn mirror CDN nhanh nhất, đua cache vs network\}.
+
+### `Promise.any` — First fulfillment; AggregateError if all fail
+
+Resolves with the **first fulfilled** value \{Resolve với giá trị **fulfilled đầu tiên**\}; rejects with `AggregateError` only when **every** input rejects \{chỉ reject `AggregateError` khi **mọi** input reject\}.
+
+```js
+try {
+  const data = await Promise.any([
+    fetchFromPrimary(),
+    fetchFromFallback(),
+    fetchFromCache(),
+  ]);
+} catch (err) {
+  // err instanceof AggregateError — err.errors holds each rejection
+  // {err instanceof AggregateError — err.errors chứa từng rejection}
+}
+```
+
+**Use when** \{Dùng khi\}: redundant sources where **any success is enough** \{nguồn dự phòng khi **bất kỳ thành công nào cũng đủ**\} (multi-region endpoints, fallback parsers) \{endpoint đa vùng, parser dự phòng\}.
+
+| Combinator | Resolves when | Rejects when | Ignores other pending? |
+|---|---|---|---|
+| `all` | all fulfill | first reject | others keep running |
+| `allSettled` | always (after all settle) | never | waits for all |
+| `race` | first settle (±) | first settle (±) | others keep running |
+| `any` | first fulfill | all reject | others keep running |
+
+---
+
+## Cancellation — `AbortController` and `AbortSignal` \{Huỷ bỏ — `AbortController` và `AbortSignal`\}
+
+Before AbortController, cancellation was ad-hoc boolean flags \{Trước AbortController, huỷ bỏ là cờ boolean tự chế\} — easy to leak and impossible to compose \{dễ rò rỉ và không compose được\}. The modern pattern \{Pattern hiện đại\}:
+
+```js
+const controller = new AbortController();
+const { signal } = controller;
+
+const req = fetch("/api/search?q=react", { signal });
+
+// User navigates away or types next character:
+controller.abort(); // → fetch rejects with AbortError
+
+try {
+  await req;
+} catch (err) {
+  if (err.name === "AbortError") return; // expected cancellation {huỷ dự kiến}
+  throw err;
+}
+```
+
+**Composable signals** \{Signal compose được\}:
+
+```js
+// Built-in timeout (Node 18+, modern browsers) {Timeout có sẵn}
+const timeoutSignal = AbortSignal.timeout(8000);
+
+// Combine: abort if user cancels OR 8s elapse {Kết hợp: huỷ nếu user huỷ HOẶC 8s}
+const signal = AbortSignal.any([userController.signal, timeoutSignal]);
+
+await fetch("/api/heavy", { signal });
+```
+
+**React / framework pattern** \{Pattern React / framework\}: create one `AbortController` per effect run, abort in the cleanup function \{tạo một `AbortController` mỗi lần effect chạy, abort trong cleanup\}:
+
+```js
+useEffect(() => {
+  const ac = new AbortController();
+  fetch(`/api/item/${id}`, { signal: ac.signal })
+    .then((r) => r.json())
+    .then(setData)
+    .catch((e) => {
+      if (e.name !== "AbortError") setError(e);
+    });
+  return () => ac.abort();
+}, [id]);
+```
+
+> Aborting a fetch **does not** undo server-side work \{Abort fetch **không** hoàn tác việc phía server\} — it only stops waiting for the response on the client \{chỉ ngừng chờ response ở client\}. Design idempotent mutations accordingly \{Thiết kế mutation idempotent cho phù hợp\}.
+
+---
+
+## Timeouts Without Swallowing Errors \{Timeout mà không nuốt lỗi\}
+
+Wrapping fetch in `Promise.race` against a timer works but conflates timeout with network failure \{Bọc fetch trong `Promise.race` với timer được nhưng lẫn timeout với lỗi mạng\}. Prefer `AbortSignal.timeout` or an explicit abort \{Ưu tiên `AbortSignal.timeout` hoặc abort rõ ràng\}:
+
+```js
+async function fetchWithTimeout(url, ms = 5000) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(ms) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+```
+
+If you must support older runtimes \{Nếu phải hỗ trợ runtime cũ\}:
+
+```js
+function timeoutSignal(ms) {
+  const ac = new AbortController();
+  const id = setTimeout(() => ac.abort(new DOMException("Timeout", "TimeoutError")), ms);
+  ac.signal.addEventListener("abort", () => clearTimeout(id), { once: true });
+  return ac.signal;
+}
+```
+
+---
+
+## Retry with Exponential Backoff and Jitter \{Retry với backoff lũy thừa và jitter\}
+
+Naive immediate retry amplifies outages \{Retry ngay lập tức làm trầm trọng thêm sự cố\} ("thundering herd") \{("bầy đàn lao vào")\}. Production retry \{Retry production\}:
+
+```js
+async function retry(fn, { retries = 3, baseMs = 300, maxMs = 8000 } = {}) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= retries) throw err;
+      const exp = Math.min(baseMs * 2 ** attempt, maxMs);
+      const jitter = Math.random() * exp * 0.3; // spread concurrent clients {trải client đồng thời}
+      await sleep(exp + jitter);
+      attempt += 1;
+    }
+  }
+}
+
+await retry(() => fetch("/api/flaky").then((r) => r.json()));
+```
+
+Only retry **idempotent** reads or writes with idempotency keys \{Chỉ retry read **idempotent** hoặc write có idempotency key\}. Never blind-retry a payment POST \{Không bao giờ retry mù POST thanh toán\}.
+
+| Attempt | Delay (base 300 ms) | With jitter (~30%) |
+|---|---|---|
+| 0 → 1 | 300 ms | 300–390 ms |
+| 1 → 2 | 600 ms | 600–780 ms |
+| 2 → 3 | 1200 ms | 1200–1560 ms |
+
+Pass `AbortSignal` into retry so navigation cancels the loop \{Truyền `AbortSignal` vào retry để điều hướng huỷ vòng lặp\}:
+
+```js
+async function retry(fn, { signal, retries = 3 } = {}) {
+  for (let i = 0; i <= retries; i++) {
+    signal?.throwIfAborted();
+    try {
+      return await fn(signal);
+    } catch (err) {
+      if (i === retries) throw err;
+      await sleep(300 * 2 ** i, signal);
+    }
+  }
+}
+```
+
+---
+
+## Concurrency Limiting — A Pool from Scratch \{Giới hạn đồng thời — Pool tự viết\}
+
+`Promise.all` on 500 URLs will get you rate-limited or crash mobile radios \{`Promise.all` trên 500 URL sẽ bị rate-limit hoặc làm radio mobile sập\}. You need a **pool** — same idea as `p-limit` \{Cần **pool** — cùng ý tưởng `p-limit`\}:
+
+```js
+function createPool(concurrency) {
+  let active = 0;
+  const queue = [];
+
+  const next = () => {
+    if (active >= concurrency || queue.length === 0) return;
+    active += 1;
+    const { fn, resolve, reject } = queue.shift();
+    Promise.resolve()
+      .then(fn)
+      .then(
+        (v) => { active -= 1; resolve(v); next(); },
+        (e) => { active -= 1; reject(e); next(); }
+      );
+  };
+
+  return (fn) =>
+    new Promise((resolve, reject) => {
+      queue.push({ fn, resolve, reject });
+      next();
+    });
+}
+
+const limit = createPool(4);
+
+const results = await Promise.allSettled(
+  urls.map((url) => limit(() => fetch(url).then((r) => r.json())))
+);
+```
+
+Four slots, many tasks queued — throughput capped without losing parallelism entirely \{Bốn slot, nhiều task xếp hàng — throughput giới hạn mà vẫn song song một phần\}. Tune concurrency from API `Retry-After` headers or device class \{Chỉnh concurrency từ header `Retry-After` hoặc loại thiết bị\}.
+
+---
+
+## Error Handling Pitfalls \{Cạm bẫy xử lý lỗi\}
+
+### Floating promises \{Promise trôi nổi\}
+
+```js
+// ❌ ESLint @typescript-eslint/no-floating-promises
+async function save() { /* … */ }
+save(); // rejection becomes unhandled {rejection thành unhandled}
+
+// ✅
+void save().catch reportError;
+// or
+await save();
+```
+
+### Mixing `await` and `.then` in one function \{Trộn `await` và `.then` trong một hàm\}
+
+Pick one style per function for readability \{Chọn một style mỗi hàm cho dễ đọc\}. Deep mixing hides failure paths \{Trộn sâu che đường lỗi\}.
+
+### `try/catch` around `Promise.all` vs per-promise
+
+```js
+try {
+  await Promise.all(tasks); // one failure → catch {một lỗi → catch}
+} catch (e) {
+  // you don't know WHICH failed without allSettled
+  // {không biết CÁI NÀO fail nếu không dùng allSettled}
+}
+```
+
+Use `allSettled` when you need per-item error UI \{Dùng `allSettled` khi cần UI lỗi từng item\}.
+
+### Global `unhandledrejection`
+
+```js
+window.addEventListener("unhandledrejection", (event) => {
+  reportToSentry(event.reason);
+  event.preventDefault(); // optional: mark handled {tuỳ chọn: đánh dấu đã xử lý}
+});
+```
+
+Still fix the root cause — global handlers are a safety net, not architecture \{Vẫn sửa gốc — handler global là lưới an toàn, không phải kiến trúc\}.
+
+### Re-throwing non-Error values
+
+Always `throw new Error(...)` or preserve `cause` \{Luôn `throw new Error(...)` hoặc giữ `cause`\} so stack traces survive \{để stack trace còn\}:
+
+```js
+catch (err) {
+  throw new Error("Upload failed", { cause: err });
+}
+```
+
+---
+
+## `for await...of` and Async Iterators (Brief) \{`for await...of` và Async Iterator (tóm tắt)\}
+
+When data arrives as a **stream of promises** rather than one blob \{Khi data đến dưới dạng **luồng promise** thay vì một khối\}, async iterables fit naturally \{async iterable hợp tự nhiên\}:
+
+```js
+async function* paginate(url) {
+  let next = url;
+  while (next) {
+    const page = await fetch(next).then((r) => r.json());
+    yield page.items;
+    next = page.next;
+  }
+}
+
+for await (const batch of paginate("/api/items?page=1")) {
+  renderBatch(batch);
+}
+```
+
+Node streams, SSE parsers, and WebSocket message handlers often expose async iteration \{Stream Node, parser SSE, handler WebSocket thường expose async iteration\}. Combine with `AbortSignal` on the underlying transport \{Kết hợp với `AbortSignal` trên transport gốc\}.
+
+---
+
+## Decision Cheat Sheet \{Bảng quyết định nhanh\}
+
+```text
+Need ALL results, fail if ANY fails?     → Promise.all
+Need ALL outcomes for reporting/retry?   → Promise.allSettled
+Need fastest response (incl. errors)?    → Promise.race
+Need first SUCCESS among redundancies?   → Promise.any
+Steps depend on previous step?           → sequential await in loop
+Independent I/O, no rate limit?          → Promise.all (parallel)
+Independent I/O, rate limited?           → concurrency pool
+User navigates / input changes?          → AbortController per request
+Flaky network read?                      → retry + backoff + jitter + signal
+```
+
+---
+
+## Closing — Async Is a Design Choice, Not a Syntax Choice \{Kết — Async là lựa chọn thiết kế, không phải cú pháp\}
+
+The demo above makes the timing visible \{Demo trên làm thời gian nhìn thấy được\}: sequential bars stack end-to-end; `Promise.all` bars overlap; `race` and `any` stop caring once their winner is decided — but **losers still finish unless you abort them** \{bar tuần tự xếp nối đuôi; bar `Promise.all` chồng lên nhau; `race` và `any` ngừng quan tâm khi có winner — nhưng **kẻ thua vẫn chạy nếu bạn không abort**\}.
+
+Ship with intent \{Ship có chủ đích\}: pick the combinator that matches your **failure semantics**, cap concurrency when fanning out, wire **AbortSignal** through every fetch path, and never leave a Promise floating \{chọn combinator khớp **ngữ nghĩa lỗi**, giới hạn concurrency khi fan-out, luồn **AbortSignal** qua mọi fetch, và không bao giờ để Promise trôi nổi\}. Your users feel the difference in milliseconds and megabytes \{User cảm nhận khác biệt bằng millisecond và megabyte\} — even if they never open DevTools \{dù họ không mở DevTools\}.

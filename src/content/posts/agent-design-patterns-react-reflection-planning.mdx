@@ -1,0 +1,370 @@
+---
+title: 'Agent Patterns: ReAct, Reflection & Planning — From One LLM Call to a Production Loop'
+description: 'ReAct, Reflection, and Planning for LLM agents — when to use each, guardrails against runaway loops, and links to tool use and orchestration.'
+pubDate: 2026-03-19
+tags: [ai, agents, react, reflection, llm_10]
+draft: false
+---
+
+> Part 10 (final) of the Building AI Agents series \{Phần 10 — cuối\}. Previous \{Trước\}: [Function Calling & Tool Use](/blog/function-calling-and-tool-use/).
+
+Ten posts ago we counted tokens \{Mười bài trước ta đếm token\}. By Part 9 we wired tools and parsed `tool_calls` \{Đến Phần 9 ta đã nối tool và parse `tool_calls`\}. This final installment closes the loop: **how you turn a single LLM call into an agent** — a runtime that repeats inference, executes side effects, and decides when to stop \{Bài cuối khép vòng: **cách biến một LLM call thành agent** — runtime lặp inference, thực thi side effect, và quyết định khi nào dừng\}.
+
+An agent is not a smarter prompt \{Agent không phải prompt thông minh hơn\}. It is an **orchestration pattern**: a loop over the model, tools, and memory with explicit termination rules \{Nó là **pattern orchestration**: vòng lặp qua model, tool, và memory với quy tắc kết thúc rõ ràng\}. The three patterns below — **ReAct**, **Reflection**, and **Planning** — cover most production agent architectures you will ship or debug \{Ba pattern dưới — **ReAct**, **Reflection**, **Planning** — cover hầu hết kiến trúc agent production bạn sẽ ship hoặc debug\}.
+
+---
+
+## Interactive demo: step through three agent loops \{Demo tương tác: bước qua ba vòng agent\}
+
+The demo walks one canned task — *"Find the cheapest flight SFO → NYC and book a Midtown hotel"* — through ReAct, Reflection, and Planning \{Demo đi một task canned — *"Tìm chuyến bay rẻ nhất SFO → NYC và đặt khách sạn Midtown"* — qua ReAct, Reflection, và Planning\}. Press **Run next step** to animate each phase; no API keys, no network \{Bấm **Run next step** để animate từng phase; không API key, không network\}.
+
+<iframe
+  src="/tools/agent-loop-demo/"
+  title="Agent design patterns interactive demo"
+  loading="lazy"
+  style="width:100%;height:720px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/agent-loop-demo/](/tools/agent-loop-demo/).
+
+---
+
+## From one LLM call to an agent \{Từ một LLM call đến agent\}
+
+A **single-turn completion** is request → response \{**Completion single-turn** là request → response\}. An **agent** adds a **control loop** around that call \{**Agent** thêm **control loop** bọc call đó\}:
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                        AGENT RUNTIME                            │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
+│  │  Prompt  │ →  │   LLM    │ →  │  Parse   │ →  │  Tools   │  │
+│  │  builder │    │  infer   │    │  output  │    │  / env   │  │
+│  └──────────┘    └──────────┘    └──────────┘    └────┬─────┘  │
+│       ↑                                                │         │
+│       └──────── append observations / memory ─────────┘         │
+│                                                                 │
+│  Terminate when: answer │ max_steps │ budget │ eval pass        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Every agent loop shares four ingredients \{Mọi vòng agent chia sẻ bốn thành phần\}:
+
+| Ingredient | Role | Series reference |
+| --- | --- | --- |
+| **Context** | What the model sees this turn | [Context Engineering & Memory](/blog/context-engineering-and-agent-memory/) |
+| **Tools** | Side effects — search, write, execute | [Function Calling & Tool Use](/blog/function-calling-and-tool-use/) |
+| **Stopping** | When generation ends per step | [Stopping Criteria & Output Control](/blog/llm-stopping-criteria-and-output-control/) |
+| **Evaluation** | Did the run succeed? | [Evaluating LLMs & Agents](/blog/evaluating-llms-and-agents/) |
+
+> **Mental model:** The LLM is the **CPU**; your runtime is the **OS** — scheduling, I/O, memory, and kill signals \{**Mental model:** LLM là **CPU**; runtime của bạn là **OS** — scheduling, I/O, memory, và kill signal\}.
+
+Without the loop, tool schemas and memory design are inert \{Không có vòng lặp, tool schema và thiết kế memory là vô dụng\}. The pattern you choose determines **how often** you call the model, **what** each call does, and **where** failure can compound \{Pattern bạn chọn quyết định **gọi model bao lâu một lần**, **mỗi call làm gì**, và **lỗi cộng dồn ở đâu**\}.
+
+---
+
+## ReAct: interleaved reasoning and acting \{ReAct: reasoning và acting xen kẽ\}
+
+**ReAct** (Reason + Act) alternates explicit reasoning traces with tool invocations \{**ReAct** (Reason + Act) xen kẽ trace reasoning rõ ràng với lời gọi tool\}. The canonical text format from Yao et al.:
+
+```text
+Thought: I need current flight prices before recommending.
+Action: search_flights(origin="SFO", dest="JFK", depart="2026-06-12")
+Observation: [{"airline":"Alaska","price":318}, ...]
+Thought: Alaska is cheapest. Search hotels next.
+Action: search_hotels(location="Midtown NYC", ...)
+Observation: [{"name":"Yotel","rate":142}, ...]
+...
+Answer: Booked Alaska AS418 + Yotel. Total ~$744.
+```
+
+### Runtime contract \{Runtime contract\}
+
+Your orchestrator must enforce three rules \{Orchestrator phải enforce ba quy tắc\}:
+
+1. **Stop before `Observation:`** — inject real tool output; never let the model hallucinate observations \{**Dừng trước `Observation:`** — inject output tool thật; không để model bịa observation\}.
+2. **Parse `Action:`** — map to a registered tool or reject \{**Parse `Action:`** — map tới tool đã đăng ký hoặc reject\}.
+3. **Append the full trace** to context for the next turn \{**Append toàn bộ trace** vào context cho turn tiếp\}.
+
+Part 4 covered stop sequences for exactly this handoff \{Phần 4 đã cover stop sequence cho handoff này\}:
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    stop=["\nObservation:"],  # runtime injects Observation after tool runs
+    max_tokens=512,
+)
+```
+
+With native function calling (Part 9), the same loop uses `tool_calls` instead of text parsing — but the **Thought → Action → Observation** rhythm remains \{Với function calling native (Phần 9), cùng vòng lặp dùng `tool_calls` thay vì parse text — nhưng nhịp **Thought → Action → Observation** vẫn giữ\}.
+
+### When ReAct wins \{Khi ReAct thắng\}
+
+| Scenario | Why ReAct |
+| --- | --- |
+| Unknown tool sequence | Next action depends on prior observation |
+| Live data (APIs, DB, web) | Cannot plan all calls upfront |
+| Debugging | Text trace is human-readable |
+| Mixed reasoning + I/O | Model decides when it has enough evidence |
+
+### ReAct failure modes \{Failure mode ReAct\}
+
+- **Loop thrashing** — repeated identical searches; fix with dedup hashes or step memory \{**Loop thrashing** — search lặp giống nhau; fix bằng dedup hash hoặc step memory\}.
+- **Premature Answer** — model answers before calling required tools; fix with schema validation or eval gates \{**Answer sớm** — model trả lời trước khi gọi tool bắt buộc; fix bằng schema validation hoặc eval gate\}.
+- **Context bloat** — every trace grows the window; summarize or trim per [Part 5](/blog/context-engineering-and-agent-memory/) \{**Context phình** — mỗi trace làm window lớn; summarize hoặc trim theo [Phần 5](/blog/context-engineering-and-agent-memory/)\}.
+
+---
+
+## Reflection: draft, critique, revise \{Reflection: draft, critique, revise\}
+
+**Reflection** (and **Reflexion**) add a **second pass** where the model evaluates its own output before returning \{**Reflection** (và **Reflexion**) thêm **pass thứ hai** model đánh giá output của chính nó trước khi trả\}. No tools required — pure generation loop \{Không cần tool — vòng generation thuần\}.
+
+```text
+Pass 1 (Draft):     "United $342 + Hampton $189/n ≈ $909."
+Pass 2 (Critique):  "Missed Alaska $318. Hotel over budget. No booking confirmation."
+Pass 3 (Revised):   "Alaska $318 + Yotel $142/n = ~$744. PNR ABC123, HT-8842."
+```
+
+### Implementation sketch \{Implementation sketch\}
+
+```python
+draft = llm("Answer the user query.", user_query)
+critique = llm(
+    "Review this draft. List factual errors, missing constraints, and quality gaps.",
+    draft,
+)
+if needs_revision(critique):  # heuristic or classifier
+    final = llm(
+        "Revise using the critique. Return only the corrected answer.",
+        draft= draft,
+        critique=critique,
+    )
+else:
+    final = draft
+```
+
+**Reflexion** extends this across episodes: store critiques in long-term memory so future runs avoid repeated mistakes \{**Reflexion** mở rộng qua episode: lưu critique vào long-term memory để run sau tránh lặp lỗi\}.
+
+### When Reflection wins \{Khi Reflection thắng\}
+
+| Scenario | Why Reflection |
+| --- | --- |
+| Writing, summarization, code review | Quality > latency; no live I/O |
+| Constraint-heavy answers | Self-critique catches missed requirements |
+| Cheap model + one retry | Two small calls beat one huge ReAct trace |
+| Post-tool synthesis | ReAct gathers data; Reflection polishes the answer |
+
+> **Cost trade-off:** Reflection adds 1–2 extra LLM calls but often **reduces** total steps vs. a ReAct agent that wanders \{**Trade-off chi phí:** Reflection thêm 1–2 LLM call nhưng thường **giảm** tổng bước so với ReAct lang thang\}.
+
+---
+
+## Planning: decompose first, execute second \{Planning: phân rã trước, thực thi sau\}
+
+**Plan-and-execute** separates **planning** from **execution** \{**Plan-and-execute** tách **planning** khỏi **execution**\}. The planner emits numbered subtasks; workers (same or different models) execute them; a synthesizer merges results \{Planner phát subtask đánh số; worker (cùng hoặc khác model) thực thi; synthesizer gộp kết quả\}.
+
+```text
+Plan:
+  1. Search flights SFO→JFK Jun 12–15
+  2. Select lowest fare
+  3. Search Midtown hotels ≤ $200/n
+  4. Book flight + hotel
+  5. Return summary with confirmations
+
+Execute 1 → Execute 2 → Execute 3 → Synthesize
+```
+
+### Variants \{Biến thể\}
+
+| Pattern | Planner output | Executor behavior |
+| --- | --- | --- |
+| **Plan-and-execute** | Natural-language subtasks | LLM + tools per subtask |
+| **ReWOO** | Tool call plan upfront | Workers run tools without intermediate LLM |
+| **Hierarchical** | Tree of goals | Sub-planners for deep tasks |
+| **LATS / tree search** | Branching plans | Explore multiple paths, prune by eval |
+
+**ReWOO** (Reasoning WithOut Observation in the loop) front-loads all tool calls — fewer LLM round-trips, but brittle when step *n+1* depends on step *n* output \{**ReWOO** front-load mọi tool call — ít round-trip LLM hơn, nhưng dễ gãy khi bước *n+1* phụ thuộc output bước *n*\}.
+
+### When Planning wins \{Khi Planning thắng\}
+
+- **Known workflow** — onboarding checklists, ETL pipelines, CI steps \{**Workflow đã biết** — checklist onboarding, pipeline ETL, bước CI\}.
+- **Parallelizable subtasks** — independent searches across sources \{**Subtask song song** — search độc lập nhiều nguồn\}.
+- **Human approval gates** — plan is reviewable before execution \{**Gate phê duyệt** — plan review được trước khi chạy\}.
+- **Cost control** — one cheap planner + targeted worker calls \{**Kiểm soát chi phí** — planner rẻ + worker call có mục tiêu\}.
+
+### Planning failure modes \{Failure mode Planning\}
+
+- **Stale plan** — executor discovers step 2 is impossible; need **re-planning** loop \{**Plan cũ** — executor thấy bước 2 không khả thi; cần vòng **re-planning**\}.
+- **Over-decomposition** — 20 micro-steps burn tokens; merge where safe \{**Phân rã quá** — 20 micro-step đốt token; gộp khi an toàn\}.
+- **Plan hallucination** — planner invents tools; validate against registry (Part 9) \{**Plan bịa tool** — validate với registry (Phần 9)\}.
+
+---
+
+## Reasoning models and when explicit CoT is redundant \{Reasoning model và khi CoT explicit thừa\}
+
+**Reasoning models** (o-series, DeepSeek-R1, QwQ, etc.) internalize chain-of-thought during training \{**Reasoning model** (o-series, DeepSeek-R1, QwQ, v.v.) internalize chain-of-thought khi training\}. They emit extended thinking tokens before the visible answer \{Chúng phát extended thinking token trước câu trả lời hiển thị\}.
+
+| Approach | Explicit `Thought:` scaffolding | Reasoning model |
+| --- | --- | --- |
+| ReAct text format | Required for interpretability | Often redundant; use tools + final answer |
+| Reflection critique | Still valuable — external pass catches blind spots | Draft may already be strong; critique remains useful |
+| Planning | Planner can be a reasoning model | Strong at decomposition; watch cost per plan token |
+| Debugging | Harder — thinking may be hidden | Log `reasoning_content` if API exposes it |
+
+> **Rule of thumb:** If the model already "thinks" internally, **don't double-pay** for verbose `Thought:` prefixes unless you need audit logs or stop-sequence handoffs \{**Quy tắc ngón tay cái:** Nếu model đã "nghĩ" nội bộ, **đừng trả double** cho prefix `Thought:` dài trừ khi cần audit log hoặc stop-sequence handoff\}.
+
+For model selection trade-offs, see [Choosing a Model](/blog/choosing-an-llm-model-framework/) \{Về trade-off chọn model, xem [Choosing a Model](/blog/choosing-an-llm-model-framework/)\}. For sampling stability during multi-step loops, see [Part 2](/blog/llm-sampling-temperature-top-p-top-k/) \{Về ổn định sampling trong vòng multi-step, xem [Phần 2](/blog/llm-sampling-temperature-top-p-top-k/)\}.
+
+---
+
+## Combining patterns in production \{Kết hợp pattern trong production\}
+
+Real agents rarely use one pattern exclusively \{Agent thực tế hiếm khi chỉ dùng một pattern\}. Common compositions:
+
+```text
+Planning → ReAct (per subtask) → Reflection (final polish)
+         ↘ ReWOO (parallel I/O) ↗
+```
+
+| Layer | Pattern | Example |
+| --- | --- | --- |
+| Top-level orchestrator | Planning | "Research competitor → draft report → send email" |
+| Subtask executor | ReAct | Live web search + scrape within one subtask |
+| Output gate | Reflection | Critique draft before user sees it |
+| Quality assurance | Eval (Part 7) | Regression suite on golden tasks |
+
+**Tool use** (Part 9) plugs into any pattern at the execution layer \{**Tool use** (Phần 9) cắm vào bất kỳ pattern nào ở tầng execution\}. **Memory** (Part 5) decides what prior plans, critiques, and observations survive the next turn \{**Memory** (Phần 5) quyết định plan, critique, observation trước nào sống sót turn sau\}.
+
+---
+
+## Multi-agent orchestration \{Multi-agent orchestration\}
+
+When a single loop is insufficient, **multi-agent** architectures assign roles \{Khi một vòng lặp không đủ, kiến trúc **multi-agent** gán role\}:
+
+- **Orchestrator + workers** — planner delegates to specialized agents ([Orchestrator Pattern](/blog/orchestrator-pattern-multi-agent/)) \{**Orchestrator + worker** — planner delegate cho agent chuyên biệt ([Orchestrator Pattern](/blog/orchestrator-pattern-multi-agent/))\}.
+- **Pipeline** — sequential handoffs with typed outputs \{**Pipeline** — handoff tuần tự với output có kiểu\}.
+- **Debate / verifier** — one agent proposes, another critiques (Reflection as architecture) \{**Debate / verifier** — một agent đề xuất, agent khác critique (Reflection như kiến trúc)\}.
+
+For system-level topology — state machines, message buses, shared scratchpads — see [Agent Architecture Deep Dive](/blog/agent-architecture-deep-dive/) \{Về topology cấp hệ thống — state machine, message bus, scratchpad dùng chung — xem [Agent Architecture Deep Dive](/blog/agent-architecture-deep-dive/)\}.
+
+Each sub-agent is still **one of the three patterns inside** \{Mỗi sub-agent bên trong vẫn là **một trong ba pattern**\}. The orchestrator's job is routing, not replacing ReAct/Reflection/Planning \{Việc orchestrator là routing, không thay ReAct/Reflection/Planning\}.
+
+---
+
+## Choosing a pattern by task \{Chọn pattern theo task\}
+
+| Task shape | Start here | Avoid |
+| --- | --- | --- |
+| Open-ended research, unknown steps | ReAct | Rigid upfront plan |
+| Single-shot quality (email, summary, review) | Reflection | Unnecessary tool loops |
+| Repeatable workflow, SOP | Planning | ReAct wandering |
+| High parallelism, stable tool graph | ReWOO / Planning | Step-by-step ReAct |
+| Long horizon, branching decisions | Hierarchical planning + eval | Flat ReAct without budgets |
+| Coding agent in IDE | ReAct + Reflection on diff | Plan-only without file I/O |
+
+Ask three questions before shipping \{Hỏi ba câu trước khi ship\}:
+
+1. **Does the next action depend on live observations?** → ReAct \{**Bước tiếp phụ thuộc observation live?** → ReAct\}.
+2. **Is the output graded on quality, not tool count?** → Reflection \{**Output chấm theo chất lượng, không phải số tool?** → Reflection\}.
+3. **Can you write the steps before running?** → Planning \{**Viết được bước trước khi chạy?** → Planning\}.
+
+---
+
+## Failure modes and guardrails \{Failure mode và guardrail\}
+
+Agents fail differently from single-turn LLMs \{Agent fail khác LLM single-turn\}. Production guardrails from Parts 4, 7, and 9:
+
+| Failure | Symptom | Guardrail |
+| --- | --- | --- |
+| **Infinite loop** | Same Action repeated | `max_steps`, action dedup, diminishing returns detector |
+| **Hallucinated tools** | Action calls unknown function | Tool registry whitelist; reject + retry prompt |
+| **Runaway cost** | Token budget blown in one run | Per-run `$` cap, cumulative token counter, step pricing alerts |
+| **Context overflow** | Truncated mid-trace | Rolling summary, observation compression ([Part 5](/blog/context-engineering-and-agent-memory/)) |
+| **Silent wrong answer** | Confident but incorrect | Eval harness ([Part 7](/blog/evaluating-llms-and-agents/)), Reflection gate, human-in-the-loop |
+| **Unsafe tool call** | Destructive write/delete | Permission tiers, confirmation UI, sandboxed execution |
+
+```python
+MAX_STEPS = 12
+MAX_TOKENS_PER_RUN = 80_000
+seen_actions: set[str] = set()
+
+for step in range(MAX_STEPS):
+    response = llm(messages, tools=registry)
+    total_tokens += response.usage.total_tokens
+    if total_tokens > MAX_TOKENS_PER_RUN:
+        raise BudgetExceeded()
+
+    if response.tool_calls:
+        action_key = canonicalize(response.tool_calls)
+        if action_key in seen_actions:
+            messages.append({"role": "user", "content": "Duplicate action. Try a different approach or answer."})
+            continue
+        seen_actions.add(action_key)
+        # execute tools, append observations ...
+    else:
+        return response.content  # final answer
+
+raise MaxStepsExceeded()
+```
+
+> **Ship criterion:** An agent without **max_steps**, **budget tracking**, and **eval regression tests** is a demo — not production \{**Tiêu chí ship:** Agent không có **max_steps**, **budget tracking**, và **eval regression test** là demo — không phải production\}.
+
+---
+
+## Prompt scaffolding reference \{Tham chiếu prompt scaffolding\}
+
+Minimal system prompts for each pattern (adapt to your stack) \{System prompt tối thiểu cho mỗi pattern (adapt stack của bạn)\}:
+
+```text
+# ReAct
+You have tools: {tool_list}. After each Action, stop. The user will provide Observation.
+Format: Thought: ... / Action: tool_name(args) / (wait for Observation) / ... / Answer: ...
+
+# Reflection
+Pass 1: Produce a complete draft.
+Pass 2: Critique the draft — list errors, omissions, constraint violations.
+Pass 3: Produce a revised answer addressing every critique point.
+
+# Planning
+Pass 1: Output a numbered plan of subtasks. Do not execute yet.
+Pass 2+: Execute subtask N. Return structured result.
+Final: Synthesize all subtask results into one answer.
+```
+
+Part 3 ([Prompt Engineering for Agents](/blog/prompt-engineering-for-agents/)) covers role prompts, few-shot exemplars, and output formatting that make these scaffolds reliable \{Phần 3 ([Prompt Engineering for Agents](/blog/prompt-engineering-for-agents/)) cover role prompt, few-shot exemplar, và output format giúp scaffold này tin cậy\}.
+
+---
+
+## Series wrap-up: the full stack \{Tổng kết loạt bài: full stack\}
+
+You now have the complete picture for building LLM agents \{Giờ bạn có bức tranh đầy đủ để build LLM agent\}:
+
+```text
+Tokens & window (1) → Sampling (2) → Prompts (3) → Stopping (4)
+       ↓
+Context & memory (5) → RAG vs fine-tune (6) → Eval (7) → Model choice (8)
+       ↓
+Tools (9) → Agent patterns: ReAct · Reflection · Planning (10)
+       ↓
+Multi-agent orchestration · production guardrails · continuous eval
+```
+
+The through-line: **every layer is a contract** \{Xuyên suốt: **mỗi tầng là một contract**\}. Tokens budget what fits \{Token budget cái gì vừa\}. Sampling controls variance \{Sampling kiểm soát phương sai\}. Stopping defines step boundaries \{Stopping định nghĩa ranh giới bước\}. Context decides what persists \{Context quyết định gì persist\}. Tools define side effects \{Tool định nghĩa side effect\}. Patterns define control flow \{Pattern định nghĩa control flow\}. Eval proves it works under change \{Eval chứng minh nó hoạt động khi thay đổi\}.
+
+Start with the **simplest pattern that fits** — usually Reflection for text-only tasks, ReAct when tools are required, Planning when the SOP is known \{Bắt đầu với **pattern đơn giản nhất phù hợp** — thường Reflection cho task text-only, ReAct khi cần tool, Planning khi SOP đã biết\}. Add complexity only when evals prove the simpler loop fails \{Chỉ thêm phức tạp khi eval chứng minh vòng đơn giản hơn fail\}.
+
+> **Final note:** The best agent architecture is the one your team can **observe, test, and roll back** — not the one with the most pattern names in the README \{**Ghi chú cuối:** Kiến trúc agent tốt nhất là cái team bạn **quan sát, test, và rollback** được — không phải cái có nhiều tên pattern nhất trong README\}.
+
+---
+
+## The Building AI Agents series \{Loạt bài Building AI Agents\}
+
+1. [Tokens & Context Windows](/blog/ai-agents-tokens-and-context-windows/)
+2. [Sampling: temperature, top_p, top_k](/blog/llm-sampling-temperature-top-p-top-k/)
+3. [Prompt Engineering for Agents](/blog/prompt-engineering-for-agents/)
+4. [Stopping Criteria & Output Control](/blog/llm-stopping-criteria-and-output-control/)
+5. [Context Engineering & Memory](/blog/context-engineering-and-agent-memory/)
+6. [Fine-tuning vs Prompting vs RAG](/blog/fine-tuning-vs-prompting-vs-rag/)
+7. [Evaluating LLMs & Agents](/blog/evaluating-llms-and-agents/)
+8. [Choosing a Model](/blog/choosing-an-llm-model-framework/)
+9. [Function Calling & Tool Use](/blog/function-calling-and-tool-use/)
+10. **[Agent Patterns: ReAct, Reflection, Planning](/blog/agent-design-patterns-react-reflection-planning/) (current)**

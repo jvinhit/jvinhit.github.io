@@ -1,0 +1,327 @@
+---
+title: 'Choosing an LLM for Agents: A Durable Framework Beyond Leaderboards'
+description: 'A senior engineer framework for model selection — capability tiers, context, modality, cost, privacy, tool use — plus routing, cascades, and why benchmarks lie.'
+pubDate: 2026-03-03
+tags: [ai, llm, models, agents, llm_10]
+draft: false
+---
+
+> Part 8 of the Building AI Agents series \{Phần 8\}. Previous \{Trước\}: [Evaluating LLMs & Agents](/blog/evaluating-llms-and-agents/) · Next \{Tiếp\}: [Function Calling & Tool Use](/blog/function-calling-and-tool-use/).
+
+Model leaderboards go stale before you finish reading them \{Bảng xếp hạng model lỗi thời trước khi bạn đọc xong\}. Vendors ship new checkpoints weekly, pricing shifts, and your agent workload is nothing like MMLU \{Vendor ship checkpoint mới hàng tuần, giá thay đổi, và workload agent của bạn không giống MMLU\}. The durable skill is not memorizing which model is \#1 today — it is building a **selection framework** you can re-run every quarter \{Kỹ năng bền vững không phải nhớ model \#1 hôm nay — mà là xây **framework chọn model** chạy lại mỗi quý\}.
+
+This post gives you that framework: capability tiers, hard constraints, eval-driven shortlists, and production patterns like routing and cascades \{Bài này đưa framework đó: capability tier, ràng buộc cứng, shortlist theo eval, và pattern production như routing và cascade\}. For a living catalog of specific models, see [LLM Models Comparison Guide](/blog/llm-models-comparison-guide/) and [Open Source LLM Ecosystem](/blog/open-source-llm-ecosystem/) — this article stays at the decision layer \{Để xem catalog model cụ thể, xem [LLM Models Comparison Guide](/blog/llm-models-comparison-guide/) và [Open Source LLM Ecosystem](/blog/open-source-llm-ecosystem/) — bài này ở tầng quyết định\}.
+
+<iframe
+  src="/tools/model-selector-demo/"
+  title="LLM model selection interactive demo"
+  loading="lazy"
+  style="width:100%;height:720px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/model-selector-demo/](/tools/model-selector-demo/).
+
+---
+
+## Start with constraints, not hype \{Bắt đầu từ ràng buộc, không phải hype\}
+
+Before comparing benchmarks, write down what your agent **must** satisfy \{Trước khi so benchmark, ghi rõ agent **bắt buộc** đáp ứng gì\}. These are pass/fail gates — a model that scores 95 on a public leaderboard but cannot run in your VPC is disqualified \{Đây là cửa pass/fail — model 95 điểm leaderboard nhưng không chạy trong VPC của bạn thì bị loại\}.
+
+| Constraint category | Questions to answer |
+|---------------------|-------------------|
+| **Data & privacy** | Can prompts leave your network? PII, HIPAA, SOC2? |
+| **Latency & UX** | Sub-second first token? Streaming required? |
+| **Modality** | Text only, or vision/audio for documents and screenshots? |
+| **Context length** | Max input per turn — 8k, 128k, 1M tokens? |
+| **Output shape** | JSON schema, tool calls, free-form prose? |
+| **Cost envelope** | Budget per task, per user/day, or per 1M tokens? |
+| **Ops maturity** | Managed API vs self-host GPUs vs hybrid? |
+
+> **Callout:** Constraints eliminate 80% of candidates before you open a single benchmark page \{**Callout:** Ràng buộc loại 80% ứng viên trước khi bạn mở trang benchmark\}. Treat "we might need vision someday" as a soft preference, not a hard gate — unless product already ships image inputs \{Coi "có thể cần vision sau" là preference mềm, không phải gate cứng — trừ khi product đã ship input ảnh\}.
+
+---
+
+## Capability tiers — think in classes, not SKUs \{Capability tier — nghĩ theo class, không theo SKU\}
+
+The market clusters into a handful of **representative tiers** that age slowly even as individual model names churn \{Thị trường gom thành vài **tier đại diện** ít lỗi thời dù tên model thay đổi\}. Map your workload to a tier first; pick a specific checkpoint second \{Map workload lên tier trước; chọn checkpoint cụ thể sau\}.
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│  TIER              │  TYPICAL USE IN AGENTS                     │
+├────────────────────┼────────────────────────────────────────────┤
+│  Frontier / large  │  Hard reasoning, ambiguous specs, codegen  │
+│  Mid / balanced    │  Default production agent loop, tool use   │
+│  Small / fast      │  Routing, classification, simple extract   │
+│  Reasoning model   │  Math, planning, verify-before-act steps   │
+│  Open-weight       │  VPC-only, fine-tune, air-gapped deploy     │
+└────────────────────┴────────────────────────────────────────────┘
+```
+
+**Frontier / large** models maximize general capability at the highest cost and latency \{**Frontier / large** tối đa capability tổng quát với cost và latency cao nhất\}. Use when errors are expensive — legal review, complex codegen, multi-file refactors \{Dùng khi lỗi đắt — legal review, codegen phức tạp, refactor nhiều file\}.
+
+**Mid / balanced** is the workhorse tier for most agent products \{**Mid / balanced** là tier workhorse cho hầu hết agent product\}. Tool-calling quality, structured output, and instruction-following are usually "good enough" at 3–10× lower cost than frontier \{Tool-calling, structured output, instruction-following thường "đủ tốt" với cost thấp hơn frontier 3–10×\}.
+
+**Small / fast** models shine in **routing** and **prefilter** roles — intent detection, safety classifiers, summarizing logs before escalation \{**Small / fast** mạnh ở **routing** và **prefilter** — intent detection, safety classifier, tóm tắt log trước khi escalate\}. Never assume a small model can replace a mid tier on multi-step tool loops without measuring \{Đừng giả định small model thay mid tier trên vòng tool nhiều bước mà không đo\}.
+
+**Reasoning models** (extended thinking, chain-of-thought baked in) trade latency and cost for hard logic \{**Reasoning model** (extended thinking, CoT sẵn) đổi latency và cost lấy logic khó\}. They are poor defaults for chat UX but excellent as **escalation targets** when a cheaper model fails verification \{Chúng không phải default cho chat UX nhưng xuất sắc làm **mục tiêu escalate** khi model rẻ fail verification\}.
+
+**Open-weight / self-host** tiers buy data sovereignty and fine-tune freedom at the cost of GPU ops, quantization tradeoffs, and uneven tool-calling \{**Open-weight / self-host** mua data sovereignty và tự do fine-tune, đổi lại GPU ops, tradeoff quantization, tool-calling không đồng đều\}. See [Open Source LLM Ecosystem](/blog/open-source-llm-ecosystem/) for deployment patterns \{Xem [Open Source LLM Ecosystem](/blog/open-source-llm-ecosystem/) cho pattern deploy\}.
+
+---
+
+## Context length — need vs afford \{Context length — nhu cầu vs chi trả\}
+
+Long context is not free even when advertised \{Context dài không miễn phí dù quảng cáo vậy\}. Many providers bill input tokens linearly; attention cost grows super-linearly on some architectures \{Nhiều provider tính input token tuyến tính; cost attention tăng siêu tuyến tính trên một số kiến trúc\}. A 500k-token dump into a 1M window can cost more than summarizing in chunks with a cheaper model \{Nhét 500k token vào cửa sổ 1M có thể đắt hơn tóm tắt theo chunk bằng model rẻ\}.
+
+| Signal | Prefer long-context tier | Prefer chunk + RAG / summarize |
+|--------|--------------------------|--------------------------------|
+| Whole-repo reasoning in one shot | ✓ | |
+| Mostly retrieval over fixed corpus | | ✓ |
+| Latency-sensitive chat | | ✓ |
+| Legal doc "read everything" audit | ✓ | |
+| Recurring same large context | | ✓ (cache / index) |
+
+> **Callout:** Context window size is a **ceiling**, not a quality guarantee \{**Callout:** Context window là **trần**, không đảm bảo chất lượng\}. Models lose "needle" accuracy in the middle of huge prompts — validate with your own long-input evals \{Model mất độ chính xác "needle" giữa prompt khổng lồ — validate bằng eval long-input của bạn\}. Part 1 covered token economics in depth: [Tokens & Context Windows](/blog/ai-agents-tokens-and-context-windows/) \{Phần 1 cover token economics sâu: [Tokens & Context Windows](/blog/ai-agents-tokens-and-context-windows/)\}.
+
+---
+
+## Modality — vision, audio, and agent UX \{Modality — vision, audio, và agent UX\}
+
+Multimodal agents are not "text model + OCR wrapper" in 2026 \{Agent multimodal không còn là "text model + OCR wrapper" năm 2026\}. Native vision models understand layout, charts, and UI screenshots — critical for browser agents and document workflows \{Vision native hiểu layout, chart, screenshot UI — quan trọng cho browser agent và document workflow\}.
+
+When evaluating modality fit \{Khi đánh giá modality fit\}:
+
+- **Hard requirement:** If users upload images or PDFs rendered as pages, filter to vision-capable tiers early \{**Bắt buộc:** Nếu user upload ảnh hoặc PDF render trang, lọc tier có vision sớm\}.
+- **Audio:** Real-time voice agents add streaming ASR/TTS latency budgets separate from LLM latency \{**Audio:** Voice agent real-time thêm budget latency ASR/TTS tách khỏi LLM latency\}.
+- **Structured docs:** Tables and forms often need vision or specialized parsers — do not assume markdown conversion preserves semantics \{**Doc có cấu trúc:** Bảng và form thường cần vision hoặc parser chuyên — đừng giả định convert markdown giữ nguyên semantics\}.
+
+---
+
+## Reasoning vs non-reasoning models \{Reasoning vs non-reasoning model\}
+
+Standard chat models answer in one forward pass per token \{Chat model chuẩn trả lời một forward pass mỗi token\}. **Reasoning models** allocate extra compute — internal chain-of-thought, self-consistency, or search — before emitting the user-visible answer \{**Reasoning model** dành thêm compute — CoT nội bộ, self-consistency, hoặc search — trước khi phát câu trả lời user thấy\}.
+
+| Dimension | Non-reasoning (Mid/Frontier chat) | Reasoning tier |
+|-----------|-----------------------------------|----------------|
+| Latency | Lower, predictable streaming | High, bursty |
+| Cost per task | Token-linear | Often 5–20× for hard problems |
+| Best for | Tool loops, extraction, dialogue | Proof, planning, ambiguous math |
+| Agent pattern | Default loop | Escalation after failed verify |
+
+Use reasoning models **surgically** \{Dùng reasoning model **có chọn lọc**\}: a router sends easy steps to mid tier, hard steps to reasoning tier, never the reverse by default \{router gửi bước dễ sang mid tier, bước khó sang reasoning tier, không mặc định ngược lại\}. Sampling knobs from Part 2 still apply — low temperature for verification steps \{Knob sampling Phần 2 vẫn áp dụng — temperature thấp cho bước verification\}.
+
+---
+
+## Latency, throughput, and SLA math \{Latency, throughput, và SLA math\}
+
+Agent latency is the sum of many LLM calls plus tool I/O \{Latency agent là tổng nhiều LLM call cộng tool I/O\}. Model choice affects every layer \{Chọn model ảnh hưởng mọi tầng\}:
+
+```text
+User message
+    → router model (small, ~100ms)
+    → planner model (mid, ~800ms)
+    → tool execution (variable)
+    → synthesizer model (mid, ~600ms)
+    → optional verifier (small or reasoning)
+= perceived latency budget
+```
+
+**Time-to-first-token (TTFT)** matters for streaming UX \{**TTFT** quan trọng cho streaming UX\}. **Tokens per second** matters for long codegen \{**Tokens/giây** quan trọng cho codegen dài\}. Batch APIs trade latency for 50% cost cuts — fine for offline eval pipelines, wrong for interactive agents \{Batch API đổi latency lấy giảm 50% cost — ổn cho eval offline, sai cho agent tương tác\}.
+
+Pick tier per **step**, not per product \{Chọn tier theo **bước**, không theo product\}: the same agent may call small for classify, mid for act, reasoning for repair \{Cùng agent có thể gọi small classify, mid act, reasoning repair\}.
+
+---
+
+## Cost per token — and per successful task \{Cost mỗi token — và mỗi task thành công\}
+
+List price is a lower bound \{Giá niêm yết là cận dưới\}. Real cost includes retries, overlong prompts, failed tool parses, and escalation \{Cost thực gồm retry, prompt dài thừa, parse tool fail, và escalate\}.
+
+| Cost driver | Mitigation |
+|-------------|------------|
+| Input-heavy prompts | Prompt compression, caching, retrieve don't stuff |
+| Multi-step loops | Step caps, cheaper model for drafts |
+| Reasoning tax | Gate with verifier; don't run o-class on every turn |
+| Output bloat | Stopping criteria (Part 4), max_tokens discipline |
+
+Normalize comparisons to **cost per successful task** on your eval set, not cost per 1M tokens in isolation \{Chuẩn hóa so sánh theo **cost mỗi task thành công** trên eval set, không chỉ cost/1M token riêng lẻ\}. Deep patterns: [LLM Cost Optimization Patterns](/blog/llm-cost-optimization-patterns/) \{Pattern sâu: [LLM Cost Optimization Patterns](/blog/llm-cost-optimization-patterns/)\}.
+
+---
+
+## Open-weight vs proprietary \{Open-weight vs proprietary\}
+
+| Factor | Proprietary API | Open-weight self-host |
+|--------|-----------------|------------------------|
+| Time to first agent | Hours | Days–weeks (GPU, quant, serving) |
+| Data residency | Vendor DPA / region | Full control |
+| Fine-tuning | Often limited / expensive | Full weights, LoRA, distillation |
+| Tool calling | Usually mature | Model-dependent, test hard |
+| Model churn | Vendor deprecates versions | You control upgrade cadence |
+
+Hybrid is common: proprietary for prototyping, open-weight for regulated production, or open small model for routing + proprietary for hard steps \{Hybrid phổ biến: proprietary prototype, open-weight production regulated, hoặc open small routing + proprietary bước khó\}.
+
+---
+
+## Fine-tunability — when weights beat prompts \{Fine-tunability — khi weight thắng prompt\}
+
+Fine-tuning helps when you have **many examples of a narrow behavior** that prompting cannot stabilize — tone, schema quirks, domain jargon, tool selection bias \{Fine-tune giúp khi có **nhiều ví dụ hành vi hẹp** mà prompt không ổn định — tone, schema lạ, jargon domain, bias chọn tool\}. It hurts when the task drifts weekly or you lack eval data \{Hại khi task đổi hàng tuần hoặc thiếu eval data\}. Part 6 covers the tradeoff space: [Fine-tuning vs Prompting vs RAG](/blog/fine-tuning-vs-prompting-vs-rag/) \{Phần 6 cover tradeoff: [Fine-tuning vs Prompting vs RAG](/blog/fine-tuning-vs-prompting-vs-rag/)\}.
+
+Open-weight tiers dominate fine-tune scenarios; proprietary APIs increasingly offer adapter-style tuning on mid tiers \{Open-weight thống trị fine-tune; API proprietary ngày càng có tuning kiểu adapter trên mid tier\}. Always fine-tune against the same eval harness you use for model selection \{Luôn fine-tune trên cùng eval harness dùng để chọn model\}.
+
+---
+
+## Tool-calling and structured output quality \{Tool-calling và structured output\}
+
+Agents live or die on **reliable function calls** and **schema-valid JSON** \{Agent sống chết ở **function call đáng tin** và **JSON đúng schema**\}. Capability benchmarks rarely measure this; your eval must \{Benchmark capability hiếm khi đo; eval của bạn phải đo\}.
+
+Checklist when shortlisting models for tool use \{Checklist shortlist model cho tool use\}:
+
+- Parallel tool calls supported?
+- Strict JSON / `response_format` / grammar constraints?
+- Behavior when tool returns error — retry or hallucinate?
+- Multi-turn tool loops stable at temperature 0.1–0.3?
+- Native vs prompt-wrapped tool protocols (compare latency)
+
+Part 9 goes deep on implementation: [Function Calling & Tool Use](/blog/function-calling-and-tool-use/) \{Phần 9 đi sâu implementation: [Function Calling & Tool Use](/blog/function-calling-and-tool-use/)\}.
+
+Example agent tool schema fragment \{Ví dụ fragment schema tool agent\}:
+
+```json
+{
+  "name": "search_docs",
+  "description": "Semantic search over internal wiki",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": { "type": "string" },
+      "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
+    },
+    "required": ["query"]
+  }
+}
+```
+
+Run 50–200 tool-call scenarios per candidate model; report **parse success rate** and **downstream task success** separately \{Chạy 50–200 scenario tool-call mỗi model; báo **tỷ lệ parse thành công** và **task success downstream** riêng\}.
+
+---
+
+## Benchmarks — useful signal, dangerous default \{Benchmark — signal hữu ích, default nguy hiểm\}
+
+Public benchmarks (MMLU, HumanEval, MATH, etc.) rank **general knowledge and exam skills**, not your agent's ticket-triage workflow \{Benchmark công khai (MMLU, HumanEval, MATH, v.v.) xếp hạng **kiến thức tổng quát và thi cử**, không phải workflow triage ticket của agent bạn\}. Three systemic problems \{Ba vấn đề hệ thống\}:
+
+1. **Contamination** — training data overlaps test sets; scores inflate \{**Contamination** — training data trùng test set; điểm phình\}.
+2. **Gaming** — vendors optimize for leaderboard tasks \{**Gaming** — vendor tối ưu cho task leaderboard\}.
+3. **Distribution shift** — your users, tools, and failure modes differ \{**Distribution shift** — user, tool, và failure mode của bạn khác\}.
+
+> **Callout:** A model +2 points on MMLU is not evidence it will parse your `create_invoice` tool correctly \{**Callout:** Model +2 điểm MMLU không chứng minh nó parse tool `create_invoice` đúng\}. Treat public benchmarks as **orientation**, not selection \{Coi benchmark công khai là **định hướng**, không phải chọn model\}.
+
+Build **your own evals** — Part 7 is the playbook: [Evaluating LLMs & Agents](/blog/evaluating-llms-and-agents/) \{Xây **eval riêng** — Phần 7 là playbook: [Evaluating LLMs & Agents](/blog/evaluating-llms-and-agents/)\}. Minimum viable selection harness \{Harness chọn model tối thiểu\}:
+
+```text
+1. 30–50 golden tasks from production logs (redacted)
+2. Metrics: success, tool accuracy, latency p95, cost per task
+3. Run all tier candidates with identical prompts + tools
+4. Blind review of failures — model vs prompt vs tool bug
+5. Pick winner on Pareto frontier (quality × cost × latency)
+```
+
+Re-run when vendors ship new checkpoints or your task mix shifts \{Chạy lại khi vendor ship checkpoint mới hoặc mix task đổi\}.
+
+---
+
+## Model routing and fallbacks \{Model routing và fallback\}
+
+**Routing** sends each request to the cheapest tier that can handle it \{**Routing** gửi mỗi request tới tier rẻ nhất xử lý được\}. Signals for routers \{Signal cho router\}:
+
+- Intent classification (small model or embeddings)
+- Estimated complexity (token count, tool count, user tier)
+- Confidence from previous step
+- Explicit user mode ("fast" vs "thorough")
+
+**Fallbacks** handle provider outages and quality cliffs \{**Fallback** xử lý outage provider và cliff chất lượng\}:
+
+```text
+Primary: Mid tier (Vendor A)
+  ↓ timeout / 5xx
+Fallback: Mid tier (Vendor B)
+  ↓ repeated tool-parse failure
+Escalate: Frontier tier
+  ↓ still failing
+Degrade: Human handoff + log for eval
+```
+
+Never silently switch tiers without logging — eval drift will mystify you \{Đừng đổi tier im lặng không log — eval drift sẽ làm bạn bối rối\}. Version the router policy like any other code \{Version policy router như code khác\}.
+
+---
+
+## Cascades — cheap first, expensive on demand \{Cascade — rẻ trước, đắt khi cần\}
+
+A **cascade** runs a fast cheap model first, then re-runs with a stronger model only when verification fails \{**Cascade** chạy model nhanh rẻ trước, chỉ chạy lại model mạnh hơn khi verification fail\}. Classic pattern \{Pattern kinh điển\}:
+
+```text
+Small → draft answer or tool plan
+Verifier (rules + small LLM) → pass?
+  yes → return
+  no  → Mid re-run with verifier feedback
+        still fail? → Reasoning tier
+```
+
+Cascades cut average cost 40–70% on mixed-difficulty workloads when verification is cheap and accurate \{Cascade cắt cost trung bình 40–70% trên workload độ khó hỗn hợp khi verification rẻ và chính xác\}. The verifier is the linchpin — invest in it \{Verifier là then chốt — đầu tư vào nó\}.
+
+Combine cascades with caching (Part 5 memory patterns) and prompt templates (Part 3) for compounding savings \{Kết hợp cascade với cache (pattern memory Phần 5) và prompt template (Phần 3) để tiết kiệm chồng lên nhau\}.
+
+---
+
+## A repeatable selection workflow \{Workflow chọn model lặp lại được\}
+
+Use this checklist every quarter or before major agent features ship \{Dùng checklist này mỗi quý hoặc trước khi ship tính năng agent lớn\}:
+
+| Step | Action |
+|------|--------|
+| 1 | Document hard constraints (privacy, latency, modality, context) |
+| 2 | Map workload to tier (frontier / mid / small / reasoning / open) |
+| 3 | Build shortlist from [comparison guide](/blog/llm-models-comparison-guide/) |
+| 4 | Run private eval harness (Part 7) — 30+ golden tasks |
+| 5 | Measure cost per **successful** task, not list price |
+| 6 | Prototype routing + cascade in staging |
+| 7 | Log tier decisions in production for continuous re-eval |
+
+```text
+CONSTRAINTS → TIER → SHORTLIST → EVAL → ROUTING DESIGN → SHIP → RE-EVAL
+```
+
+---
+
+## Common anti-patterns \{Anti-pattern thường gặp\}
+
+- **Frontier everywhere** — burns budget; mid tier handles 70% of agent steps \{**Frontier mọi nơi** — đốt budget; mid tier xử lý 70% bước agent\}.
+- **Leaderboard shopping** — optimizes irrelevant skills \{**Săn leaderboard** — tối ưu skill không liên quan\}.
+- **Ignoring tool-call eval** — chat quality ≠ agent quality \{**Bỏ qua eval tool-call** — chat tốt ≠ agent tốt\}.
+- **Single vendor lock-in** — no fallback when API deprecates a version \{**Lock-in một vendor** — không fallback khi API deprecate version\}.
+- **Static choice** — model picked at hackathon never revisited \{**Chọn tĩnh** — model chọn ở hackathon không review lại\}.
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- Select by **tier and constraints** first, specific checkpoint second \{Chọn theo **tier và ràng buộc** trước, checkpoint cụ thể sau\}.
+- Long context, vision, and reasoning are **paid upgrades** — use only when eval proves need \{Context dài, vision, reasoning là **nâng cấp trả phí** — chỉ dùng khi eval chứng minh cần\}.
+- Public benchmarks orient; **your evals decide** (Part 7) \{Benchmark công khai định hướng; **eval của bạn quyết định** (Phần 7)\}.
+- Production agents use **routing, fallbacks, and cascades** — not one model for every step \{Agent production dùng **routing, fallback, cascade** — không một model cho mọi bước\}.
+- Re-run selection when checkpoints, pricing, or task mix changes \{Chạy lại chọn model khi checkpoint, giá, hoặc mix task đổi\}.
+
+Next up: once you have a model shortlist, the agent loop depends on **reliable tool invocation** — [Function Calling & Tool Use](/blog/function-calling-and-tool-use/) \{Tiếp theo: khi đã có shortlist model, vòng agent phụ thuộc **gọi tool đáng tin** — [Function Calling & Tool Use](/blog/function-calling-and-tool-use/)\}.
+
+---
+
+## The Building AI Agents series \{Loạt bài Building AI Agents\}
+
+1. [Tokens & Context Windows](/blog/ai-agents-tokens-and-context-windows/)
+2. [Sampling: temperature, top_p, top_k](/blog/llm-sampling-temperature-top-p-top-k/)
+3. [Prompt Engineering for Agents](/blog/prompt-engineering-for-agents/)
+4. [Stopping Criteria & Output Control](/blog/llm-stopping-criteria-and-output-control/)
+5. [Context Engineering & Memory](/blog/context-engineering-and-agent-memory/)
+6. [Fine-tuning vs Prompting vs RAG](/blog/fine-tuning-vs-prompting-vs-rag/)
+7. [Evaluating LLMs & Agents](/blog/evaluating-llms-and-agents/)
+8. **[Choosing a Model](/blog/choosing-an-llm-model-framework/)** *(current)*
+9. [Function Calling & Tool Use](/blog/function-calling-and-tool-use/)
+10. [Agent Patterns: ReAct, Reflection, Planning](/blog/agent-design-patterns-react-reflection-planning/)

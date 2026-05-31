@@ -1,0 +1,410 @@
+---
+title: 'Evaluating LLMs & Agents: Golden Sets, Metrics, LLM-as-Judge, and Regression in CI'
+description: 'Why eval is the hardest part of shipping agents — golden datasets, offline vs online metrics, LLM-as-judge rubrics, human agreement, and regression in CI.'
+pubDate: 2026-02-23
+tags: [ai, llm, agents, evaluation, llm_10]
+draft: false
+---
+
+> Part 7 of the Building AI Agents series \{Phần 7\}. Previous \{Trước\}: [Fine-tuning vs Prompting vs RAG](/blog/fine-tuning-vs-prompting-vs-rag/) · Next \{Tiếp\}: [Choosing a Model](/blog/choosing-an-llm-model-framework/).
+
+You can tune sampling, craft prompts, wire RAG, and pick the best model — and still ship an agent that fails silently in production \{Bạn có thể tune sampling, viết prompt, gắn RAG, chọn model tốt nhất — vẫn deploy agent fail âm thầm trên production\}. **Evaluation** is the discipline that tells you whether any of that work actually moved the needle \{**Evaluation** là môn khoa học cho biết mọi effort đó có thực sự cải thiện hay không\}. For senior engineers building LLM agents, eval is simultaneously the **most important** and **most under-invested** part of the stack \{Với senior engineer xây agent, eval vừa **quan trọng nhất** vừa **ít được đầu tư nhất** trong stack\}.
+
+This post covers how to build golden datasets, choose metrics that match your task, automate judging without fooling yourself, and wire regression suites into CI \{Bài này cover cách xây golden dataset, chọn metric khớp task, tự động judge mà không tự lừa mình, và gắn regression suite vào CI\}. Part 6 explained *how* to improve outputs via fine-tuning, prompting, and RAG; this part explains *how you know* those improvements are real \{Phần 6 giải thích *cách* cải thiện output qua fine-tuning, prompting, RAG; phần này giải thích *cách biết* cải thiện đó là thật\}.
+
+<iframe
+  src="/tools/llm-eval-demo/"
+  title="LLM and agent evaluation interactive demo"
+  loading="lazy"
+  style="width:100%;height:720px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/llm-eval-demo/](/tools/llm-eval-demo/).
+
+---
+
+## Why eval is the hardest part of shipping agents \{Tại sao eval là phần khó nhất khi ship agent\}
+
+Agents are non-deterministic, multi-step, and context-dependent \{Agent không deterministic, nhiều bước, phụ thuộc context\}. A demo that "looks good" on three hand-picked prompts is not evidence of production readiness \{Demo "trông ổn" trên ba prompt chọn tay không phải bằng chứng sẵn sàng production\}. Eval is hard because:
+
+| Challenge | Why it hurts |
+|-----------|--------------|
+| **No single ground truth** | Paraphrases, partial credit, multiple valid tool paths |
+| **Subjective quality** | Tone, helpfulness, safety — hard to encode as exact match |
+| **Distribution shift** | Eval set from March; users ask differently in June |
+| **Compounding errors** | One wrong tool call poisons a 10-step trajectory |
+| **Cost of human review** | Expert annotators do not scale to every PR |
+
+> **Callout:** The teams that ship reliable agents treat eval as **infrastructure**, not a one-time benchmark run before launch \{**Callout:** Team ship agent đáng tin coi eval là **infrastructure**, không phải benchmark một lần trước launch\}. They maintain a living golden set, run regressions on every prompt/model change, and track online metrics after deploy \{Họ duy trì golden set sống, chạy regression mỗi khi đổi prompt/model, và theo dõi metric online sau deploy\}.
+
+Without eval, you optimize for vibes \{Không có eval, bạn optimize theo cảm giác\}. With eval, you can do **eval-driven development** — change one variable, measure delta, keep or revert \{Có eval, bạn làm **eval-driven development** — đổi một biến, đo delta, giữ hoặc revert\}.
+
+---
+
+## Building a golden / eval dataset \{Xây golden / eval dataset\}
+
+A **golden set** (or **eval set**) is a curated collection of inputs with expected outputs or scoring criteria \{**Golden set** (hay **eval set**) là tập input được curate kèm output mong đợi hoặc tiêu chí chấm điểm\}. It is your contract for "what good looks like" \{Đó là hợp đồng cho "good trông như thế nào"\}.
+
+### What each case should contain \{Mỗi case nên chứa gì\}
+
+```json
+{
+  "id": "support-refund-042",
+  "input": {
+    "messages": [{"role": "user", "content": "Can I return this after 45 days?"}],
+    "context": "Policy: returns within 30 days of purchase."
+  },
+  "reference": "Returns are accepted within 30 days; 45 days exceeds the window.",
+  "metadata": {
+    "category": "grounded_qa",
+    "difficulty": "medium",
+    "tags": ["policy", "hallucination_trap"]
+  },
+  "acceptance": {
+    "must_mention": ["30 days"],
+    "must_not_claim": ["full refund after 45 days"]
+  }
+}
+```
+
+### Sourcing cases \{Nguồn case\}
+
+| Source | Strength | Risk |
+|--------|----------|------|
+| **Production logs** (sampled, redacted) | Real distribution | Privacy, PII handling |
+| **Failure post-mortems** | High ROI — every bug becomes a case | Reactive only |
+| **Synthetic generation** | Scale quickly | May not match real user phrasing |
+| **Edge-case engineering** | Catches known failure modes | Overfits to imagined threats |
+| **Adversarial / red-team** | Finds jailbreaks, injection | Maintenance burden |
+
+Start with **50–200 high-quality cases** covering your critical paths \{Bắt đầu **50–200 case chất lượng cao** cover critical path\}. A thousand shallow cases often teach less than fifty that encode real failure modes \{Một nghìn case nông thường ít giá trị hơn năm mươi case mã hóa failure mode thật\}. Version your dataset in git alongside prompt and model config \{Version dataset trong git cùng prompt và model config\}.
+
+### Stratification \{Phân tầng\}
+
+Tag cases by capability: extraction, reasoning, tool selection, multi-turn memory, refusal/safety \{Gắn tag theo capability: extraction, reasoning, tool selection, multi-turn memory, refusal/safety\}. Report metrics **per stratum** — a 95% aggregate can hide 60% on tool calls \{Báo metric **theo stratum** — aggregate 95% có thể che 60% trên tool call\}.
+
+---
+
+## Offline vs online evaluation \{Offline vs online eval\}
+
+| Dimension | Offline eval | Online eval |
+|-----------|--------------|-------------|
+| **When** | Pre-deploy, CI, local dev | Production traffic |
+| **Data** | Golden set, held-out logs | Live user interactions |
+| **Cost** | Compute + optional human review | Latency, user trust if wrong |
+| **Signal** | Controlled, reproducible | Real distribution, drift |
+| **Speed** | Fast iteration | Slow feedback loops |
+
+**Offline eval** is your safety net: run before merge, compare model A vs B, catch regressions \{**Offline eval** là lưới an toàn: chạy trước merge, so sánh model A vs B, bắt regression\}. **Online eval** validates that offline gains transfer — A/B tests, shadow mode, human review queues \{**Online eval** xác nhận gain offline chuyển sang thật — A/B test, shadow mode, hàng đợi human review\}.
+
+```text
+  Developer change (prompt / model / RAG)
+           │
+           ▼
+   Offline golden-set eval ──► pass threshold? ──no──► block merge
+           │ yes
+           ▼
+   Staging / canary deploy
+           │
+           ▼
+   Online metrics (success rate, latency, CSAT)
+           │
+           ▼
+   Feed failures back into golden set
+```
+
+The loop closes when production failures become new golden cases \{Vòng lặp khép kín khi failure production trở thành golden case mới\}.
+
+---
+
+## Metrics — what to measure and what breaks \{Metric — đo gì và cái gì hỏng\}
+
+No single metric fits all agent tasks \{Không metric nào fit mọi task agent\}. Pick metrics aligned with user-visible success \{Chọn metric khớp success người dùng thấy được\}.
+
+### Exact match and n-gram overlap \{Exact match và n-gram overlap\}
+
+**Exact match (EM)** — output equals reference string \{**Exact match (EM)** — output bằng reference string\}. Works for classification, short factual answers, structured IDs \{Hợp cho classification, câu trả lời factual ngắn, ID có cấu trúc\}. Breaks on paraphrase: `"Paris"` vs `"The capital is Paris."` scores zero \{Vỡ với paraphrase: `"Paris"` vs `"The capital is Paris."` được 0 điểm\}.
+
+**BLEU / ROUGE** — n-gram overlap with reference \{**BLEU / ROUGE** — overlap n-gram với reference\}. Common in summarization benchmarks \{Phổ biến trong benchmark summarization\}. Penalizes valid rewording; rewards verbose copying \{Phạt diễn đạt hợp lệ; thưởng copy dài dòng\}. Poor fit for agents where **task success** matters more than wording \{Kém fit cho agent khi **task success** quan trọng hơn cách diễn đạt\}.
+
+### Semantic similarity \{Semantic similarity\}
+
+Embed output and reference; score cosine similarity \{Embed output và reference; chấm cosine similarity\}. Captures paraphrase better than EM \{Bắt paraphrase tốt hơn EM\}. Still blind to factual errors if embeddings cluster wrongly — `"Paris is in Germany"` may score high against `"Paris is in France"` \{Vẫn mù lỗi factual nếu embedding cluster sai — `"Paris is in Germany"` có thể điểm cao với `"Paris is in France"`\}. Use as a **signal**, not sole gate \{Dùng như **tín hiệu**, không phải cổng duy nhất\}.
+
+### Task success rate \{Tỷ lệ task success\}
+
+Did the agent accomplish the goal? \{Agent có hoàn thành mục tiêu không?\}
+
+- **Database query agent** — returned rows match expected SQL result
+- **Support bot** — ticket resolved without escalation (human label)
+- **Code agent** — tests pass, diff applies cleanly
+
+Task success is the metric executives care about \{Task success là metric leadership quan tâm\}. It is also the hardest to automate at scale \{Cũng là metric khó tự động hóa ở scale\}.
+
+### Groundedness and faithfulness \{Groundedness và faithfulness\}
+
+When the agent has retrieved context or tool results, does the answer **stick to sources**? \{Khi agent có context retrieve hoặc kết quả tool, câu trả lời có **bám nguồn** không?\}
+
+| Metric | Definition |
+|--------|------------|
+| **Groundedness** | Claims supported by provided context |
+| **Faithfulness** | No contradictions with source material |
+| **Citation accuracy** | Quoted spans exist and support the claim |
+
+Case TC-04 in the demo is a groundedness failure: the model claims 60 days when the doc says 30 \{Case TC-04 trong demo là lỗi groundedness: model nói 60 ngày trong khi doc ghi 30\}. See also [AI Hallucination and How to Spot It](/blog/ai-hallucination-and-how-to-spot-it/) for detection patterns \{Xem thêm [AI Hallucination and How to Spot It](/blog/ai-hallucination-and-how-to-spot-it/) cho pattern phát hiện\}.
+
+### Hallucination rate \{Tỷ lệ hallucination\}
+
+Fraction of outputs containing ** unsupported factual claims** relative to available evidence \{Tỷ lệ output chứa claim factual **không được evidence hỗ trợ** so với bằng chứng có sẵn\}. Define "claim" operationally — entity mentions, numbers, dates, policy statements \{Định nghĩa "claim" operational — entity, số, ngày, policy statement\}. Manual audit on a sample; automate with NLI models or LLM-as-judge with human calibration \{Audit thủ công trên sample; tự động bằng NLI hoặc LLM-as-judge có human calibration\}.
+
+### Tool-call accuracy \{Độ chính xác tool call\}
+
+For function-calling agents, decompose into \{Với agent function-calling, tách thành\}:
+
+```text
+  tool_selection_accuracy   — picked the right tool?
+  argument_accuracy         — JSON args valid and correct?
+  execution_success_rate    — tool ran without error?
+  end_to_end_success        — final answer correct given tool result?
+```
+
+A model can nail `argument_accuracy` but fail `tool_selection_accuracy` when two tools overlap \{Model có thể đạt `argument_accuracy` nhưng fail `tool_selection_accuracy` khi hai tool overlap\}. Report separately \{Báo riêng\}.
+
+### Latency and cost \{Latency và cost\}
+
+Quality is not free \{Chất lượng không miễn phí\}. Track per-case:
+
+| Metric | Why |
+|--------|-----|
+| **Time-to-first-token (TTFT)** | User-perceived responsiveness |
+| **Total latency** | End-to-end task time |
+| **Tokens in / out** | Direct cost driver |
+| **Tool round-trips** | Each hop adds latency and failure surface |
+
+A cheaper model that scores 3% lower but runs 4× faster may win on P99 latency SLOs \{Model rẻ hơn kém 3% nhưng nhanh 4× có thể thắng trên SLO P99 latency\}. Eval dashboards should plot **quality vs cost** Pareto fronts \{Dashboard eval nên vẽ Pareto **quality vs cost**\}.
+
+---
+
+## LLM-as-judge \{LLM-as-judge\}
+
+When exact match fails and human review does not scale, teams use a **stronger LLM** (or the same model with a rubric prompt) to score outputs \{Khi exact match fail và human review không scale, team dùng **LLM mạnh hơn** (hoặc cùng model với rubric prompt) để chấm output\}.
+
+### Rubric-based scoring \{Chấm theo rubric\}
+
+Define criteria with weights and a 1–5 scale \{Định nghĩa tiêu chí có trọng số và thang 1–5\}:
+
+```text
+  Correctness     (35%) — factually accurate vs reference / context
+  Relevance       (25%) — answers the actual question
+  Conciseness     (15%) — no unnecessary padding
+  Format/Ground   (25%) — valid JSON / faithful to sources
+```
+
+The interactive demo lets you weight criteria and score cases manually, then click **Simulate LLM Judge** to see how automated rubric scoring aggregates \{Demo tương tác cho phép gán trọng số tiêu chí và chấm thủ công, rồi bấm **Simulate LLM Judge** để xem aggregate chấm rubric tự động\}.
+
+```python
+JUDGE_PROMPT = """You are an impartial evaluator. Score the model output 1-5 on each criterion.
+
+## Input
+{input}
+
+## Context (if any)
+{context}
+
+## Model output
+{output}
+
+## Reference (if any)
+{reference}
+
+## Criteria
+- correctness: factual accuracy
+- relevance: addresses the question
+- conciseness: no fluff
+- format: valid structure / grounded in context
+
+Respond JSON only:
+{{"correctness": N, "relevance": N, "conciseness": N, "format": N, "rationale": "..."}}
+"""
+```
+
+### Pairwise comparison \{So sánh cặp\}
+
+Instead of absolute scores, ask the judge: **"Which output is better, A or B?"** \{Thay vì điểm tuyệt đối, hỏi judge: **"Output nào tốt hơn, A hay B?"**\}. Pairwise is often more consistent than 1–5 absolutes \{Pairwise thường nhất quán hơn thang 1–5 tuyệt đ đối\}. Use **Bradley-Terry** or Elo ranking to aggregate pairwise results into a model leaderboard \{Dùng **Bradley-Terry** hoặc Elo để aggregate pairwise thành leaderboard model\}.
+
+### Known biases and mitigations \{Bias đã biết và cách giảm\}
+
+| Bias | Symptom | Mitigation |
+|------|---------|------------|
+| **Position bias** | First answer wins ~55% | Swap A/B order, average both |
+| **Verbosity bias** | Longer answer rated higher | Rubric: penalize padding; compare length-normalized |
+| **Self-preference** | GPT-4 prefers GPT-4 outputs | Use different judge model than candidate |
+| **Anchoring** | Reference answer skews scores | Hide reference when testing open-ended tasks |
+| **Leniency drift** | Scores inflate over time | Anchor with frozen calibration cases |
+
+> **Callout:** LLM-as-judge is a **proxy**, not ground truth \{**Callout:** LLM-as-judge là **proxy**, không phải ground truth\}. Calibrate against human labels on a fixed slice — if judge-human agreement drops below ~80% Cohen's κ, fix the rubric before trusting automation \{Calibrate với nhãn human trên slice cố định — nếu agreement judge-human dưới ~80% Cohen's κ, sửa rubric trước khi tin automation\}.
+
+---
+
+## Human evaluation and inter-annotator agreement \{Human eval và inter-annotator agreement\}
+
+Human eval remains the gold standard for subjective quality, safety, and novel failure modes \{Human eval vẫn là chuẩn vàng cho chất lượng chủ quan, safety, và failure mode mới\}.
+
+### Designing a human eval \{Thiết kế human eval\}
+
+- **Clear rubric** with examples per score level \{**Rubric rõ** kèm ví dụ mỗi mức điểm\}
+- **Blind comparison** — annotators do not see model name \{**So sánh mù** — annotator không thấy tên model\}
+- **Duplicate cases** — same case rated by 2+ annotators \{**Case trùng** — cùng case được 2+ annotator chấm\}
+- **Adjudication** — third reviewer resolves disagreements \{**Adjudication** — reviewer thứ ba giải quyết bất đồng\}
+
+### Inter-annotator agreement \{Agreement giữa annotator\}
+
+Measure **Cohen's κ** (two raters) or **Fleiss' κ** (multiple raters) \{Đo **Cohen's κ** (hai rater) hoặc **Fleiss' κ** (nhiều rater)\}:
+
+```text
+  κ < 0.40   — poor agreement; rubric is ambiguous
+  κ 0.40–0.60 — moderate; refine definitions
+  κ 0.60–0.80 — substantial; usable for training judges
+  κ > 0.80   — strong; rubric is tight
+```
+
+Low κ means fix the rubric, not blame annotators \{κ thấp nghĩa là sửa rubric, không đổ lỗi annotator\}. Human labels also **calibrate** LLM-as-judge — run both on the same 100 cases monthly \{Nhãn human cũng **calibrate** LLM-as-judge — chạy cả hai trên cùng 100 case hàng tháng\}.
+
+---
+
+## Regression suites in CI \{Regression suite trong CI\}
+
+Treat your golden set like unit tests \{Coi golden set như unit test\}. On every PR that touches prompts, retrieval, model version, or agent graph:
+
+```text
+  1. Run agent on golden set (fixed seed where possible)
+  2. Score with automated metrics + LLM-as-judge
+  3. Compare vs baseline branch (main)
+  4. Fail if aggregate drops > ε OR any P0 case fails
+```
+
+The demo's **A/B Regression** tab shows Model A (baseline) vs Model B (candidate) per case — TC-04 improves from 2.1 → 3.8 after a prompt fix \{Tab **A/B Regression** trong demo so sánh Model A (baseline) vs Model B (candidate) theo case — TC-04 cải thiện 2.1 → 3.8 sau sửa prompt\}.
+
+```python
+# Pseudocode: CI eval gate
+BASELINE = load_scores("main")
+CANDIDATE = run_eval(agent_config, golden_set)
+
+REGRESSION_TOLERANCE = 0.05  # max allowed drop on aggregate
+P0_CASES = {"support-refund-042", "sql-injection-007"}
+
+for case_id in P0_CASES:
+    assert CANDIDATE[case_id].passed, f"P0 regression: {case_id}"
+
+delta = CANDIDATE.aggregate - BASELINE.aggregate
+assert delta >= -REGRESSION_TOLERANCE, f"Aggregate dropped by {abs(delta):.2f}"
+```
+
+Store eval artifacts (scores, outputs, latency) as CI artifacts for diff review \{Lưu artifact eval (điểm, output, latency) làm CI artifact để review diff\}. Pin model version **and** prompt hash in the eval config \{Pin model version **và** prompt hash trong eval config\}.
+
+---
+
+## Eval-driven development \{Eval-driven development\}
+
+Borrow the TDD loop for agents \{Mượn vòng TDD cho agent\}:
+
+```text
+  1. Add failing case to golden set (from bug report or anticipated edge)
+  2. Run eval — confirm failure
+  3. Change prompt / RAG / model / tool schema
+  4. Re-run eval — confirm case passes without regressions elsewhere
+  5. Merge with CI gate
+```
+
+This prevents "fix one thing, break three" cycles that plague prompt iteration \{Ngăn vòng "sửa một chỗ, vỡ ba chỗ" hay gặp khi iterate prompt\}. Eval-driven development pairs naturally with the adaptation strategies from [Fine-tuning vs Prompting vs RAG](/blog/fine-tuning-vs-prompting-vs-rag/) — each strategy change gets a measured delta \{Eval-driven development đi cùng chiến lược adaptation từ [Fine-tuning vs Prompting vs RAG](/blog/fine-tuning-vs-prompting-vs-rag/) — mỗi thay đổi strategy có delta đo được\}.
+
+---
+
+## Agent-specific evaluation \{Eval riêng cho agent\}
+
+Single-turn QA metrics miss most agent failure modes \{Metric QA một lượt bỏ sót hầu hết failure mode agent\}.
+
+### Multi-step trajectories \{Trajectory nhiều bước\}
+
+Log the full trace: thoughts, tool calls, observations, final answer \{Log full trace: thought, tool call, observation, câu trả lời cuối\}. Score at each step and end-to-end \{Chấm từng bước và end-to-end\}:
+
+| Level | Question |
+|-------|----------|
+| **Step** | Was this tool call correct given state? |
+| **Trajectory** | Did the path reach the goal efficiently? |
+| **Outcome** | Is the final answer correct? |
+
+A correct final answer via a wasteful 12-step path is a latent cost and reliability bug \{Câu trả lời đúng qua path 12 bước lãng phí là bug cost và reliability tiềm ẩn\}.
+
+### Tool use evaluation \{Eval tool use\}
+
+```json
+{
+  "expected_tools": ["search_policy", "format_response"],
+  "forbidden_tools": ["delete_user"],
+  "max_tool_calls": 3,
+  "expected_final_state": {"ticket_status": "resolved"}
+}
+```
+
+Check **tool sequence** order when it matters — `authenticate` before `transfer_funds` \{Kiểm tra thứ tự **tool sequence** khi quan trọng — `authenticate` trước `transfer_funds`\}.
+
+### Memory and context eval \{Eval memory và context\}
+
+Multi-turn cases test whether the agent retains constraints across turns \{Case multi-turn test agent có giữ constraint qua các lượt không\}. Inject distractor turns to test focus \{Chèn lượt gây nhiễu để test focus\}. After context compaction (Part 5), re-run memory-heavy cases \{Sau context compaction (Phần 5), chạy lại case nặng memory\}.
+
+### Safety and refusal eval \{Eval safety và refusal\}
+
+Include cases that **should refuse** — jailbreak attempts, out-of-scope requests, PII extraction \{Gồm case **phải refuse** — jailbreak, request ngoài scope, trích PII\}. A high task-success rate means nothing if the agent also complies with harmful requests \{Task success cao vô nghĩa nếu agent cũng comply request có hại\}.
+
+---
+
+## Putting it together — a minimal eval stack \{Gắn lại — eval stack tối thiểu\}
+
+```text
+  golden_set.json          — versioned cases + metadata
+  rubric.yaml              — criteria, weights, pass threshold
+  run_eval.py              — batch inference + scoring
+  judge_prompt.txt         — LLM-as-judge template
+  ci_eval.yml              — PR gate vs baseline
+  dashboard                — aggregate + per-stratum + cost/latency
+```
+
+| Layer | Tooling examples |
+|-------|------------------|
+| Dataset | Git, Label Studio, custom JSON |
+| Inference | Your agent runner, LangSmith traces, Braintrust |
+| Metrics | Custom scripts, Ragas, DeepEval |
+| Judge | GPT-4o, Claude, open-weight Llama + rubric |
+| CI | GitHub Actions, threshold gates |
+| Online | A/B platform, human review queue |
+
+Start minimal: JSON golden set, one rubric, one script, one CI job \{Bắt đầu tối giản: golden set JSON, một rubric, một script, một CI job\}. Expand when a metric gap blocks a release decision \{Mở rộng khi khoảng trống metric chặn quyết định release\}.
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- **Eval is infrastructure** — not a pre-launch checkbox \{**Eval là infrastructure** — không phải checkbox trước launch\}.
+- **Golden sets** encode real failures; stratify and version them \{**Golden set** mã hóa failure thật; phân tầng và version\}.
+- **Classic metrics** (EM, BLEU) break on paraphrase; use task success, groundedness, and tool accuracy for agents \{**Metric cổ điển** (EM, BLEU) vỡ với paraphrase; dùng task success, groundedness, tool accuracy cho agent\}.
+- **LLM-as-judge** scales rubric scoring — calibrate against humans, mitigate position/verbosity bias \{**LLM-as-judge** scale chấm rubric — calibrate với human, giảm position/verbosity bias\}.
+- **Regression in CI** catches prompt and model drift before users do \{**Regression trong CI** bắt drift prompt và model trước user\}.
+- **Agent eval** requires trajectory-level scoring, not just final-answer checks \{**Eval agent** cần chấm cấp trajectory, không chỉ câu trả lời cuối\}.
+
+Next up: once you can measure quality, **choose the model and framework** that hits your eval bar at acceptable cost — [Choosing a Model](/blog/choosing-an-llm-model-framework/) \{Tiếp theo: khi đo được chất lượng, **chọn model và framework** đạt ngưỡng eval với cost chấp nhận được — [Choosing a Model](/blog/choosing-an-llm-model-framework/)\}.
+
+---
+
+## The Building AI Agents series \{Loạt bài Building AI Agents\}
+
+1. [Tokens & Context Windows](/blog/ai-agents-tokens-and-context-windows/)
+2. [Sampling: temperature, top_p, top_k](/blog/llm-sampling-temperature-top-p-top-k/)
+3. [Prompt Engineering for Agents](/blog/prompt-engineering-for-agents/)
+4. [Stopping Criteria & Output Control](/blog/llm-stopping-criteria-and-output-control/)
+5. [Context Engineering & Memory](/blog/context-engineering-and-agent-memory/)
+6. [Fine-tuning vs Prompting vs RAG](/blog/fine-tuning-vs-prompting-vs-rag/)
+7. **[Evaluating LLMs & Agents](/blog/evaluating-llms-and-agents/)** *(current)*
+8. [Choosing a Model](/blog/choosing-an-llm-model-framework/)
+9. [Function Calling & Tool Use](/blog/function-calling-and-tool-use/)
+10. [Agent Patterns: ReAct, Reflection, Planning](/blog/agent-design-patterns-react-reflection-planning/)

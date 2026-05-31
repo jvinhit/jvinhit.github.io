@@ -1,0 +1,369 @@
+---
+title: 'Source Maps — How Debugging Survives the Build Process'
+description: 'A bilingual deep-dive into source maps: what they are, how they work internally (VLQ encoding, mappings field), how to generate and configure them, and best practices for production debugging.'
+pubDate: 2025-05-29
+tags: [frontend, debugging, devtools, web-performance]
+draft: false
+---
+
+## The Problem Source Maps Solve \{Vấn đề Source Map giải quyết\}
+
+Modern web apps don't ship the code you write \{Ứng dụng web hiện đại không gửi code bạn viết\}. Between your source and the browser \{Giữa source và trình duyệt\}, your code goes through \{code của bạn đi qua\}:
+
+```text
+Your Code                      What Browser Receives
+{Code của bạn}                 {Trình duyệt nhận}
+
+TypeScript     ─┐
+SCSS/PostCSS   ─┤── Build ──→  Minified JS bundle
+JSX/TSX        ─┤   Tools      Compressed CSS
+Multiple files ─┘              Single concatenated files
+                               Unreadable variable names
+```
+
+When something breaks in production \{Khi có lỗi ở production\}, the error points to `app.min.js:1:34892` \{lỗi trỏ đến `app.min.js:1:34892`\} — a single line with 50,000 characters \{một dòng có 50.000 ký tự\}. Completely useless for debugging \{Hoàn toàn vô dụng cho debug\}.
+
+**Source maps** bridge this gap \{**Source map** nối liền khoảng cách này\}. They map compiled code back to the original source \{Chúng ánh xạ code đã biên dịch ngược về source gốc\}, so DevTools can show you the TypeScript file, the exact line, the original variable names \{để DevTools có thể hiện file TypeScript, dòng chính xác, tên biến gốc\}.
+
+---
+
+## What Is a Source Map \{Source Map là gì\}
+
+A source map is a JSON file \{Source map là file JSON\} (typically with `.map` extension) that contains the mapping information \{chứa thông tin ánh xạ\}:
+
+```json
+{
+  "version": 3,
+  "file": "app.min.js",
+  "sources": ["src/utils.ts", "src/main.ts", "src/components/App.tsx"],
+  "sourcesContent": ["export function add(a: number...", "import { App }...", "..."],
+  "names": ["add", "result", "handleClick", "useState"],
+  "mappings": "AAAA,SAAS,IAAI,EAAE,CAAS..."
+}
+```
+
+| Field | Purpose \{Mục đích\} |
+|---|---|
+| `version` | Always `3` (current spec version) \{Luôn là `3` (phiên bản spec hiện tại)\} |
+| `file` | The generated file this map belongs to \{File được tạo mà map này thuộc về\} |
+| `sources` | Array of original source file paths \{Mảng đường dẫn file source gốc\} |
+| `sourcesContent` | Original source code (optional, enables debugging without serving sources) \{Code source gốc (tuỳ chọn, cho phép debug mà không cần serve source)\} |
+| `names` | Array of original identifiers (variable/function names before minification) \{Mảng định danh gốc (tên biến/hàm trước khi minify)\} |
+| `mappings` | VLQ-encoded mapping data \{Dữ liệu ánh xạ mã hoá VLQ\} |
+
+---
+
+## How Mappings Work \{Cách Mapping hoạt động\}
+
+The `mappings` field is the heart of a source map \{Trường `mappings` là trái tim của source map\}. It uses **VLQ Base64 encoding** \{Nó dùng **mã hoá VLQ Base64**\} to compress position data \{để nén dữ liệu vị trí\}.
+
+### The Encoding \{Mã hoá\}
+
+Each segment in the mappings string represents a position in the generated code and where it came from \{Mỗi đoạn trong chuỗi mappings đại diện cho vị trí trong code được tạo và nó đến từ đâu\}:
+
+```text
+Mappings: "AAAA,SAAS,IAAI;AACA,SAAS..."
+           │          │
+           │          └── Semicolons separate lines in generated file
+           │              {Chấm phẩy phân tách dòng trong file được tạo}
+           │
+           └── Commas separate segments within a line
+               {Phẩy phân tách các đoạn trong một dòng}
+```
+
+Each segment decodes to 4 or 5 values \{Mỗi đoạn giải mã thành 4 hoặc 5 giá trị\}:
+
+```text
+Segment: AAAA
+
+Decoded: [0, 0, 0, 0]
+          │  │  │  │
+          │  │  │  └── Column in original source
+          │  │  │      {Cột trong source gốc}
+          │  │  │
+          │  │  └── Line in original source (relative)
+          │  │      {Dòng trong source gốc (tương đối)}
+          │  │
+          │  └── Index into "sources" array
+          │      {Index trong mảng "sources"}
+          │
+          └── Column in generated file (relative)
+              {Cột trong file được tạo (tương đối)}
+
+Optional 5th value: index into "names" array
+{Giá trị thứ 5 tuỳ chọn: index trong mảng "names"}
+```
+
+**Key insight** \{Nhận thức quan trọng\}: all values are **relative** to the previous segment \{tất cả giá trị đều **tương đối** so với đoạn trước\}. This makes VLQ encoding very compact \{Điều này khiến mã hoá VLQ rất nhỏ gọn\} because most changes between adjacent tokens are small numbers \{vì hầu hết thay đổi giữa các token liền kề là số nhỏ\}.
+
+### VLQ (Variable-Length Quantity) \{VLQ (Đại lượng độ dài biến đổi)\}
+
+VLQ encodes integers using 6-bit groups \{VLQ mã hoá số nguyên dùng nhóm 6-bit\}, where the highest bit indicates "there's more" \{bit cao nhất chỉ "còn nữa"\}:
+
+```text
+Number: 16
+Binary: 10000
+
+VLQ encoding steps:
+{Các bước mã hoá VLQ:}
+1. Take binary: 10000
+2. Add sign bit (positive = 0): 100000
+3. Split into 5-bit groups: 00001 | 00000
+4. Reverse groups: 00000 | 00001
+5. Add continuation bit: 100000 | 000001
+6. Base64 encode each group: g | B
+
+Result: "gB"
+```
+
+This is why source maps are much smaller than you'd expect \{Đây là lý do source map nhỏ hơn nhiều so với bạn nghĩ\} — most mappings encode to just 4-8 Base64 characters per token \{hầu hết mapping mã hoá chỉ 4-8 ký tự Base64 mỗi token\}.
+
+---
+
+## Generating Source Maps \{Tạo Source Map\}
+
+### Vite \{Vite\}
+
+```ts
+// vite.config.ts
+export default defineConfig({
+  build: {
+    sourcemap: true, // generates .map files for production
+  },
+  css: {
+    devSourcemap: true, // CSS source maps in dev mode
+  },
+});
+```
+
+### Webpack \{Webpack\}
+
+```js
+// webpack.config.js
+module.exports = {
+  // Development — fast rebuild, full mapping
+  devtool: 'eval-source-map',
+
+  // Production — separate .map files, full mapping
+  // devtool: 'source-map',
+
+  // Production — .map without sourcesContent (smaller, needs source files)
+  // devtool: 'nosources-source-map',
+};
+```
+
+### TypeScript \{TypeScript\}
+
+```json
+{
+  "compilerOptions": {
+    "sourceMap": true,
+    "declarationMap": true,
+    "inlineSources": true
+  }
+}
+```
+
+### esbuild \{esbuild\}
+
+```js
+await esbuild.build({
+  entryPoints: ['src/index.ts'],
+  bundle: true,
+  sourcemap: true, // external .map file
+  // sourcemap: 'inline', // embedded in output
+  // sourcemap: 'linked', // external with //# sourceMappingURL comment
+});
+```
+
+---
+
+## Source Map Types \{Các loại Source Map\}
+
+| Type \{Loại\} | How it works \{Cách hoạt động\} | Use case \{Trường hợp dùng\} |
+|---|---|---|
+| **External** | Separate `.map` file, linked via `//# sourceMappingURL=` comment \{File `.map` riêng, liên kết qua comment\} | Production (only loaded when DevTools opens) \{Production (chỉ tải khi DevTools mở)\} |
+| **Inline** | Base64-encoded inside the JS/CSS file itself \{Mã hoá Base64 bên trong file JS/CSS\} | Development (no extra file request) \{Development (không cần request thêm)\} |
+| **Hidden** | `.map` file exists but no `//# sourceMappingURL` comment \{File `.map` tồn tại nhưng không có comment liên kết\} | Production where you upload maps to error tracking only \{Production nơi bạn chỉ upload map cho error tracking\} |
+| **Nosources** | Map file without `sourcesContent` \{File map không có `sourcesContent`\} | Production where you don't want to expose source code \{Production nơi bạn không muốn lộ source code\} |
+
+---
+
+## How Browsers Use Source Maps \{Cách trình duyệt dùng Source Map\}
+
+### Discovery \{Phát hiện\}
+
+Browsers find source maps via a special comment on the **last line** of your compiled file \{Trình duyệt tìm source map qua một comment đặc biệt ở **dòng cuối** của file đã biên dịch\}:
+
+```js
+// app.min.js (compiled)
+(() => { /* ...minified code... */ })();
+```
+
+That final line is the annotation `//# sourceMappingURL=app.min.js.map` \{Dòng cuối là comment chú thích `//# sourceMappingURL=app.min.js.map`\} — DevTools reads it to locate the map \{DevTools đọc nó để tìm map\}.
+
+Or via HTTP header \{Hoặc qua HTTP header\}:
+
+```
+SourceMap: /path/to/app.min.js.map
+```
+
+### What DevTools Does \{DevTools làm gì\}
+
+1. Detects `sourceMappingURL` \{Phát hiện `sourceMappingURL`\}
+2. Downloads the `.map` file \{Tải file `.map`\}
+3. Parses the mappings \{Phân tích mappings\}
+4. Shows original files in Sources panel \{Hiển thị file gốc trong panel Sources\}
+5. Maps error stack traces to original lines \{Ánh xạ stack trace lỗi về dòng gốc\}
+6. Enables setting breakpoints in original source \{Cho phép đặt breakpoint trong source gốc\}
+
+---
+
+## Production Best Practices \{Thực hành tốt cho Production\}
+
+### Don't Expose Source Maps Publicly \{Đừng lộ Source Map công khai\}
+
+Source maps contain your **entire original source code** \{Source map chứa **toàn bộ code source gốc**\} (in `sourcesContent`). In production \{Trong production\}:
+
+```nginx
+# Nginx: block access to .map files from public
+location ~* \.map$ {
+  deny all;
+  return 404;
+}
+```
+
+```js
+// Or: use hidden source maps + upload to error tracking
+// vite.config.ts
+export default defineConfig({
+  build: {
+    sourcemap: 'hidden', // no sourceMappingURL comment in output
+  },
+});
+```
+
+### Upload to Error Tracking Services \{Upload lên dịch vụ Error Tracking\}
+
+Services like Sentry, Datadog, Bugsnag can use your source maps to deobfuscate error stack traces \{Các dịch vụ như Sentry, Datadog, Bugsnag có thể dùng source map để giải mã stack trace lỗi\} without exposing them publicly \{mà không lộ chúng công khai\}:
+
+```bash
+# Example: upload source maps to Sentry after build
+sentry-cli sourcemaps upload \
+  --org my-org \
+  --project my-project \
+  --release "1.0.0" \
+  ./dist/assets/
+```
+
+### Source Map Size Considerations \{Cân nhắc kích thước Source Map\}
+
+Source maps can be **3-5x the size** of the compiled file \{Source map có thể **lớn gấp 3-5 lần** file đã biên dịch\}:
+
+| File | Compiled \{Đã biên dịch\} | Source Map |
+|---|---|---|
+| `app.min.js` | 150KB | 450KB - 750KB |
+| `styles.min.css` | 30KB | 90KB - 150KB |
+
+Since they're only downloaded when DevTools is open \{Vì chúng chỉ được tải khi DevTools mở\}, this doesn't affect user performance \{điều này không ảnh hưởng performance người dùng\}. But consider storage costs and CDN bandwidth for error tracking uploads \{Nhưng cân nhắc chi phí lưu trữ và băng thông CDN cho upload error tracking\}.
+
+---
+
+## CSS Source Maps \{Source Map CSS\}
+
+CSS source maps work identically \{Source map CSS hoạt động giống hệt\} but map compiled CSS back to SCSS/PostCSS/Tailwind source \{nhưng ánh xạ CSS đã biên dịch về source SCSS/PostCSS/Tailwind\}:
+
+```css
+/* styles.min.css */
+.nav{display:flex;gap:.5rem}.nav a{color:#c8ff00}
+```
+
+The compiled CSS ends with `/*# sourceMappingURL=styles.min.css.map */` \{CSS đã biên dịch kết thúc bằng `/*# sourceMappingURL=styles.min.css.map */`\} — the CSS form of the same annotation \{dạng CSS của cùng comment chú thích\}.
+
+In DevTools \{Trong DevTools\}: click any style rule → jumps to the original `.scss` file, exact line \{click bất kỳ rule style → nhảy đến file `.scss` gốc, đúng dòng\}.
+
+### Enabling CSS Source Maps \{Bật Source Map CSS\}
+
+```ts
+// vite.config.ts
+export default defineConfig({
+  css: {
+    devSourcemap: true,
+  },
+});
+```
+
+```js
+// PostCSS
+module.exports = {
+  map: { inline: false }, // external .map file
+};
+```
+
+```js
+// Sass (CLI)
+// sass --source-map input.scss output.css
+```
+
+---
+
+## Debugging with Source Maps \{Debug với Source Map\}
+
+### Chrome DevTools Tips \{Mẹo Chrome DevTools\}
+
+1. **Sources panel** \{Panel Sources\}: your original files appear in the file tree \{file gốc xuất hiện trong cây file\}
+2. **Breakpoints** \{Breakpoint\}: set them in original source — they work in compiled code \{đặt trong source gốc — chúng hoạt động trong code đã biên dịch\}
+3. **Console errors** \{Lỗi Console\}: stack traces show original file:line \{stack trace hiển thị file:dòng gốc\}
+4. **Blackboxing** \{Blackboxing\}: right-click → "Add to ignore list" to skip library code when stepping \{để bỏ qua code thư viện khi step\}
+
+### The `x_google_ignoreList` Extension \{Extension `x_google_ignoreList`\}
+
+Modern bundlers add this extension to tell DevTools which files are "library code" \{Bundler hiện đại thêm extension này để cho DevTools biết file nào là "code thư viện"\}:
+
+```json
+{
+  "version": 3,
+  "mappings": "...",
+  "sources": ["node_modules/react/index.js", "src/App.tsx", "src/utils.ts"],
+  "x_google_ignoreList": [0]
+}
+```
+
+Index `0` (`node_modules/react/index.js`) will be automatically hidden in the Sources panel and skipped when stepping through code \{sẽ tự động ẩn trong panel Sources và bị bỏ qua khi step qua code\}.
+
+---
+
+## Source Maps v4 Proposal \{Đề xuất Source Map v4\}
+
+The current v3 spec has limitations \{Spec v3 hiện tại có hạn chế\}:
+
+- **Lost variable names** \{Mất tên biến\}: when a variable is optimized away, you can't inspect it \{khi biến bị tối ưu hoá, bạn không thể inspect\}
+- **No scope information** \{Không có thông tin scope\}: can't distinguish between variables with the same name in different scopes \{không phân biệt được biến cùng tên trong scope khác nhau\}
+- **No expression mapping** \{Không ánh xạ biểu thức\}: inlined expressions lose context \{biểu thức inline mất ngữ cảnh\}
+
+The v4 proposal adds \{Đề xuất v4 thêm\}:
+- Scope information \{Thông tin scope\}
+- Original variable bindings \{Ràng buộc biến gốc\}
+- Better expression tracking \{Theo dõi biểu thức tốt hơn\}
+
+---
+
+## Quick Reference \{Tham khảo nhanh\}
+
+### When to Use Which Type \{Khi nào dùng loại nào\}
+
+| Environment \{Môi trường\} | Source Map Config \{Cấu hình Source Map\} | Why \{Tại sao\} |
+|---|---|---|
+| Local development | `inline` or `eval-source-map` | Fastest rebuild, no extra requests \{Rebuild nhanh nhất, không request thêm\} |
+| Staging/QA | `source-map` (external) | Full debugging capability \{Khả năng debug đầy đủ\} |
+| Production (public) | `hidden` + upload to error tracking | Security: don't expose source \{Bảo mật: không lộ source\} |
+| Production (internal) | `source-map` + restrict access | Full debugging for your team \{Debug đầy đủ cho team\} |
+
+### Troubleshooting \{Khắc phục sự cố\}
+
+| Problem \{Vấn đề\} | Likely Cause \{Nguyên nhân\} | Fix \{Sửa\} |
+|---|---|---|
+| DevTools shows minified code \{DevTools hiện code minified\} | Missing `sourceMappingURL` comment | Check build config generates maps |
+| "Could not load content" | Map file URL is wrong or CORS-blocked | Check path, add CORS headers |
+| Breakpoints don't hit \{Breakpoint không kích hoạt\} | Map is outdated (stale build) | Rebuild, clear browser cache |
+| Variables show as `undefined` | Optimized away during compilation \{Bị tối ưu hoá lúc biên dịch\} | Reduce optimization level or use v4 when available |
