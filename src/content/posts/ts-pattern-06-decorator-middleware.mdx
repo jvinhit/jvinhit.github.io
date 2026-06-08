@@ -1,0 +1,507 @@
+---
+title: 'Design Patterns in TypeScript · Part 6 — Decorator & Middleware'
+description: 'Add behavior without touching the original: the Decorator pattern via higher-order functions, wrapping a service to add caching/logging/retry, the middleware chain, and how TS decorators (and the new standard) compare.'
+pubDate: 2025-03-09
+tags: [typescript, design-patterns, decorator, middleware, ts_patterns_10]
+series: ts-pattern
+seriesOrder: 6
+draft: false
+---
+
+import PatternDiagram from '../../components/blog/PatternDiagram.astro';
+
+> **Part 6 of 10** in the Design Patterns in TypeScript series \{**Phần 6/10** trong series Design Patterns in TypeScript\}. Previous \{Trước\}: [Part 5 — Observer & Pub/Sub](/blog/ts-pattern-05-observer-pubsub/) · Next \{Tiếp\}: [Part 7 — Adapter & Facade](/blog/ts-pattern-07-adapter-facade/).
+
+This is **Part 6 of a 10-part series** on the design patterns every senior web engineer should have in their hands — explained with **runnable TypeScript**, real frontend/back-of-front use cases, and **exercises** at the end of each part \{Đây là **Phần 6 của series 10 bài** về các design pattern mà mọi senior web nên nắm — giải thích bằng **TypeScript chạy được**, use case web thực tế, và **bài tập** ở cuối mỗi phần\}.
+
+In [Part 5 — Observer & Pub/Sub](/blog/ts-pattern-05-observer-pubsub/) you decoupled **who hears** an event from **who fires** it \{Ở [Phần 5 — Observer & Pub/Sub](/blog/ts-pattern-05-observer-pubsub/) bạn đã tách **ai nghe** event khỏi **ai bắn** event\}. A different smell appears when you need **cross-cutting behavior** on the same operation: log every call, cache reads, retry failures, attach auth headers \{Mùi khác xuất hiện khi bạn cần **hành vi xuyên suốt** trên cùng một thao tác: log mọi lần gọi, cache đọc, retry lỗi, gắn header auth\}. Subclassing explodes combinatorially — `LoggedCachedRetriedUserService` is not a career \{Subclass làm số tổ hợp bùng nổ — `LoggedCachedRetriedUserService` không phải con đường sự nghiệp\}. **Decorator** (and its cousin **middleware**) says: **wrap** the core, keep the same interface, add behavior before or after delegation \{**Decorator** (và họ hàng **middleware**) nói: **bọc** lõi, giữ cùng interface, thêm hành vi trước hoặc sau khi ủy quyền\}.
+
+---
+
+## The intent \{Ý đồ\}
+
+The **Decorator** pattern attaches responsibilities to an object **dynamically** without subclassing for every combination \{**Decorator** gắn trách nhiệm lên object **động** mà không subclass cho mỗi tổ hợp\}. Each decorator implements the **same interface** as the core, holds a reference to an inner object (or function), and **delegates** — running extra logic on the way in or out \{Mỗi decorator implement **cùng interface** với lõi, giữ tham chiếu tới object (hoặc function) bên trong, và **ủy quyền** — chạy logic thêm trên đường vào hoặc ra\}.
+
+<PatternDiagram
+  kind="decorator"
+  caption="Each wrapper shares the same interface as the core; behavior stacks outward"
+/>
+
+You reach for it when concerns are **orthogonal** to business logic: telemetry, caching, rate limits, retries, auth — and you want to **compose** them like layers \{Bạn dùng khi các concern **trực giao** với logic nghiệp vụ: telemetry, cache, rate limit, retry, auth — và bạn muốn **xếp chồng** chúng như lớp\}. The win is **Open/Closed**: extend behavior by adding wrappers, not editing the core \{Lợi ích là **Open/Closed**: mở rộng hành vi bằng wrapper mới, không sửa lõi\}. The risk is a **deep onion** nobody can debug and decorators that **change semantics** silently \{Rủi ro là **hành tây** quá sâu không ai debug được và decorator **đổi ngữ nghĩa** im lặng\}.
+
+---
+
+## Function decorators (HOFs) — the idiomatic TS form \{Decorator function (HOF) — dạng idiomatic TS\}
+
+In TypeScript and JavaScript, the most common decorator is a **higher-order function**: a function that takes a function and returns another function with the **same call signature** \{Trong TS và JS, decorator phổ biến nhất là **higher-order function**: function nhận function và trả function có **cùng chữ ký gọi**\}.
+
+Start with a bare async core \{Bắt đầu với lõi async trần\}:
+
+```ts
+interface User {
+  id: string;
+  name: string;
+}
+
+function isUser(value: unknown): value is User {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'id' in value &&
+    'name' in value &&
+    typeof value.id === 'string' &&
+    typeof value.name === 'string'
+  );
+}
+
+async function fetchUser(id: string): Promise<User> {
+  const res = await fetch(`https://api.example.com/users/${id}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data: unknown = await res.json();
+  if (!isUser(data)) throw new Error('Invalid user payload');
+  return data;
+}
+```
+
+The typing trick: constrain `T` to "any callable" without `any` \{Mẹo typing: ràng `T` là "callable bất kỳ" không dùng `any`\}:
+
+```ts
+// Every function is assignable to this bound — captures args + return type.
+type AnyFn = (...args: never[]) => unknown;
+
+type FnDecorator<T extends AnyFn> = (fn: T) => T;
+```
+
+`(...args: never[]) => unknown` is the widest **function** type TS allows without escaping to `any` \{`(...args: never[]) => unknown` là kiểu **function** rộng nhất TS cho phép mà không thoát sang `any`\}. When you wrap `T`, use `Parameters<T>` and `ReturnType<T>` so arity and return type flow through \{Khi bọc `T`, dùng `Parameters<T>` và `ReturnType<T>` để arity và kiểu trả về đi theo\}.
+
+**Logging** — observe calls without editing `fetchUser` \{**Logging** — quan sát lần gọi mà không sửa `fetchUser`\}. We specialize to **async** functions so `ReturnType<T>` stays a `Promise` and the wrapper needs no type assertions \{Ta chuyên **async** để `ReturnType<T>` vẫn là `Promise` và wrapper không cần type assertion\}:
+
+```ts
+function withLogging<T extends (...args: never[]) => Promise<unknown>>(
+  fn: T,
+  label: string,
+): (...args: Parameters<T>) => ReturnType<T> {
+  return async (...args: Parameters<T>): ReturnType<T> => {
+    console.log(`[${label}] →`, args);
+    const value = await fn(...args);
+    console.log(`[${label}] ←`, value);
+    return value;
+  };
+}
+```
+
+**Retry** and **cache** follow the same shape \{**Retry** và **cache** cùng kiểu bọc\}:
+
+```ts
+function withRetry<T extends (...args: never[]) => Promise<unknown>>(
+  fn: T,
+  options: { maxAttempts?: number; delayMs?: number } = {},
+): (...args: Parameters<T>) => ReturnType<T> {
+  const { maxAttempts = 3, delayMs = 200 } = options;
+  return async (...args: Parameters<T>): ReturnType<T> => {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await fn(...args);
+      } catch (error) {
+        lastError = error;
+        if (attempt === maxAttempts) break;
+        await new Promise((r) => setTimeout(r, delayMs * attempt));
+      }
+    }
+    throw lastError;
+  };
+}
+
+function withCache<T extends (...args: never[]) => Promise<unknown>>(
+  fn: T,
+  keyFn: (...args: Parameters<T>) => string,
+  store = new Map<string, Awaited<ReturnType<T>>>(),
+): (...args: Parameters<T>) => ReturnType<T> {
+  return async (...args: Parameters<T>): ReturnType<T> => {
+    const key = keyFn(...args);
+    const hit = store.get(key);
+    if (hit !== undefined) return hit;
+    const value = await fn(...args);
+    store.set(key, value);
+    return value;
+  };
+}
+```
+
+The `Map` is typed at `Awaited<ReturnType<T>>`; the async wrapper's return type is `ReturnType<T>` (a `Promise`), so cache hits type-check without assertions \{`Map` gõ ở `Awaited<ReturnType<T>>`; wrapper async trả `ReturnType<T>` (`Promise`), nên cache hit type-check không cần assertion\}.
+
+**Composition** — order matters: outer decorator runs first on the way in \{**Compose** — thứ tự quan trọng: decorator ngoài chạy trước trên đường vào\}:
+
+```ts
+const fetchUserInstrumented = withCache(
+  withRetry(withLogging(fetchUser, 'fetchUser'), { maxAttempts: 3 }),
+  (id) => `user:${id}`,
+);
+
+// Call chain: cache → retry → log → fetchUser
+// await fetchUserInstrumented('42');
+```
+
+Read it inside-out: `withLogging` wraps the core; `withRetry` wraps that; `withCache` wraps the stack \{Đọc từ trong ra: `withLogging` bọc lõi; `withRetry` bọc tiếp; `withCache` bọc cả chồng\}. Caching **outside** retry avoids hammering the network on cache miss while still retrying the inner call \{Cache **ngoài** retry tránh đập mạng khi miss nhưng vẫn retry lần gọi trong\}.
+
+A small `pipe` helper keeps composition readable when every layer preserves the same async signature \{Helper `pipe` nhỏ giúp compose dễ đọc khi mỗi lớp giữ cùng chữ ký async\}:
+
+```ts
+type AsyncFn<A extends never[], R> = (...args: A) => Promise<R>;
+type AsyncWrap<A extends never[], R> = (fn: AsyncFn<A, R>) => AsyncFn<A, R>;
+
+function pipe<A extends never[], R>(
+  fn: AsyncFn<A, R>,
+  ...wraps: AsyncWrap<A, R>[]
+): AsyncFn<A, R> {
+  return wraps.reduce((acc, wrap) => wrap(acc), fn);
+}
+
+// pipe(fetchUser, (f) => withLogging(f, 'u'), (f) => withRetry(f, {}), ...)
+```
+
+---
+
+## Object / class decorators \{Decorator object / class\}
+
+When the core is a **service object** (repository, payment client, storage adapter), wrap the **interface**, not a single function \{Khi lõi là **service object** (repository, client thanh toán, adapter storage), bọc **interface**, không phải một function\}:
+
+```ts
+interface UserRepository {
+  findById(id: string): Promise<User | null>;
+}
+
+class HttpUserRepository implements UserRepository {
+  constructor(private baseUrl: string) {}
+
+  async findById(id: string): Promise<User | null> {
+    const res = await fetch(`${this.baseUrl}/users/${id}`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data: unknown = await res.json();
+    if (data === null) return null;
+    if (!isUser(data)) throw new Error('Invalid user payload');
+    return data;
+  }
+}
+
+class CachingUserRepository implements UserRepository {
+  private cache = new Map<string, User | null>();
+
+  constructor(private inner: UserRepository) {}
+
+  async findById(id: string): Promise<User | null> {
+    if (this.cache.has(id)) return this.cache.get(id) ?? null;
+    const user = await this.inner.findById(id);
+    this.cache.set(id, user);
+    return user;
+  }
+}
+
+// Wiring at the composition root — swap layers without changing callers
+const repo: UserRepository = new CachingUserRepository(
+  new HttpUserRepository('https://api.example.com'),
+);
+```
+
+Callers depend on `UserRepository`, not `HttpUserRepository` \{Caller phụ thuộc `UserRepository`, không phải `HttpUserRepository`\}. You can stack `LoggingUserRepository`, `RateLimitedUserRepository`, etc., each delegating to `inner` \{Bạn có thể xếp `LoggingUserRepository`, `RateLimitedUserRepository`, v.v., mỗi cái ủy quyền cho `inner`\}. Same pattern as [Part 1](/blog/ts-pattern-01-singleton-module/) injection: type at the boundary, concrete stack at the root \{Cùng pattern inject [Phần 1](/blog/ts-pattern-01-singleton-module/): kiểu ở biên, chồng concrete ở root\}.
+
+---
+
+## Middleware chains \{Chuỗi middleware\}
+
+**Middleware** is the Decorator pattern arranged as a **pipeline**: each layer receives a **context** and a `next()` function, runs code before/after `next()`, and passes control onward \{**Middleware** là Decorator xếp thành **pipeline**: mỗi lớp nhận **context** và `next()`, chạy code trước/sau `next()`, chuyển tiếp\}. Express, Koa, Redux, and many fetch interceptors share this **onion** model \{Express, Koa, Redux, và nhiều fetch interceptor dùng mô hình **hành tây** này\}.
+
+```ts
+interface RequestContext {
+  path: string;
+  headers: Record<string, string>;
+  status?: number;
+  body?: string;
+}
+
+type Middleware<C> = (ctx: C, next: () => Promise<void>) => Promise<void>;
+
+function compose<C>(middlewares: readonly Middleware<C>[]): Middleware<C> {
+  return async (ctx, finalNext) => {
+    let index = -1;
+
+    async function dispatch(i: number): Promise<void> {
+      if (i <= index) {
+        throw new Error('next() called multiple times');
+      }
+      index = i;
+      const layer = middlewares[i];
+      if (layer) {
+        await layer(ctx, () => dispatch(i + 1));
+      } else {
+        await finalNext();
+      }
+    }
+
+    await dispatch(0);
+  };
+}
+
+const auth: Middleware<RequestContext> = async (ctx, next) => {
+  if (!ctx.headers.authorization) {
+    ctx.status = 401;
+    ctx.body = 'Unauthorized';
+    return; // short-circuit — do not call next()
+  }
+  await next();
+};
+
+const logger: Middleware<RequestContext> = async (ctx, next) => {
+  const start = performance.now();
+  await next();
+  console.log(`${ctx.path} ${ctx.status ?? '-'} ${(performance.now() - start).toFixed(1)}ms`);
+};
+
+const handler: Middleware<RequestContext> = async (ctx, next) => {
+  ctx.status = 200;
+  ctx.body = `OK ${ctx.path}`;
+  await next();
+};
+
+const run = compose([logger, auth, handler]);
+
+await run({ path: '/users', headers: { authorization: 'Bearer x' } }, async () => {});
+// logger runs → auth runs → handler sets 200 → logger logs duration
+```
+
+**Onion model** \{Mô hình hành tây\}: entering middleware runs **top to bottom** before `next()`; after `next()` resolves, code **unwinds bottom to top** \{middleware vào chạy **trên xuống dưới** trước `next()`; sau khi `next()` resolve, code **bung ngược dưới lên**\}. That is why `logger` wraps the whole stack and measures total time \{Vì vậy `logger` bọc cả stack và đo tổng thời gian\}. Order is not cosmetic: `auth` before `handler` blocks unauthenticated hits; `auth` after `handler` would be too late \{Thứ tự không trang trí: `auth` trước `handler` chặn hit chưa auth; `auth` sau `handler` thì muộn\}.
+
+---
+
+## TypeScript `@decorator` syntax \{Cú pháp `@decorator` của TypeScript\}
+
+TypeScript also has a **language-level decorator** feature — metadata and wrapping attached with `@` above classes, methods, fields, or accessors \{TS còn có **decorator cấp ngôn ngữ** — metadata và bọc gắn bằng `@` trên class, method, field, hoặc accessor\}. Two eras matter \{Hai thời kỳ quan trọng\}:
+
+| Era | Flag / version | What it targets |
+|-----|----------------|-----------------|
+| **Legacy (experimental)** | `experimentalDecorators` + `emitDecoratorMetadata` | Mostly **classes**; loose semantics; Angular/NestJS-era tooling |
+| **Standard (TC39 Stage 3)** | TS 5.0+ with `--experimentalDecorators` **off**; `useDefineForClassFields` aligned | **Functions, classes, fields, accessors** per the [decorator metadata proposal](https://github.com/tc39/proposal-decorators) |
+
+Standard decorators are **functions** invoked at class definition time; they receive a **context** object (`kind`, `name`, `addInitializer`, etc.) and can replace or wrap the value \{Decorator chuẩn là **function** gọi lúc định nghĩa class; nhận object **context** (`kind`, `name`, `addInitializer`, v.v.) và có thể thay hoặc bọc giá trị\}. They shine when a **framework** reads metadata (routing, validation, DI) \{Chúng mạnh khi **framework** đọc metadata (routing, validate, DI)\}.
+
+For application code you own, **HOF wrappers** and **explicit decorator classes** (like `CachingUserRepository`) stay simpler: no compiler flags, easier to step through in a debugger, portable across bundlers \{Với code app bạn sở hữu, **HOF bọc** và **class decorator rõ ràng** (như `CachingUserRepository`) vẫn đơn giản hơn: không flag compiler, debug dễ, portable giữa bundler\}. NestJS-style `@Injectable()` / `@Get()` is framework sugar on top of the same idea — reach for it when the framework owns the pipeline \{`@Injectable()` / `@Get()` kiểu NestJS là đường framework trên cùng ý tưởng — dùng khi framework sở hữu pipeline\}.
+
+---
+
+## Real web use cases \{Use case web thực tế\}
+
+- **`fetch` wrappers** — auth header injection, retry with backoff, response cache keyed by URL + method \{**Bọc `fetch`** — inject header auth, retry backoff, cache response theo URL + method\}.
+- **Logging / telemetry** — wrap API clients or route handlers; one decorator ships traces to your APM \{**Log / telemetry** — bọc API client hoặc route handler; một decorator đẩy trace lên APM\}.
+- **Rate limiting** — token bucket decorator rejects before hitting origin \{**Rate limit** — decorator token bucket từ chối trước khi chạm origin\}.
+- **Memoization** — pure function decorator with a `Map` (watch memory and cache invalidation) \{**Memoize** — decorator function thuần với `Map` (cẩn memory và invalidate cache)\}.
+- **Express / Koa / Hono middleware** — `compose` arrays for HTTP; same onion as above \{**Middleware Express / Koa / Hono** — `compose` mảng cho HTTP; cùng mô hình hành tây\}.
+- **Redux middleware** — `(store) => (next) => (action) => ...` is a decorator on dispatch \{**Redux middleware** — `(store) => (next) => (action) => ...` là decorator trên dispatch\}.
+- **Test doubles** — wrap a real service with an in-memory fake at the composition root without changing production types \{**Test double** — bọc service thật bằng fake in-memory ở composition root không đổi kiểu production\}.
+
+---
+
+## Pitfalls \{Cạm bẫy\}
+
+- **Losing `this`** — decorating a **method** with a bare HOF breaks `this` binding; use an arrow in the class, `.bind()`, or wrap at the object level \{**Mất `this`** — HOF bọc **method** trần làm gãy `this`; dùng arrow trong class, `.bind()`, hoặc bọc ở cấp object\}.
+- **Broken signatures** — a decorator that drops optional parameters or changes return type violates the contract; callers and tests drift \{**Gãy chữ ký** — decorator bỏ tham số optional hoặc đổi kiểu trả về phá hợp đồng; caller và test lệch\}.
+- **Order-dependent stacks** — cache outside vs inside retry changes behavior; document the intended onion \{**Stack phụ thuộc thứ tự** — cache trong hay ngoài retry đổi hành vi; ghi rõ hành tây mong muốn\}.
+- **Over-wrapping** — seven layers with no names in stack traces; prefer named wrapper classes or explicit `pipe` at the root \{**Bọc quá nhiều** — bảy lớp không tên trong stack trace; ưu tiên class wrapper có tên hoặc `pipe` rõ ở root\}.
+- **Swallowing errors** — a decorator that catches and returns `undefined` hides failures; rethrow or map to `Result` types intentionally \{**Nuốt lỗi** — decorator bắt lỗi trả `undefined` che failure; rethrow hoặc map sang kiểu `Result` có chủ đích\}.
+- **Mutable shared cache** — module-level `Map` in a server can leak data across tenants; scope cache per request or user \{**Cache mutable dùng chung** — `Map` cấp module trên server rò dữ liệu giữa tenant; scope cache theo request hoặc user\}.
+
+---
+
+## Cheat sheet \{Bảng tra nhanh\}
+
+```ts
+// HOF decorator — same Parameters / ReturnType
+function withX<T extends (...args: never[]) => Promise<unknown>>(
+  fn: T,
+): (...args: Parameters<T>) => ReturnType<T> {
+  return async (...args) => fn(...args);
+}
+
+// Object decorator — implement same interface, delegate to inner
+class LoggingRepo implements UserRepository {
+  constructor(private inner: UserRepository) {}
+  findById(id: string) {
+    console.log('findById', id);
+    return this.inner.findById(id);
+  }
+}
+
+// Middleware — (ctx, next) => { await next(); }
+const app = compose([logger, auth, handler]);
+
+// Compose HOFs — order matters
+const f = withCache(withRetry(withLogging(core, 'c'), {}), (id) => id);
+```
+
+Decision: **one function, several concerns → HOF stack**; **service interface → wrapper classes**; **HTTP pipeline → middleware `compose`**; **framework metadata → `@decorator` when the framework owns it** \{Quyết định: **một function, nhiều concern → stack HOF**; **interface service → class wrapper**; **pipeline HTTP → `compose` middleware**; **metadata framework → `@decorator` khi framework sở hữu**\}.
+
+---
+
+## Bài tập / Exercises
+
+**1.** Implement a generic `withRetry` HOF (async only) with `maxAttempts` and `delayMs`; prove it retries then throws the last error \{Cài HOF generic `withRetry` (chỉ async) có `maxAttempts` và `delayMs`; chứng minh retry rồi ném lỗi cuối\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+function withRetry<T extends (...args: never[]) => Promise<unknown>>(
+  fn: T,
+  options: { maxAttempts?: number; delayMs?: number } = {},
+): (...args: Parameters<T>) => ReturnType<T> {
+  const { maxAttempts = 3, delayMs = 50 } = options;
+  return async (...args: Parameters<T>): ReturnType<T> => {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await fn(...args);
+      } catch (error) {
+        lastError = error;
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+      }
+    }
+    throw lastError;
+  };
+}
+
+let calls = 0;
+const flaky = withRetry(async () => {
+  calls += 1;
+  if (calls < 3) throw new Error('fail');
+  return 'ok';
+}, { maxAttempts: 5, delayMs: 1 });
+
+await flaky(); // 'ok' after 3 calls
+```
+</details>
+
+**2.** Given `fetchUser(id: string): Promise<User>`, compose **three** decorators — `withLogging`, `withRetry`, `withCache` — and explain why your cache layer is outermost or innermost \{Cho `fetchUser(id: string): Promise<User>`, compose **ba** decorator — `withLogging`, `withRetry`, `withCache` — và giải thích vì sao lớp cache ở ngoài hay trong\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+const cachedRetryLogged = withCache(
+  withRetry(withLogging(fetchUser, 'fetchUser'), { maxAttempts: 3 }),
+  (id) => `user:${id}`,
+);
+
+// Outermost cache: on hit, neither retry nor logging nor network runs.
+// If cache were innermost, a miss would still hit retry+log every time.
+```
+</details>
+
+**3.** Build `compose` for `Middleware<C>` and add `timing` middleware that logs duration after `next()` \{Cài `compose` cho `Middleware<C>` và thêm middleware `timing` log thời lượng sau `next()`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+type Middleware<C> = (ctx: C, next: () => Promise<void>) => Promise<void>;
+
+function compose<C>(stack: readonly Middleware<C>[]): Middleware<C> {
+  return async (ctx, done) => {
+    let idx = -1;
+    async function dispatch(i: number): Promise<void> {
+      if (i <= idx) throw new Error('next() called twice');
+      idx = i;
+      const fn = stack[i];
+      if (fn) await fn(ctx, () => dispatch(i + 1));
+      else await done();
+    }
+    await dispatch(0);
+  };
+}
+
+const timing: Middleware<{ path: string; ms?: number }> = async (ctx, next) => {
+  const t0 = performance.now();
+  await next();
+  ctx.ms = performance.now() - t0;
+};
+```
+</details>
+
+**4.** Wrap `HttpUserRepository` with a `CachingUserRepository` that invalidates one `id` on a hypothetical `updateUser` call \{Bọc `HttpUserRepository` bằng `CachingUserRepository` invalidate một `id` khi gọi giả định `updateUser`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+interface UserRepository {
+  findById(id: string): Promise<User | null>;
+  updateUser(user: User): Promise<void>;
+}
+
+class CachingUserRepository implements UserRepository {
+  private cache = new Map<string, User | null>();
+
+  constructor(private inner: UserRepository) {}
+
+  async findById(id: string): Promise<User | null> {
+    if (this.cache.has(id)) return this.cache.get(id) ?? null;
+    const user = await this.inner.findById(id);
+    this.cache.set(id, user);
+    return user;
+  }
+
+  async updateUser(user: User): Promise<void> {
+    await this.inner.updateUser(user);
+    this.cache.delete(user.id);
+  }
+}
+```
+</details>
+
+**Stretch \{Nâng cao\}:** write a `withRateLimit` HOF using a token bucket (max N calls per window) and compose it **outside** `withRetry` for an API client — explain what happens when the bucket is empty \{viết HOF `withRateLimit` dùng token bucket (tối đa N lần gọi mỗi cửa sổ) và compose **ngoài** `withRetry` cho API client — giải thích khi bucket hết token\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+function withRateLimit<T extends (...args: never[]) => Promise<unknown>>(
+  fn: T,
+  options: { max: number; windowMs: number },
+): (...args: Parameters<T>) => ReturnType<T> {
+  let tokens = options.max;
+  let resetAt = Date.now() + options.windowMs;
+
+  return async (...args: Parameters<T>): ReturnType<T> => {
+    const now = Date.now();
+    if (now >= resetAt) {
+      tokens = options.max;
+      resetAt = now + options.windowMs;
+    }
+    if (tokens <= 0) throw new Error('Rate limit exceeded');
+    tokens -= 1;
+    return fn(...args);
+  };
+}
+
+// Outermost rate limit: rejects before retry/logging spend work.
+// const call = withRateLimit(withRetry(withLogging(api, 'api'), {}), { max: 10, windowMs: 60_000 });
+```
+</details>
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- Decorator = **same interface in and out**, wrap and delegate, add behavior before/after \{Decorator = **cùng interface vào ra**, bọc và ủy quyền, thêm hành vi trước/sau\}.
+- In TS apps, **HOF decorators** are the default for functions; **wrapper classes** for service interfaces \{Trong app TS, **HOF decorator** là mặc định cho function; **class wrapper** cho interface service\}.
+- **Middleware** is a composed decorator pipeline with `next()` — mind the **onion order** \{**Middleware** là pipeline decorator với `next()` — chú ý **thứ tự hành tây**\}.
+- **`@decorator`** is for framework metadata; prefer explicit wrappers when you own the code \{**`@decorator`** cho metadata framework; ưu tiên wrapper rõ khi bạn sở hữu code\}.
+- Watch **`this`**, **signature drift**, **error swallowing**, and **shared mutable caches** on servers \{Cảnh giác **`this`**, **lệch chữ ký**, **nuốt lỗi**, và **cache mutable dùng chung** trên server\}.
+
+---
+
+## Next up \{Tiếp theo\}
+
+**Part 7 — Adapter & Facade**: translate foreign APIs into shapes your app understands, and hide sprawling subsystems behind one calm entry point \{**Phần 7 — Adapter & Facade**: chuyển API lạ sang shape app hiểu, và che subsystem rải rác sau một điểm vào gọn\}. Continue to [Part 7 — Adapter & Facade](/blog/ts-pattern-07-adapter-facade/). ← [Part 5 — Observer & Pub/Sub](/blog/ts-pattern-05-observer-pubsub/)

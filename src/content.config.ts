@@ -18,6 +18,13 @@ const posts = defineCollection({
       pubDate: z.coerce.date(),
       updatedDate: z.coerce.date().optional(),
       tags: z.array(z.string()).default([]),
+      /**
+       * Series membership — first-class, không phụ thuộc pubDate.
+       * `series` là id khớp với registry trong `src/lib/series.ts`;
+       * `seriesOrder` là số thứ tự phần (1-based). Cả hai đi cùng nhau.
+       */
+      series: z.string().optional(),
+      seriesOrder: z.number().int().positive().optional(),
       /** Ẩn bài khỏi production build */
       draft: z.boolean().default(false),
       /** Ảnh cover (optional) — dùng image() để Astro optimize */

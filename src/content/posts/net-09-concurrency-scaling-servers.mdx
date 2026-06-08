@@ -1,0 +1,377 @@
+---
+title: 'Network Programming · Part 9 — Concurrency & Scaling Network Servers'
+description: 'How Node handles thousands of connections on one thread, scaling with cluster and worker_threads, load balancers, timeouts, keep-alive, graceful shutdown, and client pooling — bilingual with TypeScript examples.'
+pubDate: 2024-05-27
+tags: [networking, sockets, nodejs, backend, net_10]
+series: networking
+seriesOrder: 9
+draft: false
+---
+
+import NetworkDiagram from '../../components/blog/NetworkDiagram.astro';
+
+This is **Part 9 of a 10-part series** on network programming with **Node.js + TypeScript** \{Đây là **Phần 9 của series 10 bài** về lập trình mạng với **Node.js + TypeScript**\}. Parts 2–7 built TCP, UDP, DNS, HTTP, WebSockets, and TLS — all of that runs inside **one Node process** by default \{Phần 2–7 đã xây TCP, UDP, DNS, HTTP, WebSocket và TLS — tất cả chạy trong **một process Node** mặc định\}. Today we answer the questions every production server eventually faces: **how does one thread handle thousands of connections**, **when does that break**, and **how do you scale across cores and machines** \{Hôm nay ta trả lời câu hỏi mọi server production cuối cùng đều gặp: **một thread xử lý hàng nghìn kết nối thế nào**, **khi nào nó gãy**, và **scale qua nhiều core / nhiều máy ra sao**\}.
+
+---
+
+## One thread, many connections \{Một thread, nhiều kết nối\}
+
+Node.js is **single-threaded** for JavaScript execution — one **event loop** per process \{Node.js **single-threaded** cho việc chạy JavaScript — một **event loop** mỗi process\}. That sounds like a bottleneck until you understand **non-blocking I/O** \{Nghe như nút thắt cho đến khi bạn hiểu **non-blocking I/O**\}.
+
+When your handler calls `socket.read()` or `http.request()`, Node does **not** sit and wait for bytes from the network \{Khi handler gọi `socket.read()` hoặc `http.request()`, Node **không** ngồi chờ byte từ mạng\}. It registers interest with the OS (via **epoll** on Linux, **kqueue** on macOS, **IOCP** on Windows), then returns control to the event loop \{Nó đăng ký với OS (qua **epoll** trên Linux, **kqueue** trên macOS, **IOCP** trên Windows), rồi trả quyền điều khiển về event loop\}. When data arrives, the kernel wakes Node and your callback runs \{Khi dữ liệu đến, kernel đánh thức Node và callback của bạn chạy\}.
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│  Event loop (one thread)                                │
+│    ┌──────────┐  ┌──────────┐  ┌──────────┐             │
+│    │ conn #1  │  │ conn #2  │  │ conn #N  │  … idle     │
+│    │ waiting  │  │ waiting  │  │ waiting  │             │
+│    └────┬─────┘  └────┬─────┘  └────┬─────┘             │
+│         │             │             │                   │
+│         └─────────────┴─────────────┘                   │
+│                       │                                 │
+│              OS multiplexer (epoll/kqueue)              │
+│         thousands of sockets, kernel notifies on I/O    │
+└─────────────────────────────────────────────────────────┘
+```
+
+This is the **C10k problem** mindset: one process can hold **thousands of mostly-idle sockets** because memory per connection is small and the CPU is not spent blocking on I/O \{Đây là tư duy **bài toán C10k**: một process có thể giữ **hàng nghìn socket chủ yếu idle** vì bộ nhớ mỗi kết nối nhỏ và CPU không bị block chờ I/O\}. Node shines when connections spend most of their time **waiting** — HTTP keep-alive, WebSockets, slow clients, upstream API calls \{Node mạnh khi kết nối phần lớn thời gian **chờ** — HTTP keep-alive, WebSocket, client chậm, gọi API upstream\}.
+
+> **Key idea** \{Ý chính\}: concurrency in Node is **cooperative multiplexing on one thread**, not one OS thread per connection \{đồng thời trong Node là **multiplexing hợp tác trên một thread**, không phải một OS thread mỗi kết nối\}.
+
+---
+
+## When the event loop blocks \{Khi event loop bị block\}
+
+The flip side is brutal: **any synchronous CPU work on the main thread freezes every connection** \{Mặt trái thì tàn khốc: **bất kỳ việc CPU đồng bộ nào trên main thread đều đóng băng mọi kết nối**\}. Hashing passwords, JSON parsing a 50 MB payload, image resizing, a tight `for` loop — all of it blocks the loop until it finishes \{Hash mật khẩu, parse JSON 50 MB, resize ảnh, vòng `for` chặt — tất cả block loop đến khi xong\}.
+
+```typescript
+import { createServer } from 'node:http';
+
+// ❌ BAD — blocks ALL clients for ~2 seconds
+const server = createServer((_req, res) => {
+  const start = Date.now();
+  while (Date.now() - start < 2_000) {
+    // busy-wait simulates CPU-heavy work on the main thread
+  }
+  res.end('done\n');
+});
+
+server.listen(3000);
+```
+
+Open two terminals and hit this server concurrently \{Mở hai terminal và gọi server đồng thời\}: the second request **waits** until the first finishes — not because TCP is serial, but because **JavaScript cannot run two callbacks at once** \{request thứ hai **chờ** đến khi request đầu xong — không phải vì TCP tuần tự, mà vì **JavaScript không chạy hai callback cùng lúc**\}. Rule of thumb: keep handlers **async and I/O-bound**; push CPU work to **worker threads** or another service \{Quy tắc ngón tay cái: giữ handler **async và I/O-bound**; đẩy việc CPU sang **worker thread** hoặc service khác\}.
+
+---
+
+## Scaling across CPU cores with `node:cluster` \{Scale qua nhiều core với `node:cluster`\}
+
+Modern servers have multiple cores, but one Node process uses **one core** for JavaScript \{Server hiện đại có nhiều core, nhưng một process Node chỉ dùng **một core** cho JavaScript\}. The built-in **`node:cluster`** module forks **worker processes** — typically one per CPU — that **share the same listening socket** \{Module **`node:cluster`** fork **worker process** — thường một mỗi CPU — **chia sẻ cùng socket listen**\}.
+
+The **primary** process binds to the port; when a client connects, the **OS load-balances** the accepted connection to one worker \{Process **primary** bind port; khi client kết nối, **OS cân bằng tải** kết nối accept tới một worker\}. Each worker has its **own event loop**, so four cores can run four loops in parallel \{Mỗi worker có **event loop riêng**, nên bốn core chạy bốn loop song song\}.
+
+<NetworkDiagram
+  kind="scaling"
+  caption="Primary listens on :8080; the OS distributes accepted connections across worker processes"
+/>
+
+```typescript
+import cluster from 'node:cluster';
+import { availableParallelism } from 'node:os';
+import { createServer } from 'node:http';
+import process from 'node:process';
+
+const PORT = 8080;
+const WORKERS = availableParallelism(); // cores available to this process
+
+if (cluster.isPrimary) {
+  console.log(`primary ${process.pid} — forking ${WORKERS} workers`);
+
+  for (let i = 0; i < WORKERS; i++) {
+    cluster.fork();
+  }
+
+  cluster.on('exit', (worker, code) => {
+    console.warn(`worker ${worker.process.pid} exited (${code}), restarting`);
+    cluster.fork();
+  });
+} else {
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(`hello from worker ${process.pid}\n`);
+  });
+
+  server.listen(PORT, () => {
+    console.log(`worker ${process.pid} ready on :${PORT}`);
+  });
+}
+```
+
+Hit `curl localhost:8080` repeatedly and watch **different PIDs** in the response \{Gọi `curl` lặp lại và xem **PID khác nhau** trong response\} — proof the OS spreads connections \{bằng chứng OS phân tán kết nối\}. **Sticky sessions** are not automatic: two requests from the same client may land on different workers, so **in-memory session maps break** unless you use Redis or cookies \{**Sticky session** không tự có: hai request từ cùng client có thể vào worker khác nhau, nên **map session trong RAM sẽ hỏng** trừ khi dùng Redis hoặc cookie\}.
+
+---
+
+## `worker_threads` for CPU-bound work \{`worker_threads` cho việc CPU-bound\}
+
+`cluster` scales **I/O concurrency across processes**; **`worker_threads`** offload **CPU work** without forking a full process per task \{`cluster` scale **I/O đồng thời qua process**; **`worker_threads`** offload **việc CPU** mà không fork cả process mỗi task\}. The main thread stays responsive; heavy computation runs in a pool of threads with message passing \{Main thread vẫn phản hồi; tính toán nặng chạy trong pool thread với message passing\}.
+
+```typescript
+import { createServer } from 'node:http';
+import { Worker } from 'node:worker_threads';
+import { fileURLToPath } from 'node:url';
+
+const workerPath = fileURLToPath(new URL('./hash-worker.js', import.meta.url));
+
+function hashInWorker(input: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(workerPath, { workerData: input });
+    worker.on('message', resolve);
+    worker.on('error', reject);
+    worker.on('exit', (code) => {
+      if (code !== 0) reject(new Error(`worker stopped with code ${code}`));
+    });
+  });
+}
+
+const server = createServer(async (req, res) => {
+  const body = await new Promise<string>((resolve) => {
+    let data = '';
+    req.on('data', (chunk) => { data += chunk; });
+    req.on('end', () => resolve(data));
+  });
+
+  const digest = await hashInWorker(body);
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end(`${digest}\n`);
+});
+
+server.listen(3000);
+```
+
+Companion worker file `hash-worker.js` \{File worker kèm theo `hash-worker.js`\}:
+
+```typescript
+import { parentPort, workerData } from 'node:worker_threads';
+import { createHash } from 'node:crypto';
+
+// Simulate expensive work without blocking the server's event loop
+let hash = workerData;
+for (let i = 0; i < 100_000; i++) {
+  hash = createHash('sha256').update(hash).digest('hex');
+}
+
+parentPort?.postMessage(hash);
+```
+
+Use **worker pools** (reuse workers) in production — spawning a new `Worker` per request adds overhead \{Dùng **worker pool** (tái sử dụng worker) trên production — tạo `Worker` mới mỗi request tốn overhead\}.
+
+---
+
+## Horizontal scaling & statelessness \{Scale ngang và stateless\}
+
+Eventually one machine is not enough \{Cuối cùng một máy không đủ\}. You run **multiple instances** behind a **load balancer** (nginx, HAProxy, cloud ALB) \{Chạy **nhiều instance** sau **load balancer** (nginx, HAProxy, ALB cloud)\}. Each instance is an independent Node process (often `cluster` workers × N VMs) \{Mỗi instance là process Node độc lập (thường worker `cluster` × N VM)\}.
+
+| Concern | Single instance | Multiple instances behind LB \{Nhiều instance sau LB\} |
+| --- | --- | --- |
+| **Session state** | In-memory `Map` works | Must use **Redis**, DB, or signed cookies \{Phải dùng Redis, DB, hoặc cookie ký\} |
+| **WebSockets** | One process owns the socket | Need **sticky sessions** (cookie / IP hash) or a **pub/sub bus** (Redis) to fan out \{Cần **sticky session** hoặc **pub/sub bus** để fan-out\} |
+| **File uploads** | Local disk is fine | Use object storage (S3); local disk is per-node \{Dùng object storage; disk local là per-node\} |
+| **Deploy** | Restart drops connections | **Graceful shutdown** + rolling deploy + health checks \{**Graceful shutdown** + rolling deploy + health check\} |
+
+**WebSockets (Part 6)** are especially tricky: after the upgrade, the TCP connection stays pinned to **one worker on one machine** \{**WebSocket (Phần 6)** đặc biệt khó: sau upgrade, kết nối TCP gắn với **một worker trên một máy**\}. A load balancer that round-robins **new** HTTP requests is fine, but **subsequent frames** must return to the same backend — configure **session affinity** or terminate WebSockets at a gateway that handles fan-out \{LB round-robin request HTTP **mới** thì ổn, nhưng **frame tiếp theo** phải về cùng backend — cấu hình **session affinity** hoặc terminate WebSocket tại gateway fan-out\}.
+
+---
+
+## Per-connection hygiene \{Vệ sinh từng kết nối\}
+
+Thousands of idle sockets are cheap; **stuck** sockets are not \{Hàng nghìn socket idle rẻ; socket **kẹt** thì không\}. Production servers need timeouts, limits, and clean shutdown \{Server production cần timeout, giới hạn, và tắt sạch\}.
+
+### Socket & server timeouts \{Timeout socket và server\}
+
+```typescript
+import { createServer, type Server, type Socket } from 'node:net';
+
+const MAX_CONNECTIONS = 10_000;
+let activeConnections = 0;
+
+const server = createServer((socket: Socket) => {
+  if (activeConnections >= MAX_CONNECTIONS) {
+    socket.destroy();
+    return;
+  }
+  activeConnections++;
+
+  socket.setTimeout(30_000); // idle timeout — no data for 30s → 'timeout' event
+  socket.on('timeout', () => {
+    socket.end('idle timeout\n');
+  });
+
+  socket.on('data', (chunk) => {
+    socket.write(chunk); // echo
+  });
+
+  socket.on('close', () => {
+    activeConnections--;
+  });
+});
+
+server.maxConnections = MAX_CONNECTIONS;
+server.setTimeout(60_000); // default idle timeout for sockets without their own
+
+server.listen(3000);
+```
+
+`server.setTimeout(ms)` sets the default idle timeout; `socket.setTimeout(ms)` overrides per connection \{`server.setTimeout(ms)` đặt timeout idle mặc định; `socket.setTimeout(ms)` ghi đè từng kết nối\}. For HTTP, frameworks expose `req.setTimeout()` and `server.requestTimeout` \{Với HTTP, framework có `req.setTimeout()` và `server.requestTimeout`\}.
+
+### TCP keep-alive \{TCP keep-alive\}
+
+Keep-alive lets the kernel detect **dead peers** (crashed client, NAT table expired) without application traffic \{Keep-alive cho kernel phát hiện **peer chết** (client crash, NAT hết hạn) mà không cần traffic ứng dụng\}.
+
+```typescript
+socket.setKeepAlive(true, 30_000); // probe after 30s idle
+```
+
+This is **TCP-level** keep-alive, distinct from **HTTP `Connection: keep-alive`** (Part 5) which reuses one connection for multiple requests \{Đây là keep-alive **tầng TCP**, khác **HTTP `Connection: keep-alive` (Phần 5)** tái sử dụng một kết nối cho nhiều request\}.
+
+### Graceful shutdown \{Tắt nhẹ nhàng\}
+
+On deploy or `SIGTERM`, stop accepting new connections, finish in-flight work, then exit \{Khi deploy hoặc `SIGTERM`, ngừng nhận kết nối mới, hoàn thành việc đang chạy, rồi thoát\}.
+
+```typescript
+import { createServer, type ServerResponse } from 'node:http';
+
+let shuttingDown = false;
+const inFlight = new Set<ServerResponse>();
+
+const server = createServer((_req, res) => {
+  if (shuttingDown) {
+    res.writeHead(503, { Connection: 'close' });
+    res.end('shutting down\n');
+    return;
+  }
+
+  inFlight.add(res);
+  res.on('finish', () => inFlight.delete(res));
+
+  // Simulate in-flight work
+  setTimeout(() => {
+    res.end('ok\n');
+  }, 500);
+});
+
+server.listen(3000);
+
+function shutdown(signal: string): void {
+  console.log(`${signal} received — stop accepting, drain ${inFlight.size} in-flight`);
+  shuttingDown = true;
+  server.close(() => {
+    console.log('listener closed, no new connections');
+  });
+
+  const deadline = setTimeout(() => {
+    console.error('forced exit — connections still open');
+    process.exit(1);
+  }, 10_000);
+
+  const check = setInterval(() => {
+    if (inFlight.size === 0) {
+      clearInterval(check);
+      clearTimeout(deadline);
+      console.log('all in-flight done — exiting');
+      process.exit(0);
+    }
+  }, 100);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+```
+
+`server.close()` stops accepting; existing sockets stay open until they finish or you call `destroy()` \{`server.close()` ngừng accept; socket hiện có mở đến khi xong hoặc bạn gọi `destroy()`\}. Orchestrators (Kubernetes, systemd) send **SIGTERM**, wait, then **SIGKILL** \{Orchestrator (Kubernetes, systemd) gửi **SIGTERM**, chờ, rồi **SIGKILL**\} — design your drain window to fit inside that grace period \{thiết kế cửa sổ drain vừa grace period đó\}.
+
+---
+
+## Client-side connection pooling \{Connection pooling phía client\}
+
+Scaling is not only server-side \{Scale không chỉ phía server\}. Node's default HTTP client opens a **new TCP connection per request** unless you reuse an **`http.Agent`** with **`keepAlive: true`** \{Client HTTP mặc định của Node mở **kết nối TCP mới mỗi request** trừ khi tái sử dụng **`http.Agent`** với **`keepAlive: true`**\}.
+
+```typescript
+import http from 'node:http';
+
+const agent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 50,       // cap concurrent connections per host
+  maxFreeSockets: 10,     // idle sockets kept in the pool
+  timeout: 30_000,
+});
+
+function get(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, { agent }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => resolve(body));
+    });
+    req.on('error', reject);
+  });
+}
+
+// Reuses TCP connections to localhost:3000 instead of 100 handshakes
+await Promise.all(Array.from({ length: 100 }, () => get('http://localhost:3000/')));
+```
+
+For HTTPS, use `https.Agent` the same way \{Với HTTPS, dùng `https.Agent` tương tự\}. Libraries like `fetch` (undici in Node 18+) pool connections internally, but tuning `maxSockets` still matters under load \{Thư viện như `fetch` (undici trong Node 18+) pool nội bộ, nhưng chỉnh `maxSockets` vẫn quan trọng khi tải cao\}.
+
+---
+
+## Comparison: four ways to scale \{So sánh: bốn cách scale\}
+
+| Approach | What it solves | Isolation | Shared state | Best for |
+| --- | --- | --- | --- | --- |
+| **Single process** | Simple dev / low traffic | None — one crash kills all | In-memory OK | Prototypes, internal tools |
+| **`node:cluster`** | Use all CPU cores for I/O | Process per worker — memory isolated | **Not** shared between workers | HTTP/TCP servers on one machine |
+| **`worker_threads`** | CPU-bound tasks without blocking loop | Thread isolation (lighter than process) | `SharedArrayBuffer` only if you opt in | Hashing, image ops, parsing |
+| **Multiple machines + LB** | Throughput beyond one box | Full machine isolation | **External store** required (Redis, DB) | Production traffic, HA deploys |
+
+Pick **cluster** for multi-core I/O, **worker_threads** for CPU spikes on one machine, and **horizontal scaling** when cluster is not enough or you need redundancy \{Chọn **cluster** cho I/O đa core, **worker_threads** cho đỉnh CPU trên một máy, và **scale ngang** khi cluster chưa đủ hoặc cần dự phòng\}.
+
+---
+
+## Mistakes beginners make \{Lỗi người mới hay mắc\}
+
+- ❌ Doing **CPU-heavy work** in a request handler (JSON parse of huge files, bcrypt rounds, image resize) — blocks the loop for **every** connected client \{Làm **việc CPU nặng** trong request handler — block loop cho **mọi** client đang kết nối\}.
+- ❌ **No timeouts** — slow or malicious clients hold sockets forever, eventually hitting `EMFILE` (too many open files) \{**Không timeout** — client chậm hoặc ác ý giữ socket mãi, cuối cùng gặp `EMFILE` (quá nhiều file mở)\}.
+- ❌ Assuming **in-memory state** (sessions, rate-limit counters, WebSocket room maps) still works after you add a **second instance** or a second cluster worker \{Tưởng **state trong RAM** (session, rate-limit, map phòng WebSocket) vẫn hoạt động sau khi thêm **instance thứ hai** hoặc worker cluster thứ hai\}.
+- ❌ **No graceful shutdown** — deploy kills the process mid-request; clients see reset connections and retries storm your fresh pods \{**Không graceful shutdown** — deploy giết process giữa request; client thấy reset và retry dồn vào pod mới\}.
+
+---
+
+## Exercises \{Bài tập\}
+
+Try each before opening the solution \{Thử từng bài trước khi mở lời giải\}.
+
+1. Run the cluster example and send 20 `curl` requests — count how many unique worker PIDs appear \{Chạy ví dụ cluster và gửi 20 request `curl` — đếm bao nhiêu PID worker khác nhau\}.
+2. Add a `socket.setTimeout(2000)` echo server; connect with `nc localhost 3000`, send one line, then wait 5 seconds without typing — describe what happens \{Thêm server echo với `socket.setTimeout(2000)`; kết nối bằng `nc`, gửi một dòng, chờ 5 giây không gõ — mô tả điều gì xảy ra\}.
+3. Store a counter in a module-level variable in a cluster worker; increment it per request — explain why the total differs from the number of requests \{Lưu counter biến module-level trong worker cluster; tăng mỗi request — giải thích vì sao tổng khác số request\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+# Exercise 1 — expect up to N unique PIDs where N = availableParallelism()
+for i in $(seq 1 20); do curl -s localhost:8080; done | sort -u
+```
+
+With 4 cores you typically see 4 PIDs; exact distribution depends on OS scheduling \{Với 4 core thường thấy 4 PID; phân phối chính xác phụ thuộc lịch OS\}.
+
+Exercise 2: after 2 seconds of silence, Node emits `timeout` on the socket; if your handler calls `socket.end()`, `nc` sees the connection close \{Bài 2: sau 2 giây im lặng, Node phát `timeout` trên socket; nếu handler gọi `socket.end()`, `nc` thấy kết nối đóng\}. Without a handler, the socket may sit half-open until TCP keep-alive or the client quits \{Không có handler, socket có thể nửa mở đến khi TCP keep-alive hoặc client thoát\}.
+
+Exercise 3: each worker has **its own memory space** — worker A's counter never sees worker B's increments \{Bài 3: mỗi worker có **không gian nhớ riêng** — counter của worker A không thấy increment của worker B\}. Ten requests spread across 4 workers might show at most ~3 per worker locally, not 10 globally \{Mười request rải trên 4 worker có thể chỉ ~3 mỗi worker cục bộ, không phải 10 toàn cục\}. Fix: Redis `INCR` or a DB \{Sửa: Redis `INCR` hoặc DB\}.
+
+</details>
+
+---
+
+## Takeaway \{Điều cốt lõi\}
+
+Node handles many connections on **one thread** via non-blocking I/O and the event loop — the C10k sweet spot for **idle, I/O-bound** workloads \{Node xử lý nhiều kết nối trên **một thread** nhờ non-blocking I/O và event loop — điểm ngọt C10k cho workload **idle, I/O-bound**\}. **CPU on the main thread** blocks everyone; **`cluster`** spreads I/O across cores; **`worker_threads`** offload CPU; **multiple machines** demand **stateless design** and careful WebSocket routing \{**CPU trên main thread** block tất cả; **`cluster`** rải I/O qua core; **`worker_threads`** offload CPU; **nhiều máy** đòi **thiết kế stateless** và định tuyến WebSocket cẩn thận\}. Tie it together with **timeouts**, **keep-alive**, **connection limits**, **graceful shutdown**, and **client pooling** — then in Part 10 we capture packets and debug the whole stack when something still goes wrong \{Gắn kết bằng **timeout**, **keep-alive**, **giới hạn kết nối**, **graceful shutdown**, và **client pooling** — rồi ở Phần 10 ta bắt packet và debug cả stack khi vẫn có gì đó sai\}.

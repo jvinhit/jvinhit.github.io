@@ -1,0 +1,358 @@
+---
+title: 'Docker for Developers · Part 3 — Persisting Data: Volumes, Bind Mounts & Env'
+description: 'Containers are ephemeral — so where does data live? Named volumes vs bind mounts vs tmpfs, persisting a database, mounting source code for live dev, and managing env vars and secrets safely.'
+pubDate: 2025-09-15
+tags: [docker, volumes, storage, devops, docker_k8s_10]
+series: docker
+seriesOrder: 3
+draft: false
+---
+
+import DockerDiagram from '../../components/blog/DockerDiagram.astro';
+
+> **Part 3 of 10** in the Docker → Compose → Kubernetes series \{**Phần 3/10** trong series Docker → Compose → Kubernetes\}. Previous \{Trước\}: [Part 2 — Images & the Dockerfile](/blog/docker-02-images-and-dockerfile/) · Next \{Tiếp\}: [Part 4 — Networking: Bridge, Ports & Service Discovery](/blog/docker-04-networking-bridge-ports-dns/).
+
+In [Part 1](/blog/docker-01-fundamentals-containers-images/) you learned that every running container gets a thin **writable layer** on top of its read-only image layers \{Trong [Phần 1](/blog/docker-01-fundamentals-containers-images/) bạn đã biết mỗi container đang chạy có một **layer ghi-được** mỏng trên các layer image chỉ-đọc\}. Anything you create or edit there — a database file, an upload, a config tweak — **dies when the container is removed** \{Mọi thứ bạn tạo hoặc sửa ở đó — file database, upload, chỉnh config — **chết khi container bị xóa**\}. That's fine for stateless web servers; it's catastrophic for Postgres \{Ổ với web server stateless; thảm họa với Postgres\}.
+
+This part fixes the **data problem**: where files live on disk, how to survive `docker rm`, how to mount your source code for live dev, and how to pass configuration without baking secrets into images \{Phần này giải quyết **bài toán dữ liệu**: file nằm ở đâu trên disk, cách sống sót qua `docker rm`, cách gắn source code để dev live, và cách truyền cấu hình mà không nhúng secret vào image\}.
+
+---
+
+## Three ways to mount storage — named volumes vs bind mounts vs tmpfs \{Ba cách gắn storage — named volume vs bind mount vs tmpfs\}
+
+Docker can attach storage **into** a container at a path you choose \{Docker có thể gắn storage **vào** container tại đường dẫn bạn chọn\}. There are three mechanisms \{Có ba cơ chế\}:
+
+| Mechanism \{Cơ chế\} | Where data lives \{Dữ liệu ở đâu\} | Survives `docker rm`? \{Sống qua `docker rm`?\} | Typical use \{Dùng khi nào\} |
+|---|---|---|---|
+| **Named volume** | Docker-managed directory on the host (you don't pick the path) \{Thư mục do Docker quản lý trên host (bạn không chọn path)\} | **Yes** (until you `docker volume rm`) \{**Có** (đến khi `docker volume rm`)\} | Database data, uploads, prod persistence \{Dữ liệu DB, upload, persistence production\} |
+| **Bind mount** | A specific path on **your** host filesystem \{Một path cụ thể trên filesystem **host** của bạn\} | **Yes** (it's your folder) \{**Có** (đó là folder của bạn)\} | Live dev: mount `./src` into the container \{Dev live: gắn `./src` vào container\} |
+| **tmpfs mount** | RAM only — never written to disk \{Chỉ RAM — không ghi xuống disk\} | **No** (gone when container stops) \{**Không** (mất khi container dừng)\} | Secrets, temp caches you don't want on disk \{Secret, cache tạm không muốn lên disk\} |
+
+<DockerDiagram
+  kind="storage-mounts"
+  caption="Three ways to attach storage to a container: a named volume (Docker-managed, persists), a bind mount (your host folder, persists & live-editable), and tmpfs (RAM, gone on stop)"
+/>
+
+**Rule of thumb** \{Quy tắc ngón tay cái\}: production data → **named volumes**; local development with hot reload → **bind mounts**; sensitive ephemeral scratch → **tmpfs** \{dữ liệu production → **named volume**; dev local với hot reload → **bind mount**; scratch nhạy cảm tạm thời → **tmpfs**\}.
+
+---
+
+## Named volumes — Docker owns the directory \{Named volume — Docker sở hữu thư mục\}
+
+A **named volume** is a bucket Docker creates and manages under the hood (on Linux, usually under `/var/lib/docker/volumes/`) \{Một **named volume** là "thùng" Docker tạo và quản lý bên dưới (trên Linux, thường dưới `/var/lib/docker/volumes/`)\}. You reference it by **name**, not by a host path you type \{Bạn tham chiếu bằng **tên**, không phải path host bạn gõ\}.
+
+### Manage volumes \{Quản lý volume\}
+
+```bash
+docker volume create pgdata      # create explicitly (optional — run can auto-create)
+docker volume ls                 # list all volumes
+docker volume inspect pgdata     # see mountpoint on the host
+docker volume rm pgdata          # delete one (only when no container uses it)
+docker volume prune              # delete all unused volumes
+```
+
+### Attach at run time \{Gắn khi chạy\}
+
+Short syntax (most common) \{Cú pháp ngắn (phổ biến nhất)\}:
+
+```bash
+docker run -d \
+  --name db \
+  -e POSTGRES_PASSWORD=secret \
+  -v pgdata:/var/lib/postgresql/data \
+  postgres:16-alpine
+```
+
+Here `pgdata` is the volume name and `/var/lib/postgresql/data` is where Postgres expects its files **inside** the container \{Ở đây `pgdata` là tên volume và `/var/lib/postgresql/data` là nơi Postgres mong đợi file **bên trong** container\}. The official Postgres image is built to use that path — always check the image docs for the correct mount point \{Image Postgres chính thức được build cho path đó — luôn xem docs image để biết mount point đúng\}.
+
+Long syntax (same thing, more explicit) \{Cú pháp dài (cùng việc, rõ ràng hơn)\}:
+
+```bash
+docker run -d \
+  --name db \
+  -e POSTGRES_PASSWORD=secret \
+  --mount type=volume,source=pgdata,target=/var/lib/postgresql/data \
+  postgres:16-alpine
+```
+
+Prefer named volumes when you care about **portability** and **not** hard-coding your laptop's directory layout — especially for databases and anything that must survive redeploys \{Ưu tiên named volume khi bạn cần **tính portable** và **không** hard-code cấu trúc thư mục laptop — đặc biệt cho database và thứ phải sống qua redeploy\}.
+
+---
+
+## Bind mounts — your folder, inside the container \{Bind mount — folder của bạn, bên trong container\}
+
+A **bind mount** maps a **host path** directly into the container \{**Bind mount** ánh xạ một **path trên host** thẳng vào container\}. Edit a file on your Mac → the container sees the change immediately \{Sửa file trên Mac → container thấy thay đổi ngay\}. That's how you get live reload during development \{Đó là cách bạn có live reload khi dev\}.
+
+```bash
+docker run --rm -it \
+  -v "$(pwd):/app" \
+  -w /app \
+  node:20-alpine \
+  sh
+```
+
+| Piece \{Phần\} | Meaning \{Nghĩa\} |
+|---|---|
+| `$(pwd)` | Current directory on the **host** (use absolute paths on Windows if needed) \{Thư mục hiện tại trên **host** (Windows có thể cần path tuyệt đối)\} |
+| `:/app` | Mount at `/app` **inside** the container \{Gắn tại `/app` **bên trong** container\} |
+| `-w /app` | Set working directory so commands run in the mounted tree \{Đặt working directory để lệnh chạy trong cây đã gắn\} |
+
+**Read-only** when the container must not mutate your source \{**Chỉ đọc** khi container không được sửa source của bạn\}:
+
+```bash
+docker run -v "$(pwd)/config:/app/config:ro" myimage
+```
+
+> On Docker Desktop for Mac/Windows, bind mounts go through a file-sharing layer — large `node_modules` trees can feel slower than on native Linux \{Trên Docker Desktop cho Mac/Windows, bind mount đi qua lớp chia sẻ file — cây `node_modules` lớn có thể chậm hơn Linux native\}. Named volumes for dependencies are a common fix (see pitfalls below) \{Named volume cho dependency là fix phổ biến (xem pitfalls bên dưới)\}.
+
+---
+
+## Persisting a database — prove data survives `docker rm` \{Giữ database — chứng minh dữ liệu sống qua `docker rm`\}
+
+Walk through a Postgres example end to end \{Làm ví dụ Postgres trọn vẹn\}.
+
+**1. Start Postgres with a named volume** \{**1.** Khởi động Postgres với named volume\}:
+
+```bash
+docker volume create pgdata
+
+docker run -d \
+  --name mydb \
+  -e POSTGRES_USER=dev \
+  -e POSTGRES_PASSWORD=devpass \
+  -e POSTGRES_DB=appdb \
+  -v pgdata:/var/lib/postgresql/data \
+  postgres:16-alpine
+```
+
+**2. Create a table and insert a row** \{**2.** Tạo bảng và chèn một dòng\}:
+
+```bash
+docker exec -it mydb psql -U dev -d appdb -c \
+  "CREATE TABLE IF NOT EXISTS notes (id serial PRIMARY KEY, body text);
+   INSERT INTO notes (body) VALUES ('survives container death');"
+```
+
+**3. Kill the container — data stays in the volume** \{**3.** Xóa container — dữ liệu ở lại trong volume\}:
+
+```bash
+docker stop mydb
+docker rm mydb
+docker ps -a    # mydb is gone
+```
+
+**4. Start a *new* container on the *same* volume** \{**4.** Khởi động container *mới* trên *cùng* volume\}:
+
+```bash
+docker run -d \
+  --name mydb2 \
+  -e POSTGRES_USER=dev \
+  -e POSTGRES_PASSWORD=devpass \
+  -e POSTGRES_DB=appdb \
+  -v pgdata:/var/lib/postgresql/data \
+  postgres:16-alpine
+
+docker exec -it mydb2 psql -U dev -d appdb -c "SELECT * FROM notes;"
+```
+
+You should still see `survives container death` \{Bạn vẫn thấy `survives container death`\}. The **container** was disposable; the **volume** was not \{**Container** là dùng-một-lần; **volume** thì không\}.
+
+```text
+  docker rm mydb          volume pgdata still on disk
+        │                          │
+        ▼                          ▼
+   (container gone)          ┌──────────────┐
+                            │ notes table  │
+                            └──────────────┘
+        docker run ... -v pgdata:...  ──►  mydb2 sees the same files
+```
+
+---
+
+## Environment variables & config \{Biến môi trường & cấu hình\}
+
+Containers are immutable artifacts; **configuration** should be injected at run time, not baked into the image \{Container là artifact bất biến; **cấu hình** nên inject lúc chạy, không nên "nướng" vào image\}.
+
+### Inline `-e` \{Trực tiếp `-e`\}
+
+```bash
+docker run -e NODE_ENV=production -e PORT=3000 myapp
+```
+
+### `--env-file` \{`--env-file`\}
+
+Put non-secret defaults in a file (one `KEY=value` per line) \{Đặt default không phải secret trong file (mỗi dòng `KEY=value`)\}:
+
+```bash
+# .env  (example — never commit real secrets)
+NODE_ENV=development
+PORT=3000
+LOG_LEVEL=debug
+```
+
+```bash
+docker run --env-file .env myapp
+```
+
+Docker passes those variables into the container process environment \{Docker truyền các biến đó vào môi trường tiến trình container\}. Your app reads them the same way it would on bare metal \{App đọc chúng giống khi chạy trên bare metal\}.
+
+### Secrets — don't bake them in \{Secret — đừng nhúng vào image\}
+
+- **Never** `ENV DATABASE_PASSWORD=...` in a Dockerfile for real credentials — layers are forever; anyone with the image can inspect them \{**Không bao giờ** `ENV DATABASE_PASSWORD=...` trong Dockerfile cho credential thật — layer tồn tại mãi; ai có image đều có thể inspect\}.
+- Add `.env` to **`.gitignore`** so local secrets never reach the repo \{Thêm `.env` vào **`.gitignore`** để secret local không lên repo\}.
+- Production-grade secret delivery (Docker secrets, Vault, cloud parameter stores) is a deeper topic — we'll touch it again in **Part 7** of this series \{Cách đưa secret production (Docker secrets, Vault, cloud parameter store) sâu hơn — sẽ quay lại ở **Phần 7** của series\}.
+
+For local dev, `-e` and `--env-file` are enough; treat `.env` like a password manager export, not source code \{Dev local thì `-e` và `--env-file` đủ; coi `.env` như export từ password manager, không phải source code\}.
+
+---
+
+## Common pitfalls \{Các bẫy thường gặp\}
+
+- **Mounting over a non-empty directory hides image contents** — if the image already has files at `/app` and you bind-mount an empty host folder, the container sees an **empty** `/app` \{**Gắn đè lên thư mục không rỗng che nội dung image** — image đã có file tại `/app` mà bạn bind-mount folder host rỗng thì container thấy `/app` **rỗng**\}. Mount to a subpath or ensure the host folder has what you need \{Gắn vào subpath hoặc đảm bảo folder host có đủ thứ cần\}.
+
+- **Anonymous volumes pile up** — `-v /var/lib/mysql` (no name) creates a random volume Docker won't reuse unless you know its hash \{**Anonymous volume chồng chất** — `-v /var/lib/mysql` (không tên) tạo volume ngẫu nhiên Docker không tái dùng trừ khi bạn biết hash\}. Prefer **named** volumes: `-v mydata:/var/lib/mysql` \{Ưu tiên volume **có tên**: `-v mydata:/var/lib/mysql`\}.
+
+- **Bind-mount permission mismatches** — a process in the container may run as a different UID than your host user; you may see "Permission denied" on writes \{**Lệch quyền bind mount** — tiến trình trong container có thể chạy UID khác user host; có thể gặp "Permission denied" khi ghi\}. Fixes include adjusting image `USER`, host folder permissions, or dev-only flags — image-specific \{Fix gồm chỉnh `USER` trong image, quyền folder host, hoặc flag chỉ dev — tùy image\}.
+
+- **Relative vs absolute host paths** — `-v ./data:/data` depends on your shell's current directory; `$(pwd)/data` is clearer and safer in scripts \{**Path host tương đối vs tuyệt đối** — `-v ./data:/data` phụ thuộc thư mục hiện tại của shell; `$(pwd)/data` rõ và an toàn hơn trong script\}.
+
+- **`node_modules` clobbering** — bind-mounting the project root also mounts your host's `node_modules` (or lack of them) over the container's Linux-built modules \{**Ghi đè `node_modules`** — bind-mount root project cũng gắn `node_modules` trên host (hoặc thiếu) đè lên module Linux build trong container\}. A common pattern: bind the app, but use a **named volume** for `node_modules` \{Pattern phổ biến: bind app, nhưng dùng **named volume** cho `node_modules`\}:
+
+```bash
+docker run -v "$(pwd):/app" -v app_modules:/app/node_modules -w /app node:20-alpine npm install
+```
+
+The second mount "shadows" `/app/node_modules` so installs stay inside Docker's volume, not your Mac's tree \{Mount thứ hai "che" `/app/node_modules` để install nằm trong volume Docker, không phải cây trên Mac\}.
+
+---
+
+## Cheat sheet \{Bảng tra nhanh\}
+
+```bash
+# volumes
+docker volume create mydata
+docker volume ls
+docker volume inspect mydata
+docker volume rm mydata
+docker volume prune
+
+# run with storage
+docker run -v mydata:/var/lib/postgresql/data postgres:16-alpine
+docker run -v "$(pwd):/app" -w /app node:20-alpine
+docker run -v "$(pwd)/config:/app/config:ro" myimage
+docker run --mount type=volume,source=mydata,target=/data myimage
+
+# environment
+docker run -e KEY=value myimage
+docker run --env-file .env myimage
+docker exec mycontainer env    # inspect what's set inside
+```
+
+---
+
+## Bài tập / Exercises
+
+Do these in order; you'll use volumes and env vars constantly in Compose and Kubernetes later \{Làm theo thứ tự; bạn sẽ dùng volume và biến môi trường liên tục ở Compose và Kubernetes sau này\}.
+
+**1.** Create a named volume `ex-pgdata`, run Postgres 16 with user `ex`, password `ex`, database `exdb`, mount the volume, insert one row into a table `ping`, then `docker rm` the container and start a **new** one on the same volume — prove the row still exists \{Tạo named volume `ex-pgdata`, chạy Postgres 16 với user `ex`, password `ex`, database `exdb`, gắn volume, chèn một dòng vào bảng `ping`, rồi `docker rm` container và khởi động container **mới** trên cùng volume — chứng minh dòng vẫn còn\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+docker volume create ex-pgdata
+
+docker run -d --name exdb1 \
+  -e POSTGRES_USER=ex -e POSTGRES_PASSWORD=ex -e POSTGRES_DB=exdb \
+  -v ex-pgdata:/var/lib/postgresql/data \
+  postgres:16-alpine
+
+docker exec exdb1 psql -U ex -d exdb -c \
+  "CREATE TABLE ping (msg text); INSERT INTO ping VALUES ('still here');"
+
+docker stop exdb1 && docker rm exdb1
+
+docker run -d --name exdb2 \
+  -e POSTGRES_USER=ex -e POSTGRES_PASSWORD=ex -e POSTGRES_DB=exdb \
+  -v ex-pgdata:/var/lib/postgresql/data \
+  postgres:16-alpine
+
+docker exec exdb2 psql -U ex -d exdb -c "SELECT * FROM ping;"
+# still here
+```
+</details>
+
+**2.** In an empty folder on your host, create `hello.txt` with any text. Run an Alpine container with that folder bind-mounted to `/work`, change the file from **inside** the container, then `cat hello.txt` on the host — both sides should match \{Trong folder trống trên host, tạo `hello.txt` với nội dung bất kỳ. Chạy container Alpine gắn folder đó vào `/work`, sửa file **bên trong** container, rồi `cat hello.txt` trên host — hai phía phải khớp\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+mkdir -p /tmp/docker-ex3 && cd /tmp/docker-ex3
+echo "from host" > hello.txt
+
+docker run --rm -it -v "$(pwd):/work" -w /work alpine sh -c \
+  "echo 'from container' >> hello.txt && cat /work/hello.txt"
+
+cat hello.txt
+# from host
+# from container
+```
+</details>
+
+**3.** Write a `.env` file with `GREETING=hello-from-file` and run `alpine` with `--env-file .env`, printing the variable with `sh -c 'echo $GREETING'` \{Viết file `.env` với `GREETING=hello-from-file` và chạy `alpine` với `--env-file .env`, in biến bằng `sh -c 'echo $GREETING'`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+cd /tmp/docker-ex3
+printf 'GREETING=hello-from-file\n' > .env
+
+docker run --rm --env-file .env alpine sh -c 'echo $GREETING'
+# hello-from-file
+```
+</details>
+
+**4.** List all volumes, identify `ex-pgdata`, run `docker volume inspect ex-pgdata` and note the `Mountpoint` path on the host \{Liệt kê mọi volume, nhận ra `ex-pgdata`, chạy `docker volume inspect ex-pgdata` và ghi nhớ path `Mountpoint` trên host\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+docker volume ls
+docker volume inspect ex-pgdata
+# "Mountpoint": "/var/lib/docker/volumes/ex-pgdata/_data"  (Linux)
+# on Docker Desktop Mac, path is inside the Linux VM — inspect still shows it
+```
+</details>
+
+**5.** Stop and remove any exercise containers, then `docker volume prune` and confirm unused volumes are gone (or re-create `ex-pgdata` if you still need it) \{Dừng và xóa container bài tập, rồi `docker volume prune` và xác nhận volume không dùng đã mất (hoặc tạo lại `ex-pgdata` nếu còn cần)\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+docker stop exdb2 2>/dev/null; docker rm exdb2 2>/dev/null
+docker volume prune    # type y to confirm
+docker volume ls       # ex-pgdata removed if nothing still references it
+```
+</details>
+
+**Stretch \{Nâng cao\}:** run a Node container with both `$(pwd)` bind-mounted to `/app` **and** a named volume at `/app/node_modules`; run `npm init -y && npm install lodash` inside, remove the container, start again with the same mounts, and verify `node_modules` still exists without re-running a full install on the host \{Chạy container Node vừa bind `$(pwd)` vào `/app` **vừa** named volume tại `/app/node_modules`; chạy `npm init -y && npm install lodash` bên trong, xóa container, khởi động lại với cùng mount, và xác nhận `node_modules` còn mà không cần install đầy đủ trên host\}.
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- The container **writable layer is ephemeral** — plan persistence explicitly \{**Layer ghi-được của container là tạm thời** — lên kế hoạch persistence rõ ràng\}.
+- **Named volumes** for data that must survive container replacement (databases, uploads) \{**Named volume** cho dữ liệu phải sống qua thay container (DB, upload)\}.
+- **Bind mounts** for developer workflows — your editor on the host, the app in the container \{**Bind mount** cho workflow dev — editor trên host, app trong container\}.
+- **tmpfs** when disk persistence is unwanted \{**tmpfs** khi không muốn persistence trên disk\}.
+- Inject config with **`-e` / `--env-file`**; keep secrets out of images and out of git \{Inject config bằng **`-e` / `--env-file`**; giữ secret khỏi image và khỏi git\}.
+
+---
+
+## Next up \{Tiếp theo\}
+
+**Part 4 — Networking: Bridge, Ports & Service Discovery**: how containers find each other, publish ports, and why `localhost` inside a container is not what you think \{**Phần 4 — Networking: Bridge, Ports & Service Discovery**: container tìm nhau thế nào, publish port, và vì sao `localhost` trong container không như bạn nghĩ\}. Continue to [Part 4](/blog/docker-04-networking-bridge-ports-dns/).

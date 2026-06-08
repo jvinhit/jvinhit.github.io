@@ -1,0 +1,353 @@
+---
+title: 'Docker for Developers · Part 6 — Compose in Depth: Env, Profiles, Healthchecks & Scaling'
+description: 'Level up Compose: env files and variable interpolation, healthchecks with depends_on condition, profiles for optional services, multiple compose files / overrides, and scaling services.'
+pubDate: 2025-10-06
+tags: [docker, docker-compose, healthcheck, devops, docker_k8s_10]
+series: docker
+seriesOrder: 6
+draft: false
+---
+
+This is **Part 6 of a 10-part series** that takes you from "I've heard of Docker" to confidently building, running, and *debugging* containerized apps — Docker, Docker Compose, and Kubernetes \{Đây là **Phần 6 của series 10 bài** đưa bạn từ "mới nghe nói về Docker" đến tự tin build, chạy và *debug* ứng dụng container — Docker, Docker Compose và Kubernetes\}. Previous \{Trước\}: [Part 5 — Docker Compose Fundamentals](/blog/docker-05-compose-fundamentals/) · Next \{Tiếp\}: [Part 7 — Optimizing & Securing Images](/blog/docker-07-optimizing-securing-images/). Every part ends with **exercises**; do them, don't just read \{Mỗi phần kết thúc bằng **bài tập**; hãy làm, đừng chỉ đọc\}.
+
+In [Part 5](/blog/docker-05-compose-fundamentals/) you declared a multi-service stack in `compose.yaml` and brought it up with `docker compose up` \{Trong [Phần 5](/blog/docker-05-compose-fundamentals/) bạn đã khai báo stack nhiều dịch vụ trong `compose.yaml` và bật bằng `docker compose up`\}. That gets containers **started** — but "started" is not the same as **ready** \{Điều đó chỉ làm container **khởi động** — "đã start" không đồng nghĩa **sẵn sàng**\}. This part makes your Compose files **robust and flexible**: env interpolation, health-gated dependencies, optional profiles, file overrides, scaling, and restart policies \{Phần này làm file Compose **vững và linh hoạt**: nội suy env, phụ thuộc theo health, profile tùy chọn, override file, scale và chính sách restart\}.
+
+---
+
+## Environment & variable interpolation \{Biến môi trường & nội suy biến\}
+
+Compose reads a **project `.env` file** at the project root (same folder as `compose.yaml`) and uses those values when it **parses** the YAML — before containers start \{Compose đọc file **`.env` ở root project** (cùng thư mục với `compose.yaml`) và dùng giá trị đó khi **parse** YAML — trước khi container chạy\}. Syntax `${VAR}` substitutes at parse time; `${VAR:-default}` uses a default when unset \{Cú pháp `${VAR}` thay thế lúc parse; `${VAR:-default}` dùng giá trị mặc định khi chưa set\}.
+
+```yaml
+# compose.yaml
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+```
+
+```bash
+# .env  (project root — do NOT commit secrets; add .env to .gitignore)
+POSTGRES_PASSWORD=devpass
+DB_PORT=5433
+```
+
+**`env_file`** is different: it injects key/value pairs **into the container's environment** at runtime — it does not interpolate the compose file itself \{**`env_file`** khác: nó đưa cặp key/value **vào môi trường container** lúc runtime — không nội suy file compose\}.
+
+`env_file: [.env.api]` loads into the container; `environment: NODE_ENV: ${NODE_ENV:-development}` still interpolates in YAML \{`env_file` nạp vào container; `environment` vẫn nội suy trong YAML\}. Keep secrets **out of images** and git — `.env` locally, CI secrets in prod ([Part 3](/blog/docker-03-data-volumes-bind-mounts-env/)) \{Giữ secret ngoài image và git — `.env` local, secret CI trên prod ([Phần 3](/blog/docker-03-data-volumes-bind-mounts-env/))\}.
+
+---
+
+## Healthchecks & `depends_on` conditions \{Healthcheck & điều kiện `depends_on`\}
+
+A container can be **running** while Postgres is still initializing — the classic race from Part 5's short `depends_on` \{Container có thể **đang chạy** trong khi Postgres vẫn đang khởi tạo — race kinh điển từ `depends_on` dạng ngắn ở Phần 5\}. Fix it with a **`healthcheck`** on the dependency and `condition: service_healthy` on the consumer \{Sửa bằng **`healthcheck`** trên dịch vụ phụ thuộc và `condition: service_healthy` trên dịch vụ cần chờ\}.
+
+```yaml
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -q"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  web:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+| Field | Role \{Vai trò\} |
+|---|---|
+| `test` | Command that exits 0 = healthy \{Lệnh exit 0 = healthy\} |
+| `interval` | How often to run the test \{Tần suất chạy test\} |
+| `timeout` | Max wait per test run \{Thời gian chờ tối đa mỗi lần test\} |
+| `retries` | Failures before marking unhealthy \{Số lần fail trước khi đánh unhealthy\} |
+| `start_period` | Grace period — failures don't count yet \{Khoảng ân hạn — fail chưa tính\} |
+
+```text
+  TIME ─────────────────────────────────────────────────────────────►
+
+  db container starts
+       │
+       ├──── start_period (10s) ────┤  failures ignored here
+       │                            │
+       │         pg_isready polls every interval
+       │                            │
+       │                            ▼
+       │                    status: healthy
+       │                            │
+       └────────────────────────────┼──► web may start (service_healthy)
+                                    │
+  without healthcheck: web starts here ──X── (DB may still be init)
+```
+
+```bash
+docker compose up -d && docker compose ps   # HEALTH: starting → healthy
+```
+
+---
+
+## Profiles — optional services \{Profile — dịch vụ tùy chọn\}
+
+Not every developer needs Mailhog, Adminer, or a debug sidecar every day \{Không phải ai cũng cần Mailhog, Adminer hay sidecar debug mỗi ngày\}. Mark optional services with **`profiles`** — they stay **off** unless you opt in \{Đánh dấu dịch vụ tùy chọn bằng **`profiles`** — chúng **tắt** trừ khi bạn bật\}.
+
+```yaml
+services:
+  api:
+    image: myapp:latest
+    # no profile → always starts with `docker compose up`
+
+  mailhog:
+    image: mailhog/mailhog
+    profiles: [debug]
+    ports:
+      - "8025:8025"
+```
+
+```bash
+docker compose up -d                        # api only
+docker compose --profile debug up -d        # api + mailhog
+```
+
+Use profiles for **dev-only tools**, one-off importers, or heavy local dependencies you don't want on every `up` \{Dùng profile cho **công cụ chỉ dev**, job import một lần, hoặc dependency nặng không muốn mỗi lần `up`\}.
+
+---
+
+## Multiple compose files & overrides \{Nhiều file compose & override\}
+
+Compose **merges** multiple files into one effective spec \{Compose **gộp** nhiều file thành một spec hiệu lực\}:
+
+1. **`compose.yaml`** — your base stack \{stack cơ sở\}.
+2. **`compose.override.yaml`** — auto-loaded on the same machine for local tweaks (bind mounts, debug ports) \{tự load trên cùng máy để chỉnh local (bind mount, cổng debug)\}.
+3. **`-f`** — explicit extra files, e.g. prod overlay \{file bổ sung tường minh, vd overlay prod\}.
+
+```bash
+docker compose up -d
+# equivalent to merging compose.yaml + compose.override.yaml if override exists
+
+docker compose -f compose.yaml -f compose.prod.yaml up -d
+```
+
+**Merge semantics (simplified)** \{Quy tắc gộp (rút gọn)\}: later files **override** scalars and **append** lists where allowed; **service names** are the merge key — same name deep-merges keys \{file sau **ghi đè** scalar và **nối** list khi được phép; **tên service** là khóa gộp — cùng tên thì merge sâu từng key\}. Maps like `environment` and `labels` typically merge by key \{map như `environment`, `labels` thường merge theo key\}.
+
+`compose.override.yaml` typically adds bind mounts and debug ports for `api` on your laptop \{`compose.override.yaml` thường thêm bind mount và cổng debug cho `api` trên laptop\}.
+
+---
+
+## Scaling services \{Scale dịch vụ\}
+
+Run **multiple containers** of the same service without duplicating YAML \{Chạy **nhiều container** cùng một service mà không nhân đôi YAML\}:
+
+```bash
+docker compose up -d --scale worker=3
+docker compose ps    # three worker containers
+```
+
+Good for **stateless workers** (queue consumers, batch jobs) on an internal network with **no** fixed host port per replica \{Hợp **worker stateless** (consumer hàng đợi, batch) trên mạng nội bộ **không** gán cổng host cố định cho từng replica\}. **Bad** when every replica maps the same `ports: "8080:80"` — only one can bind the host port \{**Không ổn** khi mỗi replica cùng `ports: "8080:80"` — chỉ một bind được cổng host\}. For HTTP scale-out on one host, put a **reverse proxy** or load balancer in front; in production clusters you usually scale in **Kubernetes** (Part 9+) instead \{Để scale HTTP trên một host, đặt **reverse proxy** hoặc load balancer phía trước; trên cluster production thường scale bằng **Kubernetes** (Phần 9+) thay vì `--scale`\}.
+
+---
+
+## Restart policies \{Chính sách restart\}
+
+When the daemon or host reboots, should Compose bring services back? \{Khi daemon hoặc host reboot, Compose có tự bật lại dịch vụ?\}
+
+```yaml
+services:
+  api:
+    restart: unless-stopped   # restart unless you explicitly stopped it
+  worker:
+    restart: on-failure
+```
+
+Common values: `no` (default), `unless-stopped` (good for local daemons), `on-failure` (workers) \{Thường dùng: `no`, `unless-stopped` (daemon local), `on-failure` (worker)\}.
+
+---
+
+## Common pitfalls \{Các bẫy thường gặp\}
+
+- **Healthcheck command missing in the image** — `pg_isready` must exist in the Postgres image; a minimal `FROM scratch` app won't have `curl` unless you install it \{**Lệnh healthcheck không có trong image** — `pg_isready` phải có trong image Postgres; app `FROM scratch` không có `curl` trừ khi bạn cài\}.
+- **Short `depends_on` only orders start** — `depends_on: [db]` does **not** wait for healthy; use `condition: service_healthy` \{**`depends_on` dạng ngắn chỉ sắp thứ tự start** — `depends_on: [db]` **không** chờ healthy; dùng `condition: service_healthy`\}.
+- **`.env` vs `env_file`** — `.env` feeds **Compose interpolation**; `env_file` sets **container env**. You can use both; don't confuse which layer sees which variable \{**`.env` vs `env_file`** — `.env` cho **nội suy Compose**; `env_file` set **env container**. Có thể dùng cả hai; đừng lẫn tầng nào thấy biến nào\}.
+- **Scaling a published service** — duplicate host port bindings fail; scale internal workers, not `ports`-mapped frontends \{**Scale dịch vụ đã publish cổng** — bind cổng host trùng sẽ fail; scale worker nội bộ, không scale frontend có `ports`\}.
+- **Committing `.env` with secrets** — add `.env` to `.gitignore`; commit `.env.example` with dummy values instead \{**Commit `.env` chứa secret** — thêm `.env` vào `.gitignore`; commit `.env.example` với giá trị giả\}.
+
+---
+
+## Cheat sheet \{Bảng tra nhanh\}
+
+```bash
+# env & profiles
+docker compose config              # resolved YAML after interpolation
+docker compose --profile debug up -d
+
+# health
+docker compose ps                  # HEALTH column
+docker compose up -d --wait        # wait for healthy (Compose v2.1+)
+
+# overrides & scale
+docker compose -f compose.yaml -f compose.prod.yaml up -d
+docker compose up -d --scale worker=3
+
+# lifecycle
+docker compose restart api
+docker compose down -v
+```
+
+Patterns: `healthcheck` + `depends_on: db: condition: service_healthy`, `profiles: [debug]`, `restart: unless-stopped`, `KEY: ${KEY:-default}` \{Pattern: healthcheck, service_healthy, profile, restart, nội suy biến\}.
+
+---
+
+## Bài tập / Exercises
+
+Work in `compose-lab/` (`mkdir -p compose-lab && cd compose-lab`); clean up with `docker compose down -v` \{Làm trong `compose-lab/`; dọn bằng `docker compose down -v`\}. Exercises **build on the same `compose.yaml`** \{Các bài **mở rộng cùng `compose.yaml`**\}.
+
+**1.** Add `.env` (`POSTGRES_PASSWORD`, `WEB_PORT`), interpolate in `compose.yaml`, confirm with `docker compose config` \{Thêm `.env`, nội suy, xác nhận bằng `docker compose config`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+# .env
+POSTGRES_PASSWORD=exercise
+WEB_PORT=8080
+```
+
+```yaml
+# compose.yaml — db + web
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  web:
+    image: nginx:alpine
+    ports: ["${WEB_PORT}:80"]
+```
+
+```bash
+docker compose config | grep -E 'POSTGRES_PASSWORD|"8080:80"'
+docker compose up -d && curl -sI http://localhost:8080 | head -n 1
+```
+</details>
+
+**2.** Add `healthcheck` on `db` and `depends_on: db: condition: service_healthy` on `web`; `docker compose ps` until `db` is healthy \{Thêm healthcheck + service_healthy; `docker compose ps` đến khi `db` healthy\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```yaml
+# under db:
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -q"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+# under web:
+    depends_on:
+      db: { condition: service_healthy }
+```
+
+```bash
+docker compose up -d && docker compose ps
+```
+</details>
+
+**3.** Add `mailhog` with `profiles: [debug]`; prove default `up` skips it \{Thêm `mailhog` profile `debug`; chứng minh `up` mặc định bỏ qua\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```yaml
+  mailhog:
+    image: mailhog/mailhog
+    profiles: [debug]
+    ports: ["8025:8025"]
+```
+
+```bash
+docker compose down && docker compose up -d && docker compose ps    # no mailhog
+docker compose --profile debug up -d && docker compose ps           # mailhog up
+```
+</details>
+
+**4.** Add stateless `worker` (`alpine`, `sleep infinity`), `--scale worker=3` \{Thêm `worker`, scale 3\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```yaml
+  worker:
+    image: alpine:3.20
+    command: sleep infinity
+```
+
+```bash
+docker compose up -d --scale worker=3
+docker compose ps | grep worker
+```
+</details>
+
+**5.** `compose.override.yaml` bind-mounts `./html` → `/usr/share/nginx/html`; confirm merged page \{Override bind-mount `html/`, xác nhận trang merge\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+mkdir -p html && echo '<h1>override works</h1>' > html/index.html
+```
+
+```yaml
+# compose.override.yaml
+services:
+  web:
+    volumes: ["./html:/usr/share/nginx/html:ro"]
+```
+
+```bash
+docker compose up -d && curl -s http://localhost:8080/
+```
+</details>
+
+**Stretch \{Nâng cao\}:** `compose.prod.yaml` with `restart: unless-stopped`; run `-f compose.yaml -f compose.prod.yaml config` \{`compose.prod.yaml` + `restart`; so sánh `config` với hai file `-f`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```yaml
+services:
+  web: { restart: unless-stopped, volumes: [] }
+  db: { restart: unless-stopped }
+```
+
+```bash
+docker compose -f compose.yaml -f compose.prod.yaml config
+```
+</details>
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- **`.env` interpolates the compose file**; **`env_file` loads container env** — use `${VAR:-default}` and never bake secrets into images \{**`.env` nội suy file compose**; **`env_file` nạp env container** — dùng `${VAR:-default}` và không nhúng secret vào image\}.
+- **`healthcheck` + `depends_on: condition: service_healthy`** closes the "DB is running but not ready" gap from Part 5 \{**`healthcheck` + `depends_on: condition: service_healthy`** vá khoảng trống "DB đang chạy nhưng chưa sẵn sàng" từ Phần 5\}.
+- **`profiles`** keep optional dev services off the default `up` path \{**`profiles`** giữ dịch vụ dev tùy chọn ngoài luồng `up` mặc định\}.
+- **`compose.override.yaml` and `-f`** layer environments without duplicating the whole stack \{**`compose.override.yaml` và `-f`** xếp tầng môi trường mà không nhân đôi cả stack\}.
+- **`--scale`** suits stateless workers; avoid scaling services that publish the same host port \{**`--scale`** hợp worker stateless; tránh scale dịch vụ publish cùng cổng host\}.
+
+---
+
+## Next up \{Tiếp theo\}
+
+**[Part 7 — Optimizing & Securing Images](/blog/docker-07-optimizing-securing-images/)**: shrink image size, speed up builds, scan for vulnerabilities, and run containers with least privilege — the production hardening pass \{**[Phần 7 — Tối ưu & bảo mật image](/blog/docker-07-optimizing-securing-images/)**: thu nhỏ image, tăng tốc build, quét lỗ hổng và chạy container với quyền tối thiểu — bước cứng hóa production\}.

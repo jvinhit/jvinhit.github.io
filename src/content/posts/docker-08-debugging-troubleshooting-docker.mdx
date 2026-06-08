@@ -1,0 +1,494 @@
+---
+title: 'Docker for Developers · Part 8 — Debugging & Troubleshooting Docker'
+description: 'The debugging playbook: read logs, exec in, inspect, events and stats — then a field guide to the errors you will actually hit (port in use, exit codes, OOMKilled, ImagePullBackOff, cache, networking) and how to resolve each.'
+pubDate: 2025-10-20
+tags: [docker, debugging, troubleshooting, devops, docker_k8s_10]
+series: docker
+seriesOrder: 8
+draft: false
+---
+
+import DockerDiagram from '../../components/blog/DockerDiagram.astro';
+
+> **Part 8 of 10** in the Docker → Compose → Kubernetes series \{**Phần 8/10** trong series Docker → Compose → Kubernetes\}. Previous \{Trước\}: [Part 7 — Optimizing & Securing Images](/blog/docker-07-optimizing-securing-images/) · Next \{Tiếp\}: [Part 9 — Kubernetes Fundamentals](/blog/docker-09-kubernetes-fundamentals/).
+
+Most Docker failures feel like magic until you have a **method** and a **small toolkit** \{Hầu hết lỗi Docker trông như "ma thuật" cho đến khi bạn có **phương pháp** và **bộ công cụ nhỏ**\}. In [Part 1](/blog/docker-01-fundamentals-containers-images/) you learned lifecycle basics; in [Parts 3–6](/blog/docker-03-data-volumes-bind-mounts-env/) you wired volumes, networks, and Compose stacks \{Ở [Phần 1](/blog/docker-01-fundamentals-containers-images/) bạn học vòng đời cơ bản; ở [Phần 3–6](/blog/docker-03-data-volumes-bind-mounts-env/) bạn nối volume, mạng và stack Compose\}. This part is the **cornerstone**: when something breaks at 2 a.m., you will know *which command to run next* and *what the error actually means* \{Phần này là **nền tảng**: khi có gì hỏng lúc 2 giờ sáng, bạn biết *chạy lệnh gì tiếp* và *lỗi thực sự nghĩa là gì*\}.
+
+Every part ends with **exercises**; treat them as incident drills, not trivia \{Mỗi phần kết thúc bằng **bài tập**; coi chúng như diễn tập sự cố, không phải câu đố\}.
+
+---
+
+## A general debugging method \{Phương pháp debug tổng quát\}
+
+When a container misbehaves, resist random flag changes \{Khi container hành xử lạ, đừng đổi flag bừa bãi\}. Walk this loop:
+
+<DockerDiagram
+  kind="debug-flow"
+  caption="Don't change flags at random — walk the loop: observe what Docker reports, isolate one variable, reproduce minimally, fix one thing, then verify and repeat"
+/>
+
+1. **Observe** — What does Docker report? `docker ps -a`, `docker logs`, exit code, `docker inspect` State \{**Quan sát** — Docker báo gì? `docker ps -a`, `docker logs`, exit code, `docker inspect` State\}.
+2. **Isolate** — One container, one network, one change at a time \{**Cô lập** — Một container, một mạng, một thay đổi mỗi lần\}.
+3. **Reproduce** — Smallest `docker run` or `compose.yaml` that still fails \{**Tái hiện** — `docker run` hoặc `compose.yaml` nhỏ nhất vẫn fail\}.
+4. **Fix** — Apply one fix, re-run the same command, confirm STATUS and logs \{**Sửa** — Một fix, chạy lại cùng lệnh, xác nhận STATUS và logs\}.
+
+> **Golden rule:** the container's **main process** is PID 1. If it exits, the container exits — always ask "what is PID 1 and why did it die?" \{**Quy tắc vàng:** **tiến trình chính** là PID 1. Nó thoát thì container thoát — luôn hỏi "PID 1 là gì và vì sao nó chết?"\}.
+
+---
+
+## The debugging toolkit \{Bộ công cụ debug\}
+
+These commands answer *different questions* \{Các lệnh này trả lời *câu hỏi khác nhau*\}:
+
+| Command | What it reveals \{Cho biết gì\} |
+|---|---|
+| `docker logs <c>` | stdout/stderr from the app (crash messages, stack traces) \{stdout/stderr của app (crash, stack trace)\} |
+| `docker logs -f <c>` | Follow logs live (like `tail -f`) \{Theo log trực tiếp\} |
+| `docker logs --tail 50 <c>` | Last N lines only \{Chỉ N dòng cuối\} |
+| `docker logs --since 10m <c>` | Logs from the last 10 minutes \{Log 10 phút gần nhất\} |
+| `docker exec -it <c> sh` | Shell *inside* a **running** container — files, env, DNS from its view \{Shell *trong* container **đang chạy** — file, env, DNS từ góc nhìn nó\} |
+| `docker inspect <c>` | Full JSON: State, Config.Cmd, mounts, networks, exit code \{JSON đầy đủ: State, Cmd, mount, mạng, exit code\} |
+| `docker inspect --format='{{.State.ExitCode}}' <c>` | Extract one field without scrolling JSON \{Lấy một field không cần lướt JSON\} |
+| `docker events` | Real-time stream: create, start, die, OOM, attach \{Luồng thời gian thực: create, start, die, OOM\} |
+| `docker stats` | Live CPU/memory/network per container \{CPU/RAM/mạng trực tiếp theo container\} |
+| `docker ps -a` | All containers + **STATUS** (Up, Exited, OOMKilled) + exit hint \{Mọi container + **STATUS** + gợi ý exit\} |
+| `docker diff <c>` | Files changed in the writable layer vs image \{File đổi ở layer ghi-được so với image\} |
+| `docker top <c>` | Processes running inside the container (from host view) \{Tiến trình trong container (từ host)\} |
+
+```bash
+docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+docker logs --tail 100 -f api
+docker inspect api --format 'Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}} Error={{.State.Error}}'
+docker events --filter container=api --since 30m
+docker stats --no-stream
+```
+
+If the container is **already stopped**, `exec` will fail — use `docker logs` and `docker inspect` first, or override the entrypoint (below) \{Nếu container **đã dừng**, `exec` fail — dùng `docker logs` và `docker inspect` trước, hoặc override entrypoint (bên dưới)\}.
+
+---
+
+## Reading exit codes \{Đọc exit code\}
+
+`docker ps -a` shows `Exited (N)` — **N** is the exit code of PID 1 \{`docker ps -a` hiện `Exited (N)` — **N** là exit code của PID 1\}. Interpret them like a field manual:
+
+```text
+  EXIT CODE QUICK REFERENCE (Linux containers)
+ ┌──────┬────────────────────────────────────────────────────────────┐
+ │ Code │ Meaning                                                    │
+ ├──────┼────────────────────────────────────────────────────────────┤
+ │   0  │ Success — process finished normally (or idle server died) │
+ │   1  │ General application error (check logs)                   │
+ │ 125  │ `docker run` itself failed (daemon, bad flag)            │
+ │ 126  │ Command found but not executable (permissions)             │
+ │ 127  │ Command not found (wrong CMD, missing binary in PATH)    │
+ │ 137  │ SIGKILL — often OOMKilled (128 + 9) or `docker kill`     │
+ │ 143  │ SIGTERM — graceful stop (`docker stop`, orchestrator)    │
+ └──────┴────────────────────────────────────────────────────────────┘
+```
+
+```bash
+docker inspect broken --format '{{.State.ExitCode}} {{.State.OOMKilled}} {{.State.FinishedAt}}'
+```
+
+- **137 + `OOMKilled: true`** → kernel killed the process for memory — raise limit or fix a leak \{**137 + `OOMKilled: true`** → kernel giết vì bộ nhớ — tăng limit hoặc sửa leak\}.
+- **143** after `docker stop` → expected; not a bug \{**143** sau `docker stop` → bình thường; không phải bug\}.
+- **127** right at start → wrong `CMD`/`ENTRYPOINT` or missing file in the image \{**127** ngay khi start → sai `CMD`/`ENTRYPOINT` hoặc thiếu file trong image\}.
+
+In Kubernetes you'll see **`CrashLoopBackOff`** and **`ImagePullBackOff`** — same root causes as "container exits immediately" and "image pull failed" below; Part 9 names them in cluster terms \{Trên Kubernetes bạn gặp **`CrashLoopBackOff`** và **`ImagePullBackOff`** — cùng gốc với "container thoát ngay" và "pull image fail" bên dưới; Phần 9 đặt tên theo ngữ cảnh cluster\}.
+
+---
+
+## A field guide to common errors \{Cẩm nang lỗi thường gặp\}
+
+For each issue: **SYMPTOM → CAUSE → FIX** \{Mỗi lỗi: **TRIỆU CHỨNG → NGUYÊN NHÂN → CÁCH SỬA**\}.
+
+### Port already in use / address already allocated \{Cổng đã dùng\}
+
+- **SYMPTOM:** `docker run -p 8080:80` fails with `bind: address already in use` or `port is already allocated` \{**TRIỆU CHỨNG:** `docker run -p 8080:80` fail với `bind: address already in use` hoặc `port is already allocated`\}.
+- **CAUSE:** Another process (or another container) already listens on that **host** port \{**NGUYÊN NHÂN:** Tiến trình khác (hoặc container khác) đang listen cổng **host** đó\}.
+- **FIX:**
+
+```bash
+# who owns the port? (macOS/Linux examples)
+lsof -i :8080
+docker ps --format '{{.Names}} {{.Ports}}' | grep 8080
+
+# pick another host port, or stop the conflicting container
+docker stop other && docker rm other
+docker run -p 8081:80 nginx
+```
+
+### Container exits immediately \{Container thoát ngay\}
+
+- **SYMPTOM:** `docker ps` empty; `docker ps -a` shows `Exited (0)` or `Exited (1)` seconds after start \{**TRIỆU CHỨNG:** `docker ps` trống; `docker ps -a` hiện `Exited` vài giây sau start\}.
+- **CAUSE:** No long-running foreground process — e.g. `CMD ["echo", "hi"]`, missing `-d` with a server that exits, or wrong `CMD` in Dockerfile \{**NGUYÊN NHÂN:** Không có tiến trị foreground chạy lâu — `CMD` một lần, server thoát, hoặc sai `CMD` trong Dockerfile\}.
+- **FIX:** Ensure PID 1 stays alive (`nginx -g 'daemon off;'`, `node server.js`, `tail -f /dev/null` for debug only); check `docker inspect --format '{{json .Config.Cmd}}' <image>` \{**SỬA:** Đảm bảo PID 1 sống; xem `docker inspect` Cmd/Entrypoint\}.
+
+### OOMKilled (exit 137) \{Bị giết vì hết RAM\}
+
+- **SYMPTOM:** `docker ps -a` shows `OOMKilled` or exit **137**; `docker inspect` has `"OOMKilled": true` \{**TRIỆU CHỨNG:** STATUS `OOMKilled` hoặc exit **137**\}.
+- **CAUSE:** Container exceeded memory cgroup limit (host pressure or explicit `--memory`) \{**NGUYÊN NHÂN:** Vượt giới hạn cgroup bộ nhớ (`--memory` hoặc áp lực host)\}.
+- **FIX:**
+
+```bash
+docker stats --no-stream          # who is using RAM?
+docker run --memory 512m --memory-swap 512m myapp   # cap (swap=mem disables extra swap)
+# in compose.yaml: deploy.resources.limits.memory (Compose v3+) or mem_limit on service
+```
+
+Fix the leak or raise the limit; on Docker Desktop, increase **Resources → Memory** \{Sửa leak hoặc tăng limit; trên Docker Desktop tăng **Resources → Memory**\}.
+
+### exec format error \{Sai kiến trúc CPU\}
+
+- **SYMPTOM:** Container exits instantly; logs show `exec format error` \{**TRIỆU CHỨNG:** Thoát ngay; log `exec format error`\}.
+- **CAUSE:** Binary built for **arm64** running on **amd64** host (or vice versa) — common on Apple Silicon pulling wrong tags \{**NGUYÊN NHÂN:** Binary **arm64** trên host **amd64** (hoặc ngược lại)\}.
+- **FIX:**
+
+```bash
+docker run --platform linux/amd64 myimage:tag
+# or build for the target platform
+docker build --platform linux/amd64 -t myapp .
+```
+
+### no such file or directory (entrypoint) \{Không tìm thấy file entrypoint\}
+
+- **SYMPTOM:** `exec /docker-entrypoint.sh: no such file or directory` even when the file "exists" \{**TRIỆU CHỨNG:** Báo không có file dù file "có"\}.
+- **CAUSE:** Often **Windows CRLF** line endings in `ENTRYPOINT` script (`#!/bin/sh\r`), wrong path, or binary not copied into image \{**NGUYÊN NHÂN:** Thường là **CRLF** trong script, sai path, hoặc không COPY binary vào image\}.
+- **FIX:** `dos2unix entrypoint.sh`; verify `COPY` path; run `docker run -it --entrypoint sh myimage` and `ls -la /docker-entrypoint.sh` \{**SỬA:** `dos2unix`; kiểm tra COPY; `ls` trong image\}.
+
+### Image pull failures \{Pull image thất bại\}
+
+- **SYMPTOM:** `Error response from daemon: manifest unknown`; `pull access denied`; `toomanyrequests` / rate limit \{**TRIỆU CHỨNG:** `manifest unknown`; `pull access denied`; rate limit\}.
+- **CAUSE:** Typo in tag, image deleted, private registry without login, Docker Hub anonymous rate limits \{**NGUYÊN NHÂN:** Sai tag, image private, chưa login, rate limit Hub\}.
+- **FIX:**
+
+```bash
+docker login
+docker pull nginx:1.27-alpine    # pin a tag that exists on Docker Hub
+docker manifest inspect myorg/myapp:v2   # verify tag exists (BuildKit)
+```
+
+K8s surfaces the same as **`ImagePullBackOff`** — fix the image name, credentials, or registry, then redeploy \{K8s hiện **`ImagePullBackOff`** — sửa tên image, credential hoặc registry rồi deploy lại\}.
+
+### Stale build cache \{Cache build cũ\}
+
+- **SYMPTOM:** Rebuild still serves old dependencies or old `COPY` content; "I changed the file but the image didn't" \{**TRIỆU CHỨNG:** Build vẫn dùng dependency/file cũ\}.
+- **CAUSE:** Layer cache reused because Dockerfile order or build context didn't invalidate the right layer \{**NGUYÊN NHÂN:** Cache layer tái dùng vì thứ tự Dockerfile/context\}.
+- **FIX:**
+
+```bash
+docker build --no-cache -t myapp .
+# deliberate cache bust: ARG CACHEBUST=1 before COPY, or touch dependency lockfile layer
+```
+
+See [Part 2 — Images & the Dockerfile](/blog/docker-02-images-and-dockerfile/) and [Part 7](/blog/docker-07-optimizing-securing-images/) for cache discipline \{Xem [Phần 2](/blog/docker-02-images-and-dockerfile/) và [Phần 7](/blog/docker-07-optimizing-securing-images/) về kỷ luật cache\}.
+
+### Can't connect to DB / another container \{Không kết nối DB/container khác\}
+
+- **SYMPTOM:** App logs `ECONNREFUSED 127.0.0.1:5432` or `getaddrinfo ENOTFOUND db` \{**TRIỆU CHỨNG:** `ECONNREFUSED 127.0.0.1:5432` hoặc `ENOTFOUND db`\}.
+- **CAUSE:** **`localhost` inside a container is the container itself**, not the host or sibling; or containers on **default bridge** without DNS by name \{**NGUYÊN NHÂN:** **`localhost` trong container là chính nó**; hoặc default bridge không có DNS theo tên\}.
+- **FIX:** Use **service name** on a user-defined network (`db`, `postgres`) — [Part 4](/blog/docker-04-networking-bridge-ports-dns/); in Compose, use the **service key** as hostname \{**SỬA:** Dùng **tên service** trên user-defined network; trong Compose dùng **key service** làm hostname\}.
+
+```bash
+docker network create appnet
+docker run -d --name db --network appnet -e POSTGRES_PASSWORD=x postgres:16-alpine
+docker run -d --name api --network appnet -e DATABASE_URL=postgres://postgres:secret@db:5432/app myapi
+docker exec api getent hosts db    # should resolve
+```
+
+### Permission denied on mounted volume \{Permission denied trên volume mount\}
+
+- **SYMPTOM:** App cannot write to `/data`; `Permission denied` in logs \{**TRIỆU CHỨNG:** Không ghi được `/data`; log `Permission denied`\}.
+- **CAUSE:** **UID/GID mismatch** between container user and host-owned bind-mount files ([Part 3](/blog/docker-03-data-volumes-bind-mounts-env/)) \{**NGUYÊN NHÂN:** **Lệch UID/GID** giữa user container và file bind mount trên host\}.
+- **FIX:** `chown` on host to match `USER` in Dockerfile, run with `--user`, or use named volumes for prod data \{**SỬA:** `chown` trên host khớp `USER`, `--user`, hoặc named volume cho prod\}.
+
+### Disk full / no space left on device \{Đầy disk\}
+
+- **SYMPTOM:** Build or `docker run` fails with `no space left on device`; daemon sluggish \{**TRIỆU CHỨNG:** Build/run fail `no space left on device`; daemon chậm\}.
+- **CAUSE:** Layers, dangling images, stopped containers, and build cache fill Docker's storage \{**NGUYÊN NHÂN:** Layer, image mồ côi, container dừng và build cache chiếm storage\}.
+- **FIX:** Inspect then prune safely (next section) \{**SỬA:** Xem `docker system df` rồi prune an toàn (phần sau)\}.
+
+---
+
+## Debugging a container that won't start \{Debug container không start được\}
+
+When the main process dies before you can `exec`, **override the entrypoint** and explore the filesystem \{Khi tiến trình chính chết trước khi `exec`, **override entrypoint** và khám phá filesystem\}:
+
+```bash
+docker run -it --rm --entrypoint sh myimage:broken
+# inside: ls -la, cat /app/start.sh, which node, env
+docker inspect myimage:broken --format 'Entrypoint={{json .Config.Entrypoint}} Cmd={{json .Config.Cmd}}'
+```
+
+```text
+  WON'T START?  TRY THIS LADDER
+ ┌──────────────────────────────────────────────────────────────┐
+ │ 1. docker ps -a  +  docker logs <c>                          │
+ │ 2. docker inspect <c>  (ExitCode, OOMKilled, Error)          │
+ │ 3. docker run --entrypoint sh <image>  (interactive probe)   │
+ │ 4. docker history <image>  (what layers / CMD were baked in) │
+ │ 5. Rebuild with --no-cache if image content is suspect       │
+ └──────────────────────────────────────────────────────────────┘
+```
+
+Distroless images have **no shell** — use a debug stage or copy artifacts out with `docker create` + `docker cp` \{Image distroless **không có shell** — dùng stage debug hoặc `docker create` + `docker cp`\}.
+
+---
+
+## Debugging Compose stacks \{Debug stack Compose\}
+
+Multi-service bugs need **service-scoped** commands \{Lỗi đa service cần lệnh **theo từng service**\}:
+
+```bash
+docker compose ps                    # STATUS per service (incl. health)
+docker compose logs -f api           # follow one service
+docker compose logs --tail=50 db
+docker compose config                # merged YAML — catch typos & interpolation
+docker compose config --quiet        # exit 0 only if valid
+docker compose exec api sh           # shell in running service container
+```
+
+**Healthchecks** (from [Part 6](/blog/docker-06-compose-in-depth-profiles-healthchecks/)): if a dependent service never becomes healthy, inspect the health command \{**Healthcheck** ([Phần 6](/blog/docker-06-compose-in-depth-profiles-healthchecks/)): service phụ thuộc không healthy — kiểm tra lệnh health\}:
+
+```bash
+docker compose ps
+docker inspect $(docker compose ps -q db) --format '{{json .State.Health}}'
+```
+
+```text
+  COMPOSE DEBUG FLOW
+  compose config  ──►  compose up  ──►  compose ps
+        │                    │              │
+        │                    └── compose logs -f <svc>
+        └── fix YAML/env before chasing runtime
+```
+
+`depends_on: condition: service_healthy` waits on health — if health is wrong, everything upstream starves \{`depends_on: condition: service_healthy` chờ health — health sai thì upstream đứng im\}.
+
+---
+
+## Cleaning up safely \{Dọn dẹp an toàn\}
+
+Before aggressive prune, **see what you're about to delete** \{Trước prune mạnh, **xem sắp xóa gì**\}:
+
+```bash
+docker system df
+docker system df -v    # per-image/container breakdown
+```
+
+| Command | Removes \{Xóa gì\} | Data loss risk \{Rủi ro mất dữ liệu\} |
+|---|---|---|
+| `docker system prune` | Stopped containers, unused networks, dangling images | Low — named volumes **kept** \{Thấp — volume **giữ**\} |
+| `docker system prune -a` | Above + **all** unused images | Medium — must re-pull images \{Trung bình — phải pull lại\} |
+| `docker system prune -a --volumes` | Above + **unused volumes** | **High** — DB data in unused named volumes gone \{**Cao** — mất data volume không dùng\} |
+| `docker builder prune` | Build cache only | Low for runtime; longer next build \{Thấp runtime; build lâu hơn\} |
+
+> **Warning:** `--volumes` can delete a Postgres named volume you thought was "unused" because no container currently attaches it. **Back up** or `docker volume inspect` first \{**Cảnh báo:** `--volumes` có thể xóa volume Postgres "không dùng" vì không container nào gắn. **Backup** hoặc `inspect` trước\}.
+
+```bash
+docker container prune    # stopped containers only
+docker image prune -a     # unused images
+docker volume prune       # unused volumes only — still dangerous
+```
+
+---
+
+## Cheat sheet \{Bảng tra nhanh\}
+
+```bash
+# status & exit
+docker ps -a
+docker inspect <c> --format 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}'
+docker events --since 1h
+
+# logs & live
+docker logs --tail 100 <c>
+docker logs -f --since 5m <c>
+
+# inside & probe
+docker exec -it <c> sh
+docker run -it --rm --entrypoint sh <image>
+docker top <c>    docker diff <c>    docker stats
+
+# compose
+docker compose ps
+docker compose logs -f <svc>
+docker compose config
+docker compose exec <svc> sh
+
+# disk
+docker system df
+docker system prune        # careful: add -a --volumes only when you mean it
+```
+
+---
+
+## Bài tập / Exercises
+
+Run these as **mini incidents** — break, diagnose, fix \{Làm như **sự cố nhỏ** — phá, chẩn đoán, sửa\}.
+
+**1.** A container named `lab08-crash` exits immediately. Find out why using `ps`, `logs`, and `inspect`, then fix the run command so it stays up \{Container `lab08-crash` thoát ngay. Tìm nguyên nhân bằng `ps`, `logs`, `inspect`, rồi sửa lệnh run để nó sống\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+# broken: one-shot CMD — exits right away
+docker run --name lab08-crash alpine echo hello
+docker ps -a --filter name=lab08-crash
+docker logs lab08-crash
+docker inspect lab08-crash --format 'Exit={{.State.ExitCode}} Cmd={{json .Config.Cmd}}'
+docker rm lab08-crash
+
+# fix: long-running foreground process (debug) or a real server image
+docker run -d --name lab08-crash alpine sleep infinity
+docker ps --filter name=lab08-crash   # STATUS: Up
+docker stop lab08-crash && docker rm lab08-crash
+```
+</details>
+
+**2.** You get `port is already allocated` on host port `8080`. Identify what holds the port and run nginx on a free port \{Gặp `port is already allocated` trên `8080`. Tìm ai chiếm cổng và chạy nginx trên cổng trống\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+docker run -d --name lab08-a -p 8080:80 nginx
+docker run -d --name lab08-b -p 8080:80 nginx   # fails: port allocated
+
+lsof -i :8080 || docker ps --format '{{.Names}} {{.Ports}}' | grep 8080
+
+docker run -d --name lab08-b -p 8081:80 nginx   # fix: different host port
+docker stop lab08-a lab08-b && docker rm lab08-a lab08-b
+```
+</details>
+
+**3.** App container cannot reach Postgres at `localhost:5432`. Diagnose and fix using a user-defined network and hostname `db` \{Container app không tới Postgres qua `localhost:5432`. Chẩn đoán và sửa bằng mạng tự tạo và hostname `db`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+docker network create lab08net
+docker run -d --name db --network lab08net \
+  -e POSTGRES_PASSWORD=secret postgres:16-alpine
+
+# broken mental model: localhost inside api points to api itself
+docker run --rm --network lab08net curlimages/curl \
+  curl -sS --connect-timeout 2 telnet://127.0.0.1:5432 || true
+
+# fix: use service name on shared network
+docker run --rm --network lab08net curlimages/curl \
+  sh -c 'getent hosts db && nc -zv db 5432'
+
+docker stop db && docker rm db
+docker network rm lab08net
+```
+</details>
+
+**4.** Find which container is using the most memory with `docker stats`, then cap a runaway container with `--memory` \{Tìm container ngốn RAM nhất bằng `docker stats`, rồi giới hạn container bằng `--memory`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+docker run -d --name lab08-mem1 nginx
+docker run -d --name lab08-mem2 postgres:16-alpine -e POSTGRES_PASSWORD=x
+
+docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}"
+
+# cap example (512 MB hard limit)
+docker run -d --name lab08-capped --memory 512m --memory-swap 512m nginx
+docker inspect lab08-capped --format '{{.HostConfig.Memory}}'
+
+docker stop lab08-mem1 lab08-mem2 lab08-capped
+docker rm lab08-mem1 lab08-mem2 lab08-capped
+```
+</details>
+
+**5.** `docker system df` shows high reclaimable space. Free disk safely **without** `--volumes` first; note what changed \{`docker system df` báo reclaimable cao. Giải phóng disk an toàn **không** dùng `--volumes` trước; ghi nhận thay đổi\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+docker system df
+docker run --rm hello-world
+docker system df    # note Images/Containers reclaimable
+
+docker system prune -f
+docker system df    # reclaimable should drop; named volumes untouched
+
+# optional: build cache only
+docker builder prune -f
+```
+</details>
+
+**6.** A Compose service `api` is unhealthy and `web` never starts. Use `compose ps`, `compose logs`, and health JSON to find the failing healthcheck \{Service `api` unhealthy, `web` không start. Dùng `compose ps`, `compose logs`, health JSON tìm healthcheck fail\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+Create `compose-lab08.yaml`:
+
+```yaml
+services:
+  api:
+    image: nginx:alpine
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9999/"]
+      interval: 5s
+      timeout: 3s
+      retries: 2
+  web:
+    image: nginx:alpine
+    depends_on:
+      api:
+        condition: service_healthy
+```
+
+```bash
+docker compose -f compose-lab08.yaml up -d
+docker compose -f compose-lab08.yaml ps
+docker compose -f compose-lab08.yaml logs api
+
+docker inspect $(docker compose -f compose-lab08.yaml ps -q api) \
+  --format '{{json .State.Health}}'
+
+# fix: correct health URL (nginx listens on 80)
+# edit test to http://localhost/ or disable bad healthcheck, then:
+docker compose -f compose-lab08.yaml down
+```
+</details>
+
+**Stretch \{Nâng cao\}:** Simulate **OOMKilled** with a tight `--memory` limit and a hungry process; confirm exit **137** and `OOMKilled: true` in inspect \{**Nâng cao:** Mô phỏng **OOMKilled** với `--memory` thấp và process ngốn RAM; xác nhận exit **137** và `OOMKilled: true`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+docker run -d --name lab08-oom --memory 64m --memory-swap 64m progrium/stress \
+  --vm 1 --vm-bytes 128M --vm-keep
+sleep 3
+docker ps -a --filter name=lab08-oom
+docker inspect lab08-oom --format 'Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}}'
+docker rm lab08-oom
+```
+</details>
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- Use **observe → isolate → reproduce → fix** — don't change five flags at once \{Dùng **quan sát → cô lập → tái hiện → sửa** — đừng đổi năm flag cùng lúc\}.
+- **`docker logs`**, **`docker inspect`**, and **`docker ps -a`** tell you *what happened*; **`docker exec`** tells you *what the container sees now* \{**`docker logs`**, **`docker inspect`**, **`docker ps -a`** cho biết *đã xảy ra gì*; **`docker exec`** cho biết *container đang thấy gì*\}.
+- **Exit codes** (especially **137** OOM, **127** missing cmd, **143** SIGTERM) narrow the search fast \{**Exit code** (đặc biệt **137** OOM, **127** thiếu lệnh, **143** SIGTERM) thu hẹp tìm kiếm nhanh\}.
+- **`localhost` ≠ sibling container** — use service names on user-defined networks ([Part 4](/blog/docker-04-networking-bridge-ports-dns/)) \{**`localhost` ≠ container khác** — dùng tên service trên mạng tự tạo ([Phần 4](/blog/docker-04-networking-bridge-ports-dns/))\}.
+- **`docker compose config`** and **health state** explain "works on my machine" Compose drift \{**`docker compose config`** và **trạng thái health** giải thích lệch Compose "máy tôi chạy được"\}.
+- **`docker system df`** before **`prune`** — know what you delete, especially with `--volumes` \{**`docker system df`** trước **`prune`** — biết bạn xóa gì, nhất là với `--volumes`\}.
+
+---
+
+## Next up \{Tiếp theo\}
+
+**[Part 9 — Kubernetes Fundamentals](/blog/docker-09-kubernetes-fundamentals/)** — pods, deployments, Services, and the same debugging instincts translated to `kubectl logs`, `describe`, and cluster events (`CrashLoopBackOff`, `ImagePullBackOff`) \{**Phần 9 — Kubernetes Fundamentals** — pod, deployment, Service, và cùng tư duy debug qua `kubectl logs`, `describe`, và event cluster (`CrashLoopBackOff`, `ImagePullBackOff`)\}. ← [Part 7](/blog/docker-07-optimizing-securing-images/)

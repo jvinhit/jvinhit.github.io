@@ -1,0 +1,399 @@
+---
+title: 'Design Patterns in TypeScript · Part 4 — Strategy'
+description: 'Swap an algorithm at runtime without touching its caller: the Strategy pattern, why a map of functions is the idiomatic TS form, replacing sprawling if/switch, and injecting behavior for testability.'
+pubDate: 2025-02-23
+tags: [typescript, design-patterns, strategy, architecture, ts_patterns_10]
+series: ts-pattern
+seriesOrder: 4
+draft: false
+---
+
+import PatternDiagram from '../../components/blog/PatternDiagram.astro';
+
+> **Part 4 of 10** in the Design Patterns in TypeScript series \{**Phần 4/10** trong series Design Patterns in TypeScript\}. Previous \{Trước\}: [Part 3 — Builder & Fluent APIs](/blog/ts-pattern-03-builder-fluent-api/) · Next \{Tiếp\}: [Part 5 — Observer & Pub/Sub](/blog/ts-pattern-05-observer-pubsub/).
+
+This is **Part 4 of a 10-part series** on the design patterns every senior web engineer should have in their hands — explained with **runnable TypeScript**, real frontend/back-of-front use cases, and **exercises** at the end of each part \{Đây là **Phần 4 của series 10 bài** về các design pattern mà mọi senior web nên nắm — giải thích bằng **TypeScript chạy được**, use case web thực tế, và **bài tập** ở cuối mỗi phần\}.
+
+You have seen builders assemble objects step by step ([Part 3](/blog/ts-pattern-03-builder-fluent-api/)) \{Bạn đã thấy builder lắp object từng bước ([Phần 3](/blog/ts-pattern-03-builder-fluent-api/))\}. Now we tackle a different smell: a function that grows a new `if` or `switch` branch every time product asks for another "way to do X" \{Giờ ta xử lý một mùi khác: hàm cứ thêm nhánh `if` hoặc `switch` mỗi khi product muốn thêm một "cách làm X"\}. **Strategy** says: pull each algorithm into its own unit and make the caller **swap** which one runs — without rewriting the caller \{**Strategy** nói: tách mỗi thuật toán thành một đơn vị riêng và cho caller **đổi** cái nào chạy — mà không sửa lại caller\}.
+
+---
+
+## The intent \{Ý đồ\}
+
+The **Strategy** pattern defines a family of algorithms, encapsulates each one, and makes them **interchangeable** \{**Strategy** định nghĩa một họ thuật toán, đóng gói từng cái, và cho chúng **thay thế lẫn nhau** được\}. The client (the **Context**) delegates to a strategy object or function instead of embedding branching logic \{Client (**Context**) ủy quyền cho một strategy object hoặc function thay vì nhúng logic rẽ nhánh\}. You reach for it when the *how* varies but the *what* (the operation name, the inputs, the return type) stays stable \{Bạn dùng khi *cách làm* thay đổi nhưng *việc làm* (tên thao tác, input, kiểu trả về) vẫn ổn định\}: sort order, discount rules, validation pipelines, retry backoff, payment rails, locale formatters \{thứ tự sắp xếp, quy tắc giảm giá, pipeline validate, backoff retry, cổng thanh toán, formatter theo locale\}.
+
+<PatternDiagram
+  kind="strategy"
+  caption="Context delegates to one Strategy; swap the implementation without changing the caller"
+/>
+
+The win is **Open/Closed** in practice: add a new variant by adding a new strategy, not by editing a 200-line `switch` \{Lợi ích là **Open/Closed** thực tế: thêm biến thể bằng cách thêm strategy mới, không sửa `switch` 200 dòng\}. The risk is **over-engineering** a single `if` into a registry nobody asked for \{Rủi ro là **over-engineer** một `if` đơn thành registry không ai cần\} — we'll call that out explicitly \{ta sẽ nói thẳng điều đó\}.
+
+---
+
+## The classic (interface) form \{Dạng kinh điển (interface)\}
+
+The textbook picture: a `Strategy` interface, concrete classes, and a `Context` that holds one strategy and calls it \{Ảnh sách giáo khoa: interface `Strategy`, class cụ thể, và `Context` giữ một strategy và gọi nó\}:
+
+```ts
+interface SortStrategy<T> {
+  sort(items: readonly T[]): T[];
+}
+
+class SortByPrice implements SortStrategy<{ price: number }> {
+  sort(items: readonly { price: number }[]) {
+    return [...items].sort((a, b) => a.price - b.price);
+  }
+}
+
+class SortByName implements SortStrategy<{ name: string }> {
+  sort(items: readonly { name: string }[]) {
+    return [...items].sort((a, b) => a.name.localeCompare(b.name));
+  }
+}
+
+class ProductListContext {
+  constructor(private strategy: SortStrategy<{ price: number; name: string }>) {}
+
+  setStrategy(strategy: SortStrategy<{ price: number; name: string }>) {
+    this.strategy = strategy;
+  }
+
+  displaySorted(items: readonly { price: number; name: string }[]) {
+    return this.strategy.sort(items);
+  }
+}
+```
+
+This is faithful to Gang of Four and maps cleanly to languages where **classes are the default abstraction** \{Trung thành với Gang of Four và khớp ngôn ngữ mà **class là abstraction mặc định**\}. In TypeScript web code, you will see this form when strategies carry **state** (API keys, config) or when you inject them through a DI container as class tokens \{Trong code web TypeScript, bạn gặp dạng này khi strategy mang **state** (API key, config) hoặc inject qua DI container dưới dạng class token\}. For a one-liner transform with no state, the next section is usually better \{Với transform một dòng không state, phần sau thường hợp hơn\}.
+
+---
+
+## The idiomatic TS form: functions \{Dạng idiomatic TS: function\}
+
+In JavaScript and TypeScript, a strategy is often just a **function** with a fixed signature \{Trong JS và TS, strategy thường chỉ là một **function** có chữ ký cố định\}. A `Record<Key, StrategyFn>` (or a `Map`) replaces the `switch` and keeps selection in **one place** \{`Record<Key, StrategyFn>` (hoặc `Map`) thay `switch` và gom chọn strategy **một chỗ**\}.
+
+**Before** — every new sort mode edits the same function \{**Trước** — mỗi kiểu sort mới sửa cùng một hàm\}:
+
+```ts
+type SortKey = 'price' | 'name' | 'date';
+
+interface Product {
+  name: string;
+  price: number;
+  createdAt: Date;
+}
+
+function sortProducts(items: readonly Product[], mode: SortKey): Product[] {
+  const copy = [...items];
+  switch (mode) {
+    case 'price':
+      return copy.sort((a, b) => a.price - b.price);
+    case 'name':
+      return copy.sort((a, b) => a.name.localeCompare(b.name));
+    case 'date':
+      return copy.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    default: {
+      const _exhaustive: never = mode;
+      return _exhaustive;
+    }
+  }
+}
+```
+
+**After** — add a key and a function; the context stays dumb \{**Sau** — thêm key và function; context vẫn "ngu" đúng nghĩa\}:
+
+```ts
+type SortStrategy = (items: readonly Product[]) => Product[];
+
+const sortStrategies: Record<SortKey, SortStrategy> = {
+  price: (items) => [...items].sort((a, b) => a.price - b.price),
+  name: (items) => [...items].sort((a, b) => a.name.localeCompare(b.name)),
+  date: (items) =>
+    [...items].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()),
+};
+
+function sortProducts(
+  items: readonly Product[],
+  mode: SortKey,
+  strategies: Record<SortKey, SortStrategy> = sortStrategies,
+): Product[] {
+  const strategy = strategies[mode];
+  if (!strategy) {
+    throw new Error(`Unknown sort mode: ${mode}`);
+  }
+  return strategy(items);
+}
+```
+
+`never` in the `default` branch is how you keep `switch` exhaustive when you *must* keep a switch; the map + `SortKey` union often makes that branch unnecessary \{`never` ở nhánh `default` giúp `switch` exhaustive khi *bắt buộc* giữ switch; map + union `SortKey` thường làm nhánh đó thừa\}. The senior takeaway: **registry of functions**, not a growing conditional tree \{Điểm senior: **registry function**, không phải cây điều kiện phình ra\}.
+
+---
+
+## Injecting the strategy \{Inject strategy\}
+
+Selection logic and execution logic should be separable \{Logic chọn strategy và logic thực thi nên tách\}. Pass the strategy (or the whole registry) as a parameter so callers, tests, and feature flags can substitute behavior \{Truyền strategy (hoặc cả registry) qua tham số để caller, test, và feature flag thay hành vi\}:
+
+```ts
+type DiscountStrategy = (subtotal: number) => number;
+
+const noDiscount: DiscountStrategy = (subtotal) => subtotal;
+
+const tenPercentOff: DiscountStrategy = (subtotal) =>
+  Math.round(subtotal * 0.9 * 100) / 100;
+
+export function checkoutTotal(
+  subtotal: number,
+  applyDiscount: DiscountStrategy = noDiscount,
+): number {
+  return applyDiscount(subtotal);
+}
+
+// test — no DOM, no env, deterministic:
+checkoutTotal(100, tenPercentOff); // 90
+checkoutTotal(100, (n) => n); // 100 with inline fake strategy
+```
+
+Default parameters give production behavior while tests pass a **fake** \{Tham số mặc định cho hành vi production; test truyền **fake**\}. This is the same dependency-injection move as in [Part 1](/blog/ts-pattern-01-singleton-module/) — here the "dependency" is behavior, not a service instance \{Cùng kiểu dependency injection như [Phần 1](/blog/ts-pattern-01-singleton-module/) — ở đây "dependency" là hành vi, không phải instance service\}. Part 10 goes deeper on wiring at the composition root \{Phần 10 đi sâu cách nối ở composition root\}.
+
+---
+
+## Real web use cases \{Use case web thực tế\}
+
+- **Sorting / filtering** — `SortKey` → compare function; filter presets on a data table \{**Sắp xếp / lọc** — `SortKey` → hàm so sánh; preset filter trên bảng dữ liệu\}.
+- **Pricing / discounts** — stackable rules as strategies composed left-to-right \{**Giá / giảm giá** — rule xếp chồng thành strategy compose trái sang phải\}.
+- **Validation** — per-field or per-form strategies; swap strict vs lenient in tests \{**Validate** — strategy theo field hoặc form; đổi strict vs lenient khi test\}.
+- **Retry / backoff** — `linear`, `exponential`, `fullJitter` as named functions behind one `retry(policy, fn)` API \{**Retry / backoff** — `linear`, `exponential`, `fullJitter` là function có tên sau một API `retry(policy, fn)`\}.
+- **Payment providers** — `charge(amount, provider)` where `provider` is a strategy object with `authorize` / `capture` \{**Cổng thanh toán** — `charge(amount, provider)` với `provider` là strategy object có `authorize` / `capture`\}.
+- **Formatters by locale** — `formatCurrency(n, localeStrategy)` instead of `if (locale === 'vi')` scattered in JSX helpers \{**Formatter theo locale** — `formatCurrency(n, localeStrategy)` thay vì `if (locale === 'vi')` rải trong helper JSX\}.
+
+---
+
+## Strategy vs just passing a callback \{Strategy vs chỉ truyền callback\}
+
+In JS, "Strategy" often **is** a higher-order function: you pass `(item) => boolean` or `(err) => delayMs` and you are done \{Trong JS, "Strategy" thường **chính là** higher-order function: truyền `(item) => boolean` hoặc `(err) => delayMs` là đủ\}. That is fine — you do not need a UML box for every callback \{Ổn thế — không cần hộp UML cho mọi callback\}.
+
+Reach for a **named type + registry** when \{Dùng **kiểu có tên + registry** khi\}:
+
+- The set of variants is **closed and known** (union of keys) and you want exhaustiveness checking \{Tập biến thể **đóng và biết trước** (union key) và bạn muốn kiểm tra exhaustive\}.
+- Multiple call sites must share the **same catalog** of strategies \{Nhiều call site dùng chung **catalog** strategy\}.
+- Strategies are **documented products** (payment rails, export formats) not anonymous lambdas \{Strategy là **sản phẩm có tên** (cổng thanh toán, định dạng export) không phải lambda vô danh\}.
+
+Stick to a **bare callback** when there is only one call site and the function is a one-off predicate or mapper \{Giữ **callback trần** khi chỉ một call site và function là predicate hoặc mapper một lần\}.
+
+---
+
+## Pitfalls \{Cạm bẫy\}
+
+- **Leaking selection everywhere** — `if (mode === 'price')` copied in UI, API, and tests instead of one `getStrategy(mode)` or registry lookup \{**Rò logic chọn khắp nơi** — `if (mode === 'price')` copy trong UI, API, test thay vì một `getStrategy(mode)` hoặc lookup registry\}.
+- **Incompatible strategy signatures** — if `strategyA` needs `(user, cart)` and `strategyB` needs `(sku, warehouse)`, you do not have one Strategy interface; you have two problems smashed together \{**Chữ ký strategy không tương thích** — nếu `strategyA` cần `(user, cart)` mà `strategyB` cần `(sku, warehouse)`, bạn không có một interface Strategy; bạn gộp hai bài toán khác nhau\}.
+- **Over-abstracting a single `if`** — three lines do not need a `StrategyFactoryRegistry` \{**Over-abstract một `if`** — ba dòng không cần `StrategyFactoryRegistry`\}.
+- **Mutable global current strategy** — `setStrategy()` on a module singleton makes tests order-dependent; prefer passing strategy per call or per request scope \{**Strategy global mutable** — `setStrategy()` trên module singleton khiến test phụ thuộc thứ tự; ưu tiên truyền strategy mỗi lần gọi hoặc theo scope request\}.
+
+---
+
+## Cheat sheet \{Bảng tra nhanh\}
+
+```ts
+// Idiomatic: function + registry
+type Policy = 'linear' | 'exponential';
+type BackoffFn = (attempt: number) => number;
+
+const backoff: Record<Policy, BackoffFn> = {
+  linear: (n) => n * 100,
+  exponential: (n) => 100 * 2 ** n,
+};
+
+function retryAfter(attempt: number, policy: Policy, table = backoff): number {
+  return table[policy](attempt);
+}
+
+// Injectable for tests
+function formatPrice(cents: number, fmt: (n: number) => string = (n) => `$${n}`) {
+  return fmt(cents);
+}
+
+// Class form when strategy holds state / lifecycle
+interface PaymentStrategy {
+  charge(cents: number): Promise<{ id: string }>;
+}
+```
+
+Decision: **one-off callback → pass function**; **catalog of variants → `Record<Key, Fn>`**; **stateful / IO → class or object strategy**; **tests → inject default param** \{Quyết định: **callback một lần → truyền function**; **catalog biến thể → `Record<Key, Fn>`**; **có state / IO → class hoặc object strategy**; **test → inject tham số mặc định**\}.
+
+---
+
+## Bài tập / Exercises
+
+**1.** Refactor the `switch` below into a `Record<ExportFormat, ExportStrategy>` and a thin `exportData(rows, format)` wrapper \{Refactor `switch` dưới thành `Record<ExportFormat, ExportStrategy>` và wrapper mỏng `exportData(rows, format)`\}.
+
+```ts
+type ExportFormat = 'csv' | 'json';
+type Row = { id: string; label: string };
+
+function exportData(rows: readonly Row[], format: ExportFormat): string {
+  switch (format) {
+    case 'csv':
+      return rows.map((r) => `${r.id},${r.label}`).join('\n');
+    case 'json':
+      return JSON.stringify(rows);
+    default: {
+      const _exhaustive: never = format;
+      return _exhaustive;
+    }
+  }
+}
+```
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+type ExportFormat = 'csv' | 'json';
+type Row = { id: string; label: string };
+type ExportStrategy = (rows: readonly Row[]) => string;
+
+const exportStrategies: Record<ExportFormat, ExportStrategy> = {
+  csv: (rows) => rows.map((r) => `${r.id},${r.label}`).join('\n'),
+  json: (rows) => JSON.stringify(rows),
+};
+
+function exportData(
+  rows: readonly Row[],
+  format: ExportFormat,
+  strategies: Record<ExportFormat, ExportStrategy> = exportStrategies,
+): string {
+  return strategies[format](rows);
+}
+```
+</details>
+
+**2.** Add a new strategy `xml` to the registry from exercise 1 **without** changing the body of `exportData` (only extend the registry and types) \{Thêm strategy `xml` vào registry bài 1 **mà không** sửa thân `exportData` (chỉ mở rộng registry và kiểu)\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+type ExportFormat = 'csv' | 'json' | 'xml';
+
+const exportStrategies: Record<ExportFormat, ExportStrategy> = {
+  csv: (rows) => rows.map((r) => `${r.id},${r.label}`).join('\n'),
+  json: (rows) => JSON.stringify(rows),
+  xml: (rows) =>
+    `<rows>${rows.map((r) => `<row id="${r.id}">${r.label}</row>`).join('')}</rows>`,
+};
+
+// exportData unchanged — Open/Closed at the registry edge
+```
+</details>
+
+**3.** `computeShipping(weightKg)` uses hard-coded `weightKg * 2`. Inject a `ShippingStrategy` and write a test that uses a flat-rate fake \{`computeShipping(weightKg)` hard-code `weightKg * 2`. Inject `ShippingStrategy` và viết test dùng fake flat-rate\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+type ShippingStrategy = (weightKg: number) => number;
+
+const standardShipping: ShippingStrategy = (w) => w * 2;
+
+export function computeShipping(
+  weightKg: number,
+  strategy: ShippingStrategy = standardShipping,
+): number {
+  return strategy(weightKg);
+}
+
+// test
+const flatFive: ShippingStrategy = () => 5;
+computeShipping(100, flatFive); // 5 — no dependency on weight formula
+```
+</details>
+
+**4.** The UI passes `sortMode: string` from a query param. Write a **type guard** `isSortKey(value: string): value is SortKey` and a `getSortStrategy(mode: string)` that throws on unknown keys — keep selection in one module \{UI truyền `sortMode: string` từ query param. Viết **type guard** `isSortKey(value: string): value is SortKey` và `getSortStrategy(mode: string)` throw khi key lạ — gom chọn trong một module\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+type SortKey = 'price' | 'name';
+
+function isSortKey(value: string): value is SortKey {
+  return value === 'price' || value === 'name';
+}
+
+function getSortStrategy(mode: string): SortStrategy {
+  if (!isSortKey(mode)) {
+    throw new Error(`Invalid sort mode: ${mode}`);
+  }
+  return sortStrategies[mode];
+}
+
+// route handler: getSortStrategy(searchParams.get('sort') ?? 'price')
+```
+</details>
+
+**Stretch \{Nâng cao\}:** implement `retry<T>(fn, options)` where `options.backoff` is a `BackoffFn` strategy; provide `linear` and `exponential` in a registry and unit-test that `retry` waits the sequence your fake clock expects (stub `setTimeout` or inject a `sleep` strategy) \{cài `retry<T>(fn, options)` với `options.backoff` là strategy `BackoffFn`; có `linear` và `exponential` trong registry; unit-test `retry` chờ đúng chuỗi mà fake clock mong đợi (stub `setTimeout` hoặc inject strategy `sleep`)\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+type BackoffFn = (attempt: number) => number;
+type SleepFn = (ms: number) => Promise<void>;
+
+const backoffPolicies: Record<'linear' | 'exponential', BackoffFn> = {
+  linear: (n) => n * 10,
+  exponential: (n) => 10 * 2 ** n,
+};
+
+async function retry<T>(
+  fn: () => Promise<T>,
+  options: {
+    maxAttempts: number;
+    policy: keyof typeof backoffPolicies;
+    sleep?: SleepFn;
+    backoff?: Record<keyof typeof backoffPolicies, BackoffFn>;
+  },
+): Promise<T> {
+  const sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const table = options.backoff ?? backoffPolicies;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= options.maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt === options.maxAttempts) break;
+      await sleep(table[options.policy](attempt));
+    }
+  }
+  throw lastError;
+}
+
+// test: collect delays via fake sleep
+const delays: number[] = [];
+await retry(async () => { throw new Error('fail'); }, {
+  maxAttempts: 3,
+  policy: 'linear',
+  sleep: async (ms) => { delays.push(ms); },
+});
+// delays === [10, 20] — linear backoff for attempts 1 and 2
+```
+</details>
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- Strategy = **encapsulate interchangeable algorithms**; the caller stays stable when variants grow \{Strategy = **đóng gói thuật toán thay thế được**; caller ổn định khi biến thể tăng\}.
+- In TS, prefer **`Record<Key, Fn>`** over sprawling `if/switch` when the variant set is a known union \{Trong TS, ưu tiên **`Record<Key, Fn>`** hơn `if/switch` lan khi tập biến thể là union biết trước\}.
+- **Inject** strategies (default param or argument) so tests and feature flags swap behavior without globals \{**Inject** strategy (tham số mặc định hoặc đối số) để test và feature flag đổi hành vi không cần global\}.
+- Not every callback is a "pattern" — use a **registry** when the catalog is shared and exhaustive types matter \{Không phải callback nào cũng là "pattern" — dùng **registry** khi catalog dùng chung và kiểu exhaustive quan trọng\}.
+- Watch for **leaked selection logic** and **mismatched strategy signatures** \{Tránh **logic chọn rò rỉ** và **chữ ký strategy không khớp**\}.
+
+---
+
+## Next up \{Tiếp theo\}
+
+**Part 5 — Observer & Pub/Sub**: decouple producers and consumers when many listeners react to the same event — typed channels, DOM events, and store subscriptions without spaghetti callbacks \{**Phần 5 — Observer & Pub/Sub**: tách producer và consumer khi nhiều listener phản ứng cùng một event — kênh có kiểu, DOM event, và subscription store không thành spaghetti callback\}. Continue to [Part 5 — Observer & Pub/Sub](/blog/ts-pattern-05-observer-pubsub/). ← [Part 3 — Builder & Fluent APIs](/blog/ts-pattern-03-builder-fluent-api/)

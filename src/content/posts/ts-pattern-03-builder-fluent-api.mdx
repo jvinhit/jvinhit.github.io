@@ -1,0 +1,503 @@
+---
+title: 'Design Patterns in TypeScript · Part 3 — Builder & Fluent APIs'
+description: 'Construct complex objects step by step: fluent method chaining, immutable builders, the type-safe staged (phantom-type) builder that makes illegal states unrepresentable, and when an options object is enough.'
+pubDate: 2025-02-16
+tags: [typescript, design-patterns, builder, architecture, ts_patterns_10]
+series: ts-pattern
+seriesOrder: 3
+draft: false
+---
+
+import PatternDiagram from '../../components/blog/PatternDiagram.astro';
+
+> **Part 3 of 10** in the Design Patterns in TypeScript series \{**Phần 3/10** trong series Design Patterns in TypeScript\}. Previous \{Trước\}: [Part 2 — Factory & Abstract Factory](/blog/ts-pattern-02-factory-abstract-factory/) · Next \{Tiếp\}: [Part 4 — Strategy](/blog/ts-pattern-04-strategy/).
+
+In [Part 2](/blog/ts-pattern-02-factory-abstract-factory/) you centralized **which** object to create \{Trong [Phần 2](/blog/ts-pattern-02-factory-abstract-factory/) bạn đã gom **tạo object nào**\}. This part tackles **how to assemble** an object when the constructor would be unreadable \{Phần này xử lý **cách lắp** một object khi constructor trở nên khó đọc\}: twelve positional arguments, four optional booleans, and a `null` you only discover at runtime \{mười hai tham số vị trí, bốn boolean tùy chọn, và một `null` chỉ lộ ra lúc chạy\}.
+
+**Telescoping constructors** (overload after overload) and **giant `new Thing(a, b, c, …)`** calls are a maintenance tax \{**Telescoping constructor** (overload chồng overload) và **`new Thing(a, b, c, …)` khổng lồ** là thuế bảo trì\}. The **Builder** pattern lets callers set fields **step by step**, then call `.build()` once the product is complete \{**Builder** cho phép gọi từng bước, rồi `.build()` một lần khi product đủ\}. In TypeScript you can go further: **fluent chaining**, **immutable steps**, and **staged types** that refuse `.build()` until required fields are set \{Trong TypeScript bạn có thể đi xa hơn: **chuỗi fluent**, **bước bất biến**, và **kiểu theo giai đoạn** từ chối `.build()` cho tới khi đủ field bắt buộc\}.
+
+---
+
+## The intent \{Ý đồ\}
+
+The **Builder** separates **construction** from **representation** \{**Builder** tách **dựng** khỏi **biểu diễn**\}: a director (or the caller) runs a sequence of steps; a builder accumulates state; `.build()` returns the final product \{một director (hoặc caller) chạy chuỗi bước; builder tích lũy state; `.build()` trả product cuối\}. You reach for it when an object has **many optional parts**, **validation between steps**, or **several valid “recipes”** (dev vs prod request, minimal vs full email) \{Bạn dùng khi object có **nhiều phần tùy chọn**, **validate giữa các bước**, hoặc **nhiều “công thức” hợp lệ**\}.
+
+<PatternDiagram
+  kind="builder"
+  caption="Fluent steps accumulate configuration; build() materializes one immutable product"
+/>
+
+The pattern is not “always better than a plain object” \{Pattern không phải “luôn hơn một object thường”\}. We'll be explicit about when a **config object** is enough \{Ta sẽ nói thẳng khi nào **object config** là đủ\}.
+
+---
+
+## A fluent builder — method chaining returning `this` \{Builder fluent — chuỗi method trả về `this`\}
+
+The classic **fluent API**: each setter returns **`this`** so calls chain \{API **fluent** kinh điển: mỗi setter trả **`this`** để gọi nối tiếp\}:
+
+```ts
+interface HttpRequest {
+  readonly url: string;
+  readonly method: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  readonly headers: Readonly<Record<string, string>>;
+  readonly body?: string;
+}
+
+class RequestBuilder {
+  private url = '';
+  private method: HttpRequest['method'] = 'GET';
+  private headers: Record<string, string> = {};
+  private body: string | undefined;
+
+  forUrl(url: string): this {
+    this.url = url;
+    return this;
+  }
+
+  withMethod(method: HttpRequest['method']): this {
+    this.method = method;
+    return this;
+  }
+
+  header(name: string, value: string): this {
+    this.headers[name] = value;
+    return this;
+  }
+
+  jsonBody(payload: unknown): this {
+    this.headers['content-type'] = 'application/json';
+    this.body = JSON.stringify(payload);
+    return this;
+  }
+
+  build(): HttpRequest {
+    if (!this.url) {
+      throw new Error('url is required');
+    }
+    return {
+      url: this.url,
+      method: this.method,
+      headers: { ...this.headers },
+      body: this.body,
+    };
+  }
+}
+
+const req = new RequestBuilder()
+  .forUrl('/api/users')
+  .withMethod('POST')
+  .header('authorization', 'Bearer …')
+  .jsonBody({ name: 'An' })
+  .build();
+```
+
+**Why it works on the web** \{Vì sao hợp trên web\}: query builders, fetch wrappers, and SDK clients read like English and hide defaults \{query builder, wrapper fetch, client SDK đọc như tiếng Anh và giấu default\}. The trade-off: **one mutable builder instance** — reusing the same object across calls can leak state between builds \{đánh đổi: **một instance builder có thể ghi** — tái sử dụng cùng object giữa các lần build có thể rò state\}.
+
+---
+
+## Immutable builders — each step returns a NEW builder \{Builder bất biến — mỗi bước trả builder MỚI\}
+
+For **branching recipes** and **reuse without surprise**, return a **new** builder instead of mutating `this` \{Để **nhánh công thức** và **tái dùng không bất ngờ**, trả builder **mới** thay vì ghi `this`\}:
+
+```ts
+interface Query {
+  readonly table: string;
+  readonly select: readonly string[];
+  readonly where: readonly { col: string; op: '=' | '>'; val: string | number }[];
+  readonly limit?: number;
+}
+
+class QueryBuilder {
+  private constructor(private readonly state: Query) {}
+
+  static from(table: string): QueryBuilder {
+    return new QueryBuilder({ table, select: ['*'], where: [] });
+  }
+
+  select(...columns: string[]): QueryBuilder {
+    return new QueryBuilder({ ...this.state, select: columns });
+  }
+
+  where(col: string, op: '=' | '>', val: string | number): QueryBuilder {
+    return new QueryBuilder({
+      ...this.state,
+      where: [...this.state.where, { col, op, val }],
+    });
+  }
+
+  take(n: number): QueryBuilder {
+    return new QueryBuilder({ ...this.state, limit: n });
+  }
+
+  build(): Query {
+    return this.state;
+  }
+}
+
+const base = QueryBuilder.from('orders').select('id', 'total');
+const paid = base.where('status', '=', 'paid').take(50);
+const pending = base.where('status', '=', 'pending').take(10);
+// `base` is unchanged — safe branching
+```
+
+Each step is a **pure transition** on data you already hold \{Mỗi bước là **chuyển trạng thái thuần** trên dữ liệu bạn đã có\}. Cost: more allocations (usually negligible); win: **no shared mutable builder** passed around \{Chi phí: thêm allocation (thường không đáng kể); lợi: **không chia sẻ builder mutable** khắp codebase\}.
+
+---
+
+## The type-safe staged builder — illegal states unrepresentable \{Builder theo giai đoạn an toàn kiểu — trạng thái sai không biểu diễn được\}
+
+Runtime checks in `.build()` (`if (!url) throw …`) catch mistakes **late** \{Kiểm tra runtime trong `.build()` (`if (!url) throw …`) bắt lỗi **muộn**\}. A **staged builder** threads **which fields are set** through a generic parameter; `.build()` is only typed when the **required keys** are present \{**Builder theo giai đoạn** luồn **field nào đã set** qua generic; `.build()` chỉ có kiểu khi **key bắt buộc** đã có\}.
+
+Think of it as a checklist encoded in the type system \{Hãy coi đó là checklist được mã hoá trong hệ kiểu\}:
+
+```ts
+type Steps = {
+  to: string;
+  subject: string;
+  body: string;
+};
+
+/** Present = union of step names already called */
+class EmailBuilder<Present extends keyof Steps = never> {
+  private constructor(private readonly draft: Partial<Steps>) {}
+
+  static create(): EmailBuilder {
+    return new EmailBuilder({});
+  }
+
+  to(address: string): EmailBuilder<Present | 'to'> {
+    return new EmailBuilder({ ...this.draft, to: address });
+  }
+
+  subject(line: string): EmailBuilder<Present | 'subject'> {
+    return new EmailBuilder({ ...this.draft, subject: line });
+  }
+
+  body(text: string): EmailBuilder<Present | 'body'> {
+    return new EmailBuilder({ ...this.draft, body: text });
+  }
+
+  // Only callable when all required keys are in Present
+  build(this: EmailBuilder<keyof Steps>): { readonly to: string; readonly subject: string; readonly body: string } {
+    const { to, subject, body } = this.draft;
+    // Narrowed by the `this` type — still validate for defense in depth
+    if (to === undefined || subject === undefined || body === undefined) {
+      throw new Error('incomplete email');
+    }
+    return { to, subject, body };
+  }
+}
+
+const ok = EmailBuilder.create()
+  .to('dev@example.com')
+  .subject('Deploy done')
+  .body('v1.2.0 is live')
+  .build();
+
+// Uncomment to see a COMPILE error — build() is not on the type until all steps ran:
+// const bad = EmailBuilder.create().to('x@y.z').build();
+```
+
+**How the type threads** \{Cách kiểu luồn\}: each fluent method returns `EmailBuilder<Present | 'to'>` (etc.), widening the set of satisfied steps \{mỗi method fluent trả `EmailBuilder<Present | 'to'>` (v.v.), mở rộng tập bước đã thỏa\}. The `build` method's **`this` parameter** requires `Present` to be **all keys** of `Steps` \{tham số **`this`** của `build` yêu cầu `Present` là **mọi key** của `Steps`\}. Omit `.subject()` and TypeScript never offers `.build()` on the result \{Bỏ `.subject()` thì TypeScript không cho `.build()` trên kết quả\}. That is the senior payoff: **invalid pipelines fail in the editor**, not in production \{Đó là lợi ích senior: **pipeline sai fail trong editor**, không phải production\}.
+
+You can combine staging with **immutable** returns (as above) or with a mutable builder plus a phantom brand — immutable + `this` typing is the combo we recommend \{Có thể kết hợp staging với trả **bất biến** (như trên) hoặc builder mutable + brand ảo — khuyên **bất biến + typing `this`**\}.
+
+---
+
+## Builder vs options object — when `{}` is simpler \{Builder vs object tùy chọn — khi `{}` đơn giản hơn\}
+
+Not every config deserves a builder \{Không phải config nào cũng cần builder\}. A plain **options object** (often `Partial<Config>` at the boundary, `Required<…>` inside) is enough when:
+
+- You have **few fields** (≤ ~5) and **no ordering rules** between them \{**Ít field** (≤ ~5) và **không có quy tắc thứ tự** giữa chúng\}.
+- **All fields are optional** or defaults are obvious \{**Mọi field tùy chọn** hoặc default rõ ràng\}.
+- You do not need **distinct recipes** — one shape fits all call sites \{Không cần **công thức khác nhau** — một shape cho mọi nơi gọi\}.
+
+```ts
+interface CreateChartOptions {
+  width?: number;
+  height?: number;
+  theme?: 'dark' | 'light';
+}
+
+function createChart(data: number[], options: CreateChartOptions = {}) {
+  const width = options.width ?? 640;
+  const height = options.height ?? 400;
+  const theme = options.theme ?? 'dark';
+  return { data, width, height, theme };
+}
+
+createChart([1, 2, 3], { width: 800 });
+```
+
+**Reach for a builder when** \{**Dùng builder khi**\}: call sites would need **many overloads**, **ordered validation** (e.g. must set `baseUrl` before `path`), **test data factories** with readable variants, or **compile-time enforcement** of required steps \{call site cần **nhiều overload**, **validate có thứ tự**, **factory dữ liệu test** với biến thể dễ đọc, hoặc **ép buộc compile-time** các bước bắt buộc\}. Be honest: a builder for three optional flags is ceremony \{Thành thật: builder cho ba cờ tùy chọn là nghi thức thừa\}.
+
+---
+
+## Real web use cases \{Use case web thực tế\}
+
+- **Query / ORM-style builders** — `select().from().where().limit()` for SQL or document APIs \{**Query / builder kiểu ORM** — `select().from().where().limit()` cho SQL hoặc API document\}.
+- **Test data builders** — `user().withRole('admin').verified().build()` beside factories from Part 2 \{**Builder dữ liệu test** — `user().withRole('admin').verified().build()` bên cạnh factory Phần 2\}.
+- **Notification / email / webhook payloads** — many optional headers, attachments, retry policy \{**Payload notification / email / webhook** — nhiều header, attachment, chính sách retry tùy chọn\}.
+- **Chart and dashboard config** — axes, series, legend, interaction flags composed incrementally \{**Config chart và dashboard** — trục, series, legend, cờ tương tác lắp dần\}.
+- **HTTP clients** — base URL, auth, timeouts, then per-request path and body \{**HTTP client** — base URL, auth, timeout, rồi path và body từng request\}.
+
+---
+
+## Pitfalls \{Cạm bẫy\}
+
+- **`.build()` allowed in an invalid state** — only runtime `throw`, no staged types \{**`.build()` khi state chưa hợp lệ** — chỉ `throw` runtime, không staging\}.
+- **Reusing one mutable builder** — second `.build()` inherits headers/body from the first call \{**Tái dùng một builder mutable** — lần `.build()` thứ hai kế thừa header/body lần đầu\}.
+- **Over-engineering** — builder with one method, or wrapping a DTO that is already a flat interface \{**Over-engineering** — builder một method, hoặc bọc DTO đã phẳng\}.
+- **Leaking the builder** — returning the builder from a factory instead of the product; callers keep mutating \{**Lộ builder** — trả builder thay vì product; caller tiếp tục ghi\}.
+- **Giant fluent interfaces** — dozens of methods on one class; split by **director** functions or smaller staged types \{**Interface fluent khổng lồ** — hàng chục method trên một class; tách bằng hàm **director** hoặc staged type nhỏ hơn\}.
+
+---
+
+## Cheat sheet \{Bảng tra nhanh\}
+
+```ts
+// Fluent (mutable) — ergonomic, watch reuse
+class B {
+  private x = '';
+  setX(v: string): this { this.x = v; return this; }
+  build() { return { x: this.x }; }
+}
+
+// Immutable — each step returns new B
+class Imm {
+  private constructor(private readonly s: { x: string }) {}
+  static empty() { return new Imm({ x: '' }); }
+  setX(v: string) { return new Imm({ x: v }); }
+  build() { return this.s; }
+}
+
+// Staged — Present tracks required steps; build(this: …) gates compile
+class Staged<Present extends 'a' | 'b' = never> {
+  private constructor(private readonly d: Partial<Record<'a' | 'b', string>>) {}
+  static create() { return new Staged({}); }
+  a(v: string): Staged<Present | 'a'> { return new Staged({ ...this.d, a: v }); }
+  b(v: string): Staged<Present | 'b'> { return new Staged({ ...this.d, b: v }); }
+  build(this: Staged<'a' | 'b'>) {
+    const { a, b } = this.d;
+    if (a === undefined || b === undefined) throw new Error('incomplete');
+    return { a, b };
+  }
+}
+
+// Often enough: options object + defaults
+function go(opts: { url?: string } = {}) { /* … */ }
+```
+
+Decision: **few optional fields → options**; **readable variants → immutable builder**; **required steps must be enforced → staged `this` types** \{Quyết định: **ít field tùy chọn → options**; **biến thể dễ đọc → builder bất biến**; **bước bắt buộc phải ép → staged `this`**\}.
+
+---
+
+## Bài tập / Exercises
+
+**1.** Implement a fluent `RequestBuilder` with `.url()`, `.method()`, optional `.header()`, and `.build()` that throws if `url` is missing \{Cài `RequestBuilder` fluent có `.url()`, `.method()`, `.header()` tùy chọn, và `.build()` throw nếu thiếu `url`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+class RequestBuilder {
+  private url = '';
+  private method: 'GET' | 'POST' = 'GET';
+  private headers: Record<string, string> = {};
+
+  urlPath(path: string): this {
+    this.url = path;
+    return this;
+  }
+
+  method(m: 'GET' | 'POST'): this {
+    this.method = m;
+    return this;
+  }
+
+  header(k: string, v: string): this {
+    this.headers[k] = v;
+    return this;
+  }
+
+  build() {
+    if (!this.url) throw new Error('url required');
+    return { url: this.url, method: this.method, headers: { ...this.headers } };
+  }
+}
+
+const r = new RequestBuilder().urlPath('/health').method('GET').build();
+```
+</details>
+
+**2.** Rewrite exercise 1 as an **immutable** builder: each method returns a new instance; prove two branches from the same base do not share state \{Viết lại bài 1 dạng **bất biến**: mỗi method trả instance mới; chứng minh hai nhánh từ cùng base không dùng chung state\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+interface ReqState {
+  url: string;
+  method: 'GET' | 'POST';
+  headers: Record<string, string>;
+}
+
+class ImmRequestBuilder {
+  private constructor(private readonly state: ReqState) {}
+
+  static start(): ImmRequestBuilder {
+    return new ImmRequestBuilder({ url: '', method: 'GET', headers: {} });
+  }
+
+  urlPath(path: string): ImmRequestBuilder {
+    return new ImmRequestBuilder({ ...this.state, url: path });
+  }
+
+  method(m: 'GET' | 'POST'): ImmRequestBuilder {
+    return new ImmRequestBuilder({ ...this.state, method: m });
+  }
+
+  build() {
+    if (!this.state.url) throw new Error('url required');
+    return { ...this.state, headers: { ...this.state.headers } };
+  }
+}
+
+const root = ImmRequestBuilder.start();
+const get = root.urlPath('/a').method('GET');
+const post = root.urlPath('/b').method('POST');
+console.log(get.build().method, post.build().method); // GET POST — independent
+```
+</details>
+
+**3.** Implement a **staged** `SignupBuilder` where `.email()`, `.password()`, and `.displayName()` must all be called before `.build()` is available on the type \{Cài **staged** `SignupBuilder` — phải gọi `.email()`, `.password()`, `.displayName()` trước khi `.build()` có trên kiểu\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+type SignupSteps = { email: string; password: string; displayName: string };
+
+class SignupBuilder<Present extends keyof SignupSteps = never> {
+  private constructor(private readonly data: Partial<SignupSteps>) {}
+
+  static create(): SignupBuilder {
+    return new SignupBuilder({});
+  }
+
+  email(v: string): SignupBuilder<Present | 'email'> {
+    return new SignupBuilder({ ...this.data, email: v });
+  }
+
+  password(v: string): SignupBuilder<Present | 'password'> {
+    return new SignupBuilder({ ...this.data, password: v });
+  }
+
+  displayName(v: string): SignupBuilder<Present | 'displayName'> {
+    return new SignupBuilder({ ...this.data, displayName: v });
+  }
+
+  build(this: SignupBuilder<keyof SignupSteps>) {
+    const { email, password, displayName } = this.data;
+    if (email === undefined || password === undefined || displayName === undefined) {
+      throw new Error('incomplete signup');
+    }
+    return { email, password, displayName };
+  }
+}
+
+// const fail = SignupBuilder.create().email('a@b.c').build(); // TS error
+const user = SignupBuilder.create()
+  .email('a@b.c')
+  .password('secret')
+  .displayName('An')
+  .build();
+```
+</details>
+
+**4.** Given `interface ServerOpts { host?: string; port?: number; tls?: boolean }`, implement `createServer(opts)` with defaults — **no builder**. List one scenario where you would still introduce a builder \{Cho `interface ServerOpts { host?: string; port?: number; tls?: boolean }`, cài `createServer(opts)` với default — **không builder**. Nêu một tình huống vẫn nên dùng builder\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+interface ServerOpts {
+  host?: string;
+  port?: number;
+  tls?: boolean;
+}
+
+function createServer(opts: ServerOpts = {}) {
+  return {
+    host: opts.host ?? '127.0.0.1',
+    port: opts.port ?? 3000,
+    tls: opts.tls ?? false,
+  };
+}
+
+createServer({ port: 8080, tls: true });
+```
+
+Use a builder when you need **ordered setup** (TLS credentials before listen) or **compile-time required fields** for prod-only paths \{Dùng builder khi cần **setup có thứ tự** (credential TLS trước listen) hoặc **field bắt buộc compile-time** cho nhánh production\}.
+</details>
+
+**Stretch \{Nâng cao\}:** add an optional `.attach()` step to `SignupBuilder` that does **not** block `.build()` — only `email`, `password`, and `displayName` are required. Hint: keep required keys in `SignupSteps` separate from optional keys in another generic or method \{thêm `.attach()` tùy chọn vào `SignupBuilder` không chặn `.build()` — chỉ `email`, `password`, `displayName` bắt buộc. Gợi ý: tách key bắt buộc trong `SignupSteps` khỏi key tùy chọn bằng generic hoặc method khác\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```ts
+type RequiredSignup = { email: string; password: string; displayName: string };
+type OptionalSignup = { avatarUrl?: string };
+
+class SignupBuilder2<Present extends keyof RequiredSignup = never> {
+  private constructor(
+    private readonly required: Partial<RequiredSignup>,
+    private readonly optional: OptionalSignup,
+  ) {}
+
+  static create(): SignupBuilder2 {
+    return new SignupBuilder2({}, {});
+  }
+
+  email(v: string): SignupBuilder2<Present | 'email'> {
+    return new SignupBuilder2({ ...this.required, email: v }, this.optional);
+  }
+
+  password(v: string): SignupBuilder2<Present | 'password'> {
+    return new SignupBuilder2({ ...this.required, password: v }, this.optional);
+  }
+
+  displayName(v: string): SignupBuilder2<Present | 'displayName'> {
+    return new SignupBuilder2({ ...this.required, displayName: v }, this.optional);
+  }
+
+  attachAvatar(url: string): SignupBuilder2<Present> {
+    return new SignupBuilder2(this.required, { ...this.optional, avatarUrl: url });
+  }
+
+  build(this: SignupBuilder2<keyof RequiredSignup>) {
+    const { email, password, displayName } = this.required;
+    if (email === undefined || password === undefined || displayName === undefined) {
+      throw new Error('incomplete signup');
+    }
+    return { email, password, displayName, ...this.optional };
+  }
+}
+```
+</details>
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- Builder = **step-by-step construction**, then **one** `.build()` product \{Builder = **dựng từng bước**, rồi **một** product `.build()`\}.
+- **Fluent + mutable** is ergonomic; **immutable** steps are safer for branching and reuse \{**Fluent + mutable** tiện; bước **bất biến** an toàn hơn khi nhánh và tái dùng\}.
+- **Staged generics + `this` on `build()`** make missing required fields a **compile error** \{**Generic staged + `this` trên `build()`** biến thiếu field bắt buộc thành **lỗi biên dịch**\}.
+- **Options objects** often beat builders for small, flat config — do not ceremony-wrap simple DTOs \{**Object tùy chọn** thường thắng builder cho config nhỏ, phẳng — đừng bọc nghi thức quanh DTO đơn giản\}.
+
+---
+
+## Next up \{Tiếp theo\}
+
+**Part 4 — Strategy**: swap algorithms at runtime without `switch` sprawl — typed strategy maps, injection, and when *not* to abstract \{**Phần 4 — Strategy**: đổi thuật toán lúc runtime không rải `switch` — map strategy có kiểu, injection, và khi *không* nên abstract\}. Continue to [Part 4 — Strategy](/blog/ts-pattern-04-strategy/).

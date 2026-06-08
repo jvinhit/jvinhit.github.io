@@ -41,6 +41,7 @@ export const SITE = {
     { label: 'JOURNAL', href: '/' },
     { label: 'RESUME', href: '/about' },
     { label: 'ARCHIVE', href: '/blog' },
+    { label: 'SERIES', href: '/series' },
     { label: 'PROJECTS', href: '/projects' },
     { label: 'TOOLS', href: '/tools' },
   ],

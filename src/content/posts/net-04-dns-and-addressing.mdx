@@ -1,0 +1,277 @@
+---
+title: 'Network Programming · Part 4 — DNS & Addressing: From Names to IPs'
+description: 'How DNS turns hostnames into IP addresses, the resolution chain from your app to authoritative servers, Node.js dns.lookup vs dns.resolve, record types, TTL caching, and dual-stack IPv4/IPv6 — bilingual, with runnable TypeScript examples.'
+pubDate: 2024-04-22
+tags: [networking, sockets, nodejs, backend, net_10]
+series: networking
+seriesOrder: 4
+draft: false
+---
+
+import NetworkDiagram from '../../components/blog/NetworkDiagram.astro';
+
+This is **Part 4 of a 10-part series** on network programming with **Node.js + TypeScript** \{Đây là **Phần 4 của series 10 bài** về lập trình mạng với **Node.js + TypeScript**\}. Parts 1–3 gave you the layered model, TCP, and UDP \{Phần 1–3 đã cho bạn mô hình phân tầng, TCP và UDP\}. Now we tackle the gap between **human-friendly names** and **what sockets actually need: IP addresses** \{Giờ ta xử lý khoảng cách giữa **tên dễ nhớ cho con người** và **thứ socket thực sự cần: địa chỉ IP**\}.
+
+Every time you `connect('api.example.com', 443)` or `fetch('https://example.com')`, something must translate that hostname into a routable address before a single packet leaves your machine \{Mỗi lần bạn `connect('api.example.com', 443)` hay `fetch('https://example.com')`, phải có thứ gì đó dịch hostname thành địa chỉ có thể định tuyến trước khi một packet rời máy bạn\}. That something is **DNS** — the Domain Name System \{Đó là **DNS** — Hệ thống Tên Miền\}.
+
+---
+
+## Why DNS exists \{Vì sao cần DNS\}
+
+Humans remember **names**; the Internet routes **numbers** \{Con người nhớ **tên**; Internet định tuyến theo **số**\}. `93.184.216.34` is hard to type and impossible to move when your server migrates \{`93.184.216.34` khó gõ và không thể "di chuyển" khi server đổi máy\}. `example.com` is stable — you update DNS records behind the name when infrastructure changes \{`example.com` ổn định — bạn chỉ cập nhật bản ghi DNS phía sau tên khi hạ tầng thay đổi\}.
+
+DNS is a **distributed database** that maps names to addresses (and other metadata) \{DNS là **cơ sở dữ liệu phân tán** ánh xạ tên sang địa chỉ (và metadata khác)\}. Your application almost never talks to it directly at first — you pass a hostname to `net.connect`, `http.request`, or `fetch`, and the runtime performs a **name resolution** step before opening the socket \{Ứng dụng gần như không nói chuyện trực tiếp ngay — bạn truyền hostname cho `net.connect`, `http.request`, hay `fetch`, và runtime thực hiện bước **phân giải tên** trước khi mở socket\}.
+
+> **Key idea** \{Ý chính\}: sockets connect to **IPs**; DNS is the bridge from **hostname → IP** \{socket kết nối tới **IP**; DNS là cầu nối từ **hostname → IP**\}.
+
+---
+
+## The resolution chain \{Chuỗi phân giải\}
+
+When your Node process asks "what is the IP of `example.com`?", the query typically walks through several hops — each layer can **cache** the answer \{Khi process Node hỏi "IP của `example.com` là gì?", truy vấn thường đi qua nhiều bước — mỗi tầng có thể **cache** câu trả lời\}.
+
+<NetworkDiagram
+  kind="dns"
+  caption="Your app asks a recursive resolver; the resolver walks root → TLD → authoritative until it gets an IP (cached at each hop)"
+/>
+
+1. **Your app** \{Ứng dụng\}: calls `dns.lookup`, `dns.resolve4`, or lets `net`/`http` resolve implicitly \{gọi `dns.lookup`, `dns.resolve4`, hoặc để `net`/`http` tự phân giải\}.
+2. **Recursive resolver** \{Resolver đệ quy\}: usually your OS-configured server (`8.8.8.8`, `1.1.1.1`, or your ISP) — it does the heavy lifting and caches results \{thường là server OS cấu hình — nó làm phần việc nặng và cache kết quả\}.
+3. **Root + TLD servers** \{Server gốc + TLD\}: `.` root points to `.com` nameservers, which point toward the domain's authority \{gốc `.` chỉ tới nameserver `.com`, rồi chỉ tới authority của domain\}.
+4. **Authoritative nameserver** \{Nameserver chủ quyền\}: the source of truth for `example.com` — returns the actual **A** / **AAAA** records \{nguồn sự thật cho `example.com` — trả về bản ghi **A** / **AAAA** thực tế\}.
+
+The answer flows back with a **TTL** (Time To Live) — how long each cache may keep the record before asking again \{Câu trả lời kèm **TTL** — cache được giữ bản ghi bao lâu trước khi hỏi lại\}.
+
+---
+
+## Common DNS record types \{Các loại bản ghi DNS phổ biến\}
+
+| Record | Purpose \{Mục đích\} | Example \{Ví dụ\} |
+|--------|---------------------|-------------------|
+| **A** | IPv4 address \{địa chỉ IPv4\} | `example.com → 93.184.216.34` |
+| **AAAA** | IPv6 address \{địa chỉ IPv6\} | `example.com → 2606:2800:220:1:248:1893:25c8:1946` |
+| **CNAME** | Alias to another name \{bí danh trỏ tới tên khác\} | `www.example.com → example.com` |
+| **MX** | Mail server + priority \{server mail + độ ưu tiên\} | `example.com → 10 mail.example.com` |
+| **TXT** | Arbitrary text (SPF, verification) \{văn bản tùy ý\} | `example.com → "v=spf1 include:..."` |
+| **NS** | Nameserver for the zone \{nameserver của vùng\} | `example.com → ns1.example.com` |
+| **SRV** | Service location (host, port, priority) \{vị trí dịch vụ\} | `_xmpp._tcp → 5269 xmpp.example.com` |
+
+For **socket programming**, you care most about **A** and **AAAA** — they give you the IP to `connect()` \{Với **lập trình socket**, bạn quan tâm nhất **A** và **AAAA** — chúng cho IP để `connect()`\}. **CNAME** means "resolve this other name first"; **MX** / **TXT** / **SRV** matter for mail, auth, and service discovery, not typical TCP clients \{**CNAME** nghĩa là "phân giải tên khác trước"; **MX** / **TXT** / **SRV** dùng cho mail, xác thực, discovery — không phải client TCP thường\}.
+
+---
+
+## `dns.lookup` vs `dns.resolve` \{So sánh lookup và resolve\}
+
+Node's `node:dns` module exposes two families of APIs that beginners often conflate \{Module `node:dns` có hai họ API mà người mới hay nhầm\}.
+
+| API | What it does \{Làm gì\} | Under the hood \{Bên trong\} |
+|-----|------------------------|------------------------------|
+| **`dns.lookup`** | Hostname → IP for **connecting** \{Hostname → IP để **kết nối**\} | OS resolver via `getaddrinfo` — same path `net` / `http` use \{resolver OS qua `getaddrinfo` — cùng đường `net` / `http` dùng\} |
+| **`dns.resolve` / `dns.promises.resolve4`** | Query DNS for **specific record types** \{Truy vấn DNS cho **loại bản ghi cụ thể**\} | Talks to DNS servers directly (UDP/TCP port 53) \{Nói trực tiếp với server DNS\} |
+
+Critical differences \{Khác biệt quan trọng\}:
+
+- **`dns.lookup`** respects OS settings ( `/etc/hosts`, mDNS, VPN split-DNS) and may return **either** IPv4 or IPv6 depending on system policy \{**`dns.lookup`** tuân cấu hình OS (`/etc/hosts`, mDNS, VPN) và có thể trả **IPv4 hoặc IPv6** tùy chính sách hệ thống\}.
+- **`dns.resolve4`** always asks the network for **A records** — you get what DNS says, not what the OS "prefers" for connecting \{**`dns.resolve4`** luôn hỏi mạng lấy **bản ghi A** — bạn nhận đúng DNS nói, không phải OS "ưu tiên" khi kết nối\}.
+- **`dns.lookup` uses the libuv thread pool** for the blocking `getaddrinfo` call — many concurrent lookups can **starve** other pool work (file I/O, some crypto) \{**`dns.lookup` dùng libuv thread pool** cho `getaddrinfo` blocking — nhiều lookup đồng thời có thể **đói** việc khác trong pool (file I/O, crypto)\}.
+- **`dns.promises.resolve*`** is fully async from Node's perspective — better for bulk DNS inspection \{**`dns.promises.resolve*`** async hoàn toàn từ góc nhìn Node — tốt hơn khi tra DNS hàng loạt\}.
+
+Use **`lookup`** when you want "the address I'd connect with" \{Dùng **`lookup`** khi muốn "địa chỉ tôi sẽ kết nối"\}. Use **`resolve4` / `resolve6` / `resolveMx`** when you need **raw DNS data** or multiple answers \{Dùng **`resolve4` / `resolve6` / `resolveMx`** khi cần **dữ liệu DNS thô** hoặc nhiều câu trả lời\}.
+
+---
+
+## Resolving names in TypeScript \{Phân giải tên bằng TypeScript\}
+
+Save as `resolve-demo.ts` and run with `npx tsx resolve-demo.ts` (or compile with `tsc` first) \{Lưu thành `resolve-demo.ts` và chạy bằng `npx tsx resolve-demo.ts`\}.
+
+### `dns.promises.lookup` — OS resolver path \{Đường resolver OS\}
+
+```typescript
+import { lookup } from 'node:dns/promises';
+
+// What net.connect() effectively uses: one "best" address for connecting.
+const { address, family } = await lookup('example.com');
+console.log(`lookup → ${address} (IPv${family})`);
+// e.g. lookup → 93.184.216.34 (IPv4)
+```
+
+`family` is `4` or `6` — telling you which stack the OS picked \{`family` là `4` hoặc `6` — cho biết OS chọn stack nào\}. Pass `\{ all: true \}` to get **every** address the OS would try (useful for dual-stack debugging) \{Truyền `\{ all: true \}` để lấy **mọi** địa chỉ OS sẽ thử (hữu ích debug dual-stack)\}:
+
+```typescript
+import { lookup } from 'node:dns/promises';
+
+const results = await lookup('example.com', { all: true });
+for (const r of results) {
+  console.log(`  ${r.address}  IPv${r.family}`);
+}
+```
+
+### `dns.promises.resolve4` — direct A-record query \{Truy vấn bản ghi A trực tiếp\}
+
+```typescript
+import { resolve4 } from 'node:dns/promises';
+
+// Talks to DNS servers; returns ALL A records (may be multiple!).
+const ipv4s = await resolve4('example.com');
+console.log('A records:', ipv4s);
+// A records: [ '93.184.216.34' ]
+```
+
+Large sites often return **several A records** for load balancing (round-robin DNS) \{Site lớn thường trả **nhiều bản ghi A** để cân bằng tải (round-robin DNS)\}. The OS / client may try them in order or pick one — do not assume one name equals one IP \{OS / client có thể thử theo thứ tự hoặc chọn một — đừng giả định một tên = một IP\}.
+
+### `dns.promises.resolveMx` — mail routing \{Định tuyến mail\}
+
+```typescript
+import { resolveMx } from 'node:dns/promises';
+
+const mx = await resolveMx('gmail.com');
+// Sorted by priority (lower = preferred).
+for (const record of mx) {
+  console.log(`priority ${record.priority} → ${record.exchange}`);
+}
+```
+
+### Reverse lookup — IP to hostname \{Tra ngược IP → hostname\}
+
+```typescript
+import { reverse } from 'node:dns/promises';
+
+const hostnames = await reverse('93.184.216.34');
+console.log('PTR:', hostnames);
+// PTR: [ 'example.com', 'www.example.com', ... ]  (depends on PTR record)
+```
+
+Reverse DNS uses **PTR** records; missing PTR is normal and not an error for forward connections \{Reverse DNS dùng bản ghi **PTR**; thiếu PTR là bình thường, không ảnh hưởng kết nối thuận\}.
+
+---
+
+## IPv4, IPv6, and dual-stack \{IPv4, IPv6 và dual-stack\}
+
+The Internet still runs mostly on **IPv4** (`192.0.2.1`, four bytes) \{Internet vẫn chủ yếu **IPv4** (bốn byte)\}. **IPv6** (`2001:db8::1`, 128 bits) solves address exhaustion and simplifies routing \{**IPv6** giải quyết cạn kiệt địa chỉ và đơn giản hóa định tuyến\}.
+
+A **dual-stack** host has both \{Máy **dual-stack** có cả hai\}:
+
+- **A record** → IPv4
+- **AAAA record** → IPv6
+
+When you `lookup('example.com')` without hints, Node/OS applies **Happy Eyeballs**-style policy: try addresses with low latency, often preferring IPv6 when available \{Khi `lookup('example.com')` không gợi ý, Node/OS áp dụng chính sách kiểu **Happy Eyeballs**: thử địa chỉ có độ trễ thấp, thường ưu tiên IPv6 nếu có\}. To force a family:
+
+```typescript
+import { lookup, resolve4, resolve6 } from 'node:dns/promises';
+
+const v4only = await lookup('example.com', { family: 4 });
+const v6only = await lookup('example.com', { family: 6 }).catch(() => null);
+
+const allA = await resolve4('example.com');
+const allAAAA = await resolve6('example.com').catch(() => [] as string[]);
+
+console.log({ v4only, v6only, allA, allAAAA });
+```
+
+`resolve6` may throw `ENODATA` if no AAAA exists — always handle that in production code \{`resolve6` có thể ném `ENODATA` nếu không có AAAA — luôn xử lý trong code production\}.
+
+---
+
+## TTL, caching, and stale answers \{TTL, cache và câu trả lời cũ\}
+
+Every DNS response includes a **TTL** in seconds \{Mỗi phản hồi DNS có **TTL** tính bằng giây\}. Resolvers and the OS cache the mapping until TTL expires \{Resolver và OS cache ánh xạ đến khi TTL hết hạn\}.
+
+| Layer | What gets cached \{Cache gì\} |
+|-------|------------------------------|
+| OS resolver | Recent `lookup` results \{Kết quả `lookup` gần đây\} |
+| Recursive resolver (8.8.8.8, etc.) | Answers per TTL from upstream \{Câu trả lời theo TTL từ upstream\} |
+| Your app | Only if **you** cache — Node does not cache `resolve4` across calls \{Chỉ khi **bạn** cache — Node không cache `resolve4` giữa các lần gọi\} |
+
+Implications for network programmers \{Hàm ý cho lập trình viên mạng\}:
+
+- After a deploy or failover, some clients still hit the **old IP** until TTL elapses \{Sau deploy hay failover, một số client vẫn tới **IP cũ** đến khi TTL hết\}.
+- Lower TTL (e.g. 60s) speeds propagation but increases DNS query load \{TTL thấp (vd 60s) lan nhanh nhưng tăng tải truy vấn DNS\}.
+- Calling `resolve4` on every HTTP request wastes work — `lookup` + connection reuse (Part 5+) is the normal path \{Gọi `resolve4` mỗi request HTTP lãng phí — `lookup` + tái sử dụng kết nối (Phần 5+) là đường thường gặp\}.
+
+Inspect TTL with `resolve4` options (Node 18+) or external tools like `dig` \{Xem TTL bằng tùy chọn `resolve4` (Node 18+) hoặc `dig`\}:
+
+```bash
+dig example.com A +noall +answer
+# example.com.  86400  IN  A  93.184.216.34
+#                 ^^^^^ TTL in seconds
+```
+
+---
+
+## Implicit lookup when you connect \{Lookup ngầm khi connect\}
+
+You never *have* to call `dns` yourself \{Bạn không *bắt buộc* gọi `dns` trước\}. Passing a hostname to `net.connect` triggers resolution automatically \{Truyền hostname cho `net.connect` sẽ tự phân giải\}:
+
+```typescript
+import { connect } from 'node:net';
+
+// Implicit dns.lookup inside — blocks threadpool briefly, then connects.
+const socket = connect({ host: 'example.com', port: 80 }, () => {
+  console.log('connected to', socket.remoteAddress, 'port', socket.remotePort);
+  socket.end();
+});
+
+socket.on('error', (err) => console.error('connect failed:', err.message));
+```
+
+The sequence is: **resolve hostname → pick address → TCP handshake** (Part 2) \{Trình tự: **phân giải hostname → chọn địa chỉ → bắt tay TCP** (Phần 2)\}. If DNS fails, you get `ENOTFOUND` before any packet reaches the server \{DNS lỗi → `ENOTFOUND` trước khi packet tới server\}. If you already have an IP, pass it directly and skip DNS entirely \{Đã có IP thì truyền thẳng, bỏ qua DNS\}.
+
+---
+
+## Mistakes beginners make \{Lỗi người mới hay mắc\}
+
+- ❌ Using **`resolve4`** when you meant **`lookup`** — different data sources, different semantics \{Dùng **`resolve4`** khi ý là **`lookup`** — nguồn dữ liệu và ngữ nghĩa khác nhau\}.
+- ❌ Ignoring **TTL and caching** — wondering why clients still reach a dead IP minutes after a DNS change \{Bỏ qua **TTL và cache** — thắc mắc vì sao client vẫn tới IP chết sau khi đổi DNS\}.
+- ❌ Assuming **one hostname = one IP** — round-robin returns many A records; connections may land on different machines \{Giả định **một hostname = một IP** — round-robin trả nhiều A; kết nối có thể tới máy khác nhau\}.
+- ❌ Firing thousands of **`dns.lookup`** calls in parallel — exhausts the **libuv thread pool** and stalls unrelated async work \{Gọi hàng nghìn **`dns.lookup`** song song — cạn **libuv thread pool** và làm chậm việc async khác\}.
+
+---
+
+## Exercises \{Bài tập\}
+
+Try each before opening the solution \{Thử từng bài trước khi mở lời giải\}.
+
+1. Run `lookup('localhost')` and `resolve4('localhost')` — compare `address` / results and explain any difference \{Chạy cả hai và so sánh kết quả, giải thích khác biệt\}.
+2. Call `resolve4('google.com')` twice — note how many IPs return; explain why a single `connect('google.com', 443)` still works \{Gọi `resolve4('google.com')` hai lần — đếm số IP; giải thích vì sao `connect` vẫn hoạt động\}.
+3. Write a function `resolveAll(host: string)` that returns `\{ ipv4: string[]; ipv6: string[] \}` using `resolve4` and `resolve6`, returning empty arrays when a family is missing \{Viết hàm trả về cả IPv4 và IPv6, mảng rỗng khi thiếu\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```typescript
+import { lookup, resolve4, resolve6 } from 'node:dns/promises';
+
+// 1. localhost — OS resolver vs direct DNS
+const os = await lookup('localhost');
+const direct = await resolve4('localhost');
+console.log('lookup:', os);       // often ::1 (IPv6) on modern macOS/Linux
+console.log('resolve4:', direct); // often ['127.0.0.1'] from DNS/hosts
+
+// lookup follows getaddrinfo policy; resolve4 asks DNS for A records only.
+
+// 2. google.com — many A records, connect picks one
+const ips = await resolve4('google.com');
+console.log(`${ips.length} A records:`, ips.slice(0, 3), '...');
+// connect() uses lookup + Happy Eyeballs; one successful TCP handshake is enough.
+
+// 3. resolveAll
+async function resolveAll(host: string): Promise<{ ipv4: string[]; ipv6: string[] }> {
+  const [ipv4, ipv6] = await Promise.all([
+    resolve4(host).catch(() => [] as string[]),
+    resolve6(host).catch(() => [] as string[]),
+  ]);
+  return { ipv4, ipv6 };
+}
+
+console.log(await resolveAll('example.com'));
+```
+
+`lookup('localhost')` may return `::1` while `resolve4` returns `127.0.0.1` because the OS prefers IPv6 loopback but the A record (or `/etc/hosts`) still lists IPv4 \{`lookup` có thể trả `::1` còn `resolve4` trả `127.0.0.1` vì OS ưu tiên IPv6 loopback nhưng bản ghi A vẫn là IPv4\}. Google publishes many A records for load spreading; `connect` only needs one working address \{Google có nhiều A để cân tải; `connect` chỉ cần một địa chỉ hoạt động\}.
+
+</details>
+
+---
+
+## Takeaway \{Điều cốt lõi\}
+
+DNS bridges **human names** and **machine addresses** through a cached, hierarchical resolution chain \{DNS nối **tên con người** với **địa chỉ máy** qua chuỗi phân giải phân cấp có cache\}. In Node, **`dns.lookup`** follows the OS path that `net` and `http` use; **`dns.resolve*`** queries DNS directly for specific record types \{Trong Node, **`dns.lookup`** đi theo đường OS mà `net` và `http` dùng; **`dns.resolve*`** hỏi DNS trực tiếp theo loại bản ghi\}. Respect **TTL**, expect **multiple IPs**, and avoid flooding **lookup** on the thread pool \{Tôn trọng **TTL**, chấp nhận **nhiều IP**, tránh làm ngập **lookup** trên thread pool\}. With names resolved, Part 5 builds real **HTTP** on top of the TCP socket you already know \{Đã phân giải tên, Phần 5 xây **HTTP** thật trên socket TCP bạn đã biết\}.

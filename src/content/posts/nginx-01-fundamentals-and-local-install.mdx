@@ -1,0 +1,232 @@
+---
+title: 'Nginx from Zero to Production · Part 1 — Fundamentals & Local Install'
+description: 'Start Nginx from zero: what it really is (web server, reverse proxy, load balancer), the master/worker event-driven model, install it locally on macOS/Linux/Docker, and serve your first static site — with exercises.'
+pubDate: 2026-05-05
+tags: [nginx, web-server, devops, beginner, nginx_5]
+series: nginx
+seriesOrder: 1
+draft: false
+---
+
+This is **Part 1 of a 5-part series** that takes you from "I've seen `nginx` in a tutorial" to confidently configuring, proxying, securing, and *debugging* Nginx in production \{Đây là **Phần 1 của series 5 bài** đưa bạn từ "mới thấy `nginx` trong tutorial" đến tự tin cấu hình, proxy, bảo mật và *debug* Nginx trên production\}. Every part is **hands-on** and ends with **exercises** — install things, break things, fix them \{Mỗi phần đều **thực hành** và kết thúc bằng **bài tập** — cài đặt, làm hỏng, rồi sửa\}.
+
+Nginx (pronounced "engine-x") powers a huge share of the web: it sits in front of your app and decides **what** to serve, **how**, and **to whom** \{Nginx (đọc là "engine-x") chạy phía sau một phần lớn của web: nó đứng trước ứng dụng của bạn và quyết định **phục vụ cái gì**, **như thế nào**, và **cho ai**\}. By the end of Part 1 you'll have it running on your machine, serving a real page \{Hết Phần 1, bạn sẽ có nó chạy trên máy mình, phục vụ một trang thật\}.
+
+---
+
+## 1. What is Nginx, really? \{Nginx thực ra là gì?\}
+
+People call Nginx a "web server", but that undersells it \{Người ta gọi Nginx là "web server", nhưng nói vậy là chưa đủ\}. It is one binary that plays **four roles** \{Nó là một binary đóng **bốn vai trò**\}:
+
+- **Static web server** — serve HTML, CSS, JS, images straight from disk, very fast \{**Web server tĩnh** — phục vụ HTML, CSS, JS, ảnh thẳng từ đĩa, rất nhanh\}.
+- **Reverse proxy** — receive a request and forward it to a backend app (Node, Python, Go…), then relay the response back \{**Reverse proxy** — nhận request rồi chuyển tiếp tới ứng dụng backend (Node, Python, Go…), sau đó chuyển response về\}.
+- **Load balancer** — spread traffic across many backend instances \{**Load balancer** — chia tải qua nhiều instance backend\}.
+- **TLS terminator / cache / gatekeeper** — handle HTTPS, cache responses, rate-limit abusers \{**Đầu cuối TLS / cache / người gác cổng** — xử lý HTTPS, cache response, giới hạn tốc độ kẻ lạm dụng\}.
+
+```text
+                 ┌──────────────────────── NGINX ────────────────────────┐
+   Internet ───► │  TLS termination · routing · cache · rate-limit        │
+                 │        │                    │                          │
+                 │        ▼                    ▼                          │
+                 │  serve /static         proxy_pass to app(s)            │
+                 └────────┼────────────────────┼─────────────────────────┘
+                          ▼                     ▼
+                    files on disk        ┌─── app :3000 ───┐
+                    (html, css, js)      │  app :3001       │  (upstream pool)
+                                         └─── app :3002 ───┘
+```
+
+The mental model for the whole series \{Mô hình tư duy cho cả series\}: **Nginx is the front door of your system** \{**Nginx là cửa trước của hệ thống**\}. Everything that reaches your app passes through it first \{Mọi thứ chạm tới app của bạn đều đi qua nó trước\}.
+
+### Why is it so fast? \{Tại sao nó nhanh đến vậy?\}
+
+Older servers (like classic Apache prefork) spawn **one thread or process per connection** \{Các server cũ (như Apache prefork cổ điển) tạo **một thread hoặc process cho mỗi kết nối**\}. 10,000 connections → 10,000 threads → huge memory and context-switching cost \{10.000 kết nối → 10.000 thread → tốn bộ nhớ và chi phí chuyển ngữ cảnh khổng lồ\}. This is the classic **C10k problem** \{Đây là **bài toán C10k** kinh điển\}.
+
+Nginx uses an **event-driven, asynchronous** model instead \{Nginx dùng mô hình **hướng sự kiện, bất đồng bộ** thay thế\}: a small fixed number of **worker processes**, each handling **thousands of connections** in a single thread via an event loop (`epoll` on Linux, `kqueue` on BSD/macOS) \{một số ít **worker process** cố định, mỗi cái xử lý **hàng nghìn kết nối** trong một thread duy nhất qua event loop (`epoll` trên Linux, `kqueue` trên BSD/macOS)\}. No thread-per-connection, so memory stays flat as traffic grows \{Không có chuyện một thread mỗi kết nối, nên bộ nhớ giữ ổn định khi traffic tăng\}.
+
+---
+
+## 2. The master / worker architecture \{Kiến trúc master / worker\}
+
+When Nginx starts, you get **one master process** and **several worker processes** \{Khi Nginx khởi động, bạn có **một master process** và **vài worker process**\}:
+
+```text
+   master process            (runs as root: reads config, binds :80/:443)
+      │  forks
+      ├── worker process #1   (runs as unprivileged user: handles requests)
+      ├── worker process #2
+      ├── worker process #3
+      └── worker process #4   (usually one per CPU core)
+```
+
+Division of labor \{Phân chia công việc\}:
+
+- The **master** reads and validates config, binds privileged ports (80/443), and manages workers — but it does **not** handle requests \{**Master** đọc và kiểm tra config, gắn vào cổng đặc quyền (80/443), và quản lý worker — nhưng nó **không** xử lý request\}.
+- Each **worker** handles actual client connections \{Mỗi **worker** xử lý kết nối client thật\}. They run as a low-privilege user (e.g. `www-data`, `nginx`) for safety \{Chúng chạy dưới user ít quyền (vd `www-data`, `nginx`) để an toàn\}.
+
+This split is why Nginx can **reload config with zero downtime** \{Sự phân chia này là lý do Nginx có thể **reload config mà không downtime**\}: the master starts new workers with the new config, lets old workers finish their in-flight requests, then retires them \{master khởi động worker mới với config mới, để worker cũ xử lý nốt request đang dang dở, rồi cho nghỉ\}. We'll use this constantly \{Ta sẽ dùng điều này liên tục\}:
+
+```bash
+nginx -t            # test config syntax BEFORE applying (do this every time)
+nginx -s reload     # graceful reload: no dropped connections
+```
+
+> Rule for the whole series \{Quy tắc cho cả series\}: **always `nginx -t` before `reload`** \{**luôn `nginx -t` trước khi `reload`**\}. A typo in production config that you `reload` blindly can take the site down \{Một lỗi gõ trong config production mà bạn `reload` mù quáng có thể làm sập site\}.
+
+---
+
+## 3. Install Nginx locally \{Cài Nginx trên máy\}
+
+Pick the path that matches your machine \{Chọn cách phù hợp với máy bạn\}. I recommend installing **natively** for Parts 1–4 (fast feedback) and we'll cover **Docker** properly in Part 5 \{Tôi khuyên cài **trực tiếp (native)** cho Phần 1–4 (phản hồi nhanh) và ta sẽ làm **Docker** đàng hoàng ở Phần 5\}.
+
+### macOS (Homebrew) \{macOS (Homebrew)\}
+
+```bash
+brew install nginx
+brew services start nginx     # start now + on login
+# Homebrew nginx listens on :8080 by default (no sudo needed)
+curl -I http://localhost:8080
+```
+
+### Linux (Debian/Ubuntu) \{Linux (Debian/Ubuntu)\}
+
+```bash
+sudo apt update && sudo apt install -y nginx
+sudo systemctl enable --now nginx   # start + enable on boot
+curl -I http://localhost              # listens on :80
+```
+
+### Any OS (Docker) \{Mọi OS (Docker)\}
+
+```bash
+docker run --name nginx-lab -d -p 8080:80 nginx
+curl -I http://localhost:8080
+```
+
+Whatever the path, a successful response looks like this \{Dù cách nào, một response thành công trông như sau\}:
+
+```text
+HTTP/1.1 200 OK
+Server: nginx/1.27.0
+Content-Type: text/html
+```
+
+If you see `Server: nginx`, you're live \{Nếu thấy `Server: nginx`, bạn đã chạy được\}. If `curl` says *connection refused*, Nginx isn't running or you used the wrong port \{Nếu `curl` báo *connection refused*, Nginx chưa chạy hoặc bạn dùng sai cổng\}.
+
+---
+
+## 4. Where do the files live? \{File nằm ở đâu?\}
+
+This trips up every beginner because it differs by platform \{Điều này làm rối mọi người mới vì nó khác nhau theo nền tảng\}. Find your real paths with one command \{Tìm đường dẫn thật bằng một lệnh\}:
+
+```bash
+nginx -V 2>&1 | tr ' ' '\n' | grep -E 'conf-path|prefix'
+```
+
+Typical locations \{Vị trí thường gặp\}:
+
+| Platform \{Nền tảng\}     | Main config \{Config chính\}              | Site configs \{Config site\}            |
+| ------------------------- | ----------------------------------------- | --------------------------------------- |
+| Ubuntu/Debian             | `/etc/nginx/nginx.conf`                   | `/etc/nginx/sites-available/*` + `conf.d/*.conf` |
+| macOS (Homebrew, Apple)   | `/opt/homebrew/etc/nginx/nginx.conf`      | `/opt/homebrew/etc/nginx/servers/*`     |
+| macOS (Homebrew, Intel)   | `/usr/local/etc/nginx/nginx.conf`         | `/usr/local/etc/nginx/servers/*`        |
+| Docker (`nginx` image)    | `/etc/nginx/nginx.conf`                   | `/etc/nginx/conf.d/*.conf`              |
+
+The big idea \{Ý chính\}: the main `nginx.conf` usually ends with an `include` line that pulls in **all your per-site config files** \{`nginx.conf` chính thường kết thúc bằng dòng `include` để kéo vào **tất cả file config từng-site của bạn**\}. You rarely edit `nginx.conf` itself — you drop a file into the included folder \{Bạn hiếm khi sửa chính `nginx.conf` — bạn thả một file vào thư mục được include\}.
+
+```nginx
+# Near the bottom of nginx.conf — this is what loads your files:
+http {
+    # ...
+    include /etc/nginx/conf.d/*.conf;        # Docker / RHEL style
+    include /etc/nginx/sites-enabled/*;      # Debian/Ubuntu style
+}
+```
+
+---
+
+## 5. Serve your first static site \{Phục vụ site tĩnh đầu tiên\}
+
+Let's serve our own page instead of the default welcome screen \{Hãy phục vụ trang của riêng ta thay vì màn hình chào mặc định\}.
+
+**Step 1 — create a site folder and an HTML file** \{Bước 1 — tạo thư mục site và một file HTML\}:
+
+```bash
+sudo mkdir -p /var/www/lab
+echo '<h1>Hello from Nginx</h1>' | sudo tee /var/www/lab/index.html
+```
+
+**Step 2 — write a server block** \{Bước 2 — viết một server block\}. Create a file in your includes folder (e.g. `/etc/nginx/conf.d/lab.conf`) \{Tạo một file trong thư mục includes (vd `/etc/nginx/conf.d/lab.conf`)\}:
+
+```nginx
+# /etc/nginx/conf.d/lab.conf
+server {
+    listen 8081;              # the port this site answers on
+    server_name localhost;    # which hostname this block handles
+
+    root /var/www/lab;        # base folder for files
+    index index.html;         # default file when a directory is requested
+}
+```
+
+**Step 3 — test and reload** \{Bước 3 — test và reload\}:
+
+```bash
+sudo nginx -t          # "syntax is ok" + "test is successful"
+sudo nginx -s reload
+curl http://localhost:8081     # → <h1>Hello from Nginx</h1>
+```
+
+What each directive did \{Mỗi directive đã làm gì\}:
+
+- `listen 8081` — accept connections on port 8081 \{nhận kết nối ở cổng 8081\}.
+- `server_name localhost` — handle requests whose `Host` header is `localhost` \{xử lý request có `Host` header là `localhost`\}.
+- `root /var/www/lab` — when a path like `/index.html` is requested, look for `/var/www/lab/index.html` on disk \{khi request đường dẫn như `/index.html`, tìm `/var/www/lab/index.html` trên đĩa\}.
+- `index index.html` — if the URL is a directory (`/`), serve `index.html` from it \{nếu URL là một thư mục (`/`), phục vụ `index.html` trong đó\}.
+
+You just configured Nginx end to end \{Bạn vừa cấu hình Nginx trọn vẹn\}. Everything in this series builds on this `server { ... }` block \{Mọi thứ trong series này đều xây trên block `server { ... }` này\}.
+
+---
+
+## 6. Reading what happened — logs \{Đọc xem chuyện gì đã xảy ra — log\}
+
+Nginx writes two logs you'll live in \{Nginx ghi hai log mà bạn sẽ sống cùng\}: the **access log** (every request) and the **error log** (problems) \{**access log** (mọi request) và **error log** (sự cố)\}. Tail them while you `curl` \{Theo dõi chúng trong khi `curl`\}:
+
+```bash
+# paths vary; check `nginx -V` output or these common ones
+sudo tail -f /var/log/nginx/access.log    # one line per request
+sudo tail -f /var/log/nginx/error.log     # config + runtime errors
+```
+
+A typical access line tells you the method, path, status, and size \{Một dòng access tiêu biểu cho biết method, path, status và kích thước\}:
+
+```text
+127.0.0.1 - - [05/May/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 31 "-" "curl/8.4.0"
+                                            └ request ─────┘ └sts┘└sz┘        └ user-agent ┘
+```
+
+When something breaks later in this series, your **first move is `tail -f` the error log** — it almost always tells you exactly what's wrong \{Khi có gì hỏng ở các phần sau, **việc đầu tiên là `tail -f` error log** — nó gần như luôn nói chính xác cái gì sai\}.
+
+---
+
+## 7. Recap \{Tóm tắt\}
+
+- Nginx is a **front door**: static server, reverse proxy, load balancer, TLS/cache/gatekeeper — one binary \{Nginx là **cửa trước**: server tĩnh, reverse proxy, load balancer, TLS/cache/gác cổng — một binary\}.
+- It's fast because of an **event-driven worker model**, not thread-per-connection \{Nó nhanh nhờ **mô hình worker hướng sự kiện**, không phải một-thread-mỗi-kết-nối\}.
+- **master** manages config + workers; **workers** serve requests \{**master** quản lý config + worker; **worker** phục vụ request\}.
+- Workflow you'll repeat forever \{Quy trình bạn sẽ lặp lại mãi\}: edit config → `nginx -t` → `nginx -s reload` → check logs \{sửa config → `nginx -t` → `nginx -s reload` → xem log\}.
+
+Next up — **Part 2: the configuration model** \{Tiếp theo — **Phần 2: mô hình cấu hình**\}: contexts, `location` matching, `try_files`, virtual hosts — the grammar behind every config you'll ever write \{contexts, khớp `location`, `try_files`, virtual host — ngữ pháp đằng sau mọi config bạn sẽ viết\}.
+
+---
+
+## Exercises \{Bài tập\}
+
+Do these on your own machine — reading isn't enough \{Làm trên máy của bạn — đọc thôi không đủ\}.
+
+1. **Install & verify** \{Cài & kiểm tra\}: install Nginx via your platform's method and confirm the welcome page with `curl -I` \{cài Nginx theo cách của nền tảng bạn và xác nhận trang chào bằng `curl -I`\}.
+2. **Find your paths** \{Tìm đường dẫn\}: run `nginx -V` and locate your `nginx.conf` and includes folder \{chạy `nginx -V` và xác định `nginx.conf` cùng thư mục includes\}.
+3. **Serve your own page** \{Phục vụ trang của bạn\}: create a `server` block on port `8081` serving a folder with your own `index.html` \{tạo một block `server` ở cổng `8081` phục vụ một thư mục với `index.html` của bạn\}.
+4. **Break it on purpose** \{Cố tình làm hỏng\}: delete a `;` in your config, run `nginx -t`, and read the exact error message and line number \{xoá một dấu `;` trong config, chạy `nginx -t`, và đọc thông báo lỗi cùng số dòng chính xác\}.
+5. **Watch the logs** \{Xem log\}: `tail -f` the access log, hit your page 3 times, and identify the status code and byte size of each request \{`tail -f` access log, truy cập trang 3 lần, và xác định status code cùng kích thước byte của mỗi request\}.
+6. **Stretch** \{Nâng cao\}: change `worker_processes` in `nginx.conf` to `2`, reload, and confirm with `ps aux | grep nginx` that exactly two workers run \{đổi `worker_processes` trong `nginx.conf` thành `2`, reload, và xác nhận bằng `ps aux | grep nginx` rằng đúng hai worker đang chạy\}.

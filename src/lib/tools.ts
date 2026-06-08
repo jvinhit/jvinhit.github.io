@@ -32,6 +32,13 @@ export interface Tool {
   href: string;
   icon: ToolIcon;
   tags: string[];
+  /**
+   * Full-viewport "app" demo (canvas, game, fixed-height layout) whose content
+   * height equals the viewport rather than flowing. The `/tools/view/*` viewer
+   * gives these a tall fixed iframe height instead of content auto-fit, which
+   * would otherwise collapse them.
+   */
+  app?: boolean;
 }
 
 export interface ToolSection {
@@ -41,6 +48,14 @@ export interface ToolSection {
 
 const standaloneTools: Tool[] = [
   {
+    name: 'Landing Animation Lab',
+    description:
+      'Live lab of landing-page & component animation techniques — page-load orchestration, scroll reveal, stagger, text reveal, parallax, magnetic hover, gestures, page transitions, reduced motion.',
+    href: '/tools/landing-animations-demo/',
+    icon: 'sparkles',
+    tags: ['animation', 'ux', 'react', 'demo'],
+  },
+  {
     name: 'Stock Chart Patterns',
     description:
       'Interactive gallery of common technical-analysis chart patterns — head & shoulders, double tops, triangles, flags — drawn with neckline, breakout, and target annotations.',
@@ -49,12 +64,21 @@ const standaloneTools: Tool[] = [
     tags: ['investing', 'charts', 'demo'],
   },
   {
+    name: 'iOS Video Playback Lab',
+    description:
+      'Toggle playsinline, muted, autoplay, loop & controls on a live <video> and watch the generated tag, playback status, and an event log — including the iOS fullscreen takeover and the rejected play() promise.',
+    href: '/tools/ios-video-playsinline-demo/',
+    icon: 'sparkles',
+    tags: ['ios', 'video', 'demo'],
+  },
+  {
     name: 'Vietlott Mega Draw',
     description:
       'Random number generator for Vietlott 6/45 & 6/55 with animated draw experience.',
     href: '/tools/vietlott-lottery/',
     icon: 'dices',
     tags: ['random', 'game', 'phaser'],
+    app: true,
   },
   {
     name: 'Workflow Canvas Demo',
@@ -63,6 +87,7 @@ const standaloneTools: Tool[] = [
     href: '/tools/workflow-canvas-demo/',
     icon: 'wrench',
     tags: ['canvas', 'workflow', 'demo'],
+    app: true,
   },
   {
     name: 'Placeholder & Skeleton Demo',
@@ -111,6 +136,7 @@ const standaloneTools: Tool[] = [
     href: '/tools/cors-flow-demo/',
     icon: 'gitfork',
     tags: ['cors', 'canvas', 'demo'],
+    app: true,
   },
 ];
 
@@ -198,6 +224,14 @@ const jsSeriesTools: Tool[] = [
 ];
 
 const cssSeriesTools: Tool[] = [
+  {
+    name: 'CSS Grid — Complete Reference',
+    description:
+      'Every grid property in one interactive lab — track builder, the fr unit, auto-fit/minmax responsive, template-areas presets, alignment matrix, item placement (span/lines/dense), and a full container + item cheat sheet.',
+    href: '/tools/css-grid-complete-demo/',
+    icon: 'layers',
+    tags: ['css', 'demo', 'css_10'],
+  },
   {
     name: 'Flexbox vs Grid Playground',
     description:

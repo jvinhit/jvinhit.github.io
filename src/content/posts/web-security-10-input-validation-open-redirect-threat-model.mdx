@@ -1,0 +1,342 @@
+---
+title: 'Web Security for Frontend Devs · Part 10 — Input Validation, Open Redirects & a Frontend Threat Model'
+description: 'Series finale: why client validation is UX not security, open-redirect fixes, DOM risks beyond XSS, postMessage hygiene, and a practical frontend threat-model checklist tying Parts 1–9 — with exercises.'
+pubDate: 2025-06-15
+tags: [web-security, frontend, threat-modeling, web_security_10]
+series: web-security
+seriesOrder: 10
+draft: false
+---
+
+import SecurityDiagram from '../../components/blog/SecurityDiagram.astro';
+
+> **Part 10 of 10** in the Web Security for Frontend Devs series \{**Phần 10/10** trong series Web Security for Frontend Devs\}. Previous \{Trước\}: [Part 9 — Secrets, Data Leakage & Supply-Chain](/blog/web-security-09-secrets-data-leakage-supply-chain/).
+
+This is **Part 10 of a 10-part series** (the finale) on the web-security essentials *every* frontend developer should know — and actively prevent \{Đây là **Phần 10 của series 10 bài** (**chốt series**) về những kiến thức bảo mật web mà *mọi* frontend dev nên biết — và chủ động phòng tránh\}. You have walked origins, XSS, CSP, CSRF, tokens, CORS, framing, headers, and supply chain \{Bạn đã đi qua origin, XSS, CSP, CSRF, token, CORS, framing, header, và supply chain\}. This capstone ties the threads together: **what crosses the trust boundary**, how to **validate hostile input on the server**, and how to **threat-model a frontend** before you ship \{Bài chốt nối các mảnh: **thứ gì vượt biên tin cậy**, **validate input thù địch trên server**, và **threat-model frontend** trước khi ship\}.
+
+---
+
+## Client-side validation is UX, not security \{Validate phía client là UX, không phải bảo mật\}
+
+[Part 1](/blog/web-security-01-browser-security-same-origin-policy/) already stated the rule: **never trust the client** \{[Phần 1](/blog/web-security-01-browser-security-same-origin-policy/) đã nêu quy tắc: **đừng tin client**\}. The user controls DevTools, can disable JavaScript constraints, replay requests with `curl`, and patch minified bundles \{Người dùng điều khiển DevTools, bỏ ràng buộc JS, replay request bằng `curl`, và vá bundle minify\}. A `required` attribute, a disabled submit button, or a Zod parse in the browser is **advisory** — it improves experience and catches honest mistakes, but it is **not a security control** \{Thuộc tính `required`, nút submit `disabled`, hay Zod trên trình duyệt chỉ **gợi ý** — giúp UX và bắt lỗi vô ý, nhưng **không phải kiểm soát bảo mật**\}.
+
+**Vulnerable mental model** \{**Mô hình tư duy lỗi**\}: "We disabled the Pay button until the form is valid, so attackers cannot submit bad data." \{Chúng ta `disabled` nút Pay cho đến khi form hợp lệ, nên attacker không gửi được dữ liệu xấu."\}
+
+```html
+<!-- UX only — trivially bypassed -->
+<form id="checkout">
+  <input name="amount" type="number" required min="1" max="10_000" />
+  <button type="submit" disabled>Pay</button>
+</form>
+```
+
+An attacker sends `POST /api/checkout` with `amount=-1` or `amount=999999` directly — the server must reject it \{Attacker gửi `POST /api/checkout` với `amount=-1` hoặc `amount=999999` trực tiếp — server phải từ chối\}.
+
+**Fix** \{**Sửa**\}: duplicate rules **on the server** (same schema, same limits) and enforce **authorization** there too — "can this user pay this invoice?" is never answered in the browser alone \{lặp rule **trên server** (cùng schema, cùng giới hạn) và **authorization** cũng ở đó — "user này có được trả hóa đơn này?" không chỉ trả lời trên trình duyệt\}.
+
+```ts
+// server/handler.ts — authoritative layer
+import { z } from 'zod';
+
+const CheckoutBody = z.object({
+  invoiceId: z.string().uuid(),
+  amountCents: z.number().int().min(1).max(10_000_00),
+});
+
+export async function postCheckout(req: Request, session: Session): Promise<Response> {
+  const parsed = CheckoutBody.safeParse(await req.json());
+  if (!parsed.success) {
+    return Response.json({ error: 'invalid_body' }, { status: 400 });
+  }
+  const invoice = await db.invoices.find(parsed.data.invoiceId);
+  if (!invoice || invoice.userId !== session.userId) {
+    return Response.json({ error: 'forbidden' }, { status: 403 });
+  }
+  if (invoice.amountCents !== parsed.data.amountCents) {
+    return Response.json({ error: 'amount_mismatch' }, { status: 400 });
+  }
+  // … charge
+  return Response.json({ ok: true });
+}
+```
+
+Still validate on the client — users deserve fast feedback \{Vẫn validate trên client — user xứng đáng phản hồi nhanh\}. Treat that layer as the **first, untrusted pass** \{Coi lớp đó là **lần kiểm tra đầu, không tin cậy**\}:
+
+```ts
+// client/checkout.ts — same schema, UX only
+import { z } from 'zod';
+
+const CheckoutForm = z.object({
+  invoiceId: z.string().uuid(),
+  amountCents: z.coerce.number().int().min(1).max(10_000_00),
+});
+
+function onSubmit(raw: unknown): void {
+  const result = CheckoutForm.safeParse(raw);
+  if (!result.success) {
+    showFieldErrors(result.error.flatten());
+    return;
+  }
+  void fetch('/api/checkout', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(result.data),
+  });
+}
+```
+
+Share schema types via a package or OpenAPI-generated types so client and server do not drift \{Chia sẻ kiểu schema qua package hoặc type sinh từ OpenAPI để client/server không lệch\}. The server **always** runs its own parse — never "trust the SPA already validated" \{Server **luôn** parse riêng — không "tin SPA đã validate rồi"\}.
+
+---
+
+## Open redirects \{Open redirect\}
+
+**Open redirect** vulnerabilities appear when your app reflects an untrusted URL into `Location`, `res.redirect()`, or `location.href` after login — common parameter names: `?next=`, `?returnUrl=`, `?redirect_uri=` \{**Open redirect** xuất hiện khi app phản chiếu URL không tin cậy vào `Location`, `res.redirect()`, hoặc `location.href` sau đăng nhập — thường `?next=`, `?returnUrl=`, `?redirect_uri=`\}. An attacker sends victims a **trusted link on your domain** that immediately bounces to `https://evil.com` \{Attacker gửi nạn nhân **link tin cậy trên domain bạn** rồi nhảy sang `https://evil.com`\}:
+
+- **Phishing** — clone your login on `evil.com` after the victim believed they started on you \{**Phishing** — nhái login trên `evil.com` sau khi nạn nhân tưởng bắt đầu từ bạn\}.
+- **OAuth / SSO token leakage** — some flows echo tokens in the fragment on the redirect target \{**Rò token OAuth/SSO** — một số flow nhét token vào fragment trên URL đích\}.
+
+**Vulnerable** \{**Lỗ hổng**\}:
+
+```ts
+// ❌ reflects attacker-controlled absolute URL
+export function GET(req: Request): Response {
+  const next = new URL(req.url).searchParams.get('next') ?? '/dashboard';
+  return Response.redirect(next, 302);
+}
+```
+
+```ts
+// ❌ client-side equivalent
+const params = new URLSearchParams(window.location.search);
+const next = params.get('returnUrl') ?? '/home';
+location.href = next; // ?returnUrl=https://evil.com
+```
+
+**Fixed** — allowlist **same-origin relative paths** only; reject `//`, `http:`, `https:`, backslashes, and encoded bypasses \{**Đã sửa** — allowlist **path tương đối cùng origin**; từ chối `//`, `http:`, `https:`, backslash, và bypass encode\}:
+
+```ts
+const ALLOWED_POST_LOGIN_PATHS = new Set([
+  '/dashboard',
+  '/settings/profile',
+  '/checkout/complete',
+]);
+
+function resolveSafeRedirect(raw: string | null, fallback = '/dashboard'): string {
+  if (!raw) return fallback;
+
+  // Reject absolute, protocol-relative, and backslash tricks
+  if (
+    raw.startsWith('http:') ||
+    raw.startsWith('https:') ||
+    raw.startsWith('//') ||
+    raw.includes('\\') ||
+    raw.includes('%5c') ||
+    raw.includes('%2f%2f')
+  ) {
+    return fallback;
+  }
+
+  // Must be a single leading-slash path (no open redirect via userinfo)
+  if (!raw.startsWith('/') || raw.startsWith('//') || raw.includes('://')) {
+    return fallback;
+  }
+
+  const pathOnly = raw.split('?')[0]?.split('#')[0] ?? raw;
+  if (!ALLOWED_POST_LOGIN_PATHS.has(pathOnly)) {
+    return fallback;
+  }
+
+  return raw;
+}
+
+export function GET(req: Request): Response {
+  const next = new URL(req.url).searchParams.get('next');
+  const safe = resolveSafeRedirect(next);
+  return Response.redirect(new URL(safe, req.url).toString(), 302);
+}
+```
+
+For OAuth `redirect_uri`, use **pre-registered client redirect URLs** on the server — never a free-form query param from the browser alone \{Với OAuth `redirect_uri`, dùng **URL redirect đăng ký sẵn** trên server — không param query tự do chỉ từ trình duyệt\}. Map post-login navigation to **known routes**, not arbitrary strings \{Điều hướng sau login map tới **route đã biết**, không chuỗi tùy ý\}.
+
+---
+
+## postMessage and iframe boundaries \{postMessage và biên iframe\}
+
+[Part 7](/blog/web-security-07-clickjacking-framing/) covered framing and cross-frame messaging \{[Phần 7](/blog/web-security-07-clickjacking-framing/) đã nói framing và messaging giữa frame\}. Brief recap for the trust boundary \{Tóm tắt cho biên tin cậy\}:
+
+- **`event.origin`** must match an allowlist before you act on `event.data` \{**`event.origin`** phải khớp allowlist trước khi xử lý `event.data`\}.
+- **`postMessage(payload, targetOrigin)`** — use an explicit origin; **`'*'` is never appropriate for secrets** \{**`postMessage(payload, targetOrigin)`** — origin rõ; **`'*'` không bao giờ phù hợp cho secret**\}.
+- Prefer **server-mediated handoffs** (one-time codes) over passing tokens through `postMessage` \{Ưu tiên **trao đổi qua server** (mã một lần) thay vì đẩy token qua `postMessage`\}.
+
+```ts
+const TRUSTED = new Set(['https://app.example.com']);
+
+window.addEventListener('message', (event: MessageEvent) => {
+  if (!TRUSTED.has(event.origin)) return;
+  // narrow event.data with a type guard, then act
+});
+```
+
+---
+
+## DOM-based risks beyond classic XSS \{Rủi ro DOM ngoài XSS cổ điển\}
+
+[Part 2](/blog/web-security-02-xss-cross-site-scripting/) focused on script injection \{[Phần 2](/blog/web-security-02-xss-cross-site-scripting/) tập trung inject script\}. Other **client-side sinks** still matter when data is attacker-influenced \{**Sink phía client** khác vẫn quan trọng khi dữ liệu bị attacker chi phối\}:
+
+**Dangerous URL schemes** \{**Scheme URL nguy hiểm**\} — assigning user input to `a.href`, `location.href`, or `window.open` without validation can execute `javascript:…` \{Gán input user vào `a.href`, `location.href`, `window.open` không validate có thể chạy `javascript:…`\}:
+
+```ts
+function isSafeHttpUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw, window.location.origin);
+    return u.protocol === 'https:' || u.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+function navigateUserSuppliedLink(raw: string): void {
+  if (!isSafeHttpUrl(raw)) return;
+  window.location.assign(new URL(raw, window.location.origin).href);
+}
+```
+
+**Reverse tabnabbing** \{**Reverse tabnabbing**\} — `target="_blank"` without `rel` lets the new page call `window.opener.location = 'https://evil.com'` \{`target="_blank"` thiếu `rel` cho phép tab mới gọi `window.opener.location = 'https://evil.com'`\}:
+
+```html
+<a href="https://docs.example.com/guide" target="_blank" rel="noopener noreferrer">
+  External docs
+</a>
+```
+
+**Template injection** \{**Template injection**\} — client frameworks that compile HTML strings (`v-html`, `dangerouslySetInnerHTML`, lit `unsafeHTML`) are XSS sinks; treat them like `innerHTML` from Part 2 and prefer bindings that escape by default \{Template client biên dịch chuỗi HTML là sink XSS; xử lý như `innerHTML` Phần 2, ưu tiên binding escape mặc định\}. **CSP** (Part 3) and **Trusted Types** remain your backstop when a sink slips through review \{**CSP** (Phần 3) và **Trusted Types** vẫn là lớp cuối khi sink lọt review\}.
+
+---
+
+## The trust boundary \{Biên tin cậy\}
+
+Every frontend security decision eventually answers one question: **what is allowed to cross from the untrusted client to the trusted server?** \{Mọi quyết định bảo mật frontend cuối cùng trả lời: **thứ gì được phép vượt từ client không tin cậy sang server tin cậy?**\}
+
+<SecurityDiagram
+  kind="threat-model"
+  caption="Client is hostile: validate and authorize on the server — every input crossing the boundary is untrusted until proven safe"
+/>
+
+The diagram is the capstone picture: **left = client (untrusted)**, **right = server (trusted)**, **arrow = trust boundary** \{Diagram là ảnh chốt: **trái = client (không tin)**, **phải = server (tin)**, **mũi tên = biên tin cậy**\}. Anything the browser sends — form fields, JSON bodies, headers the user can forge, `localStorage` echoed in a header, URL params — is **hostile until validated** \{Mọi thứ trình duyệt gửi — field form, body JSON, header user giả mạo, `localStorage` nhét vào header, param URL — **thù địch cho đến khi validate**\}.
+
+---
+
+## A frontend threat-model checklist \{Checklist threat-model frontend\}
+
+Use this on a real feature before merge \{Dùng trên feature thật trước khi merge\}. For each row, name the **input**, the **asset at risk**, and the **part** that teaches the fix \{Mỗi dòng: **input**, **tài sản rủi ro**, **phần** dạy cách sửa\}.
+
+| Input / channel \{Input / kênh\} | What can go wrong \{Có thể sai gì\} | Series pointer \{Trỏ series\} |
+| --- | --- | --- |
+| URL, query, hash, `document.referrer` | Open redirect, DOM XSS sinks, leaked tokens in fragment | Part 2, **this post** |
+| Forms & `fetch` bodies | CSRF, validation bypass, IDOR if server trusts client IDs | Part 4, **this post** |
+| Cookies & `Authorization` | CSRF auto-send, token theft via XSS | Parts 1, 4, 5 |
+| `localStorage` / `sessionStorage` | Any XSS reads secrets; never store refresh tokens for SPAs without hardening | Part 5 |
+| Cross-origin `fetch` + credentials | Misconfigured CORS exposing data to wrong origins | Part 6 |
+| Third-party `<script>` / npm deps | Supply-chain RCE in your origin | Part 9 |
+| `<iframe>` embed + `postMessage` | Clickjacking, confused-deputy messaging | Part 7 |
+| HTML you generate | XSS stored/reflected/DOM | Part 2 |
+| Policy surface | Missing CSP, weak `frame-ancestors`, no HSTS | Parts 3, 7, 8 |
+| Build & env | Secrets in client bundle, `.env` in repo | Part 9 |
+
+**Walkthrough** \{**Đi từng bước**\}:
+
+1. **Draw the boundary** — browser + your JS = untrusted; API + DB = trusted \{**Vẽ biên** — trình duyệt + JS bạn = không tin; API + DB = tin\}.
+2. **Enumerate inputs** — every param, header, cookie, message, file upload, and WebSocket frame \{**Liệt kê input** — mọi param, header, cookie, message, upload, frame WebSocket\}.
+3. **Enumerate assets** — session, PII, admin actions, billing, API keys (must not be in client bundle) \{**Liệt kê tài sản** — phiên, PII, hành động admin, billing, API key (không được trong bundle client)\}.
+4. **Map controls** — for each input→asset pair, list server validation, authz, encoding, and browser hardening (CSP, SameSite, headers) \{**Map kiểm soát** — mỗi cặp input→asset: validate server, authz, encoding, cứng trình duyệt (CSP, SameSite, header)\}.
+5. **Assume one layer fails** — if XSS lands, is the token still in `httpOnly` cookie? If CSRF fires, does the server need a custom header? \{**Giả định một lớp hỏng** — XSS vào thì token còn trong cookie `httpOnly`? CSRF xảy ra thì server có cần header tùy chỉnh?\}.
+
+---
+
+## Frontend security pre-ship checklist \{Checklist pre-ship bảo mật frontend\}
+
+Run this before a major release \{Chạy trước release lớn\}:
+
+- **SOP awareness** — know what cross-origin **reads** vs **sends/embeds** (Part 1) \{**Hiểu SOP** — biết **đọc** vs **gửi/nhúng** cross-origin (Phần 1)\}.
+- **Output encoding / sanitization** — escape text; sanitize HTML; avoid raw sinks (Part 2) \{**Encode / sanitize output** — escape text; sanitize HTML; tránh sink thô (Phần 2)\}.
+- **CSP** deployed with nonces/hashes; report-only tested first (Part 3) \{**CSP** với nonce/hash; thử report-only trước (Phần 3)\}.
+- **CSRF** — `SameSite` cookies + anti-CSRF token or custom header on mutations (Part 4) \{**CSRF** — cookie `SameSite` + token anti-CSRF hoặc header tùy chỉnh trên mutation (Phần 4)\}.
+- **Token storage** — prefer `httpOnly` session cookies; never treat `localStorage` as safe (Part 5) \{**Lưu token** — ưu tiên cookie phiên `httpOnly`; không coi `localStorage` an toàn (Phần 5)\}.
+- **CORS** — explicit allowlists; never `*` with credentials (Part 6) \{**CORS** — allowlist rõ; không `*` kèm credentials (Phần 6)\}.
+- **Anti-clickjacking** — `frame-ancestors` / `X-Frame-Options`; sandbox third-party iframes (Part 7) \{**Chống clickjacking** — `frame-ancestors` / XFO; sandbox iframe bên thứ ba (Phần 7)\}.
+- **HTTPS + security headers + SRI** — HSTS, `X-Content-Type-Options`, Referrer-Policy, Subresource Integrity for CDN scripts (Parts 8, 9) \{**HTTPS + header + SRI** — HSTS, X-Content-Type-Options, Referrer-Policy, SRI cho script CDN (Phần 8, 9)\}.
+- **Dependency hygiene** — lockfile, audit, pin versions; vet new packages (Part 9) \{**Vệ sinh dependency** — lockfile, audit, pin version; duyệt package mới (Phần 9)\}.
+- **Server-side validation & authz** on every mutating API — client checks are UX only (**this post**) \{**Validate & authz server** trên mọi API đổi trạng thái — kiểm tra client chỉ là UX (**bài này**)\}.
+- **Redirect allowlists** — no open `next` / `returnUrl` (**this post**) \{**Allowlist redirect** — không open `next` / `returnUrl` (**bài này**)\}.
+
+> Mental model \{Mô hình tư duy\}: You are not "adding security at the end." You are **drawing boundaries early** and making each layer fail without catastrophe \{Bạn không "thêm bảo mật cuối". Bạn **vẽ biên sớm** và khiến mỗi lớp hỏng không gây thảm họa\}.
+
+---
+
+## Bài tập / Exercises
+
+**1.** Explain in two sentences why `required` on an `<input>` is not sufficient to cap `amount` on `/api/checkout`, and what the server must do instead \{Hai câu: vì sao `required` trên `<input>` không đủ giới hạn `amount` trên `/api/checkout`, server phải làm gì\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+The attacker is not bound by your HTML form — they can POST arbitrary JSON with any `amount` \{Attacker không bị ràng buộc form HTML — họ POST JSON tùy ý với mọi `amount`\}. The server must **parse and validate** the body (schema + business rules) and **authorize** that the session may pay that invoice at that amount \{Server phải **parse và validate** body (schema + rule nghiệp vụ) và **authorize** phiên được trả hóa đơn đó với số tiền đó\}.
+</details>
+
+**2.** Which of these `next` values should `resolveSafeRedirect` reject, and why? (a) `/dashboard` (b) `//evil.com/path` (c) `https://evil.com` (d) `/dashboard?tab=1` \{Giá trị `next` nào `resolveSafeRedirect` phải từ chối, vì sao? (a) `/dashboard` (b) `//evil.com/path` (c) `https://evil.com` (d) `/dashboard?tab=1`\}
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+Reject **(b)** protocol-relative `//evil.com` and **(c)** absolute `https://` — both send the victim off-origin \{Từ chối **(b)** `//evil.com` và **(c)** `https://` — đều đưa nạn nhân ra ngoài origin\}. **(a)** is fine if `/dashboard` is on the allowlist \{**(a)** ổn nếu `/dashboard` trong allowlist\}. **(d)** is acceptable only if your allowlist logic permits query strings on allowed paths (the sample checks `pathOnly` before `?` — extend explicitly if product needs `?tab=`) \{**(d)** chấp nhận chỉ khi logic allowlist cho phép query trên path được phép (mẫu tách `pathOnly` trước `?` — mở rộng rõ nếu product cần `?tab=`)\}.
+</details>
+
+**3.** For a checkout page embedded in a partner iframe, list three controls from different parts of this series you would combine \{Trang checkout nhúng trong iframe đối tác, liệt kê ba kiểm soát từ các phần khác nhau trong series\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+Example stack \{Ví dụ xếp lớp\}:
+
+1. **Tight `frame-ancestors`** allowlisting only partner origins (Part 7) — not `'self'` globally on admin routes \{**`frame-ancestors` chặt** chỉ origin đối tác (Phần 7) — không `'self'` toàn cục trên route admin\}.
+2. **`postMessage` with `event.origin` checks** and explicit `targetOrigin` — no `'*'` for payment state (Part 7 + this post) \{**`postMessage` kiểm `event.origin`** và `targetOrigin` rõ — không `'*'` cho trạng thái thanh toán (Phần 7 + bài này)\}.
+3. **CSRF token or `SameSite` + custom header** on POST from the embed, plus **server-side validation** of amounts (Parts 4, 10) \{**Token CSRF hoặc `SameSite` + header tùy chỉnh** trên POST từ embed, cộng **validate server** số tiền (Phần 4, 10)\}.
+</details>
+
+**Stretch \{Nâng cao\}:** Pick one feature in an app you maintain. Draw the trust-boundary diagram in your notes, list five inputs and five assets, and map each input to at least one control from Parts 1–9 \{Chọn một feature trong app bạn duy trì. Vẽ diagram biên tin cậy, liệt kê năm input và năm tài sản, map mỗi input tới ít nhất một kiểm soát từ Phần 1–9\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+There is no single canonical answer — grading is whether every input has a **server-side** control and whether assets have **defense in depth** (e.g. PII behind authz + CSP + no secrets in bundle) \{Không có một đáp án chuẩn — đạt khi mỗi input có kiểm soát **phía server** và tài sản có **phòng thủ nhiều lớp** (vd PII sau authz + CSP + không secret trong bundle)\}. If any input maps only to "we validate in React," mark it **fail** until the API enforces the same rule \{Nếu input chỉ map "validate trong React," đánh **fail** cho đến khi API ép cùng rule\}.
+</details>
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- **Client validation is UX** — the server re-validates and authorizes every mutating request \{**Validate client là UX** — server validate lại và authorize mọi request đổi trạng thái\}.
+- **Open redirects** are fixed with **path allowlists**, not blind trust of `next` / `returnUrl` \{**Open redirect** sửa bằng **allowlist path**, không tin mù `next` / `returnUrl`\}.
+- **`postMessage`** requires **`event.origin`** checks and explicit `targetOrigin` — never `'*'` for secrets \{**`postMessage`** cần kiểm **`event.origin`** và `targetOrigin` rõ — không `'*'` cho secret\}.
+- **DOM risks** include `javascript:` URLs, `opener` tabnabbing, and template sinks — not only `<script>` injection \{**Rủi ro DOM** gồm URL `javascript:`, tabnabbing `opener`, sink template — không chỉ inject `<script>`\}.
+- **Threat-model** = boundary + inputs + assets + mapped controls across the series \{**Threat-model** = biên + input + tài sản + kiểm soát map theo series\}.
+
+---
+
+## The whole series \{Toàn bộ series\}
+
+You made it through all **10 parts**. Use this list to revisit any topic — each link is a standalone deep dive with diagrams, vulnerable-vs-fixed code, and exercises \{Bạn đã đi hết **10 phần**. Dùng danh sách này để ôn từng chủ đề — mỗi link là bài sâu độc lập có diagram, code lỗi/sửa, và bài tập\}.
+
+1. [Part 1 — The Browser Security Model & Same-Origin Policy](/blog/web-security-01-browser-security-same-origin-policy/)
+2. [Part 2 — Cross-Site Scripting (XSS)](/blog/web-security-02-xss-cross-site-scripting/)
+3. [Part 3 — Content Security Policy (CSP)](/blog/web-security-03-content-security-policy/)
+4. [Part 4 — CSRF & SameSite Cookies](/blog/web-security-04-csrf-samesite-cookies/)
+5. [Part 5 — Auth Tokens & Secure Storage](/blog/web-security-05-auth-tokens-secure-storage/)
+6. [Part 6 — CORS Explained](/blog/web-security-06-cors-explained/)
+7. [Part 7 — Clickjacking & Framing](/blog/web-security-07-clickjacking-framing/)
+8. [Part 8 — Secure Headers & HTTPS/TLS](/blog/web-security-08-secure-headers-https-tls/)
+9. [Part 9 — Secrets, Data Leakage & Supply-Chain](/blog/web-security-09-secrets-data-leakage-supply-chain/)
+10. Part 10 — Input Validation, Open Redirects & a Frontend Threat Model *(you are here)*
+
+You now have a **frontend security field guide**: not a checklist you paste once, but a way to **name trust boundaries**, **spot which part of the series applies**, and **ship without hoping the browser saves you** \{Giờ bạn có **cẩm nang bảo mật frontend**: không phải checklist dán một lần, mà cách **đặt tên biên tin cậy**, **nhận phần series nào áp dụng**, và **ship mà không trông trình duyệt cứu bạn**\}. Re-read any part when a PR adds a new `?next=` param, a `postMessage` listener, or "just one more `innerHTML`" — that is the series doing its job \{Đọc lại phần nào khi PR thêm `?next=`, listener `postMessage`, hay "thêm một `innerHTML` nữa" — đó là lúc series làm đúng việc\}. ← [Part 9 — Secrets, Data Leakage & Supply-Chain](/blog/web-security-09-secrets-data-leakage-supply-chain/)

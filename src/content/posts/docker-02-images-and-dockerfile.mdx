@@ -1,0 +1,361 @@
+---
+title: 'Docker for Developers · Part 2 — Images & the Dockerfile'
+description: 'Stop using other people''s images and build your own: Dockerfile instructions, how layers and the build cache work, multi-stage builds for tiny images, .dockerignore, and tagging.'
+pubDate: 2025-09-08
+tags: [docker, dockerfile, images, devops, docker_k8s_10]
+series: docker
+seriesOrder: 2
+draft: false
+---
+
+import DockerDiagram from '../../components/blog/DockerDiagram.astro';
+
+This is **Part 2 of a 10-part series** on Docker → Compose → Kubernetes \{Đây là **Phần 2 của series 10 bài** về Docker → Compose → Kubernetes\}. In [Part 1 — Containers, Images & the Mental Model](/blog/docker-01-fundamentals-containers-images/) you learned that an **image is a read-only template** and a **container is a running instance** \{Ở [Phần 1 — Container, Image & mô hình tư duy](/blog/docker-01-fundamentals-containers-images/) bạn đã học **image là khuôn mẫu chỉ-đọc** và **container là thực thể đang chạy**\}. This part is where you stop pulling only `nginx` and `node` from Docker Hub and **build your own images** with a `Dockerfile` \{Phần này là lúc bạn ngừng chỉ kéo `nginx` và `node` từ Docker Hub và **tự build image** bằng `Dockerfile`\}.
+
+Every part ends with **exercises**; do them on your machine \{Mỗi phần kết thúc bằng **bài tập**; hãy làm trên máy thật\}. You'll write Dockerfiles, exploit the build cache, shrink images with multi-stage builds, and tag images like a pro \{Bạn sẽ viết Dockerfile, tận dụng build cache, thu nhỏ image bằng multi-stage build và gắn tag image đúng cách\}.
+
+---
+
+## Anatomy of a Dockerfile — the core instructions \{Giải phẫu Dockerfile — các chỉ thị lõi\}
+
+A **Dockerfile** is a text recipe: each line is an instruction that becomes an **image layer** when you build \{Một **Dockerfile** là công thức văn bản: mỗi dòng là một chỉ thị trở thành một **layer image** khi bạn build\}. A minimal app might look like this \{Một app tối giản có thể như sau\}:
+
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY . .
+ENV NODE_ENV=production
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+| Instruction | Role \{Vai trò\} |
+|---|---|
+| `FROM` | Base image — every Dockerfile starts here \{Image nền — mọi Dockerfile bắt đầu từ đây\} |
+| `WORKDIR` | Set the working directory inside the image (creates dirs if needed) \{Đặt thư mục làm việc trong image (tạo thư mục nếu chưa có)\} |
+| `COPY` / `ADD` | Copy files from **build context** into the image; prefer `COPY` unless you need `ADD`'s tar/URL extras \{Copy file từ **build context** vào image; ưu tiên `COPY` trừ khi cần tính năng tar/URL của `ADD`\} |
+| `RUN` | Execute a command **at build time** (install packages, compile) \{Chạy lệnh **lúc build** (cài package, biên dịch)\} |
+| `ENV` | Set environment variables (available at build and run time) \{Đặt biến môi trường (dùng khi build và khi chạy)\} |
+| `EXPOSE` | Document which port the app listens on (does **not** publish it — you still need `-p` on `docker run`) \{Ghi nhận cổng app lắng nghe ( **không** tự publish — vẫn cần `-p` khi `docker run`)\} |
+| `CMD` | Default command when a container **starts** (overridable) \{Lệnh mặc định khi container **khởi động** (có thể ghi đè)\} |
+| `ENTRYPOINT` | Main executable — container is built around it (Part 2 covers vs `CMD` below) \{Tiến trình chính — container xoay quanh nó (so với `CMD` ở dưới)\} |
+
+> **`RUN` vs `CMD`**: `RUN` runs during `docker build`; `CMD` runs when you `docker run` \{**`RUN` vs `CMD`**: `RUN` chạy khi `docker build`; `CMD` chạy khi `docker run`\}. Mixing them up is a classic beginner mistake \{Nhầm hai cái là lỗi kinh điển của người mới\}.
+
+---
+
+## Build & tag your image \{Build & gắn tag image\}
+
+From the directory that contains your `Dockerfile` (and app files), build and name the result \{Từ thư mục chứa `Dockerfile` (và file app), build và đặt tên kết quả\}:
+
+```bash
+docker build -t myapp:1.0 .
+#              │      │   └── build context (usually ".")
+#              │      └────── tag (version or label)
+#              └───────────── repository name
+```
+
+- **Build context** = the folder Docker sends to the daemon (everything not excluded by `.dockerignore`) \{**Build context** = thư mục Docker gửi lên daemon (mọi thứ không bị `.dockerignore` loại)\}.
+- **`-t name:tag`** = repository + tag. Without a tag, Docker defaults to `latest` \{**`-t name:tag`** = repository + tag. Không có tag thì Docker mặc định `latest`\}.
+
+List and run what you built \{Liệt kê và chạy thứ vừa build\}:
+
+```bash
+docker images myapp
+docker run --rm -p 3000:3000 myapp:1.0
+```
+
+You can tag the same image ID under multiple names \{Cùng một image ID có thể gắn nhiều tên\}:
+
+```bash
+docker tag myapp:1.0 myapp:1.0-prod
+docker tag myapp:1.0 registry.example.com/myapp:1.0
+```
+
+Inspect metadata (layers, env, cmd) without running \{Xem metadata (layer, env, cmd) mà không cần chạy\}:
+
+```bash
+docker image inspect myapp:1.0
+docker history myapp:1.0    # which Dockerfile steps created which layers
+```
+
+---
+
+## Layers & the build cache \{Layer & build cache\}
+
+Each Dockerfile instruction that changes the filesystem creates a **new read-only layer** \{Mỗi chỉ thị Dockerfile thay đổi filesystem tạo một **layer chỉ-đọc** mới\}. Rebuilds are fast because Docker **reuses cached layers** when the instruction and its inputs haven't changed \{Build lại nhanh vì Docker **tái dùng layer cache** khi chỉ thị và input không đổi\}.
+
+<DockerDiagram
+  kind="image-layers"
+  caption="Each instruction adds a read-only layer (cached & shared); a container adds one thin writable layer on top"
+/>
+
+When you rebuild, Docker reuses every cached layer up to the first change, then rebuilds the rest \{Khi build lại, Docker tái dùng mọi layer cache cho tới chỗ thay đổi đầu tiên, rồi rebuild phần còn lại\}:
+
+```text
+  docker build (first time)              docker build (code changed only)
+ ┌─────────────────────────┐            ┌─────────────────────────┐
+ │ FROM node:20-alpine     │  CACHE ✓   │ FROM node:20-alpine     │  CACHE ✓
+ ├─────────────────────────┤            ├─────────────────────────┤
+ │ COPY package*.json      │  CACHE ✓   │ COPY package*.json      │  CACHE ✓
+ ├─────────────────────────┤            ├─────────────────────────┤
+ │ RUN npm ci              │  CACHE ✓   │ RUN npm ci              │  CACHE ✓
+ ├─────────────────────────┤            ├─────────────────────────┤
+ │ COPY . .                │  NEW       │ COPY . .                │  REBUILD ──► invalidates below
+ ├─────────────────────────┤            ├─────────────────────────┤
+ │ CMD ["node","server.js"]│  NEW       │ CMD ...                 │  REBUILD
+ └─────────────────────────┘            └─────────────────────────┘
+```
+
+**Cache invalidation rule**: once a layer rebuilds, **all following layers** rebuild too \{**Quy tắc vô hiệu cache**: một layer rebuild thì **mọi layer phía sau** cũng rebuild\}. That's why order matters \{Đó là lý do thứ tự quan trọng\}.
+
+### The dependency-first trick \{Mẹo copy dependency trước\}
+
+**Bad** — copy everything first; any code change busts `npm ci` \{**Tệ** — copy hết trước; đổi code làm hỏng cache `npm ci`\}:
+
+```dockerfile
+COPY . .
+RUN npm ci --omit=dev
+```
+
+**Good** — copy lockfiles, install, then copy source \{**Tốt** — copy lockfile, cài, rồi mới copy source\}:
+
+```dockerfile
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY . .
+```
+
+Same idea for Python (`requirements.txt` then `pip install`, then app code) or Go (`go.mod` / `go.sum` then `go mod download`) \{Cùng ý với Python (`requirements.txt` rồi `pip install`, rồi code) hoặc Go (`go.mod` / `go.sum` rồi `go mod download`)\}.
+
+Force a clean rebuild when debugging cache weirdness \{Build sạch khi debug cache lạ\}:
+
+```bash
+docker build --no-cache -t myapp:1.0 .
+```
+
+---
+
+## .dockerignore \{Tệp .dockerignore\}
+
+The build context is everything in `.` (minus ignores) — including `node_modules`, `.git`, and local secrets if you're not careful \{Build context là mọi thứ trong `.` (trừ ignore) — kể cả `node_modules`, `.git` và secret local nếu bạn không cẩn thận\}. A **`.dockerignore`** file (same syntax as `.gitignore`) keeps junk out \{**`.dockerignore`** (cú pháp giống `.gitignore`) giữ rác ra ngoài\}:
+
+```text
+node_modules
+.git
+.env
+.env.*
+dist
+coverage
+*.md
+Dockerfile*
+.dockerignore
+```
+
+Smaller context, fewer accidental secrets, and you won't overwrite image `node_modules` with your host copy \{Context nhỏ hơn, ít lộ secret, không ghi đè `node_modules` trong image bằng bản trên host\}.
+
+---
+
+## Multi-stage builds \{Build nhiều giai đoạn\}
+
+A **multi-stage Dockerfile** has more than one `FROM` — typically a **builder** stage with compilers and devDependencies, and a **runtime** stage that copies only the artifact you need \{**Dockerfile multi-stage** có nhiều hơn một `FROM` — thường là giai đoạn **builder** có compiler và devDependencies, và giai đoạn **runtime** chỉ copy artifact cần thiết\}.
+
+```text
+  STAGE "builder"                    STAGE "runtime" (final image)
+ ┌──────────────────────┐           ┌──────────────────────┐
+ │ node:20-alpine       │  COPY     │ node:20-alpine       │
+ │ npm ci + npm run     │ ────────► │ production deps only │
+ │ build → dist/        │  artifact │ + dist/              │
+ │ (~400 MB tools)      │           │ (~80 MB typical)     │
+ └──────────────────────┘           └──────────────────────┘
+        discarded                           what you ship
+```
+
+Example — compile in `builder`, run slim in `runtime` \{Ví dụ — build ở `builder`, chạy gọn ở `runtime`\}:
+
+```dockerfile
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine AS runtime
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY --from=builder /app/dist ./dist
+USER node
+CMD ["node", "dist/server.js"]
+```
+
+`COPY --from=builder` pulls only artifacts into the final image — compare with `docker images` (often **hundreds of MB smaller** than a single-stage build with dev tools) \{`COPY --from=builder` chỉ kéo artifact vào image cuối — so với `docker images` (thường **nhỏ hơn hàng trăm MB** so với single-stage có dev tools)\}.
+
+---
+
+## CMD vs ENTRYPOINT \{CMD vs ENTRYPOINT\}
+
+- **`CMD`** — default command when the container starts; `docker run myapp echo hi` **replaces** it entirely \{**`CMD`** — lệnh mặc định khi container khởi động; `docker run myapp echo hi` **thay thế** hoàn toàn\}.
+- **`ENTRYPOINT`** — fixed executable; extra `docker run` args **append** (unless you pass `--entrypoint`) \{**`ENTRYPOINT`** — tiến trình cố định; args thêm của `docker run` **nối vào** (trừ `--entrypoint`)\}.
+
+Prefer **exec form** `CMD ["node", "server.js"]` over shell form `CMD node server.js` — PID 1 gets signals correctly \{Ưu tiên **exec form** `CMD ["node", "server.js"]` thay vì shell form — PID 1 nhận signal đúng\}. Combine `ENTRYPOINT ["node"]` + `CMD ["server.js"]` when you want a stable binary with swappable default args \{Kết hợp `ENTRYPOINT ["node"]` + `CMD ["server.js"]` khi cần binary cố định với args mặc định đổi được\}.
+
+---
+
+## Common pitfalls \{Các bẫy thường gặp\}
+
+- **`latest` tag trap** — `latest` is not "newest stable"; it's just a label that moves. Pin versions in prod: `myapp:1.0.3` or digests `myapp@sha256:...` \{**Bẫy tag `latest`** — `latest` không phải "bản ổn định mới nhất"; chỉ là nhãn có thể đổi. Ghim version trên prod: `myapp:1.0.3` hoặc digest\}.
+- **Copy-everything-first** — busts the cache on every code edit; copy lockfiles/deps first \{**Copy hết trước** — phá cache mỗi lần sửa code; copy lockfile/dependency trước\}.
+- **Huge images** — full `node:20` instead of `node:20-alpine`, shipping devDependencies, no multi-stage \{**Image khổng lồ** — dùng `node:20` thay vì `node:20-alpine`, nhét devDependencies, không multi-stage\}.
+- **Running as root** — default user is `root`; leaks and container escapes hurt more. Use `USER` (non-root) — we'll go deeper in Part 7 \{**Chạy root** — user mặc định là `root`. Dùng `USER` (non-root) — đào sâu ở Phần 7\}.
+- **No `.dockerignore`** — slow builds, fat context, accidental secrets in layers \{**Không có `.dockerignore`** — build chậm, context phình, secret lọt vào layer\}.
+- **`EXPOSE` ≠ published port** — you still need `-p 3000:3000` on `docker run` \{**`EXPOSE` ≠ publish cổng** — vẫn cần `-p 3000:3000` khi `docker run`\}.
+
+---
+
+## Cheat sheet \{Bảng tra nhanh\}
+
+```bash
+# build & tag
+docker build -t myapp:1.0 .
+docker build --no-cache -t myapp:1.0 .
+docker tag myapp:1.0 myapp:latest
+docker images
+docker rmi myapp:1.0
+
+# inspect
+docker image inspect myapp:1.0
+docker history myapp:1.0
+
+# run what you built
+docker run --rm -p 3000:3000 myapp:1.0
+docker run --rm myapp:1.0 node -v   # override CMD
+
+# cleanup build cache
+docker builder prune
+```
+
+---
+
+## Bài tập / Exercises
+
+Create a folder `docker-lab-02/` and work there \{Tạo thư mục `docker-lab-02/` và làm bài trong đó\}. Each task is self-contained \{Mỗi bài độc lập\}.
+
+**1.** Write a `Dockerfile` for this tiny Node app and build it as `hello-docker:1.0` \{Viết `Dockerfile` cho app Node nhỏ và build thành `hello-docker:1.0`\}. Create `package.json` (`name`: `hello-docker`, `main`: `server.js`, empty `dependencies`) and `server.js` (HTTP on `PORT` default 3000, body `Hello from my image`) \{Tạo `package.json` và `server.js` như mô tả\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json ./
+RUN npm install --omit=dev
+COPY server.js .
+ENV PORT=3000
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+```bash
+docker build -t hello-docker:1.0 .
+docker run --rm -p 3000:3000 hello-docker:1.0
+curl http://localhost:3000
+```
+</details>
+
+**2.** Reorder the Dockerfile: `COPY package.json` + `RUN npm install` **before** `COPY server.js`. Change only `server.js` and rebuild — `RUN npm install` should show `CACHED` \{Sắp xếp lại: copy `package.json` + `npm install` **trước** `server.js`; sửa chỉ `server.js`, build lại — `RUN npm install` phải `CACHED`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev
+COPY server.js .
+CMD ["node", "server.js"]
+```
+
+```bash
+# first build
+docker build -t hello-docker:1.0 .
+
+# edit server.js (e.g. change the response string)
+docker build -t hello-docker:1.0 .
+# watch output: RUN npm install → CACHED
+```
+</details>
+
+**3.** Convert exercise 1 into a **multi-stage** build: a `builder` stage that adds a build step (e.g. `echo "built" > dist.txt`), and a `runtime` stage that copies only `server.js` + `dist.txt` \{Chuyển bài 1 sang **multi-stage**: stage `builder` có bước build (vd `echo "built" > dist.txt`), stage `runtime` chỉ copy `server.js` + `dist.txt`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```dockerfile
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY server.js .
+RUN mkdir dist && echo "built at $(date -Iseconds)" > dist/build-stamp.txt
+
+FROM node:20-alpine AS runtime
+WORKDIR /app
+COPY server.js .
+COPY --from=builder /app/dist/build-stamp.txt ./dist/
+CMD ["node", "server.js"]
+```
+
+```bash
+docker build -t hello-docker:ms .
+docker run --rm hello-docker:ms cat dist/build-stamp.txt
+docker images hello-docker
+```
+</details>
+
+**4.** Build with two tags from one Dockerfile: `hello-docker:1.0` and `hello-docker:1.0-local`, then list them and confirm they share the same `IMAGE ID` \{Build hai tag từ một Dockerfile: `hello-docker:1.0` và `hello-docker:1.0-local`, liệt kê và xác nhận cùng `IMAGE ID`\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+docker build -t hello-docker:1.0 .
+docker tag hello-docker:1.0 hello-docker:1.0-local
+docker images hello-docker
+# same IMAGE ID column for both tags
+```
+</details>
+
+**5.** Run your image detached on port `3100`, verify with `curl`, read logs, then stop and remove \{Chạy image ở chế độ detached cổng `3100`, kiểm tra bằng `curl`, xem log, rồi dừng và xóa\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```bash
+docker run --name hello -d -p 3100:3000 hello-docker:1.0
+curl http://localhost:3100
+docker logs hello
+docker stop hello && docker rm hello
+```
+</details>
+
+**Stretch \{Nâng cao\}:** add a `.dockerignore` that excludes a large dummy folder, compare `docker build` context size with and without it (watch the "transferring context" line) \{Thêm `.dockerignore` loại thư mục dummy lớn, so sánh kích thước context khi build (dòng "transferring context")\}.
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- A **Dockerfile** is a layer-by-layer recipe; **`RUN` is build-time**, **`CMD`/`ENTRYPOINT` are run-time** \{**Dockerfile** là công thức từng layer; **`RUN` lúc build**, **`CMD`/`ENTRYPOINT` lúc chạy**\}.
+- **Order instructions for cache**: dependencies before application source \{**Sắp xếp cho cache**: dependency trước source app\}.
+- **`.dockerignore`** keeps context small and secrets out \{**`.dockerignore`** giữ context nhỏ và chặn secret\}.
+- **Multi-stage builds** ship slim runtime images without compilers and dev tooling \{**Multi-stage** đưa image runtime gọn, không kéo compiler và dev tool\}.
+- **Tag intentionally** — avoid relying on `latest` in production \{**Tag có chủ đích** — đừng phụ thuộc `latest` trên production\}.
+
+---
+
+## Next up \{Tiếp theo\}
+
+[Part 3 — Persisting Data: Volumes, Bind Mounts & Env](/blog/docker-03-data-volumes-bind-mounts-env/) — volumes, bind mounts, and environment variables so data survives container restarts \{**Phần 3** — volume, bind mount và biến môi trường để dữ liệu sống sót khi container restart\}. ← [Part 1](/blog/docker-01-fundamentals-containers-images/)

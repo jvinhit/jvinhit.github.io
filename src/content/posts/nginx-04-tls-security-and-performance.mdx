@@ -1,0 +1,250 @@
+---
+title: 'Nginx from Zero to Production · Part 4 — TLS, Security & Performance'
+description: 'Production-grade Nginx: HTTPS with a local self-signed cert (and Let''s Encrypt), HTTP/2, gzip/brotli, response caching with proxy_cache, rate limiting, and the security headers every site needs — with exercises.'
+pubDate: 2026-05-26
+tags: [nginx, tls, security, performance, nginx_5]
+series: nginx
+seriesOrder: 4
+draft: false
+---
+
+Your proxy from [Part 3](/blog/nginx-03-reverse-proxy-and-load-balancing) works, but it's naked HTTP \{Proxy của bạn từ [Phần 3](/blog/nginx-03-reverse-proxy-and-load-balancing) chạy được, nhưng nó là HTTP trần\}. This part adds the four things that separate a toy from production \{Phần này thêm bốn thứ tách một đồ chơi khỏi production\}: **encryption, compression, caching, and protection** \{**mã hoá, nén, caching, và bảo vệ**\}.
+
+We'll practice all of it locally with a self-signed certificate \{Ta sẽ thực hành tất cả cục bộ với một chứng chỉ tự ký\}.
+
+---
+
+## 1. HTTPS with a local certificate \{HTTPS với chứng chỉ cục bộ\}
+
+In production you'll get a free certificate from Let's Encrypt (next section) \{Trên production bạn sẽ lấy chứng chỉ miễn phí từ Let's Encrypt (phần sau)\}. To learn locally, generate a **self-signed** one \{Để học cục bộ, tạo một cái **tự ký**\}:
+
+```bash
+sudo mkdir -p /etc/nginx/certs
+sudo openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout /etc/nginx/certs/local.key \
+  -out    /etc/nginx/certs/local.crt \
+  -subj "/CN=localhost"
+```
+
+Now an HTTPS server block \{Giờ là một server block HTTPS\}:
+
+```nginx
+server {
+    listen 443 ssl;
+    http2  on;                    # enable HTTP/2 (Nginx 1.25.1+ syntax)
+    server_name localhost;
+
+    ssl_certificate     /etc/nginx/certs/local.crt;
+    ssl_certificate_key /etc/nginx/certs/local.key;
+
+    # Modern, safe defaults
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;     # reuse handshakes → faster reconnects
+
+    location / {
+        proxy_pass http://app_pool;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+```bash
+sudo nginx -t && sudo nginx -s reload
+curl -k https://localhost/        # -k: accept the self-signed cert locally
+```
+
+`-k` skips trust verification because a self-signed cert isn't in your trust store — that's expected locally, never in production \{`-k` bỏ qua xác thực tin cậy vì chứng chỉ tự ký không có trong kho tin cậy — điều này bình thường ở local, không bao giờ ở production\}.
+
+### Redirect all HTTP to HTTPS \{Chuyển hết HTTP sang HTTPS\}
+
+Keep a tiny port-80 block whose only job is to bounce visitors to HTTPS \{Giữ một block cổng 80 nhỏ với nhiệm vụ duy nhất là đẩy khách sang HTTPS\}:
+
+```nginx
+server {
+    listen 80;
+    server_name localhost;
+    return 301 https://$host$request_uri;   # permanent redirect to https
+}
+```
+
+---
+
+## 2. Let's Encrypt for real domains \{Let's Encrypt cho domain thật\}
+
+On a public server with a real domain, **Certbot** automates everything — issuing, installing, and renewing free certificates \{Trên server công khai với domain thật, **Certbot** tự động hoá mọi thứ — cấp, cài, và gia hạn chứng chỉ miễn phí\}:
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d example.com -d www.example.com
+# edits your Nginx config, obtains the cert, and sets up auto-renewal
+sudo certbot renew --dry-run     # verify renewal works
+```
+
+Certificates last 90 days; Certbot installs a timer to renew them automatically \{Chứng chỉ sống 90 ngày; Certbot cài một timer để gia hạn tự động\}. You don't touch them again \{Bạn không phải đụng tới chúng nữa\}.
+
+---
+
+## 3. Compression — gzip & brotli \{Nén — gzip & brotli\}
+
+Compressing text responses cuts bytes on the wire by 60–80% \{Nén response dạng text cắt 60–80% byte trên đường truyền\}. Enable gzip in the `http` context \{Bật gzip trong context `http`\}:
+
+```nginx
+http {
+    gzip on;
+    gzip_comp_level 5;                 # 1=fast/large … 9=slow/small; 5 is a good balance
+    gzip_min_length 1024;             # don't bother compressing tiny responses
+    gzip_vary on;                      # add "Vary: Accept-Encoding" for caches
+    gzip_types
+        text/plain text/css application/json
+        application/javascript text/xml application/xml image/svg+xml;
+}
+```
+
+Note \{Lưu ý\}: `gzip_types` should **not** include already-compressed formats (JPEG, PNG, MP4, woff2) — re-compressing them wastes CPU for ~0 gain \{`gzip_types` **không** nên gồm các định dạng đã nén (JPEG, PNG, MP4, woff2) — nén lại chúng tốn CPU mà gần như không lợi\}.
+
+**Brotli** compresses ~15–20% better than gzip and is supported by all modern browsers \{**Brotli** nén tốt hơn gzip ~15–20% và được mọi trình duyệt hiện đại hỗ trợ\}. It needs the `ngx_brotli` module (bundled in many distros / the official image variants) \{Nó cần module `ngx_brotli` (đi kèm trong nhiều distro / các biến thể image chính thức)\}:
+
+```nginx
+brotli on;
+brotli_comp_level 5;
+brotli_types text/css application/javascript application/json image/svg+xml;
+```
+
+Verify which one a response used \{Kiểm tra response dùng cái nào\}:
+
+```bash
+curl -H 'Accept-Encoding: gzip, br' -I https://localhost/app.css -k
+# → Content-Encoding: br   (or gzip)
+```
+
+---
+
+## 4. Static caching headers \{Header cache cho file tĩnh\}
+
+Tell browsers to cache fingerprinted assets for a long time and HTML not at all \{Bảo trình duyệt cache asset có fingerprint thật lâu và HTML thì không\}. (For the full theory, see the [Frontend Caching deep dive](/blog/frontend-caching-deep-dive).) \{(Lý thuyết đầy đủ xem [bài Frontend Caching](/blog/frontend-caching-deep-dive).)\}
+
+```nginx
+# Hashed assets (app.a3f9.js) never change → cache for a year
+location ~* \.(js|css|woff2|png|jpg|svg)$ {
+    expires 1y;
+    add_header Cache-Control "public, immutable";
+    access_log off;                 # don't log every asset hit
+}
+
+# HTML is the entry point → must revalidate so deploys take effect
+location = /index.html {
+    add_header Cache-Control "no-cache";
+}
+```
+
+---
+
+## 5. Response caching with `proxy_cache` \{Cache response với `proxy_cache`\}
+
+Nginx can cache **backend responses** so repeated requests never touch your app — turning a slow API into an instant one \{Nginx có thể cache **response backend** để request lặp lại không chạm app — biến một API chậm thành tức thì\}.
+
+```nginx
+# 1) define the cache store (in http context)
+proxy_cache_path /var/cache/nginx levels=1:2
+                 keys_zone=api_cache:10m max_size=1g inactive=60m;
+
+server {
+    location /api/ {
+        proxy_pass http://app_pool;
+
+        proxy_cache api_cache;                      # use the store above
+        proxy_cache_valid 200 302 60s;              # cache OK responses 60s
+        proxy_cache_valid 404 10s;                  # cache misses briefly too
+        proxy_cache_use_stale error timeout updating;  # serve stale if backend dies
+        add_header X-Cache-Status $upstream_cache_status;  # HIT / MISS / EXPIRED
+    }
+}
+```
+
+Watch it work \{Xem nó hoạt động\}:
+
+```bash
+curl -I https://localhost/api/products -k   # X-Cache-Status: MISS  (first hit)
+curl -I https://localhost/api/products -k   # X-Cache-Status: HIT   (served from cache)
+```
+
+`proxy_cache_use_stale` is the production hero \{`proxy_cache_use_stale` là người hùng production\}: if the backend is down or slow, Nginx serves the last good response instead of an error — your site stays up during a backend hiccup \{nếu backend chết hoặc chậm, Nginx phục vụ response tốt cuối cùng thay vì lỗi — site của bạn vẫn sống khi backend trục trặc\}.
+
+> Never cache **personalized** responses (anything behind login) in shared Nginx cache, or one user sees another's data \{Đừng bao giờ cache response **cá nhân hoá** (mọi thứ sau đăng nhập) trong cache Nginx dùng chung, kẻo user này thấy data của user khác\}. Bypass per-user routes \{Bỏ qua cache cho route theo-user\}: `proxy_cache_bypass $cookie_session;` \{`proxy_cache_bypass $cookie_session;`\}.
+
+---
+
+## 6. Rate limiting \{Giới hạn tốc độ\}
+
+Protect login endpoints and APIs from brute force and floods \{Bảo vệ endpoint đăng nhập và API khỏi brute force và lụt request\}. Define a "leaky bucket" zone, then apply it \{Định nghĩa một vùng "thùng rò", rồi áp dụng\}:
+
+```nginx
+# define zones in the http context, keyed by client IP
+limit_req_zone  $binary_remote_addr zone=api:10m   rate=10r/s;   # 10 req/sec/IP
+limit_req_zone  $binary_remote_addr zone=login:10m rate=5r/m;    # 5 req/min/IP
+
+server {
+    location /api/ {
+        limit_req zone=api burst=20 nodelay;   # allow short bursts up to 20
+        proxy_pass http://app_pool;
+    }
+
+    location /login {
+        limit_req zone=login burst=3;          # strict: brute-force defense
+        proxy_pass http://app_pool;
+    }
+}
+```
+
+How to read it \{Cách đọc\}:
+
+- `rate=10r/s` — the steady allowed rate per IP \{tốc độ cho phép ổn định mỗi IP\}.
+- `burst=20` — a queue absorbing short spikes above the rate \{một hàng đợi hấp thụ spike ngắn vượt tốc độ\}.
+- `nodelay` — serve the burst immediately rather than spacing it out; without it, queued requests are delayed to fit the rate \{phục vụ burst ngay thay vì giãn đều; thiếu nó, request trong hàng đợi bị trì hoãn cho khớp tốc độ\}.
+
+Over the limit, Nginx returns **503** (configurable via `limit_req_status 429;`) \{Vượt giới hạn, Nginx trả **503** (đổi được qua `limit_req_status 429;`)\}. Also cap concurrent connections per IP with `limit_conn` if needed \{Cũng có thể giới hạn số kết nối đồng thời mỗi IP bằng `limit_conn` nếu cần\}.
+
+---
+
+## 7. Security headers \{Header bảo mật\}
+
+A few headers harden every response \{Vài header làm cứng mọi response\}. (Deep background in the [Web Security series](/series/web-security).) \{(Nền tảng chi tiết trong [series Web Security](/series/web-security).)\}
+
+```nginx
+# HSTS: force HTTPS for 2 years (only add once HTTPS truly works!)
+add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+add_header X-Content-Type-Options    "nosniff" always;        # no MIME sniffing
+add_header X-Frame-Options           "SAMEORIGIN" always;     # anti-clickjacking
+add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
+# A starter Content-Security-Policy — tailor to your app
+add_header Content-Security-Policy   "default-src 'self'" always;
+```
+
+The `always` keyword matters \{Từ khoá `always` quan trọng\}: without it, Nginx omits the header on error responses (4xx/5xx) — and those are exactly the responses an attacker probes \{thiếu nó, Nginx bỏ header trên response lỗi (4xx/5xx) — mà đó chính là những response kẻ tấn công dò\}.
+
+> Add **HSTS only after** HTTPS is fully working \{Chỉ thêm **HSTS sau khi** HTTPS đã chạy hoàn chỉnh\}. It tells browsers to refuse plain HTTP for two years — ship it broken and you've locked users out \{Nó bảo trình duyệt từ chối HTTP thường suốt hai năm — ship khi còn lỗi là bạn khoá luôn user ở ngoài\}.
+
+---
+
+## 8. Recap \{Tóm tắt\}
+
+- Serve **HTTPS** (self-signed locally, Let's Encrypt in prod), enable **HTTP/2**, and 301-redirect HTTP→HTTPS \{Phục vụ **HTTPS** (tự ký ở local, Let's Encrypt ở prod), bật **HTTP/2**, và 301 redirect HTTP→HTTPS\}.
+- **Compress** text with gzip/brotli; don't recompress media \{**Nén** text bằng gzip/brotli; đừng nén lại media\}.
+- Cache static assets long, HTML never; cache backend responses with **`proxy_cache`** and survive outages via `proxy_cache_use_stale` \{Cache asset tĩnh lâu, HTML không bao giờ; cache response backend bằng **`proxy_cache`** và sống sót qua sự cố nhờ `proxy_cache_use_stale`\}.
+- **Rate-limit** APIs and especially `/login` \{**Giới hạn tốc độ** API và đặc biệt `/login`\}.
+- Add **security headers** with `always` \{Thêm **header bảo mật** kèm `always`\}.
+
+Next — **Part 5: production & debugging** \{Tiếp — **Phần 5: production & debug**\}: a complete real-world config (SPA + API + cache + TLS), Docker/Compose deployment, and a debugging cheat-sheet \{một config thực tế hoàn chỉnh (SPA + API + cache + TLS), triển khai Docker/Compose, và cheat-sheet debug\}.
+
+---
+
+## Exercises \{Bài tập\}
+
+1. **Local HTTPS** \{HTTPS cục bộ\}: generate a self-signed cert, serve `https://localhost`, and confirm with `curl -k -I` that you get `HTTP/2 200` \{tạo chứng chỉ tự ký, phục vụ `https://localhost`, và xác nhận bằng `curl -k -I` rằng bạn nhận `HTTP/2 200`\}.
+2. **Force HTTPS** \{Ép HTTPS\}: add the port-80 redirect block and verify `curl -I http://localhost` returns `301` to the `https://` URL \{thêm block redirect cổng 80 và xác minh `curl -I http://localhost` trả `301` tới URL `https://`\}.
+3. **Compression** \{Nén\}: enable gzip, then compare `Content-Length` of a CSS file with and without `Accept-Encoding: gzip` \{bật gzip, rồi so `Content-Length` của một file CSS khi có và không có `Accept-Encoding: gzip`\}.
+4. **proxy_cache** \{proxy_cache\}: cache `/api/` for 60s, add `X-Cache-Status`, and watch it flip `MISS → HIT` on the second request \{cache `/api/` trong 60s, thêm `X-Cache-Status`, và xem nó chuyển `MISS → HIT` ở request thứ hai\}.
+5. **Rate limit** \{Giới hạn tốc độ\}: set `/login` to `5r/m`, then hammer it with a loop (`for i in {1..10}; do curl -k -o /dev/null -s -w "%{http_code}\n" https://localhost/login; done`) and watch the **503**s appear \{đặt `/login` thành `5r/m`, rồi nã nó bằng vòng lặp và xem các **503** xuất hiện\}.
+6. **Stretch** \{Nâng cao\}: add all five security headers with `always`, then verify they appear even on a `404` response \{thêm cả năm header bảo mật kèm `always`, rồi xác minh chúng xuất hiện cả trên response `404`\}.
