@@ -1789,3 +1789,1261 @@ frontend system đều cần.
 - [web.dev — Back/forward cache](https://web.dev/articles/bfcache)
 - [Fastly — Surrogate-Control header](https://docs.fastly.com/en/guides/working-with-surrogate-keys)
 - [Cloudflare — Cache everything](https://developers.cloudflare.com/cache/)
+
+---
+
+<details>
+<summary>Reference đầy đủ — HTTP Caching cheat sheet (bấm để mở)</summary>
+
+## Mục Lục
+
+1. [Tổng quan kiến trúc](#1-tổng-quan-kiến-trúc)
+2. [Vòng đời của một request](#2-vòng-đời-của-một-request)
+3. [Cache-Control — Từng Directive Chi Tiết](#3-cache-control--từng-directive-chi-tiết)
+4. [Các header liên quan: ETag, Last-Modified, Vary, Age](#4-các-header-liên-quan)
+5. [Cơ chế Validation (304 Not Modified)](#5-cơ-chế-validation)
+6. [Các tầng cache](#6-các-tầng-cache)
+7. [Chiến lược caching theo loại resource](#7-chiến-lược-caching-theo-loại-resource)
+8. [Auth & Caching Issues — Chi Tiết](#8-auth--caching-issues)
+9. [Các lỗi caching phổ biến](#9-các-lỗi-caching-phổ-biến)
+10. [Debugging](#10-debugging)
+
+---
+
+## 1. Tổng Quan Kiến Trúc
+
+Khi browser gửi một request, response có thể đi qua nhiều tầng cache trước khi chạm đến origin server:
+
+```
+[Browser]
+    │
+    │  (1) Browser Cache — bộ nhớ local của browser
+    │
+    ↓
+[Proxy / CDN]
+    │        ── Cloudflare, Fastly, AWS CloudFront, Nginx proxy...
+    │           Lưu bản copy của response để phục vụ nhiều user
+    │
+    ↓
+[Load Balancer]
+    │
+    ↓
+[Origin Server]
+    │
+    │  (optional) Application-level cache: Redis, Memcached
+    │
+    ↓
+[Database]
+```
+
+Ba tầng quan trọng nhất từ góc độ HTTP headers:
+
+- **Browser Cache**: Chỉ phục vụ 1 user (private). Browser tự quản lý.
+- **Shared/Proxy Cache**: Phục vụ nhiều user. CDN hoặc reverse proxy quản lý.
+- **Origin Server**: Nơi dữ liệu gốc tồn tại.
+
+HTTP headers là "hợp đồng" giữa server và các tầng cache này — quy định ai được phép cache, bao lâu, và điều kiện nào thì phải revalidate.
+
+---
+
+## 2. Vòng Đời Của Một Request
+
+### Lần đầu tiên (Cold Cache)
+
+```
+Browser                                     Server
+   │──── GET /api/data ─────────────────────→│
+   │                                          │
+   │←── 200 OK ────────────────────────────── │
+   │    Cache-Control: max-age=3600           │
+   │    ETag: "abc123"                        │
+   │    Body: {...}                           │
+   │                                          │
+   │ Browser lưu response vào cache           │
+   │ Ghi nhận: cached_at = now                │
+   │            max_age   = 3600              │
+   │            etag      = "abc123"          │
+```
+
+### Trong thời gian còn "fresh" (ví dụ 30 phút sau)
+
+```
+Browser                                     Server
+   │ Kiểm tra: now - cached_at = 30 min      │
+   │           max-age = 60 min              │
+   │           → CHƯA expire                 │
+   │                                          │
+   │ Trả thẳng từ cache, KHÔNG gửi request   │
+   │ DevTools sẽ hiển thị: "from disk cache" │
+```
+
+### Sau khi expire (ví dụ 2 giờ sau)
+
+```
+Browser                                     Server
+   │──── GET /api/data ─────────────────────→│
+   │     If-None-Match: "abc123"             │
+   │     (conditional request)               │
+   │                                          │
+   │ Trường hợp 1: Data không đổi            │
+   │←── 304 Not Modified ────────────────────│
+   │    (Không có body)                      │
+   │ Browser dùng tiếp response cũ           │
+   │                                          │
+   │ Trường hợp 2: Data đã thay đổi          │
+   │←── 200 OK ──────────────────────────────│
+   │    ETag: "xyz789"  (ETag mới)           │
+   │    Body: {...}     (Content mới)        │
+   │ Browser thay thế cache cũ               │
+```
+
+Khi dùng `no-cache`, step 2 bị bỏ qua — browser luôn gửi conditional request lên server, dù cache chưa expire.
+
+---
+
+## 3. Cache-Control — Từng Directive Chi Tiết
+
+`Cache-Control` có thể xuất hiện trong cả **response header** (server → client) và **request header** (client → server). Phần lớn bạn sẽ cấu hình ở response.
+
+---
+
+### 3.1 `max-age=<seconds>`
+
+**Ý nghĩa**: Response được coi là "fresh" trong `N` giây kể từ khi được tạo ra trên server (thời điểm `Date` header).
+
+**Cơ chế cụ thể**:
+
+```
+Server response lúc 10:00:00:
+  Date: Mon, 08 Jun 2026 10:00:00 GMT
+  Cache-Control: max-age=3600
+
+Browser logic:
+  fresh_until = Date + max-age
+             = 10:00:00 + 3600s
+             = 11:00:00
+
+  Nếu request đến lúc 10:30 → fresh → serve from cache, NO request
+  Nếu request đến lúc 11:30 → stale → gửi conditional request lên server
+```
+
+**Lưu ý quan trọng**: `max-age` tính từ thời điểm **response được tạo trên server** (`Date` header), không phải thời điểm browser nhận được. Nếu response đi qua CDN mất 10 giây, browser chỉ còn `max-age - 10` giây của freshness.
+
+```
+  Server tạo response     CDN nhận    Browser nhận
+  10:00:00                10:00:05    10:00:10
+  |___________________________|____________|
+        5 giây                   5 giây
+
+  max-age=3600
+  → Browser fresh_until = 10:00:10 + (3600 - 10) = 10:59:00?
+  Không! fresh_until = Date + max-age = 10:00:00 + 3600 = 11:00:00
+  → Browser có đúng 3600s từ thời điểm server tạo ra response
+```
+
+Header `Age` sẽ cho browser biết response đã "sống" được bao lâu rồi (xem mục 4).
+
+---
+
+### 3.2 `s-maxage=<seconds>`
+
+**Ý nghĩa**: Giống `max-age` nhưng **chỉ áp dụng cho shared cache** (CDN, proxy). Browser bỏ qua `s-maxage`.
+
+```
+Cache-Control: max-age=60, s-maxage=86400
+```
+
+- **Browser**: Cache 60 giây
+- **CDN/Proxy**: Cache 86400 giây (1 ngày)
+
+**Tại sao cần `s-maxage`?**
+
+CDN phục vụ hàng triệu user — việc giữ cache lâu hơn giảm tải rất nhiều cho origin. Browser cache chỉ phục vụ 1 user nên không cần lâu.
+
+```javascript
+// Ví dụ: News article
+// - CDN cache 1 ngày (article không đổi thường xuyên)
+// - Browser cache 1 phút (để user Ctrl+F5 vẫn thấy bản mới nếu cần)
+res.set('Cache-Control', 'public, max-age=60, s-maxage=86400');
+```
+
+---
+
+### 3.3 `public`
+
+**Ý nghĩa**: Cho phép **mọi tầng cache** (browser, CDN, proxy, intermediate cache) lưu response này.
+
+**Khi nào cần thiết?**
+
+Normally, nếu response không có header nào hoặc có `Authorization` header, shared cache sẽ **không** cache theo mặc định. `public` override rule đó.
+
+```
+GET /api/data
+Authorization: Bearer token123    ← có header này
+
+→ Mặc định CDN KHÔNG cache (vì có Authorization)
+→ Nếu thêm Cache-Control: public → CDN được phép cache
+
+Dùng khi: token dùng để auth request nhưng response trả ra là public data
+(Ví dụ: signed URL để fetch resource nhưng resource tự nó là public)
+```
+
+---
+
+### 3.4 `private`
+
+**Ý nghĩa**: **Chỉ browser** được phép cache. CDN, proxy, shared cache KHÔNG được cache.
+
+```
+Cache-Control: private, max-age=600
+```
+
+```
+Browser → CDN → Server
+               ↓
+         200 OK + private
+               ↓
+CDN: "private → không cache, forward về browser"
+Browser: "private OK → tôi cache được"
+
+Kết quả: Chỉ browser cache response này
+```
+
+**Quan trọng cho auth**: Dữ liệu user-specific (profile, inbox, cart) phải dùng `private`. Nếu dùng `public`, CDN có thể phục vụ dữ liệu của User A cho User B.
+
+---
+
+### 3.5 `no-cache`
+
+**Ý nghĩa**: Cache vẫn **được phép lưu** response, nhưng **mỗi lần dùng phải revalidate với server trước**.
+
+Cái tên rất misleading — `no-cache` không có nghĩa là "không cache". Nó có nghĩa là "cache nhưng luôn hỏi lại server".
+
+```
+no-cache flow:
+
+Browser request → Cache có response → Gửi conditional request:
+  If-None-Match: "abc123"
+  lên server
+
+Server:
+  → Data chưa đổi: 304 Not Modified (không body, nhanh)
+  → Data đã đổi:   200 OK (body mới)
+```
+
+So sánh với `max-age`:
+
+```
+max-age=3600:
+  - 0-3600s: Browser KHÔNG request, dùng thẳng cache
+  - >3600s: Browser gửi conditional request
+
+no-cache:
+  - Mọi lúc: Browser LUÔN gửi conditional request
+  - Nếu 304: dùng cache
+  - Nếu 200: dùng response mới
+```
+
+**Khi nào dùng**: HTML, trang index, bất cứ thứ gì cần đảm bảo luôn fresh nhưng vẫn muốn tận dụng 304 để tiết kiệm bandwidth.
+
+---
+
+### 3.6 `no-store`
+
+**Ý nghĩa**: **Tuyệt đối không lưu** response vào bất kỳ cache nào. Mỗi request đều phải download full response.
+
+```
+no-store flow:
+
+Browser request → Không kiểm tra cache → Fetch full response
+                  ↑ bỏ qua hoàn toàn     ↑ luôn có body
+```
+
+**Phân biệt `no-cache` vs `no-store`**:
+
+```
+                    Lưu vào cache?    Revalidate?    Có body?
+no-cache            Có               Luôn luôn      Chỉ khi 200
+no-store            Không            N/A            Luôn luôn
+```
+
+**Khi nào dùng**: Dữ liệu cực kỳ nhạy cảm — bank transaction, OTP, dữ liệu y tế. Mọi thứ mà việc lưu trên disk của user đã là vấn đề bảo mật.
+
+---
+
+### 3.7 `must-revalidate`
+
+**Ý nghĩa**: Khi cache đã **stale** (hết hạn), KHÔNG được phép dùng stale response — phải revalidate với server. Nếu server không reach được → trả lỗi (504 Gateway Timeout).
+
+**Tại sao cần?** Theo HTTP spec, cache được phép trả stale response khi server không available (`stale-if-error`). `must-revalidate` tắt behavior đó.
+
+```
+max-age=3600 (không có must-revalidate):
+  - Cache expired + server down → Browser có thể dùng stale response
+  - Hành vi này tùy browser implement
+
+max-age=3600, must-revalidate:
+  - Cache expired + server down → 504 Gateway Timeout
+  - Không bao giờ dùng stale response
+```
+
+**Khác với `no-cache`**:
+
+```
+no-cache: Revalidate kể cả khi CHƯA stale
+must-revalidate: Chỉ enforce khi ĐÃ stale (đã qua max-age)
+```
+
+---
+
+### 3.8 `proxy-revalidate`
+
+**Ý nghĩa**: Giống `must-revalidate` nhưng **chỉ áp dụng cho shared cache** (CDN, proxy). Browser không bị ảnh hưởng.
+
+```
+Cache-Control: max-age=600, proxy-revalidate
+```
+
+- Browser: Cache 10 phút, sau đó có thể dùng stale (không bắt buộc revalidate)
+- CDN: Cache 10 phút, sau đó BẮT BUỘC revalidate với origin
+
+---
+
+### 3.9 `immutable`
+
+**Ý nghĩa**: Nói với browser rằng response này **sẽ không bao giờ thay đổi** trong thời gian `max-age`. Browser sẽ **không revalidate** dù user Ctrl+F5.
+
+```
+Cache-Control: public, max-age=31536000, immutable
+```
+
+Tại sao cần `immutable`?
+
+```
+Không có immutable:
+  User Ctrl+F5 → Browser gửi conditional request (If-None-Match)
+  → Server trả 304 → Waste 1 RTT cho file không bao giờ đổi
+
+Có immutable:
+  User Ctrl+F5 → Browser: "immutable + chưa expire → không cần check"
+  → Serve từ cache luôn
+```
+
+**Chỉ dùng với content-hashed assets**. Nếu file đổi, filename đổi → URL mới → browser fetch lại.
+
+```
+/assets/app.a1b2c3d4.js  → Cache-Control: immutable
+/assets/app.e5f6g7h8.js  → URL mới → browser fetch fresh
+```
+
+---
+
+### 3.10 `stale-while-revalidate=<seconds>`
+
+**Ý nghĩa**: Khi cache đã stale nhưng chưa quá `stale-while-revalidate` giây, browser **có thể trả response cũ ngay lập tức** trong khi **revalidate ở background**.
+
+```
+Cache-Control: max-age=60, stale-while-revalidate=3600
+
+Timeline:
+  0s - 60s:    Fresh → Serve từ cache, không request
+  60s - 3660s: Stale, nhưng trong SWR window
+               → Trả cache cũ ngay (người dùng không chờ)
+               → Background: gửi request revalidate
+               → Lần request tiếp theo sẽ có dữ liệu mới
+  > 3660s:     Phải fetch fresh, blocking
+```
+
+**Use case điển hình**: News feed, product listings — data có thể hơi cũ 1-2 phút không sao, nhưng không muốn user chờ loading spinner mỗi lần vào trang.
+
+---
+
+### 3.11 `stale-if-error=<seconds>`
+
+**Ý nghĩa**: Nếu server trả lỗi (5xx), browser được phép dùng stale cache trong `N` giây.
+
+```
+Cache-Control: max-age=3600, stale-if-error=86400
+
+Nếu origin server down:
+→ Browser dùng stale cache (dù đã cũ đến 1 ngày)
+→ Thay vì hiện lỗi trắng trang
+```
+
+Kết hợp với `must-revalidate` sẽ override điều này (không cho dùng stale dù server lỗi).
+
+---
+
+### 3.12 `no-transform`
+
+**Ý nghĩa**: Cấm proxy/CDN transform response (không compress, không resize ảnh, không modify body).
+
+```
+Cache-Control: public, max-age=3600, no-transform
+```
+
+Dùng khi response phải giữ nguyên chính xác (checksum-sensitive, encrypted content).
+
+---
+
+### 3.13 Tổng Hợp Directive
+
+```
+┌──────────────────────┬─────────────────┬───────────────────────────────────────────────────┐
+│ Directive            │ Áp dụng cho     │ Hành vi                                           │
+├──────────────────────┼─────────────────┼───────────────────────────────────────────────────┤
+│ max-age=N            │ Browser + CDN   │ Fresh trong N giây (tính từ Date header)           │
+│ s-maxage=N           │ CDN only        │ Fresh trong N giây chỉ tại CDN                     │
+│ public               │ CDN + Browser   │ Bất kỳ cache nào đều được lưu                      │
+│ private              │ Browser only    │ Chỉ browser được lưu, CDN không được               │
+│ no-cache             │ Browser + CDN   │ Lưu được, nhưng luôn phải revalidate trước dùng    │
+│ no-store             │ Browser + CDN   │ Tuyệt đối không lưu vào bất kỳ cache nào           │
+│ must-revalidate      │ Browser + CDN   │ Khi stale, bắt buộc revalidate, không dùng stale  │
+│ proxy-revalidate     │ CDN only        │ Như must-revalidate nhưng chỉ cho CDN              │
+│ immutable            │ Browser         │ Không revalidate kể cả khi user force refresh      │
+│ stale-while-reval.   │ Browser + CDN   │ Trả stale ngay + revalidate background             │
+│ stale-if-error       │ Browser + CDN   │ Dùng stale nếu server trả lỗi                      │
+│ no-transform         │ CDN/Proxy       │ Không cho phép proxy modify response               │
+└──────────────────────┴─────────────────┴───────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Các Header Liên Quan
+
+### 4.1 `ETag` (Entity Tag)
+
+Server tạo ra một "fingerprint" cho response. Khi content thay đổi, ETag thay đổi.
+
+**Strong ETag** (`ETag: "abc123"`): Byte-for-byte identical. Server chỉ trả 304 nếu response **hoàn toàn giống nhau**.
+
+**Weak ETag** (`ETag: W/"abc123"`): Semantically equivalent. Server trả 304 nếu "nội dung về mặt nghĩa là giống nhau", dù bytes có thể khác (ví dụ: whitespace thay đổi, timestamp trong JSON thay đổi).
+
+```javascript
+// Server tính ETag như thế nào?
+import crypto from 'crypto';
+
+function generateETag(data) {
+  return crypto
+    .createHash('md5')
+    .update(JSON.stringify(data))
+    .digest('hex');
+}
+
+// Hoặc dùng file modification time + size
+function fileETag(stat) {
+  return `"${stat.mtime.getTime().toString(16)}-${stat.size.toString(16)}"`;
+}
+```
+
+Conditional request headers tương ứng:
+
+- `If-None-Match: "abc123"` — dùng với GET (check if stale)
+- `If-Match: "abc123"` — dùng với PUT/PATCH (optimistic locking, tránh lost update)
+
+---
+
+### 4.2 `Last-Modified` và `If-Modified-Since`
+
+Alternative cho ETag, dùng timestamp thay vì hash.
+
+```
+Server → Browser:
+  Last-Modified: Mon, 08 Jun 2026 10:00:00 GMT
+
+Browser → Server (sau khi cache stale):
+  If-Modified-Since: Mon, 08 Jun 2026 10:00:00 GMT
+
+Server:
+  - File chưa đổi sau 10:00 → 304 Not Modified
+  - File đổi sau 10:00      → 200 OK + Last-Modified mới
+```
+
+**ETag vs Last-Modified**:
+
+```
+                ETag            Last-Modified
+Độ chính xác    Cao (hash)      Thấp (1s granularity)
+Overhead        Cần tính hash   Dùng mtime có sẵn
+Dynamic content Dễ implement    Khó (content tính toán lúc nào?)
+Files tĩnh      OK              OK (dùng file mtime)
+```
+
+Nếu server trả **cả hai**, browser gửi cả hai trong conditional request. Server ưu tiên ETag.
+
+---
+
+### 4.3 `Vary` Header
+
+Nói với cache: "Response này thay đổi tùy theo giá trị của header `X`". Mỗi giá trị header khác nhau → cache entry khác nhau.
+
+```
+Server response:
+  Vary: Accept-Encoding
+
+→ Cache tạo 2 entries riêng biệt:
+  - Request với Accept-Encoding: gzip   → cache entry A
+  - Request với Accept-Encoding: br     → cache entry B
+```
+
+```javascript
+// Ví dụ thực tế: API trả JSON hoặc XML tùy Accept
+res.set('Vary', 'Accept');
+
+// Request 1: Accept: application/json  → cache A (JSON)
+// Request 2: Accept: application/xml   → cache B (XML)
+```
+
+**Dùng với auth** (chi tiết ở mục 8):
+
+```
+Vary: Cookie         → Mỗi cookie khác nhau → cache entry riêng
+Vary: Authorization  → Mỗi token khác nhau → cache entry riêng
+```
+
+**Pitfall**: `Vary: User-Agent` tạo hàng nghìn cache entries cho mỗi browser variant. Tránh dùng nếu không cần thiết.
+
+---
+
+### 4.4 `Age` Header
+
+Header do **CDN/proxy** thêm vào, cho biết response đã ở trong cache bao lâu (tính bằng giây).
+
+```
+Browser nhận response:
+  Cache-Control: max-age=3600
+  Age: 1200
+
+→ Response đã cache ở CDN được 1200 giây
+→ Browser chỉ còn 3600 - 1200 = 2400 giây fresh time
+→ Browser tính: fresh_until = now + 2400s
+```
+
+Nếu `Age > max-age` → Response đã stale khi đến browser. Browser sẽ revalidate ngay.
+
+---
+
+### 4.5 `Expires` (Legacy)
+
+Absolute timestamp thay vì relative seconds. **Deprecated nhưng vẫn còn trên nhiều server cũ**.
+
+```
+Expires: Mon, 08 Jun 2026 12:00:00 GMT
+```
+
+Vấn đề: Server và client clock có thể lệch nhau → tính toán sai.
+
+Rule: Nếu cả `Cache-Control` và `Expires` cùng tồn tại, `Cache-Control` luôn thắng.
+
+---
+
+## 5. Cơ Chế Validation
+
+Validation là quá trình browser hỏi server "resource này có thay đổi không?". Nếu không → 304, dùng cache. Nếu có → 200, download mới.
+
+### Conditional Request Flow Đầy Đủ
+
+```
+Browser có cached response với:
+  ETag: "abc123"
+  Last-Modified: Mon, 08 Jun 2026 10:00:00 GMT
+  Cache-Control: no-cache  (hoặc max-age đã expired)
+
+Browser gửi:
+  GET /api/data HTTP/1.1
+  If-None-Match: "abc123"           ← ETag check
+  If-Modified-Since: Mon, 08 Jun 2026 10:00:00 GMT  ← timestamp check
+
+Server xử lý:
+  1. Kiểm tra If-None-Match trước (ưu tiên hơn)
+  2. So sánh ETag hiện tại với "abc123"
+  3. Nếu giống → 304 (kể cả nếu timestamp khác)
+  4. Nếu khác → 200 với body mới
+
+Khi server trả 304:
+  - KHÔNG có body (tiết kiệm bandwidth)
+  - Có thể update headers (Cache-Control mới, ETag mới)
+  - Browser dùng body từ cache cũ, headers từ 304 response mới
+
+304 Response có thể chứa:
+  HTTP/1.1 304 Not Modified
+  Cache-Control: max-age=3600  ← Reset freshness timer
+  ETag: "abc123"               ← Confirm ETag
+  (Không có body)
+```
+
+### Freshness vs Validation
+
+```
+Cache State        Behavior
+────────────────────────────────────────────────────────────
+Fresh              Serve from cache, NO request to server
+Stale + ETag       Send If-None-Match → 304 or 200
+Stale + no ETag    Send If-Modified-Since → 304 or 200
+no-cache           Always validate (dù vẫn "fresh" về mặt max-age)
+no-store           Never cache, always full download
+```
+
+---
+
+## 6. Các Tầng Cache
+
+### 6.1 Memory Cache (Browser RAM)
+
+- Nhanh nhất — trong RAM
+- Bị xóa khi đóng tab hoặc browser
+- Chrome hiển thị: `"(from memory cache)"`
+- Thường chứa: resources đang được dùng trong tab hiện tại
+
+### 6.2 Disk Cache (Browser Disk)
+
+- Chậm hơn memory, nhưng persist qua restart
+- Chrome hiển thị: `"(from disk cache)"`
+- Controlled bởi `Cache-Control` headers
+- Chrome location: `chrome://cache`
+
+### 6.3 Service Worker Cache
+
+Khác với disk cache ở điểm: **code của bạn kiểm soát hoàn toàn**. Browser cache tự động theo HTTP headers. Service Worker cache thì bạn quyết định lưu gì, khi nào expire, strategy nào.
+
+```javascript
+// Intercept mọi request
+self.addEventListener('fetch', (event) => {
+  event.respondWith(
+    caches.match(event.request).then((hit) => {
+      if (hit) return hit;
+      return fetch(event.request);
+    })
+  );
+});
+```
+
+Service Worker cache và HTTP cache hoạt động **độc lập**. Service Worker có thể quyết định bypass HTTP cache bằng:
+
+```javascript
+fetch(request, { cache: 'no-store' }); // Bypass browser HTTP cache
+```
+
+### 6.4 CDN / Shared Cache
+
+Proxy đứng giữa browser và server. Một response được cache ở CDN có thể phục vụ cho hàng triệu user.
+
+```
+                     CDN cache
+User A → GET /img/logo.png ─→ MISS → Origin
+User B → GET /img/logo.png ─→ HIT  ← CDN trả luôn (origin không biết)
+User C → GET /img/logo.png ─→ HIT  ← CDN trả luôn
+```
+
+CDN respect `Cache-Control` headers: `public` cho phép CDN cache, `private` không cho.
+
+CDN cũng có thể **override** cache headers trong config — ví dụ Cloudflare có thể cache mọi thứ bất kể `Cache-Control`.
+
+---
+
+## 7. Chiến Lược Caching Theo Loại Resource
+
+### 7.1 HTML Entry Point (`index.html`)
+
+**Không bao giờ cache**, hoặc nếu cache thì phải revalidate mỗi lần:
+
+```javascript
+res.set('Cache-Control', 'no-cache');
+// Kết hợp với ETag để 304 nếu unchanged
+
+// Hoặc an toàn hơn:
+res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+res.set('Pragma', 'no-cache'); // Legacy HTTP/1.0
+res.set('Expires', '0');
+```
+
+**Lý do**: HTML là entry point load tất cả JS, CSS. Nếu cache HTML cũ, user sẽ dùng app cũ kể cả sau khi deploy mới.
+
+### 7.2 Static Assets có Content Hash (JS, CSS, Font)
+
+```javascript
+// Webpack / Vite tạo: app.3f7a92bc.js
+res.set('Cache-Control', 'public, max-age=31536000, immutable');
+```
+
+**Lý do**: URL đã bao gồm hash của content. File đổi → hash đổi → URL đổi → browser tự fetch lại. URL cũ vẫn valid trong cache (rollback dễ dàng).
+
+### 7.3 Ảnh và Media Tĩnh
+
+```javascript
+// Ảnh có version trong URL (logo.v2.png)
+res.set('Cache-Control', 'public, max-age=31536000, immutable');
+
+// Ảnh không có version (avatar có thể đổi)
+res.set('Cache-Control', 'public, max-age=3600');
+res.set('ETag', etagFromFile);
+```
+
+### 7.4 API — Public Data (Không cần auth)
+
+```javascript
+// Product list, article list, categories...
+res.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+```
+
+Có thể thêm CDN cache dài hơn:
+
+```javascript
+res.set('Cache-Control', 'public, max-age=60, s-maxage=3600');
+// Browser: 1 phút
+// CDN: 1 giờ
+```
+
+### 7.5 API — User-Specific Data (Cần auth)
+
+```javascript
+// Profile, cart, settings...
+res.set('Cache-Control', 'private, no-cache');
+res.set('ETag', generateETag(userData));
+// → Browser cache, nhưng revalidate mỗi lần
+// → 304 nếu không đổi (tiết kiệm bandwidth)
+// → CDN không cache (private)
+```
+
+### 7.6 API — Real-time Data
+
+```javascript
+// Stock prices, live chat, notifications
+res.set('Cache-Control', 'no-store');
+// Mỗi request đều phải fetch fresh
+```
+
+---
+
+## 8. Auth & Caching Issues
+
+Đây là phần dễ gây lỗi nhất. Caching và authentication tương tác theo nhiều cách không trực quan.
+
+### 8.1 Issue: Shared Cache Leak Dữ Liệu Giữa Users
+
+**Scenario**:
+
+```
+1. User A đăng nhập, request GET /api/profile
+2. Server trả: 200 OK, Cache-Control: public, max-age=3600
+3. CDN cache response của User A
+4. User B (chưa đăng nhập, hoặc khác user) request GET /api/profile
+5. CDN trả response của User A cho User B!
+```
+
+**Root cause**: Dùng `public` cho endpoint trả user-specific data.
+
+**Fix**:
+
+```javascript
+// Nguy hiểm
+res.set('Cache-Control', 'public, max-age=3600');
+
+// Đúng: Private cache only
+res.set('Cache-Control', 'private, max-age=300');
+// CDN không cache, chỉ browser của user đó
+```
+
+Nhưng `private` chưa đủ nếu dùng session cookie (xem 8.2).
+
+---
+
+### 8.2 Issue: Cùng Browser, Khác User (Shared Device)
+
+**Scenario**:
+
+```
+1. User A đăng nhập trên máy tính chung ở thư viện
+2. Vào /dashboard → Browser cache response (Cache-Control: private, max-age=600)
+3. User A logout
+4. User B ngồi vào, vào /dashboard
+5. Browser vẫn còn cache → Hiển thị dashboard của User A!
+```
+
+**Fix 1**: Xóa cache khi logout
+
+```javascript
+// Frontend logout handler
+async function logout() {
+  await api.post('/auth/logout');
+
+  // Xóa cache bằng cách invalidate Service Worker cache
+  if ('caches' in window) {
+    const cacheNames = await caches.keys();
+    await Promise.all(cacheNames.map((name) => caches.delete(name)));
+  }
+
+  // Clear state management (Zustand, Redux)
+  useUserStore.getState().reset();
+
+  // Redirect
+  window.location.href = '/login';
+  // Hard redirect (không history.push) để browser không back được
+}
+```
+
+**Fix 2**: Dùng `no-cache` thay vì `max-age` cho sensitive data
+
+```javascript
+res.set('Cache-Control', 'private, no-cache');
+res.set('ETag', generateETag(userId + userDataVersion));
+
+// Browser cache nhưng luôn revalidate
+// Sau logout: token invalid → 401 → redirect login
+```
+
+**Fix 3**: Include user identifier trong cache key (dùng `Vary: Cookie`)
+
+```javascript
+res.set('Cache-Control', 'private, max-age=300');
+res.set('Vary', 'Cookie');
+// Mỗi session cookie khác → cache entry khác
+// User B có session khác → cache miss → fetch fresh
+```
+
+---
+
+### 8.3 Issue: `Authorization` Header Và Shared Cache
+
+Theo HTTP spec, nếu request có `Authorization` header, shared cache (CDN) **mặc định không được cache** response — trừ khi server explicit opt-in bằng `Cache-Control: public`.
+
+```
+Mặc định (không có explicit Cache-Control):
+  Request: GET /api/data + Authorization: Bearer token
+  → CDN không cache (safe default)
+
+Nếu thêm public:
+  Response: Cache-Control: public, max-age=3600
+  → CDN cache response của token này
+  → Danger: User B với token khác có thể nhận được response của User A
+    (nếu CDN không cache theo Vary: Authorization)
+```
+
+**Fix**:
+
+```javascript
+// Endpoint trả user-specific data + dùng Bearer token
+// Sai — CDN cache tất cả bearer token dùng chung 1 entry
+res.set('Cache-Control', 'public, max-age=600');
+
+// Option 1: Private (CDN không cache)
+res.set('Cache-Control', 'private, max-age=300');
+
+// Option 2: Public + Vary theo Authorization
+// Mỗi token → cache entry riêng
+// Chỉ dùng khi response thực sự public nhưng request có token
+res.set('Cache-Control', 'public, max-age=300');
+res.set('Vary', 'Authorization');
+// Cẩn thận: tạo rất nhiều cache entries (1 entry/token)
+```
+
+---
+
+### 8.4 Issue: Token Expire Trong Khi Cache Vẫn Fresh
+
+**Scenario**:
+
+```
+1. User request /api/user/cart, token hợp lệ
+2. Server: 200 OK, Cache-Control: private, max-age=3600
+3. Browser cache, fresh_until = now + 3600s
+4. Token expire sau 1800s (30 phút)
+5. User request /api/user/cart lần 2 — cache vẫn fresh (1 tiếng)
+6. Browser serve từ cache → Không gửi request → Token expire không được phát hiện
+7. User thực hiện action khác cần token → 401 → Confusion
+```
+
+**Fix**: Align `max-age` với token lifetime
+
+```javascript
+// Nếu token expire sau 1800s (30 phút)
+res.set('Cache-Control', `private, max-age=${tokenRemainingSeconds - 60}`);
+// Cache expire 1 phút trước token expire → browser fetch lại trước khi token chết
+
+// Hoặc đơn giản: max-age ngắn + no-cache
+res.set('Cache-Control', 'private, no-cache');
+// Browser luôn hit server → server luôn validate token
+// 304 nếu data chưa đổi, 401 nếu token expire
+```
+
+**Pattern tốt hơn**: Silent token refresh kết hợp với cache
+
+```javascript
+// axios interceptor
+axiosInstance.interceptors.response.use(null, async (error) => {
+  if (error.response?.status === 401 && !error.config._retry) {
+    error.config._retry = true;
+
+    try {
+      await refreshAccessToken(); // Refresh token
+      return axiosInstance(error.config); // Retry request
+    } catch (refreshError) {
+      logout(); // Refresh cũng fail → logout
+      return Promise.reject(refreshError);
+    }
+  }
+  return Promise.reject(error);
+});
+```
+
+---
+
+### 8.5 Issue: Cache Sau Khi Logout Không Bị Xóa
+
+Logout chỉ invalidate server-side session hoặc token. Browser cache vẫn giữ nguyên.
+
+**Scenario**:
+
+```
+1. User đăng nhập, browse quanh ứng dụng
+2. Browser cache: /api/cart, /api/notifications, /api/profile
+3. User logout → Server invalidate session
+4. User nhấn Back button
+5. Browser render từ cache → Page hiển thị như đang đăng nhập!
+   (Vì HTML/JS từ cache, API responses từ cache)
+```
+
+**Fix toàn diện**:
+
+```javascript
+// 1. Server: Endpoint logout trả no-store
+app.post('/api/auth/logout', async (req, res) => {
+  await invalidateSession(req.sessionId);
+
+  res.set('Cache-Control', 'no-store');
+  // Clear auth cookie
+  res.clearCookie('session', { httpOnly: true, secure: true });
+
+  res.json({ success: true });
+});
+
+// 2. Server: Endpoint check auth status (không cache)
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.set('Cache-Control', 'no-cache, no-store');
+  res.json({ userId: req.user.id, role: req.user.role });
+});
+// Mỗi page load, app gọi /api/auth/me → nếu 401 → redirect login
+
+// 3. Frontend: Clear state và cache
+async function logout() {
+  try {
+    await axios.post('/api/auth/logout');
+  } finally {
+    // Clear Zustand state
+    useAuthStore.getState().clearUser();
+    useCartStore.getState().clearCart();
+
+    // Clear axios cache nếu có custom cache layer
+    axiosCache.clear();
+
+    // Invalidate React Query / SWR cache
+    queryClient.clear();
+
+    // Hard redirect (không SPA navigation)
+    window.location.replace('/login');
+  }
+}
+```
+
+---
+
+### 8.6 Issue: CDN Cache Public API Sau Khi Data Thay Đổi
+
+**Scenario**:
+
+```
+1. Admin cập nhật giá sản phẩm qua /admin/products/123
+2. CDN đang cache /api/products/123, max-age=3600, còn 2 tiếng fresh
+3. User request /api/products/123 → CDN trả giá cũ
+4. User mua hàng với giá cũ → Conflict với database
+```
+
+**Fix: Cache Invalidation / Purging**
+
+```javascript
+// Khi admin cập nhật:
+app.put('/admin/products/:id', requireAdmin, async (req, res) => {
+  const product = await updateProduct(req.params.id, req.body);
+
+  // Purge CDN cache cho URL này
+  await cloudflare.purgeCache([`/api/products/${req.params.id}`]);
+  // Hoặc dùng Surrogate-Key để purge theo tag (xem dưới)
+
+  res.json(product);
+});
+
+// Surrogate-Key / Cache-Tag pattern:
+// Server đánh tag cho response
+app.get('/api/products/:id', (req, res) => {
+  res.set('Surrogate-Key', `product-${req.params.id} products`);
+  res.set('Cache-Control', 'public, max-age=3600');
+  res.json(product);
+});
+
+// Khi sản phẩm thay đổi, purge theo tag:
+await cloudflare.purgeTag(`product-${productId}`);
+// Invalidate tất cả URLs có Surrogate-Key chứa tag này
+```
+
+Hoặc dùng `stale-while-revalidate` để giảm risk:
+
+```javascript
+// Chấp nhận data hơi cũ 1 phút
+res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+// CDN revalidate trong background → user ít khi thấy stale data
+```
+
+---
+
+### 8.7 Issue: Vary Header Và Cookie-Based Auth
+
+Khi dùng session cookie để auth, mọi response cho user-specific data cần `Vary: Cookie` — nếu không, cache có thể phục vụ nhầm.
+
+```
+Không có Vary: Cookie:
+  User A (cookie: session=aaa) → GET /api/dashboard → 200, cache lưu
+  User B (cookie: session=bbb) → GET /api/dashboard → HIT (dữ liệu của User A!)
+
+Có Vary: Cookie:
+  User A → cache entry cho cookie=aaa
+  User B → cache entry cho cookie=bbb (miss → fetch fresh)
+```
+
+```javascript
+// Session-based auth
+app.get('/api/dashboard', requireAuth, (req, res) => {
+  res.set('Cache-Control', 'private, max-age=300');
+  res.set('Vary', 'Cookie'); // Tạo separate cache entry per cookie
+
+  res.json(getDashboardData(req.user.id));
+});
+```
+
+**Lưu ý**: `private` + `Vary: Cookie` ở CDN level: `private` đã bảo CDN không cache → `Vary: Cookie` chỉ ảnh hưởng browser. Nếu muốn CDN cache per-user, dùng `public` + `Vary: Cookie` (nhưng thường tạo quá nhiều entries, không practical).
+
+---
+
+### 8.8 Issue: Conditional Request Bị Bypass Do CORS
+
+Với cross-origin requests, browser đôi khi không gửi conditional headers (`If-None-Match`) vì cache entry không match origin.
+
+```
+App: app.example.com
+API: api.example.com (khác origin)
+
+Browser cache entry từ api.example.com/data với ETag "abc"
+→ Cache entry gắn với origin api.example.com
+→ Request từ app.example.com vẫn có thể trigger validation
+  (nhưng phụ thuộc vào CORS preflight và browser implementation)
+```
+
+**Fix**: Đảm bảo CORS headers đúng và consistent:
+
+```javascript
+app.use(
+  cors({
+    origin: 'https://app.example.com',
+    exposedHeaders: ['ETag', 'Cache-Control', 'Last-Modified'],
+    // Browser chỉ có thể đọc headers được expose
+  })
+);
+```
+
+---
+
+## 9. Các Lỗi Caching Phổ Biến
+
+### 9.1 Cache Stampede / Thundering Herd
+
+Xảy ra khi cache expire đồng thời với nhiều request → tất cả hit origin server cùng lúc.
+
+```
+100 users request cùng 1 URL
+Cache expire đúng lúc đó
+→ 100 requests đến origin server cùng lúc
+→ Server quá tải, database chết
+```
+
+**Fix**:
+
+```javascript
+// Pattern 1: Stale-While-Revalidate
+res.set('Cache-Control', 'max-age=60, stale-while-revalidate=3600');
+// Chỉ 1 background request thay vì 100 concurrent
+
+// Pattern 2: Probabilistic Early Expiration (Jitter)
+// Thay vì expire exact lúc max-age hết, expire random trong window
+const jitter = Math.random() * 0.1 * maxAge; // 10% jitter
+res.set('Cache-Control', `max-age=${Math.floor(maxAge - jitter)}`);
+
+// Pattern 3: Cache Lock (server-side Redis)
+async function getWithCacheLock(key, fetchFn, ttl) {
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
+  const lockKey = `lock:${key}`;
+  const acquired = await redis.set(lockKey, '1', 'EX', 5, 'NX');
+
+  if (!acquired) {
+    // Đợi lock release, retry
+    await sleep(100);
+    return getWithCacheLock(key, fetchFn, ttl);
+  }
+
+  try {
+    const data = await fetchFn();
+    await redis.setex(key, ttl, JSON.stringify(data));
+    return data;
+  } finally {
+    await redis.del(lockKey);
+  }
+}
+```
+
+### 9.2 Cache Key Collision
+
+Hai resources khác nhau nhưng cùng cache key → browser phục vụ nhầm.
+
+```
+GET /api/data?page=1  → cache key: /api/data
+GET /api/data?page=2  → cache key: /api/data (nếu không include query string!)
+→ User luôn thấy page 1
+```
+
+**Fix**: Đảm bảo server trả đúng `Vary` headers, và cache layer bao gồm query params trong key.
+
+### 9.3 Stale Cache Sau Deploy
+
+```
+Deploy app mới:
+- index.html (không cache)
+- app.newHash.js (cached lâu dài)
+
+Nếu user có service worker cache cũ:
+→ Service Worker serve app.oldHash.js
+→ JavaScript cũ, API mới → Incompatibility
+```
+
+**Fix**:
+
+```javascript
+// Versioned Service Worker cache
+const CACHE_VERSION = process.env.BUILD_ID; // Build ID thay đổi mỗi deploy
+const CACHE_NAME = `app-cache-${CACHE_VERSION}`;
+
+// Activate: Delete old caches
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((cacheNames) =>
+      Promise.all(
+        cacheNames
+          .filter((name) => name !== CACHE_NAME)
+          .map((name) => caches.delete(name))
+      )
+    )
+  );
+});
+```
+
+---
+
+## 10. Debugging
+
+### Chrome DevTools — Network Tab
+
+```
+Cột Size:
+  "(from memory cache)"  → RAM, không request, instant
+  "(from disk cache)"    → Disk, không request, fast
+  304                    → Revalidated, dùng cache, có request
+  200 (số byte)          → Full download, có request
+
+Cột Status:
+  200 (grey italic)      → Served from cache
+  200 (đen)              → Fresh download from network
+  304                    → Not modified, dùng cache
+
+Disable cache khi debug:
+  DevTools → Network → "Disable cache" checkbox
+  (Chỉ disable khi DevTools mở)
+
+Xem headers:
+  Click vào request → Headers tab
+  Request Headers: If-None-Match, If-Modified-Since, Cache-Control
+  Response Headers: Cache-Control, ETag, Last-Modified, Vary, Age
+```
+
+### Kiểm Tra Cache Headers Bằng cURL
+
+```bash
+# Xem response headers
+curl -I https://example.com/api/data
+
+# Conditional request với ETag
+curl -I -H 'If-None-Match: "abc123"' https://example.com/api/data
+
+# Force bypass cache
+curl -H 'Cache-Control: no-cache' https://example.com/api/data
+
+# Verbose (xem cả request lẫn response headers)
+curl -v https://example.com/api/data 2>&1 | grep -E "< |> "
+```
+
+### Kiểm Tra Từ JavaScript
+
+```javascript
+async function debugCacheHeaders(url) {
+  const res = await fetch(url);
+
+  const headers = {
+    status: res.status,
+    cacheControl: res.headers.get('cache-control'),
+    etag: res.headers.get('etag'),
+    lastModified: res.headers.get('last-modified'),
+    vary: res.headers.get('vary'),
+    age: res.headers.get('age'),
+    expires: res.headers.get('expires'),
+  };
+
+  console.table(headers);
+
+  // Tính thời gian còn lại
+  const maxAge = parseInt(
+    headers.cacheControl?.match(/max-age=(\d+)/)?.[1] ?? 0
+  );
+  const age = parseInt(headers.age ?? 0);
+  const remaining = maxAge - age;
+
+  console.log(`Cache remaining: ${remaining}s (${Math.floor(remaining / 60)} min)`);
+}
+```
+
+---
+
+## Tóm Tắt Nhanh
+
+```
+Loại Resource                   Config Header
+───────────────────────────────────────────────────────────────────────
+index.html                      no-cache, no-store, must-revalidate
+JS/CSS có content hash          public, max-age=31536000, immutable
+Ảnh tĩnh                        public, max-age=86400, + ETag
+Public API (categories, news)   public, max-age=3600, stale-while-revalidate=86400
+CDN-optimized public API        public, max-age=60, s-maxage=3600
+User-specific data              private, no-cache + ETag
+Sensitive (token, OTP)          no-store
+Real-time (stock, live chat)    no-store
+```
+
+**Nguyên tắc cốt lõi**:
+
+1. HTML luôn `no-cache` → Đảm bảo deploy mới được nhận
+2. Static assets dùng content hash → Cache vĩnh viễn an toàn
+3. User data dùng `private` → CDN không được cache
+4. Sensitive data dùng `no-store` → Không bao giờ lưu đĩa
+5. Dùng ETag + `no-cache` → Revalidate nhưng tiết kiệm bandwidth với 304
+6. Dùng `Vary: Cookie` → Mỗi user session một cache entry
+7. Xóa cache khi logout → Bảo mật trên shared device
+8. Align `max-age` với token lifetime → Không serve stale auth data
+
+</details>
