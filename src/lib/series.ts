@@ -14,9 +14,20 @@ export interface SeriesMeta {
   title: string;
   /** Mô tả ngắn cho trang /series và landing */
   blurb: string;
+  /**
+   * Pin series lên đầu listing (/series, /blog). Số lớn hơn = ưu tiên cao hơn.
+   * Bỏ trống = không pin, xếp theo hoạt động gần nhất (`latest`) như mặc định.
+   */
+  pin?: number;
 }
 
 export const SERIES: Record<string, SeriesMeta> = {
+  ai: {
+    title: 'AI for Developers — LLMs, Agents & Coding',
+    blurb:
+      'The complete AI path for developers in one series: from the history of AI and how LLMs work (tokens, sampling, embeddings, prompting) to choosing models, RAG and fine-tuning, building agents (tool use, architecture, patterns, MCP), and finally coding day-to-day with AI agents and Cursor — hands-on and hype-free.',
+    pin: 1,
+  },
   bash: {
     title: 'Bash & Shell Scripting',
     blurb:
@@ -42,6 +53,16 @@ export const SERIES: Record<string, SeriesMeta> = {
     blurb:
       'Master Nginx hands-on: install locally, understand the config model, build a reverse proxy and load balancer, add TLS, caching and rate limiting, then ship and debug a production setup.',
   },
+  nextjs: {
+    title: 'Next.js 16 from Zero to Senior',
+    blurb:
+      'Go from zero to senior on the latest Next.js (16): the App Router mental model, Server Components and data fetching, the new Cache Components & "use cache" model, Server Actions, route handlers and proxy, rendering, SEO, auth, then shipping and debugging production — hands-on, with exercises.',
+  },
+  nodejs: {
+    title: 'Node.js Super Senior — 10 Phases + Deep Dives',
+    blurb:
+      'A production-ready, enterprise-grade path from "gà mờ" to Super Senior Node.js backend developer: ten core phases — core fundamentals, HTTP, Express, databases, auth & security, advanced patterns, DevOps, performance, testing, and enterprise architecture — then bonus deep dives into PostgreSQL, Prisma, and NestJS. Hands-on in TypeScript, with projects.',
+  },
   eng: {
     title: 'Practical English for Work',
     blurb:
@@ -50,12 +71,22 @@ export const SERIES: Record<string, SeriesMeta> = {
   'css-modern': {
     title: 'Modern CSS Deep Dives',
     blurb:
-      'Core modern CSS: layout mental models, cascade layers, custom properties, container queries, and responsive design.',
+      'The complete modern CSS path in one series: layout mental models (Flexbox, Grid, subgrid, container queries, fluid design), the cascade, custom properties and color, then animation (transitions, keyframes, easing, performance, accessible and scroll-driven motion), and finally pure-CSS 3D — perspective, preserve-3d objects, tilt and parallax, carousels, lighting and performance.',
   },
-  'css-animation': {
-    title: 'CSS Animation Mastery',
+  'web-dev': {
+    title: 'Web Development in Practice',
     blurb:
-      'Transitions, keyframes, easing, performance, accessible motion, and scroll-driven animations.',
+      'Practical web development for senior frontend engineers — the CSS, JavaScript, and browser-platform fundamentals behind production UI. From CSS performance and modern features, through core JavaScript (event loop, async, closures, fetch, events, memory, Intl) and the browser APIs that power real apps, to landing-page motion across CSS, vanilla JS, and React + Framer Motion.',
+  },
+  threejs: {
+    title: 'Three.js from Zero to Senior',
+    blurb:
+      'Go from "gà mờ" to senior on Three.js: the WebGL mental model and your first scene, geometries and materials, the scene graph and cameras, lights and shadows, PBR textures and environment maps, loading glTF models and the animation system, post-processing with the EffectComposer, performance and instancing, raycasting and interaction, and a production capstone covering loading, responsiveness, framework integration, and deployment. Every part ships a live, interactive 3D demo.',
+  },
+  svg: {
+    title: 'SVG from Zero to Senior',
+    blurb:
+      'Master SVG end to end: the coordinate system and viewBox, the path language, painting with strokes/gradients/patterns, text, transforms and nested coordinate systems, animation (CSS + SMIL, line-drawing), filters, clipping and masking, interactive data-driven graphics with JavaScript, and finally production — optimization, sprites, accessibility and performance. Every part ships a live, interactive demo.',
   },
   networking: {
     title: 'Network Programming',
@@ -68,6 +99,20 @@ export const SERIES: Record<string, SeriesMeta> = {
       'A practical mindset series on effort, focus, consistency, discipline, resilience, and positivity — small daily practices that compound over time.',
   },
 };
+
+/**
+ * Thứ tự hiển thị homepage: bài được pin (`top` có giá trị) lên trước, `top`
+ * giảm dần; phần còn lại theo `pubDate` giảm dần. `top` độc lập với series —
+ * nó chỉ điều khiển vị trí ở homepage, không ảnh hưởng thứ tự trong series.
+ */
+export function sortByPriority(posts: Post[]): Post[] {
+  return [...posts].sort((a, b) => {
+    const topA = a.data.top ?? -Infinity;
+    const topB = b.data.top ?? -Infinity;
+    if (topA !== topB) return topB - topA;
+    return b.data.pubDate.getTime() - a.data.pubDate.getTime();
+  });
+}
 
 export function isSeriesPost(post: Post): boolean {
   const { series, seriesOrder } = post.data;
@@ -142,5 +187,11 @@ export function listSeries(posts: Post[]): SeriesSummary[] {
       } satisfies SeriesSummary;
     })
     .filter((s): s is SeriesSummary => s !== null)
-    .sort((a, b) => b.latest.getTime() - a.latest.getTime());
+    .sort((a, b) => {
+      // Pinned series lên đầu (pin desc); phần còn lại theo hoạt động gần nhất.
+      const pinA = a.meta.pin ?? -Infinity;
+      const pinB = b.meta.pin ?? -Infinity;
+      if (pinA !== pinB) return pinB - pinA;
+      return b.latest.getTime() - a.latest.getTime();
+    });
 }

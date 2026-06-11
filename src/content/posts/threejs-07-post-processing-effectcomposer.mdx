@@ -1,0 +1,155 @@
+---
+title: 'Three.js from Zero to Senior · Part 7 — Post-Processing & the EffectComposer'
+description: 'Add cinematic polish: how the EffectComposer renders your scene to a texture and runs full-screen passes (bloom, vignette, custom shaders), why pass order and OutputPass matter, and the performance budget — with a live bloom rig.'
+pubDate: 2026-06-09
+tags: [threejs, 3d, post-processing, threejs_10]
+series: threejs
+seriesOrder: 7
+draft: false
+---
+
+The difference between a tech demo and something that looks *shipped* is often the last 5% — the glow on a neon sign, the soft falloff at the screen edge, the filmic contrast. \{Khác biệt giữa một demo kỹ thuật và thứ trông *đã hoàn thiện* thường nằm ở 5% cuối — quầng sáng trên biển neon, độ tắt mềm ở mép màn hình, độ tương phản điện ảnh.\} That layer is **post-processing**: image effects applied *after* the 3D render, to the rendered picture itself. \{Lớp đó là **post-processing**: hiệu ứng ảnh áp dụng *sau* khi render 3D, lên chính bức ảnh đã render.\}
+
+Toggle bloom in the demo and push the threshold around — only the bright emissive core glows; the dim cubes stay crisp. \{Bật bloom trong demo và đẩy threshold — chỉ lõi phát sáng mới rực; các khối mờ vẫn sắc.\}
+
+<iframe
+  src="/tools/threejs-postprocessing-demo/"
+  title="Three.js post-processing and bloom interactive demo"
+  loading="lazy"
+  style="width:100%;height:760px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/threejs-postprocessing-demo/](/tools/threejs-postprocessing-demo/).
+
+## The mental model: render to a texture, then rework it \{Mô hình tư duy: render ra texture, rồi xử lý lại\}
+
+Normally `renderer.render(scene, camera)` draws straight to the screen. \{Bình thường `renderer.render(scene, camera)` vẽ thẳng ra màn hình.\} Post-processing inserts a middle step: \{Post-processing chèn một bước giữa:\}
+
+1. Render the 3D scene into an off-screen **render target** (a texture). \{Render scene 3D vào một **render target** ngoài màn hình (một texture).\}
+2. Run that texture through a chain of **full-screen passes** — each pass reads the previous result and writes a new one. \{Cho texture đó chạy qua một chuỗi **pass toàn màn hình** — mỗi pass đọc kết quả trước và ghi ra kết quả mới.\}
+3. The final pass writes to the screen. \{Pass cuối ghi ra màn hình.\}
+
+The orchestrator for all this is the **`EffectComposer`**. \{Bộ điều phối cho tất cả là **`EffectComposer`**.\}
+
+## Wiring an EffectComposer \{Nối một EffectComposer\}
+
+```js
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const composer = new EffectComposer(renderer);
+
+// 1. RenderPass draws the scene into the composer's render target. Almost always first.
+composer.addPass(new RenderPass(scene, camera));
+
+// 2. Bloom: extract bright pixels, blur them, add back.
+const bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 1.1, 0.4, 0.2);
+//                                  resolution            strength radius threshold
+composer.addPass(bloom);
+
+// 3. OutputPass: tone mapping + correct sRGB conversion. Put it LAST.
+composer.addPass(new OutputPass());
+```
+
+Then, in your loop, render through the composer **instead of** the renderer: \{Rồi trong loop, render qua composer **thay vì** renderer:\}
+
+```js
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  composer.render();        // ← not renderer.render(...)
+}
+```
+
+That single swap — `composer.render()` for `renderer.render()` — is the whole hook. \{Cú đổi duy nhất đó — `composer.render()` thay cho `renderer.render()` — chính là toàn bộ điểm móc nối.\}
+
+## Pass order is the program \{Thứ tự pass chính là chương trình\}
+
+Passes run top to bottom, each consuming the last one's output. \{Pass chạy từ trên xuống, mỗi cái tiêu thụ output của cái trước.\} Order changes the result: \{Thứ tự đổi kết quả:\}
+
+- `RenderPass` is almost always **first** — there's nothing to process until the scene exists as a texture. \{`RenderPass` gần như luôn **đầu tiên** — chẳng có gì để xử lý cho tới khi scene tồn tại dạng texture.\}
+- Color/tone effects like `OutputPass` go **last**, so they grade the final composited image, not an intermediate one. \{Hiệu ứng màu/tone như `OutputPass` đi **cuối**, để chỉnh trên ảnh hợp thành cuối cùng, không phải ảnh trung gian.\}
+- A vignette before bloom darkens *before* the glow spreads; after bloom it frames the finished image. Neither is "wrong" — they're different looks. \{Vignette trước bloom làm tối *trước* khi quầng lan; sau bloom thì nó đóng khung ảnh hoàn thiện. Không cái nào "sai" — chúng là hai vẻ khác nhau.\}
+
+## OutputPass and the color-space trap \{OutputPass và cái bẫy không gian màu\}
+
+Here's a bug that bites everyone the first time: add bloom and suddenly the whole scene looks washed out or too dark. \{Đây là lỗi cắn ai cũng dính lần đầu: thêm bloom và đột nhiên cả scene trông nhợt nhạt hoặc quá tối.\} The composer's render target is **linear**, but the screen expects **sRGB**. \{Render target của composer là **linear**, nhưng màn hình mong đợi **sRGB**.\} When you render directly, Three.js converts for you; inside a composer chain it doesn't, until you add an **`OutputPass`** at the end to do tone mapping + sRGB conversion. \{Khi render trực tiếp, Three.js tự chuyển cho bạn; trong chuỗi composer thì không, cho tới khi bạn thêm **`OutputPass`** ở cuối để làm tone mapping + chuyển sRGB.\}
+
+> Rule: the moment you switch to an `EffectComposer`, add an `OutputPass` as the final pass. \{Quy tắc: ngay khi chuyển sang `EffectComposer`, thêm `OutputPass` làm pass cuối.\}
+
+## Tuning bloom — strength, radius, threshold \{Tinh chỉnh bloom — strength, radius, threshold\}
+
+`UnrealBloomPass` has three knobs, and **threshold** is the one that separates tasteful from cartoonish: \{`UnrealBloomPass` có ba núm, và **threshold** là cái phân biệt tinh tế với màu mè:\}
+
+- **`threshold`** — only pixels brighter than this bloom. Low threshold = everything glows (hazy, overdone). High threshold = only the brightest highlights glow (controlled, premium). \{**`threshold`** — chỉ pixel sáng hơn ngưỡng này mới bloom. Ngưỡng thấp = mọi thứ rực (mờ ảo, lố). Ngưỡng cao = chỉ điểm sáng nhất rực (kiểm soát, cao cấp).\}
+- **`strength`** — how intense the added glow is. \{**`strength`** — quầng thêm vào mạnh cỡ nào.\}
+- **`radius`** — how far the glow bleeds outward. \{**`radius`** — quầng loang ra xa cỡ nào.\}
+
+The senior trick: drive bloom from **emissive materials** and **HDR-range values** above 1.0, so the bright parts of your scene blow out naturally and the threshold has something to catch. \{Mẹo senior: cấp bloom từ **vật liệu emissive** và **giá trị dải HDR** trên 1.0, để phần sáng của scene cháy ra tự nhiên và threshold có cái để bắt.\}
+
+```js
+material.emissive = new THREE.Color(0xc8ff00);
+material.emissiveIntensity = 1.6; // > 1 pushes it into bloom range
+```
+
+## Don't forget resize \{Đừng quên resize\}
+
+The composer holds its own render targets sized to the canvas. \{Composer giữ render target riêng có kích thước theo canvas.\} On resize you must update **both** the renderer and the composer, or the post-processed image will stretch or alias: \{Khi resize bạn phải cập nhật **cả** renderer lẫn composer, nếu không ảnh hậu kỳ sẽ bị kéo hoặc răng cưa:\}
+
+```js
+function onResize(w, h) {
+  renderer.setSize(w, h);
+  composer.setSize(w, h);          // ← easy to forget
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+```
+
+## The performance budget \{Ngân sách hiệu năng\}
+
+Every pass is at least one full-screen draw over every pixel. \{Mỗi pass ít nhất là một lần vẽ toàn màn hình lên mọi pixel.\} Bloom is *several* passes (downsample → blur → upsample), which is why it's the heaviest common effect. \{Bloom là *vài* pass (giảm mẫu → làm mờ → tăng mẫu), nên nó là hiệu ứng phổ biến nặng nhất.\} On a high-DPI phone at full resolution this adds up fast. \{Trên điện thoại DPI cao ở độ phân giải tối đa, nó cộng dồn nhanh.\} Senior habits: \{Thói quen senior:\}
+
+- Cap `renderer.setPixelRatio(Math.min(devicePixelRatio, 2))` — post-processing cost scales with pixel count. \{Giới hạn `setPixelRatio` — chi phí hậu kỳ tỉ lệ với số pixel.\}
+- Use as few passes as the look needs; combine effects into a single custom `ShaderPass` when you can. \{Dùng ít pass nhất mà vẻ cần; gộp hiệu ứng vào một `ShaderPass` tuỳ biến khi có thể.\}
+- Consider the newer `postprocessing` library (pmndrs) which merges effects into one pass for big savings. \{Cân nhắc thư viện `postprocessing` (pmndrs) mới hơn, gộp hiệu ứng vào một pass để tiết kiệm lớn.\}
+
+## A custom pass, in one shader \{Một pass tuỳ biến, trong một shader\}
+
+When you outgrow the built-ins, a `ShaderPass` runs your own GLSL over the image. \{Khi bạn vượt qua các pass dựng sẵn, `ShaderPass` chạy GLSL của bạn lên ảnh.\} The shape is always the same — `tDiffuse` is the incoming image: \{Hình dạng luôn giống nhau — `tDiffuse` là ảnh đầu vào:\}
+
+```js
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+const Vignette = {
+  uniforms: { tDiffuse: { value: null }, strength: { value: 1.0 } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform float strength; varying vec2 vUv;
+    void main(){
+      vec4 c = texture2D(tDiffuse, vUv);
+      float d = distance(vUv, vec2(0.5));      // 0 center → ~0.7 corner
+      c.rgb *= smoothstep(0.8, 0.2, d * strength);
+      gl_FragColor = c;
+    }`,
+};
+composer.addPass(new ShaderPass(Vignette));
+```
+
+## The master's warnings \{Lời cảnh báo của sư phụ\}
+
+- **Washed-out / dark after adding the composer?** Add an `OutputPass` as the final pass. \{**Nhợt/tối sau khi thêm composer?** Thêm `OutputPass` làm pass cuối.\}
+- **Effects not showing?** You're still calling `renderer.render()` — switch to `composer.render()`. \{**Hiệu ứng không hiện?** Bạn vẫn gọi `renderer.render()` — đổi sang `composer.render()`.\}
+- **Image stretches on resize?** You forgot `composer.setSize()`. \{**Ảnh kéo khi resize?** Bạn quên `composer.setSize()`.\}
+- **Everything glows / looks hazy?** Threshold too low, or emissive values too high. \{**Mọi thứ rực/mờ ảo?** Threshold quá thấp, hoặc emissive quá cao.\}
+- **Mobile frame rate dies?** Drop pixel ratio and pass count before anything else. \{**FPS mobile chết?** Giảm pixel ratio và số pass trước tiên.\}
+
+## Practice, or it didn't happen \{Luyện tập, không thì coi như chưa học\}
+
+1. **Threshold sweep** \{Quét threshold\}: in the demo, move threshold from 0 to 0.8 and name where it stops looking like fog and starts looking premium. \{trong demo, kéo threshold từ 0 tới 0.8 và gọi tên chỗ nó hết trông như sương và bắt đầu trông cao cấp.\}
+2. **Order experiment** \{Thử thứ tự\}: add a vignette `ShaderPass` before vs. after bloom and compare. \{thêm một `ShaderPass` vignette trước và sau bloom rồi so sánh.\}
+3. **Emissive driving** \{Điều khiển bằng emissive\}: drop `emissiveIntensity` to 0 and confirm the bloom disappears even with strength high. \{hạ `emissiveIntensity` về 0 và xác nhận bloom biến mất dù strength cao.\}
+
+## What's next \{Phần tiếp theo\}
+
+Your scene now looks polished — but polish costs frames, and so does everything else as scenes grow. \{Scene của bạn giờ trông bóng bẩy — nhưng bóng bẩy tốn frame, và mọi thứ khác cũng vậy khi scene lớn lên.\} In **Part 8** we go full senior on **performance**: draw calls, `InstancedMesh` for thousands of objects, geometry merging, frustum culling, level-of-detail, and how to read `renderer.info` like a profiler — with a live demo that pits one instanced mesh against thousands of separate ones. \{Ở **Phần 8** ta vào chế độ senior về **hiệu năng**: draw call, `InstancedMesh` cho hàng nghìn vật thể, gộp geometry, frustum culling, mức chi tiết, và đọc `renderer.info` như một profiler — với demo đối đầu một instanced mesh với hàng nghìn mesh riêng lẻ.\}

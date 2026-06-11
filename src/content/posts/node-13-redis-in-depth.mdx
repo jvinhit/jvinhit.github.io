@@ -1,0 +1,190 @@
+---
+title: 'Node.js Super Senior · Phase 13 — Redis in Depth'
+description: 'Bonus Phase 13: make it fast and scalable with Redis. Core data types, cache-aside with TTLs and stampede protection, pub/sub vs Streams, atomic rate limiting, distributed locks, sessions, and BullMQ jobs — in TypeScript.'
+pubDate: 2026-06-10
+tags: [nodejs, redis, caching, queues, node_10]
+series: nodejs
+seriesOrder: 13
+draft: false
+---
+
+This is **Bonus Phase 13** \{Đây là **Bonus Phase 13**\}. Phase 6 mentioned Redis; now we go deep \{Phase 6 có nhắc Redis; giờ ta đi sâu\}. Redis is an in-memory data structure store that does far more than caching: pub/sub, streams, atomic counters, locks, sessions, and job queues \{Redis là kho cấu trúc dữ liệu trong bộ nhớ làm nhiều hơn caching: pub/sub, stream, bộ đếm nguyên tử, khóa, session, và hàng đợi job\}. A junior uses it as a key-value cache; a senior reaches for the *right primitive* for each problem \{Junior dùng nó như cache key-value; senior chọn đúng *primitive* cho mỗi bài toán\}.
+
+---
+
+## 13.0 Connect \{Kết nối\}
+
+```bash
+docker run --name redis -p 6379:6379 -d redis:7
+npm i ioredis            # or: npm i redis  (node-redis v4)
+```
+
+```ts
+import Redis from 'ioredis';
+export const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379');
+```
+
+> Senior note \{Ghi chú senior\}: reuse **one** client (it multiplexes). But pub/sub *subscriber* connections can't run normal commands — create a **separate** client for subscribing \{tái dùng **một** client. Nhưng kết nối *subscriber* pub/sub không chạy lệnh thường được — tạo client **riêng** để subscribe\}.
+
+---
+
+## 13.1 The data types that matter \{Các kiểu dữ liệu quan trọng\}
+
+Knowing which type to use is the whole skill \{Biết dùng kiểu nào là toàn bộ kỹ năng\}:
+
+| Type | Use for \{Dùng cho\} |
+| --- | --- |
+| **String** | cached JSON, counters (`INCR`), flags |
+| **Hash** | objects/records — update one field without rewriting all |
+| **List** | simple queues, recent-items feeds (`LPUSH`/`LRANGE`) |
+| **Set** | uniqueness, tags, "who's online" |
+| **Sorted Set (ZSet)** | leaderboards, rate windows, priority queues (score = rank/time) |
+| **Stream** | append-only event log with consumer groups |
+
+---
+
+## 13.2 Caching: cache-aside + TTL \{Caching: cache-aside + TTL\}
+
+The dominant pattern: check cache, on miss read the DB and backfill with an expiry \{Pattern chủ đạo: kiểm cache, nếu miss thì đọc DB và nạp lại kèm hạn\}.
+
+```ts
+async function getPost(id: number) {
+  const key = `post:${id}`;
+  const hit = await redis.get(key);
+  if (hit) return JSON.parse(hit);                       // cache hit
+
+  const post = await prisma.post.findUnique({ where: { id } }); // miss → DB (Phase 12)
+  if (post) await redis.set(key, JSON.stringify(post), 'EX', 300); // TTL 5 min
+  return post;
+}
+```
+
+**Always set a TTL** unless you have an explicit invalidation strategy — un-expiring keys are a slow memory leak \{**Luôn đặt TTL** trừ khi có chiến lược vô hiệu rõ ràng — key không hết hạn là rò bộ nhớ chậm\}. On writes, invalidate: `await redis.del('post:'+id)` \{Khi ghi, vô hiệu hóa cache\}.
+
+### The cache stampede \{Cơn giẫm đạp cache\}
+
+When a hot key expires, thousands of concurrent requests miss at once and hammer the DB \{Khi một key nóng hết hạn, hàng nghìn request đồng thời miss cùng lúc và dộng DB\}. Defenses: a short **lock** so only one request rebuilds (see 13.5), **slightly randomized TTLs** (jitter) so keys don't expire together, or serving stale while refreshing in the background \{Phòng vệ: một **khóa** ngắn để chỉ một request dựng lại, **TTL ngẫu nhiên nhẹ** (jitter), hoặc phục vụ dữ liệu cũ trong khi làm mới nền\}.
+
+---
+
+## 13.3 Pub/Sub vs Streams \{Pub/Sub và Streams\}
+
+Both move messages, but with opposite durability \{Cả hai chuyển tin, nhưng độ bền ngược nhau\}:
+
+```ts
+// Pub/Sub — fire-and-forget; offline subscribers MISS messages
+sub.subscribe('orders');
+sub.on('message', (ch, msg) => handle(JSON.parse(msg)));
+pub.publish('orders', JSON.stringify({ id: 42 }));
+
+// Streams — durable append-only log; consumers replay & ack what they processed
+await redis.xadd('orders', '*', 'id', '42');
+const res = await redis.xreadgroup('GROUP', 'workers', 'w1', 'COUNT', 10, 'STREAMS', 'orders', '>');
+// ... process, then: redis.xack('orders', 'workers', id)
+```
+
+Use **Pub/Sub** for ephemeral fan-out (live notifications) where missing a message is fine \{Dùng **Pub/Sub** cho fan-out tạm thời nơi mất tin cũng được\}. Use **Streams** when every event must be processed at least once with consumer groups \{Dùng **Streams** khi mọi sự kiện phải được xử lý ít nhất một lần\}.
+
+---
+
+## 13.4 Rate limiting — atomic counters \{Rate limit — bộ đếm nguyên tử\}
+
+A fixed-window limiter is two atomic ops; `INCR` returns the new value, and `EXPIRE` on first hit sets the window \{Limiter cửa sổ cố định là hai thao tác nguyên tử\}:
+
+```ts
+async function allow(ip: string, limit = 100, windowSec = 60) {
+  const key = `rl:${ip}`;
+  const count = await redis.incr(key);          // atomic
+  if (count === 1) await redis.expire(key, windowSec); // start the window
+  return count <= limit;
+}
+```
+
+Because `INCR` is atomic, this is correct even under heavy concurrency — no lost updates \{Vì `INCR` nguyên tử, nó đúng cả khi đồng thời nặng\}. For smoother limits use a sliding window with a **sorted set** of timestamps, ideally inside a Lua script for atomicity \{Cho giới hạn mượt hơn dùng sliding window với **sorted set** timestamp, lý tưởng trong script Lua để nguyên tử\}.
+
+---
+
+## 13.5 Distributed locks \{Khóa phân tán\}
+
+To ensure only one process does something (a cron job, a cache rebuild), use `SET key value NX PX` — set only if absent, with an auto-expiry so a crashed holder can't deadlock \{Để chỉ một process làm việc gì đó, dùng `SET key value NX PX`\}:
+
+```ts
+const token = crypto.randomUUID();
+const got = await redis.set('lock:rebuild', token, 'PX', 10_000, 'NX');
+if (got === 'OK') {
+  try { /* critical section */ }
+  finally {
+    // release ONLY if we still own it (compare-and-delete via Lua)
+    await redis.eval(
+      `if redis.call("get",KEYS[1])==ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`,
+      1, 'lock:rebuild', token,
+    );
+  }
+}
+```
+
+> Senior note \{Ghi chú senior\}: always include the random `token` and release with compare-and-delete, or you'll delete a lock someone else acquired after yours expired. For multi-node correctness, understand the Redlock debate before trusting a single-instance lock for money-critical work \{luôn kèm `token` ngẫu nhiên và giải phóng bằng compare-and-delete. Cho đúng đa node, hiểu tranh luận Redlock trước khi tin một khóa một-instance cho việc liên quan tiền\}.
+
+---
+
+## 13.6 Sessions \{Session\}
+
+Redis is the standard session store for horizontally-scaled apps — any instance can read any session \{Redis là kho session chuẩn cho app scale ngang — instance nào cũng đọc được session nào\}:
+
+```ts
+import session from 'express-session';
+import { RedisStore } from 'connect-redis';
+
+app.use(session({
+  store: new RedisStore({ client: redis }),
+  secret: process.env.SESSION_SECRET!,
+  resave: false, saveUninitialized: false,
+  cookie: { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 86_400_000 },
+}));
+```
+
+This connects to Phase 5 auth and previews Phase 15: sessions vs JWT \{Cái này nối với auth Phase 5 và hé lộ Phase 15: session vs JWT\}.
+
+---
+
+## 13.7 Background jobs with BullMQ \{Job nền với BullMQ\}
+
+Don't do slow work (emails, image processing, webhooks) inside the request \{Đừng làm việc chậm trong request\}. Offload to a Redis-backed queue and process it in a worker \{Đẩy sang hàng đợi nền Redis và xử lý trong worker\}:
+
+```ts
+import { Queue, Worker } from 'bullmq';
+const connection = { host: 'localhost', port: 6379 };
+
+const emailQueue = new Queue('email', { connection });
+await emailQueue.add('welcome', { to: 'a@ex.com' }, {
+  attempts: 3, backoff: { type: 'exponential', delay: 1000 },  // retry on failure
+});
+
+new Worker('email', async (job) => { await sendEmail(job.data); }, { connection });
+```
+
+Built-in retries, backoff, delayed/repeatable jobs, and concurrency — the production way to keep request latency low \{Có sẵn retry, backoff, job trễ/lặp, và concurrency — cách production giữ độ trễ request thấp\}.
+
+---
+
+## 13.8 The master's warnings \{Lời cảnh báo của sư phụ\}
+
+- **Every cache key needs a TTL or an invalidation plan.** Otherwise Redis fills until it evicts unpredictably \{**Mọi cache key cần TTL hoặc kế hoạch vô hiệu.**\}
+- **Cache invalidation is hard — keep it simple.** Prefer short TTLs over clever multi-key invalidation you can't reason about \{**Vô hiệu cache khó — giữ đơn giản.**\}
+- **Pub/Sub drops messages for offline subscribers.** If delivery matters, use Streams or a queue \{**Pub/Sub rớt tin với subscriber offline.**\}
+- **Locks must auto-expire and verify ownership.** A lock without `PX` can deadlock forever; a blind `DEL` frees someone else's lock \{**Khóa phải tự hết hạn và xác minh sở hữu.**\}
+- **Redis is (mostly) single-threaded.** A `KEYS *` or a giant Lua script blocks everything — use `SCAN` and keep scripts tiny \{**Redis (phần lớn) đơn luồng.** `KEYS *` chặn mọi thứ — dùng `SCAN`\}.
+
+---
+
+## 13.9 Practice \{Thực hành\}
+
+1. Add cache-aside to the Phase 12 `getPost`, with TTL jitter and write-through invalidation \{Thêm cache-aside vào `getPost` Phase 12, kèm TTL jitter và vô hiệu khi ghi\}.
+2. Build a per-user rate limiter middleware with `INCR`/`EXPIRE` and return `429` with a `Retry-After` header \{Dựng middleware rate limit theo user, trả `429` kèm `Retry-After`\}.
+3. Move email sending to a BullMQ worker with 3 retries and exponential backoff \{Chuyển gửi email sang worker BullMQ với 3 retry và backoff lũy thừa\}.
+
+---
+
+## What's next \{Phần tiếp theo\}
+
+You can persist (Phase 11–12) and accelerate/scale (Phase 13) \{Bạn lưu trữ được và tăng tốc/scale được\}. The pieces are there, but wiring them by hand in Express gets unwieldy on a large team \{Các mảnh đã đủ, nhưng nối tay trong Express trở nên cồng kềnh với team lớn\}. In **Phase 14** we adopt **NestJS** — a structured, dependency-injected framework that organizes modules, providers, guards, pipes, and interceptors, and wraps Prisma and Redis cleanly into an enterprise-ready architecture \{Ở **Phase 14** ta dùng **NestJS** — một framework có cấu trúc, tiêm phụ thuộc, tổ chức module, provider, guard, pipe, interceptor, và bọc Prisma cùng Redis gọn gàng\}.

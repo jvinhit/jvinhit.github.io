@@ -1,0 +1,576 @@
+---
+title: 'Proxyman — HTTP Debugging toàn tập cho Developer & Tester'
+description: 'Hướng dẫn Proxyman từ cơ bản đến pro: capture & decrypt HTTPS, filter nâng cao, Compose/Repeat, Breakpoint sửa request/response on the fly, Map Local/Remote, Scripting JS, throttling, mobile, và workflow thực chiến.'
+pubDate: 2026-06-09
+tags: [proxyman, debugging, http, testing]
+draft: false
+---
+
+Mọi bug "không thể reproduce" của frontend, mobile hay QA, 80% nằm ở **một
+chỗ duy nhất**: cái gì thực sự đi qua dây mạng. Không phải code bạn nghĩ
+bạn gửi — mà là request thật, header thật, body thật, status thật.
+
+**Proxyman** là một HTTP debugging proxy native cho macOS (Swift +
+SwiftNIO, chạy mượt trên Apple Silicon, hỗ trợ tới macOS 26 Tahoe). Nó
+đứng giữa app của bạn và server, cho bạn **xem, sửa, mock, và chặn** mọi
+HTTP/HTTPS/WebSocket traffic. Charles Proxy làm được điều tương tự nhưng
+viết bằng Java; Proxyman là bản "đúng chất Mac" của ý tưởng đó.
+
+Bài này đi từ cài đặt → đọc traffic → filter → sửa response → mock →
+scripting → mobile → các tính năng pro. Đọc xong bạn có đủ để dùng
+Proxyman như một phần phản xạ hằng ngày, không chỉ "mở ra khi bí".
+
+---
+
+## 1. Proxyman là gì và vì sao bạn cần nó
+
+Một proxy debug nằm **giữa client và server**, log lại mọi thứ đi qua:
+
+```text
+  ┌──────────┐        ┌──────────────────┐        ┌──────────┐
+  │  Browser │        │     Proxyman     │        │  Server  │
+  │  iOS app │ ─────► │  (man-in-middle) │ ─────► │  API/CDN │
+  │ Android  │ ◄───── │  log · sửa · mock│ ◄───── │          │
+  └──────────┘        └──────────────────┘        └──────────┘
+                              │
+                              ▼
+                    Bạn thấy & can thiệp:
+                    URL · Method · Headers
+                    Body · Status · Timing
+```
+
+Khác nhau giữa "đoán" và "biết":
+
+| Tình huống                                  | Không có proxy            | Có Proxyman                                  |
+| ------------------------------------------- | ------------------------- | -------------------------------------------- |
+| API trả sai dữ liệu                         | Đọc code, thêm `console`  | Xem chính xác response body server trả về    |
+| Test UI khi server lỗi `500`                | Chờ backend làm hỏng hộ   | Breakpoint đổi status thành `500` ngay        |
+| Frontend gọi sai endpoint                   | Soi Network tab mệt mỏi   | Filter theo host, thấy đúng request          |
+| Mock data chưa có API                       | Viết mock server riêng    | Map Local trả file JSON                       |
+| App mobile gọi gì lên server                | Gần như mù                | Capture full traffic từ device thật          |
+
+**Ai cần?** Frontend dev (debug API, CORS, caching), mobile dev (iOS/
+Android traffic), QA/tester (giả lập lỗi, edge case, data bất thường),
+backend dev (xem request client gửi thật sự).
+
+> Proxyman có bản Free (đủ dùng cho phần lớn nhu cầu) và bản Premium (mở
+> khoá Map Remote nhiều rule, Scripting không giới hạn, v.v.). Phần lớn
+> tính năng trong bài chạy được ở bản Free.
+
+---
+
+## 2. Cài đặt và capture lần đầu
+
+Tải Proxyman từ [proxyman.com](https://proxyman.com) (hoặc `brew install
+--cask proxyman`). Lần đầu mở app:
+
+1. Proxyman tự cài **Proxy Helper Tool** — thứ này set System HTTP Proxy
+   trỏ về Proxyman (`127.0.0.1:9090`) rồi tự revert khi tắt app. Nhanh và
+   sạch hơn chỉnh tay trong System Settings.
+2. Ngay lập tức bạn thấy traffic HTTP của máy chảy vào cột bên trái, nhóm
+   theo **domain**.
+
+```text
+Proxyman layout:
+
+┌───────────────┬──────────────────────────────────────┐
+│  Domain list  │   Flow detail                        │
+│               │  ┌────────────────────────────────┐  │
+│ ▸ apple.com   │  │ Request  │ Response             │  │
+│ ▸ github.com  │  ├────────────────────────────────┤  │
+│ ▾ api.app.io  │  │ Headers · Body · Query · Cookie │  │
+│   GET /users  │  │ Hex · Raw · Preview             │  │
+│   POST /login │  └────────────────────────────────┘  │
+└───────────────┴──────────────────────────────────────┘
+```
+
+Lúc này bạn mới chỉ thấy **HTTP**. HTTPS vẫn hiện nhưng body bị mã hoá
+(`<encrypted>`). Để đọc được HTTPS, cần bước tiếp theo: SSL Proxying.
+
+---
+
+## 3. SSL Proxying — đọc được HTTPS
+
+HTTPS được mã hoá end-to-end, nên mặc định proxy chỉ thấy "cục dữ liệu
+rối". Để decrypt, Proxyman đóng vai một **Certificate Authority** trung
+gian: nó tạo cert riêng cho từng domain, ký bằng root cert của Proxyman.
+Khi máy bạn **tin** root cert đó, traffic sẽ giải mã được.
+
+```text
+  Client  ──TLS──►  Proxyman  ──TLS──►  Server
+            (cert Proxyman)    (cert thật)
+                  │
+       Chỉ decrypt được nếu device
+       đã TRUST root cert Proxyman
+```
+
+### 3.1. Cài & trust certificate trên macOS
+
+Menu **Certificate → Install Certificate on this Mac → Trust**. Lệnh này
+thêm root cert của Proxyman vào Keychain và đánh dấu "Always Trust".
+
+### 3.2. Bật SSL Proxying cho domain cần xem
+
+Mặc định Proxyman **không** decrypt mọi thứ (để khỏi loạn). Bạn bật theo
+domain:
+
+- Right-click một domain → **Enable SSL Proxying**, hoặc
+- **Tools → SSL Proxying List** → thêm pattern.
+
+Pattern hỗ trợ wildcard:
+
+```text
+api.myapp.com          # đúng 1 host
+*.myapp.com            # mọi subdomain
+*.myapp.com:443        # giới hạn theo port
+*                      # tất cả (chỉ dùng khi thật cần — rất nhiễu)
+```
+
+Sau khi bật, `<encrypted>` biến thành JSON/HTML đọc được.
+
+> **Pitfall thường gặp:** App dùng **certificate pinning** sẽ từ chối cert
+> của Proxyman → request fail. Pinning là tính năng bảo mật cố ý; muốn
+> debug phải tắt pinning ở bản debug build (hoặc dùng Frida/objection cho
+> app không tự build được). Không có cách "bypass" sạch cho production app.
+
+---
+
+## 4. Đọc một flow: Request & Response inspector
+
+Click vào một request, panel bên phải tách thành **Request** và
+**Response**, mỗi bên có nhiều tab:
+
+| Tab           | Cho bạn xem                                              |
+| ------------- | ------------------------------------------------------- |
+| **Headers**   | Toàn bộ header (auth, content-type, cache-control...)   |
+| **Body**      | Payload — auto format JSON/Form/Multipart               |
+| **Query**     | Query string tách thành key-value                       |
+| **Cookies**   | Cookie gửi đi / `Set-Cookie` nhận về                    |
+| **Preview**   | Render JSON tree, ảnh, HTML                              |
+| **Raw**       | Nguyên văn HTTP message — copy nguyên block             |
+| **Hex**       | Byte-level, cho binary/protobuf                         |
+| **Timing**    | DNS, connect, TLS, TTFB, download — soi bottleneck      |
+
+Vài thói quen hữu ích:
+
+- **Copy as cURL**: right-click → Copy → cURL. Dán vào terminal hoặc gửi
+  cho backend để họ reproduce y hệt.
+- **Pretty/Raw toggle** cho JSON: đọc tree khi debug, copy raw khi cần.
+- **Diff hai flow**: chọn 2 request → **Tools → Diff** để so header/body
+  (cực hữu ích khi "request giống hệt mà kết quả khác").
+
+---
+
+## 5. Filter — tìm đúng cái cần trong biển traffic
+
+Một app thật bắn hàng trăm request. Kỹ năng filter quyết định bạn debug
+nhanh hay chậm.
+
+### 5.1. Quick filter
+
+Ô search trên toolbar lọc tức thời theo URL. Gõ `login` → chỉ còn request
+chứa `login`.
+
+### 5.2. Multiple Filters (AND/OR)
+
+Mạnh hơn nhiều: kết hợp nhiều tiêu chí. Mở **Multiple Filters** rồi build
+điều kiện theo `URL`, `Method`, `Status Code`, `Header`, `Body`,
+`Content-Type`, `Host`...
+
+```text
+Tìm mọi POST tới API auth bị lỗi:
+
+  Method   is        POST
+  AND  Host     contains  api.myapp.com
+  AND  Path     contains  /auth
+  AND  Status   >=        400
+```
+
+Mỗi dòng hỗ trợ toán tử: `contains`, `not contains`, `prefix`, `suffix`,
+`matches regex`, `is`, `>=`, `<=`...
+
+### 5.3. Regex matching
+
+Khi pattern phức tạp, bật chế độ regex:
+
+```text
+Path  matches regex  ^/v[0-9]+/users/\d+$
+```
+
+→ chỉ bắt `/v1/users/42`, `/v2/users/100`, bỏ qua `/users/list`.
+
+### 5.4. Custom Filters (lưu lại để tái dùng)
+
+Filter hay dùng → lưu thành **Custom Filter** đặt tên ("Failed API",
+"GraphQL only", "Slow > 1s"). Lần sau một click là có.
+
+### 5.5. Command Palette
+
+Nhấn phím tắt mở **Command Palette** để nhảy nhanh tới request, script,
+tool... mà không rời bàn phím — kiểu `Cmd+P` của VS Code nhưng cho traffic.
+
+---
+
+## 6. Compose & Repeat — tạo và gửi lại request
+
+### 6.1. Repeat
+
+Right-click request → **Repeat** (hoặc `Cmd+R`): gửi lại y hệt. Dùng để:
+
+- Reproduce một lỗi nhiều lần.
+- Test rate limiting / idempotency.
+- **Repeat Multiple Times** để bắn N lần liên tiếp.
+
+### 6.2. Compose
+
+**Compose** mở một editor để tự soạn request từ đầu (hoặc clone từ một
+request có sẵn rồi chỉnh). Bạn đổi method, URL, header, body rồi **Execute**.
+
+```text
+Compose:
+  Method:  POST
+  URL:     https://api.myapp.com/v1/orders
+  Headers: Authorization: Bearer <token>
+           Content-Type: application/json
+  Body:    { "productId": 42, "qty": 2 }
+  → [Execute]
+```
+
+Nó là một **Postman mini** ngay trong proxy: tận dụng token/cookie thật từ
+traffic vừa bắt, không phải copy thủ công sang app khác.
+
+---
+
+## 7. Breakpoint — sửa request/response on the fly
+
+Đây là tính năng "đắt giá" nhất. **Breakpoint** tạm dừng một request hoặc
+response **đang chạy** để bạn sửa rồi mới cho đi tiếp. Khác với Map
+Local (response tĩnh), breakpoint cho bạn can thiệp **realtime, có chọn lọc**.
+
+```text
+  App ──► [Proxyman tạm dừng] ──► bạn sửa ──► [Execute] ──► Server
+                                  │
+                       App ◄── [tạm dừng] ◄── bạn sửa response ◄── Server
+```
+
+### 7.1. Tạo breakpoint
+
+Right-click request → **Tools → Breakpoint**. Proxyman mở cửa sổ và điền
+sẵn matching rule (URL/host/path). Chọn chặn ở **Request**, **Response**,
+hoặc cả hai → **Add**.
+
+### 7.2. Sửa được những gì
+
+Khi breakpoint kích hoạt, bạn có thể chỉnh:
+
+- **Request**: Scheme, Host, Path, Port, **HTTP Method**, Headers, Query,
+  Form entry, Authorization/Cookie, và Body.
+- **Response**: **HTTP Status Code**, Headers, `Set-Cookie`, và Body.
+
+Cũng có chế độ **Raw** để sửa nguyên văn message — nhanh khi cần đổi nhiều
+thứ cùng lúc.
+
+### 7.3. Ba hành động
+
+| Nút         | Ý nghĩa                                                  |
+| ----------- | ------------------------------------------------------- |
+| **Execute** | Gửi đi với thay đổi vừa nhập                             |
+| **Cancel**  | Bỏ breakpoint, cho request/response đi tiếp như cũ      |
+| **Abort**   | Ngắt kết nối, trả về `503`                              |
+
+### 7.4. Ví dụ thực chiến cho tester
+
+Test UI khi API trả lỗi mà **không cần backend làm hỏng**:
+
+```text
+1. Breakpoint trên Response của  GET /api/profile
+2. Gọi lại → Proxyman dừng response
+3. Đổi Status Code: 200 → 500
+   Đổi Body:  { "error": "Internal Server Error" }
+4. Execute → app nhận đúng lỗi đó → kiểm tra error state của UI
+```
+
+Cũng cách đó: giả lập field `null`, list rỗng, ngày sai định dạng, token
+hết hạn (`401`)... — toàn bộ edge case mà bình thường rất khó dựng.
+
+> Breakpoint là thao tác **thủ công** (dừng — sửa — tiếp). Nếu cần làm
+> **tự động** mỗi lần, dùng Scripting (mục 10).
+
+---
+
+## 8. Map Local — mock response từ file
+
+**Map Local** trả về một **file local** thay cho response thật của server.
+Hoàn hảo khi: API chưa có, muốn dữ liệu cố định để test, hoặc tách
+frontend khỏi backend đang sửa.
+
+```text
+  App gọi  GET /api/users
+       │
+       ▼
+  Proxyman: "URL này khớp Map Local"
+       │
+       ▼
+  Trả về nội dung  ~/mocks/users.json   (không chạm tới server)
+```
+
+### 8.1. Tạo rule
+
+Right-click request → **Tools → Map Local**. Proxyman điền sẵn matching
+URL. Trỏ tới một file (ví dụ `users.json`) → Save. Từ giờ mọi request khớp
+đều nhận file đó.
+
+### 8.2. Map Local Directory
+
+Trỏ tới **cả một thư mục**: Proxyman map theo cấu trúc path. Tiện khi mock
+nhiều endpoint cùng lúc:
+
+```text
+~/mocks/
+├── api/
+│   ├── users.json      → /api/users
+│   ├── orders.json     → /api/orders
+│   └── profile.json    → /api/profile
+```
+
+> Nhớ set đúng `Content-Type` (file `.json` → `application/json`) để app
+> parse được. Proxyman thường tự suy ra theo đuôi file.
+
+---
+
+## 9. Map Remote — chuyển hướng endpoint
+
+**Map Remote** đổi đích đến của request: từ URL này sang URL khác, giữ
+nguyên method/headers/body. Khác Map Local (file tĩnh), Map Remote vẫn gọi
+**một server thật** — chỉ là server khác.
+
+```text
+  App gọi:    https://api.prod.myapp.com/v1/users
+  Map Remote: prod  ──►  http://localhost:3000
+  Thực tế đi: http://localhost:3000/v1/users
+```
+
+Use case kinh điển:
+
+- **App production gọi vào backend local**: test fix backend mà không build
+  lại app.
+- Trỏ staging → prod hoặc ngược lại để so sánh.
+- Chuyển CDN/asset host sang bản dev.
+
+Tạo rule: **Tools → Map Remote** → nhập `Map From` (URL/regex) và `Map To`.
+Bật regex nếu cần giữ lại phần path động.
+
+---
+
+## 10. Scripting — tự động hoá bằng JavaScript
+
+Khi cần can thiệp **mọi lần, tự động** (không ngồi bấm Execute), dùng
+**Scripting Tool**: viết JavaScript chạy trên request và/hoặc response.
+Nó là "breakpoint tự động" nhưng linh hoạt hơn nhiều — có thể dùng snippet
+có sẵn và cả thư viện npm.
+
+```javascript
+// Chạy TRƯỚC khi request rời máy
+function onRequest(context, url, request) {
+  // Inject header debug cho mọi request tới API
+  request.headers['X-Debug-Mode'] = 'true';
+  return request;
+}
+
+// Chạy SAU khi nhận response, TRƯỚC khi app thấy
+function onResponse(context, url, request, response) {
+  if (url.includes('/api/feature-flags')) {
+    const body = JSON.parse(response.body);
+    body.newCheckout = true; // bật feature flag để test
+    response.body = JSON.stringify(body);
+  }
+  return response;
+}
+```
+
+Scripting hợp khi:
+
+- Bật/tắt feature flag cho **mọi** response một cách nhất quán.
+- Tự thêm/đổi token, ký request, sinh giá trị động.
+- Biến đổi data theo logic phức tạp (regex, điều kiện) mà UI breakpoint
+  làm thủ công sẽ chậm.
+
+> Proxyman kèm sẵn bộ **Snippet Code** (đổi status, delay response, redirect,
+> chỉnh JSON...) — copy rồi sửa nhanh thay vì viết từ đầu.
+
+---
+
+## 11. Block/Allow List, No Caching & Network Conditions
+
+### 11.1. Block List / Allow List
+
+- **Block List**: chặn request khớp pattern (trả lỗi kết nối). Dùng để mô
+  phỏng "endpoint chết", "analytics bị chặn", hoặc test fallback khi một
+  service offline.
+- **Allow List**: chỉ cho qua những gì khớp, chặn phần còn lại — cô lập
+  traffic cần quan sát.
+
+### 11.2. No Caching
+
+Ép mọi response **không cache** (chèn header phù hợp) để mỗi lần test đều
+là data tươi — tránh "sửa rồi mà vẫn ra kết quả cũ".
+
+### 11.3. Network Conditions (throttling)
+
+Giả lập mạng yếu: bóp băng thông, thêm latency, mô phỏng 3G/Edge. Bắt buộc
+khi test loading state, timeout, spinner, retry, offline UX.
+
+```text
+Network Conditions:
+  Preset:     3G  (hoặc tự set)
+  Bandwidth:  ↓ 780 kbps   ↑ 330 kbps
+  Latency:    +400 ms
+  → Xem UI có loading/timeout đàng hoàng không
+```
+
+---
+
+## 12. GraphQL, WebSocket, gRPC & Protobuf
+
+Proxyman không chỉ hiểu REST:
+
+- **GraphQL**: nhóm và filter theo **Query Name** (không phải chỉ theo URL
+  `/graphql` chung chung). Breakpoint, Map Local/Remote, Scripting đều áp
+  được theo từng query/mutation.
+- **WebSocket**: xem từng message gửi/nhận realtime trong một kết nối WS.
+- **gRPC / Protobuf**: decode binary protobuf thành dạng đọc được (cần
+  cung cấp `.proto` để map field cho rõ).
+
+Nghĩa là dù stack của bạn là REST cổ điển hay GraphQL/gRPC hiện đại,
+Proxyman vẫn soi được tới tận body.
+
+---
+
+## 13. Capture traffic từ mobile
+
+Đây là chỗ Proxyman toả sáng so với DevTools của browser.
+
+### 13.1. iOS Simulator
+
+Simulator share network với Mac → traffic tự xuất hiện. Chỉ cần đã
+**Install Certificate on iOS Simulators** (menu Certificate) là decrypt
+được HTTPS.
+
+### 13.2. iOS device thật
+
+```text
+1. iPhone & Mac chung Wi-Fi
+2. Wi-Fi → cấu hình HTTP Proxy thủ công → IP_của_Mac : 9090
+3. Safari mở  proxy.man/ssl  → cài profile certificate
+4. Settings → General → About → Certificate Trust Settings → bật trust
+5. Traffic iPhone chảy vào Proxyman trên Mac
+```
+
+> Proxyman cũng có **app iOS riêng** capture HTTPS ngay trên device, không
+> cần Mac — kèm Block List, Map Local, Breakpoint.
+
+### 13.3. Android (emulator & device)
+
+Tương tự: set proxy trỏ về IP máy Mac, cài cert Proxyman. Lưu ý từ Android
+7+, app chỉ tin **user certificate** nếu khai báo `network_security_config`
+— nên thường phải debug trên bản build có cấu hình đó (hoặc thiết bị đã
+root).
+
+---
+
+## 14. Tính năng Pro: External/Reverse Proxy, DNS Spoofing, MCP
+
+Khi đã quen, đây là những thứ tách "biết dùng" khỏi "dùng thành thạo":
+
+| Tính năng           | Khi nào cần                                                       |
+| ------------------- | ---------------------------------------------------------------- |
+| **External Proxy**  | Đẩy traffic qua proxy khác (HTTP/HTTPS/SOCKS/PAC) — chain proxy   |
+| **Reverse Proxy**   | Proxyman làm server đầu vào, forward tới backend — test webhook   |
+| **DNS Spoofing**    | Ép một host phân giải về IP bạn muốn (không sửa `/etc/hosts`)     |
+| **Access Control**  | Giới hạn ai được kết nối vào Proxyman (bảo mật khi share mạng)    |
+| **Custom Certs**    | Dùng root/client/server cert riêng cho môi trường đặc thù         |
+| **Import Charles**  | Mở session Charles cũ — chuyển nhà không mất lịch sử              |
+
+### 14.1. Điều khiển bằng CLI & MCP (tự động hoá)
+
+Từ Proxyman 4.12+, bạn bật/tắt **Breakpoint, Map Local, Scripting** bằng
+command line — nhúng vào script test. Mới hơn, Proxyman có **MCP server**:
+AI agent (Cursor, Claude...) có thể tạo breakpoint, map local/remote, bật
+SSL proxying, filter flow, export cURL... qua các tool như
+`create_breakpoint`, `create_map_local`, `enable_ssl_proxying`,
+`filter_flows`. Tức là bạn "nói" cho agent debug network thay vì click tay.
+
+---
+
+## 15. Workflow thực chiến + checklist
+
+### 15.1. Frontend dev debug một API lỗi
+
+```text
+1. Enable SSL Proxying cho api.myapp.com
+2. Filter: Host contains api.myapp.com AND Status >= 400
+3. Mở request lỗi → so Request body (đúng cái FE gửi?) vs Response
+4. Nghi backend? → Copy as cURL gửi cho BE
+5. Nghi FE? → Compose lại request đúng để xác nhận server OK
+```
+
+### 15.2. Tester verify error handling
+
+```text
+1. Breakpoint Response của các endpoint chính
+2. Lần lượt ép: 500, 401, 403, timeout (Network Conditions), body rỗng
+3. Ghi lại UI phản ứng từng case → đó là test case thật
+```
+
+### 15.3. Phát triển song song khi API chưa xong
+
+```text
+1. Map Local Directory ~/mocks → trả JSON theo spec
+2. FE code bình thường như API đã có
+3. Khi BE xong → tắt Map Local, đổi sang traffic thật
+```
+
+### Checklist nhanh
+
+- [ ] Đã Install + **Trust** root cert (macOS và/hoặc device)?
+- [ ] Đã **Enable SSL Proxying** đúng domain (không bật `*` cho cả thế giới)?
+- [ ] App có **certificate pinning** không? (nếu có, phải tắt ở debug build)
+- [ ] Filter đã đủ hẹp để không lạc trong traffic?
+- [ ] Test xong nhớ **tắt Breakpoint/Map/Scripting** kẻo quên rồi tưởng bug?
+
+---
+
+## 16. Pitfalls hay gặp
+
+1. **Bật SSL Proxying nhưng quên trust cert** → vẫn thấy `<encrypted>` hoặc
+   SSL error. Trust cert là bước bắt buộc, không phải optional.
+2. **Để Breakpoint/Map Local bật rồi quên** → "sao app cứ trả data lạ?".
+   Luôn dọn rule sau khi debug.
+3. **`*` trong SSL Proxying List** → decrypt mọi thứ, app chậm và list
+   nhiễu. Chỉ bật domain bạn quan tâm.
+4. **Certificate pinning** → không phải bug của Proxyman; đó là app cố tình
+   từ chối cert lạ. Cần debug build tắt pinning.
+5. **Android 7+ không tin user cert** → phải có `network_security_config`
+   hoặc thiết bị root.
+6. **Map Local sai `Content-Type`** → app không parse được JSON. Set header
+   cho đúng.
+
+---
+
+## Kết
+
+Proxyman biến mạng từ "hộp đen" thành thứ bạn **nhìn thấy và điều khiển**.
+Lộ trình để thành thạo rất tự nhiên:
+
+1. **Tuần 1** — capture + SSL Proxying + đọc flow + filter. Chỉ vậy đã thay
+   đổi cách bạn debug.
+2. **Tuần 2** — Breakpoint + Map Local + Compose/Repeat: bắt đầu *chủ động*
+   tạo tình huống thay vì chờ nó xảy ra.
+3. **Về sau** — Scripting, Map Remote, mobile, Network Conditions, MCP: tự
+   động hoá và xử lý case khó.
+
+Mẹo cuối: đừng chỉ mở Proxyman khi "có bug". Hãy bật nó **trong lúc dev
+bình thường** — bạn sẽ thấy những request thừa, header sai, call lặp mà
+trước giờ không ai để ý. Đó mới là lúc nó đáng giá nhất.
+
+Happy debugging!

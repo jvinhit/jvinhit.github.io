@@ -25,6 +25,11 @@ const posts = defineCollection({
        */
       series: z.string().optional(),
       seriesOrder: z.number().int().positive().optional(),
+      /**
+       * Pin lên đầu homepage — bài có `top` được ưu tiên trước khi xét `pubDate`.
+       * Số lớn hơn = ưu tiên cao hơn. Bỏ trống = không pin (xếp theo pubDate).
+       */
+      top: z.number().int().optional(),
       /** Ẩn bài khỏi production build */
       draft: z.boolean().default(false),
       /** Ảnh cover (optional) — dùng image() để Astro optimize */

@@ -1,0 +1,277 @@
+---
+title: 'Next.js 16 from Zero to Senior · Part 4 — Cache Components & the New Caching Model'
+description: 'The headline feature of Next.js 16: Cache Components. Enable cacheComponents, use the "use cache" directive, control TTL with cacheLife, invalidate with cacheTag + revalidateTag/updateTag, and ship instant pages with PPR.'
+pubDate: 2026-06-11
+tags: [nextjs, caching, use-cache, ppr, nextjs_10]
+series: nextjs
+seriesOrder: 4
+draft: false
+---
+
+This is the part that makes Next.js 16 *different* from everything before it \{Đây là phần khiến Next.js 16 *khác* mọi thứ trước đó\}. If you only deeply learn one chapter, make it this one — caching is where most Next.js bugs and most Next.js performance live \{Nếu chỉ học sâu một chương, hãy là chương này — caching là nơi phần lớn bug và phần lớn hiệu năng của Next.js nằm\}.
+
+In Next.js 13–15, caching was **implicit**: `fetch` was cached by default, plus a confusing mix of `revalidate`, `unstable_cache`, and `cache()` \{Ở Next.js 13–15, caching là **ngầm định**: `fetch` được cache mặc định, cộng một mớ lộn xộn `revalidate`, `unstable_cache`, và `cache()`\}. Next.js 16 throws that out and replaces it with **one explicit, composable primitive: Cache Components** \{Next.js 16 vứt bỏ tất cả và thay bằng **một primitive rõ ràng, kết hợp được: Cache Components**\}.
+
+---
+
+## 1. The mental model \{Mô hình tư duy\}
+
+Three directives now describe *where code runs and how it's cached* \{Ba directive giờ mô tả *code chạy ở đâu và được cache thế nào*\}:
+
+```text
+'use client'  → this code runs in the browser
+'use server'  → this code is a server action callable from the client
+'use cache'   → this code's result is cached and reused
+```
+
+`'use cache'` is the caching counterpart to `'use client'` and `'use server'` \{`'use cache'` là người anh em về caching của `'use client'` và `'use server'`\}. Caching becomes an **explicit, auditable decision** — you can grep your codebase for `'use cache'` and see exactly what's cached \{Caching trở thành một **quyết định rõ ràng, kiểm tra được** — bạn có thể grep codebase tìm `'use cache'` và thấy chính xác cái gì được cache\}.
+
+The default is the opposite of before \{Mặc định ngược với trước đây\}: **nothing is cached; everything is dynamic at request time unless you opt in** \{**không gì được cache; mọi thứ động lúc request trừ khi bạn chủ động chọn**\}.
+
+---
+
+## 2. Turn it on \{Bật nó lên\}
+
+Cache Components are opt-in at the project level \{Cache Components bật ở cấp project\}. Without this flag, **`'use cache'` does nothing** (it's a silent no-op, in dev and production alike) \{Không có cờ này, **`'use cache'` không làm gì** (nó là no-op âm thầm, ở cả dev lẫn production)\}:
+
+```ts
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
+  cacheComponents: true,
+};
+
+export default nextConfig;
+```
+
+> In 16.2 the API graduated from `unstable_` to stable. Older posts show `unstable_cacheLife` / `dynamicIO` — on 16.2+ use the stable names below \{Ở 16.2 API đã tốt nghiệp từ `unstable_` lên ổn định. Bài cũ hiện `unstable_cacheLife` / `dynamicIO` — trên 16.2+ hãy dùng tên ổn định bên dưới\}.
+
+---
+
+## 3. `'use cache'` — three scopes \{`'use cache'` — ba phạm vi\}
+
+Put the directive at the top of a **function**, a **component**, or a whole **file** \{Đặt directive ở đầu một **hàm**, một **component**, hoặc cả một **file**\}.
+
+### Function scope \{Phạm vi hàm\}
+
+```ts
+// lib/products.ts
+export async function getProducts() {
+  'use cache';
+  const res = await fetch('https://api.example.com/products');
+  return res.json();
+}
+```
+
+### Component scope \{Phạm vi component\}
+
+```tsx
+async function ProductList() {
+  'use cache';
+  const products = await getProductsFromDb();
+  return (
+    <ul>
+      {products.map((p) => (
+        <li key={p.id}>{p.name}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+### File scope \{Phạm vi file\}
+
+```tsx
+// app/blog/page.tsx
+'use cache'; // every export in this file is cacheable
+
+export default async function BlogIndex() {
+  const posts = await getAllPosts();
+  return <PostList posts={posts} />;
+}
+```
+
+The compiler automatically generates a **cache key** from the function's arguments and the closure it captures \{Trình biên dịch tự động tạo một **cache key** từ tham số của hàm và closure nó bắt được\}. Call `getProduct(42)` and `getProduct(7)` and they cache separately, keyed by the argument \{Gọi `getProduct(42)` và `getProduct(7)` thì chúng cache riêng, theo tham số\}.
+
+> Because the args become the cache key, everything passed in must be serializable, and you **cannot** read request data (`cookies()`, `headers()`, `searchParams`) inside a `'use cache'` scope — that would make the result un-cacheable \{Vì tham số trở thành cache key, mọi thứ truyền vào phải serialize được, và bạn **không thể** đọc dữ liệu request (`cookies()`, `headers()`, `searchParams`) trong phạm vi `'use cache'` — làm vậy sẽ khiến kết quả không cache được\}.
+
+---
+
+## 4. `cacheLife` — how long to cache \{`cacheLife` — cache bao lâu\}
+
+By default a cached entry uses a sensible profile \{Mặc định một entry cache dùng một profile hợp lý\}. To control freshness, call `cacheLife` with a named profile \{Để kiểm soát độ tươi, gọi `cacheLife` với một profile có tên\}:
+
+```ts
+import { cacheLife } from 'next/cache';
+
+export async function getPrice() {
+  'use cache';
+  cacheLife('minutes'); // built-in profile
+  const res = await fetch('https://api.example.com/price');
+  return res.json();
+}
+```
+
+Built-in profiles include `seconds`, `minutes`, `hours`, `days`, `weeks`, and `max` \{Các profile dựng sẵn gồm `seconds`, `minutes`, `hours`, `days`, `weeks`, và `max`\}. Each profile defines three numbers \{Mỗi profile định nghĩa ba con số\}:
+
+- **`stale`** — how long the client may use a cached value without checking \{client được dùng giá trị cache bao lâu mà không kiểm tra\}.
+- **`revalidate`** — how often the server refreshes in the background \{server làm mới ngầm bao thường xuyên\}.
+- **`expire`** — the maximum age before it must be re-fetched fresh \{tuổi tối đa trước khi buộc fetch lại\}.
+
+Define custom profiles in config \{Định nghĩa profile tùy chỉnh trong config\}:
+
+```ts
+// next.config.ts
+const nextConfig: NextConfig = {
+  cacheComponents: true,
+  cacheLife: {
+    pricing: { stale: 60, revalidate: 300, expire: 3600 }, // seconds
+  },
+};
+```
+
+```ts
+cacheLife('pricing'); // use your custom profile
+```
+
+---
+
+## 5. `cacheTag` — targeted invalidation \{`cacheTag` — vô hiệu hóa có chủ đích\}
+
+Tag a cached entry so you can invalidate it precisely later \{Gắn tag cho một entry cache để sau này vô hiệu hóa chính xác\}:
+
+```ts
+import { cacheTag } from 'next/cache';
+
+export async function getProduct(id: string) {
+  'use cache';
+  cacheTag(`product-${id}`, 'products'); // attach one or more tags
+  return db.product.findUnique({ where: { id } });
+}
+```
+
+Now, when a product changes, invalidate just that tag instead of dumping the whole cache \{Giờ khi một sản phẩm đổi, vô hiệu hóa đúng tag đó thay vì xóa toàn bộ cache\}.
+
+### `revalidateTag` vs `updateTag` \{`revalidateTag` so với `updateTag`\}
+
+Both invalidate by tag, but they differ in *when* fresh data is visible \{Cả hai vô hiệu hóa theo tag, nhưng khác ở *khi nào* dữ liệu mới hiện ra\}:
+
+```ts
+import { revalidateTag, updateTag } from 'next/cache';
+
+// In a Server Action after a mutation:
+revalidateTag('products'); // marks stale; next request refetches
+updateTag('products');     // refreshes immediately AND shows fresh data
+                           // in the SAME response (read-your-writes)
+```
+
+- **`revalidateTag`** — marks entries stale; the *next* visitor triggers a refresh \{đánh dấu entry là cũ; người xem *tiếp theo* kích hoạt làm mới\}. Great for "eventually consistent" public data \{Tốt cho dữ liệu công khai "nhất quán dần"\}.
+- **`updateTag`** (new in 16) — invalidates **and** re-renders within the current action's response, so the user who made the change sees their own update instantly \{(mới ở 16) vô hiệu hóa **và** render lại ngay trong response của action hiện tại, nên người vừa thay đổi thấy cập nhật của chính mình tức thì\}. This solves the classic "I submitted the form but still see old data" bug \{Cái này giải quyết bug kinh điển "tôi vừa submit form mà vẫn thấy dữ liệu cũ"\}.
+
+There's also `revalidatePath('/products')` to invalidate everything rendered on a given path \{Còn có `revalidatePath('/products')` để vô hiệu hóa mọi thứ render trên một path\}.
+
+---
+
+## 6. Partial Prerendering (PPR) — the payoff \{Partial Prerendering (PPR) — phần thưởng\}
+
+Cache Components are built on **PPR**, which ends the old "is this page static OR dynamic?" dilemma \{Cache Components xây trên **PPR**, kết thúc thế lưỡng nan cũ "trang này tĩnh HAY động?"\}. Now a single page can be **both** \{Giờ một trang có thể **cả hai**\}:
+
+- Components marked `'use cache'` become the **static shell** — prerendered, served instantly from the edge \{Component đánh dấu `'use cache'` trở thành **vỏ tĩnh** — prerender sẵn, phục vụ tức thì từ edge\}.
+- Components that read request data (or aren't cached) become **dynamic holes**, wrapped in `<Suspense>` and **streamed in** \{Component đọc dữ liệu request (hoặc không cache) trở thành **lỗ động**, bọc trong `<Suspense>` và **stream vào**\}.
+
+```tsx
+// app/product/[id]/page.tsx
+import { Suspense } from 'react';
+
+export default async function ProductPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+  return (
+    <>
+      {/* Static shell: cached, instant */}
+      <ProductDetails id={id} />
+
+      {/* Dynamic hole: personalized, streamed */}
+      <Suspense fallback={<RecsSkeleton />}>
+        <Recommendations id={id} />
+      </Suspense>
+    </>
+  );
+}
+
+async function ProductDetails({ id }: { id: string }) {
+  'use cache';
+  cacheTag(`product-${id}`);
+  const product = await getProduct(id);
+  return <h1>{product.name}</h1>;
+}
+
+async function Recommendations({ id }: { id: string }) {
+  // reads cookies for personalization → dynamic, streamed in a Suspense hole
+  const recs = await getPersonalizedRecs(id);
+  return <RecList recs={recs} />;
+}
+```
+
+The user gets the product title instantly (static shell) while their personalized recommendations stream in a moment later \{User nhận tiêu đề sản phẩm tức thì (vỏ tĩnh) trong khi gợi ý cá nhân hóa stream vào một lúc sau\}. Best of both worlds \{Tốt nhất của cả hai\}.
+
+> If a page has an uncached dynamic part **not** wrapped in `<Suspense>`, Next.js 16 will warn you at build — Suspense is how you declare "this hole is allowed to be dynamic" \{Nếu một trang có phần động không cache mà **không** bọc trong `<Suspense>`, Next.js 16 sẽ cảnh báo lúc build — Suspense là cách bạn khai báo "lỗ này được phép động"\}.
+
+---
+
+## 7. Migrating from the old model \{Di trú từ mô hình cũ\}
+
+If you've seen these in older code, here's the Next.js 16 replacement \{Nếu bạn từng thấy những thứ này trong code cũ, đây là cái thay thế ở Next.js 16\}:
+
+```text
+OLD (13–15)                              NEW (16)
+─────────────────────────────────────────────────────────────────
+fetch(url) cached by default          → fetch(url) is dynamic; add 'use cache'
+export const revalidate = 60          → cacheLife() inside a 'use cache' scope
+unstable_cache(fn, keys, { tags })    → 'use cache' + cacheTag()  (unstable_cache removed)
+fetch(url, { next: { tags } })        → cacheTag() in a 'use cache' function
+fetch(url, { next: { revalidate } })  → cacheLife() in a 'use cache' function
+```
+
+The conceptual upgrade \{Nâng cấp về tư duy\}: caching is no longer attached to individual `fetch` options scattered around — it's a property of a **function or component**, declared once at the top \{caching không còn gắn vào các tùy chọn `fetch` rải rác — nó là thuộc tính của một **hàm hoặc component**, khai báo một lần ở đầu\}.
+
+---
+
+## 8. A decision guide \{Hướng dẫn quyết định\}
+
+| Data \{Dữ liệu\} | Strategy \{Chiến lược\} |
+|---|---|
+| Marketing copy, docs \{Nội dung marketing, docs\} | `'use cache'` + `cacheLife('days')` |
+| Product catalog \{Danh mục sản phẩm\} | `'use cache'` + `cacheTag` + `revalidateTag` on edit |
+| Prices that change often \{Giá đổi thường xuyên\} | `'use cache'` + `cacheLife('minutes')` |
+| User-specific dashboard \{Dashboard riêng user\} | dynamic (no cache), stream in `<Suspense>` |
+| Anything reading cookies/headers \{Đọc cookie/header\} | dynamic — can't be cached by definition |
+| After a write, show fresh data now \{Sau khi ghi, hiện data mới ngay\} | `updateTag` in the Server Action |
+
+The senior instinct \{Bản năng senior\}: **cache the shared, slow-changing things; stream the personal, fast-changing things** \{**cache những thứ dùng chung, ít đổi; stream những thứ cá nhân, đổi nhanh**\}.
+
+---
+
+## 9. Exercises \{Bài tập\}
+
+1. **Enable & verify** \{Bật & kiểm chứng\}: set `cacheComponents: true`, add `'use cache'` to a `getProducts()` that logs inside. Reload several times and confirm the log fires **once**, then disable the flag and confirm it logs **every** time \{bật cờ, thêm `'use cache'` vào `getProducts()` có log bên trong. Reload vài lần xác nhận log chạy **một lần**, rồi tắt cờ và xác nhận nó log **mỗi** lần\}.
+
+2. **cacheLife** \{cacheLife\}: cache a timestamp with `cacheLife('seconds')` and watch it update only after the profile's window elapses \{cache một timestamp với `cacheLife('seconds')` và xem nó chỉ cập nhật sau khi cửa sổ của profile trôi qua\}.
+
+3. **Tag & invalidate** \{Gắn tag & vô hiệu hóa\}: tag a product with `cacheTag('product-1')`, then add a Server Action button that calls `revalidateTag('product-1')` and confirm the cached value refreshes \{gắn tag sản phẩm bằng `cacheTag('product-1')`, rồi thêm nút Server Action gọi `revalidateTag('product-1')` và xác nhận giá trị cache làm mới\}.
+
+4. **updateTag vs revalidateTag** \{updateTag vs revalidateTag\}: build the same edit flow twice — once with `revalidateTag`, once with `updateTag` — and observe which one shows fresh data in the *same* submission \{dựng cùng luồng sửa hai lần — một với `revalidateTag`, một với `updateTag` — và quan sát cái nào hiện data mới trong *cùng* lần submit\}.
+
+5. **PPR** \{PPR\}: build a product page with a cached `<ProductDetails>` shell and a dynamic `<Recommendations>` in `<Suspense>`. Run `next build` and confirm the page is partially prerendered \{dựng trang sản phẩm với vỏ `<ProductDetails>` đã cache và `<Recommendations>` động trong `<Suspense>`. Chạy `next build` và xác nhận trang được prerender một phần\}.
+
+---
+
+## What's next \{Phần tiếp theo\}
+
+You now understand the single most important — and most misunderstood — part of Next.js: when code runs, when results are cached, how to invalidate precisely, and how PPR gives you instant shells with dynamic holes \{Giờ bạn hiểu phần quan trọng nhất — và bị hiểu nhầm nhiều nhất — của Next.js: khi nào code chạy, khi nào kết quả được cache, cách vô hiệu hóa chính xác, và cách PPR cho bạn vỏ tức thì với lỗ động\}.
+
+**Part 5** turns to the browser: **Client Components, interactivity, and using the URL as state** with `useRouter`, `usePathname`, and `useSearchParams` \{**Phần 5** chuyển sang trình duyệt: **Client Components, tương tác, và dùng URL làm state** với `useRouter`, `usePathname`, và `useSearchParams`\}.

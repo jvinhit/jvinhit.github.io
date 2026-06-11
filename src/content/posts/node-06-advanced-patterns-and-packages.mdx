@@ -1,0 +1,292 @@
+---
+title: 'Node.js Super Senior · Phase 6 — Advanced Patterns & Packages'
+description: 'Phase 6: patterns that scale a codebase — dependency injection and IoC, repository + service + unit of work, caching strategies and invalidation, BullMQ job queues, structured logging, config validation, and resilience patterns.'
+pubDate: 2026-06-09
+tags: [nodejs, design-patterns, redis, queues, node_10]
+series: nodejs
+seriesOrder: 6
+draft: false
+---
+
+This is **Phase 6 of the 10-phase Super Senior path** \{Đây là **Phase 6 của lộ trình Super Senior 10 phase**\}. You can build a secure, persistent API \{Bạn dựng được API an toàn, có lưu trữ\}. Now we focus on the patterns that keep a codebase **maintainable as it grows to hundreds of files and many engineers** \{Giờ ta tập trung vào các mẫu giữ codebase **bảo trì được khi lớn lên hàng trăm file và nhiều kỹ sư**\}. These patterns are the vocabulary of senior engineering \{Các mẫu này là từ vựng của kỹ thuật senior\}.
+
+---
+
+## 6.1 Dependency Injection & Inversion of Control \{Tiêm phụ thuộc & đảo ngược điều khiển\}
+
+The problem: when a class creates its own dependencies (`new Database()`), it's **tightly coupled** — you can't swap or mock them, and testing becomes painful \{Vấn đề: khi một class tự tạo phụ thuộc, nó **gắn chặt** — không thể thay hay mock, test thành cực hình\}. The **Dependency Inversion Principle** says: depend on **abstractions**, not concretions \{**Nguyên lý đảo ngược phụ thuộc**: phụ thuộc vào **trừu tượng**, không phải cụ thể\}.
+
+```ts
+// ❌ Tightly coupled — welded to a specific Database
+class UserService { private db = new Database(); }
+
+// ✅ Injected — receives anything that satisfies the interface (mock it in tests)
+class UserService {
+  constructor(private readonly db: DatabasePort) {}
+}
+```
+
+A small container wires the whole object graph in one place, with **scopes** \{Một container nhỏ lắp cả đồ thị đối tượng ở một chỗ, với **scope**\}:
+
+```ts
+type Factory<T> = (c: Container) => T;
+
+class Container {
+  private factories = new Map<string, Factory<unknown>>();
+  private singletons = new Map<string, unknown>();
+
+  register<T>(name: string, factory: Factory<T>, opts: { singleton?: boolean } = {}): void {
+    this.factories.set(name, opts.singleton
+      ? (c) => { if (!this.singletons.has(name)) this.singletons.set(name, factory(c)); return this.singletons.get(name); }
+      : factory);
+  }
+  get<T>(name: string): T {
+    const f = this.factories.get(name);
+    if (!f) throw new Error(`Service not registered: ${name}`);
+    return f(this) as T;
+  }
+}
+
+const c = new Container();
+c.register('db', () => new Database(), { singleton: true });   // one shared instance
+c.register('userService', (c) => new UserService(c.get('db'))); // new per resolve
+```
+
+The three scopes you must distinguish \{Ba scope phải phân biệt\}: **singleton** (one for the app — DB pool, logger), **transient** (new each time), **request-scoped** (one per HTTP request — carries the request id/user) \{**singleton** (một cho app), **transient** (mới mỗi lần), **request-scoped** (một mỗi request)\}.
+
+> Senior note \{Ghi chú senior\}: for real apps use a mature container — **awilix** (no decorators) or **inversify**/**tsyringe** (decorator-based). NestJS (Phase 13) builds DI in as its core \{cho app thật dùng **awilix** hoặc **inversify**/**tsyringe**. NestJS (Phase 13) tích hợp DI làm lõi\}.
+
+---
+
+## 6.2 Repository, service & unit of work \{Repository, service & unit of work\}
+
+Layer your data access so business logic never touches the ORM directly \{Phân tầng truy cập dữ liệu để logic nghiệp vụ không chạm thẳng ORM\}.
+
+```ts
+// Generic base repository — the only layer that talks to the ORM
+class BaseRepository<T extends object> {
+  constructor(protected readonly model: ModelStatic<T>) {}
+  findById = (id: string) => this.model.findByPk(id);
+  create = (data: Partial<T>) => this.model.create(data);
+}
+
+class UserRepository extends BaseRepository<User> {
+  findByEmail = (email: string) => this.model.findOne({ where: { email } });
+}
+
+// Service holds business rules — no ORM, no HTTP
+class UserService {
+  constructor(private readonly repo: UserRepository) {}
+  async registerUser(email: string, password: string) {
+    if (await this.repo.findByEmail(email)) throw new AppError('Email already exists', 409);
+    return this.repo.create({ email, password: await bcrypt.hash(password, 12) });
+  }
+}
+```
+
+When one business action spans **multiple repositories** that must commit together, wrap them in a **Unit of Work** (a transaction passed to each repository) \{Khi một hành động nghiệp vụ trải nhiều **repository** phải commit cùng nhau, bọc chúng trong một **Unit of Work** (một transaction truyền cho mỗi repository)\}:
+
+```ts
+await uow.run(async (tx) => {
+  await orderRepo.create(order, tx);
+  await inventoryRepo.decrement(itemId, qty, tx);   // both commit or both roll back
+});
+```
+
+---
+
+## 6.3 Caching strategies & invalidation \{Chiến lược caching & invalidation\}
+
+Caching is a senior's biggest single performance lever — and its hardest correctness problem \{Caching là đòn bẩy hiệu năng lớn nhất của senior — và bài toán đúng-đắn khó nhất\}. Know the four strategies \{Biết bốn chiến lược\}:
+
+| Strategy \{Chiến lược\} | How \{Cách\}                                              |
+| ----------------------- | -------------------------------------------------------- |
+| **Cache-aside**         | app checks cache → miss → read DB → fill cache (most common) |
+| **Read-through**        | the cache library reads the DB for you on a miss          |
+| **Write-through**       | write to cache + DB together (consistent, slower writes)  |
+| **Write-behind**        | write to cache now, flush to DB async (fast, riskier)     |
+
+```ts
+// Cache-aside with a generic helper
+async function cached<T>(key: string, ttl: number, load: () => Promise<T>): Promise<T> {
+  const hit = await redis.get(key);
+  if (hit) return JSON.parse(hit) as T;
+  const value = await load();
+  await redis.set(key, JSON.stringify(value), 'EX', ttl);
+  return value;
+}
+const user = await cached(`user:${id}`, 3600, () => userRepo.findById(id));
+```
+
+The two hard parts \{Hai phần khó\}:
+
+- **Invalidation** — on every write, delete the affected keys; design keys so you *can* (`user:${id}`, and a versioned list key you bump on change) \{**invalidation** — mỗi lần write, xóa key liên quan; thiết kế key để bạn *có thể*\}.
+- **Stampede** — when a hot key expires, thousands of requests miss at once and hammer the DB. Mitigate with a short **lock** (one request rebuilds), or **stale-while-revalidate** (serve stale, refresh in background) \{**stampede** — khi key nóng hết hạn, hàng nghìn request miss cùng lúc. Giảm bằng **lock** ngắn hoặc **stale-while-revalidate**\}.
+
+---
+
+## 6.4 Background job queues (BullMQ) \{Hàng đợi job nền (BullMQ)\}
+
+Slow or unreliable work (email, PDFs, image processing, third-party calls) must **not** block the HTTP response \{Việc chậm hoặc kém tin cậy **không được** chặn HTTP response\}. Push it to a **queue** and process it in a separate worker \{Đẩy vào **queue** và xử lý trong worker riêng\}.
+
+```text
+HTTP request ─▶ add job to queue ─▶ respond 202 immediately
+                       │
+                       ▼ (separate worker process, scales independently)
+                  process job ──fail──▶ retry w/ backoff ──exhausted──▶ dead-letter
+```
+
+```ts
+import { Queue, Worker } from 'bullmq';
+const connection = { host: 'localhost', port: 6379 };
+
+const emailQueue = new Queue('email', { connection });
+
+// Producer — enqueue and return fast. jobId makes it idempotent (dedupe).
+await emailQueue.add('welcome', { to: 'a@b.com' }, {
+  jobId: `welcome:${userId}`,
+  attempts: 3,
+  backoff: { type: 'exponential', delay: 5000 },
+  removeOnComplete: 1000,
+});
+
+// Repeatable (cron-like) job — e.g. nightly cleanup
+await emailQueue.add('digest', {}, { repeat: { pattern: '0 2 * * *' } });
+
+// Consumer — a separate worker file/process
+const worker = new Worker('email', async (job) => {
+  await sendEmail(job.data.to); // throwing triggers a retry
+}, { connection, concurrency: 5 });
+
+worker.on('failed', (job, err) => logger.error({ jobId: job?.id, err }, 'job failed'));
+process.on('SIGTERM', () => worker.close()); // finish active jobs, stop pulling new ones
+```
+
+Senior reasoning \{Lập luận senior\}: design jobs to be **idempotent** (a retry must not double-charge), set a **dead-letter** path for poison jobs, and shut workers down gracefully \{thiết kế job **idempotent**, có **dead-letter** cho job độc, và tắt worker êm\}.
+
+---
+
+## 6.5 Structured logging (pino/Winston) \{Log có cấu trúc (pino/Winston)\}
+
+`console.log` is fine for a script, wrong for a service \{`console.log` ổn cho script, sai cho service\}. Production logs must be **structured JSON** so tools (Datadog, Loki, ELK) can search and aggregate them \{Log production phải là **JSON có cấu trúc** để công cụ tìm và tổng hợp\}.
+
+```ts
+import pino from 'pino';
+
+export const logger = pino({
+  level: process.env.LOG_LEVEL ?? 'info',
+  redact: ['req.headers.authorization', 'password', '*.password'], // never log secrets
+  base: { service: 'user-api' },
+});
+
+// A child logger binds context (request id) to every line it emits
+app.use((req, _res, next) => {
+  req.log = logger.child({ requestId: req.requestId });
+  next();
+});
+
+// Log structured objects, not interpolated strings — fields become searchable
+req.log.info({ userId: 123 }, 'user registered');
+req.log.error({ err }, 'db connection failed'); // pass the Error → captures stack
+```
+
+The senior habits \{Thói quen senior\}: **log objects + a correlation id**, choose **levels** deliberately (`debug`/`info`/`warn`/`error`), and **redact** secrets \{**log object + correlation id**, chọn **level** có chủ đích, và **che** secret\}. pino is faster; Winston is more flexible — both are fine \{pino nhanh hơn; Winston linh hoạt hơn\}.
+
+---
+
+## 6.6 Configuration & secrets — validate at boot \{Cấu hình & secret — validate khi khởi động\}
+
+A 12-factor app reads config from the environment. A senior **validates it once at startup** so the process crashes immediately on misconfiguration instead of failing mysteriously later \{App 12-factor đọc config từ env. Senior **validate một lần khi khởi động** để process crash ngay khi cấu hình sai thay vì lỗi bí ẩn về sau\}:
+
+```ts
+import { z } from 'zod';
+
+const Env = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PORT: z.coerce.number().default(3000),
+  DATABASE_URL: z.string().url(),
+  JWT_SECRET: z.string().min(32),
+});
+
+// Parse once; export typed, validated config. Fails fast with a clear message.
+export const env = Env.parse(process.env);
+```
+
+---
+
+## 6.7 Validation strategy — one source of truth \{Chiến lược validation — một nguồn sự thật\}
+
+For TypeScript-first projects, **Zod** is the default because it *infers* static types from the schema — one definition powers runtime validation **and** compile-time types \{cho project TypeScript-first, **Zod** là mặc định vì nó *suy ra* type tĩnh từ schema — một định nghĩa cho cả validation runtime **và** type compile-time\}:
+
+```ts
+import { z } from 'zod';
+
+const CreateUser = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+});
+type CreateUser = z.infer<typeof CreateUser>; // the TS type, derived from the schema
+```
+
+Joi is mature and powerful too; pick one and be consistent \{Joi cũng trưởng thành và mạnh; chọn một và nhất quán\}.
+
+---
+
+## 6.8 Resilience patterns \{Mẫu chống chịu\}
+
+Production calls fail; seniors plan for it \{Lời gọi production sẽ hỏng; senior lên kế hoạch cho điều đó\}.
+
+- **Retry with exponential backoff + jitter** — for transient failures; never retry non-idempotent writes blindly \{**retry với backoff mũ + jitter** — cho lỗi tạm thời\}.
+- **Timeout everything** — every outbound call gets an `AbortSignal.timeout` (Phase 1) so one slow dependency can't exhaust your pool \{**timeout mọi thứ** — mỗi lời gọi outbound có `AbortSignal.timeout`\}.
+- **Circuit breaker** — after N consecutive failures, "open" the circuit and fail fast for a cool-down, sparing a struggling dependency (`opossum`) \{**circuit breaker** — sau N lỗi liên tiếp, "mở" mạch và fail nhanh một lúc\}.
+- **Bulkhead** — cap concurrency per dependency (the `mapLimit` from Phase 1) so one slow service can't consume all workers \{**bulkhead** — giới hạn concurrency mỗi dependency\}.
+- **Outbox pattern** — to publish an event *and* commit a DB change atomically, write the event to an `outbox` table in the same transaction, then relay it \{**outbox** — ghi sự kiện vào bảng `outbox` trong cùng transaction rồi chuyển tiếp\}.
+
+```ts
+async function retry<T>(fn: () => Promise<T>, tries = 3, base = 200): Promise<T> {
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (err) {
+      if (i >= tries - 1) throw err;
+      const delay = base * 2 ** i + Math.random() * 100; // backoff + jitter
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+```
+
+---
+
+## 6.9 Useful GoF patterns in Node \{Các mẫu GoF hữu ích trong Node\}
+
+- **Factory** — centralize object creation (e.g. building a configured client) \{tập trung tạo đối tượng\}.
+- **Strategy** — swap an algorithm at runtime (payment provider, storage backend) \{đổi thuật toán lúc chạy\}.
+- **Adapter** — wrap a third-party SDK behind your own port so you can swap vendors \{bọc SDK bên thứ ba sau một port\}.
+- **Observer** — `EventEmitter` (Phase 1) for in-process pub/sub \{`EventEmitter` cho pub/sub trong tiến trình\}.
+- **Decorator** — wrap a function to add caching/logging/timing without touching it \{bọc hàm để thêm cache/log/đo mà không sửa nó\}.
+
+> Don't pattern-match for its own sake \{Đừng áp mẫu cho có\}: a pattern is justified only when it removes real duplication or coupling. Premature abstraction is as costly as none \{một mẫu chỉ chính đáng khi nó loại trùng lặp hay coupling thật. Trừu tượng sớm tốn kém như không có\}.
+
+---
+
+## 7. Hands-on projects \{Dự án thực hành\}
+
+1. **DI container with scopes** \{DI container có scope\}: implement the `Container` with singleton + transient; register `db`/`userRepository`/`userService`; swap `db` for an in-memory fake in a test and prove nothing else changes \{cài `Container`; đổi `db` sang fake và chứng minh không gì khác đổi\}.
+
+2. **Repository + service + unit of work** \{Repository + service + unit of work\}: refactor your Phase 3/4 API into controller→service→repository, then add an order+inventory action wrapped in a transaction \{tái cấu trúc thành controller→service→repository, thêm hành động order+inventory trong một transaction\}.
+
+3. **Caching with invalidation & stampede guard** \{Cache có invalidation & chống stampede\}: add cache-aside to a GET route, invalidate on write, and add a lock so a key expiry doesn't stampede the DB \{thêm cache-aside, invalidate khi write, và lock để hết hạn không stampede\}.
+
+4. **BullMQ queue** \{Queue BullMQ\}: enqueue an idempotent "welcome email" job on register, process it with concurrency 5, force a failure and confirm retry+backoff, add a repeatable nightly job, and close the worker on `SIGTERM` \{enqueue job idempotent, xử lý concurrency 5, ép lỗi xác nhận retry, thêm job lặp lại, đóng worker khi `SIGTERM`\}.
+
+5. **Structured logging** \{Log có cấu trúc\}: add pino with redaction and a per-request child logger; confirm secrets are redacted and every line carries the request id \{thêm pino có redaction và child logger mỗi request; xác nhận secret bị che và mỗi dòng có request id\}.
+
+6. **Config + resilience** \{Config + chống chịu\}: validate env with Zod at boot (crash on missing `JWT_SECRET`); wrap a flaky outbound call in `retry` + timeout + a circuit breaker \{validate env bằng Zod khi boot; bọc lời gọi yếu trong retry + timeout + circuit breaker\}.
+
+---
+
+## What's next \{Phần tiếp theo\}
+
+You've added the senior toolkit: DI and IoC with scopes, repository + service + unit of work, caching strategies with safe invalidation, BullMQ queues, structured logging, boot-time config validation, and resilience patterns \{Bạn đã thêm bộ công cụ senior: DI/IoC có scope, repository + service + unit of work, chiến lược caching với invalidation an toàn, queue BullMQ, log có cấu trúc, validate config khi khởi động, và mẫu chống chịu\}.
+
+In **Phase 7**, we ship it: **DevOps & deployment** — environment/config management, Docker and Docker Compose, PM2 in cluster mode, health checks, and a full CI/CD pipeline with GitHub Actions, ending with a deploy to a real server \{Ở **Phase 7**, ta ship nó: **DevOps & triển khai** — quản lý env/config, Docker và Compose, PM2 cluster, health check, và pipeline CI/CD đầy đủ với GitHub Actions\}.

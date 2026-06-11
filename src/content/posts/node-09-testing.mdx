@@ -1,0 +1,250 @@
+---
+title: 'Node.js Super Senior · Phase 9 — Comprehensive Testing'
+description: 'Phase 9: ship without fear — the testing pyramid, test doubles, unit and integration tests with supertest and Testcontainers, mocking with nock, factories, meaningful coverage, and the built-in node:test runner.'
+pubDate: 2026-06-09
+tags: [nodejs, testing, jest, supertest, node_10]
+series: nodejs
+seriesOrder: 9
+draft: false
+---
+
+This is **Phase 9 of the 10-phase Super Senior path** \{Đây là **Phase 9 của lộ trình Super Senior 10 phase**\}. Tests aren't bureaucracy — they're what lets a senior **refactor aggressively and deploy on a Friday** without fear \{Test không phải thủ tục — chúng là thứ cho phép senior **refactor mạnh tay và deploy chiều thứ Sáu** không sợ\}. A good suite is executable documentation and a safety net \{Một bộ test tốt là tài liệu chạy được và một lưới an toàn\}.
+
+---
+
+## 9.0 The pyramid & what to test \{Kim tự tháp & test cái gì\}
+
+```text
+        ╱╲      E2E  — few, slow, high confidence (full system)
+       ╱──╲
+      ╱ Int ╲   Integration — some, medium (modules + DB/HTTP together)
+     ╱──────╲
+    ╱  Unit  ╲  Unit — many, fast, isolated (one function/class)
+   ╱──────────╲
+```
+
+The senior strategy \{Chiến lược senior\}: **many fast unit tests, fewer integration tests, a handful of E2E** \{**nhiều unit test nhanh, ít integration test, vài E2E**\}. Inverting this (mostly slow E2E) gives a flaky, painful suite \{Đảo ngược cho bộ test giòn và đau\}.
+
+Test **behavior, not implementation** \{Test **hành vi, không phải cài đặt**\}: assert what a unit returns/throws/changes, never which private method it called — otherwise every refactor breaks tests that should still pass \{khẳng định cái nó trả/ném/đổi, không phải nó gọi method private nào\}. And always cover the **edge cases and error paths**, not just the happy path \{luôn phủ **edge case và đường lỗi**, không chỉ happy path\}.
+
+### Test doubles — say the right word \{Test double — dùng đúng từ\}
+
+| Double \{Loại\} | What it does \{Làm gì\}                                  |
+| --------------- | ------------------------------------------------------- |
+| **dummy**       | filler passed but never used \{nhồi chỗ, không dùng\}   |
+| **stub**        | returns canned values \{trả giá trị đóng hộp\}         |
+| **spy**         | records how it was called \{ghi lại cách bị gọi\}      |
+| **mock**        | a spy with pre-set expectations \{spy có kỳ vọng\}     |
+| **fake**        | a working lightweight impl (in-memory DB) \{impl nhẹ\} |
+
+---
+
+## 9.1 Unit testing \{Unit test\}
+
+Unit tests verify one unit in **isolation** — dependencies are mocked \{Unit test kiểm một đơn vị **độc lập** — phụ thuộc được mock\}. This is exactly why we used dependency injection in Phase 6 \{Đây chính là lý do ta dùng DI ở Phase 6\}. Follow **Arrange–Act–Assert** \{Theo **Arrange–Act–Assert**\}:
+
+```ts
+import { UserService } from '../src/services/UserService';
+
+describe('UserService', () => {
+  const repo = { findById: jest.fn(), findByEmail: jest.fn(), create: jest.fn() };
+  const service = new UserService(repo as never);
+  beforeEach(() => jest.clearAllMocks());
+
+  it('returns a user profile', async () => {
+    const mockUser = { id: '1', email: 'a@b.com' };   // Arrange
+    repo.findById.mockResolvedValue(mockUser);
+    const result = await service.getUserProfile('1');  // Act
+    expect(result).toEqual(mockUser);                  // Assert
+    expect(repo.findById).toHaveBeenCalledWith('1');
+  });
+
+  it('throws when the user is missing', async () => {
+    repo.findById.mockResolvedValue(null);
+    await expect(service.getUserProfile('999')).rejects.toThrow('User not found');
+  });
+});
+```
+
+Two senior techniques \{Hai kỹ thuật senior\}: **parametrize** repetitive cases with `it.each`, and **control time** with fake timers so time-dependent code is deterministic \{**tham số hóa** ca lặp bằng `it.each`, và **điều khiển thời gian** bằng fake timer\}:
+
+```ts
+it.each([
+  ['', 'empty'],
+  ['no-at', 'missing @'],
+])('rejects invalid email %s', (email) => expect(() => parseEmail(email)).toThrow());
+
+jest.useFakeTimers().setSystemTime(new Date('2026-01-01')); // freeze "now"
+```
+
+---
+
+## 9.2 Integration testing (supertest) \{Integration test (supertest)\}
+
+Integration tests exercise real modules together — routes, middleware, and a real (test) database — by sending real HTTP requests with **supertest** \{Integration test chạy các module thật cùng nhau bằng HTTP request thật với **supertest**\}:
+
+```ts
+import request from 'supertest';
+import { app } from '../src/app';
+import { User } from '../src/models/User';
+
+describe('Auth API', () => {
+  beforeEach(async () => { await User.destroy({ where: {} }); }); // clean slate
+
+  it('registers a new user', async () => {
+    const res = await request(app).post('/auth/register')
+      .send({ email: 'new@example.com', password: 'SecurePass123' });
+    expect(res.status).toBe(201);
+    expect(res.body.token).toBeDefined();
+  });
+
+  it('rejects a duplicate email', async () => {
+    await User.create({ email: 'dup@example.com', password: 'hashed' });
+    const res = await request(app).post('/auth/register')
+      .send({ email: 'dup@example.com', password: 'SecurePass123' });
+    expect(res.status).toBe(409);
+  });
+});
+```
+
+### The test-database strategy \{Chiến lược database test\}
+
+Use a **real but disposable** database, never a mock — the point is to test the real integration \{Dùng database **thật nhưng vứt được**, không mock — mục đích là test tích hợp thật\}. **Testcontainers** spins up a throwaway Postgres per run, so tests are hermetic and CI-friendly \{**Testcontainers** dựng một Postgres vứt-đi mỗi lần chạy\}:
+
+```ts
+import { PostgreSqlContainer } from '@testcontainers/postgresql';
+
+let container: Awaited<ReturnType<PostgreSqlContainer['start']>>;
+beforeAll(async () => {
+  container = await new PostgreSqlContainer('postgres:17-alpine').start();
+  process.env.DATABASE_URL = container.getConnectionUri();
+});
+afterAll(() => container.stop());
+```
+
+For isolation **between tests**, the fastest correct trick is to run each test **in a transaction and roll it back** at the end — instant reset, no truncation \{Để cô lập **giữa các test**, mẹo nhanh và đúng nhất là chạy mỗi test **trong một transaction rồi rollback** — reset tức thì\}.
+
+---
+
+## 9.3 End-to-end testing \{Kiểm thử end-to-end\}
+
+E2E tests verify a whole user journey across many endpoints, in order \{E2E test kiểm cả hành trình xuyên nhiều endpoint, theo thứ tự\}:
+
+```ts
+it('register → fetch profile → update profile', async () => {
+  const reg = await request(app).post('/auth/register')
+    .send({ email: 'flow@example.com', password: 'SecurePass123' });
+  const token = reg.body.token;
+
+  const profile = await request(app).get('/api/users/profile')
+    .set('Authorization', `Bearer ${token}`);
+  expect(profile.status).toBe(200);
+
+  const updated = await request(app).put('/api/users/profile')
+    .set('Authorization', `Bearer ${token}`).send({ firstName: 'Flo' });
+  expect(updated.body.firstName).toBe('Flo');
+});
+```
+
+---
+
+## 9.4 Mocking external services \{Mock dịch vụ bên ngoài\}
+
+Never call real third-party APIs in tests — they're slow, flaky, and may cost money \{Đừng bao giờ gọi API bên thứ ba thật trong test — chậm, giòn, tốn tiền\}. **nock** intercepts outbound HTTP; **msw** does the same with a request-handler model; **faker** generates realistic data \{**nock** chặn HTTP ra; **msw** tương tự; **faker** sinh dữ liệu thực tế\}:
+
+```ts
+import nock from 'nock';
+
+it('handles the payment provider', async () => {
+  nock('https://api.stripe.com').post('/v1/charges').reply(200, { id: 'ch_1', paid: true });
+  const result = await paymentService.charge(1000);
+  expect(result.paid).toBe(true);
+});
+```
+
+> Always test the **failure** path too — make the mock return `500`/timeout and assert your retry/circuit-breaker (Phase 6) behaves \{Luôn test cả đường **thất bại** — cho mock trả `500`/timeout và khẳng định retry/circuit-breaker hoạt động\}.
+
+---
+
+## 9.5 Fixtures & factories \{Fixture & factory\}
+
+Hard-coded test data rots. Use **factories** that build valid objects with overridable fields \{Dữ liệu test viết cứng sẽ mục. Dùng **factory** dựng object hợp lệ với field ghi đè được\}:
+
+```ts
+import { faker } from '@faker-js/faker';
+
+const makeUser = (overrides: Partial<NewUser> = {}): NewUser => ({
+  email: faker.internet.email(),
+  password: 'SecurePass123',
+  ...overrides,                       // override only what the test cares about
+});
+
+const admin = makeUser({ role: 'admin' });
+```
+
+---
+
+## 9.6 Coverage that means something \{Coverage có ý nghĩa\}
+
+```ts
+// jest.config.ts
+export default {
+  preset: 'ts-jest',
+  testEnvironment: 'node',
+  setupFilesAfterEach: ['<rootDir>/__tests__/setup.ts'], // connect/clear DB per test file
+  collectCoverage: true,
+  coverageThreshold: { global: { branches: 80, functions: 80, lines: 80, statements: 80 } },
+};
+```
+
+Coverage is a **floor, not a goal** \{Coverage là **sàn, không phải đích**\}: 80% is healthy, but 100% coverage of trivial code with no edge-case assertions is worthless \{80% là lành mạnh, nhưng 100% coverage code tầm thường không có khẳng định edge-case là vô giá trị\}. To measure whether your tests actually *catch bugs*, use **mutation testing** (`Stryker`) — it mutates your code and checks your tests fail \{Để đo test có *bắt bug* thật không, dùng **mutation testing** (`Stryker`)\}. Run tests in CI on every push (Phase 7) so a failing test blocks the merge \{Chạy test trong CI mỗi push để test fail chặn merge\}.
+
+---
+
+## 9.7 The modern built-in runner \{Trình chạy dựng sẵn hiện đại\}
+
+Jest is the most popular, but Node 24 ships a **built-in test runner** — zero dependencies, native TypeScript, fast \{Node 24 có **trình chạy test dựng sẵn** — không phụ thuộc, TS native, nhanh\}:
+
+```ts
+import { test, describe } from 'node:test';
+import assert from 'node:assert/strict';
+
+describe('math', () => { test('adds', () => assert.equal(2 + 2, 4)); });
+```
+
+```bash
+node --test                          # discover and run *.test.ts
+node --test --experimental-test-coverage
+```
+
+A senior knows both \{Senior biết cả hai\}: Jest for its ecosystem and mocking; `node:test` or **Vitest** (TS projects) for speed and fewer dependencies \{Jest vì hệ sinh thái và mock; `node:test` hoặc **Vitest** cho tốc độ\}.
+
+---
+
+## 9.8 Flaky tests — a senior allergy \{Test giòn — dị ứng của senior\}
+
+A flaky test (passes/fails randomly) is worse than no test — it trains the team to ignore red \{Test giòn (lúc đậu lúc rớt) tệ hơn không có test — nó tập cho team phớt lờ màu đỏ\}. Causes and fixes \{Nguyên nhân và cách sửa\}: shared state between tests (isolate/reset), real time/`setTimeout` (fake timers), real network (mock), test order dependence (each test self-contained), and unawaited promises (always `await`) \{state chung, thời gian thật, mạng thật, phụ thuộc thứ tự, promise chưa await\}.
+
+---
+
+## 10. Hands-on projects \{Dự án thực hành\}
+
+1. **Unit suite (80%+)** \{Bộ unit (≥80%)\}: unit-test your services with mocked repositories — happy paths, edge cases, error paths; parametrize with `it.each`; enforce the threshold \{unit-test service với repo mock; tham số hóa; áp ngưỡng\}.
+
+2. **Integration with Testcontainers** \{Integration với Testcontainers\}: test auth + CRUD with supertest against a throwaway Postgres, isolating each test in a rolled-back transaction \{test bằng supertest với Postgres vứt-đi, cô lập mỗi test bằng transaction rollback\}.
+
+3. **E2E workflow** \{Luồng E2E\}: register → login → create → read → delete, asserting status and state at each step \{khẳng định status và trạng thái mỗi bước\}.
+
+4. **Factories + external mocks** \{Factory + mock ngoài\}: build faker factories; mock a payment API with nock and test both success and failure (incl. retry behavior) \{dựng factory faker; mock API thanh toán và test cả thành công lẫn thất bại\}.
+
+5. **CI gate + mutation testing** \{Cổng CI + mutation testing\}: wire the suite into the Phase 7 pipeline (Postgres service) so failures block deploy; run Stryker on one module and improve a weak test \{đấu bộ test vào pipeline; chạy Stryker và cải thiện một test yếu\}.
+
+**Extra drills** \{Bài tập thêm\}: convert one Jest file to `node:test`/Vitest and compare run time; find and fix a flaky test by removing shared state \{chuyển một file sang `node:test`/Vitest và so thời gian; tìm và sửa một test giòn\}.
+
+---
+
+## What's next \{Phần tiếp theo\}
+
+You can now test at every level — unit (mocked deps), integration (supertest + Testcontainers), and E2E — with test doubles, factories, external mocks, meaningful (and mutation-checked) coverage, the built-in runner, and zero tolerance for flakiness \{Giờ bạn test được ở mọi cấp — unit, integration, E2E — với test double, factory, mock ngoài, coverage có nghĩa, trình chạy dựng sẵn, và không khoan nhượng với test giòn\}.
+
+In **Phase 10**, the capstone, we put it all together with **enterprise architecture** — clean/layered architecture, the SOLID principles, domain-driven design, microservices and an API gateway, event-driven design and CQRS — the thinking that separates a senior from a *super* senior \{Ở **Phase 10**, bài tổng kết, ta ghép tất cả với **kiến trúc enterprise** — clean/layered, SOLID, DDD, microservices và API gateway, hướng sự kiện và CQRS\}.

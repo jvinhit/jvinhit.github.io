@@ -1,0 +1,205 @@
+---
+title: 'Node.js Super Senior · Phase 8 — Performance & Optimization'
+description: 'Phase 8: make it fast and prove it — measuring percentiles, profiling with perf_hooks and clinic.js, event-loop lag, query optimization, multi-layer caching, clustering and worker threads, response optimization, and hunting memory leaks.'
+pubDate: 2026-06-09
+tags: [nodejs, performance, profiling, caching, node_10]
+series: nodejs
+seriesOrder: 8
+draft: false
+---
+
+This is **Phase 8 of the 10-phase Super Senior path** \{Đây là **Phase 8 của lộ trình Super Senior 10 phase**\}. The defining senior trait here is **measure first** \{Đặc điểm senior cốt yếu ở đây là **đo trước**\}. Juniors guess and "optimize" random code; seniors profile, find the real bottleneck, fix it, and prove the win with numbers \{Junior đoán và "tối ưu" code ngẫu nhiên; senior profile, tìm bottleneck thật, sửa, và chứng minh bằng số\}.
+
+> "Premature optimization is the root of all evil." Profile, then optimize \{"Tối ưu sớm là gốc rễ mọi tai họa." Profile, rồi tối ưu\}.
+
+---
+
+## 8.1 Measure the right thing \{Đo đúng thứ\}
+
+Two numbers people confuse \{Hai con số người ta hay nhầm\}: **latency** (how long one request takes) and **throughput** (requests per second). They're related but optimized differently \{**latency** và **throughput** liên quan nhưng tối ưu khác nhau\}.
+
+And **never report the average latency** — it hides the pain \{**đừng bao giờ báo latency trung bình** — nó giấu nỗi đau\}. Report **percentiles** \{Báo **percentile**\}:
+
+```text
+p50 = 20ms   ← half of requests are faster than this (the "typical" user)
+p95 = 80ms   ← the slow 5%
+p99 = 400ms  ← the painful 1% — often where timeouts and rage-quits live
+```
+
+A senior tracks **p99**, plus error rate and saturation \{Senior theo dõi **p99**, cộng tỷ lệ lỗi và độ bão hòa\}. Useful frames: **RED** (Rate, Errors, Duration) for services, **USE** (Utilization, Saturation, Errors) for resources \{Khung hữu ích: **RED** cho service, **USE** cho tài nguyên\}.
+
+```bash
+# Load test so numbers reflect concurrency, not a single curl
+npx autocannon -c 100 -d 20 http://localhost:3000/api/posts   # 100 conns, 20s
+# k6 / artillery are great for scripted, multi-step scenarios
+```
+
+The senior loop \{Vòng lặp senior\}: **load test → profile → fix the top bottleneck → re-test** \{**load test → profile → sửa bottleneck lớn nhất → test lại**\}.
+
+---
+
+## 8.2 Profiling — find the real bottleneck \{Profiling — tìm bottleneck thật\}
+
+Start in-process with the built-in `perf_hooks` to time real operations \{Bắt đầu trong tiến trình với `perf_hooks` để đo thao tác thật\}:
+
+```ts
+import { performance, PerformanceObserver, monitorEventLoopDelay } from 'node:perf_hooks';
+
+new PerformanceObserver((items) => {
+  for (const e of items.getEntries()) console.log(`${e.name}: ${e.duration.toFixed(1)}ms`);
+}).observe({ entryTypes: ['measure'] });
+
+performance.mark('q-start');
+await db.heavyQuery();
+performance.measure('heavyQuery', 'q-start', performance.mark('q-end').name);
+
+// Event-loop lag is THE Node health metric — rising lag means you're blocking
+const h = monitorEventLoopDelay({ resolution: 20 });
+h.enable();
+setInterval(() => console.log(`loop p99 lag: ${(h.percentile(99) / 1e6).toFixed(1)}ms`), 5000);
+```
+
+For the full picture, use a profiler \{Để có bức tranh đầy đủ, dùng profiler\}:
+
+- **clinic.js** — `clinic doctor` diagnoses (event loop vs CPU vs I/O vs memory); `clinic flame` renders a CPU **flame graph**; `clinic bubbleprof` shows async flow \{chẩn đoán; flame graph; luồng async\}.
+- **`node --prof`** then `node --prof-process`, or **`--cpu-prof`** to load in Chrome DevTools / VS Code \{profile CPU\}.
+- **`0x`** for a quick flame graph; **heap snapshots** (`--inspect`) for memory \{flame graph nhanh; heap snapshot cho bộ nhớ\}.
+
+A flame graph reads simply: **width = total time in that function** \{Đọc flame graph đơn giản: **bề rộng = tổng thời gian trong hàm đó**\}. The widest plateau is your bottleneck — not the function you *assumed* was slow \{Cao nguyên rộng nhất là bottleneck — không phải hàm bạn *tưởng* là chậm\}.
+
+---
+
+## 8.3 Don't block the event loop \{Đừng chặn event loop\}
+
+The most damaging Node performance bug isn't a slow query — it's **CPU work on the main thread** (Phase 1) \{Bug hiệu năng tai hại nhất không phải query chậm — mà là **việc CPU trên luồng chính**\}. A synchronous loop, a giant `JSON.parse`, sync crypto, or a catastrophic regex freezes *every* concurrent request \{Vòng đồng bộ, `JSON.parse` khổng lồ, crypto đồng bộ, hay regex thảm họa đóng băng *mọi* request đồng thời\}.
+
+```ts
+// ❌ Blocks the loop for everyone while it runs
+const result = expensiveSyncComputation(hugeInput);
+
+// ✅ Offload genuine CPU work to a worker thread (use a pool: piscina)
+import Piscina from 'piscina';
+const pool = new Piscina({ filename: new URL('./worker.js', import.meta.url).href });
+const result = await pool.run(hugeInput);   // main loop stays responsive
+```
+
+Rule \{Quy tắc\}: I/O → event loop; **CPU → worker threads**; rising event-loop lag is your alarm \{I/O → event loop; **CPU → worker thread**; lag event loop tăng là chuông báo\}.
+
+---
+
+## 8.4 Database optimization \{Tối ưu database\}
+
+The database is the #1 bottleneck in most APIs \{Database là bottleneck số 1 trong đa số API\}. The senior playbook \{Sổ tay senior\}:
+
+1. **Kill N+1** with eager loading; **batch** with DataLoader where you can't join (Phase 4) \{diệt N+1 bằng eager loading; gộp bằng DataLoader\}.
+2. **Index** every filtered/joined/sorted column; verify with `EXPLAIN ANALYZE` that it says `Index Scan`, not `Seq Scan` (Phase 11) \{index; xác minh bằng `EXPLAIN ANALYZE`\}.
+3. **Select only needed columns** — `SELECT *` ships and deserializes data you discard \{chỉ chọn cột cần — `SELECT *` chuyển và giải mã dữ liệu bạn bỏ\}.
+4. **Tune the pool** — too small starves; too big overwhelms the DB (Phase 4) \{chỉnh pool — nhỏ quá đói, lớn quá ngợp DB\}.
+
+```ts
+// ✅ Eager loading + projection — one query, only the fields you use
+const users = await User.findAll({
+  attributes: ['id', 'email'],
+  include: [{ model: Post, as: 'posts', attributes: ['id', 'title'] }],
+});
+```
+
+---
+
+## 8.5 Caching — every layer \{Caching — mọi tầng\}
+
+Caching is the biggest single lever for read-heavy APIs \{Caching là đòn bẩy lớn nhất cho API đọc nhiều\}. Think in layers, cheapest first \{Nghĩ theo tầng, rẻ nhất trước\}:
+
+```text
+client/CDN cache ─▶ HTTP cache (ETag/Cache-Control) ─▶ app memory (LRU)
+      ─▶ Redis (shared) ─▶ database
+   each layer you hit saves the cost of every layer below it
+```
+
+**Cache-aside** (the default) and **write-through** (Phase 6) cover most needs \{**Cache-aside** (mặc định) và **write-through** lo phần lớn\}:
+
+```ts
+async function getUserProfile(userId: string) {
+  const key = `user:${userId}`;
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);                       // hit
+  const user = await User.findByPk(userId);                    // miss → DB
+  await redis.set(key, JSON.stringify(user), 'EX', 3600);
+  return user;
+}
+```
+
+Add an **in-process LRU** (`lru-cache`) in front of Redis for ultra-hot keys, and **HTTP caching** (ETag/`Cache-Control`, Phase 2) so clients and CDNs skip your server entirely \{Thêm **LRU trong tiến trình** trước Redis cho key cực nóng, và **HTTP caching** để client/CDN bỏ qua server\}. The two hard problems remain **invalidation** and **stampede** (Phase 6) \{Hai bài toán khó vẫn là **invalidation** và **stampede**\}.
+
+---
+
+## 8.6 Scale across cores — clustering & workers \{Mở rộng theo lõi — clustering & worker\}
+
+Node runs on one core by default \{Node mặc định chạy một lõi\}. The `cluster` module forks one worker per core, all sharing the listening port \{Module `cluster` fork một worker mỗi lõi, chung cổng lắng nghe\}:
+
+```ts
+import cluster from 'node:cluster';
+import { availableParallelism } from 'node:os';
+
+if (cluster.isPrimary) {
+  for (let i = 0; i < availableParallelism(); i++) cluster.fork();
+  cluster.on('exit', (w) => { console.log(`worker ${w.process.pid} died`); cluster.fork(); });
+} else {
+  app.listen(3000);
+}
+```
+
+This multiplies **throughput** by roughly the core count; PM2/orchestrators do it for you in prod (Phase 7) \{Cái này nhân **throughput** xấp xỉ số lõi; PM2/orchestrator làm hộ ở prod\}. Distinguish clearly \{Phân biệt rõ\}: **cluster** = more processes for I/O throughput; **worker threads** = offload CPU within a process. Clustering does **not** speed up one slow request \{**cluster** = nhiều tiến trình cho throughput I/O; **worker thread** = đẩy CPU trong một tiến trình. Clustering **không** làm nhanh một request chậm\}.
+
+---
+
+## 8.7 Response & network optimization \{Tối ưu response & mạng\}
+
+```ts
+import compression from 'compression';
+app.use(compression());                  // gzip/brotli — shrinks JSON dramatically
+```
+
+- **Paginate everything** — never return an unbounded list; cap the limit; prefer **keyset** over `OFFSET` for deep pages (Phase 4) \{**phân trang mọi thứ** — chốt limit; ưu tiên keyset\}.
+- **Shape payloads** — return only the fields the client needs; consider field-selection or GraphQL \{**định hình payload** — chỉ field cần\}.
+- **Stream large responses** instead of buffering (Phase 2) \{**stream response lớn** thay vì buffer\}.
+- **Reuse outbound connections** with a keep-alive agent (Phase 2) \{**tái dùng kết nối outbound** bằng keep-alive agent\}.
+
+---
+
+## 8.8 Memory & GC — leak hunting \{Bộ nhớ & GC — săn rò rỉ\}
+
+V8 splits the heap into a young generation (cheap, frequent GC) and old generation (expensive, rare). A **leak** is memory that stays referenced and migrates to old space forever \{V8 chia heap thành young (rẻ, thường) và old (đắt, hiếm). **Rò rỉ** là bộ nhớ vẫn được tham chiếu và trôi sang old mãi\}.
+
+```ts
+const m = process.memoryUsage();
+console.log(`heapUsed ${(m.heapUsed / 1048576).toFixed(1)}MB rss ${(m.rss / 1048576).toFixed(1)}MB`);
+```
+
+Hunt a leak with **two heap snapshots under load** (Chrome DevTools, `node --inspect`), then **diff** them — the objects that keep growing are your leak \{Săn rò rỉ bằng **hai heap snapshot dưới tải**, rồi **diff** — vật thể lớn dần là rò rỉ\}. The usual culprits (Phase 1): unbounded caches/arrays, forgotten `setInterval`/listeners, closures over big objects, object-keyed `Map`s without `WeakMap` \{Thủ phạm thường gặp: cache/mảng không giới hạn, `setInterval`/listener bị quên, closure giữ vật thể lớn, `Map` khóa-object không dùng `WeakMap`\}.
+
+> Quick V8 tips \{Mẹo V8 nhanh\}: keep object shapes **monomorphic** (same keys, same order) so V8 can optimize; avoid `delete` on hot objects (it deoptimizes hidden classes); cap `--max-old-space-size` for memory-heavy jobs \{giữ hình dạng object **đơn hình**; tránh `delete` trên object nóng; chốt `--max-old-space-size`\}.
+
+---
+
+## 9. Hands-on projects \{Dự án thực hành\}
+
+1. **Baseline + profile** \{Baseline + profile\}: load test a main flow with autocannon (record req/s, p50/p99), then run `clinic doctor`/`flame` and identify the widest plateau \{load test, ghi p50/p99, rồi clinic và tìm cao nguyên rộng nhất\}.
+
+2. **Fix DB bottlenecks** \{Sửa bottleneck DB\}: reproduce an N+1, fix with eager loading + projection, add an index, confirm with `EXPLAIN ANALYZE` and a before/after autocannon \{tái hiện N+1, sửa + thêm index, xác nhận\}.
+
+3. **Multi-layer cache** \{Cache nhiều tầng\}: add cache-aside (Redis) + an LRU in front + HTTP ETag; measure p99 at each layer and implement correct invalidation \{thêm cache-aside + LRU + ETag; đo p99 từng tầng và invalidation\}.
+
+4. **Offload CPU** \{Đẩy CPU\}: move a CPU-heavy endpoint to a piscina worker pool; prove event-loop lag drops and concurrent requests stay responsive \{chuyển endpoint nặng CPU sang piscina; chứng minh lag giảm\}.
+
+5. **Cluster & compare** \{Cluster & so sánh\}: run single-process vs `cluster`/PM2 cluster under load and chart the throughput difference \{chạy đơn vs cluster dưới tải và vẽ chênh lệch throughput\}.
+
+6. **Hunt a leak** \{Săn rò rỉ\}: introduce an ever-growing cache, capture and diff two heap snapshots under load, then fix it with a TTL/`WeakMap` \{tạo cache lớn dần, diff hai snapshot, rồi sửa\}.
+
+---
+
+## What's next \{Phần tiếp theo\}
+
+You can now make a Node service fast and *prove* it: measuring percentiles, profiling with perf_hooks/clinic.js, watching event-loop lag, killing N+1 and tuning queries, multi-layer caching, clustering and worker threads, response optimization, and leak hunting — all validated with load tests \{Giờ bạn làm service Node nhanh và *chứng minh* được: đo percentile, profiling, theo dõi lag, diệt N+1 và chỉnh query, cache nhiều tầng, clustering và worker, tối ưu response, và săn rò rỉ — xác thực bằng load test\}.
+
+In **Phase 9**, we lock in correctness with **comprehensive testing** — the testing pyramid, unit tests, integration tests with supertest and Testcontainers, mocking, fixtures and factories, coverage that means something, and testing async/errors — so you can refactor and ship without fear \{Ở **Phase 9**, ta khóa tính đúng đắn với **kiểm thử toàn diện** — kim tự tháp test, unit, integration với supertest và Testcontainers, mocking, fixture/factory, coverage có nghĩa, và test async/lỗi — để refactor và ship không sợ\}.

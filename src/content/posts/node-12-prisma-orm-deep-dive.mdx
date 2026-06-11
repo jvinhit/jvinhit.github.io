@@ -1,0 +1,285 @@
+---
+title: 'Node.js Super Senior · Phase 12 — Prisma ORM Deep Dive'
+description: 'Bonus Phase 12: master Prisma — the schema and relations, migrations, the type-safe Client (CRUD, select/include, nested writes, aggregations), transactions, connection pooling, safe raw SQL, extensions, and error handling.'
+pubDate: 2026-06-09
+tags: [nodejs, prisma, orm, postgresql, node_10]
+series: nodejs
+seriesOrder: 12
+draft: false
+---
+
+This is **Bonus Phase 12** \{Đây là **Bonus Phase 12**\}. Phase 11 gave you raw PostgreSQL mastery — the foundation \{Phase 11 cho bạn làm chủ PostgreSQL thô — nền tảng\}. Now we add **Prisma**, the ORM most modern TypeScript teams reach for \{Giờ ta thêm **Prisma**, ORM mà đa số team TypeScript hiện đại chọn\}. Its selling point is **end-to-end type safety**: your database schema generates a fully-typed client, so a wrong field or type is a *compile error*, not a 2am production incident \{Điểm bán hàng của nó là **type safety đầu-cuối**: schema database sinh ra một client có type đầy đủ, nên field hay type sai là *lỗi compile*, không phải sự cố production lúc 2 giờ sáng\}.
+
+Everything you learned in Phase 11 still applies — Prisma generates SQL; you must still understand indexes, transactions, and N+1 \{Mọi thứ bạn học ở Phase 11 vẫn áp dụng — Prisma sinh SQL; bạn vẫn phải hiểu index, transaction, và N+1\}.
+
+---
+
+## 12.1 What Prisma is \{Prisma là gì\}
+
+Prisma has three parts \{Prisma có ba phần\}: a declarative **schema** (`schema.prisma`), a **migration** engine (`prisma migrate`), and a generated, type-safe **Client** (`@prisma/client`). Plus **Studio**, a GUI for your data \{Cộng **Studio**, một GUI cho dữ liệu\}.
+
+```bash
+npm install prisma --save-dev
+npm install @prisma/client
+npx prisma init --datasource-provider postgresql   # creates prisma/schema.prisma + .env
+```
+
+```text
+schema.prisma  ──prisma migrate──▶  database (SQL DDL)
+      │
+      └──prisma generate──▶  @prisma/client  (typed query API)
+```
+
+---
+
+## 12.2 The schema — your single source of truth \{Schema — nguồn sự thật duy nhất\}
+
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  name      String?
+  role      Role     @default(USER)
+  posts     Post[]                            // 1-to-many: a user has many posts
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")                              // actual table name
+}
+
+model Post {
+  id        String   @id @default(uuid())
+  title     String
+  body      String
+  published Boolean  @default(false)
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  authorId  String
+  tags      Tag[]                             // implicit many-to-many
+
+  @@index([authorId, published])              // composite index (Phase 11 rules apply)
+  @@map("posts")
+}
+
+model Tag {
+  id    String @id @default(uuid())
+  name  String @unique
+  posts Post[]
+}
+
+enum Role { USER ADMIN }
+```
+
+Read this like the DDL from Phase 11 \{Đọc cái này như DDL ở Phase 11\}: `@id`/`@default`/`@unique` are column constraints, `@relation` defines the foreign key with a referential action, `@@index` is your composite index, and `@@map` decouples model names from table names \{`@id`/`@default`/`@unique` là constraint cột, `@relation` định nghĩa khóa ngoại kèm hành động tham chiếu, `@@index` là index ghép, `@@map` tách tên model khỏi tên bảng\}.
+
+### Relations \{Quan hệ\}
+
+- **1-to-many** — a scalar FK on one side (`authorId`) + a list on the other (`posts Post[]`) \{FK vô hướng một bên + danh sách bên kia\}.
+- **Many-to-many** — *implicit* (`Post[]`/`Tag[]`, Prisma manages the join table) or *explicit* (model the join table yourself when it carries extra fields) \{*ngầm* hoặc *tường minh* khi bảng nối có field thêm\}.
+- **1-to-1** — a `@unique` FK \{một FK `@unique`\}.
+
+---
+
+## 12.3 Migrations \{Migration\}
+
+```bash
+npx prisma migrate dev --name add_posts   # dev: creates + applies a migration, regenerates client
+npx prisma migrate deploy                  # prod/CI: applies pending migrations only
+npx prisma migrate reset                   # wipe + replay (dev only)
+npx prisma db push                         # prototype: sync schema WITHOUT a migration file
+```
+
+The senior distinction \{Phân biệt senior\}: `migrate dev` authors versioned, committed SQL migrations (use everywhere real); `db push` is for fast prototyping and throws the history away \{`migrate dev` tạo migration SQL có version, commit (dùng mọi nơi thật); `db push` cho prototype nhanh và bỏ lịch sử\}. In CI/CD (Phase 7), run `migrate deploy` as a **separate, backward-compatible step before** the new code goes live \{Trong CI/CD, chạy `migrate deploy` như **bước riêng, tương thích ngược, trước** khi code mới lên\}.
+
+---
+
+## 12.4 The Client — typed CRUD \{Client — CRUD có type\}
+
+```ts
+import { PrismaClient, Prisma } from '@prisma/client';
+export const prisma = new PrismaClient();
+
+// CREATE — input type is generated; a typo or wrong type won't compile
+const user = await prisma.user.create({ data: { email: 'a@b.com', name: 'Ann' } });
+
+// READ — findUnique by a unique field; select trims the payload (and its type!)
+const u = await prisma.user.findUnique({
+  where: { email: 'a@b.com' },
+  select: { id: true, email: true },   // returned type is { id: string; email: string }
+});
+
+// READ many — filter, sort, paginate
+const posts = await prisma.post.findMany({
+  where: { published: true, author: { role: 'ADMIN' } },  // filter across the relation
+  orderBy: { createdAt: 'desc' },
+  take: 20,
+  skip: 0,
+});
+
+// UPDATE / DELETE
+await prisma.post.update({ where: { id }, data: { published: true } });
+await prisma.post.delete({ where: { id } });
+```
+
+### include vs select — and the N+1 escape \{include vs select — và thoát N+1\}
+
+`include` pulls relations; `select` picks exact fields. **Prisma batches relation loads into a few queries**, so loading posts *with* authors does **not** fire one query per post \{`include` kéo quan hệ; `select` chọn field chính xác. **Prisma gộp việc tải quan hệ thành vài query**, nên tải post *kèm* author **không** bắn một query mỗi post\}:
+
+```ts
+// ✅ One query for posts + one batched query for all authors — not N+1
+const feed = await prisma.post.findMany({
+  include: { author: { select: { id: true, name: true } }, tags: true },
+});
+```
+
+But you can still create N+1 by **awaiting relations inside a loop** — don't \{Nhưng bạn vẫn tạo N+1 nếu **await quan hệ trong vòng lặp** — đừng làm vậy\}.
+
+### Nested writes, upsert, aggregation \{Ghi lồng, upsert, tổng hợp\}
+
+```ts
+// Nested write — create a user AND their first post in one atomic call
+await prisma.user.create({
+  data: { email: 'c@d.com', posts: { create: [{ title: 'Hello', body: '...' }] } },
+});
+
+// Upsert — insert or update (maps to ON CONFLICT, Phase 11)
+await prisma.tag.upsert({ where: { name: 'node' }, create: { name: 'node' }, update: {} });
+
+// Aggregation + groupBy
+const stats = await prisma.post.groupBy({
+  by: ['authorId'],
+  _count: { _all: true },
+  having: { authorId: { _count: { gt: 5 } } },
+});
+```
+
+---
+
+## 12.5 Type safety beyond the basics \{Type safety nâng cao\}
+
+Prisma derives precise types from your queries, so you never hand-write DTOs that drift from the schema \{Prisma suy ra type chính xác từ query, nên bạn không tự viết DTO lệch khỏi schema\}:
+
+```ts
+// The exact return type of a specific include/select — reusable across layers
+type PostWithAuthor = Prisma.PostGetPayload<{ include: { author: true } }>;
+
+// Validate-and-type an input object without executing it
+const data = Prisma.validator<Prisma.UserCreateInput>()({ email: 'x@y.com' });
+```
+
+---
+
+## 12.6 Transactions \{Transaction\}
+
+Two flavors \{Hai kiểu\}. The **array** form runs independent operations atomically \{Dạng **mảng** chạy các thao tác độc lập nguyên tử\}; the **interactive** form gives you a `tx` client for read-modify-write logic, with isolation control \{dạng **tương tác** cho bạn một client `tx` cho logic đọc-sửa-ghi, có điều khiển cô lập\}:
+
+```ts
+// Array: all-or-nothing, no logic between
+await prisma.$transaction([
+  prisma.account.update({ where: { id: from }, data: { balance: { decrement: amount } } }),
+  prisma.account.update({ where: { id: to },   data: { balance: { increment: amount } } }),
+]);
+
+// Interactive: logic + the isolation levels from Phase 11
+await prisma.$transaction(async (tx) => {
+  const acct = await tx.account.findUniqueOrThrow({ where: { id: from } });
+  if (acct.balance < amount) throw new Error('Insufficient funds'); // throwing rolls back
+  await tx.account.update({ where: { id: from }, data: { balance: { decrement: amount } } });
+  await tx.account.update({ where: { id: to },   data: { balance: { increment: amount } } });
+}, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+```
+
+> Everything from Phase 11 holds: under `Serializable`, be ready to **retry** on a serialization failure \{Mọi thứ ở Phase 11 vẫn đúng: dưới `Serializable`, sẵn sàng **retry** khi serialization failure\}.
+
+---
+
+## 12.7 Connection pooling & raw SQL \{Connection pooling & SQL thô\}
+
+`PrismaClient` pools connections; tune `connection_limit` in the `DATABASE_URL`, and respect the Phase 4 math (`instances × limit ≤ db_max`) \{`PrismaClient` pool kết nối; chỉnh `connection_limit` trong `DATABASE_URL`, và tôn trọng công thức Phase 4\}. In serverless, front it with **PgBouncer** or use **Prisma Accelerate** (managed pooling + caching); for non-default runtimes use a **driver adapter** \{Trong serverless, đặt **PgBouncer** phía trước hoặc dùng **Prisma Accelerate**; với runtime khác dùng **driver adapter**\}.
+
+When Prisma's API can't express a query, drop to **parameterized raw SQL** — the tagged-template form is injection-safe \{Khi API Prisma không diễn đạt được, hạ xuống **SQL thô parameterized** — dạng tagged-template an toàn injection\}:
+
+```ts
+// ✅ Safe: ${userInput} is sent as a parameter, never interpolated into SQL
+const rows = await prisma.$queryRaw<{ id: string }[]>`
+  SELECT id FROM posts WHERE title ILIKE ${'%' + term + '%'} LIMIT 20
+`;
+await prisma.$executeRaw`UPDATE posts SET views = views + 1 WHERE id = ${id}`;
+```
+
+> Never use `$queryRawUnsafe` with concatenated user input — that's the one footgun back to SQL injection \{Đừng dùng `$queryRawUnsafe` với input nối chuỗi — đó là cái bẫy đưa SQL injection trở lại\}.
+
+---
+
+## 12.8 Client extensions & error handling \{Mở rộng client & xử lý lỗi\}
+
+`$extends` lets you add reusable behavior — computed fields, query logging, or **soft delete** — without wrapping every call \{`$extends` cho bạn thêm hành vi tái dùng — field tính toán, log query, hay **soft delete** — mà không bọc mọi lời gọi\}:
+
+```ts
+const xprisma = prisma.$extends({
+  query: {
+    post: {
+      // Turn every delete into an update (soft delete)
+      async delete({ args, query }) {
+        return query({ ...args, data: { deletedAt: new Date() } } as never);
+      },
+    },
+  },
+});
+```
+
+Handle Prisma's typed errors by **code**, not message \{Xử lý lỗi có type của Prisma theo **mã**, không theo message\}:
+
+```ts
+import { Prisma } from '@prisma/client';
+
+try {
+  await prisma.user.create({ data });
+} catch (err) {
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === 'P2002') throw new AppError('Email already exists', 409); // unique violation
+    if (err.code === 'P2025') throw new NotFoundError();                       // record not found
+  }
+  throw err;
+}
+```
+
+> Senior rules \{Quy tắc senior\}: instantiate **one** `PrismaClient` for the whole app (a new one per request exhausts the pool), and disconnect on shutdown (`await prisma.$disconnect()`) \{tạo **một** `PrismaClient` cho cả app; ngắt khi tắt\}.
+
+---
+
+## 12.9 Prisma vs raw SQL vs other ORMs \{Prisma vs SQL thô vs ORM khác\}
+
+| | Raw SQL / `pg` | Prisma | TypeORM / Sequelize |
+|---|---|---|---|
+| Type safety \{An toàn type\} | manual | **generated, end-to-end** | partial |
+| Migrations \{Migration\} | hand-written | declarative + generated | decorator/CLI |
+| Control \{Kiểm soát\} | total | high (+ raw escape hatch) | high |
+| Learning curve \{Đường học\} | SQL | low | medium |
+
+Senior take \{Quan điểm senior\}: Prisma's DX and type safety make it an excellent default; keep raw SQL (Phase 11) for the queries it can't express \{DX và type safety của Prisma khiến nó là mặc định tốt; giữ SQL thô cho query nó không diễn đạt được\}.
+
+---
+
+## 12.10 Practice \{Thực hành\}
+
+1. Model the Phase 11 blog (users, posts, tags, comments) in `schema.prisma` with relations, enums, and a composite index; run `migrate dev` \{mô hình blog trong `schema.prisma` với quan hệ, enum, index ghép; chạy `migrate dev`\}.
+2. Build a typed repository: CRUD + filtered/paginated `findMany` + a nested write; prove the return types are inferred \{dựng repository có type: CRUD + `findMany` lọc/phân trang + ghi lồng; chứng minh type trả được suy ra\}.
+3. Implement a money-transfer interactive transaction at `Serializable` with a retry loop \{cài transaction chuyển tiền tương tác ở `Serializable` kèm retry\}.
+4. Add a soft-delete client extension and map `P2002`/`P2025` to your `AppError`s \{thêm extension soft-delete và ánh xạ `P2002`/`P2025` sang `AppError`\}.
+
+---
+
+## What's next \{Phần tiếp theo\}
+
+You can now run Prisma like a senior: a typed schema and relations, versioned migrations, the full Client query API without N+1, precise derived types, transactions with isolation, sane pooling, injection-safe raw SQL, extensions, and code-based error handling \{Giờ bạn dùng Prisma như senior: schema có type và quan hệ, migration có version, API query đầy đủ không N+1, type suy ra chính xác, transaction có cô lập, pooling hợp lý, SQL thô an toàn, extension, và xử lý lỗi theo mã\}.
+
+The next bottleneck in any serious backend is doing the *same expensive work* repeatedly — so in **Phase 13** we add a cache and a job queue with **Redis**: caching patterns and TTLs, pub/sub and streams, rate limiting, distributed locks, sessions, and BullMQ background jobs \{Nút cổ chai kế tiếp trong mọi backend nghiêm túc là làm *cùng việc tốn kém* lặp đi lặp lại — nên ở **Phase 13** ta thêm cache và hàng đợi job với **Redis**: pattern cache và TTL, pub/sub và stream, rate limit, khóa phân tán, session, và job nền BullMQ\}.

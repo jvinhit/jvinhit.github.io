@@ -1,0 +1,127 @@
+---
+title: 'Three.js from Zero to Senior · Bonus Part 12 — Physics with cannon-es'
+description: 'Make things move on their own: the render-world / physics-world split, rigid bodies and colliders, the fixed-timestep loop, syncing meshes to bodies, friction and restitution, and when to reach for Rapier — with a live physics sandbox.'
+pubDate: 2026-06-09
+tags: [threejs, 3d, physics, threejs_10]
+series: threejs
+seriesOrder: 12
+draft: false
+---
+
+Three.js is a **renderer** — it draws what you tell it, exactly where you tell it. \{Three.js là một **bộ render** — nó vẽ những gì bạn bảo, đúng chỗ bạn bảo.\} It has no idea about gravity, collisions, or momentum. \{Nó không biết gì về trọng lực, va chạm, hay quán tính.\} To make objects fall, bounce, and stack realistically, you bolt on a **physics engine** that computes motion, and copy its results onto your meshes each frame. \{Để vật rơi, nảy, và chồng lên nhau chân thực, bạn gắn thêm một **engine vật lý** tính chuyển động, rồi sao kết quả lên mesh mỗi frame.\}
+
+Click the floor in the sandbox to drop bodies — they collide, tumble, and settle into stacks. \{Click sàn trong sandbox để thả vật — chúng va chạm, lăn, và lắng thành đống.\} Drive gravity and bounce live. \{Điều khiển trọng lực và độ nảy trực tiếp.\}
+
+<iframe
+  src="/tools/threejs-physics-demo/"
+  title="Three.js cannon-es physics sandbox demo"
+  loading="lazy"
+  style="width:100%;height:840px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/threejs-physics-demo/](/tools/threejs-physics-demo/).
+
+## The core idea: two worlds, kept in sync \{Ý tưởng cốt lõi: hai thế giới, giữ đồng bộ\}
+
+This is the one mental model that makes everything click: there are **two parallel worlds**. \{Đây là mô hình tư duy duy nhất khiến mọi thứ sáng tỏ: có **hai thế giới song song**.\}
+
+- The **render world** (Three.js) — `Scene`, `Mesh`es, materials, lights. What the user *sees*. \{**Render world** (Three.js) — `Scene`, `Mesh`, material, đèn. Cái người dùng *thấy*.\}
+- The **physics world** (cannon-es) — a `World` of `Body`s with mass, velocity, and collision shapes. What *decides where things go*. \{**Physics world** (cannon-es) — một `World` chứa các `Body` có khối lượng, vận tốc, và hình va chạm. Cái *quyết định vật đi đâu*.\}
+
+They never share objects — only **numbers**. \{Chúng không bao giờ chia sẻ object — chỉ chia sẻ **số**.\} Each frame, the physics world steps forward, then every mesh copies its body's position and rotation. \{Mỗi frame, physics world bước tới, rồi mỗi mesh sao vị trí và xoay của body.\}
+
+## Setting up the physics world \{Dựng physics world\}
+
+```js
+import * as CANNON from 'cannon-es';
+
+const world = new CANNON.World();
+world.gravity.set(0, -9.82, 0);                 // m/s², pointing down
+world.broadphase = new CANNON.SAPBroadphase(world); // faster broad-phase for many bodies
+world.allowSleep = true;                        // bodies at rest stop being simulated
+```
+
+`allowSleep` is a free performance win: a body that's settled goes to sleep and is skipped until something hits it. \{`allowSleep` là một món lợi hiệu năng miễn phí: body đã lắng sẽ ngủ và bị bỏ qua cho tới khi có gì đó đụng vào.\}
+
+## Bodies and colliders \{Body và collider\}
+
+A `Body` has a **mass** (0 = static, immovable) and one or more **collision shapes**. \{Một `Body` có **khối lượng** (0 = tĩnh, bất động) và một hoặc nhiều **hình va chạm**.\} Crucially, the collider is a *separate, simpler* shape from the render mesh: \{Quan trọng: collider là một hình *riêng, đơn giản hơn* so với render mesh:\}
+
+```js
+// Render: a detailed Three mesh.
+const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), material);
+scene.add(mesh);
+
+// Physics: a simple box collider. Note Cannon's half-extents (half the size).
+const body = new CANNON.Body({ mass: 1 });
+body.addShape(new CANNON.Box(new CANNON.Vec3(0.5, 0.5, 0.5)));
+body.position.set(0, 5, 0);
+world.addBody(body);
+```
+
+A senior **never** uses the visual mesh as its own collider for complex shapes — you approximate with boxes, spheres, and capsules. \{Senior **không bao giờ** dùng mesh hiển thị làm collider cho hình phức tạp — bạn xấp xỉ bằng hộp, cầu, và capsule.\} A character is a capsule; a barrel is a cylinder; a building is a few boxes. \{Nhân vật là capsule; thùng là trụ; toà nhà là vài cái hộp.\} Per-triangle collision is enormously more expensive and usually unnecessary. \{Va chạm theo từng tam giác đắt hơn rất nhiều và thường không cần.\}
+
+## The fixed-timestep loop \{Vòng lặp fixed-timestep\}
+
+Physics must advance in **fixed** increments, or simulations become non-deterministic and explode at low frame rates. \{Vật lý phải tiến theo bước **cố định**, nếu không mô phỏng mất tính tất định và "nổ" ở frame rate thấp.\} cannon-es handles this for you if you call `step` correctly: \{cannon-es lo việc này nếu bạn gọi `step` đúng:\}
+
+```js
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 1 / 30);   // clamp to avoid huge catch-up jumps
+
+  world.step(1 / 60, dt, 3);
+  //         ^fixed     ^elapsed ^max substeps
+
+  // Sync: copy each body's transform onto its mesh.
+  for (const { mesh, body } of objects) {
+    mesh.position.copy(body.position);
+    mesh.quaternion.copy(body.quaternion);   // Three & Cannon agree on quaternion layout
+  }
+  renderer.render(scene, camera);
+}
+```
+
+The three arguments matter: `step(fixedTimeStep, deltaTime, maxSubSteps)`. \{Ba tham số quan trọng: `step(fixedTimeStep, deltaTime, maxSubSteps)`.\} The engine runs as many fixed `1/60` steps as needed to cover the real elapsed time, capped by `maxSubSteps`. \{Engine chạy số bước cố định `1/60` cần thiết để bù thời gian thực, giới hạn bởi `maxSubSteps`.\} **Clamp `dt`** so a tab that was backgrounded doesn't try to simulate ten seconds in one frame and launch everything into orbit. \{**Kẹp `dt`** để một tab bị đẩy nền không cố mô phỏng mười giây trong một frame và bắn mọi thứ lên quỹ đạo.\}
+
+## Materials: friction and restitution \{Material: ma sát và độ nảy\}
+
+Physics materials are *not* render materials — they describe how surfaces interact: \{Material vật lý *không* phải material render — chúng mô tả cách bề mặt tương tác:\}
+
+```js
+const mat = new CANNON.Material('default');
+const contact = new CANNON.ContactMaterial(mat, mat, {
+  friction: 0.3,      // 0 = ice, high = grippy
+  restitution: 0.3,   // 0 = no bounce, 1 = perfectly bouncy
+});
+world.addContactMaterial(contact);
+world.defaultContactMaterial = contact;
+```
+
+The sandbox's bounce slider edits `restitution` live — drag it to 1 and the bodies turn into superballs. \{Slider độ nảy của sandbox sửa `restitution` trực tiếp — kéo lên 1 và các vật biến thành bóng siêu nảy.\}
+
+## cannon-es vs Rapier — which engine? \{cannon-es và Rapier — engine nào?\}
+
+- **cannon-es** — pure JavaScript, tiny, zero setup, perfect for learning and light scenes (what this demo uses). The maintained fork of the original cannon.js. \{**cannon-es** — JavaScript thuần, nhỏ, không cần cài đặt, hoàn hảo để học và scene nhẹ (demo này dùng). Bản fork được bảo trì của cannon.js gốc.\}
+- **Rapier** — Rust compiled to WebAssembly, dramatically faster and more stable for thousands of bodies or production games. Slightly more setup (async wasm load). \{**Rapier** — Rust biên dịch ra WebAssembly, nhanh và ổn định hơn hẳn cho hàng nghìn body hoặc game production. Cài đặt nhỉnh hơn (nạp wasm bất đồng bộ).\}
+
+Learn the concepts on cannon-es; reach for Rapier when performance demands it. \{Học khái niệm trên cannon-es; chuyển sang Rapier khi hiệu năng đòi hỏi.\} The two-world mental model is identical either way. \{Mô hình hai-thế-giới giống nhau ở cả hai.\}
+
+## The master's warnings \{Lời cảnh báo của sư phụ\}
+
+- **Objects sink through the floor or jitter?** Your `dt` isn't clamped, or `maxSubSteps` is too low for the frame rate. \{**Vật lún qua sàn hay rung?** `dt` chưa kẹp, hoặc `maxSubSteps` quá thấp so với frame rate.\}
+- **Box collider half the visual size?** Cannon's `Box` takes **half-extents** — half the full dimension. \{**Box collider bằng nửa kích thước hiển thị?** `Box` của Cannon nhận **nửa-cạnh** — một nửa kích thước đầy đủ.\}
+- **Everything launches into space?** A backgrounded tab fed a huge `dt` — clamp it. \{**Mọi thứ bắn lên trời?** Tab nền nạp một `dt` khổng lồ — kẹp nó.\}
+- **Mesh and body drift apart?** You forgot to copy **both** `position` and `quaternion` every frame. \{**Mesh và body lệch nhau?** Bạn quên sao **cả** `position` lẫn `quaternion` mỗi frame.\}
+- **Frame rate dies with many bodies?** Enable `allowSleep`, use `SAPBroadphase`, and simplify colliders — or move to Rapier. \{**FPS chết với nhiều body?** Bật `allowSleep`, dùng `SAPBroadphase`, đơn giản hoá collider — hoặc chuyển sang Rapier.\}
+
+## Practice, or it didn't happen \{Luyện tập, không thì coi như chưa học\}
+
+1. **Bounce sweep** \{Quét độ nảy\}: in the sandbox, set restitution to 0 then 1 and drop a sphere from height — feel the difference. \{trong sandbox, đặt restitution về 0 rồi 1 và thả một quả cầu từ trên cao — cảm nhận khác biệt.\}
+2. **Zero gravity** \{Không trọng lực\}: drag gravity to 0 and rain bodies — they drift instead of fall. \{kéo trọng lực về 0 và mưa các vật — chúng trôi thay vì rơi.\}
+3. **Stress test** \{Thử tải\}: hit "Rain 20" repeatedly and watch the awake/sleeping counts — sleeping bodies are free. \{bấm "Rain 20" liên tục và xem số awake/sleeping — body ngủ là miễn phí.\}
+
+## What's next \{Phần tiếp theo\}
+
+You can now make scenes that look custom (shaders) and move on their own (physics). \{Giờ bạn làm được scene trông tuỳ biến (shader) và tự chuyển động (vật lý).\} The bonus frontier from here: **WebXR** for VR/AR experiences in the browser, and **react-three-fiber** for writing Three.js scenes declaratively as React components at real application scale. \{Biên giới bonus từ đây: **WebXR** cho trải nghiệm VR/AR trong trình duyệt, và **react-three-fiber** để viết scene Three.js theo kiểu khai báo như component React ở quy mô ứng dụng thật.\} Both build directly on every concept this series has covered. \{Cả hai dựng thẳng trên mọi khái niệm series này đã trình bày.\}

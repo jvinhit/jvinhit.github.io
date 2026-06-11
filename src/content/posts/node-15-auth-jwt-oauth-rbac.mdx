@@ -1,0 +1,160 @@
+---
+title: 'Node.js Super Senior · Phase 15 — Auth & Security Capstone: JWT, OAuth2 & RBAC'
+description: 'The bonus-arc finale: master modern auth. JWT anatomy and signing, access/refresh rotation, cookie vs header storage and the XSS/CSRF trade-off, token revocation with Redis, OAuth2/OIDC with PKCE, and role/permission RBAC as NestJS guards.'
+pubDate: 2026-06-10
+tags: [nodejs, authentication, security, jwt, node_10]
+series: nodejs
+seriesOrder: 15
+draft: false
+---
+
+This is **Bonus Phase 15**, the capstone of the bonus arc \{Đây là **Bonus Phase 15**, phần đỉnh của nhánh bonus\}. Phase 5 introduced auth; now we go deep on the topic that turns a working API into a *safe* one \{Phase 5 giới thiệu auth; giờ ta đi sâu vào chủ đề biến một API chạy được thành một API *an toàn*\}. Tokens are where most real-world breaches begin \{Token là nơi đa số rò rỉ thực tế bắt đầu\}. A junior gets login working; a senior can explain exactly which attack each design decision prevents \{Junior làm login chạy; senior giải thích được đúng đòn tấn công nào mỗi quyết định thiết kế ngăn chặn\}.
+
+---
+
+## 15.0 What a JWT actually is \{JWT thực chất là gì\}
+
+A JWT is three Base64URL parts joined by dots: `header.payload.signature` \{JWT là ba phần Base64URL nối bằng dấu chấm\}. The header names the algorithm, the payload holds **claims**, the signature proves it wasn't tampered with \{Header nêu thuật toán, payload chứa **claim**, signature chứng minh không bị giả mạo\}.
+
+```text
+eyJhbGciOiJIUzI1NiJ9 . eyJzdWIiOiIxMjMiLCJyb2xlIjoiYWRtaW4ifQ . <signature>
+   header (alg)              payload (claims: sub, role, exp)         HMAC/RSA signature
+```
+
+The signature is **not** encryption — anyone can read the payload \{Signature **không** phải mã hóa — ai cũng đọc được payload\}. **Never put secrets in a JWT** \{**Đừng bao giờ để bí mật trong JWT**\}. It guarantees *integrity* (the server signed it), not *confidentiality* \{Nó đảm bảo *tính toàn vẹn*, không phải *tính bí mật*\}.
+
+```ts
+import jwt from 'jsonwebtoken';
+const token = jwt.sign({ sub: user.id, role: user.role }, process.env.JWT_SECRET!,
+  { expiresIn: '15m', issuer: 'api', audience: 'web' });
+const claims = jwt.verify(token, process.env.JWT_SECRET!, { issuer: 'api', audience: 'web' });
+```
+
+**HS256** uses one shared secret (simple, single service); **RS256** signs with a private key and verifies with a public one (right when many services verify but only one issues) \{**HS256** dùng một secret chung; **RS256** ký bằng private key và verify bằng public key\}.
+
+---
+
+## 15.1 Access + refresh tokens \{Access token + refresh token\}
+
+A single long-lived token is a liability — if stolen, the attacker has long access and you can't revoke it \{Một token sống lâu duy nhất là rủi ro — nếu bị trộm, kẻ tấn công có quyền lâu và bạn không thu hồi được\}. The senior pattern is **two tokens** \{Pattern senior là **hai token**\}:
+
+- **Access token** — short-lived (5–15 min), sent on every request, stateless. \{sống ngắn, gửi mỗi request, không trạng thái.\}
+- **Refresh token** — long-lived (days), stored server-side/revocable, used *only* to mint new access tokens. \{sống lâu, lưu phía server/thu hồi được, chỉ để cấp access token mới.\}
+
+```ts
+function issueTokens(user: User) {
+  const accessToken  = jwt.sign({ sub: user.id, role: user.role }, ACCESS_SECRET, { expiresIn: '15m' });
+  const refreshToken = jwt.sign({ sub: user.id, jti: randomUUID() }, REFRESH_SECRET, { expiresIn: '7d' });
+  return { accessToken, refreshToken };
+}
+```
+
+### Refresh token rotation \{Xoay refresh token\}
+
+Each time a refresh token is used, issue a **new** one and invalidate the old `jti` \{Mỗi lần dùng refresh token, cấp một cái **mới** và vô hiệu `jti` cũ\}. If an old (already-rotated) token is ever replayed, that signals theft — revoke the whole family and force re-login \{Nếu một token cũ (đã xoay) bị phát lại, đó là dấu hiệu trộm — thu hồi cả họ token và bắt đăng nhập lại\}.
+
+---
+
+## 15.2 Revocation with Redis \{Thu hồi với Redis\}
+
+Stateless JWTs can't be un-issued — so for logout and "revoke everywhere" you need server state \{JWT không trạng thái không thể bị hủy phát — nên cho logout và "thu hồi mọi nơi" bạn cần trạng thái server\}. Track refresh-token `jti`s in Redis (Phase 13) with a TTL equal to the token lifetime \{Theo dõi `jti` của refresh token trong Redis với TTL bằng tuổi token\}:
+
+```ts
+// on login: allowlist this refresh token
+await redis.set(`rt:${jti}`, user.id, 'EX', 7 * 24 * 3600);
+// on refresh: must still exist, then rotate
+if (!(await redis.get(`rt:${jti}`))) throw new UnauthorizedException('revoked');
+await redis.del(`rt:${jti}`);                 // invalidate old
+// on logout / breach: del the jti (or all of a user's) → instant revocation
+```
+
+Access tokens stay short so you rarely need to deny them; for emergencies keep a small **denylist** of access `jti`s until they expire \{Access token để ngắn nên hiếm khi cần chặn; cho khẩn cấp giữ một **denylist** nhỏ\}.
+
+---
+
+## 15.3 Where to store tokens — the real security decision \{Lưu token ở đâu — quyết định bảo mật thật sự\}
+
+This is the question that separates seniors \{Đây là câu hỏi tách biệt senior\}:
+
+| Storage \{Lưu\} | Exposed to \{Lộ với\} | Notes \{Ghi chú\} |
+| --- | --- | --- |
+| `localStorage` + `Authorization` header | **XSS** (any injected script can read it) | easy CORS/mobile; one XSS = stolen token |
+| `httpOnly` cookie | **CSRF** (sent automatically) | JS can't read it → XSS-safe; needs CSRF defense |
+
+The senior consensus: **refresh token in an `httpOnly`, `Secure`, `SameSite` cookie**; access token in memory (a JS variable), re-fetched via the refresh cookie \{Đồng thuận senior: **refresh token trong cookie `httpOnly`, `Secure`, `SameSite`**; access token trong bộ nhớ\}.
+
+```ts
+res.cookie('refresh', refreshToken, {
+  httpOnly: true,            // JS can't read it → mitigates XSS token theft
+  secure: true,              // HTTPS only
+  sameSite: 'strict',        // mitigates CSRF
+  path: '/auth/refresh',     // sent only to the refresh endpoint
+  maxAge: 7 * 24 * 3600_000,
+});
+```
+
+`httpOnly` blocks XSS reads; `SameSite` blocks most CSRF; if you can't use `SameSite=strict`, add a CSRF token (Phase 5) \{`httpOnly` chặn đọc XSS; `SameSite` chặn phần lớn CSRF\}.
+
+---
+
+## 15.4 OAuth2 & OIDC — delegated login \{OAuth2 & OIDC — đăng nhập ủy quyền\}
+
+"Sign in with Google" is **OAuth2** (authorization) plus **OpenID Connect** (authentication — it adds an `id_token`) \{"Sign in with Google" là **OAuth2** cộng **OpenID Connect**\}. Use the **Authorization Code flow with PKCE** for web/mobile \{Dùng **Authorization Code flow với PKCE**\}:
+
+1. App redirects to the provider with a `code_challenge` (hash of a random verifier). \{App chuyển hướng tới provider kèm `code_challenge`.\}
+2. User authenticates; provider redirects back with a short-lived **code**. \{User xác thực; provider chuyển về kèm **code** ngắn hạn.\}
+3. App exchanges code **+ `code_verifier`** server-side for tokens. \{App đổi code + `code_verifier` phía server lấy token.\}
+
+PKCE binds the code to the original requester, defeating code-interception attacks \{PKCE buộc code với bên yêu cầu gốc, đánh bại tấn công chặn code\}. **Never implement the crypto yourself** — use Passport strategies (Phase 5) or a vetted OIDC client, and always validate `state`, `nonce`, issuer, and audience \{**Đừng tự cài crypto** — dùng strategy Passport hoặc client OIDC đã kiểm chứng, và luôn validate `state`, `nonce`, issuer, audience\}.
+
+---
+
+## 15.5 RBAC as NestJS guards \{RBAC làm guard NestJS\}
+
+Authentication is "who are you"; **authorization** is "what may you do" \{Xác thực là "bạn là ai"; **phân quyền** là "bạn được làm gì"\}. With the Phase 14 lifecycle, role checks are a custom decorator + guard \{Với vòng đời Phase 14, kiểm vai trò là một decorator + guard tùy biến\}:
+
+```ts
+export const Roles = (...roles: string[]) => SetMetadata('roles', roles);
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private reflector: Reflector) {}
+  canActivate(ctx: ExecutionContext): boolean {
+    const required = this.reflector.get<string[]>('roles', ctx.getHandler());
+    if (!required) return true;
+    const { user } = ctx.switchToHttp().getRequest();        // set by the JWT auth guard
+    return required.includes(user?.role);
+  }
+}
+
+@Roles('admin')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Delete(':id')
+remove(@Param('id', ParseIntPipe) id: number) { return this.posts.remove(id); }
+```
+
+For finer control, store **permissions** (`post:delete`) instead of broad roles, and check those — roles are just bundles of permissions \{Cho kiểm soát mịn hơn, lưu **permission** thay vì vai trò rộng\}.
+
+---
+
+## 15.6 The attacks every senior defends against \{Các đòn tấn công mọi senior phòng vệ\}
+
+- **`alg: none` / algorithm confusion** — an attacker sets the header to `none` or swaps RS256→HS256. Pin the expected algorithm in `verify` \{kẻ tấn công đặt header `none` hoặc tráo thuật toán. Ghim thuật toán mong đợi trong `verify`\}.
+- **Missing expiry** — always set `expiresIn`; a non-expiring token is a permanent key \{luôn đặt `expiresIn`\}.
+- **Weak secret** — HS256 secrets must be long and random (≥ 32 bytes), never committed (Prohibitions rule) \{secret HS256 phải dài và ngẫu nhiên, không commit\}.
+- **Token theft via XSS** — see 15.3; `httpOnly` cookies + a strong CSP \{trộm token qua XSS — cookie `httpOnly` + CSP mạnh\}.
+- **No audience/issuer checks** — validate `aud`/`iss` so a token minted for another service can't be replayed at yours \{validate `aud`/`iss`\}.
+
+---
+
+## 15.7 Practice \{Thực hành\}
+
+1. Implement access+refresh issuing with rotation, storing `jti`s in Redis, and a working "log out everywhere" \{Cài cấp access+refresh có xoay, lưu `jti` trong Redis, và "đăng xuất mọi nơi"\}.
+2. Build a `JwtAuthGuard` + `RolesGuard` and protect an admin-only route; verify a non-admin gets `403` \{Dựng `JwtAuthGuard` + `RolesGuard` và bảo vệ route chỉ admin\}.
+3. Add "Sign in with Google" via Passport OIDC with PKCE, validating `state` and `nonce` \{Thêm "Sign in with Google" qua Passport OIDC với PKCE\}.
+
+---
+
+## The end of the bonus arc \{Kết thúc nhánh bonus\}
+
+Five bonus phases on, the Super Senior path is complete from a new angle \{Sau năm bonus phase, lộ trình Super Senior hoàn chỉnh từ một góc mới\}. You can model and run **PostgreSQL** (11), wrap it type-safely with **Prisma** (12), make it fast and scalable with **Redis** (13), structure it all in **NestJS** (14), and lock it down with modern **JWT/OAuth2/RBAC** security (15) \{Bạn mô hình và vận hành **PostgreSQL**, bọc type-safe bằng **Prisma**, tăng tốc bằng **Redis**, cấu trúc trong **NestJS**, và khóa chặt bằng bảo mật **JWT/OAuth2/RBAC** hiện đại\}. Combined with the core ten phases, you now hold a complete, production-grade backend toolkit \{Kết hợp với mười phase cốt lõi, giờ bạn có bộ công cụ backend hoàn chỉnh, đạt chuẩn production\}. The mark of the senior remains the same: not memorized APIs, but **judgment** — and the security mindset to defend every choice \{Dấu hiệu senior vẫn vậy: không phải API thuộc lòng, mà là **phán đoán** — và tư duy bảo mật để bảo vệ mọi lựa chọn\}. Now go build something real, and secure it \{Giờ hãy đi dựng thứ gì đó thật, và bảo mật nó\}. 🔐
