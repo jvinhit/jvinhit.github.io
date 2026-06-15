@@ -1,697 +1,404 @@
 ---
 title: 'LLM Cost Optimization — 10 patterns giảm hóa đơn 50-95% không mất quality'
-description: 'Pattern thực chiến giảm chi phí LLM ở scale: prompt caching, semantic cache, model routing, distillation, batch API, quantization, streaming + early stop, và framework đo ROI khi self-host.'
+description: 'Mọi đòn bẩy chi phí LLM quy về 3 nhóm: đừng gọi model, gọi nhẹ hơn, rẻ hơn mỗi token. 10 pattern thực chiến (prompt cache, semantic cache, routing, distillation, batch, quantization, self-host), cost math, và ROI framework.'
 pubDate: 2026-04-30
-tags: [ai, llm, cost-optimization, production, performance, scaling]
+tags: [ai, llm, cost-optimization, production, scaling]
 series: ai
 seriesOrder: 15
 top: 1
 draft: false
 ---
 
-LLM rẻ ở prototype, đắt ở production. Startup dùng GPT-4 thoải mái
-khi MAU = 100. Lên 100K MAU, hóa đơn $50K/tháng và founder bắt đầu
-hoảng.
+LLM rẻ ở prototype, đắt ở production. Một startup xài GPT-4 vô tư khi
+có 100 user. Lên 100K user, hoá đơn $200K/tháng và founder bắt đầu mất
+ngủ. Tin tốt: phần lớn con số đó **cắt được 50–95% mà không mất
+quality** — nếu bạn hiểu *tiền chảy đi đâu*.
 
-Bài này là **practical playbook** giảm cost 50-95% mà giữ quality. 10
-pattern + cost calculation + decision framework. Áp dụng được ngay
-mai cho production app.
+Cả bài này xoay quanh **một nguyên lý gốc**. Trước khi nhớ 10 pattern,
+hãy nhớ phương trình:
 
-Reference: [Tokens & Pricing](/blog/ai-tokens-and-pricing-explained)
-nếu cần ôn lại fundamental về cost.
+```text
+chi phí = (số lần gọi) × (số token mỗi lần) × (giá mỗi token)
+```
+
+> **Ý tưởng lớn nhất**: mọi kỹ thuật tối ưu chi phí, không trừ cái nào,
+> chỉ làm **một trong ba việc**:
+>
+> 1. **Đừng gọi model** (giảm số lần gọi) — caching, batch defer.
+> 2. **Gọi nhẹ hơn** (giảm token mỗi lần) — cắt output, quản context, RAG.
+> 3. **Rẻ hơn mỗi token** (giảm đơn giá) — routing model nhỏ, distillation,
+>    batch discount, quantization/self-host.
+>
+> Khi bí, hỏi: "đòn bẩy này thuộc nhóm nào, và nó đánh vào thừa số lớn
+> nhất trong hoá đơn của mình chưa?"
+
+Ôn lại nền tảng token/giá ở [Tokens & Pricing](/blog/ai-tokens-and-pricing-explained).
 
 ---
 
-## 1. Vì sao cost matters — thực tế ở scale
+## 1. Vì sao cost matters — math gây sốc ở scale
 
-### 1.1. Math đơn giản, kết quả gây sốc
-
-Chatbot serve 100K user, mỗi user 5 query/ngày, mỗi query 2K input +
-500 output token, dùng Claude 3.5 Sonnet:
+Chatbot 100K user, 5 query/ngày/user, mỗi query 2K input + 500 output,
+Claude 3.5 Sonnet (giá ví dụ $3/$15 per 1M):
 
 ```text
-Per query cost:
-  Input: 2K × $3/1M = $0.006
-  Output: 500 × $15/1M = $0.0075
-  Total: $0.0135 / query
-
-Daily volume: 100K × 5 = 500K query
-Daily cost: 500K × $0.0135 = $6,750
-Monthly cost: $202,500
-Yearly cost: $2.43M
+Mỗi query: 2K×$3/1M + 500×$15/1M = $0.006 + $0.0075 = $0.0135
+Mỗi ngày:  100K × 5 × $0.0135 = $6.750
+Mỗi tháng: ~$202.500   →   mỗi năm: ~$2,43 triệu
 ```
 
-$2.4M/năm cho **1 chatbot duy nhất**. Đa số startup không sống nổi
-mức này.
-
-### 1.2. Cost dọc theo growth curve
-
-```text
-1K users     → $24K/năm     (acceptable)
-10K users    → $240K/năm    (cần optimize)
-100K users   → $2.4M/năm    (must optimize)
-1M users     → $24M/năm     (need self-host hoặc partner deal)
-```
-
-Mỗi 10x user = 10x cost. Nếu pricing model không scale tương ứng →
+**$2,4 triệu/năm cho một con chatbot.** Và cost scale **tuyến tính theo
+user**: mỗi 10× user = 10× hoá đơn. Nếu doanh thu không scale theo kịp,
 margin chết.
 
-### 1.3. Đâu là pain point?
+Ba thừa số trong phương trình tương ứng ba nguồn rò rỉ điển hình:
 
-3 nguồn cost:
+| Thừa số | Nguồn rò rỉ thường gặp | Pattern xử lý |
+| --- | --- | --- |
+| Số lần gọi | Hỏi lại câu đã hỏi; gọi realtime việc không gấp | Prompt cache, semantic cache, batch |
+| Token/lần | Output dài dòng; resend cả history + docs mỗi turn | Output reduction, context mgmt, RAG |
+| Giá/token | Dùng model premium cho task tầm thường | Routing, distillation, quantization |
 
-1. **Output tokens**: 3-5x input. Verbose response = đốt tiền.
-2. **Repeated context**: paste cùng system prompt + docs mỗi request.
-3. **Premium model cho mọi query**: dùng Claude Opus cho "fix typo".
-
-10 pattern dưới đây address từng nguồn này.
+> **Hiểu lầm thường gặp**: "tối ưu chi phí = chọn model rẻ hơn." Đó chỉ
+> là thừa số thứ ba. Thường thì **số lần gọi** và **token/lần** mới là
+> chỗ đốt tiền lớn nhất — và sửa chúng *không hề* đụng tới chất lượng.
 
 ---
 
-## 2. Pattern 1: Prompt Caching
+## NHÓM 1 — Đừng gọi model (giảm số lần gọi)
 
-**Saving: 50-90% cost cho cached portion**
+### 2. Pattern 1: Prompt Caching — *tiết kiệm 50–90% phần cached*
 
-API provider cache prefix prompt. Lần sau request với prefix identical
-→ giá rẻ.
+Provider lưu (cache) phần **đầu** của prompt. Lần sau gửi đúng prefix
+đó → tính giá rẻ hẳn.
 
-### 2.1. Discount
+> **Ẩn dụ**: như quán quen nhớ "phần như mọi khi" của bạn. Họ không bắt
+> bạn đọc lại toàn bộ order từ đầu mỗi lần — chỉ hỏi phần thay đổi hôm
+> nay. Đây thực chất là **CDN/HTTP cache nhưng cho prompt**.
 
-| Provider      | Cached input cost        |
-| ------------- | ------------------------ |
-| Anthropic     | 10% giá thường (90% off) |
-| OpenAI        | 50% giá thường           |
-| Google Gemini | 25% giá thường (75% off) |
+| Provider | Giá input đã cache |
+| --- | --- |
+| Anthropic | 10% giá thường (giảm 90%) |
+| Google Gemini | 25% giá thường (giảm 75%) |
+| OpenAI | 50% giá thường (tự động) |
 
-### 2.2. Cách structure prompt cache-friendly
+Cấu trúc prompt cho cache-friendly: **bất biến lên đầu, biến đổi xuống
+cuối**.
 
 ```text
-[CACHEABLE PREFIX]
-System prompt
-Rules / convention
-Tool definitions
-Reference docs
-Few-shot examples
-[/CACHEABLE PREFIX]
-
-[VARIABLE TAIL]
-User query
-Conversation history mới nhất
-[/VARIABLE TAIL]
+[PREFIX bất biến — sẽ được cache]    system prompt · rules · tool defs · docs · few-shot
+[TAIL biến đổi — tính giá full]      câu hỏi user · history mới nhất
 ```
 
-Phần CACHEABLE giữ identical → hit cache → giảm 50-90%. Phần TAIL
-thay đổi mỗi request → tính giá full.
-
-### 2.3. Anthropic explicit caching
-
-Anthropic yêu cầu mark cache breakpoint:
+Anthropic cần đánh dấu breakpoint tường minh:
 
 ```python
 client.messages.create(
     model="claude-3-5-sonnet-20241022",
-    system=[
-        {
-            "type": "text",
-            "text": "Long system prompt with rules and docs...",
-            "cache_control": {"type": "ephemeral"}
-        }
-    ],
-    messages=[...]
-)
-```
-
-Cache TTL: 5 phút (default). User chat liên tục → từ message 2 trở
-đi save 90%.
-
-### 2.4. Real impact
-
-Chatbot RAG với 5K token system prompt + retrieved docs:
-
-```text
-Without caching:
-  5500 token input × $3/1M × 100K query/ngày = $1,650/ngày
-
-With caching (Anthropic):
-  First request: 5500 × $3.75/1M = $0.020 (write cache, slight
-  premium)
-  Sub-requests: 5500 × $0.30/1M = $0.0017 (90% off)
-
-  Avg cost (giả sử cache hit 80%):
-  100K × ((0.20 × 0.020) + (0.80 × 0.0017)) = $536/ngày
-
-Saving: $1,114/ngày = 67% giảm
-```
-
-### 2.5. Pitfalls
-
-- Cache invalidate khi byte 1 trong prefix đổi → shuffle prompt order
-  có thể break cache.
-- TTL 5 phút → user lâu mới chat lại không hit cache.
-- Cost write cache cao hơn fresh → cần >2 hit để break-even.
-
----
-
-## 3. Pattern 2: Semantic Cache (LLM-level cache)
-
-**Saving: 30-70% cho query trùng lặp**
-
-Khác prompt cache (provider-side). **Semantic cache** là layer của
-bạn:
-
-```text
-Query → check cache (vector similarity)
-  ├── Hit (sim > 0.95): trả response cached
-  └── Miss: call LLM, store response
-```
-
-### 3.1. Implementation
-
-```python
-from openai import OpenAI
-import redis
-
-client = OpenAI()
-cache = redis.Redis()  # hoặc vector DB
-
-def embed(text):
-    return client.embeddings.create(
-        model="text-embedding-3-small",
-        input=text
-    ).data[0].embedding
-
-def cached_chat(query, threshold=0.95):
-    query_vec = embed(query)
-
-    # Search cache
-    candidates = vector_search(query_vec, k=1)
-    if candidates and candidates[0].score > threshold:
-        return candidates[0].response
-
-    # Cache miss
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": query}]
-    )
-
-    cache.add(query_vec, response.choices[0].message.content)
-    return response.choices[0].message.content
-```
-
-### 3.2. Khi nào hiệu quả
-
-Use case có **query repetitive**:
-
-- FAQ chatbot (90% query trùng lặp ý)
-- Customer support (cùng câu hỏi nhiều user)
-- Product Q&A
-- Documentation search
-
-Cost embedding rẻ ($0.02/1M tokens cho text-embedding-3-small) so với
-LLM call → ROI thường rất tốt.
-
-### 3.3. Pitfalls
-
-- **Threshold quá cao** (0.99) → ít hit, ROI thấp.
-- **Threshold quá thấp** (0.85) → trả response sai cho query nuance
-  khác.
-- **Stale data**: query hôm nay = query tuần trước nhưng context
-  đổi. → TTL 1-7 ngày.
-- **Personalization**: user A hỏi "lương tôi" ≠ user B hỏi cùng câu.
-  Cache phải scope per user.
-
-### 3.4. Library
-
-- **GPTCache** (Zilliz) — semantic cache Python
-- **Redis Vector** — cache + vector trong 1 DB
-- **LangChain LLMCache** — built-in semantic cache option
-
----
-
-## 4. Pattern 3: Model Routing
-
-**Saving: 60-90% cost với quality giữ nguyên**
-
-Không phải task nào cũng cần model lớn. Route động theo task complexity:
-
-```text
-Query → classifier (rules / LLM nhỏ)
-  ├── Simple ("dịch sang Anh", "format JSON")
-  │     → GPT-4o-mini ($0.15/1M)
-  ├── Medium ("explain function này")
-  │     → Claude Haiku ($0.8/1M)
-  └── Complex ("design architecture cho X")
-        → Claude Sonnet ($3/1M)
-```
-
-### 4.1. Classifier strategies
-
-**Rule-based** (đơn giản, free):
-
-```python
-def route(query):
-    if len(query) < 50:
-        return "haiku"
-    if any(kw in query.lower() for kw in ["architect", "design", "review"]):
-        return "sonnet"
-    return "mini"
-```
-
-**LLM-based** (chính xác hơn, cost classifier nhỏ):
-
-```python
-def route(query):
-    classifier_result = mini_llm.complete(
-        f"Classify difficulty: easy/medium/hard\nQuery: {query}\nClass:"
-    )
-    return {"easy": "mini", "medium": "haiku", "hard": "sonnet"}[classifier_result]
-```
-
-Classifier cost ~$0.0001/query → negligible. Saving 60-90% trên
-expensive query.
-
-### 4.2. Library
-
-- **OpenRouter** — auto routing với chiến lược định trước
-- **NotDiamond, Martian** — startup chuyên router AI
-- **LangChain Router** — built-in
-
-### 4.3. A/B test bắt buộc
-
-Routing có thể downgrade quality. Always A/B test:
-
-- 10% traffic giữ premium model
-- 90% traffic theo router
-- Compare quality (user rating, conversion)
-
-Nếu quality không drop > 2-3% → router safe.
-
----
-
-## 5. Pattern 4: Output Token Reduction
-
-**Saving: 30-60% direct**
-
-Output đắt 3-5x input. Giảm output → giảm cost rõ rệt.
-
-### 5.1. Explicit length constraint
-
-```text
-❌ "Explain RAG"
-   → response 2000 tokens, verbose
-
-✅ "Explain RAG in 100 words. Bullet points only. No introduction."
-   → response 200 tokens
-```
-
-10x reduction.
-
-### 5.2. Force structured output
-
-JSON / structured response tự nhiên ngắn hơn prose:
-
-```text
-"List 5 framework. Format JSON: {name, useCase, popularity}.
-No prose."
-```
-
-### 5.3. Stop sequences
-
-Cắt response sớm:
-
-```python
-client.chat.completions.create(
-    model="gpt-4o",
+    system=[{
+        "type": "text",
+        "text": "System prompt dài + rules + docs...",
+        "cache_control": {"type": "ephemeral"},  # mốc cache
+    }],
     messages=[...],
-    stop=["</answer>", "---", "## Next"]
 )
 ```
 
-Model output tới stop sequence → dừng. Tiết kiệm token thừa.
+**Tác động thật** (RAG bot, 5,5K token prefix, cache hit ~80%): từ
+~$1.650/ngày xuống ~$536/ngày — **giảm 67%** chỉ bằng một thay đổi cấu
+trúc, không đụng logic.
 
-### 5.4. Max tokens cap
+> **Cẩn thận (misconception)**: "cache luôn bật sẵn và luôn rẻ." Không.
+> Cache **vỡ khi đổi dù một byte** trong prefix (xáo thứ tự prompt là
+> mất cache); TTL ngắn (~5 phút); và ghi cache *đắt hơn* gọi thường một
+> chút — cần ≥2 hit mới hoà vốn. Đừng cache thứ chỉ dùng một lần.
 
-Hard limit. Cẩn thận: cắt giữa câu nếu không đủ.
+### 3. Pattern 2: Semantic Cache — *tiết kiệm 30–70% với query trùng ý*
+
+Khác prompt cache (của provider). Đây là cache **của bạn**, so khớp
+theo *ý nghĩa* chứ không phải khớp chính xác chuỗi:
+
+```text
+Query → embed → tìm trong cache theo vector similarity
+  ├── Hit (sim > 0.95)  → trả thẳng câu trả lời đã lưu (không gọi LLM)
+  └── Miss              → gọi LLM, rồi lưu lại cho lần sau
+```
+
+> **Ẩn dụ**: như cuốn sổ FAQ ở quầy lễ tân. Ai hỏi câu *đủ giống* một
+> câu đã trả lời → đưa luôn đáp án trong sổ, khỏi gọi chuyên gia.
 
 ```python
-max_tokens=500  # response không vượt 500 tokens
+def cached_chat(query, threshold=0.95):
+    qv = embed(query)                          # text-embedding-3-small, rất rẻ
+    hit = vector_search(qv, k=1)
+    if hit and hit[0].score > threshold:
+        return hit[0].response                  # 0 token LLM
+    resp = llm_call(query)
+    cache.add(qv, resp)
+    return resp
 ```
 
-### 5.5. Anti-pattern: force ngắn quá
+Hiệu quả nhất khi query **lặp lại nhiều**: FAQ bot, customer support,
+product Q&A. Chi phí embedding (~$0.02/1M token) rẻ hơn gọi LLM hàng
+trăm lần → ROI rất cao.
 
-Quá ngắn → response không đủ info → user hỏi lại → tổng cost cao
-hơn. Sweet spot 60-80% length default.
+> **Bẫy**: threshold cao quá (0.99) → ít hit; thấp quá (0.85) → trả sai
+> cho câu nuance khác. Và **phải scope theo user**: "lương của tôi" của
+> A khác của B. Đặt TTL 1–7 ngày để tránh stale.
 
----
+### 4. Pattern 3: Batch API — *tiết kiệm 50% cho việc không gấp*
 
-## 6. Pattern 5: Distillation
+Việc **không cần realtime** (report hằng ngày, backfill embedding,
+moderation ban đêm, gán nhãn dữ liệu) → gửi batch, nhận sau 1–24h, giảm
+thẳng 50% (OpenAI/Anthropic/Google đều có).
 
-**Saving: 90-99% inference cost (nếu volume lớn)**
-
-Train model nhỏ học từ model lớn. Dùng output GPT-4 → fine-tune
-GPT-4o-mini → kết quả 90-95% quality của GPT-4 với cost của mini.
-
-### 6.1. Process
-
-```text
-1. Collect 5K-50K examples
-2. Run through GPT-4 (expensive teacher) → get high-quality output
-3. Fine-tune GPT-4o-mini (cheap student) on (input, GPT-4 output) pairs
-4. Deploy student model
-```
-
-### 6.2. Economics
-
-```text
-Distillation cost (one-time):
-  - Teacher inference: 10K example × GPT-4 cost ≈ $300
-  - Fine-tune: $50-100
-  - Total: ~$400
-
-Inference cost per query:
-  - GPT-4: $0.02
-  - Fine-tuned mini: $0.001
-  - Saving: 95%
-
-Break-even: ~25K query
-At 1M query/month: saves $19K/month
-```
-
-### 6.3. Khi nên distill
-
-- Volume lớn (>100K query/tháng)
-- Task narrow (1 domain, không cần general intelligence)
-- Acceptable quality drop 2-5%
-
-Đọc thêm: [Fine-tuning Basics](/blog/fine-tuning-llm-basics).
-
----
-
-## 7. Pattern 6: Batch API
-
-**Saving: 50% direct**
-
-Nếu task **không cần realtime** (background job, analytics), dùng
-batch API:
-
-| Provider  | Batch discount |
-| --------- | -------------- |
-| OpenAI    | 50% off        |
-| Anthropic | 50% off        |
-| Google    | 50% off        |
-
-### 7.1. Use cases
-
-- Daily report generation
-- Backfill embeddings
-- Content moderation overnight
-- Data labeling pipeline
-- Periodic content generation
-
-### 7.2. Trade-off
-
-- Latency: 1-24 giờ thay vì giây
-- Không stream
-- Phải buffer requests thành batch
-
-OpenAI batch:
+> **Ẩn dụ**: như giặt đồ giờ thấp điểm hay sạc xe ban đêm — cùng công
+> việc, rẻ một nửa vì bạn nhường chỗ cho việc gấp của người khác.
 
 ```python
 batch = client.batches.create(
     input_file_id="file-abc",
     endpoint="/v1/chat/completions",
-    completion_window="24h"
+    completion_window="24h",
 )
-
-# 24h sau
-output = client.batches.retrieve(batch.id).output_file_id
 ```
+
+Đánh đổi: độ trễ giờ tính bằng giờ, không stream, phải gom request.
 
 ---
 
-## 8. Pattern 7: Streaming + Early Stop
+## NHÓM 2 — Gọi nhẹ hơn (giảm token mỗi lần)
 
-**Saving: variable, 10-30%**
+### 5. Pattern 4: Output Token Reduction — *tiết kiệm 30–60%*
 
-User nhấn "stop" giữa response → server abort → không tốn output token
-còn lại.
+Output đắt gấp 3–5× input, nên cắt output ăn tiền nhất.
 
-### 8.1. Implementation
-
-```python
-stream = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[...],
-    stream=True
-)
-
-for chunk in stream:
-    yield chunk.choices[0].delta.content
-    if user_stopped():
-        break  # streamhoặc abort connection
+```text
+❌ "Explain RAG"                                  → ~2.000 token, lan man
+✅ "Explain RAG in 100 words. Bullet points. No intro." → ~200 token
 ```
 
-### 8.2. UX combo
+Công cụ: ràng buộc độ dài rõ ràng; ép structured output (JSON ngắn hơn
+văn xuôi); `stop` sequences; `max_tokens` cap.
 
-UI có nút "Stop generation" rõ ràng. User thấy AI lạc → stop ngay,
-re-prompt với clarify thay vì đợi xong response 2000 token rồi không
-dùng.
+> **Misconception**: "càng ngắn càng rẻ." Sai ở mức tổng. Ép ngắn quá →
+> thiếu thông tin → user hỏi lại → tổng cost *cao hơn*. Điểm ngọt
+> thường là 60–80% độ dài mặc định.
 
----
+### 6. Pattern 5: Smart Context Management — *tiết kiệm 30–70% input*
 
-## 9. Pattern 8: Smart Context Management
+Context dài đốt tiền *mỗi turn*, vì toàn bộ history bị gửi lại liên tục
+(xem [Tokens & Context Windows](/blog/ai-agents-tokens-and-context-windows)).
+Phần lớn chat dùng context lãng phí.
 
-**Saving: 30-70% input cost**
-
-Context dài = đốt tiền. Nhưng đa số chat dùng context không hiệu quả.
-
-### 9.1. Trim history
-
-Conversation 20 turn → context 50K. Thực tế model chỉ cần 3-5 turn
-gần nhất + summary phần cũ.
+- **Trim + rolling summary**: giữ 3–5 turn gần nhất + tóm tắt phần cũ
+  thay vì gửi cả 20 turn.
+- **Lazy loading**: đừng paste cả `@src/` "phòng hờ"; chỉ add file thật
+  sự cần.
+- **Fork hội thoại**: đổi chủ đề → mở chat mới, đừng kéo lê context cũ.
+- **RAG thay long context**: tài liệu 100K token mà chỉ cần 1 fact →
+  chunk + embed + lấy top-3 (~3K token) thay vì nhồi cả 100K. Xem
+  [RAG Guide](/blog/rag-retrieval-augmented-generation-guide).
 
 ```python
-def trim(history, max_messages=10):
-    if len(history) <= max_messages:
+def trim(history, keep=10):
+    if len(history) <= keep:
         return history
-
-    # Tóm tắt phần cũ
-    old = history[:-max_messages]
-    summary = llm_summarize(old)
-
-    return [
-        {"role": "system", "content": f"Earlier conversation: {summary}"},
-        *history[-max_messages:]
-    ]
+    summary = llm_summarize(history[:-keep])     # nén phần cũ một lần
+    return [{"role": "system", "content": f"Earlier: {summary}"},
+            *history[-keep:]]
 ```
 
-### 9.2. Lazy context loading
-
-Đừng paste cả `@src/` vào context "phòng hờ". Chỉ load file thực sự
-cần. Cursor làm điều này tự động — bạn add `@file` thay vì `@dir`.
-
-### 9.3. Conversation forking
-
-User đổi chủ đề → start new chat thay vì tiếp tục. Context cũ vô
-nghĩa cho task mới, đốt tiền không lý do.
-
-### 9.4. Sliding window cho long doc
-
-Tài liệu 100K token, query 1 fact cụ thể. Đừng paste cả 100K. Chunk
-
-- embed + retrieve top-3 → 3K context. Đó là RAG.
-
-Đọc thêm: [RAG Guide](/blog/rag-retrieval-augmented-generation-guide).
+> **Ẩn dụ**: như cuộc họp dài — đừng đọc lại toàn bộ biên bản mỗi lần ai
+> đó phát biểu. Tóm tắt phần đã chốt, chỉ giữ chi tiết những phút gần
+> đây.
 
 ---
 
-## 10. Pattern 9: Quantization (cho self-host)
+## NHÓM 3 — Rẻ hơn mỗi token (giảm đơn giá)
 
-**Saving: 50-75% memory + 30-50% latency**
+### 7. Pattern 6: Model Routing — *tiết kiệm 60–90%, giữ quality*
 
-Nếu self-host model, quantize giúp scale đáng kể.
-
-### 10.1. Cách hoạt động
-
-Model gốc fp16 (16-bit float per weight). Quantize → 8-bit, 4-bit
-hoặc thấp hơn:
+Không phải task nào cũng cần model lớn. Phân loại độ khó rồi route:
 
 ```text
-Llama 3.3 70B fp16: 140 GB VRAM
-Llama 3.3 70B int8: 70 GB VRAM
-Llama 3.3 70B int4: 35 GB VRAM
+Query → classifier (rule hoặc LLM nhỏ)
+  ├── Đơn giản ("dịch", "format JSON")     → GPT-4o-mini  (~$0.15/1M)
+  ├── Trung bình ("giải thích hàm này")    → Claude Haiku (~$0.8/1M)
+  └── Phức tạp ("design architecture X")   → Claude Sonnet (~$3/1M)
 ```
 
-### 10.2. Quality trade-off
+> **Ẩn dụ**: như **phân loại bệnh nhân (triage)** ở phòng cấp cứu. Y tá
+> đẩy ca nhẹ sang phòng khám thường, ca nặng mới tới bác sĩ chuyên khoa.
+> Không ai đưa một vết xước giấy cho bác sĩ phẫu thuật chấn thương.
 
-| Format             | Quality drop | VRAM saving |
-| ------------------ | ------------ | ----------- |
-| fp16 → int8        | &lt;1%       | 50%         |
-| fp16 → int4        | 2-5%         | 75%         |
-| fp16 → int2/binary | 10-30%       | 87.5%       |
+Classifier rule-based gần như free; classifier bằng LLM nhỏ chính xác
+hơn, cost ~$0.0001/query (không đáng kể). Vendor sẵn có: **OpenRouter,
+Martian, NotDiamond**.
 
-Sweet spot: **int4 (Q4_K_M format)** cho production.
+> **Bắt buộc A/B test**: routing có thể tụt quality. Giữ 10% traffic ở
+> model premium làm đối chứng; nếu quality nhánh route không tụt quá
+> 2–3% (user rating, conversion) thì router an toàn.
 
-### 10.3. Format phổ biến
+### 8. Pattern 7: Distillation — *tiết kiệm 90–99% inference ở volume lớn*
 
-- **GGUF**: llama.cpp, Ollama, LM Studio
-- **GPTQ**: cũ, vẫn phổ biến
-- **AWQ**: tốt cho inference batch
-- **bitsandbytes**: Hugging Face transformers
+Dùng output của model lớn (teacher) để fine-tune model nhỏ (student).
+Kết quả: ~90–95% chất lượng teacher với giá student.
 
-Đọc thêm: [Open Source LLM Ecosystem](/blog/open-source-llm-ecosystem).
+> **Ẩn dụ**: như **thợ cả dạy thợ học việc**. Sau khi học đủ các ca quen
+> thuộc, thợ học việc tự làm phần lớn công việc thường nhật với chi phí
+> thấp; thợ cả chỉ vào cuộc khi gặp ca lạ.
+
+```text
+One-time: chạy ~10K example qua GPT-4 (~$300) + fine-tune mini (~$100) ≈ $400
+Per query: GPT-4 $0.02 → mini fine-tuned $0.001  (giảm ~95%)
+Break-even: ~25K query. Ở 1M query/tháng → tiết kiệm ~$19K/tháng.
+```
+
+Nên distill khi: volume lớn (>100K query/tháng), task hẹp (1 domain),
+chấp nhận tụt 2–5% quality. Xem [Fine-tuning Basics](/blog/fine-tuning-llm-basics).
+
+### 9. Pattern 8: Quantization (self-host) — *giảm 50–75% VRAM, 30–50% latency*
+
+Nén weight từ fp16 xuống int8/int4 để model nhỏ vừa GPU rẻ hơn.
+
+> **Ẩn dụ**: như nén ảnh JPEG — file nhỏ đi nhiều, chất lượng giảm rất
+> ít nếu chọn mức nén hợp lý.
+
+```text
+Llama 3.3 70B:  fp16 140GB  →  int8 70GB  →  int4 35GB VRAM
+```
+
+| Format | Quality drop | VRAM giảm |
+| --- | --- | --- |
+| fp16 → int8 | &lt;1% | 50% |
+| fp16 → int4 (Q4_K_M) ⭐ | 2–5% | 75% |
+| fp16 → int2 | 10–30% | 87.5% |
+
+Sweet spot production: **int4 (Q4_K_M)**. Format: GGUF (Ollama,
+llama.cpp), AWQ (batch inference), GPTQ. Xem
+[Open Source LLM Ecosystem](/blog/open-source-llm-ecosystem).
+
+### 10. Pattern 9: Streaming + Early Stop — *tiết kiệm 10–30% (biến thiên)*
+
+Stream output; khi user bấm "Stop" (thấy AI đi lạc) → abort → không trả
+tiền cho phần output còn lại. Cần nút "Stop generation" rõ ràng trong UI.
+
+### 11. Pattern 10: Self-host Break-even — *tiết kiệm 70–95% ở scale rất lớn*
+
+```text
+API (Sonnet):   ~$0.0135/query
+Self-host (Llama 70B, 2×H100 thuê ~$2.880/tháng):
+  ~$0.000022/query ở 100% utilization
+Break-even thô:  $0.0135 × N = $2.880  →  N ≈ 213K query/tháng
+```
+
+> **Misconception nguy hiểm nhất của cả bài**: "self-host luôn rẻ hơn."
+> Break-even thô bỏ qua **chi phí ẩn**: DevOps ($5–20K/tháng nhân sự),
+> SLA/độ tin cậy bạn tự gánh, quality Llama 70B < Sonnet ở nhiều task,
+> và gánh nặng tự nâng cấp model. Thực tế thường **1M+ query/tháng** mới
+> đáng, và chỉ khi đã có đội DevOps.
 
 ---
 
-## 11. Pattern 10: Self-host Break-even
-
-**Saving: 70-95% ở scale**
-
-Khi nào nên switch từ API sang self-host?
-
-### 11.1. Cost calculation
-
-API (Claude Sonnet):
+## 12. ROI Framework — làm pattern nào trước
 
 ```text
-$3/1M input + $15/1M output
-Avg query 2K input + 500 output = $0.0135/query
+TIER 1 — Easy wins (tuần này)
+  Prompt caching · Output reduction · Structured output · Streaming + stop
+TIER 2 — Medium (tháng này)
+  Model routing · Semantic cache · Context trim / RAG · Batch API
+TIER 3 — High (quý này, cần team)
+  Distillation · Quantization · Self-host · Custom batch pipeline
 ```
 
-Self-host (Llama 3.3 70B trên 2× H100):
+Quy tắc: **đo trước, tối ưu sau**, và đi từ Tier 1. Đừng nhảy thẳng
+self-host khi prompt caching còn chưa bật.
 
-```text
-Hardware: $4/h × 24 × 30 = $2,880/month (rented)
-Throughput: ~50 query/s × 60 × 60 × 24 × 30 = 130M query/month max
-Effective cost: $2,880 / 130M = $0.000022/query
+### Monitoring tối thiểu
 
-→ 600x rẻ hơn API ở 100% utilization
-→ 60x rẻ hơn ở 10% utilization
-```
+Theo dõi: cost/request (P50/P95/P99), cost/user, **cache hit rate**,
+phân bố model. Công cụ: Helicone, Langfuse, dashboard provider. Đặt
+alert: chi tiêu/ngày > ngưỡng, cost/user bất thường, cache hit tụt.
 
-### 11.2. Break-even point
-
-```text
-API cost = Self-host fixed cost
-$0.0135 × N = $2,880
-N ≈ 213K query/month
-```
-
-Vượt 200K query/tháng → self-host break-even. Vượt 1M → no-brainer.
-
-### 11.3. Hidden cost của self-host
-
-- DevOps: monitor, scale, deploy ($5K-20K/tháng staff)
-- Reliability: API có 99.9% SLA, self-host bạn phải build
-- Model quality: Llama 70B < Claude Sonnet ở nhiều task
-- Update: provider auto upgrade, self-host phải re-evaluate model
-
-→ Break-even thực tế **cao hơn 200K** vì hidden cost. Thường 1M+
-query/tháng mới đáng.
+> **Production thực tế**: các sản phẩm support-bot như **Intercom Fin**
+> tính tiền theo *mỗi lần giải quyết* (per resolution) chứ không theo
+> token — mô hình giá đó chỉ sống được nhờ caching + routing quyết
+> liệt. Prompt caching (Anthropic ~90% off) và Batch API (50% off) là
+> tính năng có thật, công khai, áp dụng được ngay hôm nay.
 
 ---
 
-## 12. ROI Framework — chọn pattern nào trước
+## Key Takeaways
 
-Stack pattern theo độ dễ:
+- **Một phương trình cai trị tất cả**: `chi phí = số lần gọi × token/lần
+  × giá/token`. Mỗi pattern chỉ đánh vào một thừa số.
+- **Ba nhóm đòn bẩy**: đừng gọi (cache, batch) · gọi nhẹ hơn (cắt
+  output, context, RAG) · rẻ hơn mỗi token (routing, distillation,
+  quantization).
+- **Phần lớn tiền nằm ở số-lần-gọi và token/lần**, không phải đơn giá —
+  và sửa chúng *không* hạ chất lượng.
+- **Output đắt gấp 3–5× input**: cắt output là đòn bẩy trực tiếp nhất.
+- **Caching là quả ngọt dễ hái nhất** (50–90%), nhưng vỡ khi đổi 1 byte
+  prefix và TTL ngắn.
+- **Self-host chỉ đáng ở 1M+ query/tháng** sau khi tính chi phí ẩn.
 
-```text
-TIER 1 — Easy wins (làm tuần này)
-├── Prompt caching (free saving 50-90%)
-├── Output token reduction (prompt change)
-├── Structured output (prompt change)
-└── Streaming + early stop (UI change)
+## Common Mistakes
 
-TIER 2 — Medium effort (tháng này)
-├── Model routing (1-2 sprint)
-├── Semantic cache (1-2 sprint)
-└── Context trim / RAG (2-4 sprint)
+- **Đồng nhất "tối ưu chi phí" với "đổi model rẻ"** — bỏ quên hai thừa
+  số lớn hơn.
+- **Nhảy thẳng self-host** khi chưa bật prompt caching (free).
+- **Cache thứ chỉ dùng một lần**, hoặc xáo thứ tự prompt làm vỡ cache.
+- **Ép output ngắn quá** → user hỏi lại → tổng cost tăng.
+- **Semantic cache không scope theo user** → trả nhầm dữ liệu người khác.
+- **Routing không A/B test** → âm thầm tụt quality.
+- **Tối ưu mà không monitoring** → đoán mò, sửa sai chỗ.
 
-TIER 3 — High effort (quarter này)
-├── Distillation (cần ML team)
-├── Self-host (cần DevOps + ML team)
-└── Custom batch pipeline (1-2 month)
-```
+## When Should You Use This?
 
-**Đa số team** nên start với Tier 1, đo saving, rồi tiến dần. Đừng
-nhảy thẳng self-host khi prompt caching chưa enable.
+| Quy mô | Việc nên làm |
+| --- | --- |
+| Prototype / &lt;1K user | Đừng tối ưu sớm. Bật prompt caching (free) là đủ. Tập trung vào product. |
+| 10K user (~$240K/năm) | Tier 1 toàn bộ + bắt đầu routing & semantic cache. Dựng monitoring. |
+| 100K user (~$2,4M/năm) | Tier 1+2 bắt buộc. Cân nhắc distillation cho task hẹp volume lớn. |
+| 1M+ user | Thêm Tier 3: self-host + quantization cho phần ổn định, vẫn dùng API cho phần khó. |
 
----
+**Khi KHÔNG nên tối ưu**: lúc còn tìm product-market fit, hoặc khi cost
+chưa phải ràng buộc thật. Tối ưu sớm = phức tạp hoá hệ thống cho một
+vấn đề chưa tồn tại. Đo đã, rồi mới cắt.
 
-## 13. Monitoring & Budgeting
+## Quick Start Guide
 
-### 13.1. Metrics quan trọng
+Làm trong tuần này, theo thứ tự ROI giảm dần:
 
-```text
-ECONOMICS
-- Cost per request (P50, P95, P99)
-- Cost per user (DAU/MAU)
-- Cost per feature (Chat vs Search vs Summary)
+1. **Bật prompt caching** — đưa system prompt + rules + docs lên đầu,
+   giữ bất biến; với Anthropic thêm `cache_control`. (giảm 50–90% phần
+   cached, ~0 công sức)
+2. **Siết output** — thêm "ngắn gọn, bullet, không mở bài" + `max_tokens`
+   hợp lý vào prompt mặc định.
+3. **Thêm nút Stop + streaming** — ngừng đốt token khi AI đi lạc.
+4. **Dựng monitoring** — log cost/request + cache hit rate (Helicone /
+   Langfuse) để biết tiền chảy đâu *trước khi* tối ưu sâu.
+5. **Sau khi có số liệu**: thêm model routing cho query đơn giản và
+   semantic cache nếu traffic lặp lại nhiều.
 
-USAGE
-- Tokens in / out per request
-- Cache hit rate
-- Model distribution (% query mỗi model)
-
-QUALITY
-- User rating
-- Response time
-- Error rate
-```
-
-### 13.2. Tools
-
-- **Helicone** — proxy, log mọi LLM call, dashboard
-- **Langfuse** — open source observability
-- **OpenAI Platform Dashboard** — built-in
-- **Custom**: write to BigQuery / DataDog
-
-### 13.3. Budget alerts
-
-```text
-Daily spend > $X → Slack alert
-Cost per user > $Y → flag suspicious
-Cache hit < threshold → engineer review
-```
-
-Không có monitoring = không biết đang đốt tiền chỗ nào.
-
----
-
-## 14. Tổng kết
-
-LLM cost không phải fixed. Optimize 50-95% là achievable cho hầu hết
-production app.
-
-5 pattern impactful nhất:
-
-1. **Prompt caching** (Tier 1, dễ, 50-90% off cached)
-2. **Model routing** (Tier 2, vừa, 60-90% off premium)
-3. **Semantic cache** (Tier 2, ROI cao cho repetitive query)
-4. **Output reduction** (Tier 1, prompt-level)
-5. **RAG thay long context** (Tier 2, scale)
-
-Self-host (Tier 3) chỉ make sense ở scale rất lớn (1M+ query/tháng)
-và có DevOps capacity.
-
-Cuối cùng: **monitor first, optimize second**. Không có data = đoán
-mò = optimize sai chỗ.
+> Triết lý cuối cùng: **đo trước, tối ưu sau.** Không có dữ liệu = đoán
+> mò = tối ưu nhầm thừa số.
 
 ---
 
 ### Đọc thêm
 
-- [Tokens & Pricing](/blog/ai-tokens-and-pricing-explained) — fundamental
-- [LLM Models Comparison](/blog/llm-models-comparison-guide) — chọn
-  model đúng
+- [Tokens & Pricing](/blog/ai-tokens-and-pricing-explained) — nền tảng
+- [LLM Models Comparison](/blog/llm-models-comparison-guide) — chọn model đúng
 - [Fine-tuning Basics](/blog/fine-tuning-llm-basics) — distillation
-- [RAG Guide](/blog/rag-retrieval-augmented-generation-guide) — context
-  management
+- [RAG Guide](/blog/rag-retrieval-augmented-generation-guide) — quản context
 - [Open Source LLM Ecosystem](/blog/open-source-llm-ecosystem) — self-host
 
 ### Reference
 
-- Anthropic Prompt Caching docs
+- Anthropic — Prompt Caching docs (giảm tới ~90% input đã cache)
+- OpenAI / Anthropic / Google — Batch API (giảm 50%)
 - "Optimizing LLM Cost" — Helicone blog series
 - vLLM throughput benchmarks
-- "Knowledge Distillation" — Hinton et al. 2015
+- "Distilling the Knowledge in a Neural Network" — Hinton et al. 2015

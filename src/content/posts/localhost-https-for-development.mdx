@@ -1,0 +1,553 @@
+---
+title: 'Localhost HTTPS for Development — mkcert, OpenSSL, Caddy, Vite/Next & nginx'
+description: 'A hands-on guide to running https://localhost in development: mkcert, OpenSSL self-signed, Caddy, Node/Vite/Next.js dev servers and Docker + nginx — per-OS steps, verified commands, a comparison table, checklist and troubleshooting.'
+pubDate: 2026-06-15
+tags: [https, tls, mkcert, devtools, security]
+draft: false
+---
+
+> Internal-style engineering note, turned into a post \{Note kỹ thuật nội bộ, viết lại thành bài blog\}. Goal: get a **trusted** `https://localhost` (green padlock, no warnings) for development, without assuming you already know PKI \{Mục tiêu: có `https://localhost` **được tin cậy** (khóa xanh, không cảnh báo) cho dev, không giả định bạn đã biết PKI\}. Every command is checked against official docs — but tools change by version, so run `--version` first when in doubt \{Mọi lệnh đều đối chiếu tài liệu chính thức — nhưng tool đổi theo version, nên chạy `--version` trước khi nghi ngờ\}.
+
+---
+
+## Why you need HTTPS on localhost \{Vì sao cần HTTPS trên localhost\}
+
+Plain `http://localhost:3000` is fine until it isn't \{`http://localhost:3000` ổn cho tới khi không còn ổn\}. Many browser features only work in a **secure context** \{Nhiều tính năng trình duyệt chỉ chạy trong **secure context**\}:
+
+- **Secure-context APIs** — Service Worker, `getUserMedia` (camera/mic), Web Crypto `subtle`, Clipboard, WebAuthn, HTTP/2 \{API yêu cầu secure context — Service Worker, camera/mic, Web Crypto, Clipboard, WebAuthn, HTTP/2\}. `http://localhost` is treated as secure for *some* of these, but a custom host like `dev.example.local` is **not** \{`http://localhost` được coi là an toàn cho *một số* API, nhưng host tùy biến như `dev.example.local` thì **không**\}.
+- **Cookie flags** — `Secure` and `SameSite=None` cookies are only sent over HTTPS, which you need to mirror production auth/OAuth \{Cookie `Secure` và `SameSite=None` chỉ gửi qua HTTPS — cần để mô phỏng auth/OAuth giống production\}.
+- **Production parity** — test HTTP→HTTPS redirects, HSTS, mixed-content and CSP `upgrade-insecure-requests` \{Giống production — test redirect, HSTS, mixed-content, CSP\}.
+- **OAuth / webhook callbacks** — many providers require an `https://` redirect URI \{Nhiều provider bắt buộc redirect URI là `https://`\}.
+
+Why not just click through the warning page? Because an **untrusted** certificate still breaks Service Workers, internal `fetch` and HTTP/2 — and you re-click every time \{Vì certificate **không được tin cậy** vẫn làm hỏng Service Worker, `fetch` nội bộ và HTTP/2 — và phải click lại mỗi lần\}. The goal is a *trusted* cert, not a dismissed warning \{Mục tiêu là cert *được tin cậy*, không phải tắt cảnh báo\}.
+
+---
+
+## PKI in 60 seconds \{PKI trong 60 giây\}
+
+Skip if you already know this \{Bỏ qua nếu đã biết\}:
+
+- **Certificate** — a public file (`.crt`/`.pem`) proving "I am `localhost`", paired with a secret **private key** (`.key`) you never share \{Certificate — file công khai chứng minh "tôi là `localhost`", đi kèm **private key** bí mật không bao giờ chia sẻ\}.
+- **CA (Certificate Authority)** — signs a cert so browsers trust it. Production uses public CAs (Let's Encrypt); for dev we make our **own local CA** \{CA — ký vào cert để trình duyệt tin. Production dùng CA công khai; dev thì ta tạo **CA cục bộ của mình**\}.
+- **Trust store** — the list of CAs your OS/browser trusts. To kill warnings you must install your **root CA into the trust store** \{Trust store — danh sách CA mà OS/trình duyệt tin. Muốn hết cảnh báo phải cài **root CA vào trust store**\}.
+- **SAN (Subject Alternative Name)** — ⚠️ modern browsers **ignore the CN field** and only read SAN to match the hostname \{SAN — trình duyệt hiện đại **bỏ qua field CN**, chỉ đọc SAN để khớp hostname\}. A cert with no SAN always fails. Always include at least `DNS:localhost,IP:127.0.0.1` (and `IP:::1` for IPv6) \{Cert không SAN luôn lỗi. Luôn thêm tối thiểu `DNS:localhost,IP:127.0.0.1` và `IP:::1`\}.
+
+Where the trust store lives, per OS \{Trust store nằm ở đâu, theo OS\}:
+
+| OS | System trust store | Browser note |
+|---|---|---|
+| **macOS** | Keychain Access → "System" | Firefox needs NSS (`brew install nss`) |
+| **Windows** | `certlm.msc` → "Trusted Root Certification Authorities" | Chrome/Edge use system store |
+| **Linux** | `/usr/local/share/ca-certificates/` + `update-ca-certificates` | Firefox/Chrome use a separate **NSS** store (`libnss3-tools`) |
+
+---
+
+## Comparison of approaches \{So sánh các phương án\}
+
+| Approach | Ease | Auto-trust | Custom domain | Reverse proxy | Use when |
+|---|---|---|---|---|---|
+| **mkcert** | ⭐⭐⭐⭐⭐ | ✅ | ✅ easy | — | Default for most devs |
+| **OpenSSL self-signed** | ⭐⭐ | ❌ (trust manually) | ✅ (config) | — | Minimal envs (CI), full control |
+| **Caddy** | ⭐⭐⭐⭐ | ✅ (`caddy trust`) | ✅ | ✅ built-in | A proxy in front of your app |
+| **Vite/Next builtin** | ⭐⭐⭐⭐ | Next ✅ (mkcert) / Vite plugin ❌ | limited | — | Pure FE project, fewest steps |
+| **Docker + nginx** | ⭐⭐ | ❌ (trust root manually) | ✅ | ✅ | Prod-like topology, many services |
+
+> **Recommended for a team:** use **mkcert** to create a trusted cert, then load that cert into your dev server or proxy \{**Khuyến nghị cho team:** dùng **mkcert** tạo cert được tin cậy, rồi nạp cert đó vào dev server hoặc proxy\}. It's cross-platform, truly trusted, and one cert set works for Vite, Next.js, Node, nginx and Docker \{Đa nền tảng, được tin cậy thật, và một bộ cert dùng được cho mọi nơi\}.
+
+> ⚠️ Never commit private keys (`*-key.pem`, `*.key`) or your personal root CA to git \{Không bao giờ commit private key hay root CA cá nhân vào git\}. Add them to `.gitignore` and generate via a script instead \{Thêm vào `.gitignore` và generate bằng script\}.
+
+---
+
+## Method 1 — mkcert (recommended) \{Phương án 1 — mkcert (khuyến nghị)\}
+
+mkcert is a zero-config tool that creates a local CA, installs it into your system root store, then issues **locally-trusted** certs \{mkcert là tool zero-config: tạo local CA, cài vào system root store, rồi cấp cert **được tin cậy cục bộ**\}. It does **not** configure your server — loading the cert is up to you \{Nó **không** cấu hình server — việc nạp cert là của bạn\}.
+
+**Install** \{Cài đặt\}:
+
+```bash
+# macOS
+brew install mkcert
+brew install nss          # only if you use Firefox
+
+# Windows (PowerShell, run as Administrator if needed)
+choco install mkcert
+# or: scoop bucket add extras; scoop install mkcert
+
+# Linux (Ubuntu/Debian)
+sudo apt install libnss3-tools     # needed for Firefox/Chrome trust
+brew install mkcert                # via Homebrew on Linux, or download a release binary
+```
+
+> ⚠️ On Linux the `apt` package isn't available everywhere — Homebrew on Linux or the release binary from GitHub is the reliable path \{Trên Linux gói `apt` không phải lúc nào cũng có — Homebrew on Linux hoặc binary từ GitHub là chắc chắn nhất\}. Check the latest release version \{Kiểm tra version release mới nhất\}.
+
+**Setup (one-time CA install, then issue certs)** \{Cài CA một lần, rồi cấp cert\}:
+
+```bash
+mkcert -install                       # installs local CA into the trust store (may ask password)
+mkcert localhost 127.0.0.1 ::1        # creates localhost+2.pem and localhost+2-key.pem
+```
+
+More examples \{Ví dụ thêm\}:
+
+```bash
+mkcert localhost myapp.localhost dev.example.local 127.0.0.1 ::1   # several names in one cert
+mkcert "*.example.localhost"                                       # wildcard
+mkcert -cert-file dev.pem -key-file dev-key.pem localhost 127.0.0.1  # explicit filenames
+```
+
+Useful commands \{Lệnh hữu ích\}:
+
+```bash
+mkcert -CAROOT          # path to rootCA.pem / rootCA-key.pem
+mkcert -uninstall       # remove the local CA from the trust store
+mkcert -pkcs12 localhost   # export a .p12 for legacy apps (e.g. Java)
+```
+
+> To trust the cert on **another machine or container**, copy `rootCA.pem` from `mkcert -CAROOT` and import it there — but never copy `rootCA-key.pem` off your machine \{Để tin cert trên **máy/container khác**, copy `rootCA.pem` từ `mkcert -CAROOT` và import; nhưng không bao giờ mang `rootCA-key.pem` ra ngoài\}.
+
+**Verify** \{Kiểm tra\}:
+
+```bash
+openssl x509 -in localhost+2.pem -noout -text | grep -A1 "Subject Alternative Name"
+curl -v https://localhost:3000      # no -k needed once it's trusted
+```
+
+**Common errors** \{Lỗi thường gặp\}:
+
+| Error | Cause | Fix |
+|---|---|---|
+| Firefox still warns | Missing NSS/`certutil` | Install `nss`/`libnss3-tools`, re-run `mkcert -install` |
+| `permission denied` (Windows) | Not elevated | Run terminal **as Administrator** |
+| Chrome still invalid after install | Cert made *before* CA install, or cache | Re-issue the cert; clear cache (see Troubleshooting) |
+
+---
+
+## Method 2 — OpenSSL self-signed \{Phương án 2 — OpenSSL self-signed\}
+
+Use OpenSSL directly when you can't install extra tools (CI, minimal servers) or need full control \{Dùng OpenSSL trực tiếp khi không cài được tool ngoài (CI, server tối giản) hoặc cần kiểm soát đầy đủ\}. The cost: it is **not auto-trusted** — you import it into each OS trust store manually \{Cái giá: **không tự trust** — bạn phải import vào trust store từng OS\}.
+
+> Requires OpenSSL **1.1.1+** for `-addext` \{Cần OpenSSL **1.1.1+** để có `-addext`\}. On OpenSSL 3.x, `-nodes` still works but the new alias is `-noenc` \{Trên OpenSSL 3.x, `-nodes` vẫn chạy nhưng alias mới là `-noenc`\}. Check with `openssl version` \{Kiểm tra bằng `openssl version`\}.
+
+**One-line self-signed (with SAN)** \{Self-signed một lệnh, có SAN\}:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 365 \
+  -keyout localhost.key \
+  -out localhost.crt \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,DNS:*.localhost,IP:127.0.0.1,IP:::1"
+```
+
+**Better: a reusable local CA** — trust the CA once, then sign as many certs as you want \{Tốt hơn: local CA tái dùng — trust CA một lần, rồi ký bao nhiêu cert tùy ý\}:
+
+```bash
+# 1) Root CA (trust this once)
+openssl req -x509 -newkey rsa:4096 -nodes -sha256 -days 3650 \
+  -keyout devRootCA.key -out devRootCA.crt -subj "/CN=My Dev Local CA"
+
+# 2) Key + CSR for the domain
+openssl req -newkey rsa:2048 -nodes -sha256 \
+  -keyout localhost.key -out localhost.csr -subj "/CN=localhost"
+
+# 3) Sign the CSR with the CA, attaching SAN via an ext file
+cat > localhost.ext <<'EOF'
+subjectAltName = DNS:localhost,DNS:*.localhost,DNS:dev.example.local,IP:127.0.0.1,IP:::1
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+basicConstraints = critical, CA:FALSE
+EOF
+
+openssl x509 -req -in localhost.csr \
+  -CA devRootCA.crt -CAkey devRootCA.key -CAcreateserial \
+  -out localhost.crt -days 365 -sha256 -extfile localhost.ext
+```
+
+Config-file variant for older OpenSSL without `-addext` \{Biến thể config file cho OpenSSL cũ không có `-addext`\} — `localhost.cnf`:
+
+```ini
+[req]
+default_bits       = 2048
+prompt             = no
+default_md         = sha256
+distinguished_name = dn
+x509_extensions    = v3_req
+
+[dn]
+CN = localhost
+
+[v3_req]
+subjectAltName   = @alt_names
+keyUsage         = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+
+[alt_names]
+DNS.1 = localhost
+DNS.2 = *.localhost
+DNS.3 = dev.example.local
+IP.1  = 127.0.0.1
+IP.2  = ::1
+```
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 365 \
+  -keyout localhost.key -out localhost.crt -config localhost.cnf
+```
+
+**Trust the cert/CA, per OS** \{Trust cert/CA theo OS\}:
+
+```bash
+# macOS (System Keychain — needs sudo)
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain localhost.crt
+```
+
+```powershell
+# Windows (PowerShell as Administrator)
+Import-Certificate -FilePath "C:\path\localhost.crt" -CertStoreLocation Cert:\LocalMachine\Root
+```
+
+```bash
+# Linux (Ubuntu/Debian) — system store
+sudo cp localhost.crt /usr/local/share/ca-certificates/localhost.crt
+sudo update-ca-certificates
+
+# Firefox/Chrome on Linux use NSS, not the system store:
+certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "dev-local-ca" -i localhost.crt
+```
+
+**Verify** \{Kiểm tra\}:
+
+```bash
+openssl x509 -in localhost.crt -noout -text | grep -A1 "Subject Alternative Name"
+curl -v https://localhost:8080      # drop -k to test real trust
+```
+
+| Error | Cause | Fix |
+|---|---|---|
+| `unknown option -addext` | OpenSSL `< 1.1.1` / LibreSSL | Use the config-file variant |
+| `hostname mismatch` | Missing/incorrect SAN | Add the right name to `subjectAltName`, re-issue |
+| `NET::ERR_CERT_AUTHORITY_INVALID` | CA/cert not trusted | Trust it per OS above |
+
+---
+
+## Method 3 — Caddy local HTTPS \{Phương án 3 — Caddy local HTTPS\}
+
+Caddy is a web server/reverse proxy that serves HTTPS by default \{Caddy là web server/reverse proxy phục vụ HTTPS mặc định\}. For local/internal hosts it generates certs from its **internal CA** and tries to install that root into your trust store \{Với host local/internal, nó sinh cert từ **internal CA** và cố cài root đó vào trust store\}.
+
+**Install** \{Cài đặt\}:
+
+```bash
+brew install caddy          # macOS
+choco install caddy         # Windows (or: scoop install caddy)
+# Linux: use the official Caddy apt repo — see caddyserver.com/docs/install
+```
+
+**Caddyfile** — static, or reverse proxy to your app \{tĩnh, hoặc proxy tới app\}:
+
+```caddyfile
+# Reverse proxy localhost HTTPS -> a Vite app on port 5173
+localhost {
+	tls internal
+	reverse_proxy localhost:5173
+}
+
+# Custom host -> app on port 3000
+myapp.localhost {
+	tls internal
+	reverse_proxy 127.0.0.1:3000
+}
+```
+
+`tls internal` forces Caddy's locally-trusted internal CA instead of a public ACME cert \{`tls internal` ép Caddy dùng internal CA được tin cậy cục bộ thay vì cert public qua ACME\}.
+
+**Run + trust** \{Chạy + trust\}:
+
+```bash
+caddy trust        # install Caddy's root CA into the trust store (sudo/admin) — run once
+caddy run          # foreground, reads ./Caddyfile
+# or: caddy start / caddy stop
+```
+
+> `*.localhost` resolves to loopback automatically — `myapp.localhost` just works \{`*.localhost` tự resolve về loopback — `myapp.localhost` chạy ngay\}. Other hosts like `dev.example.local` need a hosts entry (see Examples) \{Host khác như `dev.example.local` cần entry trong file hosts (xem Ví dụ)\}.
+
+If auto-install fails (e.g. in Docker), the root cert is at `<data_dir>/pki/authorities/local/root.crt` — copy and import it manually \{Nếu auto-install thất bại (vd Docker), root cert nằm ở `<data_dir>/pki/authorities/local/root.crt` — copy và import thủ công\}.
+
+| Error | Cause | Fix |
+|---|---|---|
+| Browser not trusted | Caddy root CA not in store | `caddy trust` or import `root.crt` |
+| `permission denied` on `:443` | Privileged port, non-root | Use a high port `:8443` (see Troubleshooting) |
+| `address already in use` | Something holds 80/443 | Stop it or `caddy stop` |
+
+---
+
+## Method 4 — Node.js / Vite / Next.js dev server \{Phương án 4 — dev server Node/Vite/Next.js\}
+
+Best pattern: generate the cert with mkcert, then load it \{Pattern tốt nhất: tạo cert bằng mkcert rồi nạp vào\}.
+
+**Node.js (`https` module)** \{Node.js thuần\}:
+
+```js
+import https from "node:https";
+import { readFileSync } from "node:fs";
+import express from "express";
+
+const app = express();
+app.get("/", (_req, res) => res.send("OK over HTTPS"));
+
+https
+  .createServer(
+    { key: readFileSync("./localhost-key.pem"), cert: readFileSync("./localhost.pem") },
+    app,
+  )
+  .listen(3000, () => console.log("https://localhost:3000"));
+```
+
+**Vite** — `server.https` takes the same object as Node's `https.createServer()` \{`server.https` nhận đúng object như `https.createServer()` của Node\}:
+
+```ts
+// vite.config.ts
+import { defineConfig } from "vite";
+import { readFileSync } from "node:fs";
+
+export default defineConfig({
+  server: {
+    https: {
+      key: readFileSync("./localhost-key.pem"),
+      cert: readFileSync("./localhost.pem"),
+    },
+    host: "localhost",
+    port: 5173,
+  },
+});
+```
+
+> Quick-but-untrusted variant: `@vitejs/plugin-basic-ssl` auto-generates a self-signed cert, but it is **not trusted** so the browser still warns \{Biến thể nhanh nhưng untrusted: `@vitejs/plugin-basic-ssl` tự sinh cert self-signed, nhưng **không được tin cậy** nên trình duyệt vẫn cảnh báo\}. Prefer the mkcert cert above for a clean padlock \{Ưu tiên cert mkcert ở trên để có khóa sạch\}.
+
+**Next.js (>= 13.5)** — has a built-in mkcert-backed flag \{Next.js có cờ dùng mkcert sẵn\}:
+
+```jsonc
+// package.json
+{ "scripts": { "dev": "next dev --experimental-https" } }
+```
+
+```bash
+npm run dev    # creates ./certificates and serves https://localhost:3000
+# custom cert:
+next dev --experimental-https \
+  --experimental-https-key ./localhost-key.pem \
+  --experimental-https-cert ./localhost.pem
+```
+
+> ⚠️ `--experimental-https` exists since Next.js 13.5 and is still flagged *experimental* — the flag name may change, and it's dev-only \{`--experimental-https` có từ Next.js 13.5 và vẫn mang nhãn *experimental* — tên cờ có thể đổi, chỉ dùng cho dev\}.
+
+| Error | Cause | Fix |
+|---|---|---|
+| `ERR_OSSL_PEM_NO_START_LINE` | Wrong path / not PEM | Check paths; use the right `*-key.pem` & `*.pem` |
+| Vite plugin still warns | Cert is untrusted by design | Switch to a mkcert cert via `server.https` |
+| Next flag not recognized | Next `< 13.5` | `npm i next@latest` |
+| internal `fetch` self-signed error | server-side HTTPS call to itself | Use a trusted cert; *temporarily* `NODE_TLS_REJECT_UNAUTHORIZED=0` (dev only, insecure) |
+
+---
+
+## Method 5 — Docker + nginx reverse proxy \{Phương án 5 — Docker + nginx reverse proxy\}
+
+Put nginx in a container as an **SSL termination proxy**: nginx listens on HTTPS, forwards HTTP to the app \{Đặt nginx trong container làm **SSL termination proxy**: nginx nghe HTTPS, forward HTTP xuống app\}. Generate certs with mkcert on the host and mount them in \{Tạo cert bằng mkcert ở host và mount vào\}.
+
+```bash
+# 1) On the host
+mkcert -install
+mkdir -p certs
+mkcert -cert-file certs/localhost.pem -key-file certs/localhost-key.pem localhost 127.0.0.1 ::1
+```
+
+`nginx.conf` \{file `nginx.conf`\}:
+
+```nginx
+events {}
+
+http {
+    server {
+        listen 443 ssl;
+        server_name localhost;
+
+        ssl_certificate     /etc/nginx/certs/localhost.pem;
+        ssl_certificate_key /etc/nginx/certs/localhost-key.pem;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        ssl_ciphers         HIGH:!aNULL:!MD5;
+
+        location / {
+            proxy_pass http://app:3000;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Upgrade $http_upgrade;       # WebSocket / HMR
+            proxy_set_header Connection "upgrade";
+        }
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+        return 301 https://$host$request_uri;
+    }
+}
+```
+
+> ⚠️ Since nginx **1.25.1** the old standalone `ssl;` directive was removed — always enable TLS via `listen ... 443 ssl;` as above \{Từ nginx **1.25.1** directive `ssl;` cũ đã bị gỡ — luôn bật TLS bằng `listen ... 443 ssl;` như trên\}.
+
+`docker-compose.yml`:
+
+```yaml
+services:
+  app:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./:/app
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0 --port 3000"
+    expose:
+      - "3000"
+
+  proxy:
+    image: nginx:stable
+    depends_on:
+      - app
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+```
+
+```bash
+docker compose up
+curl -v https://localhost     # trusted because the host already trusts the mkcert root
+```
+
+Since the **browser and curl run on the host**, the host's mkcert root is enough \{Vì **browser và curl chạy ở host**, root mkcert của host là đủ\}. If a *container* must trust the cert, bake the root in \{Nếu một *container* cần trust cert, nướng root vào image\}:
+
+```dockerfile
+COPY rootCA.pem /usr/local/share/ca-certificates/devRootCA.crt
+RUN update-ca-certificates     # Debian/Ubuntu images
+```
+
+| Error | Cause | Fix |
+|---|---|---|
+| `cannot load certificate` | Wrong mount path | Check `./certs:/etc/nginx/certs` and filenames |
+| `502 Bad Gateway` | Wrong `proxy_pass` / app not ready | App must listen on `0.0.0.0:3000`, service name `app` |
+| `bind: address already in use` | Port 443 taken | Map `"8443:443"` or stop the other service |
+
+---
+
+## Concrete examples \{Ví dụ cụ thể\}
+
+**`localhost` on port 3000 (Next.js/Node)** \{`localhost` cổng 3000\}:
+
+```bash
+mkcert localhost 127.0.0.1 ::1
+next dev --experimental-https        # -> https://localhost:3000
+```
+
+**`myapp.localhost` on port 5173 (Vite)** — `*.localhost` auto-resolves, no hosts edit \{`*.localhost` tự resolve, không cần sửa hosts\}:
+
+```bash
+mkcert -cert-file app.pem -key-file app-key.pem myapp.localhost localhost 127.0.0.1 ::1
+# vite.config.ts: server.host = "myapp.localhost", server.port = 5173
+# -> https://myapp.localhost:5173
+```
+
+**`dev.example.local` on port 8080 (via Caddy/nginx)** — `.local` needs a hosts entry \{`.local` cần entry hosts\}:
+
+```bash
+# macOS / Linux
+echo "127.0.0.1 dev.example.local" | sudo tee -a /etc/hosts
+# Windows: edit C:\Windows\System32\drivers\etc\hosts as Administrator, add:
+#   127.0.0.1 dev.example.local
+
+mkcert dev.example.local
+# Caddyfile:
+#   dev.example.local:8443 {
+#     tls /path/dev.example.local.pem /path/dev.example.local-key.pem
+#     reverse_proxy localhost:8080
+#   }
+# -> https://dev.example.local:8443
+```
+
+> ⚠️ On macOS, `.local` is used by mDNS (Bonjour); if resolution is flaky, prefer `.localhost` or `.test` for dev \{Trên macOS, `.local` do mDNS dùng; nếu resolve chập chờn, ưu tiên `.localhost` hoặc `.test`\}.
+
+| Port | Typically for | Command |
+|---|---|---|
+| 3000 | Next.js / Node / Express | `next dev --experimental-https` / `node server.js` |
+| 5173 | Vite | `npm run dev` (with `server.https`) |
+| 8080 | Backend behind a proxy | nginx/Caddy `reverse_proxy localhost:8080` |
+| 443 | Standard HTTPS proxy | Caddy/nginx (needs privileged-port permission) |
+
+---
+
+## Checklist \{Checklist\}
+
+- [ ] **Install the tool** — `mkcert -version` / `openssl version` / `caddy version` \{Cài tool\}
+- [ ] **Install the local CA** — `mkcert -install` (once per machine; Firefox needs NSS) \{Cài local CA\}
+- [ ] **Create the certificate** — `mkcert localhost 127.0.0.1 ::1`; keep `*.pem` out of git \{Tạo certificate\}
+- [ ] **Trust the certificate** — auto via mkcert/Caddy, or import the root CA per OS \{Trust certificate\}
+- [ ] **Configure the dev server** — load `key`/`cert` into Vite/Node/Next, or set up Caddy/nginx \{Config dev server\}
+- [ ] **Hosts entry (if needed)** — `127.0.0.1 dev.example.local` for non-`*.localhost` names \{Entry hosts nếu cần\}
+- [ ] **Test in the browser** — open `https://localhost:<port>` → padlock, no warning \{Test bằng browser\}
+- [ ] **Test with curl** — `curl -v https://localhost:<port>` returns 200 **without** `-k` \{Test bằng curl\}
+- [ ] **Check SAN** — `openssl x509 -in <cert>.pem -noout -text | grep -A1 "Subject Alternative Name"` \{Kiểm tra SAN\}
+- [ ] **.gitignore** — exclude `*.pem`, `*-key.pem`, `*.key`, `certs/`, `certificates/` \{Loại trừ key khỏi git\}
+
+---
+
+## Troubleshooting \{Xử lý sự cố\}
+
+**`NET::ERR_CERT_AUTHORITY_INVALID` / "certificate is not trusted"** — the root CA isn't trusted \{root CA chưa được tin cậy\}. Run `mkcert -install` (then re-issue the cert), import the root CA per OS, or `caddy trust` \{Chạy `mkcert -install` rồi tạo lại cert, hoặc import root CA, hoặc `caddy trust`\}. Firefox separately needs NSS \{Firefox cần NSS riêng\}.
+
+**`hostname mismatch` / `ERR_CERT_COMMON_NAME_INVALID`** — the SAN doesn't match \{SAN không khớp\}. Inspect with `openssl x509 ... | grep -A1 "Subject Alternative Name"` and re-issue with the right names \{Kiểm tra rồi tạo lại với tên đúng\}.
+
+**`port already in use` / `EADDRINUSE`** \{port đang bận\}:
+
+```bash
+lsof -i :3000 && kill -9 <PID>                    # macOS / Linux
+netstat -ano | findstr :3000 ; taskkill /PID <PID> /F   # Windows
+```
+
+**`permission denied` binding port 443 (or `<1024`)** \{permission denied khi bind 443\} — easiest is a high port like `8443` \{dễ nhất là dùng port cao như `8443`\}. On Linux you can grant the capability \{Trên Linux có thể cấp capability\}:
+
+```bash
+sudo setcap CAP_NET_BIND_SERVICE=+eip $(which caddy)
+```
+
+**Browser cache / HSTS stuck** \{cache/HSTS bị kẹt\} — after visiting a broken HTTPS page the browser may refuse to proceed \{sau khi vào trang HTTPS lỗi, trình duyệt có thể từ chối\}. In Chrome open `chrome://net-internals/#hsts` → "Delete domain security policies" → enter `localhost` → Delete, then hard-reload or use Incognito \{Trong Chrome mở `chrome://net-internals/#hsts` → xóa policy cho `localhost`, rồi hard-reload hoặc Incognito\}. Restart the browser after `mkcert -install` to reload the trust store \{Khởi động lại browser sau `mkcert -install` để nạp trust store mới\}.
+
+**WSL / Windows trust store mismatch** \{trust store WSL/Windows lệch nhau\} — dev runs in WSL but the browser runs on Windows, so the stores are separate \{dev chạy trong WSL nhưng browser ở Windows, hai store tách biệt\}. Install mkcert and run `mkcert -install` **on Windows**, or export the WSL root CA and import it on Windows \{Cài mkcert và chạy `mkcert -install` **trên Windows**, hoặc export root CA từ WSL rồi import trên Windows\}:
+
+```bash
+cp "$(mkcert -CAROOT)/rootCA.pem" /mnt/c/Users/<you>/Desktop/
+```
+
+```powershell
+Import-Certificate -FilePath "C:\Users\<you>\Desktop\rootCA.pem" -CertStoreLocation Cert:\LocalMachine\Root
+```
+
+Make sure the WSL dev server listens on `0.0.0.0` so Windows can reach it \{Đảm bảo dev server trong WSL nghe `0.0.0.0` để Windows truy cập được\}.
+
+**`curl` fails but the browser is fine (or vice-versa)** \{`curl` lỗi nhưng browser OK hoặc ngược lại\} — `curl` uses the system store while browsers may use NSS; trust the root in both places \{`curl` dùng system store còn browser có thể dùng NSS; trust root ở cả hai\}. To diagnose only (not long-term): `curl -k https://localhost:3000` \{Chỉ để chẩn đoán: `curl -k ...`\}.
+
+---
+
+## References \{Tài liệu tham khảo\}
+
+Cross-check these — tools change, so verify the current version \{Đối chiếu khi cần — tool thay đổi, kiểm tra version hiện tại\}:
+
+- **mkcert** — [github.com/FiloSottile/mkcert](https://github.com/FiloSottile/mkcert)
+- **OpenSSL** — [`req`](https://docs.openssl.org/master/man1/openssl-req/) · [`x509`](https://docs.openssl.org/master/man1/openssl-x509/)
+- **Caddy** — [Automatic HTTPS](https://caddyserver.com/docs/automatic-https) · [`tls` directive](https://caddyserver.com/docs/caddyfile/directives/tls) · [Install](https://caddyserver.com/docs/install)
+- **Node.js** — [HTTPS API](https://nodejs.org/api/https.html)
+- **Vite** — [`server.https`](https://vite.dev/config/server-options.html#server-https) · [plugin-basic-ssl](https://github.com/vitejs/vite-plugin-basic-ssl)
+- **Next.js** — [CLI `next dev`](https://nextjs.org/docs/app/api-reference/cli/next) · [Vercel KB: localhost HTTPS](https://vercel.com/kb/guide/access-nextjs-localhost-https-certificate-self-signed)
+- **nginx** — [Configuring HTTPS servers](https://nginx.org/en/docs/http/configuring_https_servers.html) · [SSL termination](https://docs.nginx.com/nginx/admin-guide/security-controls/terminating-ssl-http/)
+- **Let's Encrypt** — [Certificates for localhost](https://letsencrypt.org/docs/certificates-for-localhost/)

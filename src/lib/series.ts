@@ -78,6 +78,26 @@ export const SERIES: Record<string, SeriesMeta> = {
     blurb:
       'Practical web development for senior frontend engineers — the CSS, JavaScript, and browser-platform fundamentals behind production UI. From CSS performance and modern features, through core JavaScript (event loop, async, closures, fetch, events, memory, Intl) and the browser APIs that power real apps, to landing-page motion across CSS, vanilla JS, and React + Framer Motion.',
   },
+  'chrome-ext': {
+    title: 'Build Chrome Extensions — Zero to Pro (Manifest V3)',
+    blurb:
+      'Go from "I want to build a browser extension" to shipping one on the Chrome Web Store. Every part has real config and a live, interactive simulator. Start with the Manifest V3 mental model and your first "load unpacked" extension, then the manifest deep dive, the component architecture (popup, service worker, content scripts, options), content-script injection and isolated worlds, the event-driven background service worker, messaging across contexts, chrome.storage, UI surfaces and the action API, permissions and security, the powerful APIs (tabs, scripting, contextMenus, commands, notifications), a pro Vite + CRXJS + TypeScript + React build, and finally publishing, auto-update, and cross-browser — with a capstone extension.',
+  },
+  webpack: {
+    title: 'Webpack from Zero to Pro',
+    blurb:
+      'Master Webpack 5 config from the ground up — every part ships a real config and a live, interactive demo. Start with the bundler mental model and your first build, then the config anatomy, loaders and plugins, the dev server with HMR and source maps, code splitting and lazy loading, tree shaking and production mode, long-term caching with contenthash, bundle analysis and performance, advanced resolve plus authoring your own loader and plugin, Module Federation for micro-frontends, and a production capstone with migration tips.',
+  },
+  vite: {
+    title: 'Vite from Zero to Pro',
+    blurb:
+      'Master Vite 8 from the ground up — every part ships a real config and a live, interactive demo. Start with the native-ESM mental model and your first project, then the vite.config.ts anatomy, the dev server and on-demand transform, dependency pre-bundling, HMR internals, CSS and static assets, glob imports, env vars and modes, the Rollup-compatible plugin API, production builds with Rolldown, library mode plus the SSR/Environment API, and finish with performance tuning, a capstone config, and migrating off Webpack/CRA.',
+  },
+  'tailwind-ui': {
+    title: 'Tailwind, Radix & shadcn/ui — Zero to Pro',
+    blurb:
+      'Become fluent in the modern React styling stack — every part ships real config and a live, interactive demo. Start with the Tailwind CSS v4 mental model and setup, then core utilities and layout, design tokens and theming, variants and state composition, and building reusable components the right way (clsx, tailwind-merge, cn, cva) plus the plugin ecosystem. Then go headless and accessible with Radix UI primitives, adopt shadcn/ui (philosophy, CLI, components.json), theme and customize it, build validated forms with react-hook-form + zod, and finish with pro patterns and a dashboard capstone.',
+  },
   threejs: {
     title: 'Three.js from Zero to Senior',
     blurb:

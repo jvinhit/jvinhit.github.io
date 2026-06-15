@@ -1,0 +1,184 @@
+---
+title: 'Build Chrome Extensions · Part 6 — Messaging Across Contexts'
+description: 'How isolated pieces talk: one-shot sendMessage, long-lived connect ports, the return-true async trap, broadcasting to tabs, and externally_connectable. With an interactive messaging playground.'
+pubDate: 2026-07-08
+tags: [chrome-extension, messaging, runtime, chrome_ext_12]
+series: chrome-ext
+seriesOrder: 6
+draft: false
+---
+
+Every context is isolated, so the **only** way they cooperate is by passing messages \{Mọi ngữ cảnh đều cô lập, nên cách **duy nhất** để chúng hợp tác là truyền tin nhắn\}. Get messaging right and your extension feels like one program; get it wrong and you'll chase "the popup works but the content script never responds" bugs for hours \{Làm đúng messaging thì extension như một chương trình; làm sai thì bạn sẽ rượt lỗi "popup chạy nhưng content script không bao giờ phản hồi" hàng giờ\}.
+
+Try both messaging styles below — fire packets and read the code each one generates \{Thử cả hai kiểu messaging bên dưới — bắn gói tin và đọc code mỗi kiểu sinh ra\}:
+
+<iframe
+  src="/tools/chrome-ext-messaging-playground/"
+  title="Messaging playground"
+  loading="lazy"
+  style="width:100%;height:1240px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+---
+
+## 1. One-shot messages \{Tin nhắn một lần\}
+
+The workhorse: send a message, get one response back \{Con ngựa kéo: gửi tin nhắn, nhận về một phản hồi\}. From popup, options, or content script **to the worker** \{Từ popup, options, hay content script **tới worker**\}:
+
+```js
+// sender (popup.js / content.js)
+const response = await chrome.runtime.sendMessage({ action: "getData" });
+console.log(response.items);
+
+// receiver (background.js)
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === "getData") {
+    sendResponse({ items: [1, 2, 3] });
+  }
+});
+```
+
+`sender` tells you **who** sent it — `sender.tab` is set when it came from a content script, letting you reply to the right tab \{`sender` cho biết **ai** gửi — `sender.tab` được đặt khi đến từ content script, giúp bạn trả về đúng tab\}.
+
+---
+
+## 2. The `return true` async trap \{Bẫy async `return true`\}
+
+This is the single most common messaging bug \{Đây là lỗi messaging phổ biến nhất\}. If your listener responds **asynchronously**, you must `return true` to keep the channel open \{Nếu listener phản hồi **bất đồng bộ**, bạn phải `return true` để giữ kênh mở\}:
+
+```js
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === "fetch") {
+    fetch(msg.url)
+      .then((r) => r.json())
+      .then((data) => sendResponse(data)); // runs later
+    return true; // ← without this, the channel closes and sendResponse is a no-op
+  }
+});
+```
+
+Without `return true`, Chrome closes the message channel the moment the listener returns, and your later `sendResponse` silently does nothing \{Không có `return true`, Chrome đóng kênh ngay khi listener return, và `sendResponse` sau đó âm thầm không làm gì\}. The sender's `await` then resolves to `undefined` \{`await` của bên gửi sẽ resolve thành `undefined`\}.
+
+---
+
+## 3. Worker → content script \{Worker → content script\}
+
+`chrome.runtime.sendMessage` reaches the worker; to reach a **specific tab's** content script use `chrome.tabs.sendMessage` \{`chrome.runtime.sendMessage` tới worker; để tới content script của **một tab cụ thể** dùng `chrome.tabs.sendMessage`\}:
+
+```js
+// background.js — send to the active tab
+const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+const res = await chrome.tabs.sendMessage(tab.id, { action: "highlight", term: "todo" });
+```
+
+If no content script is listening in that tab, the call rejects with "Could not establish connection" — guard with try/catch \{Nếu không có content script nào lắng nghe trong tab đó, lời gọi reject với "Could not establish connection" — bọc try/catch\}.
+
+---
+
+## 4. Long-lived connections (ports) \{Kết nối lâu dài (port)\}
+
+For **repeated** or **streaming** messages, opening a one-shot channel each time is wasteful \{Với tin nhắn **lặp lại** hoặc **streaming**, mở kênh một-lần mỗi lần là lãng phí\}. Open a **port** once and reuse it \{Mở một **port** một lần và tái dùng\}:
+
+```js
+// popup.js
+const port = chrome.runtime.connect({ name: "live" });
+port.postMessage({ type: "subscribe" });
+port.onMessage.addListener((msg) => render(msg));
+
+// background.js
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "live") return;
+  const id = setInterval(() => port.postMessage({ tick: Date.now() }), 1000);
+  port.onDisconnect.addListener(() => clearInterval(id)); // clean up!
+});
+```
+
+Ports are perfect for live dashboards, progress streams, or any back-and-forth \{Port hoàn hảo cho dashboard trực tiếp, luồng tiến độ, hay bất kỳ qua-lại nào\}. **Always handle `onDisconnect`** to release resources \{**Luôn xử lý `onDisconnect`** để giải phóng tài nguyên\}.
+
+> ⚠️ A long-lived port keeps the service worker alive while open. That's useful for an active task, but don't hold ports open forever just to dodge the lifecycle \{Một port lâu dài giữ service worker sống khi còn mở. Hữu ích cho tác vụ đang chạy, nhưng đừng giữ port mở mãi chỉ để né vòng đời\}.
+
+---
+
+## 5. Broadcasting \{Phát sóng\}
+
+There's no built-in "send to everyone" \{Không có sẵn "gửi tới tất cả"\}. To notify all tabs, query them and loop \{Để báo tất cả tab, truy vấn rồi lặp\}:
+
+```js
+const tabs = await chrome.tabs.query({});
+for (const tab of tabs) {
+  chrome.tabs.sendMessage(tab.id, { action: "themeChanged" }).catch(() => {});
+}
+```
+
+Often a cleaner pattern is to write to `chrome.storage` and let every context react via `chrome.storage.onChanged` (Part 7) \{Thường mẫu sạch hơn là ghi vào `chrome.storage` và để mọi ngữ cảnh phản ứng qua `chrome.storage.onChanged` (Phần 7)\}.
+
+---
+
+## 6. Talking to web pages & other extensions \{Nói chuyện với trang web & extension khác\}
+
+By default web pages can't message your extension \{Mặc định trang web không nhắn extension của bạn được\}. Opt in with `externally_connectable` in the manifest, then the page uses `chrome.runtime.sendMessage(extensionId, msg)` \{Bật bằng `externally_connectable` trong manifest, rồi trang dùng `chrome.runtime.sendMessage(extensionId, msg)`\}:
+
+```json
+{
+  "externally_connectable": {
+    "matches": ["https://yourapp.com/*"]
+  }
+}
+```
+
+Handle these on `chrome.runtime.onMessageExternal` and **validate the sender's origin** — this is an attack surface \{Xử lý trên `chrome.runtime.onMessageExternal` và **xác thực origin của bên gửi** — đây là bề mặt tấn công\}.
+
+---
+
+## 7. Message hygiene \{Vệ sinh tin nhắn\}
+
+- Use a consistent **`{ action, payload }`** shape so listeners can `switch` cleanly \{Dùng hình dạng **`{ action, payload }`** nhất quán để listener `switch` gọn\}.
+- Messages are **JSON-serialized** — no functions, DOM nodes, or class instances \{Tin nhắn được **serialize JSON** — không hàm, node DOM, hay instance class\}.
+- Always handle the **rejection** when no receiver exists \{Luôn xử lý **rejection** khi không có bên nhận\}.
+- Validate untrusted input, especially from content scripts and external senders \{Xác thực input không tin cậy, nhất là từ content script và bên gửi ngoài\}.
+
+---
+
+## 8. Exercises \{Bài tập\}
+
+**1.** Your `sendMessage` in the popup resolves to `undefined` even though the worker's listener calls `sendResponse` after a `fetch`. Fix it. \{`sendMessage` trong popup resolve thành `undefined` dù listener của worker gọi `sendResponse` sau một `fetch`. Sửa đi.\}
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+Add `return true` in the listener so the channel stays open for the async `sendResponse` \{Thêm `return true` trong listener để kênh mở chờ `sendResponse` bất đồng bộ\}.
+</details>
+
+**2.** You need to push a live progress bar from the worker to the popup every 500ms. One-shot or port? \{Bạn cần đẩy thanh tiến độ trực tiếp từ worker tới popup mỗi 500ms. One-shot hay port?\}
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+A **port** — open once, stream many `postMessage` updates, clean up on `onDisconnect` \{Một **port** — mở một lần, stream nhiều cập nhật `postMessage`, dọn ở `onDisconnect`\}.
+</details>
+
+**3.** `chrome.tabs.sendMessage(tabId, ...)` throws "Could not establish connection". Likely cause? \{`chrome.tabs.sendMessage(tabId, ...)` ném "Could not establish connection". Nguyên nhân khả dĩ?\}
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+No content script is loaded/listening in that tab (wrong URL match, or the page hasn't injected it). Guard with try/catch and check your `matches` \{Không có content script nào tải/lắng nghe trong tab đó (sai URL match, hoặc trang chưa tiêm). Bọc try/catch và kiểm tra `matches`\}.
+</details>
+
+**Stretch \{Nâng cao\}:** in the playground, switch to port mode, open the port, send several packets, then disconnect — note there's no re-handshake per message \{trong playground, chuyển sang port mode, mở port, gửi vài gói, rồi disconnect — để ý không có bắt-tay-lại mỗi tin nhắn\}.
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- **`sendMessage`** for one-shot request/response; **ports** for repeated/streaming \{**`sendMessage`** cho yêu cầu/phản hồi một lần; **port** cho lặp lại/streaming\}.
+- **`return true`** keeps the channel open for async `sendResponse` \{**`return true`** giữ kênh mở cho `sendResponse` bất đồng bộ\}.
+- Reach a tab's content script with **`chrome.tabs.sendMessage`** \{Tới content script của tab bằng **`chrome.tabs.sendMessage`**\}.
+- Prefer **`chrome.storage.onChanged`** over manual broadcasting for shared state \{Ưu tiên **`chrome.storage.onChanged`** hơn phát sóng thủ công cho state chung\}.
+- Validate **external** messages — they're an attack surface \{Xác thực tin nhắn **bên ngoài** — chúng là bề mặt tấn công\}.
+
+---
+
+## Next up \{Tiếp theo\}
+
+**Part 7 — Storage**: `local` vs `sync` vs `session`, quotas, the `onChanged` event for reactive UIs, storage as the single source of truth, and migrating shapes between versions \{**Phần 7 — Storage**: `local` vs `sync` vs `session`, hạn mức, sự kiện `onChanged` cho UI phản ứng, storage làm nguồn sự thật duy nhất, và di trú cấu trúc giữa các phiên bản\}.

@@ -1,0 +1,172 @@
+---
+title: 'Three.js from Zero to Senior · Bonus Part 18 — Interaction: Raycasting, Click-to-Move & a Character State Machine'
+description: 'Turn taps into 3D intent. Raycast to pick the character or the ground, move with click-to-move, face the travel direction, and wire a tiny state machine that drives Idle ⇄ Walk ⇄ Run cross-fades — coexisting with OrbitControls. Live demo.'
+pubDate: 2026-06-11
+tags: [threejs, 3d, animation, interaction, threejs_10]
+series: threejs
+seriesOrder: 18
+draft: false
+---
+
+A character that only plays clips is a puppet. \{Một nhân vật chỉ biết phát clip là con rối.\} The finale of this arc makes it **respond**: click the ground and it walks there; click the character and it waves. \{Cao trào của mạch này làm nó biết **phản hồi**: click mặt đất thì đi tới đó; click nhân vật thì vẫy tay.\} The glue is a **raycaster** (2D tap → 3D point) and a tiny **state machine** that decides which Part 17 cross-fade to run. \{Chất keo là một **raycaster** (tap 2D → điểm 3D) và một **state machine** nhỏ quyết định chạy cross-fade nào của Part 17.\}
+
+<iframe
+  src="/tools/threejs-interaction-demo/"
+  title="Three.js interaction, click-to-move and state machine demo"
+  loading="lazy"
+  allow="fullscreen"
+  allowfullscreen
+  style="width:100%;height:740px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Open the full demo \{Mở demo đầy đủ\}: [/tools/threejs-interaction-demo/](/tools/threejs-interaction-demo/).
+
+## Raycasting: a ray through the pixel \{Raycasting: một tia xuyên qua pixel\}
+
+A screen tap is 2D; the world is 3D. \{Một cú chạm màn hình là 2D; thế giới là 3D.\} A `Raycaster` shoots a ray from the camera *through* the tapped pixel and reports what it hits, sorted nearest-first. \{`Raycaster` bắn một tia từ camera *xuyên qua* pixel được chạm và báo nó trúng gì, sắp theo gần-trước.\} The only fiddly part is converting pixel coordinates to **Normalized Device Coordinates** (−1…1): \{Phần lắt léo duy nhất là đổi toạ độ pixel sang **Normalized Device Coordinates** (−1…1):\}
+
+```js
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+
+function setNDC(e) {
+  const r = canvas.getBoundingClientRect();          // account for canvas offset
+  pointer.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+  pointer.y = -((e.clientY - r.top) / r.height) * 2 + 1; // y is flipped
+}
+
+raycaster.setFromCamera(pointer, camera);
+const hits = raycaster.intersectObject(target, true);  // true = recurse children
+if (hits.length) console.log(hits[0].point, hits[0].object);
+```
+
+Use `intersectObject(obj, true)` for a single subtree (a glTF model is a tree of meshes — you *need* `recursive`), or `intersectObjects([a, b], true)` for several. \{Dùng `intersectObject(obj, true)` cho một cây con (model glTF là cây mesh — bạn *cần* `recursive`), hoặc `intersectObjects([a, b], true)` cho nhiều.\} `hits[0]` is the closest hit, with `.point` (world position), `.object`, `.face` and `.distance`. \{`hits[0]` là điểm trúng gần nhất, có `.point` (vị trí thế giới), `.object`, `.face` và `.distance`.\}
+
+## Coexisting with OrbitControls: tap vs drag \{Sống chung với OrbitControls: tap khác drag\}
+
+If every pointer-up fired an action, orbiting the camera would also move the character. \{Nếu mọi pointer-up đều kích hoạt hành động, xoay camera cũng sẽ làm nhân vật di chuyển.\} The fix is to treat it as a **tap only if the pointer barely moved** between down and up: \{Cách sửa là chỉ coi là **tap nếu con trỏ gần như không di chuyển** giữa down và up:\}
+
+```js
+let downPos = null;
+canvas.addEventListener('pointerdown', (e) => { downPos = { x: e.clientX, y: e.clientY }; });
+canvas.addEventListener('pointerup', (e) => {
+  if (downPos && Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y) < 8) handleTap(e);
+  downPos = null;   // a bigger move was an orbit drag — ignore it
+});
+```
+
+OrbitControls keeps the drag; you keep the tap. \{OrbitControls giữ drag; bạn giữ tap.\} The same 8px threshold makes touch forgiving without stealing orbit gestures. \{Ngưỡng 8px giúp cảm ứng dễ chịu mà không cướp cử chỉ xoay.\}
+
+## Priority picking: character first, then ground \{Ưu tiên chọn: nhân vật trước, mặt đất sau\}
+
+One tap can mean two things, so order the raycasts by intent. \{Một cú chạm có thể mang hai nghĩa, nên xếp thứ tự raycast theo ý định.\} Test the character first; if missed, fall through to the ground: \{Thử nhân vật trước; trượt thì rơi xuống mặt đất:\}
+
+```js
+function handleTap(e) {
+  setNDC(e); raycaster.setFromCamera(pointer, camera);
+  if (raycaster.intersectObject(model, true).length) { emote('Wave'); return; } // hit body
+  const hit = raycaster.intersectObject(floor)[0];                              // hit ground
+  if (hit) setDestination(hit.point);
+}
+```
+
+This "most-specific target wins" ordering is how every editor and game handles overlapping click meaning. \{Thứ tự "mục tiêu cụ thể nhất thắng" là cách mọi editor và game xử lý nghĩa click chồng nhau.\}
+
+## Click-to-move: steer toward the point \{Click-to-move: lái về phía điểm\}
+
+Store the destination, then each frame move toward it, rotate to face the direction, and stop on arrival: \{Lưu điểm đến, rồi mỗi frame tiến về phía nó, xoay để hướng theo, và dừng khi tới:\}
+
+```js
+let target = null;
+function setDestination(p) { target = p.clone(); target.y = 0; marker.position.copy(target); marker.visible = true; }
+
+function tick(dt) {
+  if (target) {
+    const dx = target.x - model.position.x, dz = target.z - model.position.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist > 0.12) {
+      go(running ? 'Running' : 'Walking');                  // state machine
+      const step = Math.min(dist, speed * dt);             // never overshoot
+      model.position.x += (dx / dist) * step;
+      model.position.z += (dz / dist) * step;
+      model.rotation.y = Math.atan2(dx, dz);               // face where you walk
+    } else { target = null; marker.visible = false; go('Idle'); }
+  }
+}
+```
+
+Two details make it feel right: clamp the step to the remaining distance so the character never overshoots and jitters, and set `rotation.y = atan2(dx, dz)` so it always faces travel. \{Hai chi tiết làm nó "đúng cảm giác": kẹp bước theo khoảng cách còn lại để nhân vật không vượt quá và rung, và đặt `rotation.y = atan2(dx, dz)` để luôn hướng về phía đi.\} A pulsing ring marker gives the player feedback that the click registered. \{Một vòng ring nhấp nháy cho người chơi biết cú click đã được nhận.\}
+
+## The state machine \{State machine\}
+
+The "machine" is just a current state plus rules for changing it — but centralizing transitions is what keeps animation logic from rotting. \{"Cỗ máy" chỉ là một trạng thái hiện tại cộng quy tắc đổi nó — nhưng tập trung hoá chuyển trạng thái giữ cho logic animation khỏi mục nát.\}
+
+```js
+let activeName = null, emoting = false;
+
+function go(name) {                       // locomotion transitions
+  if (emoting || activeName === name) return;   // don't fight an emote / no-op
+  fadeTo(name, 0.3, true);               // cross-fade + loop (Part 17)
+  activeName = name;
+}
+function emote(name) {                    // one-shot overlay
+  emoting = true; fadeTo(name, 0.15, false);
+}
+mixer.addEventListener('finished', () => {        // emote done → resume
+  emoting = false;
+  go(target ? (running ? 'Running' : 'Walking') : 'Idle');
+});
+```
+
+Three guards earn their keep: the `activeName === name` check makes `go()` idempotent (safe to call every frame), the `emoting` flag stops movement from cancelling a wave mid-swing, and the `finished` handler restores the right locomotion state afterward. \{Ba lớp bảo vệ đáng giá: kiểm tra `activeName === name` khiến `go()` idempotent (gọi mỗi frame vẫn an toàn), cờ `emoting` ngăn di chuyển huỷ cú vẫy giữa chừng, và handler `finished` khôi phục đúng trạng thái di chuyển sau đó.\}
+
+## Hover cursor, cheaply \{Con trỏ hover, rẻ\}
+
+A pointer cursor over clickable things is a nice touch — but raycasting on *every* `pointermove` is wasteful. \{Con trỏ pointer khi rê qua thứ click được là điểm cộng — nhưng raycast trên *mọi* `pointermove` thì lãng phí.\} Skip it while a button is pressed (you're orbiting), and keep the test to the single model subtree: \{Bỏ qua khi đang nhấn (bạn đang xoay), và chỉ test trên cây con của model:\}
+
+```js
+canvas.addEventListener('pointermove', (e) => {
+  if (downPos) return;                   // mid-drag: don't bother
+  setNDC(e); raycaster.setFromCamera(pointer, camera);
+  canvas.classList.toggle('overChar', raycaster.intersectObject(model, true).length > 0);
+});
+```
+
+## Performance: raycast on demand \{Hiệu năng: raycast khi cần\}
+
+Raycasting walks geometry, so it isn't free. \{Raycast duyệt qua hình học, nên không miễn phí.\} The rules: \{Các quy tắc:\}
+
+- **Raycast on events, not every frame** — a tap, a hover; never inside the render loop "just in case". \{**Raycast theo sự kiện, không phải mỗi frame** — một cú tap, một lần hover; đừng trong vòng render "phòng khi".\}
+- **Pick a cheap ground.** Intersecting a math `THREE.Plane` (`ray.intersectPlane`) is far cheaper than a big mesh if you only need the point. \{**Chọn mặt đất rẻ.** Cắt một `THREE.Plane` toán học rẻ hơn nhiều so với một mesh lớn nếu bạn chỉ cần điểm.\}
+- **Scope the targets.** Pass an explicit array, not `scene.children`; use `Layers` to exclude non-interactive objects. \{**Giới hạn mục tiêu.** Truyền một mảng tường minh, đừng `scene.children`; dùng `Layers` để loại object không tương tác.\}
+- **Coarse first.** For many objects, test bounding spheres/boxes before exact geometry. \{**Thô trước.** Với nhiều object, test bounding sphere/box trước hình học chính xác.\}
+
+## Troubleshooting: symptom → cause → fix \{Khắc phục: triệu chứng → nguyên nhân → cách sửa\}
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Clicks land in the wrong place | NDC ignores canvas offset | use `getBoundingClientRect()` in `setNDC` |
+| Orbiting also moves the character | no tap-vs-drag check | gate `handleTap` behind the move threshold |
+| Nothing is ever hit | non-recursive raycast on a glTF tree | `intersectObject(model, true)` |
+| Character jitters at the target | overshoot past the point | clamp step to remaining `dist` |
+| Emote gets cancelled instantly | movement calls `go()` over it | guard with an `emoting` flag |
+| Faces the wrong way | swapped atan2 args | `atan2(dx, dz)` for Three's +Z forward |
+| Frame rate drops on hover | raycasting every move | skip while pressed; scope targets |
+
+## Master's warnings \{Lời cảnh báo của bậc thầy\}
+
+- **Always raycast through `getBoundingClientRect()`**, never `window.innerWidth` — embedded canvases and fullscreen both break the naive math. \{**Luôn raycast qua `getBoundingClientRect()`**, đừng `window.innerWidth` — canvas nhúng và fullscreen đều làm hỏng phép tính ngây thơ.\}
+- **Centralize transitions.** Scatter `play()` calls across handlers and you'll get stuck/overlapping states; one `go()` is the single source of truth. \{**Tập trung hoá chuyển trạng thái.** Rải `play()` khắp nơi sẽ kẹt/chồng trạng thái; một `go()` là nguồn chân lý duy nhất.\}
+- **Make `go()` idempotent.** It runs every frame; it must no-op when already in the state. \{**Cho `go()` idempotent.** Nó chạy mỗi frame; phải no-op khi đã ở đúng trạng thái.\}
+- **Move the node, not the mocap.** Use in-place clips and translate the parent yourself — root-motion clips fight your click-to-move. \{**Di chuyển node, không phải mocap.** Dùng clip tại-chỗ và tự dịch node cha — clip root-motion sẽ chọi với click-to-move.\}
+
+## Practice \{Thực hành\}
+
+1. Add keyboard control: `WASD` sets a velocity directly (no target), feeding the same `go()` machine. \{Thêm điều khiển phím: `WASD` đặt vận tốc trực tiếp (không target), nuôi cùng cỗ máy `go()`.\}
+2. Replace the ground mesh raycast with `ray.intersectPlane` and confirm it still lands correctly — and is cheaper. \{Thay raycast mesh đất bằng `ray.intersectPlane` và xác nhận vẫn đúng — và rẻ hơn.\}
+3. Add a second clickable prop; on hit, make the character walk to it, then `Wave`. \{Thêm một prop click được; khi trúng, cho nhân vật đi tới rồi `Wave`.\}
+4. Smooth the turn: `lerp` `rotation.y` toward the target angle instead of snapping. \{Làm mượt cú quay: `lerp` `rotation.y` về góc đích thay vì nhảy phắt.\}
+
+## Where this leaves you \{Bạn đang ở đâu sau loạt bài này\}
+
+Across Parts 14–18 you went from "boxes in code" to a complete asset pipeline: **import** glTF, choose the right **tools** to author it, **compress** it for production, **animate** rigged characters, and now make them **respond** to input. \{Qua Part 14–18 bạn đi từ "box bằng code" tới một pipeline asset hoàn chỉnh: **import** glTF, chọn đúng **công cụ**, **nén** cho production, **animate** nhân vật có xương, và giờ cho chúng **phản hồi** input.\} That's the working core of every product configurator, room planner and browser game — the rest is content and polish. \{Đó là phần lõi của mọi product configurator, room planner và game trình duyệt — phần còn lại là nội dung và đánh bóng.\}

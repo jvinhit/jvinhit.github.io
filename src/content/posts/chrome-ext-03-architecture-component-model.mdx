@@ -1,0 +1,153 @@
+---
+title: 'Build Chrome Extensions · Part 3 — Architecture & the Component Model'
+description: 'How the popup, content script, service worker and options page relate — what each one can and cannot do, why they are isolated, and the data-flow that ties them together. With an interactive context map.'
+pubDate: 2026-06-29
+tags: [chrome-extension, architecture, content-script, service-worker, chrome_ext_12]
+series: chrome-ext
+seriesOrder: 3
+draft: false
+---
+
+The number-one reason beginners get stuck is treating an extension like a single program \{Lý do số một khiến người mới mắc kẹt là coi extension như một chương trình duy nhất\}. It isn't \{Không phải vậy\}. It's a small **distributed system**: several pieces in **isolated contexts**, each with different powers, coordinating by messages \{Nó là một **hệ phân tán** nhỏ: nhiều phần trong các **ngữ cảnh cô lập**, mỗi phần quyền khác nhau, phối hợp bằng tin nhắn\}. Internalize this map and everything downstream gets easy \{Thấm bản đồ này thì mọi thứ sau đó trở nên dễ\}.
+
+Click each context and play the data-flow as you read \{Bấm từng ngữ cảnh và chạy luồng dữ liệu khi đọc\}:
+
+<iframe
+  src="/tools/chrome-ext-architecture/"
+  title="Extension architecture and context map"
+  loading="lazy"
+  style="width:100%;height:1080px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+---
+
+## 1. Why isolation exists \{Vì sao có sự cô lập\}
+
+Each context runs in a **separate JavaScript environment** for security and stability \{Mỗi ngữ cảnh chạy trong một **môi trường JavaScript riêng** vì bảo mật và ổn định\}. A content script on a malicious page must not be able to reach into your service worker's privileged code; a crashing popup must not take down background logic \{Một content script trên trang độc hại không được chạm vào code đặc quyền của service worker; một popup crash không được kéo sập logic nền\}. Isolation is the price — and the benefit \{Cô lập là cái giá — và cũng là lợi ích\}.
+
+The consequence you must remember \{Hệ quả phải nhớ\}: **you can't share variables or call functions across contexts**. You share *data* through messaging (Part 6) and `chrome.storage` (Part 7) \{**không chia sẻ biến hay gọi hàm giữa ngữ cảnh được**. Bạn chia sẻ *dữ liệu* qua messaging (Phần 6) và `chrome.storage` (Phần 7)\}.
+
+---
+
+## 2. The capability matrix \{Ma trận khả năng\}
+
+| | Popup | Content script | Service worker | Options |
+|---|---|---|---|---|
+| Access the **page DOM** | ✗ | ✓ | ✗ | ✗ |
+| Has its **own HTML UI** | ✓ | ± (can inject) | ✗ | ✓ |
+| **Full `chrome.*`** APIs | ✓ | limited | ✓ | ✓ |
+| **Always available** | ✗ (only when open) | per matching page | on events | ✗ |
+| Keeps **long-lived state** | ✗ | ✗ | ✗ | ✗ |
+
+Two rows deserve emphasis \{Hai hàng đáng nhấn mạnh\}:
+
+- **Only the content script touches the page DOM.** The popup and worker live outside the page entirely \{**Chỉ content script chạm DOM của trang.** Popup và worker sống hoàn toàn ngoài trang\}.
+- **Nothing keeps long-lived state.** Popups die on close, content scripts die on navigation, service workers terminate when idle \{**Không gì giữ state lâu dài.** Popup chết khi đóng, content script chết khi điều hướng, service worker tắt khi rảnh\}. Persist everything important to `chrome.storage` \{Lưu mọi thứ quan trọng vào `chrome.storage`\}.
+
+---
+
+## 3. The four contexts in depth \{Bốn ngữ cảnh chi tiết\}
+
+**Popup** — full `chrome.*` access, its own DOM, *but ephemeral* \{**Popup** — toàn quyền `chrome.*`, DOM riêng, *nhưng phù du*\}. Treat it as a pure view over stored state: read on open, write on change, never the source of truth \{Coi nó như một view thuần trên state đã lưu: đọc khi mở, ghi khi đổi, không bao giờ là nguồn sự thật\}.
+
+**Content script** — runs *in* the page, in an **isolated world**: it shares the DOM but has its own JS scope, separate from the page's scripts \{**Content script** — chạy *trong* trang, ở **thế giới cô lập**: dùng chung DOM nhưng có scope JS riêng, tách khỏi script của trang\}. It can only use a small subset of `chrome.*` (`runtime`, `storage`, `i18n`) — for anything more it messages the worker \{Nó chỉ dùng được một phần nhỏ `chrome.*` — muốn hơn thì nhắn cho worker\}.
+
+**Service worker** — no DOM, no `window`, no `document` \{**Service worker** — không DOM, không `window`, không `document`\}. It's the **coordinator**: it reacts to events from every other context, makes network requests, runs cross-tab logic, and owns shared state operations \{Nó là **bộ điều phối**: phản ứng sự kiện từ mọi ngữ cảnh khác, gọi mạng, chạy logic xuyên tab, và sở hữu các thao tác state chung\}. It sleeps when idle and wakes on the next event (Part 5) \{Nó ngủ khi rảnh và thức dậy ở sự kiện kế (Phần 5)\}.
+
+**Options page** — like a bigger, non-ephemeral popup: full `chrome.*`, its own DOM, used for settings, reading/writing `chrome.storage` \{**Options page** — như một popup to hơn, không phù du: toàn quyền `chrome.*`, DOM riêng, dùng cho cài đặt, đọc/ghi `chrome.storage`\}.
+
+---
+
+## 4. The canonical data flow \{Luồng dữ liệu kinh điển\}
+
+A typical action — "user clicks a popup button to highlight text on the page" — crosses three contexts \{Một hành động điển hình — "user bấm nút popup để tô sáng chữ trên trang" — đi qua ba ngữ cảnh\}:
+
+```text
+Popup  ──sendMessage──▶  Service worker  ──tabs.sendMessage──▶  Content script  ──▶  Page DOM
+  ▲                                                                   │
+  └───────────────────────  response  ◀──────────────────────────────┘
+```
+
+```js
+// popup.js — ask the worker
+const res = await chrome.runtime.sendMessage({ action: 'highlight', term: 'todo' });
+
+// background.js — relay to the active tab's content script
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === 'highlight') {
+    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+      chrome.tabs.sendMessage(tab.id, msg, sendResponse);
+    });
+    return true; // keep the channel open for the async response
+  }
+});
+
+// content.js — actually touch the DOM
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === 'highlight') {
+    highlightTermInDom(msg.term);
+    sendResponse({ ok: true });
+  }
+});
+```
+
+Not every action needs all three hops \{Không phải hành động nào cũng cần cả ba chặng\}. A popup that just calls `chrome.tabs.create()` needs no content script \{Một popup chỉ gọi `chrome.tabs.create()` thì không cần content script\}. But when page DOM is involved, this is the shape \{Nhưng khi liên quan DOM của trang, đây là hình dạng\}.
+
+---
+
+## 5. Choosing where code goes \{Chọn nơi đặt code\}
+
+A practical decision guide \{Hướng dẫn quyết định thực dụng\}:
+
+- Needs to **read/change the visited page**? → content script \{Cần **đọc/sửa trang đang xem**? → content script\}
+- Needs **`chrome.*` power** (tabs, network, cross-tab)? → service worker \{Cần **quyền `chrome.*`** (tab, mạng, xuyên tab)? → service worker\}
+- A **quick control panel** on the icon? → popup \{Một **bảng điều khiển nhanh** trên icon? → popup\}
+- **Persistent settings UI**? → options page \{**UI cài đặt thường trú**? → options page\}
+- **Shared data** between all of the above? → `chrome.storage` \{**Dữ liệu chung** giữa tất cả? → `chrome.storage`\}
+
+Keep each piece thin and single-purpose; route everything privileged through the worker \{Giữ mỗi phần mỏng và đơn nhiệm; định tuyến mọi thứ đặc quyền qua worker\}.
+
+---
+
+## 6. Exercises \{Bài tập\}
+
+**1.** Your popup needs the current page's `<h1>` text. Which contexts are involved and in what order? \{Popup cần text `<h1>` của trang hiện tại. Những ngữ cảnh nào tham gia và theo thứ tự nào?\}
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+Popup → (worker or directly) → content script reads `document.querySelector('h1')` → sends the text back. The content script is required because only it can touch the page DOM \{Popup → (worker hoặc trực tiếp) → content script đọc `document.querySelector('h1')` → gửi text về. Content script bắt buộc vì chỉ nó chạm DOM được\}.
+</details>
+
+**2.** Where should you store a user's "dark mode on" preference so the popup, content script, and options page all agree? \{Lưu lựa chọn "dark mode bật" ở đâu để popup, content script và options page đều nhất quán?\}
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+`chrome.storage` — it's the shared persistence layer all contexts can read/write \{`chrome.storage` — lớp lưu trữ chung mọi ngữ cảnh đọc/ghi được\}.
+</details>
+
+**3.** Why can't the service worker just call `document.querySelector` itself? \{Vì sao service worker không tự gọi `document.querySelector` được?\}
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+It has no DOM — no `document` or `window`. DOM access must be delegated to a content script \{Nó không có DOM — không `document` hay `window`. Truy cập DOM phải ủy quyền cho content script\}.
+</details>
+
+**Stretch \{Nâng cao\}:** in the context map, play the data-flow and note which contexts the request passes through before it reaches the page \{trong context map, chạy luồng dữ liệu và để ý request đi qua những ngữ cảnh nào trước khi tới trang\}.
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- An extension is a **distributed system** of isolated contexts — no shared variables, no cross-context function calls \{Extension là **hệ phân tán** của các ngữ cảnh cô lập — không biến chung, không gọi hàm xuyên ngữ cảnh\}.
+- **Only content scripts touch the page DOM**; the worker has no DOM at all \{**Chỉ content script chạm DOM trang**; worker không có DOM\}.
+- **Nothing is long-lived** — persist to `chrome.storage` \{**Không gì lâu dài** — lưu vào `chrome.storage`\}.
+- Communicate via **messaging**; route privileged work through the service worker \{Giao tiếp qua **messaging**; định tuyến việc đặc quyền qua service worker\}.
+
+---
+
+## Next up \{Tiếp theo\}
+
+**Part 4 — Content scripts**: injecting JS and CSS into pages, the isolated world in detail, match patterns and `run_at`, injecting your own UI, and the gotchas of touching someone else's page \{**Phần 4 — Content script**: tiêm JS và CSS vào trang, thế giới cô lập chi tiết, mẫu khớp và `run_at`, tiêm UI riêng, và các bẫy khi chạm trang của người khác\}.

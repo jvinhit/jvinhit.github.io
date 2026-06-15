@@ -1,0 +1,175 @@
+---
+title: 'Build Chrome Extensions · Part 5 — The Background Service Worker'
+description: 'The event-driven heart of MV3: the lifecycle (install, wake, idle, terminate), why there is no persistent state, alarms vs setTimeout, and registering listeners correctly. With a live lifecycle simulator.'
+pubDate: 2026-07-05
+tags: [chrome-extension, service-worker, background, chrome_ext_12]
+series: chrome-ext
+seriesOrder: 5
+draft: false
+---
+
+In Manifest V2 the background page was **always running** \{Trong Manifest V2 trang nền **luôn chạy**\}. In V3 that's gone — the background is a **service worker** that wakes on an event, does its job, and is **terminated when idle** \{Trong V3 điều đó biến mất — nền là một **service worker** thức dậy khi có sự kiện, làm việc, rồi **bị tắt khi rảnh**\}. This single change breaks every habit V2 developers had, and it's the source of most "my extension randomly stops working" bugs \{Thay đổi duy nhất này phá mọi thói quen của dev V2, và là nguồn của hầu hết lỗi "extension thỉnh thoảng ngừng hoạt động"\}.
+
+Fire events below and watch the worker wake, idle, and terminate — note how the in-memory counter resets \{Bấm các sự kiện bên dưới và xem worker thức, rảnh, tắt — để ý bộ đếm trong bộ nhớ reset thế nào\}:
+
+<iframe
+  src="/tools/chrome-ext-sw-lifecycle/"
+  title="Service worker lifecycle simulator"
+  loading="lazy"
+  style="width:100%;height:1180px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+---
+
+## 1. Declaring the worker \{Khai báo worker\}
+
+```json
+{
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}
+```
+
+`"type": "module"` lets you use `import` statements — strongly recommended \{`"type": "module"` cho phép dùng `import` — rất nên dùng\}. There is **one** worker for the whole extension, shared across all tabs and windows \{Có **một** worker cho cả extension, dùng chung mọi tab và cửa sổ\}.
+
+---
+
+## 2. The lifecycle \{Vòng đời\}
+
+```text
+install/update ─▶ [WAKE on event] ─▶ run handlers ─▶ idle ~30s ─▶ TERMINATE
+                       ▲                                              │
+                       └──────────────── next event ─────────────────┘
+```
+
+Chrome terminates the worker after roughly **30 seconds of inactivity** (and resets the timer on each event) \{Chrome tắt worker sau khoảng **30 giây không hoạt động** (và reset đồng hồ mỗi sự kiện\}). Every wake is a **cold start**: the file re-runs top to bottom, all globals re-initialize \{Mỗi lần thức là một **khởi động lạnh**: file chạy lại từ đầu, mọi global khởi tạo lại\}.
+
+The events that wake it include `onInstalled`, `onMessage`, `action.onClicked`, `alarms.onAlarm`, `tabs.onUpdated`, `webNavigation.*`, and more \{Các sự kiện đánh thức gồm `onInstalled`, `onMessage`, `action.onClicked`, `alarms.onAlarm`, `tabs.onUpdated`, `webNavigation.*`, v.v.\}.
+
+---
+
+## 3. The golden rule: no persistent state \{Quy tắc vàng: không state thường trú\}
+
+Because the worker dies, **anything in a variable is lost** \{Vì worker chết, **mọi thứ trong biến đều mất**\}.
+
+```js
+// ✗ BROKEN — count resets to 0 on every wake
+let count = 0;
+chrome.action.onClicked.addListener(() => { count++; });
+
+// ✓ CORRECT — storage survives termination
+chrome.action.onClicked.addListener(async () => {
+  const { count = 0 } = await chrome.storage.local.get("count");
+  await chrome.storage.local.set({ count: count + 1 });
+});
+```
+
+Treat the worker as **stateless** \{Coi worker là **không trạng thái**\}. Read what you need from `chrome.storage` (Part 7) at the start of each handler, write back at the end \{Đọc cái cần từ `chrome.storage` (Phần 7) đầu mỗi handler, ghi lại ở cuối\}.
+
+---
+
+## 4. Register listeners at the top level \{Đăng ký listener ở cấp cao nhất\}
+
+This is the second rule people break \{Đây là quy tắc thứ hai người ta hay phá\}. Listeners must be registered **synchronously, at the top level** of the file — not inside a promise, timeout, or async callback \{Listener phải được đăng ký **đồng bộ, ở cấp cao nhất** của file — không phải bên trong promise, timeout, hay async callback\}.
+
+```js
+// ✓ top-level — Chrome re-registers this on every wake before dispatching the event
+chrome.runtime.onMessage.addListener(handleMessage);
+
+// ✗ WRONG — by the time this runs, the waking event was already missed
+setTimeout(() => {
+  chrome.runtime.onMessage.addListener(handleMessage);
+}, 1000);
+```
+
+Why? When an event wakes the worker, Chrome re-runs the file, expects the listeners to be registered immediately, then dispatches the event \{Vì sao? Khi một sự kiện đánh thức worker, Chrome chạy lại file, kỳ vọng listener được đăng ký ngay, rồi mới phát sự kiện\}. Register late and you miss the very event that woke you \{Đăng ký muộn thì bạn lỡ chính sự kiện đã đánh thức bạn\}.
+
+---
+
+## 5. Timers: use `chrome.alarms`, not `setTimeout` \{Hẹn giờ: dùng `chrome.alarms`, không `setTimeout`\}
+
+`setTimeout`/`setInterval` die with the worker — a 10-minute timer never fires if the worker terminates at 30 seconds \{`setTimeout`/`setInterval` chết theo worker — một timer 10 phút không bao giờ kích hoạt nếu worker tắt ở giây 30\}. Use `chrome.alarms`, which wakes the worker for you \{Dùng `chrome.alarms`, nó sẽ đánh thức worker giúp bạn\}:
+
+```js
+// create once (e.g. in onInstalled)
+chrome.alarms.create("refresh", { periodInMinutes: 15 });
+
+// top-level listener
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "refresh") refreshData();
+});
+```
+
+The minimum period is 30 seconds \{Chu kỳ tối thiểu là 30 giây\}. For anything periodic or delayed beyond a few seconds, alarms are the only reliable tool \{Với bất cứ thứ gì định kỳ hoặc trễ hơn vài giây, alarms là công cụ tin cậy duy nhất\}.
+
+---
+
+## 6. `onInstalled` — first-run setup \{`onInstalled` — thiết lập lần đầu\}
+
+Use `onInstalled` to set default storage values, create context menus, or open a welcome page \{Dùng `onInstalled` để đặt giá trị storage mặc định, tạo context menu, hoặc mở trang chào mừng\}:
+
+```js
+chrome.runtime.onInstalled.addListener(({ reason }) => {
+  if (reason === "install") {
+    chrome.storage.local.set({ theme: "dark", count: 0 });
+    chrome.tabs.create({ url: "welcome.html" });
+  }
+  if (reason === "update") {
+    // run migrations between versions here
+  }
+});
+```
+
+---
+
+## 7. Debugging the worker \{Gỡ lỗi worker\}
+
+On `chrome://extensions` click **"service worker"** under your extension to open its dedicated DevTools \{Trên `chrome://extensions` bấm **"service worker"** dưới extension để mở DevTools riêng\}. If it says "inactive", the worker is asleep — that's normal, not a bug \{Nếu hiện "inactive", worker đang ngủ — bình thường, không phải lỗi\}. Trigger an event to wake it \{Kích một sự kiện để đánh thức\}.
+
+---
+
+## 8. Exercises \{Bài tập\}
+
+**1.** You store the user's session token in `let token` at the top of `background.js`. Sometimes API calls fail with 401. Why? \{Bạn lưu token phiên trong `let token` ở đầu `background.js`. Đôi khi gọi API lỗi 401. Vì sao?\}
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+The worker terminated and `token` reset to `undefined` on the next wake \{Worker tắt và `token` reset về `undefined` ở lần thức kế\}. Store it in `chrome.storage` and read it per request \{Lưu vào `chrome.storage` và đọc theo mỗi request\}.
+</details>
+
+**2.** Your `setInterval(poll, 600000)` (10 min) never runs. Fix it. \{`setInterval(poll, 600000)` (10 phút) không bao giờ chạy. Sửa đi.\}
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+Replace with `chrome.alarms.create("poll", { periodInMinutes: 10 })` plus an `onAlarm` listener — the worker dies long before 10 minutes \{Thay bằng `chrome.alarms.create("poll", { periodInMinutes: 10 })` cộng listener `onAlarm` — worker chết lâu trước 10 phút\}.
+</details>
+
+**3.** You register `onMessage` inside `chrome.storage.local.get(...).then(...)`. Messages are sometimes dropped. Why? \{Bạn đăng ký `onMessage` bên trong `chrome.storage.local.get(...).then(...)`. Tin nhắn đôi khi bị rớt. Vì sao?\}
+
+<details>
+<summary>Solution \{Lời giải\}</summary>
+
+The listener registers asynchronously, after the waking event was already dispatched \{Listener đăng ký bất đồng bộ, sau khi sự kiện đánh thức đã được phát\}. Register it synchronously at the top level \{Đăng ký đồng bộ ở cấp cao nhất\}.
+</details>
+
+**Stretch \{Nâng cao\}:** in the simulator, fire an event, let it terminate, then fire another and watch the in-memory counter reset to a fresh value \{trong trình mô phỏng, bấm một sự kiện, để nó tắt, rồi bấm cái khác và xem bộ đếm reset\}.
+
+---
+
+## Key takeaways \{Điểm chính\}
+
+- The MV3 background is a **service worker** — it wakes on events and **terminates when idle** \{Nền MV3 là **service worker** — thức theo sự kiện và **tắt khi rảnh**\}.
+- **No persistent state** — globals reset on every wake; use `chrome.storage` \{**Không state thường trú** — global reset mỗi lần thức; dùng `chrome.storage`\}.
+- Register listeners **synchronously at the top level** \{Đăng ký listener **đồng bộ ở cấp cao nhất**\}.
+- Use **`chrome.alarms`**, never `setTimeout`, for delayed/periodic work \{Dùng **`chrome.alarms`**, không bao giờ `setTimeout`, cho việc trễ/định kỳ\}.
+- Use **`onInstalled`** for defaults and migrations \{Dùng **`onInstalled`** cho mặc định và di trú\}.
+
+---
+
+## Next up \{Tiếp theo\}
+
+**Part 6 — Messaging across contexts**: one-shot `sendMessage`, long-lived `connect` ports, the `return true` async trap, broadcasting, and `externally_connectable` — how all the isolated pieces actually talk \{**Phần 6 — Messaging xuyên ngữ cảnh**: `sendMessage` một lần, cổng `connect` lâu dài, bẫy async `return true`, phát sóng, và `externally_connectable` — cách các mảnh cô lập thực sự nói chuyện\}.
