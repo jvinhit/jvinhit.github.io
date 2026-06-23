@@ -1,0 +1,192 @@
+---
+title: 'Design Patterns in Frontend · Part 3 — Observer & Pub/Sub'
+description: 'The pattern behind reactivity, event bus, and signals. Build a type-safe Observable and EventEmitter, distinguish Observer from Pub/Sub, and understand why forgetting to unsubscribe is the number-one memory leak source.'
+pubDate: 2026-07-29
+tags: [design-patterns, observer, pubsub, reactivity, fe_patterns_12]
+series: fe-patterns
+seriesOrder: 3
+draft: true
+---
+
+Nếu chỉ được học một pattern cho frontend, hãy học cái này. **Observer** là nền tảng của reactivity (Vue, Solid, signals), của mọi hệ thống sự kiện, của `addEventListener`, của RxJS, của cách store thông báo cho component re-render. Hiểu nó là hiểu *cách dữ liệu chảy* trong app hiện đại.
+
+---
+
+## 1. Vấn đề: làm sao "thông báo khi có thay đổi"
+
+Giả sử có một trạng thái và nhiều nơi cần phản ứng khi nó đổi. Cách ngây thơ là mỗi nơi tự đi hỏi liên tục (polling) — lãng phí. Ta muốn cơ chế ngược lại: ai quan tâm thì **đăng ký**, khi có thay đổi thì được **thông báo**. Đó chính là Observer.
+
+```text
+            ┌── observer A (listening)
+Subject ────┼── observer B (listening)
+(has data)  └── observer C (listening)
+   │
+   └─ on change → notify() → call all subscribed observers
+```
+
+---
+
+## 2. Observer pattern: type-safe Observable
+
+Một `Subject` (chủ thể) giữ danh sách observer, cho phép `subscribe` và phát thông báo:
+
+```ts
+type Observer<T> = (value: T) => void;
+
+class Observable<T> {
+  private observers = new Set<Observer<T>>(); // Set: add/remove O(1), no duplicates
+
+  subscribe(observer: Observer<T>): () => void {
+    this.observers.add(observer);
+    // RETURN an unsubscribe function — the most important detail of the pattern
+    return () => this.observers.delete(observer);
+  }
+
+  notify(value: T): void {
+    // copy before iterating: guard against observer unsubscribing during notify
+    for (const observer of [...this.observers]) observer(value);
+  }
+}
+```
+
+```ts
+const temperature = new Observable<number>();
+
+const unsubscribe = temperature.subscribe((t) => console.log(`Temperature: ${t}°`));
+temperature.notify(25); // "Temperature: 25°"
+
+unsubscribe(); // stop listening
+temperature.notify(30); // prints nothing
+```
+
+Chi tiết "đúng chuẩn senior": `subscribe` **trả về hàm hủy**. Đây là quy ước phổ biến (React `useEffect` cleanup, `store.subscribe` của Redux đều theo) và là tuyến phòng thủ chính chống rò rỉ bộ nhớ.
+
+---
+
+## 3. Một store reactive nhỏ — Observer trong thực tế
+
+Ghép Observer với một giá trị state, ta có một store mini — chính là lõi của Zustand/Redux:
+
+```ts
+class Store<T> {
+  private observers = new Set<Observer<T>>();
+  constructor(private state: T) {}
+
+  getState(): T {
+    return this.state;
+  }
+
+  setState(partial: Partial<T>): void {
+    this.state = { ...this.state, ...partial }; // immutable: create new state
+    this.notify();
+  }
+
+  subscribe(observer: Observer<T>): () => void {
+    this.observers.add(observer);
+    return () => this.observers.delete(observer);
+  }
+
+  private notify(): void {
+    for (const observer of [...this.observers]) observer(this.state);
+  }
+}
+```
+
+Nối vào React bằng `useSyncExternalStore` (API chính thức để đăng ký store ngoài):
+
+```tsx
+function useStore<T, S>(store: Store<T>, selector: (state: T) => S): S {
+  return useSyncExternalStore(
+    (onChange) => store.subscribe(onChange), // React handles subscribe + cleanup
+    () => selector(store.getState()), // read current snapshot
+  );
+}
+```
+
+`useSyncExternalStore` lo luôn việc hủy đăng ký khi component unmount — nên đây là cách đúng để cắm store tự viết vào React mà không rò rỉ.
+
+---
+
+## 4. Pub/Sub: tách rời hơn một bậc
+
+Observer "thuần" có một điểm: subject biết observer của nó (chúng gắn trực tiếp). **Pub/Sub** chèn thêm một lớp trung gian — **event bus** — ở giữa. Publisher phát sự kiện theo *tên/kênh*, subscriber nghe theo tên; **hai bên không biết nhau**.
+
+```ts
+type Handler<T> = (payload: T) => void;
+
+// Event map: channel name → payload type, for end-to-end type safety
+interface EventMap {
+  'cart:add': { productId: string; qty: number };
+  'cart:clear': void;
+  'user:login': { userId: string };
+}
+
+class EventBus<M extends Record<string, unknown>> {
+  private handlers = new Map<keyof M, Set<Handler<M[keyof M]>>>();
+
+  on<K extends keyof M>(event: K, handler: Handler<M[K]>): () => void {
+    const set = (this.handlers.get(event) ?? new Set()) as Set<Handler<M[K]>>;
+    set.add(handler);
+    this.handlers.set(event, set as Set<Handler<M[keyof M]>>);
+    return () => set.delete(handler);
+  }
+
+  emit<K extends keyof M>(event: K, payload: M[K]): void {
+    const set = this.handlers.get(event) as Set<Handler<M[K]>> | undefined;
+    if (set) for (const handler of [...set]) handler(payload);
+  }
+}
+
+const bus = new EventBus<EventMap>();
+bus.on('cart:add', ({ productId, qty }) => console.log(`Add ${qty} × ${productId}`));
+bus.emit('cart:add', { productId: 'sku-1', qty: 2 }); // fully type-checked
+```
+
+| Tiêu chí | Observer | Pub/Sub |
+|----------|----------|---------|
+| Subject biết observer? | Có (gắn trực tiếp) | Không (qua event bus) |
+| Độ tách rời | Vừa | Cao |
+| Dễ debug? | Dễ hơn (luồng rõ) | Khó hơn (luồng gián tiếp) |
+| Dùng cho | reactivity, store | communication between loose modules |
+
+> `EventTarget`/`addEventListener` của DOM và `CustomEvent` chính là Pub/Sub có sẵn của trình duyệt. Trước khi tự viết event bus, cân nhắc dùng `EventTarget`.
+
+---
+
+## 5. Rò rỉ bộ nhớ: lỗi số một của Observer
+
+Mọi `subscribe` **phải** có `unsubscribe` tương ứng. Quên hủy = observer (và mọi thứ closure của nó giữ) không bao giờ được thu gom rác → rò rỉ bộ nhớ tích lũy theo thời gian.
+
+```tsx
+// ❌ subscribe but no cleanup → leak on every component mount
+useEffect(() => {
+  store.subscribe(handleChange);
+}, []);
+
+// ✅ return cleanup so React unsubscribes on unmount
+useEffect(() => {
+  const unsubscribe = store.subscribe(handleChange);
+  return unsubscribe; // clean up
+}, []);
+```
+
+Đây là lý do `useEffect` thiết kế để trả về hàm cleanup, và là lý do mọi `subscribe` tốt đều trả về `unsubscribe`. Khi review code, thấy `subscribe`/`addEventListener` mà không thấy cleanup tương ứng — đó là cờ đỏ.
+
+---
+
+## 6. Khi nào KHÔNG dùng
+
+- **Pub/Sub cho mọi giao tiếp** → luồng dữ liệu trở nên "ma thuật", khó lần ai phát/ai nghe. Ưu tiên props/callback tường minh cho quan hệ cha-con gần.
+- **Event bus toàn cục làm state management** → dễ rối; dùng store có cấu trúc (Phần 10) cho state ứng dụng.
+- Quá nhiều observer cho một subject nóng → cân nhắc gộp thông báo (batch) để tránh "bão notify".
+
+---
+
+## Tóm tắt
+
+- **Observer**: subject giữ danh sách observer, `subscribe` trả về `unsubscribe`, `notify` gọi tất cả — nền của reactivity và store.
+- Cắm store tự viết vào React bằng `useSyncExternalStore` (tự lo cleanup).
+- **Pub/Sub** thêm event bus trung gian → tách rời cao hơn nhưng khó debug hơn; `EventTarget` là Pub/Sub có sẵn.
+- **Luôn cleanup** mọi subscription — quên hủy đăng ký là nguồn rò rỉ bộ nhớ số một.
+
+**Phần tiếp theo:** Factory — tập trung logic khởi tạo object/component phức tạp vào một chỗ.

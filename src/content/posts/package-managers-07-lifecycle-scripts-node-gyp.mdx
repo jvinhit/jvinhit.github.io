@@ -1,0 +1,205 @@
+---
+title: 'Node Package Managers · Part 7 — Lifecycle Scripts & node-gyp'
+description: 'Why npm install can compile C++ on your machine: lifecycle scripts (preinstall/install/postinstall), what node-gyp does, the N-API native addon model, and why postinstall is both essential and dangerous.'
+pubDate: 2026-06-22
+tags: [node-gyp, native-addons, lifecycle-scripts, security, package_managers_12]
+series: package-managers
+seriesOrder: 7
+draft: false
+---
+
+Đây là **Phần 7 của series 12 phần** về package manager Node. Tới giờ, package toàn là JavaScript thuần. Nhưng phần lớn hệ sinh thái là **code native** — C, C++, Rust — và đưa nó lên máy bạn là nơi `node install` làm việc bất ngờ nhất (và nguy hiểm nhất).
+
+Đây là phần các tutorial bỏ qua, và là phần kỹ sư senior bị gọi dậy lúc nửa đêm.
+
+---
+
+## 1. Lifecycle script — tóm tắt và thứ tự đầy đủ
+
+`scripts` trong `package.json` chạy tại thời điểm xác định. Khi install, các cái tự động chạy theo thứ tự này — **cho package của bạn VÀ mọi dependency có định nghĩa**:
+
+```text
+npm install / pnpm install / yarn
+        │
+        ▼
+preinstall → (resolve+fetch+link) → install → postinstall → prepare
+{chạy cho YOUR package và CHO MỌI dependency có các script này}
+```
+
+```json
+{
+  "scripts": {
+    "preinstall":  "node ./scripts/check-platform.js",
+    "install":     "node-gyp rebuild",     // ← compile native code
+    "postinstall": "node ./scripts/download-binary.js",
+    "prepare":     "husky install"         // after install, before publish
+  }
+}
+```
+
+Tính chất nguy hiểm: chúng chạy **tự động**, với **quyền của user**, **trước** khi bạn chạy dòng nào của app mình. `postinstall` của một dependency transitive bị xâm nhập là thực thi code mỗi lần `npm install`.
+
+---
+
+## 2. Vì sao cần code native?
+
+JavaScript không làm được mọi thứ đủ nhanh hoặc đủ cấp thấp. Native addon tồn tại cho:
+
+```text
+- raw CPU performance     image processing (sharp), crypto, compression
+- OS-level access         file watchers, USB/serial, native dialogs
+- existing C/C++ libs      libvips, sqlite, libgit2, ICU
+- hardware/SIMD            video transcoding, ML kernels
+```
+
+Một native addon là thư viện chia sẻ đã biên dịch (file `.node`) mà Node load qua `require()` giống module JS. Câu hỏi là: **file `.node` đó được build cho OS + CPU + version Node *của bạn* ra sao?**
+
+---
+
+## 3. `node-gyp` — công cụ build native
+
+`node-gyp` là công cụ đa nền tảng **biên dịch addon C/C++** khi install. Nó bọc hệ build GYP của Google và điều khiển compiler thật của nền tảng bạn:
+
+```text
+package with C++ source + a binding.gyp file
+        │  npm install triggers  "install": "node-gyp rebuild"
+        ▼
+node-gyp:
+  1. find Python + a C++ toolchain (make/gcc/clang, or MSVC on Windows)
+  2. download Node header files for YOUR exact Node version
+  3. generate platform build files from binding.gyp
+  4. compile → build/Release/addon.node
+{tìm toolchain → tải header Node → sinh build file → biên dịch ra .node}
+```
+
+Đây là lý do cài vài package bỗng cần **Python và compiler C++**, và vì sao cùng `package.json` "chạy trên Mac tôi" nhưng nổ tung trên máy Windows của đồng đội hay image Docker mỏng.
+
+```text
+Classic node-gyp failures {các lỗi node-gyp kinh điển}:
+  - "gyp ERR! find Python"          → no Python on the machine
+  - "MSB... not found" (Windows)     → no Visual Studio build tools
+  - "node_api.h: No such file"       → header download blocked / offline
+  - works locally, fails in Alpine   → musl vs glibc, no build-base
+```
+
+`binding.gyp` là manifest build của addon — source, thư mục include, thư viện, cờ compiler:
+
+```python
+# binding.gyp (it's JSON-ish, Python-evaluated)
+{
+  "targets": [{
+    "target_name": "addon",
+    "sources": ["src/addon.cc"],
+    "include_dirs": ["<!@(node -p \"require('node-addon-api').include\")"],
+    "libraries": ["-lvips"],            # link an external C library
+    "cflags_cc": ["-std=c++17"]
+  }]
+}
+```
+
+### Cache và các nút môi trường
+
+`node-gyp` cache header Node tải về theo từng version trong một **devdir**, và đọc biến môi trường `npm_config_*` mà npm bơm từ flag và `.npmrc`:
+
+```bash
+npm_config_jobs=max          # parallelize the C++ compile (faster CI)
+npm_config_nodedir=/path     # point at prebuilt Node headers (offline/CI)
+npm_config_python=/usr/bin/python3   # pin which Python node-gyp uses
+# any package.json "config" or .npmrc key becomes npm_config_<key> at build time
+```
+
+Điều này quan trọng cho **CI offline, tái lập**: nạp sẵn devdir và ghim `nodedir`/`python` để build không bao giờ chạm mạng giữa lúc install.
+
+---
+
+## 4. Cách hiện đại — N-API / Node-API
+
+Nỗi đau cũ: addon biên dịch cho Node 18 vỡ trên Node 20 vì nó link với nội bộ V8. **Node-API (N-API)** sửa bằng một **ABI ổn định**:
+
+```text
+Old:  addon ↔ V8 internals      → recompile for every Node major
+N-API: addon ↔ stable Node-API  → compile ONCE, runs across Node versions
+{biên dịch một lần, chạy qua các version Node}
+```
+
+Đây là lý do binary prebuilt (Phần 8) trở nên khả thi: với ABI ổn định, publisher có thể ship một `.node` mỗi nền tảng vẫn chạy qua các bản nâng cấp Node. Tool như `node-addon-api` (C++) và `napi-rs` (Rust) nhắm N-API.
+
+### Phiên bản ABI và biến tấu Electron
+
+Addon trước N-API gắn với một **ABI version** — vd Node 20 là ABI 115, Node 22 là ABI 127. Một binary build cho ABI này ném `NODE_MODULE_VERSION mismatch` trên ABI khác:
+
+```text
+Error: The module was compiled against NODE_MODULE_VERSION 115,
+       this version of Node.js requires NODE_MODULE_VERSION 127.
+→ rebuild with: npm rebuild   (or `npx node-gyp rebuild`)
+```
+
+**Electron** làm tệ hơn: nó gói Node/V8 *riêng* với ABI *khác*, nên native module phải rebuild với header của Electron. Đó là việc của `@electron/rebuild` và `prebuild-install --runtime=electron`. Addon N-API né hết — chúng ổn định ABI qua cả Node và Electron.
+
+---
+
+## 5. Biên dịch vs tải — ngã ba lúc install
+
+Khi cài package native, một trong hai điều xảy ra:
+
+```text
+A) PREBUILT BINARY PATH  (the happy path, most packages today)
+   postinstall/install downloads a ready-made .node for your platform.
+   No compiler needed. Fast.   {không cần compiler, nhanh}
+        │ but: what if no prebuilt exists for your platform?
+        ▼
+B) COMPILE-FROM-SOURCE FALLBACK
+   node-gyp rebuild kicks in → needs Python + C++ toolchain → slow,
+   and the #1 source of "npm install failed" tickets.
+{cần Python + toolchain C++ → chậm, nguồn lỗi install số 1}
+```
+
+Phần 8 hoàn toàn về đường A — cách package phân phối binary prebuilt, và hệ luỵ bảo mật của "postinstall tải và chạy binary từ internet".
+
+---
+
+## 6. Căng thẳng bảo mật
+
+Đây là sự thật khó chịu:
+
+```text
+Lifecycle scripts are NECESSARY        {cần thiết}
+  → native modules literally cannot install without them
+Lifecycle scripts are DANGEROUS        {nguy hiểm}
+  → they're arbitrary code execution from your whole dependency tree
+```
+
+Phản ứng của hệ sinh thái là **lật mặc định về "tắt"**:
+
+- build script của dependency **không** chạy tự động; bạn allow-list.
+- `--ignore-scripts` để tắt, version mới thêm kiểm soát tinh hơn.
+- Tăng cứng chung: chạy install với script tắt, rồi rebuild rõ ràng chỉ native dep tin cậy.
+
+```bash
+# Hardened install pattern (we expand this in Part 10)
+npm ci --ignore-scripts          # install with NO scripts
+npm rebuild sharp                # then rebuild only the native deps you trust
+# pnpm equivalent: scripts are off by default; approve specific ones:
+pnpm approve-builds
+```
+
+> Sự dịch chuyển tư duy: coi "một package muốn chạy postinstall" là **yêu cầu đặc quyền**, không phải quyền mặc định. Cấp nó một cách có chủ đích.
+
+---
+
+## Giờ bạn đã biết gì
+
+- Lifecycle script chạy tự động cho **mọi** dependency có định nghĩa.
+- `node-gyp` biên dịch addon C/C++ khi install, cần Python + toolchain.
+- **N-API** cho ABI ổn định nên addon sống qua nâng cấp Node và binary prebuilt khả thi.
+- Script cần cho native module nhưng là thực thi code tuỳ ý — manager hiện đại để mặc định **tắt**.
+
+---
+
+## Bài tập
+
+1. Cài một package native với log chi tiết và xem nó tải binary prebuilt hay gọi `node-gyp`.
+2. Chạy cùng install với `--ignore-scripts` và xem cái gì vỡ.
+3. Trong image Docker mỏng, kích hoạt build `node-gyp` và sửa lỗi toolchain.
+
+Tiếp theo — Phần 8: Native module & phân phối binary:

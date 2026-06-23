@@ -1,0 +1,256 @@
+---
+title: 'How Browsers Work · Part 8 — Memory & Garbage Collection'
+description: 'How V8 manages memory: the stack vs the heap, generational garbage collection (young/old), the mark-and-sweep cycle, and how to find and fix memory leaks in real apps.'
+pubDate: 2026-10-19
+tags: [browser, internals, memory, garbage-collection, v8, browser_internals_12]
+series: browser-internals
+seriesOrder: 8
+draft: true
+---
+
+Phần 1–7 đã đi qua kiến trúc, render, và cách JavaScript chạy trên luồng chính. Phần này zoom vào **bộ nhớ**: giá trị sống ở đâu, V8 quyết định giải phóng gì thế nào, và vì sao SPA có thể ngốn RAM dần dù bạn không bao giờ gọi `malloc`.
+
+Mọi object code tạo ra — DOM node, closure, response API cache — chiếm bộ nhớ heap bên trong tiến trình renderer. **Garbage collector (GC)** của V8 thu hồi những gì bạn không còn cần, nhưng chỉ những gì nó chứng minh được là **không còn reachable**. Rò rỉ xảy ra khi bạn vô tình giữ chúng reachable mãi mãi.
+
+| Khái niệm | Tóm tắt một dòng |
+|---------|------------------------------|
+| **Stack** | Nhanh, frame kích thước cố định cho primitive và reference |
+| **Heap** | Lưu trữ động cho object, mảng, closure |
+| **Roots** | Điểm bắt đầu GC dùng để quyết định reachability |
+| **Generational GC** | Hầu hết object chết sớm → tối ưu cho allocation ngắn hạn |
+
+---
+
+## 1. Stack vs heap: giá trị sống ở đâu
+
+Khi V8 chạy function của bạn, nó cấp phát hai vùng bộ nhớ riêng biệt:
+
+**Stack** là cấu trúc LIFO gắn với call frame. Mỗi lần function được gọi, một frame mới được push; khi return, frame bị pop.
+
+- **Primitive** — lưu trực tiếp trong frame.
+- **Reference** (con trỏ) tới heap object — frame lưu địa chỉ, không phải object.
+- **Địa chỉ return** và slot biến cục bộ.
+
+Stack nhanh và tự động được thu hồi khi function return. Nó cũng **nhỏ** — đệ quy sâu có thể làm tràn.
+
+**Heap** là vùng lớn, không có cấu trúc cố định, nơi V8 cấp phát object, mảng, function, và closure. Khi bạn viết `const user = { name: 'An' }`, object `{ name: 'An' }` sống trên heap; biến `user` trên stack giữ reference tới nó.
+
+```text
+Stack (per thread)                Heap (shared, GC-managed)
+┌─────────────────────┐          ┌──────────────────────────┐
+│ main() frame        │          │  { name: 'An' }  ←───────┼── user (ref)
+│   user ─────────────┼─────────►│                          │
+│   count: 42         │          │  [1, 2, 3]       ←───────┼── items (ref)
+│ fetchData() frame   │          │                          │
+│   items ────────────┼─────────►│  function() { ... }      │
+│   i: 0              │          └──────────────────────────┘
+└─────────────────────┘
+```
+
+> Primitive trên stack biến mất khi frame pop. Heap object sống sót cho đến khi GC chứng minh không ai reach được nữa.
+
+---
+
+## 2. Reachability và GC roots
+
+V8 **không** dùng reference counting (thất bại với vòng lặp tham chiếu). Thay vào đó dùng **tracing garbage collection**: bắt đầu từ **roots** đã biết, duyệt mọi reference, đánh dấu mọi thứ reachable, và giải phóng phần còn lại.
+
+**GC roots** phổ biến trong renderer trình duyệt:
+
+| Root | Ví dụ |
+|------|-------------------|
+| **Global object** | `window`, `window`, binding cấp module, property trên `globalThis` |
+| **Stack** | Biến cục bộ và argument trong call frame đang chạy (và bị treo) |
+| **Engine internals** | Reference ẩn từ code đã tối ưu, handle đăng ký với V8 API |
+| **DevTools / debugger** | Scope bị pause và reference từ console có thể tạm giữ object sống |
+
+Nếu object reachable từ bất kỳ root nào — trực tiếp hay qua chuỗi reference — nó **ở lại**. Nếu không, nó thành **garbage** và sẽ được thu gom.
+
+```js
+let cache = [];
+
+function loadUsers() {
+  const users = fetchFromApi(); // heap object
+  cache.push(users);            // still reachable via global `cache`
+  return users;
+}
+
+function loadUsersOnce() {
+  const users = fetchFromApi();
+  return users;                 // if caller drops the reference, GC can free it
+}
+```
+
+Phiên bản đầu giữ mọi mảng fetch trong `cache` mãi mãi trừ khi bạn xóa tường minh. Đó không phải bug GC — đó là **reachability có chủ ý**.
+
+---
+
+## 3. Thu gom rác theo thế hệ
+
+V8 chia heap thành **các thế hệ** dựa trên quy luật quan sát được: **hầu hết object chết sớm**. Cấp phát và giải phóng object tạm ngắn hạn chiếm ưu thế trong workload thực tế.
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│                     V8 Heap                            │
+├──────────────────────┬──────────────────────────────────┤
+│  Young Generation    │  Old Generation                  │
+│  (New Space)         │  (Old Space)                     │
+│                      │                                  │
+│  ┌────────┐ ┌──────┐ │  Long-lived objects promoted     │
+│  │ From   │ │ To   │ │  here after surviving N collections│
+│  │ space  │ │space │ │                                  │
+│  └────────┘ └──────┘ │                                  │
+│  Scavenger (copying) │  Mark-Sweep-Compact              │
+│  — fast, frequent    │  — slower, less frequent         │
+└──────────────────────┴──────────────────────────────────┘
+```
+
+### Thế hệ trẻ: Scavenger
+
+Object mới cấp phát trong **thế hệ trẻ** (thường chia **from-space** và **to-space**).
+
+1. Duyệt object reachable từ roots.
+2. **Chép** survivor sang to-space (đồng thời compact).
+3. Hoán đổi vai trò from/to; vứt from-space cũ một lần.
+
+Scavenge nhanh vì thế hệ trẻ nhỏ và hầu hết object đã chết.
+
+### Thế hệ già: Mark-Sweep-Compact
+
+Object sống sót qua nhiều Scavenge được **promote** lên **thế hệ già**.
+
+1. **Mark** — duyệt từ roots, đánh dấu mọi object reachable.
+2. **Sweep** — giải phóng object không được đánh dấu.
+3. **Compact** — tùy chọn di chuyển object sống sót để giảm phân mảnh.
+
+Major GC chậm hơn và chạy ít hơn. Khi chạy trên luồng chính không giảm nhẹ, bạn cảm nhận **jank spike** — pause dài khi mọi thứ dừng lại.
+
+---
+
+## 4. GC incremental, concurrent, và lazy
+
+Major GC stop-the-world thuần sẽ đóng băng UI hàng chục đến hàng trăm ms trên heap lớn. V8 hiện đại trải công việc ra:
+
+| Kỹ thuật | Làm gì |
+|-----------|-------------------------|
+| **Incremental marking** | Chia mark thành slice nhỏ xen kẽ với JS |
+| **Concurrent marking** | Mark trên luồng phụ trong khi JS chạy |
+| **Concurrent sweeping** | Giải phóng bộ nhớ trên luồng nền |
+| **Lazy sweeping** | Hoãn sweep đến khi thật sự cần bộ nhớ |
+
+Các kỹ thuật này giảm thời gian pause nhưng **không** loại bỏ hoàn toàn chi phí GC — áp lực allocation vẫn quan trọng. Tạo hàng triệu object ngắn hạn buộc Scavenge liên tục; giữ graph lớn sống lâu buộc major collection đắt đỏ.
+
+> Bạn không thể `free()` thủ công trong JavaScript. Cần gạt duy nhất là **ngừng giữ reference** tới thứ không còn cần.
+
+---
+
+## 5. Rò rỉ bộ nhớ phổ biến trong web app
+
+**Memory leak** trong JS nghĩa là object reachable tích lũy theo thời gian — thường vì thứ bạn quên vẫn reference chúng. Thủ phạm điển hình trong SPA:
+
+| Mẫu rò rỉ | Vì sao |
+|--------------|----------------------------|
+| **Forgotten timers** | `setInterval` / `setTimeout` `setInterval` / `setTimeout` giữ closure sống và có thể chạy mãi |
+| **Event listeners not removed** | Handler closure capture state component; DOM hoặc emitter vẫn giữ handler |
+| **Detached DOM nodes** | Node bị gỡ khỏi cây nhưng vẫn được reference trong JS — GC không thu được nó hay subtree |
+| **Growing global caches** | `Map`, `Map`, mảng, hoặc object trên `window` chỉ biết `.set()` / `.push()` |
+| **Closures over large scopes** | Callback nhỏ vô tình đóng over biến `data` khổng lồ |
+| **Observers not disconnected** | `ResizeObserver`, `IntersectionObserver`, `MutationObserver` Observer không disconnect sau unmount |
+
+### WeakMap và WeakRef cho cache
+
+Khi cache **key theo object** (vd metadata theo DOM element), `Map` mạnh ngăn key bị thu gom. Dùng **`WeakMap`** — key giữ yếu và không ngăn GC object key.
+
+```js
+const metadata = new WeakMap();
+
+function attachMeta(el, info) {
+  metadata.set(el, info); // when `el` is GC'd, entry disappears
+}
+```
+
+**`WeakRef`** cho phép giữ reference không mạnh và kiểm tra `.deref()` sau — hữu ích cho soft cache chấp nhận entry cũ. **`FinalizationRegistry`** chạy cleanup khi object bị thu gom, nhưng dùng tiết kiệm — phức tạp và timing không xác định.
+
+---
+
+## 6. Chẩn đoán rò rỉ bằng DevTools
+
+Panel **Memory** của Chrome DevTools là công cụ chính. Quy trình khi nghi rò rỉ:
+
+1. **Heap snapshot** — chụp graph object tại một thời điểm; lọc theo constructor.
+2. **Comparison** — chụp A, thực hiện hành động, force GC, chụp B, diff xem gì **tăng**.
+3. **Allocation timeline** — ghi allocation theo thời gian; spike không giảm chỉ object bị giữ.
+4. **Detached nodes** — tìm `Detached` trong snapshot; mỗi cái là subtree DOM đã gỡ nhưng vẫn được reference trong JS.
+
+Theo dõi **Task Manager** (Phần 1): bộ nhớ tab leo mỗi lần navigate và không về baseline là cờ đỏ.
+
+---
+
+## 7. Ví dụ cụ thể: rò rỉ listener khi unmount
+
+Xét widget dashboard subscribe resize cửa sổ:
+
+```js
+// ❌ LEAK — listener never removed; closure captures `state`
+function mountWidget(container, state) {
+  const handler = () => {
+    container.textContent = JSON.stringify(state);
+  };
+  window.addEventListener('resize', handler);
+  // no cleanup — if mountWidget runs again, old handler + state stay alive
+}
+
+// ✅ FIX — return a cleanup function; call it on unmount
+function mountWidget(container, state) {
+  const handler = () => {
+    container.textContent = JSON.stringify(state);
+  };
+  window.addEventListener('resize', handler);
+
+  return () => {
+    window.removeEventListener('resize', handler);
+  };
+}
+
+// Usage in a SPA component lifecycle
+let cleanup;
+function onMount(el, data) {
+  cleanup = mountWidget(el, data);
+}
+function onUnmount() {
+  cleanup?.();
+  cleanup = null;
+}
+```
+
+Trong React, tương đương là `useEffect` có cleanup return; trong vanilla JS, mọi `addEventListener` cần `removeEventListener` tương ứng (hoặc signal `AbortController`) khi UI bị hủy.
+
+```js
+// Modern pattern with AbortController
+function mountWidget(container, state) {
+  const controller = new AbortController();
+  const { signal } = controller;
+
+  const handler = () => {
+    container.textContent = JSON.stringify(state);
+  };
+  window.addEventListener('resize', handler, { signal });
+
+  return () => controller.abort(); // removes all listeners registered with this signal
+}
+```
+
+Sau khi sửa, lặp lại heap snapshot comparison: detached node và số `(closure)` phải ổn định qua các chu kỳ mount/unmount.
+
+---
+
+## Tóm tắt
+
+- **Stack** giữ primitive và reference; **heap** giữ object — chỉ heap object cần GC.
+- GC giải phóng object **unreachable** duyệt từ **roots** — không phải "khi bạn nghĩ xong".
+- **Generational GC**: Scavenger nhanh trên object trẻ; Mark-Sweep-Compact trên object già đã promote.
+- Kỹ thuật **incremental/concurrent** giảm pause nhưng áp lực allocation vẫn tốn kém.
+- Leak = reference quên: timer, listener, DOM detached, cache global, closure béo.
+- Dùng **WeakMap** / **WeakRef** cho cache key theo object; chẩn đoán bằng snapshot và comparison **DevTools Memory**.
+
+**Phần tiếp theo:** Networking & HTTP caching — trình duyệt fetch tài nguyên, cache, và ưu tiên byte quan trọng trên đường truyền.

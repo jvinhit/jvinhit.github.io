@@ -1,0 +1,156 @@
+---
+title: 'Web Performance · Part 17 — Rendering Pipeline & CSS Performance'
+description: 'Nửa sau hiệu năng render: forced reflow / layout thrashing, content-visibility, CSS containment, kỷ luật will-change, selector cost, và animation chỉ chạm compositor để giữ 60fps.'
+pubDate: 2026-09-19
+tags: [performance, rendering, css, reflow, web_perf_12]
+series: web-perf
+seriesOrder: 17
+draft: true
+---
+
+INP và animation mượt phụ thuộc vào việc trình duyệt *vẽ* nhanh. Phần này về nửa render của hiệu năng: pipeline style → layout → paint → composite, những thao tác buộc trình duyệt làm lại việc đắt, và các công cụ CSS hiện đại để cắt giảm. Đây là phần hay bị bỏ quên — nhiều người tối ưu JS rồi quên rằng *cập nhật DOM/CSS* cũng tốn.
+
+> Pipeline render: **style** (tính computed style) → **layout** (tính hình học) → **paint** (vẽ pixel) → **composite** (ghép layer). Thay đổi càng sớm trong chuỗi càng đắt vì kéo theo các bước sau.
+
+---
+
+## 1. Ba mức chi phí của một thay đổi style
+
+```text
+Đổi transform / opacity        → chỉ COMPOSITE        ⚡ rẻ nhất (compositor lo)
+Đổi color / background         → PAINT + composite    🙂 vừa
+Đổi width / top / margin / DOM → LAYOUT + paint + comp 🐢 đắt nhất (reflow)
+```
+
+Layout (reflow) là bước đắt nhất vì đổi hình học một phần tử có thể buộc tính lại cả cây xung quanh. Mục tiêu: với animation và cập nhật thường xuyên, **chỉ chạm `transform`/`opacity`**.
+
+---
+
+## 2. Forced synchronous layout & layout thrashing
+
+Trình duyệt gom thay đổi và layout *một lần mỗi khung* (như đã thấy trong frame lifecycle). Nhưng nếu bạn **đọc** một thuộc tính hình học (`offsetHeight`, `getBoundingClientRect`...) ngay *sau khi ghi* style, trình duyệt buộc phải layout **đồng bộ ngay lập tức** để trả số đúng — gọi là **forced reflow**. Lặp trong vòng lặp = **layout thrashing**.
+
+```ts
+// ❌ THRASH: mỗi vòng buộc một layout đồng bộ (đọc sau ghi)
+for (const el of items) {
+  el.style.width = container.offsetWidth + 'px'; // đọc offsetWidth sau khi DOM đổi
+}
+
+// ✅ Tách: đọc tất cả TRƯỚC, ghi tất cả SAU
+const width = container.offsetWidth;            // đọc 1 lần
+for (const el of items) el.style.width = width + 'px'; // chỉ ghi
+```
+
+```text
+Thuộc tính gây forced reflow khi đọc (sau khi ghi):
+  offsetTop/Left/Width/Height, clientWidth/Height,
+  scrollTop/Height, getBoundingClientRect(), getComputedStyle(),
+  ... → gom đọc lại một chỗ, đừng xen kẽ với ghi.
+```
+
+Mẹo: dùng `requestAnimationFrame` để dồn ghi, và đọc ở đầu khung. Thư viện như FastDOM tự động batch đọc/ghi.
+
+---
+
+## 3. content-visibility — bỏ qua render ngoài màn hình
+
+`content-visibility: auto` cho trình duyệt **bỏ qua layout và paint** cho cây con khi nó ngoài viewport — một trong các tối ưu render mạnh nhất cho trang dài.
+
+```css
+.section {
+  content-visibility: auto;
+  /* kích thước ước lượng để scrollbar/độ cao ổn định khi nội dung bị bỏ qua */
+  contain-intrinsic-size: auto 600px;
+}
+```
+
+```text
+Trang 100 section dài:
+  Không content-visibility → layout+paint cả 100 ngay (chậm tải)
+  Có content-visibility    → chỉ render section gần viewport, còn lại bỏ qua
+                            → giảm thời gian render ban đầu đáng kể
+```
+
+`contain-intrinsic-size` quan trọng: thiếu nó, các section bị bỏ qua có chiều cao 0 → scrollbar nhảy và CLS. Cho kích thước placeholder hợp lý.
+
+---
+
+## 4. CSS containment — cô lập vùng render
+
+`contain` báo trình duyệt rằng một phần tử là **độc lập** — thay đổi bên trong không ảnh hưởng ra ngoài, nên trình duyệt giới hạn phạm vi layout/paint phải tính lại.
+
+```css
+/* Mỗi card là một "hộp" độc lập: đổi nội dung trong card không reflow cả trang */
+.card {
+  contain: content; /* = layout + paint + style containment */
+}
+
+/* contain: strict = layout + paint + size + style (cần biết kích thước cố định) */
+.widget { contain: strict; width: 300px; height: 200px; }
+```
+
+| Giá trị | Cô lập |
+|---|---|
+| `layout` | layout bên trong không ảnh hưởng ngoài |
+| `paint` | con không vẽ tràn ra ngoài (clip) |
+| `size` | kích thước không phụ thuộc con |
+| `content` | = layout + paint (+ style) — dùng phổ biến |
+| `strict` | = tất cả — mạnh nhất, cần kích thước rõ |
+
+Containment đặc biệt giá trị cho component lặp lại nhiều (list item, card grid): nó giới hạn "bán kính ảnh hưởng" của mỗi cập nhật.
+
+---
+
+## 5. will-change — dùng đúng liều
+
+`will-change` báo trước cho trình duyệt thăng một phần tử lên layer riêng để chuẩn bị animate (transform/opacity rẻ). Nhưng **lạm dụng phản tác dụng**: mỗi layer tốn bộ nhớ GPU.
+
+```css
+/* ✅ Báo trước NGAY TRƯỚC khi animate, gỡ sau khi xong */
+.menu { will-change: transform; }       /* chỉ khi sắp/đang animate */
+
+/* ❌ will-change tràn lan trên mọi thứ → layer explosion, tốn VRAM, chậm hơn */
+* { will-change: transform; }            /* đừng bao giờ */
+```
+
+```ts
+// Pattern: bật will-change khi sắp animate, gỡ khi xong
+el.style.willChange = 'transform';
+el.addEventListener('transitionend', () => { el.style.willChange = 'auto'; }, { once: true });
+```
+
+> Quy tắc: chỉ thăng phần tử *thật sự* sắp animate; số layer ít. Trình duyệt cũng tự thăng layer cho transform/opacity animation, nên thường không cần `will-change` thủ công — chỉ thêm khi đo thấy jank lúc bắt đầu animation.
+
+---
+
+## 6. Selector cost & các điểm khác
+
+Chi phí selector hiếm khi là bottleneck chính, nhưng trên cây DOM lớn với CSS phức tạp thì đáng lưu ý:
+
+```text
+✅ Lành mạnh:
+  - selector phẳng, theo class (.btn-primary)
+  - tránh descendant sâu, universal trong selector nóng
+  - dùng transform/opacity cho animation (mục 1)
+  - giảm số DOM node (cây nhỏ → style/layout nhanh)
+  - dùng CSS thay JS cho animation khi có thể (chạy off-main-thread)
+⚠️ Coi chừng:
+  - animate width/height/top/left (gây reflow mỗi khung)
+  - box-shadow/filter lớn (paint đắt) animate liên tục
+  - DOM khổng lồ (>vài nghìn node) làm mọi recalculation chậm
+```
+
+Đo bằng tab Performance: track "Rendering" (tím = recalc style + layout; xanh lá = paint). Cảnh báo "Forced reflow" và paint flashing (Rendering pane) chỉ thẳng vào thủ phạm.
+
+---
+
+## 7. Tóm tắt
+
+- Thay đổi style có ba mức chi phí: **transform/opacity (composite, rẻ)** < color/bg (paint) < **width/top/DOM (layout/reflow, đắt)**; animate thì chỉ chạm transform/opacity.
+- **Forced reflow / layout thrashing**: đọc hình học sau khi ghi style buộc layout đồng bộ; **gom đọc trước, ghi sau**, dồn ghi vào `rAF`.
+- **`content-visibility: auto`** bỏ qua layout/paint ngoài viewport (kèm `contain-intrinsic-size` để tránh CLS) — mạnh cho trang dài.
+- **CSS `contain`** cô lập vùng render, giới hạn bán kính ảnh hưởng của cập nhật — tốt cho component lặp lại.
+- **`will-change`** dùng đúng liều (bật trước animate, gỡ sau); lạm dụng gây layer explosion tốn VRAM.
+- Giữ **DOM nhỏ**, selector phẳng; đo bằng track Rendering + cảnh báo Forced reflow trong Performance.
+
+**Phần tiếp theo:** Memory & long-session performance — rò rỉ bộ nhớ, detached DOM, `measureUserAgentSpecificMemory`, và vì sao SPA chậm dần sau nhiều giờ dùng.

@@ -1,0 +1,197 @@
+---
+title: 'How Browsers Work · Part 7 — The Event Loop, Tasks & Microtasks'
+description: 'The model that ties JS to rendering: the task queue, the microtask queue, where promises and rAF fit, why a long task freezes the page, and how rendering is scheduled between tasks.'
+pubDate: 2026-10-17
+tags: [browser, internals, event-loop, async, javascript, browser_internals_12]
+series: browser-internals
+seriesOrder: 7
+draft: true
+---
+
+Phần 1 và 5 đã nêu **JavaScript và render dùng chung một luồng chính** trong mỗi tiến trình renderer. **Event loop** là bộ lập lịch quyết định *cái gì chạy tiếp* trên luồng đó — và do đó trang có paint, phản hồi input, hay đứng im.
+
+Nếu V8 (Phần 6) là *cách* JS thực thi, event loop là *khi nào* — và là cầu nối giữa callback async, promise, và các bước render từ Phần 5.
+
+```text
+┌──────────────────────────────────────────────┐
+│              Main thread (one stack)          │
+│  ┌─────────────────────────────────────────┐ │
+│  │  Run one macrotask (task)               │ │
+│  └──────────────────┬──────────────────────┘ │
+│                     ▼                          │
+│  ┌─────────────────────────────────────────┐ │
+│  │  Drain microtask queue (all of it)      │ │
+│  └──────────────────┬──────────────────────┘ │
+│                     ▼                          │
+│  ┌─────────────────────────────────────────┐ │
+│  │  Rendering steps (if needed this frame) │ │
+│  │  → rAF callbacks → style/layout/paint   │ │
+│  └──────────────────┬──────────────────────┘ │
+│                     ▼                          │
+│              Next macrotask…                   │
+└──────────────────────────────────────────────┘
+```
+
+---
+
+## 1. Một luồng, nhiều nguồn việc
+
+Trình duyệt đưa việc tới luồng chính từ nhiều nơi: input người dùng, timer, phản hồi mạng, `postMessage`, promise resolve, và hơn nữa. Tất cả phải được **tuần tự hóa** — chỉ một call stack, một việc chạy tại một thời điểm.
+
+Công việc event loop đơn giản đến lừa đảo:
+
+1. Chọn **task** (macrotask) kế tiếp và chạy tới hết.
+2. Chạy **mọi** **microtask** đang chờ tới khi hàng microtask rỗng.
+3. Tùy chọn chạy **bước render** (gồm callback `requestAnimationFrame`) nếu deadline khung hình cần.
+4. Lặp lại.
+
+Bước 1–2 xảy ra nhiều lần mỗi khung; bước 3 thường nhắm ~60 Hz nhưng có thể bỏ qua nếu luồng chính vẫn bận.
+
+---
+
+## 2. Macrotask (task)
+
+**Macrotask** — thường gọi **task** — là một đơn vị việc event loop lên lịch một cái mỗi lượt. Nguồn task phổ biến:
+
+| Source | Ví dụ |
+|--------|-------------------|
+| DOM events | `click`, `input`, `keydown` handlers |
+| Timers | `setTimeout`, `setInterval` callbacks |
+| Network | `fetch().then()` runs a microtask, but the initial callback scheduling often originates from a task |
+| I/O | `message` event from `postMessage`, some WebSocket handlers |
+| Navigation | `pageshow`, history changes |
+
+Mỗi task chạy tới khi call stack unwind — không preempt giữa function. Handler click 200 ms chặn mọi thứ xếp hàng sau nó trong 200 ms.
+
+---
+
+## 3. Microtask: promise và bạn bè
+
+**Hàng microtask** được xả **hoàn toàn sau mỗi task** (và sau mỗi callback microtask — microtask có thể enqueue thêm microtask). Nguồn gồm:
+
+- **`Promise.then` / `catch` / `finally`** và continuation **`await`**.
+- **`queueMicrotask()`**.
+- Callback **`MutationObserver`** (mutation DOM quan sát đồng bộ sau task gây ra chúng).
+
+Microtask chạy **trước** macrotask kế tiếp và **trước** render cho cơ hội khung hình đó. Đó là lý do "sau handler click này, mọi chuỗi promise xong trước click kế tiếp" — và vì sao vòng lặp `Promise.resolve().then(() => enqueue again)` vô hạn đói render.
+
+---
+
+## 4. Thứ tự: ví dụ đi từng bước
+
+Xét script này:
+
+```js
+console.log('1 sync');
+
+setTimeout(() => console.log('2 timeout'), 0);
+
+Promise.resolve()
+  .then(() => console.log('3 microtask A'))
+  .then(() => console.log('4 microtask B'));
+
+queueMicrotask(() => console.log('5 queueMicrotask'));
+
+console.log('6 sync');
+```
+
+**Output chính xác:**
+
+```text
+1 sync
+6 sync
+3 microtask A
+5 queueMicrotask
+4 microtask B
+2 timeout
+```
+
+Vì sao:
+
+1. `1 sync` và `6 sync` chạy đồng bộ trong lần thực thi script ban đầu (task đầu tiên).
+2. `setTimeout` lên lịch **macrotask**; `Promise` và `queueMicrotask` enqueue **microtask**.
+3. Khi task đầu xong, event loop **xả mọi microtask** theo thứ tự: `3`, rồi `5`, rồi `4` (chuỗi từ `3`).
+4. Chỉ sau đó macrotask kế chạy: `2 timeout`.
+
+> Quy tắc ngón cái: **sync → microtask → macrotask kế → (có thể render) → lặp**.
+
+---
+
+## 5. Render nằm ở đâu
+
+Giữa các macrotask, trình duyệt có thể chạy giai đoạn **"update the rendering"** (thuật ngữ spec HTML) — đại khái mỗi lần refresh màn hình, không phải sau mọi task. Giai đoạn đó gồm:
+
+1. Callback **`requestAnimationFrame`** (theo thứ tự đăng ký).
+2. **Style, layout, paint** (khi cần — Phần 5).
+3. **Việc compositor** (thường trên luồng khác).
+
+Thứ tự then chốt: **microtask chạy trước rAF và trước paint** cho một cơ hội khung hình. Nếu chuỗi promise mutate DOM, mutation hiện với callback rAF cùng khung — nhưng chuỗi microtask *dài* có thể đẩy rAF qua deadline khung.
+
+```js
+Promise.resolve().then(() => {
+  element.style.transform = 'translateX(100px)'; // microtask — before rAF
+});
+
+requestAnimationFrame(() => {
+  // reads layout after the transform above is applied
+  console.log(element.getBoundingClientRect().left);
+});
+```
+
+---
+
+## 6. Long task và độ trễ input
+
+Vì task và microtask không preempt, mọi việc đồng bộ dài hơn ~**50 ms** được phân loại **long task** (Performance API) và trực tiếp hại tương tác. Trong lúc long task chạy:
+
+- Sự kiện input xếp hàng nhưng handler không chạy.
+- Bước render bị bỏ qua hoặc trễ.
+- Trang cảm giác đóng băng — nguyên nhân gốc luồng chính đằng sau **INP** (Interaction to Next Paint) kém.
+
+Cách sửa theo mô hình: **nhường** luồng chính, chia việc qua nhiều task, chuyển tính toán nặng sang Web Worker. Mục tiêu giữ mỗi task dưới ngân sách khung để input và paint được lượt.
+
+---
+
+## 7. API lập lịch: khi nào dùng gì
+
+### `setTimeout(fn, 0)` và clamp tối thiểu
+
+`setTimeout(..., 0)` **không** chạy ngay — nó xếp macrotask sau microtask, và trình duyệt **clamp** timeout lồng nhau/tối thiểu (lịch sử 4 ms, dài hơn ở tab nền). Dùng để hoãn việc sang lượt task kế, không cho visual khớp khung hình.
+
+### `requestAnimationFrame`
+
+Cho animation và đọc DOM phải xảy ra trước paint, **rAF** là hook đúng — chạy sau microtask của khung và trước style/layout/paint. Nối cập nhật mỗi khung trong rAF, không phải setTimeout.
+
+### `requestIdleCallback`
+
+**`requestIdleCallback`** lên lịch việc ưu tiên thấp trong thời gian rảnh *sau* render, với object deadline cho biết còn bao nhiêu thời gian an toàn. Tốt cho prefetch, log không gấp, hoặc chunk index nền — không cho thứ user thấy trên đường quan trọng. Không có trên Web Worker; hỗ trợ tốt trên Chromium, kiểm tra target cho Safari.
+
+### `scheduler.yield()` và `scheduler.postTask()`
+
+Bổ sung **Scheduler API** hiện đại cho phép nhường hợp tác:
+
+- **`scheduler.yield()`** — tạm dừng async function, để trình duyệt xử lý việc ưu tiên cao hơn (input, render), rồi tiếp tục.
+- **`scheduler.postTask()`** — lên lịch task với ưu tiên rõ (`user-blocking`, `user-visible`, `background`).
+
+```js
+async function processChunked(items) {
+  for (const item of items) {
+    heavyWork(item);
+    await scheduler.yield(); // let input + rendering breathe
+  }
+}
+```
+
+`navigator.scheduling?.isInputPending()` (nơi hỗ trợ) cho yield sớm nếu user đang tương tác. Các API này mã hóa điều event loop đã làm ngầm — nhưng cho *bạn* kiểm soát khi nhả luồng.
+
+---
+
+## Tóm tắt
+
+- **Event loop** tuần tự hóa mọi JS luồng chính: một **macrotask** mỗi lượt, rồi **mọi microtask**, rồi **render** tùy chọn.
+- **Microtask** (promise, `queueMicrotask`, `MutationObserver`) luôn chạy trước macrotask kế và trước paint.
+- Thứ tự: **code sync → microtask → task kế → (rAF → style/layout/paint)**.
+- **Long task** (>50 ms) chặn input và render — lõi vấn đề INP; nhường bằng worker, chunk, hoặc `scheduler.yield()`.
+- Dùng **rAF** cho visual, **idle callback** cho việc nền, **`scheduler.yield()`** để nhường luồng chính hợp tác.
+
+**Phần tiếp theo:** Bộ nhớ và garbage collection — V8 quản lý heap thế nào, vì sao leak xảy ra trong SPA, và DevTools cho bạn thấy gì.

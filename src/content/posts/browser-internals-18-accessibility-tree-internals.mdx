@@ -1,0 +1,141 @@
+---
+title: 'How Browsers Work · Part 18 — Accessibility Tree Internals'
+description: 'Trình duyệt dựng cây accessibility song song với DOM thế nào: role/name/state, thuật toán tính tên, cây bị cắt tỉa, và cách screen reader truy vấn qua API nền tảng (UIA/AX/AT-SPI).'
+pubDate: 2026-11-08
+tags: [browser, internals, accessibility, a11y, browser_internals_12]
+series: browser-internals
+seriesOrder: 18
+draft: true
+---
+
+Ta đã theo DOM qua render và compositing. Nhưng có một cây thứ hai trình duyệt dựng song song mà developer ít khi thấy: **accessibility tree (cây a11y)**. Đây là cách trình duyệt mô tả trang cho công nghệ hỗ trợ (screen reader, công cụ điều khiển bằng giọng nói). Hiểu nó biến accessibility từ "đoán mò ARIA" thành mô hình rõ ràng.
+
+---
+
+## 1. Cây thứ ba của trang
+
+Bạn đã biết DOM tree và (từ Phần 13) layer tree. Cây thứ ba là **accessibility tree** — dẫn xuất từ DOM nhưng phục vụ AT.
+
+```text
+HTML ─► DOM tree ──► Render tree ─► Layout ─► Paint  (cho mắt)
+             │
+             └──────► Accessibility tree ─► platform API ─► screen reader (cho AT)
+```
+
+Mỗi node a11y chứa bộ thuộc tính ngữ nghĩa, quan trọng nhất là **role**, **name**, **state/value** và quan hệ cha–con.
+
+---
+
+## 2. Role, name, state — bộ ba ngữ nghĩa
+
+| Thuộc tính | Nghĩa | Nguồn |
+|---|---|---|
+| **Role** | "Đây là cái gì" (button, link, heading…) | thẻ HTML ngầm (`<button>`) hoặc `role=` |
+| **Name** | "Tên gọi để đọc lên" | thuật toán tính tên (mục 3) |
+| **State/Value** | checked, expanded, disabled, value… | thuộc tính HTML + ARIA |
+
+HTML ngữ nghĩa cho cả ba *miễn phí*: `<button>Lưu</button>` có role=button, name="Lưu", và state khi `disabled`. ARIA chỉ nên dùng khi không có phần tử HTML phù hợp — "No ARIA is better than bad ARIA".
+
+```html
+<!-- ✅ HTML ngữ nghĩa: role + name + state tự có -->
+<button disabled>Lưu</button>
+
+<!-- 🟡 phải tự cấp mọi thứ, dễ sai -->
+<div role="button" tabindex="0" aria-disabled="true">Lưu</div>
+```
+
+---
+
+## 3. Thuật toán tính tên (accessible name computation)
+
+"Name" không hiển nhiên — trình duyệt chạy một thuật toán có thứ tự ưu tiên (ACCName) để quyết định đọc gì:
+
+```text
+Thứ tự ưu tiên (đơn giản hoá):
+1. aria-labelledby  (trỏ tới id phần tử khác → dùng text của nó)
+2. aria-label       (chuỗi trực tiếp)
+3. nhãn gắn kết:     <label for>, alt của <img>, text bên trong <button>
+4. title            (fallback yếu)
+→ nếu rỗng: phần tử "không có tên" (screen reader đọc chung chung)
+```
+
+```html
+<!-- aria-labelledby thắng mọi thứ khác -->
+<button aria-label="Đóng" aria-labelledby="t1">
+  <span id="t1">Huỷ</span>      <!-- name = "Huỷ" (labelledby thắng) -->
+</button>
+
+<!-- input lấy name từ label liên kết -->
+<label for="email">Email</label>
+<input id="email" type="email">  <!-- name = "Email" -->
+```
+
+> Cạm bẫy: `aria-label`/`aria-labelledby` *ghi đè* nội dung hiển thị. Người dùng giọng nói nói "click Huỷ" nhưng label là "Đóng" → lệnh không khớp. Giữ accessible name khớp với text nhìn thấy.
+
+---
+
+## 4. Cây bị cắt tỉa — vì sao thiếu node
+
+Accessibility tree **không** ánh xạ 1–1 với DOM. Trình duyệt cắt tỉa:
+
+- `display:none` / `visibility:hidden` → **loại khỏi** cây a11y.
+- `aria-hidden="true"` → loại bỏ node và con khỏi a11y (nhưng vẫn hiển thị cho mắt!).
+- Node thuần trình bày (div bao bọc) có thể bị gộp/bỏ.
+- `inert` → loại khỏi tương tác và a11y.
+
+```text
+DOM                         Accessibility tree
+<header>                    header
+  <div class="wrap">          (gộp, bỏ wrapper)
+    <button>Menu</button>     button "Menu"
+  <span aria-hidden> ✕        (loại bỏ)
+```
+
+Hệ quả thực tế: `aria-hidden="true"` trên phần tử *có thể focus* tạo bug nguy hiểm — AT bỏ qua nó nhưng người dùng vẫn tab tới được, gây "focus mồ côi". Dùng `inert` để vừa ẩn a11y vừa chặn focus.
+
+---
+
+## 5. Screen reader truy vấn thế nào
+
+Trình duyệt không "đọc" gì — nó *xuất* accessibility tree qua **API nền tảng**, và screen reader (process riêng) truy vấn qua đó:
+
+```text
+Renderer (a11y tree)
+   │  ánh xạ sang API hệ điều hành
+   ▼
+ Windows: UI Automation (UIA / IAccessible2)
+ macOS:   NSAccessibility (AX)
+ Linux:   AT-SPI
+   │
+   ▼
+Screen reader (NVDA / JAWS / VoiceOver / Orca) ─► giọng nói / chữ nổi
+```
+
+Dựng cây a11y có chi phí, nên trình duyệt thường dựng **lười** — chỉ khi phát hiện AT đang chạy hoặc khi API được truy vấn. Vì vậy bật DevTools "Accessibility" pane hay axe-core sẽ kích hoạt việc tính toán này.
+
+---
+
+## 6. Kiểm tra cây a11y
+
+- DevTools → **Elements → Accessibility** pane: xem role/name computed và "Accessibility Tree" đầy đủ.
+- `axe-core` / Lighthouse: bắt lỗi tự động (thiếu name, tương phản, thứ tự heading).
+- Test thật bằng VoiceOver (macOS: ⌘F5) / NVDA — công cụ tự động chỉ bắt ~30–40% vấn đề.
+
+```js
+// Lấy thông tin a11y computed qua CDP / Puppeteer
+const snapshot = await page.accessibility.snapshot();
+// → cây { role, name, children } như screen reader thấy
+```
+
+---
+
+## 7. Tóm tắt
+
+- Trình duyệt dựng **accessibility tree** song song DOM, mô tả trang cho AT bằng **role / name / state**.
+- HTML ngữ nghĩa cho role+name+state miễn phí; ARIA chỉ dùng khi không có phần tử phù hợp.
+- **Accessible name** tính theo thứ tự: `aria-labelledby` → `aria-label` → nhãn/alt/text → `title`; giữ name khớp text hiển thị.
+- Cây a11y **bị cắt tỉa**: `display:none`/`aria-hidden`/`inert` loại node; cẩn thận `aria-hidden` trên phần tử focus được (dùng `inert`).
+- Trình duyệt xuất cây qua **API nền tảng** (UIA/AX/AT-SPI); screen reader là process riêng truy vấn qua đó; cây thường dựng lười.
+- Kiểm tra bằng Accessibility pane, axe-core/Lighthouse, và test thật với VoiceOver/NVDA.
+
+**Phần tiếp theo:** Image & media decoding pipeline — ảnh đi từ byte tới pixel ra sao, decode đồng bộ vs bất đồng bộ, `decoding="async"`/`Image.decode()`, `createImageBitmap`, và OffscreenCanvas cho xử lý ngoài luồng chính.

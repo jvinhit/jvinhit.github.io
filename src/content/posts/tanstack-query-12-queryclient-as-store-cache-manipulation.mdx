@@ -1,0 +1,230 @@
+---
+title: 'TanStack Query · Phần 12 — QueryClient như một store: thao tác cache chủ động'
+description: 'Đọc-ghi cache trực tiếp với getQueryData/setQueryData và bản số nhiều getQueriesData/setQueriesData, invalidate bằng predicate và refetchType, cancelQueries/removeQueries, rồi subscribe vào cache để đồng bộ chéo.'
+pubDate: 2026-07-03
+tags: [react, tanstack-query, react-query, cache, tanstack_query_8]
+series: tanstack-query
+seriesOrder: 12
+draft: false
+---
+
+Hầu hết thời gian bạn để React Query tự quản cache: query đọc, mutation invalidate, Query lo phần còn lại. Nhưng có những lúc bạn cần **cầm lái** — ghi thẳng vào cache không qua mạng, sửa nhiều query một lúc, hay đồng bộ hai phần cache liên quan. Lúc đó `QueryClient` trở thành một **store đọc-ghi được** mà bạn thao tác trực tiếp.
+
+Phần này là "API reference có chú giải" cho mặt store của `QueryClient`, kèm các pattern thực chiến. Đây là nền cho optimistic update đa query (Phần 15) và realtime (Phần 14).
+
+---
+
+## 1. `getQueryData` / `setQueryData` — một entry
+
+```ts
+import { queryClient } from '@/lib/query-client';
+
+// Đọc snapshot hiện tại (đồng bộ, có thể undefined nếu chưa cache)
+const customer = queryClient.getQueryData<Customer>(customerKeys.detail(id));
+
+// Ghi đè trực tiếp
+queryClient.setQueryData(customerKeys.detail(id), updatedCustomer);
+```
+
+`setQueryData` chấp nhận **giá trị mới** hoặc **hàm updater** (an toàn hơn vì thấy giá trị hiện tại):
+
+```ts
+queryClient.setQueryData<Customer>(customerKeys.detail(id), (old) => {
+  if (!old) return old; // chưa có cache → đừng tạo data từ hư không
+  return { ...old, name: 'Tên mới' };
+});
+```
+
+> **Quy tắc vàng:** trong updater, nếu `old === undefined` thì **trả về `undefined`** (không đổi). Tự "bịa" một entry từ data một phần dễ tạo state nửa vời mà component không xử lý nổi.
+
+`setQueryData` cập nhật **đồng bộ** và làm mọi observer của key đó re-render ngay — không gọi mạng. Đây là cốt lõi của optimistic update và cập nhật từ sự kiện realtime.
+
+---
+
+## 2. Updater bất biến & vai trò của structural sharing
+
+`setQueryData` **không** tự clone — bạn phải trả về object mới một cách bất biến, đúng như reducer:
+
+```ts
+// Cập nhật một phần tử trong list cache
+queryClient.setQueryData<Customer[]>(customerKeys.lists(), (old) =>
+  old?.map((c) => (c.id === id ? { ...c, status: 'active' } : c)),
+);
+```
+
+Sau khi bạn trả về data mới, Query chạy **structural sharing** (Phần 7): những phần tử *không đổi* giữ nguyên tham chiếu, chỉ phần tử đổi nhận tham chiếu mới. Hệ quả: component render từng row với `React.memo` chỉ re-render đúng row đã đổi.
+
+---
+
+## 3. `getQueriesData` / `setQueriesData` — nhiều entry qua filter
+
+Khi một thay đổi ảnh hưởng **nhiều** query (vd đổi tên user xuất hiện ở nhiều list đã lọc/sắp xếp khác nhau), dùng bản số nhiều với **query filter**:
+
+```ts
+// Đọc mọi cache khớp prefix ['customers', 'list', ...]
+const entries = queryClient.getQueriesData<Customer[]>({
+  queryKey: customerKeys.lists(),
+});
+// entries: [[queryKey, data], ...]
+
+// Ghi vào MỌI list cache cùng lúc
+queryClient.setQueriesData<Customer[]>(
+  { queryKey: customerKeys.lists() },
+  (old) => old?.map((c) => (c.id === id ? { ...c, name: newName } : c)),
+);
+```
+
+Query filter nhận: `queryKey` (prefix), `exact`, `type` (`'active' | 'inactive' | 'all'`), `stale`, và `predicate` (mục 4). Đây là cách "phát sóng" một thay đổi tới mọi biến thể của một query mà không cần biết hết các tham số lọc/sắp xếp.
+
+---
+
+## 4. `invalidateQueries` nâng cao: `predicate` & `refetchType`
+
+`invalidateQueries` đánh dấu query là stale **và** refetch những query đang active. Nhưng bạn kiểm soát được *cái nào* và *refetch ra sao*:
+
+```ts
+// Invalidate có điều kiện tinh vi qua predicate
+queryClient.invalidateQueries({
+  predicate: (query) =>
+    query.queryKey[0] === 'customers' &&
+    // chỉ invalidate list có filter 'archived'
+    typeof query.queryKey[2] === 'object' &&
+    (query.queryKey[2] as { status?: string }).status === 'archived',
+});
+```
+
+`refetchType` quyết định query nào được **fetch lại** ngay sau khi đánh dấu stale:
+
+| `refetchType` | Hành vi |
+|---|---|
+| `'active'` (mặc định) | Chỉ refetch query đang có observer (đang hiển thị) |
+| `'all'` | Refetch cả query inactive (đang trong cache nhưng không hiển thị) |
+| `'none'` | Chỉ đánh dấu stale, **không** refetch — để lần dùng sau tự fetch |
+
+```ts
+// Đánh dấu stale nhưng KHÔNG refetch ngay (vd sắp rời trang, refetch là phí)
+queryClient.invalidateQueries({ queryKey: customerKeys.all, refetchType: 'none' });
+```
+
+> **`invalidateQueries` vs `setQueryData`:** invalidate = "data này có thể sai, đi hỏi server lại" (tốn request, luôn đúng). `setQueryData` = "tôi *biết* giá trị mới, ghi thẳng" (không request, nhưng bạn chịu trách nhiệm về tính đúng). Realtime/optimistic ưu tiên `setQueryData`; sau ghi không chắc chắn thì `invalidateQueries`.
+
+---
+
+## 5. `cancelQueries` & `removeQueries`
+
+```ts
+// Huỷ các request đang bay cho key này (chuẩn bị optimistic update — Phần 6)
+await queryClient.cancelQueries({ queryKey: customerKeys.detail(id) });
+
+// Xoá hẳn entry khỏi cache (vd sau khi xoá tài nguyên, hoặc khi logout)
+queryClient.removeQueries({ queryKey: customerKeys.detail(id) });
+```
+
+- `cancelQueries` cần thiết trước optimistic update: nếu một refetch đang bay, nó có thể về *sau* và đè lên data optimistic của bạn. Huỷ trước để tránh.
+- `removeQueries` xoá sạch entry (không chỉ đánh dấu stale). Hữu ích khi data không còn ý nghĩa (đã xoá, hoặc logout cần dọn cache user).
+
+Khi **logout**, thường gọi `queryClient.clear()` để xoá toàn bộ cache, tránh user mới thấy data user cũ.
+
+---
+
+## 6. `queryClient.subscribe` — đồng bộ chéo ngoài React
+
+`QueryCache` phát sự kiện mỗi khi có thay đổi (added, updated, removed). Bạn `subscribe` để chạy side-effect *ngoài* vòng render — vd ghi log, đồng bộ hai cache liên quan, hoặc bắc cầu sang một store khác:
+
+```ts
+const unsubscribe = queryClient.getQueryCache().subscribe((event) => {
+  if (event.type === 'updated' && event.query.queryKey[0] === 'cart') {
+    // Mỗi khi cache 'cart' đổi, cập nhật badge số lượng ngoài React tree.
+    const cart = event.query.state.data as CartItem[] | undefined;
+    updateCartBadge(cart?.length ?? 0);
+  }
+});
+
+// Nhớ huỷ khi không cần (vd khi app unmount).
+```
+
+Tương tự, `queryClient.getMutationCache().subscribe(...)` cho sự kiện mutation. Đây là cơ chế nền của Devtools và các tiện ích như `broadcastQueryClient` (Phần 13).
+
+---
+
+## 7. Pattern thực chiến: ghi từ detail vào list (và ngược lại)
+
+Một thao tác hay gặp: user sửa chi tiết một item, ta đã có data mới — đồng bộ cả entry detail lẫn các list chứa nó mà **không refetch**:
+
+```ts
+function syncCustomerEverywhere(updated: Customer) {
+  // 1) entry chi tiết
+  queryClient.setQueryData(customerKeys.detail(updated.id), updated);
+
+  // 2) mọi list đang cache (mọi filter/sort)
+  queryClient.setQueriesData<Customer[]>(
+    { queryKey: customerKeys.lists() },
+    (old) => old?.map((c) => (c.id === updated.id ? updated : c)),
+  );
+}
+```
+
+Ngược lại, khi prefetch một list, bạn có thể "mồi" luôn cache detail cho từng item để mở chi tiết là tức thì:
+
+```ts
+function seedDetailsFromList(customers: Customer[]) {
+  for (const c of customers) {
+    // Chỉ set nếu chưa có, để không đè data detail (có thể đầy đủ hơn).
+    if (queryClient.getQueryData(customerKeys.detail(c.id)) === undefined) {
+      queryClient.setQueryData(customerKeys.detail(c.id), c);
+    }
+  }
+}
+```
+
+> **Cẩn thận shape:** chỉ làm vậy khi item trong list **cùng shape** với detail. Nếu detail có thêm field (vd `orders`), mồi từ list sẽ tạo data thiếu — khi đó hãy để detail tự fetch.
+
+---
+
+## 8. Bài tập
+
+**1.** Khi nào nên dùng `setQueryData` thay vì `invalidateQueries`, và đánh đổi là gì?
+
+<details>
+<summary>Lời giải</summary>
+
+Dùng `setQueryData` khi bạn *đã biết chắc* giá trị mới (kết quả mutation, sự kiện realtime) — cập nhật tức thì, không tốn request. Đánh đổi: bạn chịu trách nhiệm về tính đúng; nếu shape lệch hoặc server còn biến đổi data, cache sẽ sai. `invalidateQueries` luôn đúng (hỏi lại server) nhưng tốn request và có độ trễ. Thực tế hay kết hợp: `setQueryData` cho tức thì, rồi `invalidateQueries` để chốt sự thật.
+
+</details>
+
+**2.** `refetchType: 'none'` dùng để làm gì?
+
+<details>
+<summary>Lời giải</summary>
+
+Đánh dấu query là stale nhưng *không* refetch ngay. Hợp khi bạn biết data đã cũ nhưng chưa cần fetch lại lúc này (vd sắp điều hướng đi, hoặc query inactive) — lần sau query được dùng/được focus nó sẽ tự refetch. Tránh tạo request thừa ngay tại thời điểm invalidate.
+
+</details>
+
+**3.** Vì sao phải `cancelQueries` trước khi optimistic update?
+
+<details>
+<summary>Lời giải</summary>
+
+Một refetch đang bay có thể resolve *sau* khi bạn ghi data optimistic và **đè** lên nó bằng data cũ từ server, làm UI nhảy ngược. `cancelQueries` huỷ các request đang bay cho key đó trước, đảm bảo data optimistic không bị ghi đè cho tới khi mutation hoàn tất.
+
+</details>
+
+**Nâng cao:** Viết `syncCustomerEverywhere` ở mục 7 và gọi nó trong `onSuccess` của mutation sửa. Mở Devtools, sửa một customer, xác nhận cả entry detail lẫn các list đều cập nhật ngay mà **không** có request refetch nào.
+
+---
+
+## Tóm tắt
+
+- `QueryClient` là **store đọc-ghi**: `getQueryData`/`setQueryData` cho một entry (updater bất biến, trả `undefined` khi chưa có cache).
+- `getQueriesData`/`setQueriesData` + **query filter** cập nhật nhiều entry cùng lúc — phát một thay đổi tới mọi biến thể.
+- `invalidateQueries` mạnh nhờ `predicate` (chọn lọc) và `refetchType` (`active`/`all`/`none`).
+- `cancelQueries` (trước optimistic), `removeQueries`/`clear()` (logout, dọn data chết).
+- `getQueryCache().subscribe(...)` chạy side-effect ngoài React — nền của Devtools, broadcast, và đồng bộ chéo.
+- Pattern hay: đồng bộ detail ↔ list bằng `setQueryData`, mồi detail từ list — chỉ khi shape khớp.
+
+---
+
+## Phần tiếp theo
+
+**Phần 13 — Offline-first & Persistence sâu:** giữ cache qua reload bằng `persistQueryClient` + persister (sync/async), kiểm soát `buster`/`maxAge`, lọc dữ liệu nhạy cảm khi `dehydrate`, hàng đợi **paused mutations** chạy lại khi có mạng, và đồng bộ cache đa tab bằng `broadcastQueryClient`.

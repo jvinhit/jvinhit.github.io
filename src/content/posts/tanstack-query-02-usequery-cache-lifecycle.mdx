@@ -1,0 +1,264 @@
+---
+title: 'TanStack Query · Phần 2 — useQuery sâu & vòng đời cache'
+description: 'Phân biệt status vs fetchStatus, xử lý đầy đủ loading/error/empty, hiểu chính xác staleTime vs gcTime, các trigger refetch, và đi qua vòng đời một cache entry theo dòng thời gian.'
+pubDate: 2026-06-23
+tags: [react, tanstack-query, react-query, caching, tanstack_query_8]
+series: tanstack-query
+seriesOrder: 2
+draft: false
+---
+
+Ở [Phần 1](/blog/tanstack-query-01-mental-model-setup/) ta đã viết query đầu tiên. Phần này mổ xẻ `useQuery` cho kỹ: hai trục trạng thái mà người mới hay nhầm (`status` vs `fetchStatus`), cách render đúng cả ba ca loading/error/empty, và — quan trọng nhất — **hai bộ đếm `staleTime` và `gcTime`** quyết định khi nào Query gọi lại mạng và khi nào nó xoá cache.
+
+Hiểu chắc phần này, bạn sẽ thôi "đoán mò" vì sao query lúc refetch lúc không.
+
+---
+
+## 1. Giá trị `useQuery` trả về
+
+`useQuery` trả về một object lớn. Những trường hay dùng nhất:
+
+```tsx
+const {
+  data,          // dữ liệu (undefined cho tới khi có lần fetch thành công đầu tiên)
+  error,         // lỗi (null nếu không lỗi)
+  status,        // 'pending' | 'error' | 'success'  → nói về DATA
+  fetchStatus,   // 'fetching' | 'paused' | 'idle'   → nói về NETWORK
+  isPending,     // status === 'pending'
+  isError,       // status === 'error'
+  isSuccess,     // status === 'success'
+  isFetching,    // fetchStatus === 'fetching'
+  isLoading,     // isPending && isFetching (lần fetch đầu, chưa có cache)
+  refetch,       // gọi lại query thủ công
+  dataUpdatedAt, // timestamp lần data cập nhật gần nhất
+} = useQuery({ queryKey: ['users'], queryFn: fetchUsers });
+```
+
+---
+
+## 2. `status` vs `fetchStatus` — hai trục độc lập
+
+Đây là chỗ gây bối rối nhất với người mới. React Query tách trạng thái thành **hai câu hỏi khác nhau**:
+
+- **`status`** trả lời: *"Tôi đã có dữ liệu chưa?"*
+  - `pending` — chưa có data nào trong cache.
+  - `success` — đã có data.
+  - `error` — lần fetch thất bại và chưa có data để hiển thị.
+- **`fetchStatus`** trả lời: *"Ngay lúc này có đang gọi mạng không?"*
+  - `fetching` — `queryFn` đang chạy.
+  - `idle` — không làm gì.
+  - `paused` — muốn fetch nhưng không có mạng (offline).
+
+Vì sao cần tách? Vì một query **đã có data** (`status: 'success'`) vẫn **đang refetch nền** (`fetchStatus: 'fetching'`) cùng lúc. Nếu chỉ có một trục, bạn không thể vừa hiện dữ liệu cũ vừa báo "đang làm mới".
+
+| Tình huống | `status` | `fetchStatus` |
+|---|---|---|
+| Lần đầu vào, chưa có cache | `pending` | `fetching` |
+| Có cache, đang refetch nền | `success` | `fetching` |
+| Có cache, đứng yên | `success` | `idle` |
+| Lỗi, chưa có data | `error` | `idle` |
+| Muốn fetch nhưng offline | `pending` | `paused` |
+
+Hệ quả thực dụng:
+
+- `isLoading` = `isPending && isFetching` → đúng nghĩa "spinner toàn trang lần đầu".
+- `isFetching` → dùng cho **indicator nhỏ** kiểu "đang làm mới…" trong khi vẫn hiện data cũ.
+
+```tsx
+function UserList() {
+  const { data, isPending, isError, error, isFetching } = useQuery({
+    queryKey: ['users'],
+    queryFn: fetchUsers,
+  });
+
+  if (isPending) return <FullPageSpinner />;        // chưa có data → spinner to
+  if (isError) return <ErrorState message={error.message} />;
+
+  return (
+    <div>
+      {/* có data rồi nhưng đang refetch nền → chỉ báo nhẹ, không che nội dung */}
+      {isFetching ? <span className="text-muted">Đang làm mới…</span> : null}
+      <ul>{data.map((u) => <li key={u.id}>{u.name}</li>)}</ul>
+    </div>
+  );
+}
+```
+
+---
+
+## 3. Luôn xử lý đủ bốn ca: loading / error / empty / data
+
+Một lỗi rất phổ biến là quên ca **empty** (request thành công nhưng mảng rỗng). Thứ tự kiểm tra nên là:
+
+```tsx
+function CustomerList() {
+  const { data, isPending, isError, error } = useQuery({
+    queryKey: ['customers'],
+    queryFn: fetchCustomers,
+  });
+
+  if (isPending) return <ListSkeleton />;
+  if (isError) return <ErrorState message={error.message} onRetry={() => location.reload()} />;
+  if (data.length === 0) return <EmptyState label="Chưa có khách hàng nào" />;
+
+  return <CustomerTable rows={data} />;
+}
+```
+
+Vì sao đặt `isPending` và `isError` trước? Vì sau hai lệnh `return` đó, TypeScript **thu hẹp kiểu** và hiểu rằng `data` chắc chắn đã tồn tại — nên `data.length` không còn báo lỗi "possibly undefined". Đây là cách viết vừa an toàn type vừa đúng UX.
+
+---
+
+## 4. `staleTime` vs `gcTime` — hai bộ đếm hay bị nhầm
+
+Đây là khái niệm cốt lõi nhất của React Query. Hai cái tên gần giống nhau nhưng trả lời hai câu hỏi khác hẳn:
+
+| Bộ đếm | Trả lời câu hỏi | Mặc định |
+|--------|------------------|----------|
+| **`staleTime`** | Data được coi là *tươi* trong bao lâu (không refetch nền)? | `0` (luôn stale ngay) |
+| **`gcTime`** | Sau khi không còn component nào dùng, bao lâu thì *xoá* cache? | `5 phút` |
+
+Nói cách khác:
+
+- **`staleTime` điều khiển việc REFETCH.** Trong khoảng tươi, Query phục vụ data từ cache mà *không* gọi mạng. Hết khoảng đó, data thành "stale" và Query sẽ refetch nền ở các thời điểm thích hợp.
+- **`gcTime` điều khiển BỘ NHỚ.** Khi một query không còn observer nào (không component nào đang dùng), nó thành "inactive". Sau `gcTime`, cache entry bị **garbage-collected** (xoá). (`gc` = garbage collection; ở v4 tên cũ là `cacheTime`.)
+
+Điểm mấu chốt: **một query có thể vừa stale vừa vẫn còn trong cache.** Khi đó Query hiện data cũ *ngay lập tức*, rồi mới revalidate nền — đây chính là trải nghiệm "instant rồi tự cập nhật" mà `useEffect` không cho miễn phí.
+
+```ts
+// fresh trong 30s, giữ cache 10 phút sau khi không còn ai dùng
+useQuery({
+  queryKey: ['profile'],
+  queryFn: fetchProfile,
+  staleTime: 30_000,
+  gcTime: 10 * 60_000,
+});
+```
+
+> **Cách chọn `staleTime`:** data ít đổi (cấu hình, hồ sơ) → đặt `staleTime` cao (vài phút đến `Infinity`) để khỏi refetch thừa. Data đổi liên tục (giá realtime, tồn kho) → để thấp hoặc `0`. Đặt mặc định hợp lý ở `QueryClient` (Phần 1), rồi override từng query khi cần.
+
+---
+
+## 5. Khi nào Query tự refetch?
+
+Khi một query đang **stale**, React Query sẽ refetch nền ở các thời điểm sau (đều bật mặc định):
+
+- **`refetchOnMount`** — khi một component mới dùng query mount lên.
+- **`refetchOnWindowFocus`** — khi user quay lại tab trình duyệt.
+- **`refetchOnReconnect`** — khi mạng kết nối lại.
+
+Nếu data còn **fresh** (trong `staleTime`), tất cả các trigger trên đều bị bỏ qua — không tốn request. Đó là lý do `staleTime` là cần gạt quan trọng để cân bằng giữa "data mới" và "đỡ tốn mạng".
+
+Bạn có thể tắt từng cái:
+
+```ts
+useQuery({
+  queryKey: ['settings'],
+  queryFn: fetchSettings,
+  staleTime: Infinity,          // không bao giờ tự coi là stale
+  refetchOnWindowFocus: false,  // không refetch khi focus lại
+});
+```
+
+Ngoài ra còn `refetchInterval` để polling định kỳ:
+
+```ts
+useQuery({
+  queryKey: ['notifications'],
+  queryFn: fetchNotifications,
+  refetchInterval: 10_000, // poll mỗi 10s — hợp cho dữ liệu gần realtime
+});
+```
+
+---
+
+## 6. Vòng đời một cache entry theo dòng thời gian
+
+Ghép tất cả lại, đây là hành trình của một query với `staleTime: 60s`, `gcTime: 5 phút`:
+
+```text
+t=0      Mount <UserList> → key ['users'] chưa có cache
+         → status=pending, fetchStatus=fetching → queryFn chạy
+         → thành công → data vào cache, status=success, đánh dấu FRESH
+
+t=0..60s Data FRESH. Mọi mount mới / focus tab → KHÔNG refetch, dùng cache ngay
+
+t=10s    Rời tab rồi quay lại → vẫn fresh → KHÔNG refetch
+
+t=70s    Quay lại tab → data đã STALE (>60s)
+         → hiện data cũ NGAY, đồng thời refetch nền (fetchStatus=fetching)
+         → response về → cache cập nhật, lại FRESH
+
+t=200s   Unmount <UserList> → không còn observer → query thành INACTIVE
+         → gcTime (5 phút) bắt đầu đếm
+
+t=200s+5p Không component nào dùng lại trong 5 phút → cache entry bị XOÁ
+          → lần sau mount lại sẽ là pending + fetch từ đầu
+```
+
+Mở Devtools và quan sát đúng dòng thời gian này: query đổi màu fresh → stale → fetching, rồi chuyển sang "inactive" khi bạn unmount, và biến mất sau `gcTime`. Khi đã "thấy tận mắt", mọi quyết định cấu hình về sau đều dễ.
+
+---
+
+## 7. `refetch`, `enabled` và `initialData` (xem nhanh)
+
+- **`refetch()`** — hàm trả về từ `useQuery` để gọi lại thủ công (vd nút "Tải lại"). Khác với invalidation (Phần 5/6) ở chỗ nó chỉ tác động đúng query này.
+- **`enabled`** — `false` để tạm hoãn query (dùng cho dependent query, Phần 3).
+- **`initialData` / `placeholderData`** — cung cấp data ban đầu để tránh màn hình trống. Ta sẽ dùng `placeholderData` cho pagination ở Phần 4.
+
+```tsx
+const { data, refetch, isFetching } = useQuery({
+  queryKey: ['report'],
+  queryFn: fetchReport,
+  staleTime: 5 * 60_000,
+});
+
+<button onClick={() => refetch()} disabled={isFetching}>
+  {isFetching ? 'Đang tải…' : 'Tải lại'}
+</button>;
+```
+
+---
+
+## 8. Bài tập
+
+**1.** Một query có `staleTime: 60_000` và `gcTime: 300_000`. Bạn xem trang, rời đi 2 phút, rồi quay lại. Điều gì xảy ra?
+
+<details>
+<summary>Lời giải</summary>
+
+Cache vẫn còn (2 phút < 5 phút `gcTime`) nên data cũ hiện **ngay lập tức**. Nhưng nó đã stale (2 phút > 60s `staleTime`), nên Query refetch **nền** và cập nhật khi response về. Người dùng thấy nội dung ngay, rồi nó tự làm mới.
+</details>
+
+**2.** Khác nhau giữa `isLoading` và `isFetching` là gì? Dùng cái nào cho spinner toàn trang, cái nào cho indicator "đang làm mới"?
+
+<details>
+<summary>Lời giải</summary>
+
+`isFetching` = đang gọi mạng (kể cả khi đã có data cũ). `isLoading` = `isPending && isFetching` = đang fetch lần đầu và *chưa có* data. Dùng `isLoading` (hoặc `isPending`) cho spinner toàn trang; dùng `isFetching` cho indicator nhỏ "đang làm mới" khi vẫn hiển thị data cũ.
+</details>
+
+**3.** Vì sao cần tách `status` và `fetchStatus` thành hai trục thay vì gộp thành một enum?
+
+<details>
+<summary>Lời giải</summary>
+
+Vì hai chiều này độc lập: một query có thể *đã có data* (`success`) mà *đồng thời đang refetch nền* (`fetching`). Gộp một trục sẽ không biểu diễn được trạng thái "có data cũ + đang làm mới", trong khi đó lại là trạng thái phổ biến nhất của UX stale-while-revalidate.
+</details>
+
+**Nâng cao:** Tạo hai component cùng dùng `queryKey: ['users']` với `staleTime: 10_000`. Mount cả hai cùng lúc và quan sát Devtools: chỉ có **một** request (dedup). Đợi qua 10s, focus lại tab và xem nó refetch một lần cho cả hai.
+
+---
+
+## Tóm tắt
+
+- `useQuery` có hai trục trạng thái: **`status`** (đã có data chưa: pending/success/error) và **`fetchStatus`** (có đang gọi mạng: fetching/idle/paused).
+- Luôn xử lý đủ **loading → error → empty → data**; đặt `isPending`/`isError` trước để TypeScript thu hẹp kiểu `data`.
+- **`staleTime`** = data tươi bao lâu (điều khiển refetch); **`gcTime`** = giữ cache bao lâu sau khi hết observer (điều khiển bộ nhớ). Một query có thể stale mà vẫn còn cache.
+- Khi stale, Query refetch nền lúc mount / focus / reconnect; có thể tắt từng cái hoặc dùng `refetchInterval` để polling.
+
+---
+
+## Phần tiếp theo
+
+**Phần 3 — Query keys, API client (zod) & `queryOptions`:** thiết kế hệ query key phân cấp chống gõ sai, viết một `apiFetch` dùng chung validate dữ liệu tại biên bằng zod (không bao giờ để `any` lọt vào app), gói query bằng `queryOptions` để tái dùng, và làm quen dependent/parallel queries.

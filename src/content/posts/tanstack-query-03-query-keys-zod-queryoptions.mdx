@@ -1,0 +1,321 @@
+---
+title: 'TanStack Query · Phần 3 — Query keys, zod & queryOptions'
+description: 'Thiết kế query key phân cấp chống gõ sai, viết apiFetch validate dữ liệu tại biên bằng zod để any không lọt vào app, gói query bằng queryOptions tái dùng, và làm dependent/parallel queries.'
+pubDate: 2026-06-24
+tags: [react, tanstack-query, react-query, zod, tanstack_query_8]
+series: tanstack-query
+seriesOrder: 3
+draft: false
+---
+
+Hai phần trước ta fetch bằng `queryKey: ['users']` và `fetch().then(r => r.json())` cho nhanh. Trong dự án thật, cách đó nhanh chóng sinh bug: query key rải rác dễ gõ sai, và `res.json()` trả về `any` khiến TypeScript "tin server mù quáng". Phần này dựng nền tảng chuẩn cho phần còn lại của series:
+
+1. Một **hệ query key phân cấp** chống gõ sai và giúp invalidation chính xác.
+2. Một **`apiFetch` dùng chung** validate dữ liệu tại biên bằng **zod**.
+3. Gói query bằng **`queryOptions`** để tái dùng giữa `useQuery`, prefetch, `setQueryData`.
+4. **Dependent** và **parallel** queries.
+
+---
+
+## 1. Query key — định danh của cache
+
+Query key là **danh tính** của một mẩu dữ liệu trong cache. React Query so sánh key theo **giá trị sâu (deep equality)**, không phụ thuộc thứ tự key trong object. Hai quy tắc vàng:
+
+- Key phải **mô tả đầy đủ** mọi thứ mà `queryFn` phụ thuộc. Nếu `queryFn` dùng `userId` và `filters`, thì cả hai phải nằm trong key.
+- Key dạng mảng, đi từ **tổng quát → cụ thể**: `['customers', 'list', { status: 'active' }]`.
+
+```ts
+// Cùng dữ liệu → cùng key (thứ tự field trong object KHÔNG quan trọng)
+['todos', { status: 'done', page: 1 }]
+['todos', { page: 1, status: 'done' }] // ← React Query coi là GIỐNG nhau
+
+// Khác tham số → khác key → khác cache entry
+['todos', { status: 'active', page: 1 }]
+['todos', { status: 'active', page: 2 }]
+```
+
+> Vì key phụ thuộc đã nằm trong mảng, bạn **không cần** dependency array kiểu `useEffect`. Đổi tham số trong key = tự động query lại với cache riêng cho tham số mới. Đây cũng là lý do Query miễn nhiễm race condition (Phần 1).
+
+---
+
+## 2. Query key factory — chống gõ sai
+
+Rải string literal khắp nơi (`['customers']` chỗ này, `['customer', id]` chỗ kia) là mầm bug: gõ sai một ký tự là âm thầm tạo cache thứ hai, hoặc invalidation trượt. Giải pháp: gom toàn bộ key của một feature vào **một factory**.
+
+```ts
+// src/features/customers/keys.ts
+export const customerKeys = {
+  all: ['customers'] as const,
+  lists: () => [...customerKeys.all, 'list'] as const,
+  list: (filters: { q?: string; status?: string }) =>
+    [...customerKeys.lists(), filters] as const,
+  details: () => [...customerKeys.all, 'detail'] as const,
+  detail: (id: string) => [...customerKeys.details(), id] as const,
+};
+```
+
+`as const` giữ key là **tuple readonly** để TypeScript suy đúng kiểu. Vì key lồng nhau theo thứ bậc, `customerKeys.all` là **tiền tố** của mọi key customer khác, nên invalidation có thể chính xác *hoặc* lan rộng:
+
+```ts
+// Chỉ một chi tiết
+queryClient.invalidateQueries({ queryKey: customerKeys.detail('42') });
+
+// Mọi danh sách customer (mọi filter)
+queryClient.invalidateQueries({ queryKey: customerKeys.lists() });
+
+// Tất cả query liên quan customer
+queryClient.invalidateQueries({ queryKey: customerKeys.all });
+```
+
+(Chi tiết invalidation ở Phần 5 và 6 — giờ chỉ cần biết factory làm nó gọn và an toàn.)
+
+---
+
+## 3. Validate tại biên với zod
+
+*Tài liệu: [zod](https://zod.dev/).*
+
+### Vấn đề
+
+`res.json()` trả `Promise<any>`. TypeScript tin server vô điều kiện. Nếu API đổi tên field, hay trả về null bất ngờ, bạn không phát hiện ở *biên* mà ở tận sâu trong component — một crash khó truy. Quy tắc của project (xem `prohibitions`): **không `any`, không `as` trừ khi đã validate runtime**.
+
+### Giải pháp: `apiFetch` + zod
+
+```ts
+// src/lib/api-client.ts
+import { z } from 'zod';
+
+export class ApiError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+const BASE_URL = import.meta.env.VITE_API_URL ?? '';
+
+/**
+ * Fetch + validate tại biên. Đọc `unknown` rồi parse bằng schema,
+ * nên `any` không bao giờ lọt vào trong app.
+ */
+export async function apiFetch<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  init?: RequestInit,
+): Promise<T> {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: { 'Content-Type': 'application/json', ...init?.headers },
+    ...init,
+  });
+
+  if (!res.ok) {
+    throw new ApiError(res.status, `Request lỗi: ${res.status}`);
+  }
+
+  const json: unknown = await res.json();
+  // Kiểm tra hình dạng dữ liệu TRƯỚC khi nó vào app — fail to, fail sớm.
+  return schema.parse(json);
+}
+```
+
+Định nghĩa schema theo feature và **suy type từ schema** — một nguồn chân lý cho cả runtime lẫn compile time:
+
+```ts
+// src/features/customers/schema.ts
+import { z } from 'zod';
+
+export const customerSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  email: z.string().email(),
+  plan: z.enum(['starter', 'pro', 'enterprise']),
+  mrr: z.number(),
+  status: z.enum(['active', 'trial', 'churned']),
+});
+
+export const customerListSchema = z.array(customerSchema);
+
+// Suy type TỪ schema → validator và type không bao giờ lệch nhau.
+export type Customer = z.infer<typeof customerSchema>;
+```
+
+`z.infer` lấy type `Customer` *từ* schema, nên khi schema đổi, type tự đổi theo. Bạn không bao giờ phải viết một `interface Customer` song song rồi quên cập nhật.
+
+---
+
+## 4. Gói query bằng `queryOptions`
+
+*Tài liệu: [queryOptions](https://tanstack.com/query/latest/docs/framework/react/guides/query-options).*
+
+Thay vì rải `{ queryKey, queryFn }` khắp nơi, gói chúng vào một helper `queryOptions`. Lợi ích: **một định nghĩa, tái dùng** giữa `useQuery`, `useQueries`, `prefetchQuery`, `setQueryData`... và type liên kết chặt giữa key và data.
+
+```ts
+// src/features/customers/api.ts
+import { queryOptions } from '@tanstack/react-query';
+import { apiFetch } from '@/lib/api-client';
+import { customerListSchema, customerSchema } from './schema';
+import { customerKeys } from './keys';
+
+export function customersQuery(filters: { q?: string } = {}) {
+  return queryOptions({
+    queryKey: customerKeys.list(filters),
+    queryFn: () => {
+      // Dựng query string thủ công — KHÔNG `as`, đúng tinh thần "không ép kiểu thiếu kiểm".
+      const params = new URLSearchParams();
+      if (filters.q) params.set('q', filters.q);
+      return apiFetch(`/customers?${params}`, customerListSchema);
+    },
+  });
+}
+
+export function customerQuery(id: string) {
+  return queryOptions({
+    queryKey: customerKeys.detail(id),
+    queryFn: () => apiFetch(`/customers/${id}`, customerSchema),
+  });
+}
+```
+
+Hook của feature trở nên mỏng dính:
+
+```ts
+// src/features/customers/hooks.ts
+import { useQuery } from '@tanstack/react-query';
+import { customersQuery, customerQuery } from './api';
+
+export function useCustomers(filters: { q?: string } = {}) {
+  return useQuery(customersQuery(filters));
+}
+
+export function useCustomer(id: string) {
+  return useQuery(customerQuery(id));
+}
+```
+
+Và component chỉ còn lo render:
+
+```tsx
+function CustomersTable() {
+  const { data, isPending, isError, error } = useCustomers();
+
+  if (isPending) return <TableSkeleton />;
+  if (isError) return <ErrorState message={error.message} />;
+  if (data.length === 0) return <EmptyState label="Chưa có khách hàng" />;
+
+  return <DataTable rows={data} />; // data có type Customer[] đầy đủ
+}
+```
+
+> Quy ước của project: **tách logic khỏi UI**. Key/schema/queryFn nằm ở `lib`/feature, component chỉ gọi hook và render trạng thái. Đây cũng là điều giúp test dễ (Phần 8).
+
+---
+
+## 5. Dependent queries — query phụ thuộc query khác
+
+Đôi khi query B cần kết quả của query A. Ví dụ: lấy `user` trước, rồi mới lấy `projects` của user đó. Dùng option **`enabled`** để hoãn query B cho tới khi có dữ liệu:
+
+```tsx
+function UserProjects({ email }: { email: string }) {
+  // Query 1: lấy user theo email
+  const userQ = useQuery({
+    queryKey: ['user', email],
+    queryFn: () => apiFetch(`/users?email=${email}`, userSchema),
+  });
+
+  const userId = userQ.data?.id;
+
+  // Query 2: chỉ chạy khi đã có userId
+  const projectsQ = useQuery({
+    queryKey: ['projects', userId],
+    queryFn: () => apiFetch(`/users/${userId}/projects`, projectListSchema),
+    enabled: Boolean(userId), // ← hoãn cho tới khi userId tồn tại
+  });
+
+  // Khi enabled=false, query ở trạng thái pending nhưng fetchStatus='idle'
+  if (projectsQ.isPending) return <Spinner />;
+  // ...
+}
+```
+
+Khi `enabled: false`, query không chạy `queryFn`; nó nằm ở `status: 'pending'`, `fetchStatus: 'idle'`. Nhớ điều này để render đúng (đừng tưởng nhầm là đang loading mạng).
+
+---
+
+## 6. Parallel queries — chạy song song, tránh waterfall
+
+"Waterfall" là sát thủ hiệu năng: component A fetch xong mới render B, B *rồi mới* fetch của nó — các round-trip nối đuôi nhau. Nếu các query **độc lập**, hãy bắn **song song**.
+
+Hai `useQuery` trong cùng component đã tự chạy song song:
+
+```tsx
+function Dashboard() {
+  const stats = useQuery(statsQuery());          // hai cái này
+  const activity = useQuery(recentActivityQuery()); // chạy SONG SONG
+  // ...
+}
+```
+
+Với một **danh sách động** các query, dùng `useQueries`:
+
+```tsx
+import { useQueries } from '@tanstack/react-query';
+
+function CustomerCards({ ids }: { ids: string[] }) {
+  const results = useQueries({
+    queries: ids.map((id) => customerQuery(id)), // tái dùng queryOptions ở mục 4
+  });
+
+  const isLoading = results.some((r) => r.isPending);
+  // ...
+}
+```
+
+Phản mẫu cần tránh: render cha (fetch), và **chỉ trong nhánh thành công của cha** mới mount con (fetch). Điều đó nối tiếp hai request độc lập. Hãy đưa các query độc lập **lên cùng cấp** để chúng chồng lên nhau.
+
+---
+
+## 7. Bài tập
+
+**1.** Vì sao nên validate `res.json()` bằng zod thay vì ép kiểu `as Customer[]`?
+
+<details>
+<summary>Lời giải</summary>
+
+`as` là "lời nói dối lúc compile" — bảo TypeScript tin dữ liệu runtime chưa kiểm. Nếu API đổi/lỗi, type sai âm thầm và crash ở chỗ khác. `schema.parse` kiểm hình dạng *thật* tại biên và ném lỗi ngay khi lệch, biến lỗi runtime mơ hồ thành lỗi rõ ràng đúng chỗ.
+</details>
+
+**2.** Một query có `queryFn` dùng `userId` và `page`, nhưng `queryKey` chỉ là `['orders']`. Bug gì sẽ xảy ra?
+
+<details>
+<summary>Lời giải</summary>
+
+Mọi `userId`/`page` chia sẻ *cùng* một cache entry → đổi trang hay đổi user vẫn trả data cũ (cache hit sai), và refetch ghi đè lẫn nhau. Key phải chứa đủ phụ thuộc: `['orders', userId, page]`.
+</details>
+
+**3.** Khi `enabled: false`, `status` và `fetchStatus` của query là gì?
+
+<details>
+<summary>Lời giải</summary>
+
+`status: 'pending'` (chưa có data) nhưng `fetchStatus: 'idle'` (không gọi mạng). Đừng hiển thị spinner "đang tải mạng" cho trạng thái này; nên hiện placeholder kiểu "đang chờ điều kiện".
+</details>
+
+**Nâng cao:** Viết `customerKeys` cho feature của bạn, một `apiFetch` + zod schema, và `queryOptions` cho cả list lẫn detail. Thêm hook `useCustomer(id)` rồi render ở trang chi tiết.
+
+---
+
+## Tóm tắt
+
+- Query key là danh tính cache, so sánh theo giá trị; phải chứa **đủ** mọi phụ thuộc của `queryFn`. Dùng **key factory** mỗi feature để chống gõ sai và invalidation phân cấp.
+- Validate mọi response bằng **zod tại biên** trong `apiFetch`, suy type qua `z.infer` — `any` không lọt vào app, không `as` thiếu kiểm.
+- Gói query bằng **`queryOptions`** để tái dùng giữa `useQuery`/`useQueries`/prefetch/`setQueryData`; tách logic khỏi UI.
+- **Dependent query** dùng `enabled`; **parallel query** dùng `useQuery` anh em hoặc `useQueries` để tránh waterfall.
+
+---
+
+## Phần tiếp theo
+
+**Phần 4 — Pagination & `useInfiniteQuery`:** giữ trang cũ mượt mà khi chuyển trang với `placeholderData: keepPreviousData`, rồi dựng infinite scroll thực thụ bằng `useInfiniteQuery` với `getNextPageParam`/`fetchNextPage` và một `IntersectionObserver`.

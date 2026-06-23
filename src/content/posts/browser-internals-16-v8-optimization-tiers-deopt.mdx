@@ -1,0 +1,137 @@
+---
+title: 'How Browsers Work · Part 16 — V8 Deep: Optimization Tiers & Deopt'
+description: 'Bên trong máy ảo JS: Ignition, Sparkplug, Maglev, TurboFan, hidden class, inline cache (mono/poly/megamorphic), và vì sao code "ổn định kiểu" chạy nhanh hơn nhiều.'
+pubDate: 2026-11-04
+tags: [browser, internals, v8, javascript, browser_internals_12]
+series: browser-internals
+seriesOrder: 16
+draft: true
+---
+
+Phần 6 cho ta bức tranh tổng thể V8: parse → bytecode → JIT. Phần này mở nắp động cơ. JavaScript là ngôn ngữ động — không khai báo kiểu — nhưng V8 chạy nó gần tốc độ máy bằng cách *suy đoán* kiểu rồi biên dịch tối ưu, và *huỷ* tối ưu khi suy đoán sai. Hiểu cơ chế này giải thích nhiều "mẹo hiệu năng" tưởng huyền bí.
+
+---
+
+## 1. Bốn tầng thực thi
+
+V8 không biên dịch tối ưu ngay — vì hầu hết code chỉ chạy một lần. Nó dùng kiến trúc **tiered**: bắt đầu nhanh-để-khởi-động, rồi tối ưu dần code "nóng".
+
+```text
+Source ─► Parse ─► Bytecode
+                     │
+        ┌────────────┴───────────────────────────────┐
+        ▼                                             │ "nóng" dần
+  Ignition (interpreter)   ─► chạy bytecode, thu thập type feedback
+        │ chạy nhiều lần
+        ▼
+  Sparkplug (baseline JIT)  ─► máy mã không tối ưu, biên dịch siêu nhanh
+        │ nóng hơn
+        ▼
+  Maglev (mid-tier JIT)     ─► tối ưu vừa, biên dịch nhanh
+        │ rất nóng
+        ▼
+  TurboFan (optimizing JIT) ─► tối ưu tối đa, biên dịch chậm
+```
+
+Mỗi tầng đánh đổi *thời gian biên dịch* lấy *tốc độ chạy*. Hàm chạy một lần ở Ignition là đủ; vòng lặp triệu lần leo tới TurboFan. Triết lý: chỉ trả giá tối ưu cho code thật sự đáng.
+
+---
+
+## 2. Hidden class (Shape / Map) — kiểu ẩn cho object
+
+JS object là túi key→value động, nhưng nếu V8 lưu mỗi object như hash map thì sẽ chậm. Thay vào đó V8 gán mỗi object một **hidden class** (gọi nội bộ là Map/Shape) mô tả "hình dạng": object có những thuộc tính nào, ở offset nào.
+
+```js
+function P(x, y) { this.x = x; this.y = y; }
+const a = new P(1, 2);  // hidden class C0 → C1(x) → C2(x,y)
+const b = new P(3, 4);  // CÙNG chuỗi C0→C1→C2  ✅ chia sẻ shape
+```
+
+Object cùng "hình dạng" chia sẻ hidden class → V8 truy cập thuộc tính bằng offset cố định thay vì tra cứu. Nhưng thêm thuộc tính theo *thứ tự khác nhau* tạo *hidden class khác nhau*:
+
+```js
+const a = {}; a.x = 1; a.y = 2; // shape {x,y}
+const b = {}; b.y = 2; b.x = 1; // shape {y,x} — KHÁC a!  ✗ làm chậm
+```
+
+> Quy tắc: khởi tạo object với cùng tập thuộc tính, cùng thứ tự (lý tưởng là trong constructor/literal). Tránh `delete` thuộc tính (chuyển object sang chế độ "dictionary" chậm).
+
+---
+
+## 3. Inline cache — mono, poly, megamorphic
+
+Khi code đọc `obj.x`, V8 ghi nhớ tại điểm gọi đó nó đã gặp hidden class nào — gọi là **inline cache (IC)**. Lần sau cùng shape → truy cập tức thì.
+
+```text
+Site đọc obj.x từng gặp:
+  1 shape   → MONOMORPHIC   ⚡ nhanh nhất (đoán chắc chắn)
+  2–4 shapes → POLYMORPHIC   🙂 vẫn ổn (kiểm tra vài shape)
+  >4 shapes  → MEGAMORPHIC   🐢 bỏ IC, tra cứu chung — chậm
+```
+
+Hàm xử lý nhiều shape khác nhau qua cùng một điểm gọi trở nên *megamorphic* và mất tối ưu. Đây là lý do thật sự đằng sau lời khuyên "giữ kiểu ổn định": code đơn hình (monomorphic) cho phép IC + JIT inline mạnh nhất.
+
+---
+
+## 4. Speculation & deopt — khi suy đoán sai
+
+TurboFan biên dịch dựa trên *giả định* từ type feedback ("`x` luôn là số nhỏ - Smi"). Nếu sau đó giả định sai (truyền vào một object), code tối ưu không còn đúng → V8 **deoptimize**: vứt mã đã tối ưu, nhảy về Ignition/Sparkplug, chạy lại từ trạng thái hiện tại.
+
+```js
+function add(a, b) { return a + b; }
+for (let i = 0; i < 1e6; i++) add(i, i);  // TurboFan: giả định number
+add('x', 'y');  // ✗ vi phạm giả định → DEOPT
+```
+
+Deopt thỉnh thoảng thì ổn. Nhưng **deopt loop** — tối ưu rồi deopt liên tục — là sát thủ hiệu năng. Nguyên nhân thường gặp: hàm nhận lúc number lúc string/object, mảng "lỗ hổng" (holey), đổi shape giữa chừng.
+
+```text
+optimize → deopt → optimize → deopt ...   ← lãng phí, chậm hơn cả không tối ưu
+```
+
+---
+
+## 5. Elements kind — mảng cũng có "kiểu"
+
+V8 chuyên hoá cả mảng theo nội dung, từ nhanh đến chậm:
+
+```text
+PACKED_SMI    [1, 2, 3]              ⚡ nhanh nhất (số nguyên nhỏ, liền)
+PACKED_DOUBLE [1.5, 2.5]             ⚡
+PACKED_ELEMENTS[1, 'a', {}]          🙂 (kiểu hỗn hợp)
+HOLEY_*       [1, , 3] / a[100]=1    🐢 (có "lỗ" → kiểm tra từng phần tử)
+```
+
+Mảng chỉ leo *xuống* (general hơn), không leo lại lên. Vì vậy: đừng tạo lỗ (`arr[100] = x` khi `arr.length` là 5), đừng trộn kiểu trong mảng số nóng, ưu tiên `push` thay vì gán index thưa.
+
+---
+
+## 6. Đọc tín hiệu tối ưu (khi cần)
+
+Bạn hiếm khi cần, nhưng khi điều tra có thể bật cờ V8 (qua Node hoặc Chrome) để xem trạng thái tối ưu:
+
+```bash
+node --trace-opt --trace-deopt app.js   # in mỗi lần optimize / deopt
+node --allow-natives-syntax app.js       # mở các hàm %... nội bộ
+```
+
+```js
+// với --allow-natives-syntax (chỉ để debug, không bao giờ dùng trong production)
+%OptimizeFunctionOnNextCall(add);
+console.log(%GetOptimizationStatus(add));
+```
+
+Trong DevTools, tab **Performance** cho thấy thời gian "Compile" / "Optimize"; gai deopt liên tục thường lộ ra ở hàm nóng.
+
+---
+
+## 7. Tóm tắt
+
+- V8 dùng kiến trúc **tiered**: Ignition (interpreter) → Sparkplug → Maglev → TurboFan, đánh đổi thời gian biên dịch lấy tốc độ chạy cho code nóng.
+- **Hidden class (Map/Shape)** cho phép truy cập thuộc tính bằng offset; giữ object cùng tập thuộc tính, cùng thứ tự, tránh `delete`.
+- **Inline cache**: monomorphic (1 shape) nhanh nhất, megamorphic (>4 shapes) mất tối ưu — đây là lý do thật của "giữ kiểu ổn định".
+- **Deopt** xảy ra khi suy đoán sai; deopt thỉnh thoảng thì ổn, **deopt loop** thì rất chậm.
+- Mảng có **elements kind** (PACKED_SMI nhanh → HOLEY chậm); tránh tạo lỗ và trộn kiểu trong mảng nóng.
+- Debug bằng `--trace-opt/--trace-deopt` hoặc tab Performance khi thật cần — đừng tối ưu mò.
+
+**Phần tiếp theo:** Memory deep — heap snapshot, ba loại view, săn rò rỉ với detached DOM, Oilpan GC, và `WeakRef`/`FinalizationRegistry`/`measureUserAgentSpecificMemory`.

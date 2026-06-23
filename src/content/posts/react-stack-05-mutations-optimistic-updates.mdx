@@ -1,0 +1,232 @@
+---
+title: 'Build a Real React App · Part 5 — Mutations & Optimistic Updates'
+description: 'Change server data the right way: useMutation, cache invalidation vs setQueryData, and the full optimistic-update pattern — onMutate snapshots, instant UI, onError rollback, onSettled reconciliation — wired to toasts.'
+pubDate: 2026-07-09
+tags: [react, tanstack-query, mutations, ux, react_stack_12]
+series: react-stack
+seriesOrder: 5
+draft: true
+---
+
+Phần 4 đọc dữ liệu bằng `useQuery`. Giờ ta *đổi* nó — tạo, sửa, xóa customer — bằng `useMutation`, và giữ cache đồng bộ. Kỹ thuật chủ đạo là **optimistic update**: UI phản ứng tức thì, trước khi server xác nhận, và rollback sạch nếu request lỗi.
+
+Mô hình tư duy: mutation là một *write*; sau khi thành công, các *read* đã cache có thể sai, nên bạn phải đối soát — bằng **invalidate** (refetch) hoặc **ghi cache trực tiếp** (`setQueryData`).
+
+---
+
+## 1. Cơ bản về mutation
+
+*Docs: [useMutation](https://tanstack.com/query/latest/docs/framework/react/reference/useMutation).*
+
+`useMutation` không chạy lúc render — bạn gọi `mutate` (hoặc `mutateAsync`) trong event handler. Trước hết, hàm API, có type và validate như Phần 4:
+
+```ts
+// src/features/customers/api.ts
+import { apiFetch } from '@/lib/api-client';
+import { customerSchema, type Customer } from './schema';
+
+export type CreateCustomerInput = Omit<Customer, 'id' | 'mrr' | 'status'>;
+
+export function createCustomer(input: CreateCustomerInput): Promise<Customer> {
+  return apiFetch('/customers', customerSchema, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+```
+
+Hook lo đối soát cache để component chỉ làm việc với `mutate` + trạng thái:
+
+```ts
+// src/features/customers/hooks.ts
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
+import { createCustomer } from './api';
+import { customerKeys } from './keys';
+
+export function useCreateCustomer() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: createCustomer,
+    onSuccess: (created) => {
+      // refetch every customer list so the new row appears
+      void queryClient.invalidateQueries({ queryKey: customerKeys.lists() });
+      toast.success(`Created ${created.name}`);
+    },
+    onError: (error) => toast.error(error.message),
+  });
+}
+```
+
+```tsx
+function CreateButton() {
+  const { mutate, isPending } = useCreateCustomer();
+  return (
+    <Button
+      disabled={isPending}
+      onClick={() => mutate({ name: 'Acme', email: 'a@acme.com', plan: 'pro' })}
+    >
+      {isPending ? 'Creating…' : 'New customer'}
+    </Button>
+  );
+}
+```
+
+### Tóm tắt một dòng
+
+`useMutation` chạy write theo yêu cầu qua `mutate`; đối soát cache trong `onSuccess` và hiện `isPending`/lỗi lên UI.
+
+---
+
+## 2. Invalidate vs `setQueryData`
+
+Sau một write, có hai cách sửa read cũ:
+
+| Strategy | What it does | When to use |
+|----------|--------------|-------------|
+| `invalidateQueries` | Marks queries stale → refetches from server | Default; guarantees correctness, costs a round-trip |
+| `setQueryData` | Writes the new value into the cache directly | When you already have the authoritative value (e.g. the server's response) and want zero extra fetch |
+
+`invalidateQueries` là mặc định an toàn — server là nguồn chân lý. `setQueryData` là tối ưu (và là động cơ của optimistic update bên dưới).
+
+```ts
+// patch a single detail entry with the server's response — no refetch
+onSuccess: (updated) => {
+  queryClient.setQueryData(customerKeys.detail(updated.id), updated);
+  void queryClient.invalidateQueries({ queryKey: customerKeys.lists() });
+}
+```
+
+### Tóm tắt một dòng
+
+Mặc định `invalidateQueries` cho đúng; dùng `setQueryData` khi đã có giá trị chuẩn và muốn bỏ refetch.
+
+---
+
+## 3. Mẫu optimistic update
+
+*Docs: [optimistic updates](https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates).*
+
+### Vấn đề
+
+Với hành động thường xuyên, rủi ro thấp (đổi trạng thái, đổi tên), chờ server rồi mới cập nhật UI cảm giác ì. Optimistic update áp dụng thay đổi ngay và đối soát khi response về.
+
+### Mẫu bốn callback
+
+Hợp đồng: **chụp → vá → rollback khi lỗi → đối soát luôn**.
+
+```ts
+// src/features/customers/hooks.ts
+export function useUpdateCustomerStatus() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, status }: { id: string; status: Customer['status'] }) =>
+      updateCustomer(id, { status }),
+
+    // 1. onMutate: runs BEFORE the request — patch the cache optimistically
+    onMutate: async ({ id, status }) => {
+      // cancel in-flight refetches so they don't overwrite our optimistic value
+      await queryClient.cancelQueries({ queryKey: customerKeys.lists() });
+
+      // snapshot the current cache for rollback
+      const previous = queryClient.getQueriesData<Customer[]>({
+        queryKey: customerKeys.lists(),
+      });
+
+      // optimistically patch every list cache
+      queryClient.setQueriesData<Customer[]>(
+        { queryKey: customerKeys.lists() },
+        (old) => old?.map((c) => (c.id === id ? { ...c, status } : c)),
+      );
+
+      // return context so onError can restore it
+      return { previous };
+    },
+
+    // 2. onError: roll back to the snapshot
+    onError: (error, _vars, context) => {
+      context?.previous.forEach(([key, data]) => {
+        queryClient.setQueryData(key, data);
+      });
+      toast.error(error.message);
+    },
+
+    // 3. onSettled: runs after success OR error — reconcile with the server
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: customerKeys.lists() });
+    },
+  });
+}
+```
+
+Vì sao từng bước quan trọng:
+
+- không có nó, refetch nền bắt đầu trước mutation có thể về *sau* và đè giá trị optimistic.
+- cách *duy nhất* để hoàn tác sạch là nhớ chính xác trạng thái trước.
+- ngay cả khi thành công, server có thể tính field dẫn xuất (vd `mrr`), nên đồng bộ lại với chân lý.
+
+### Tóm tắt một dòng
+
+UI lạc quan = `onMutate` (cancel + chụp + vá) → `onError` (khôi phục) → `onSettled` (invalidate đối soát).
+
+---
+
+## 4. Khi nào KHÔNG nên lạc quan
+
+Optimistic update lợi cho UX với write nhanh, dễ đoán, ít rủi ro. Tránh khi:
+
+- Kết quả phụ thuộc **giá trị server tính** bạn không đoán được (tổng, ID, hạng) — hiện pending thay vì.
+- Hành động **phá hủy hoặc rủi ro cao** (thanh toán, xóa khó hoàn tác) — xác nhận và chờ.
+- Lỗi **thường xuyên** — rollback liên tục khó chịu hơn một spinner ngắn.
+
+Với create cần `id` server sinh, ưu tiên `onSuccess` + `invalidate` (hoặc `setQueryData` với response) hơn là hàng tạm giả.
+
+### Tóm tắt một dòng
+
+Lạc quan với write nhanh, dễ đoán, ít rủi ro; chờ-và-hiện-pending với loại server-tính, phá hủy, hay hay lỗi.
+
+---
+
+## 5. Bài tập
+
+**1.** Vì sao gọi `cancelQueries` đầu `onMutate`?
+
+<details>
+<summary>Lời giải</summary>
+
+Một refetch đang bay bắt đầu trước mutation có thể về sau `setQueryData` optimistic và đè bằng dữ liệu server cũ. Hủy query pending chặn race đó.
+</details>
+
+**2.** Bạn cập nhật lạc quan, request *thành công*, nhưng vẫn `invalidateQueries` trong `onSettled`. Sao không bỏ qua khi thành công?
+
+<details>
+<summary>Lời giải</summary>
+
+Vá optimistic là *phỏng đoán*. Server có thể set field dẫn xuất (timestamp, tổng tính) bạn không đoán. `onSettled` đối soát cache với trạng thái server chuẩn để đoán không lệch.
+</details>
+
+**3.** Khi nào `setQueryData` tốt hơn `invalidateQueries` sau update thành công?
+
+<details>
+<summary>Lời giải</summary>
+
+Khi response của mutation *chính là* giá trị chuẩn mới (vd customer đã update). Ghi trực tiếp bỏ qua round-trip refetch, tiết kiệm request mà vẫn đúng.
+</details>
+
+Nâng cao:thêm `useDeleteCustomer` với xóa lạc quan khỏi list và rollback khi lỗi, kèm dialog xác nhận trước khi xóa.
+
+---
+
+## Điểm chính
+
+- `useMutation` chạy write qua `mutate`; hiện `isPending` và lỗi, đối soát cache trong callback.
+- Đối soát bằng **`invalidateQueries`** (mặc định an toàn) hoặc **`setQueryData`** (bỏ refetch khi đã có chân lý).
+- Mẫu optimistic: `onMutate` cancel+chụp+vá → `onError` rollback → `onSettled` invalidate.
+- Đừng lạc quan với write server-tính, phá hủy, hay hay lỗi.
+
+---
+
+## Tiếp theo
+
+**Phần 6 — Form với react-hook-form + zod**: dựng form tạo customer với input không kiểm soát, một schema zod dùng chung cho form và API, `zodResolver`, validate tại chỗ, map lỗi server, và submit vào mutation vừa dựng.

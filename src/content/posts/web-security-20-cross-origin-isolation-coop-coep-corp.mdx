@@ -1,0 +1,305 @@
+---
+title: 'Web Security for Frontend Devs · Part 20 — Cross-Origin Isolation: COOP, COEP & CORP'
+description: 'Bonus track: why Spectre forced browsers to disable SharedArrayBuffer and precise timers, and how COOP + COEP + CORP let you safely re-unlock them. The headers, the gotchas when COEP breaks your CDN, a live simulator, and labs.'
+pubDate: 2026-06-23
+tags: [web-security, frontend, cross-origin-isolation, web_security_10]
+series: web-security
+seriesOrder: 20
+draft: false
+---
+
+> **Phần 20 — Nhánh bonus** trong series Web Security for Frontend Devs. Trước: Tiếp:
+
+Bạn cần `SharedArrayBuffer` cho một thư viện wasm — `ffmpeg.wasm`, một game engine, một image codec. Bạn gọi nó và trình duyệt báo `SharedArrayBuffer is not defined`. Stack Overflow bảo "thêm hai cái header". Bạn thêm vào, `SharedArrayBuffer` sống lại — nhưng giờ **một nửa ảnh và script từ CDN ngừng load**. Chào mừng tới **cross-origin isolation**: một cú đánh đổi bảo mật mà mọi frontend dev rồi sẽ chạm tới, và gần như ai cũng cấu hình sai lần đầu.
+
+Phần này giải thích vì sao ba header — **COOP**, **COEP**, **CORP** — tồn tại, chúng khớp nhau ra sao, và vì sao bật chúng lại làm hỏng tài nguyên bên thứ ba.
+
+---
+
+## Mô hình tư duy: vì sao web mất `SharedArrayBuffer`
+
+Năm 2018, **Spectre** cho thấy CPU hiện đại đoán trước nhánh lệnh (speculative execution) để lại dấu vết đo được trong cache. Với một **đồng hồ độ phân giải cao** và **bộ nhớ chia sẻ**, một origin có thể suy ra từng byte của origin khác **đang ở cùng process** — vượt mọi biên giới phần mềm, kể cả Same-Origin Policy.
+
+Trình duyệt không vá được CPU, nên chúng cùn hoá hai nguyên liệu chính cho **mọi người**:
+
+```text
+SharedArrayBuffer            → gỡ bỏ / khoá
+performance.now()            → làm thô về ~100µs
+Atomics.wait, self-profiling → khoá
+```
+
+Vấn đề: các API đó hợp pháp và cần thiết cho wasm threads, video, codec. Phải có cách **lấy lại** chúng — nhưng chỉ khi trang chứng minh được nó **không chia sẻ process với nội dung không tin cậy, có credential**. Bằng chứng đó gọi là **cross-origin isolation**.
+
+---
+
+## Cánh cổng: `crossOriginIsolated`
+
+Trình duyệt phơi ra một boolean duy nhất:
+
+```js
+if (self.crossOriginIsolated) {
+  // SharedArrayBuffer, high-res timer, measureUserAgentSpecificMemory()… đều mở
+}
+```
+
+Nó **chỉ** `true` khi document được phục vụ với **cả hai**:
+
+```http
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+Thiếu một cái → `crossOriginIsolated` là `false` và các API mạnh vẫn tắt. Hai header này không thừa — mỗi cái bịt một nửa con đường rò rỉ.
+
+---
+
+## COOP — cắt quan hệ cửa sổ
+
+**`Cross-Origin-Opener-Policy: same-origin`** đảm bảo trang bạn **không chia sẻ browsing context group** với trang cross-origin. Sau khi đặt:
+
+- `window.opener` thành `null` với mọi thứ cross-origin bạn mở (đây cũng là phòng thủ reverse tabnabbing ở [Phần 18](/blog/web-security-18-reverse-tabnabbing-window-opener/)).
+- Một popup cross-origin **không** giữ được tham chiếu script tới bạn, và ngược lại.
+
+Mục tiêu Spectre: nếu một cửa sổ cross-origin có thể chia sẻ process với bạn, đồng hồ của bạn đo được nó. COOP buộc chúng vào **process riêng**.
+
+Có biến thể `same-origin-allow-popups` giữ liên kết với popup **do bạn mở** — tiện cho luồng OAuth — nhưng **không** đủ cho cross-origin isolation. Isolation cần đúng `same-origin`.
+
+---
+
+## COEP — buộc mọi byte nhúng phải opt-in
+
+**`Cross-Origin-Embedder-Policy: require-corp`** lật mặc định: giờ **mọi tài nguyên cross-origin** (ảnh, script, font, iframe) phải **tự nguyện cho phép** bị nhúng, nếu không bị **chặn**.
+
+Đây chính là phần làm hỏng site bạn. Trước COEP, một `<img src="https://cdn.other/x.png">` cứ thế load. Sau `require-corp`, ảnh đó cần khai báo rõ "tôi đồng ý bị origin này nhúng" — nếu không:
+
+```text
+GET https://cdn.other/x.png
+→ net::ERR_BLOCKED_BY_RESPONSE.NotSameOriginAfterDefaultedToSameOriginByCoep
+```
+
+Lý do Spectre: nếu trang đã isolated lại nhúng được byte có credential của bên thứ ba vào process của mình, đồng hồ độ phân giải cao lại đo được chúng. COEP đảm bảo **không byte cross-origin nào lọt vào mà chưa đồng ý**.
+
+---
+
+## CORP — cách tài nguyên nói "được, nhúng đi"
+
+Opt-in mà COEP đòi đến từ phía **tài nguyên**, qua header **`Cross-Origin-Resource-Policy`**:
+
+```http
+Cross-Origin-Resource-Policy: cross-origin   # bất kỳ ai cũng nhúng được — đúng cho CDN công khai
+Cross-Origin-Resource-Policy: same-site      # chỉ same-site mới nhúng
+Cross-Origin-Resource-Policy: same-origin    # chỉ chính origin đó
+```
+
+Vậy bộ ba ăn khớp thế này:
+
+```text
+Trang bạn:     COOP: same-origin  +  COEP: require-corp     → muốn isolated
+Mỗi tài nguyên: Cross-Origin-Resource-Policy: cross-origin   → cho phép bị nhúng
+                (hoặc tải qua CORS thành công)
+```
+
+Một cách opt-in thứ hai: **CORS**. Tài nguyên tải qua request CORS thành công (thuộc tính `crossorigin` + `Access-Control-Allow-Origin`) cũng thoả `require-corp` mà không cần CORP. Xem lại CORS ở [Phần 6](/blog/web-security-06-cors-explained/).
+
+---
+
+## `credentialless` — lối thoát khi không sửa được CDN
+
+Bạn thường **không kiểm soát** header của CDN bên thứ ba, nên không ép họ thêm CORP được. Đó là lý do có **`Cross-Origin-Embedder-Policy: credentialless`**:
+
+```http
+Cross-Origin-Embedder-Policy: credentialless
+```
+
+Với `credentialless`, request no-cors cross-origin được gửi **không kèm cookie/credential**, nên **không cần CORP**. Đổi lại: tài nguyên đó hành xử như **đã đăng xuất** — ổn cho ảnh/script công khai, nhưng hỏng nếu nó cần phiên đăng nhập của bạn. `credentialless` vẫn đủ để đạt isolation khi đi cùng `COOP: same-origin`.
+
+> Tư duy nhanh: `require-corp` = "mọi byte phải xin phép"; `credentialless` = "byte không xin phép vẫn vào, nhưng tôi tước credential nên nó không lộ gì".
+
+---
+
+## Thử ngay — trình mô phỏng COOP / COEP / CORP
+
+Panel 1: chọn COOP và COEP cho **trang bạn** và xem cổng `crossOriginIsolated` bật/tắt cùng các API được mở khoá (kèm readout thật của chính frame này). Panel 2: cấu hình một tài nguyên cross-origin — origin, CORP, có CORS không — và xem nó **load hay bị chặn** dưới COEP bạn chọn.
+
+<iframe
+  src="/tools/cross-origin-isolation-demo/"
+  title="Interactive COOP COEP CORP cross-origin isolation simulator"
+  loading="lazy"
+  style="width:100%;height:1180px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Mở demo đầy đủ:
+
+---
+
+## Lab thực hành — tái hiện an toàn
+
+Chứng minh cổng isolation trong trình duyệt thật bằng một server tĩnh tự đặt header.
+
+### Lab 1 — không header → không `SharedArrayBuffer`
+
+```bash
+mkdir -p /tmp/coi && cd /tmp/coi
+cat > index.html <<'EOF'
+<!doctype html><meta charset="utf-8"><title>isolation?</title>
+<pre id="o"></pre>
+<script>
+  o.textContent =
+    "crossOriginIsolated = " + self.crossOriginIsolated + "\n" +
+    "SharedArrayBuffer    = " + (typeof SharedArrayBuffer);
+</script>
+EOF
+python3 -m http.server 5000 >/dev/null 2>&1 &
+echo "open http://localhost:5000/"
+```
+
+Mở trang: `crossOriginIsolated = false`, `SharedArrayBuffer = undefined`. Server mặc định không gửi COOP/COEP.
+
+Đã chứng minh: không có hai header thì API mạnh tắt.
+
+### Lab 2 — thêm header → mở khoá
+
+`http.server` của Python không đặt header tuỳ ý dễ, nên dùng một server Node nhỏ:
+
+```bash
+cat > server.mjs <<'EOF'
+import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
+createServer((req, res) => {
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+  res.setHeader("Content-Type", "text/html");
+  res.end(readFileSync("./index.html"));
+}).listen(5001, () => console.log("open http://localhost:5001/"));
+EOF
+node server.mjs
+```
+
+Mở `http://localhost:5001/`: giờ `crossOriginIsolated = true` và `SharedArrayBuffer = function`.
+
+Đã chứng minh: `COOP: same-origin` + `COEP: require-corp` lật cổng.
+
+### Lab 3 — COEP làm hỏng ảnh cross-origin
+
+Thêm vào `index.html` (ở Lab 2) một ảnh cross-origin **không** CORP:
+
+```bash
+# thêm dòng này vào index.html rồi reload http://localhost:5001/
+#   <img src="https://upload.wikimedia.org/wikipedia/commons/0/01/AltaiMtns.jpg" width="200">
+```
+
+Reload và mở Console/Network: ảnh **bị chặn** với `ERR_BLOCKED_BY_RESPONSE`. Giờ đổi header server thành `credentialless`:
+
+```bash
+# trong server.mjs: "Cross-Origin-Embedder-Policy", "credentialless"
+```
+
+Reload — ảnh load lại (không kèm cookie) mà trang vẫn isolated.
+
+Đã chứng minh: `require-corp` chặn tài nguyên không opt-in; `credentialless` cứu mà vẫn giữ isolation.
+
+### Dọn dẹp
+
+```bash
+kill %1 2>/dev/null; rm -rf /tmp/coi
+```
+
+---
+
+## Phòng thủ & triển khai
+
+### 1. Chỉ bật isolation khi thực sự cần
+
+Cross-origin isolation **không** phải "bảo mật miễn phí bật cho vui" — nó là điều kiện để dùng `SharedArrayBuffer`/wasm-threads/high-res timer. Nếu không cần các API đó, đừng bật `require-corp` chỉ để rồi đi gỡ lỗi CDN.
+
+### 2. Audit mọi tài nguyên cross-origin trước
+
+Trước khi bật COEP, liệt kê mọi origin bạn nhúng (CDN, font, analytics, ảnh, iframe nhúng — nhớ tự kiểm ở [Phần 1](/blog/web-security-01-browser-security-same-origin-policy/)). Mỗi cái cần `CORP: cross-origin`, hỗ trợ CORS, hoặc bạn phải dùng `credentialless`.
+
+### 3. Ưu tiên `credentialless` cho phụ thuộc bên thứ ba
+
+Nếu không sửa được header bên thứ ba, `COEP: credentialless` là đường ít đau nhất — chỉ nhớ tài nguyên sẽ chạy ở trạng thái đăng xuất.
+
+### 4. Đặt CORP cho tài nguyên *của bạn*
+
+Nếu bạn **phục vụ** assets cho site khác nhúng, thêm `Cross-Origin-Resource-Policy: cross-origin` (hoặc `same-site`) để chúng không vỡ khi khách bật COEP. CORP cũng là một phòng thủ tốt độc lập chống các tấn công kiểu Spectre/[XS-Leaks](/blog/web-security-21-xs-leaks-cross-site-leaks/).
+
+### 5. Dùng report-only để dò trước
+
+```http
+Cross-Origin-Embedder-Policy-Report-Only: require-corp
+Cross-Origin-Opener-Policy-Report-Only: same-origin; report-to="coi"
+```
+
+Bản `-Report-Only` báo cáo cái-gì-sẽ-vỡ qua Reporting API mà **chưa** thực sự chặn — bật nó trước khi enforce.
+
+---
+
+## Liên hệ các phần trước
+
+COOP bạn gặp lần đầu như lớp chống reverse tabnabbing ở [Phần 18](/blog/web-security-18-reverse-tabnabbing-window-opener/) — ở đây nó là một nửa của isolation. CORS ([Phần 6](/blog/web-security-06-cors-explained/)) là cơ chế opt-in thứ hai cho COEP. Và mục tiêu cuối — chặn rò cross-origin qua kênh phụ — chính là chủ đề [Phần 21 (XS-Leaks)](/blog/web-security-21-xs-leaks-cross-site-leaks/).
+
+---
+
+## Checklist phòng tránh
+
+1. Cần `SharedArrayBuffer`/wasm-threads? Mới bật isolation.
+2. Đặt **`COOP: same-origin`** + **`COEP: require-corp`** (hoặc `credentialless`).
+3. Kiểm `self.crossOriginIsolated === true` trước khi dùng API mạnh.
+4. Audit mọi tài nguyên cross-origin → CORP, CORS, hoặc `credentialless`.
+5. Tài nguyên bạn phục vụ ra ngoài: thêm **`CORP: cross-origin`/`same-site`**.
+6. Triển khai bằng bản **`-Report-Only`** trước khi enforce.
+
+---
+
+## Bài tập / Exercises
+
+**1.** Bạn đặt `COEP: require-corp` và `SharedArrayBuffer` vẫn `undefined`. Nguyên nhân khả dĩ nhất là gì?
+
+<details>
+<summary>Lời giải</summary>
+
+Thiếu **`COOP: same-origin`** (hoặc đặt nhầm `same-origin-allow-popups`). Cần **cả hai** header thì `crossOriginIsolated` mới `true`. Kiểm `self.crossOriginIsolated` để xác nhận.
+</details>
+
+**2.** Trong simulator, đặt COEP = `require-corp`, tài nguyên cross-origin không CORP, không CORS. Vì sao bị chặn, và nêu **ba** cách sửa.
+
+<details>
+<summary>Lời giải</summary>
+
+`require-corp` đòi mọi byte cross-origin opt-in; tài nguyên này không có. Sửa: (a) cho server tài nguyên gửi `CORP: cross-origin`; (b) tải qua CORS (`crossorigin` + `Access-Control-Allow-Origin`); (c) đổi trang sang `COEP: credentialless` (tải không credential, không cần CORP).
+</details>
+
+**3.** Vì sao `credentialless` an toàn về Spectre dù không đòi CORP?
+
+<details>
+<summary>Lời giải</summary>
+
+Vì request no-cors cross-origin bị **tước credential** — phản hồi không gắn với phiên đăng nhập của nạn nhân, nên dù bị đo qua kênh phụ cũng không lộ dữ liệu riêng tư. Đánh đổi là tài nguyên chạy ở trạng thái đăng xuất.
+</details>
+
+Nâng cao:Trong simulator, tìm cấu hình mà tài nguyên **load được** nhưng trang **vẫn không** isolated, và giải thích một câu vì sao (gợi ý: COEP = `unsafe-none`).
+
+---
+
+## Điểm chính
+
+- Spectre khiến trình duyệt tắt `SharedArrayBuffer` và timer chính xác cho tất cả; **cross-origin isolation** là cách lấy lại.
+- `crossOriginIsolated === true` cần **`COOP: same-origin`** + **`COEP: require-corp`/`credentialless`**.
+- COOP cắt quan hệ cửa sổ cross-origin; COEP buộc mọi byte nhúng opt-in qua **CORP** hoặc **CORS**.
+- Bật COEP hay làm vỡ tài nguyên bên thứ ba — dùng `credentialless` hoặc thêm CORP để cứu.
+- Chỉ bật khi cần, audit tài nguyên trước, và triển khai bằng bản `-Report-Only`.
+
+---
+
+## Nguồn
+
+- web.dev — [Why you need cross-origin isolation for powerful features](https://web.dev/articles/why-coop-coep) and [A guide to enable cross-origin isolation](https://web.dev/articles/coop-coep).
+- MDN — [`Cross-Origin-Opener-Policy`](https://developer.mozilla.org/docs/Web/HTTP/Reference/Headers/Cross-Origin-Opener-Policy), [`Cross-Origin-Embedder-Policy`](https://developer.mozilla.org/docs/Web/HTTP/Reference/Headers/Cross-Origin-Embedder-Policy), [`Cross-Origin-Resource-Policy`](https://developer.mozilla.org/docs/Web/HTTP/Reference/Headers/Cross-Origin-Resource-Policy), and [`crossOriginIsolated`](https://developer.mozilla.org/docs/Web/API/crossOriginIsolated).
+- Google — [Spectre & the web](https://security.googleblog.com/2021/03/a-spectre-proof-of-concept-for-spectre.html); [COEP credentialless](https://developer.chrome.com/blog/coep-credentialless-origin-trial).
+
+---
+
+## Series
+
+Các phần bonus xếp trên mười phần lõi và nhánh nâng cao. Sợi chỉ từ [Phần 1](/blog/web-security-01-browser-security-same-origin-policy/): **biên giới process mới là biên giới bảo mật thật khi phần cứng rò rỉ — bạn chứng minh sự cô lập để đổi lấy quyền năng**.

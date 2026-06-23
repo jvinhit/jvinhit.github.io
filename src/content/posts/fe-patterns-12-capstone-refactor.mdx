@@ -1,0 +1,221 @@
+---
+title: 'Design Patterns Frontend · Part 12 — Capstone: Refactor a Messy Feature'
+description: 'Bringing all 11 parts together: take a tangled 300-line "god component" and refactor it step by step with state machines, DI, strategy, facade, observer, and compound components — plus a checklist for spotting code that needs refactoring.'
+pubDate: 2026-08-16
+tags: [design-patterns, refactor, architecture, capstone, fe_patterns_12]
+series: fe-patterns
+seriesOrder: 12
+draft: true
+---
+
+Mười một phần, mười một nhóm pattern. Phần cuối ghép chúng lại theo cách bạn sẽ gặp trong đời thực: cầm một component "thần thánh" (god component) rối tung và **refactor từng bước**. Mục tiêu không phải dùng *mọi* pattern, mà chọn đúng pattern cho từng nỗi đau cụ thể.
+
+---
+
+## 1. "Bệnh nhân": một CheckoutForm 300 dòng
+
+Hãy hình dung component thanh toán điển hình tích tụ qua nhiều sprint:
+
+```tsx
+// ❌ BEFORE: one component owns everything
+function CheckoutForm() {
+  const [isLoading, setIsLoading] = useState(false);
+  const [isError, setIsError] = useState(false);
+  const [isSuccess, setIsSuccess] = useState(false);
+  const [paymentMethod, setPaymentMethod] = useState('card');
+  const [items, setItems] = useState([]);
+  // ...10 more useState calls
+
+  const handleSubmit = async () => {
+    setIsLoading(true);
+    setIsError(false);
+    // calls Stripe SDK directly here
+    if (paymentMethod === 'card') { /* 30 lines of card logic */ }
+    else if (paymentMethod === 'paypal') { /* 30 lines of paypal logic */ }
+    else if (paymentMethod === 'momo') { /* 30 lines of momo logic */ }
+    // fee calculation, validation, fetch, setting all kinds of state...
+    // 200 lines of JSX mixed with logic
+  };
+  // ...
+}
+```
+
+Triệu chứng (chính là checklist nhận diện code cần refactor):
+
+- **Quá nhiều `useState` boolean rời rạc** → trạng thái không thể xảy ra (Phần 10).
+- **Gọi thẳng SDK bên thứ ba** → buộc cứng, khó test (Phần 7).
+- **Chuỗi if/else theo loại** → vi phạm Open/Closed (Phần 5).
+- **Một component làm mọi thứ** → vi phạm Single Responsibility (Phần 1).
+
+---
+
+## 2. Bước 1 — Thay boolean rời rạc bằng State Machine (Phần 10)
+
+Gộp `isLoading/isError/isSuccess` thành một trạng thái tường minh, diệt trạng thái vô nghĩa:
+
+```ts
+type CheckoutState =
+  | { status: 'editing' }
+  | { status: 'submitting' }
+  | { status: 'success'; orderId: string }
+  | { status: 'error'; error: Error };
+
+function checkoutMachine(state: CheckoutState, event: CheckoutEvent): CheckoutState {
+  switch (state.status) {
+    case 'editing':
+      return event.type === 'SUBMIT' ? { status: 'submitting' } : state;
+    case 'submitting':
+      if (event.type === 'OK') return { status: 'success', orderId: event.orderId };
+      if (event.type === 'FAIL') return { status: 'error', error: event.error };
+      return state;
+    case 'error':
+      return event.type === 'RETRY' ? { status: 'submitting' } : state;
+    case 'success':
+      return state;
+  }
+}
+```
+
+Giờ "loading + error cùng lúc" là **không thể biểu diễn**.
+
+---
+
+## 3. Bước 2 — Tách thanh toán bằng Strategy + Adapter (Phần 5, 7)
+
+Chuỗi if/else theo `paymentMethod` trở thành các strategy sau một interface chung. Mỗi nhà cung cấp là một adapter:
+
+```ts
+interface PaymentProvider {
+  pay(amount: number): Promise<{ orderId: string }>;
+}
+
+// Each adapter wraps one SDK; all conform to PaymentProvider (Adapter, Part 7)
+class StripeAdapter implements PaymentProvider { async pay(amount: number) { /* Stripe SDK */ return { orderId: 's1' }; } }
+class PaypalAdapter implements PaymentProvider { async pay(amount: number) { /* PayPal SDK */ return { orderId: 'p1' }; } }
+class MomoAdapter implements PaymentProvider { async pay(amount: number) { /* MoMo SDK */ return { orderId: 'm1' }; } }
+
+// Factory picks strategy based on user choice (Factory, Part 4)
+function paymentProviderFor(method: 'card' | 'paypal' | 'momo'): PaymentProvider {
+  const map = { card: new StripeAdapter(), paypal: new PaypalAdapter(), momo: new MomoAdapter() };
+  return map[method];
+}
+```
+
+Thêm phương thức thanh toán mới giờ = thêm một adapter + một entry, **không sửa** logic submit. Open/Closed thành hình.
+
+---
+
+## 4. Bước 3 — Đưa logic vào ViewModel hook + DI (Phần 11)
+
+Gom toàn bộ state nghiệp vụ vào một hook (ViewModel), và tiêm phụ thuộc thay vì gọi thẳng:
+
+```ts
+function useCheckout(provider: PaymentProvider) { // provider is INJECTED (DI, Part 11)
+  const [state, dispatch] = useReducer(checkoutMachine, { status: 'editing' });
+
+  const submit = useCallback(
+    async (amount: number) => {
+      dispatch({ type: 'SUBMIT' });
+      try {
+        const { orderId } = await provider.pay(amount);
+        dispatch({ type: 'OK', orderId });
+      } catch (error) {
+        dispatch({ type: 'FAIL', error: error as Error });
+      }
+    },
+    [provider],
+  );
+
+  return { state, submit };
+}
+```
+
+Hook này **test được không cần render** và không cần SDK thật — chỉ tiêm một `PaymentProvider` giả.
+
+---
+
+## 5. Bước 4 — Tách UI bằng Compound Components (Phần 9)
+
+200 dòng JSX tách thành các phần trình bày thuần, phối hợp qua compound API:
+
+```tsx
+function CheckoutForm({ method }: { method: 'card' | 'paypal' | 'momo' }) {
+  const provider = useMemo(() => paymentProviderFor(method), [method]);
+  const { state, submit } = useCheckout(provider);
+
+  // render by status — clear, no boolean combinations
+  return (
+    <Checkout>
+      <Checkout.Summary />
+      <Checkout.PaymentSelector />
+      {state.status === 'error' && <Checkout.Error error={state.error} />}
+      <Checkout.SubmitButton
+        loading={state.status === 'submitting'}
+        disabled={state.status === 'submitting'}
+        onSubmit={() => submit(totalAmount)}
+      />
+    </Checkout>
+  );
+}
+```
+
+So với "trước": mỗi phần một trách nhiệm, mỗi phần test riêng được, và đọc `CheckoutForm` là hiểu ngay luồng.
+
+---
+
+## 6. Bước 5 — Tách side-effect bằng Observer (Phần 3)
+
+Những việc phụ (analytics, toast, log) không nên nhồi vào logic submit. Phát sự kiện, để nơi khác lắng nghe (Pub/Sub, Phần 3):
+
+```ts
+// In machine/hook: only emit events, don't handle analytics itself
+bus.emit('checkout:success', { orderId });
+
+// Elsewhere (fully decoupled) listens:
+bus.on('checkout:success', ({ orderId }) => {
+  analytics.trackCheckout(orderId, total); // analytics Facade from Part 7
+  toast.success('Order placed successfully!');
+});
+```
+
+Logic thanh toán giờ **không biết** tới analytics hay toast — tách mối quan tâm trọn vẹn.
+
+---
+
+## 7. Bức tranh "sau khi refactor"
+
+| Nỗi đau ban đầu | Pattern áp dụng | Part |
+|------------------|-----------------|------|
+| Loose boolean state | State Machine | 10 |
+| if/else by payment method | Strategy + Factory | 4, 5 |
+| Direct SDK calls | Adapter + DI | 7, 11 |
+| Component owns everything | ViewModel hook + Compound | 9, 11 |
+| Mixed side effects | Observer/Pub-Sub + Facade | 3, 7 |
+
+Kết quả: từ một file 300 dòng khó test, ta có các mảnh nhỏ — mỗi mảnh một trách nhiệm, test độc lập, mở rộng không sửa code cũ.
+
+---
+
+## 8. Checklist nhận diện code cần refactor
+
+Mang theo khi đọc code (của bạn hoặc của người khác):
+
+1. **Nhiều boolean state liên quan?** → State Machine (Phần 10).
+2. **Chuỗi if/else / switch theo loại lặp lại?** → Strategy + Factory (Phần 4, 5).
+3. **Gọi thẳng thư viện bên thứ ba khắp nơi?** → Adapter/Facade + DI (Phần 7, 11).
+4. **Component > 150 dòng làm nhiều việc?** → tách hook (ViewModel) + presentational (Phần 9, 11).
+5. **Logic copy-paste lần thứ 3?** → tách hook/hàm dùng chung (Phần 9).
+6. **Side-effect (analytics, toast) trộn trong logic nghiệp vụ?** → Observer/Pub-Sub (Phần 3).
+7. **Khó viết test vì phụ thuộc cứng?** → Dependency Injection (Phần 11).
+
+> Nhưng đừng quên bài học Phần 1: **refactor khi có nỗi đau thật**, không phải để trưng bày pattern. Mỗi pattern thêm vào là một thứ người sau phải hiểu — chỉ đáng khi nó cắt giảm phức tạp đang có.
+
+---
+
+## Kết series
+
+Design pattern ở frontend không phải kiến thức hàn lâm — chúng là **từ vựng chung** để nói về cách tổ chức code, và là **bộ công cụ** để gỡ rối khi code lớn lên. Bạn không cần thuộc lòng 23 pattern GoF. Bạn cần nhận ra *hình dạng của nỗi đau* (state rối, phụ thuộc cứng, trùng lặp, component khổng lồ) và biết pattern nào tương ứng.
+
+Quan trọng nhất: pattern là phương tiện, không phải mục đích. Code đơn giản, rõ ràng luôn thắng code "đúng pattern" nhưng rối rắm. Hãy dùng chúng để làm code *đơn giản hơn cho người đọc tiếp theo* — đó mới là dấu hiệu thật của một senior.
+
+Cảm ơn bạn đã đi hết 12 phần. Hãy mở một component rối nhất trong dự án của bạn và chạy checklist ở mục 8 — refactor một bước thôi cũng đã là tiến bộ.

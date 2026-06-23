@@ -1,0 +1,198 @@
+---
+title: 'Node.js Super Senior · Phase 17 — GraphQL APIs'
+description: 'Bonus Phase 17: GraphQL trên Node. Schema và type system, resolver, vấn đề N+1 và DataLoader, mutation và subscription, lỗi & phân quyền, rồi khi nào GraphQL thắng REST — và khi nào không.'
+pubDate: 2026-06-22
+tags: [nodejs, graphql, api, dataloader, node_10]
+series: nodejs
+seriesOrder: 17
+draft: false
+---
+
+Đây là **Bonus Phase 17**. Phase 3 bạn dựng REST với Express; giờ ta xét một mô hình API khác. **GraphQL** đảo ngược quyền kiểm soát: thay vì server quyết định mỗi endpoint trả gì, client *hỏi đúng* dữ liệu nó cần trong một request. Mạnh, nhưng không miễn phí — phần này chỉ cả sức mạnh lẫn cạm bẫy (đặc biệt N+1).
+
+---
+
+## REST vs GraphQL — vấn đề cốt lõi
+
+REST hay gặp **over-fetching** (trả thừa field) và **under-fetching** (phải gọi nhiều endpoint để ghép một màn hình). GraphQL giải bằng một endpoint duy nhất nhận query mô tả hình dạng dữ liệu cần:
+
+```graphql
+# client hỏi đúng những gì cần, lồng nhau trong một round-trip
+query {
+  user(id: "1") {
+    name
+    posts(last: 3) { title }
+  }
+}
+```
+
+```text
+REST:      GET /users/1  +  GET /users/1/posts   (2 request, có thể thừa field)
+GraphQL:   POST /graphql  { user { name posts { title } } }   (1 request, đúng field)
+```
+
+---
+
+## Schema & type system
+
+GraphQL là **schema-first**: bạn định nghĩa kiểu, query và mutation. Schema là hợp đồng giữa client và server.
+
+```graphql
+type User {
+  id: ID!
+  name: String!
+  posts: [Post!]!     # ! nghĩa là non-null
+}
+
+type Post {
+  id: ID!
+  title: String!
+  author: User!
+}
+
+type Query {
+  user(id: ID!): User
+  posts: [Post!]!
+}
+
+type Mutation {
+  createPost(title: String!, authorId: ID!): Post!
+}
+```
+
+Dùng **Apollo Server** (hoặc GraphQL Yoga, Pothos cho code-first type-safe):
+
+```bash
+npm install @apollo/server graphql
+```
+
+---
+
+## Resolver — nơi dữ liệu được lấy
+
+Mỗi field có thể có một **resolver** — hàm trả giá trị cho field đó. Resolver nhận `(parent, args, context, info)`:
+
+```ts
+const resolvers = {
+  Query: {
+    user: (_parent, { id }, ctx) => ctx.db.user.findUnique({ where: { id } }),
+    posts: (_parent, _args, ctx) => ctx.db.post.findMany(),
+  },
+  User: {
+    // resolver field: lấy posts cho MỘT user (cha là user)
+    posts: (parent, _args, ctx) => ctx.db.post.findMany({ where: { authorId: parent.id } }),
+  },
+  Mutation: {
+    createPost: (_p, { title, authorId }, ctx) =>
+      ctx.db.post.create({ data: { title, authorId } }),
+  },
+};
+```
+
+`context` (tạo mỗi request) là nơi để DB client, user đã auth, và DataLoader — đúng tinh thần dependency injection (Phase 6/10).
+
+---
+
+## Vấn đề N+1 — và DataLoader
+
+Đây là cái bẫy quan trọng nhất của GraphQL. Query lấy 10 post kèm `author` của mỗi post: resolver `posts` chạy 1 query, rồi resolver `author` chạy **thêm 1 query mỗi post** → 1 + 10 = 11 query. Với danh sách lớn, đây là thảm họa hiệu năng.
+
+```text
+posts → 1 query
+  post[0].author → query
+  post[1].author → query
+  ...                       ← N query cho N post  (N+1!)
+```
+
+**DataLoader** gộp (batch) các lượt lấy trong cùng một tick và cache trong phạm vi request:
+
+```ts
+import DataLoader from 'dataloader';
+
+// tạo MỚI mỗi request (đặt trong context) để cache không rò giữa user
+const userLoader = new DataLoader<string, User>(async (ids) => {
+  const users = await db.user.findMany({ where: { id: { in: [...ids] } } });
+  // PHẢI trả đúng thứ tự ids
+  return ids.map((id) => users.find((u) => u.id === id)!);
+});
+
+const resolvers = {
+  Post: {
+    author: (post, _args, ctx) => ctx.userLoader.load(post.authorId), // gộp tự động
+  },
+};
+```
+
+Giờ 10 lượt `.load()` gộp thành **1 query** `WHERE id IN (...)`. DataLoader là kiến thức bắt buộc — thiếu nó, GraphQL của bạn sẽ giết database.
+
+---
+
+## Mutation, lỗi & phân quyền
+
+Mutation thay đổi dữ liệu (như POST/PUT/DELETE). Phân quyền làm trong resolver/context, không ở tầng route như REST:
+
+```ts
+Mutation: {
+  deletePost: (_p, { id }, ctx) => {
+    if (!ctx.user) throw new GraphQLError('Chưa đăng nhập', {
+      extensions: { code: 'UNAUTHENTICATED' },
+    });
+    if (ctx.user.role !== 'admin') throw new GraphQLError('Cấm', {
+      extensions: { code: 'FORBIDDEN' },
+    });
+    return ctx.db.post.delete({ where: { id } });
+  },
+}
+```
+
+GraphQL luôn trả HTTP 200 kèm mảng `errors` — dùng `extensions.code` để client phân biệt loại lỗi. Validate input bằng schema GraphQL + zod cho luật nghiệp vụ.
+
+---
+
+## Subscription — realtime
+
+Ngoài query/mutation, GraphQL có **subscription** cho dữ liệu realtime qua WebSocket (cầu nối tới Phase 19):
+
+```graphql
+type Subscription {
+  postAdded: Post!
+}
+```
+
+```ts
+Subscription: {
+  postAdded: { subscribe: () => pubsub.asyncIterator(['POST_ADDED']) },
+}
+// trong createPost: pubsub.publish('POST_ADDED', { postAdded: newPost });
+```
+
+---
+
+## GraphQL vs REST — chọn lựa
+
+| | REST (Phase 3) | GraphQL |
+|---|---|---|
+| Hình dạng dữ liệu | server quyết | client hỏi |
+| Round-trip | nhiều endpoint | một query lồng |
+| Caching HTTP | dễ (GET + ETag) | khó hơn (POST) |
+| File upload, đơn giản | tự nhiên | thêm việc |
+| Hợp cho | API công khai, CRUD đơn giản, cache CDN | client đa dạng, đồ thị dữ liệu phức tạp, mobile tiết kiệm băng thông |
+
+Quan điểm senior: GraphQL tỏa sáng khi nhiều loại client cần *hình dạng khác nhau* trên một đồ thị dữ liệu phong phú. Với CRUD đơn giản hay API cần cache HTTP/CDN mạnh, REST vẫn gọn hơn. Đừng chọn GraphQL vì hype — chọn vì bài toán hình dạng dữ liệu.
+
+---
+
+## Thực hành
+
+1. Định nghĩa schema `User`/`Post` với quan hệ hai chiều; dựng Apollo Server.
+2. Resolver dùng Prisma (Phase 12) qua `context`.
+3. Tạo bug N+1 cố ý (query posts kèm author), đo số query, rồi sửa bằng DataLoader trong context.
+4. Thêm mutation `createPost` có auth + RBAC (Phase 5) ném `GraphQLError` với `extensions.code`.
+5. Thêm subscription `postAdded` qua `graphql-ws`.
+6. Viết test integration cho một query lồng và xác nhận chỉ 2 query DB chạy.
+
+---
+
+## Phần tiếp theo
+
+GraphQL cho một API linh hoạt trên *một* service. Khi hệ thống lớn vượt một process, bạn tách thành nhiều service. Ở **Phase 18 — Microservices & gRPC**, ta đi: khi nào nên (và không nên) tách monolith, giao tiếp đồng bộ với **gRPC** + Protocol Buffers, bất đồng bộ qua message queue (Phase 16), service discovery, và xử lý lỗi phân tán.

@@ -1,0 +1,125 @@
+---
+title: 'How Browsers Work · Part 15 — Rendering Scheduling & the Frame Lifecycle'
+description: 'Một khung hình 16.6ms gồm những gì và theo thứ tự nào: rAF, style, layout, paint, composite. Cộng với content-visibility, requestIdleCallback và scheduler.postTask để xếp việc đúng khe.'
+pubDate: 2026-11-02
+tags: [browser, internals, rendering, scheduling, browser_internals_12]
+series: browser-internals
+seriesOrder: 15
+draft: true
+---
+
+Phần 7 giới thiệu event loop. Phần này phóng to vào **một khung hình** (frame) — đơn vị thời gian mà trình duyệt dùng để cập nhật màn hình. Ở 60Hz, mỗi khung có ~16.6ms; ở 120Hz chỉ ~8.3ms. Hiểu chính xác thứ tự công việc trong một khung là chìa khoá để biết *khi nào* code của bạn chạy và vì sao một số animation giật.
+
+---
+
+## 1. Giải phẫu một khung hình
+
+Mỗi khung, nếu cần cập nhật hình ảnh, trình duyệt chạy chuỗi này (gọi là "rendering steps" / update-the-rendering):
+
+```text
+│ Một khung (~16.6ms @ 60Hz)                                        │
+├──────────────────────────────────────────────────────────────────┤
+│ 1. Input  (xử lý sự kiện chuột/chạm/bàn phím đang chờ)             │
+│ 2. requestAnimationFrame callbacks                                 │
+│ 3. Style   (tính computed style cho node bị ảnh hưởng)            │
+│ 4. Layout  (tính hình học — nếu cần)                              │
+│ 5. (ResizeObserver / IntersectionObserver chạy ở mốc thích hợp)   │
+│ 6. Paint   (ghi paint records)                                     │
+│ 7. Composite (commit sang compositor thread)                       │
+├──────────────────────────────────────────────────────────────────┤
+│ Thời gian thừa → idle period → requestIdleCallback                 │
+```
+
+Điểm mấu chốt: **`requestAnimationFrame` chạy *trước* style/layout/paint**. Đó là khe đúng để cập nhật trạng thái animation — thay đổi của bạn sẽ được phản ánh ngay trong style/layout cùng khung đó.
+
+---
+
+## 2. requestAnimationFrame — đồng bộ với khung
+
+`requestAnimationFrame(cb)` lên lịch `cb` chạy *ngay trước* bước render kế tiếp. Dùng nó cho animation bằng JS để mỗi thay đổi khớp đúng một khung.
+
+```js
+function tick(now) {
+  // 'now' là timestamp khung hiện tại (cùng gốc với performance.now())
+  el.style.transform = `translateX(${x(now)}px)`; // ghi, sẽ render trong khung này
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+```
+
+Đừng dùng `setTimeout/setInterval` cho animation: chúng không đồng bộ VSync → đôi khi hai cập nhật rơi vào một khung (phí) hoặc lệch (giật). `rAF` tự dừng khi tab ẩn (tiết kiệm pin), khác `setInterval`.
+
+---
+
+## 3. Bẫy: đọc–ghi xen kẽ trong cùng khung (layout thrashing)
+
+Vì style/layout xảy ra *một lần* mỗi khung, đọc thuộc tính hình học (như `offsetHeight`) *sau khi* đã ghi style buộc trình duyệt layout đồng bộ ngay lập tức — **forced synchronous layout** (Phần 5). Lặp lại trong vòng lặp gọi là *layout thrashing*.
+
+```js
+// ❌ thrash: mỗi vòng buộc một layout đồng bộ
+for (const el of items) {
+  el.style.width = box.offsetWidth + 'px'; // ghi rồi đọc đan xen
+}
+
+// ✅ tách đọc và ghi
+const w = box.offsetWidth;          // đọc 1 lần
+for (const el of items) el.style.width = w + 'px'; // chỉ ghi
+```
+
+Mẹo: gom *đọc* rồi gom *ghi*. Thư viện như FastDOM tự động hoá việc này bằng cách hoãn ghi vào `rAF`.
+
+---
+
+## 4. content-visibility — bỏ qua render phần ngoài màn hình
+
+`content-visibility: auto` báo trình duyệt **bỏ qua layout và paint** cho cây con khi nó ngoài viewport — một trong những tối ưu render mạnh nhất cho trang dài.
+
+```css
+.card {
+  content-visibility: auto;
+  /* kích thước ước lượng để scrollbar không nhảy khi nội dung bị bỏ qua */
+  contain-intrinsic-size: auto 320px;
+}
+```
+
+Khi card cuộn vào gần viewport, trình duyệt mới render nó. `contain-intrinsic-size` cung cấp kích thước placeholder để giữ chiều cao trang ổn định. Đây là cách khai báo điều mà compositor tiling (Phần 13) làm cho pixel, nhưng ở mức layout.
+
+---
+
+## 5. requestIdleCallback & scheduler.postTask — xếp việc theo độ ưu tiên
+
+Sau khi render xong, nếu còn thời gian trước khung kế, trình duyệt có một **idle period**. `requestIdleCallback` chạy việc không gấp trong khe đó.
+
+```js
+requestIdleCallback((deadline) => {
+  // chạy tới khi hết thời gian rảnh của khung
+  while (deadline.timeRemaining() > 0 && queue.length) process(queue.shift());
+}, { timeout: 2000 }); // bảo đảm chạy trễ nhất sau 2s dù không rảnh
+```
+
+Hiện đại hơn là **`scheduler.postTask`** với mức ưu tiên rõ ràng, và **`scheduler.yield()`** để nhường lại luồng chính giữa một tác vụ dài (cải thiện INP):
+
+```js
+await scheduler.postTask(work, { priority: 'background' }); // 'user-blocking' | 'user-visible' | 'background'
+
+async function chunkedWork(items) {
+  for (const item of items) {
+    process(item);
+    await scheduler.yield(); // nhường để xử lý input → INP tốt hơn
+  }
+}
+```
+
+> Quy tắc khe: animation → `requestAnimationFrame`; việc không gấp → `requestIdleCallback`/`postTask('background')`; chia nhỏ tác vụ dài để không chặn input → `scheduler.yield()`.
+
+---
+
+## 6. Tóm tắt
+
+- Mỗi khung (~16.6ms @60Hz) chạy theo thứ tự cố định: input → **rAF** → style → layout → observers → paint → composite → (idle).
+- **`requestAnimationFrame`** chạy *trước* style/layout, là khe đúng để cập nhật animation; đồng bộ VSync và tự dừng khi tab ẩn.
+- Đọc hình học sau khi ghi style trong cùng khung gây **forced layout / thrashing**; gom đọc rồi gom ghi.
+- **`content-visibility: auto`** bỏ qua layout/paint cho cây con ngoài viewport; kèm `contain-intrinsic-size` để giữ chiều cao ổn định.
+- **`requestIdleCallback`** chạy việc không gấp trong idle period; **`scheduler.postTask`/`scheduler.yield`** cho lập lịch theo ưu tiên và nhường luồng chính (tốt cho INP).
+
+**Phần tiếp theo:** V8 deep — các tầng tối ưu (Ignition → Sparkplug → Maglev → TurboFan), hidden class, inline cache, và vì sao "monomorphic" code chạy nhanh còn "megamorphic" thì không.

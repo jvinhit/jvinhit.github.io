@@ -1,0 +1,218 @@
+---
+title: 'Algorithms in Frontend · Part 10 — String Algorithms: Highlight, Diff & Slug'
+description: 'Strings everywhere in the UI: XSS-safe search result highlighting, Levenshtein for "did you mean...", LCS for text diff, and proper slugify for URLs — plus Unicode pitfalls many people miss.'
+pubDate: 2026-07-19
+tags: [algorithms, string, diff, levenshtein, fe_algorithms_12]
+series: fe-algorithms
+seriesOrder: 10
+draft: true
+---
+
+Frontend xử lý chuỗi liên tục: tô đậm phần khớp trong kết quả tìm kiếm, gợi ý "ý bạn là...", hiển thị thay đổi giữa hai phiên bản văn bản, tạo slug cho URL. Mỗi việc đều có một thuật toán chuỗi phía sau, và mỗi cái đều có cạm bẫy Unicode khiến code "chạy được với tiếng Anh" nhưng vỡ với tiếng Việt hay emoji.
+
+---
+
+## 1. Highlight phần khớp — và làm sao tránh XSS
+
+Sau khi tìm kiếm (Phần 3), ta muốn tô đậm phần chuỗi khớp. Cách sai phổ biến là nối chuỗi HTML rồi `innerHTML` — mở toang cửa cho XSS nếu dữ liệu chứa `<script>`.
+
+Cách đúng: **tách chuỗi thành các đoạn khớp / không khớp** rồi để framework render text an toàn (React tự escape). Tái dùng mảng `matches` (chỉ số ký tự khớp) từ fuzzy search ở Phần 3:
+
+```ts
+interface Segment {
+  text: string;
+  matched: boolean;
+}
+
+// Group consecutive match indices into segments, alternating with non-match segments
+function toSegments(text: string, matchIndices: number[]): Segment[] {
+  const isMatch = new Set(matchIndices);
+  const segments: Segment[] = [];
+  let buffer = '';
+  let prevMatched: boolean | null = null;
+
+  for (let i = 0; i < text.length; i++) {
+    const matched = isMatch.has(i);
+    if (prevMatched !== null && matched !== prevMatched) {
+      segments.push({ text: buffer, matched: prevMatched });
+      buffer = '';
+    }
+    buffer += text[i];
+    prevMatched = matched;
+  }
+  if (buffer) segments.push({ text: buffer, matched: prevMatched ?? false });
+  return segments;
+}
+```
+
+```tsx
+function Highlight({ text, matches }: { text: string; matches: number[] }) {
+  // React auto-escapes text content → no XSS risk, no innerHTML needed
+  return (
+    <>
+      {toSegments(text, matches).map((seg, i) =>
+        seg.matched ? <mark key={i}>{seg.text}</mark> : <span key={i}>{seg.text}</span>,
+      )}
+    </>
+  );
+}
+```
+
+> Nếu chỉ highlight theo **chuỗi con** (substring) thay vì fuzzy, dùng `indexOf` lặp để tìm các vị trí khớp rồi cũng tạo segment như trên. Tuyệt đối tránh ghép HTML thủ công.
+
+---
+
+## 2. Levenshtein: khoảng cách chỉnh sửa cho "ý bạn là..."
+
+Khoảng cách Levenshtein là **số phép chèn/xóa/thay** tối thiểu để biến chuỗi này thành chuỗi kia. "kitten" → "sitting" là 3. Nó là nền cho gợi ý sửa lỗi chính tả và "did you mean".
+
+```ts
+function levenshtein(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+
+  // DP with only one row — O(min) memory instead of O(m*n)
+  let prev = Array.from({ length: n + 1 }, (_, i) => i);
+  let curr = new Array<number>(n + 1);
+
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(
+        prev[j] + 1, // delete
+        curr[j - 1] + 1, // insert
+        prev[j - 1] + cost, // replace (or keep if cost=0)
+      );
+    }
+    [prev, curr] = [curr, prev]; // swap rows, reuse arrays
+  }
+  return prev[n];
+}
+```
+
+```ts
+function didYouMean(input: string, dictionary: string[], maxDistance = 2): string | null {
+  let best: string | null = null;
+  let bestDist = Infinity;
+  for (const word of dictionary) {
+    const d = levenshtein(input.toLowerCase(), word.toLowerCase());
+    if (d < bestDist) {
+      bestDist = d;
+      best = word;
+    }
+  }
+  return bestDist <= maxDistance ? best : null;
+}
+
+didYouMean('javascrpit', ['javascript', 'typescript', 'rust']); // → "javascript"
+```
+
+Độ phức tạp `O(m·n)` — chấp nhận được cho từ ngắn so với từ điển nhỏ. Đừng chạy nó trên toàn bộ một bài viết dài; cho từ điển lớn, lọc sơ bộ trước (theo độ dài, ký tự đầu).
+
+---
+
+## 3. LCS & text-diff: hiển thị thay đổi
+
+Để hiển thị diff giữa hai đoạn văn bản (kiểu Git), ta dùng **LCS — Longest Common Subsequence**. Phần *không* thuộc LCS là phần bị xóa (ở bản cũ) hoặc thêm (ở bản mới).
+
+```ts
+type DiffOp = { type: 'keep' | 'add' | 'remove'; value: string };
+
+function diffWords(oldText: string, newText: string): DiffOp[] {
+  const a = oldText.split(/(\s+)/); // split but keep whitespace for correct rejoin
+  const b = newText.split(/(\s+)/);
+  const m = a.length;
+  const n = b.length;
+
+  // LCS length table
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  // Trace back to build the operation list
+  const ops: DiffOp[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < m && j < n) {
+    if (a[i] === b[j]) {
+      ops.push({ type: 'keep', value: a[i] });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      ops.push({ type: 'remove', value: a[i++] });
+    } else {
+      ops.push({ type: 'add', value: b[j++] });
+    }
+  }
+  while (i < m) ops.push({ type: 'remove', value: a[i++] });
+  while (j < n) ops.push({ type: 'add', value: b[j++] });
+  return ops;
+}
+```
+
+Render thì map mỗi op sang một thẻ có style (xanh = thêm, đỏ gạch = xóa). Đây cũng là nền của diff dòng trong code review — chỉ khác là tách theo dòng thay vì theo từ.
+
+---
+
+## 4. Slugify: tạo URL sạch (cẩn thận Unicode)
+
+URL slug cần bỏ dấu, thay khoảng trắng bằng gạch nối, loại ký tự không hợp lệ. Mấu chốt là **chuẩn hóa Unicode đúng** cho tiếng Việt:
+
+```ts
+function slugify(input: string): string {
+  return input
+    .normalize('NFD') // split accented chars into base + combining marks
+    .replace(/[\u0300-\u036f]/g, '') // strip combining marks (tone marks, etc.)
+    .replace(/đ/g, 'd') // đ/Đ don't decompose via NFD — handle separately
+    .replace(/Đ/g, 'd')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\s-]/g, '') // remove invalid characters
+    .replace(/\s+/g, '-') // spaces → hyphens
+    .replace(/-+/g, '-'); // collapse consecutive hyphens
+}
+
+slugify('Lập trình Frontend — Phần 1'); // → "lap-trinh-frontend-phan-1"
+```
+
+Lưu ý "đ/Đ" của tiếng Việt **không** được tách bởi `NFD` (nó là ký tự độc lập, không phải "d + dấu"), nên phải thay tay — đây là lỗi mà rất nhiều hàm slugify "copy từ Stack Overflow" bỏ sót.
+
+---
+
+## 5. Cảnh báo Unicode: `.length` không phải số ký tự
+
+Cạm bẫy lớn nhất khi xử lý chuỗi ở frontend: `string.length` đếm **code unit UTF-16**, không phải ký tự người dùng thấy.
+
+```ts
+'café'.length; // 4 or 5 depending on normalization (é may be 1 or 2 code units)
+'👨‍👩‍👧'.length; // 8 (!) — one family emoji is multiple code points joined by ZWJ
+[...'👨‍👩‍👧'].length; // 5 — still not "1" as the eye sees
+```
+
+Khi cần đếm/cắt theo "ký tự người dùng cảm nhận" (grapheme), dùng `Intl.Segmenter`:
+
+```ts
+const seg = new Intl.Segmenter('vi', { granularity: 'grapheme' });
+const graphemes = [...seg.segment('👨‍👩‍👧 xin chào')].map((s) => s.segment);
+graphemes.length; // counts correctly by user perception
+```
+
+Quy tắc: với cắt chuỗi hiển thị (truncate "..."), highlight, đếm ký tự còn lại trong ô nhập — luôn nghĩ tới grapheme, đừng tin `.length`.
+
+---
+
+## Tóm tắt
+
+- **Highlight** bằng cách chia segment + để framework escape, **không** ghép HTML (tránh XSS).
+- **Levenshtein** (`O(m·n)`, tối ưu bộ nhớ 1 hàng) cho "did you mean"; lọc sơ bộ trước khi quét từ điển lớn.
+- **LCS** dựng text-diff (keep/add/remove) — nền của diff code review.
+- **Slugify** phải chuẩn hóa `NFD` + xử lý riêng "đ/Đ" cho tiếng Việt.
+- `.length` đếm code unit, không phải grapheme — dùng `Intl.Segmenter` khi cần đếm/cắt theo cảm nhận người dùng.
+
+**Phần tiếp theo:** Hình học & animation — easing, interpolation, hit-testing và drag-snap.

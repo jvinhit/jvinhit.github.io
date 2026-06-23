@@ -1,0 +1,159 @@
+---
+title: 'How Browsers Work · Part 22 — Capstone 2: Profiling Internals End-to-End'
+description: 'Ghép mọi tầng nội bộ lại: đọc Performance panel và Perfetto, quy một jank cụ thể về đúng process/thread/giai đoạn pipeline, và một quy trình điều tra hiệu năng có hệ thống.'
+pubDate: 2026-11-16
+tags: [browser, internals, profiling, performance, browser_internals_12]
+series: browser-internals
+seriesOrder: 22
+draft: true
+---
+
+Mười phần chuyên sâu vừa qua mở từng hộp đen: compositor, scheduling, V8, bộ nhớ, a11y, decode ảnh, threading, process model. Capstone này dạy kỹ năng buộc tất cả lại với nhau — **profiling**: nhìn một trang giật và quy trách chính xác về đúng *process*, *thread*, và *giai đoạn pipeline* gây ra nó. Đây là nơi lý thuyết biến thành chẩn đoán.
+
+---
+
+## 1. Bản đồ tinh thần: jank xảy ra ở đâu?
+
+Khi có vấn đề hiệu năng, hãy định vị nó trên kiến trúc đã học:
+
+```text
+                ┌─ Network (Phần 9) ── tải chậm, waterfall xấu
+                │
+Browser process ┤
+                └─ GPU process / Viz ── composite chậm, quá nhiều layer (Phần 13)
+
+Renderer process
+  ├─ Main thread ── JS dài, layout/style, forced reflow (Phần 5,7,15,16)
+  ├─ Compositor thread ── scroll/transform (mượt hay rớt về main? Phần 14)
+  └─ Raster/Worker threads ── raster tile, decode ảnh (Phần 13,19)
+```
+
+Mọi triệu chứng đều rơi vào một trong các ô này. Câu hỏi của profiler luôn là: *thread nào, giai đoạn nào, trong process nào?*
+
+---
+
+## 2. Đọc Performance panel theo tầng
+
+DevTools → **Performance** → record. Các track tương ứng trực tiếp với kiến trúc:
+
+| Track | Tương ứng | Tìm gì |
+|---|---|---|
+| **Main** | luồng chính renderer | long task (>50ms), Recalculate Style, Layout, "Purple" |
+| **Compositor / Raster** | compositor & raster threads | raster lâu, quá nhiều tile |
+| **GPU** | GPU process | thời gian composite |
+| **Network** | browser process | waterfall, chờ TTFB |
+| **Frames** | khung hình | khung rớt (đỏ), thời gian mỗi khung |
+
+Màu trong track Main map sang pipeline (Phần 5/15):
+
+```text
+Vàng   = Scripting (JS, gọi hàm)        → nghi V8 / long task
+Tím    = Rendering (style + layout)     → nghi forced reflow / layout thrash
+Xanh lá= Painting (paint + composite)   → nghi layer/paint nặng
+```
+
+---
+
+## 3. Bốn loại jank & cách nhận diện
+
+```text
+① JS long task chặn luồng chính
+   Dấu hiệu: khối VÀNG dài, cờ "Long task" đỏ, INP cao.
+   Soi: Bottom-Up/Call Tree tìm hàm tốn nhất. → Phần 7,16 (deopt? megamorphic?)
+   Sửa: chia nhỏ (scheduler.yield), đẩy sang worker (Phần 20).
+
+② Forced synchronous layout (reflow)
+   Dấu hiệu: khối TÍM kèm cảnh báo "Forced reflow", thường trong vòng lặp.
+   Soi: stack trỏ về đọc offsetWidth/getBoundingClientRect sau khi ghi style.
+   Sửa: gom đọc rồi gom ghi (Phần 5,15).
+
+③ Layer/paint nặng hoặc layer explosion
+   Dấu hiệu: XANH LÁ nhiều, "Layers" pane cho thấy quá nhiều layer/VRAM.
+   Soi: bật "Layer borders" + Rendering pane "Paint flashing".
+   Sửa: giảm will-change, chỉ animate transform/opacity (Phần 13).
+
+④ Scroll rớt về main thread
+   Dấu hiệu: cuộn giật khi JS bận; "Scrolling on main thread".
+   Soi: kiểm tra non-passive wheel/touch listener.
+   Sửa: { passive: true }, dùng animation-timeline (Phần 14).
+```
+
+---
+
+## 4. Công cụ chuyên sâu hơn DevTools
+
+Khi cần nhìn *liên process* (renderer + GPU + browser cùng lúc):
+
+```text
+chrome://tracing  /  Perfetto (ui.perfetto.dev)
+  → trace mọi process & thread của Chrome trên một timeline
+  → thấy commit từ main → compositor, raster threads, GPU draw
+  → đo chính xác round-trip giữa các thread (vd input → composite)
+```
+
+```bash
+# Bắt trace từ dòng lệnh rồi mở trong Perfetto
+google-chrome --trace-startup --trace-startup-file=trace.json
+```
+
+Các pane bổ trợ trong DevTools:
+
+- **Rendering** pane: Paint flashing, Layer borders, Scrolling performance issues, FPS meter.
+- **Layers** pane: cây layer + lý do mỗi layer được thăng (Phần 13).
+- **Performance Monitor**: CPU/JS heap/DOM node/listener theo thời gian thực (bắt rò rỉ Phần 17).
+- **Memory**: heap snapshot (Phần 17).
+
+---
+
+## 5. Quy trình điều tra có hệ thống
+
+Đừng tối ưu mò. Theo vòng lặp này:
+
+```text
+1. ĐO trước     → record Performance, ghi lại số (INP, khung rớt, long task)
+2. KHOANH VÙNG  → jank ở thread nào? giai đoạn nào? (mục 1–3)
+3. TÌM GỐC      → Bottom-Up/Call Tree/retainer path → hàm/dòng cụ thể
+4. SỬA 1 THỨ    → đổi đúng một biến số
+5. ĐO LẠI       → so với baseline; giữ nếu tốt hơn, revert nếu không
+6. LẶP          → tới khi đạt ngân sách (budget)
+```
+
+Gắn số đo vào **Core Web Vitals** để biết khi nào dừng: LCP (ảnh/render — Phần 19,5), INP (đáp ứng input — Phần 7,15), CLS (layout shift — Phần 5,19). Đặt ngân sách trước, đo sau.
+
+> Nguyên tắc tối thượng: *đo trước khi sửa, đo lại sau khi sửa*. Trực giác về hiệu năng thường sai; profiler thì không.
+
+---
+
+## 6. Toàn series — bản đồ "How Browsers Work"
+
+Mười hai phần nền tảng + mười phần chuyên sâu hợp thành bức tranh hoàn chỉnh:
+
+```text
+NỀN TẢNG (1–12)
+  1  Mô hình tinh thần        7  Event loop
+  2  URL → pixel              8  Memory & GC
+  3  HTML parsing → DOM       9  Networking
+  4  CSS → CSSOM             10  Storage
+  5  Rendering pipeline      11  Security model
+  6  JS engine (V8)          12  Capstone 1
+
+CHUYÊN SÂU (13–22)
+  13 GPU & compositor        18 Accessibility tree
+  14 Scrolling internals     19 Image/media decode
+  15 Frame scheduling        20 Threading (Workers/SAB)
+  16 V8 tiers & deopt        21 Process model & BFCache
+  17 Memory leak hunting     22 Capstone 2 — profiling (bài này)
+```
+
+---
+
+## 7. Tóm tắt
+
+- Mọi vấn đề hiệu năng đều quy về **thread nào, giai đoạn nào, process nào** — dùng bản đồ kiến trúc để định vị.
+- **Performance panel**: track Main/Compositor/GPU/Network/Frames; màu Vàng=Scripting, Tím=Rendering, Xanh lá=Painting.
+- Bốn loại jank kinh điển: JS long task, forced reflow, layer/paint nặng, scroll rớt về main — mỗi loại có dấu hiệu và cách sửa riêng.
+- **Perfetto/chrome://tracing** cho góc nhìn liên process; Rendering/Layers/Memory pane cho chi tiết từng tầng.
+- Theo quy trình **đo → khoanh vùng → tìm gốc → sửa một thứ → đo lại**; gắn vào Core Web Vitals và đặt ngân sách trước.
+- Đây là điểm hội tụ của cả series: hiểu nội bộ trình duyệt biến profiling từ đoán mò thành chẩn đoán có cơ sở.
+
+Cảm ơn bạn đã đi hết hành trình "How Browsers Work". Giờ khi một trang chậm, bạn không còn thấy một hộp đen — bạn thấy các process, thread và giai đoạn, và biết chính xác nơi cần nhìn.

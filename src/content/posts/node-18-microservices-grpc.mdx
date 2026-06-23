@@ -1,0 +1,146 @@
+---
+title: 'Node.js Super Senior · Phase 18 — Microservices & gRPC'
+description: 'Bonus Phase 18: vượt một process. Khi nào nên (và không nên) tách monolith, giao tiếp đồng bộ với gRPC + Protobuf, event bất đồng bộ qua message queue, API gateway, và xử lý lỗi phân tán (timeout, retry, circuit breaker).'
+pubDate: 2026-06-22
+tags: [nodejs, microservices, grpc, distributed, node_10]
+series: nodejs
+seriesOrder: 18
+draft: false
+---
+
+Đây là **Bonus Phase 18**. Đến giờ mọi thứ chạy trong một process (kể cả NestJS Phase 14). Khi tổ chức và hệ thống lớn lên, ta tách thành **microservices** — nhiều service nhỏ deploy độc lập. Đây là quyết định kiến trúc *đắt* — phần này nói thẳng cả lợi ích lẫn cái giá, rồi cách giao tiếp giữa service.
+
+---
+
+## Cảnh báo trước: monolith first
+
+Quan điểm senior quan trọng nhất của phase này: **đừng bắt đầu bằng microservices**. Một monolith có cấu trúc tốt (Phase 10) phục vụ phần lớn dự án tốt hơn. Microservices đổi độ phức tạp *code* lấy độ phức tạp *vận hành phân tán* — mạng có thể lỗi, độ trễ là thật, transaction xuyên service rất khó, debug cần distributed tracing (Phase 20).
+
+```text
+Tách khi:                          Đừng tách khi:
+- team lớn cần deploy độc lập       - team nhỏ, một codebase còn quản được
+- các phần scale rất khác nhau      - chưa rõ ranh giới domain
+- ngôn ngữ/công nghệ khác nhau      - chỉ vì "nghe nói microservices xịn"
+```
+
+Tách theo **bounded context** (ranh giới domain), không theo tầng kỹ thuật.
+
+---
+
+## Hai kiểu giao tiếp
+
+Service nói chuyện theo hai cách, và bạn dùng *cả hai*:
+
+```text
+Đồng bộ (request/response):  gRPC hoặc HTTP/REST  — cần câu trả lời ngay
+Bất đồng bộ (event):         message queue (Phase 16) — fire-and-forget, decouple
+```
+
+Quy tắc: ưu tiên **bất đồng bộ qua event** để giảm phụ thuộc thời gian thực giữa service; dùng đồng bộ khi thật sự cần kết quả ngay trong luồng request.
+
+---
+
+## gRPC + Protocol Buffers
+
+Cho giao tiếp đồng bộ giữa service nội bộ, **gRPC** thường thắng REST: nhanh hơn (HTTP/2, nhị phân), hợp đồng chặt (Protobuf), hỗ trợ streaming. Bạn định nghĩa service trong file `.proto`:
+
+```proto
+// user.proto
+syntax = "proto3";
+
+service UserService {
+  rpc GetUser (GetUserRequest) returns (User);
+  rpc ListUsers (ListUsersRequest) returns (stream User); // server streaming
+}
+
+message GetUserRequest { string id = 1; }
+message User { string id = 1; string name = 2; string email = 3; }
+```
+
+Server Node:
+
+```ts
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+
+const def = protoLoader.loadSync('user.proto');
+const proto = grpc.loadPackageDefinition(def) as any;
+
+const server = new grpc.Server();
+server.addService(proto.UserService.service, {
+  GetUser: async (call, callback) => {
+    const user = await db.user.findUnique({ where: { id: call.request.id } });
+    if (!user) return callback({ code: grpc.status.NOT_FOUND, message: 'Không thấy' });
+    callback(null, user);
+  },
+});
+server.bindAsync('0.0.0.0:50051', grpc.ServerCredentials.createInsecure(), () => {});
+```
+
+Client gọi như hàm cục bộ:
+
+```ts
+const client = new proto.UserService('user-svc:50051', grpc.credentials.createInsecure());
+client.GetUser({ id: '1' }, (err, user) => console.log(user));
+```
+
+Protobuf cho **hợp đồng có version, type-safe** giữa service — đổi schema mà không phá client cũ nếu tuân quy tắc tương thích. REST/JSON vẫn hợp cho API hướng ra ngoài; gRPC cho nội bộ service-to-service.
+
+---
+
+## Event-driven giữa service
+
+Cho decoupling, service phát **event** lên broker (Phase 16 — RabbitMQ/Kafka) thay vì gọi thẳng nhau:
+
+```ts
+// Order service phát event, KHÔNG gọi thẳng email/inventory service
+await broker.publish('order.created', { orderId, userId, items });
+
+// Email service và Inventory service tự subscribe và phản ứng độc lập
+broker.subscribe('order.created', async (evt) => { await sendReceipt(evt); });
+```
+
+Order service không cần biết ai lắng nghe — thêm service mới không phải sửa nó. Đây là **eventual consistency**: chấp nhận trễ một chút để đổi lấy decoupling và khả năng chịu lỗi.
+
+---
+
+## API Gateway & service discovery
+
+Client ngoài không nên biết địa chỉ từng service. **API Gateway** là cửa vào duy nhất: định tuyến, auth tập trung (Phase 5), rate limit, gộp response. **Service discovery** (DNS nội bộ của Kubernetes, Consul) cho service tìm nhau mà không hard-code IP — trong K8s (Phase 9-10 docker series) đơn giản là gọi theo tên service.
+
+---
+
+## Lỗi phân tán — timeout, retry, circuit breaker
+
+Mạng *sẽ* lỗi. Mỗi lời gọi liên-service phải phòng thủ:
+
+```ts
+// timeout: đừng chờ vô hạn
+const res = await Promise.race([
+  client.getUser(id),
+  new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000)),
+]);
+```
+
+- **Timeout**: luôn đặt deadline cho mọi remote call.
+- **Retry + backoff**: thử lại lỗi tạm thời (chỉ với thao tác **idempotent** — Phase 16).
+- **Circuit breaker**: khi một service hỏng liên tục, "ngắt cầu dao" để dừng dội request, trả fallback nhanh, và tự thử lại sau (thư viện `opossum`).
+
+Thiếu những lớp này, một service chậm sẽ kéo sập cả hệ thống theo hiệu ứng domino (cascading failure).
+
+---
+
+## Thực hành
+
+1. Tách capstone thành 2 service: `user-svc` và `order-svc`.
+2. `order-svc` gọi `user-svc` qua **gRPC** (file `.proto` chung) để xác thực user khi tạo order.
+3. Sau khi tạo order, `order-svc` **phát event** `order.created`; một `email-svc` subscribe và gửi receipt qua BullMQ (Phase 16).
+4. Bọc lời gọi gRPC bằng timeout + retry + circuit breaker (`opossum`).
+5. Đặt một API Gateway (Express hoặc Nginx — docker series) trước cả hai, auth JWT tập trung.
+6. Chạy tất cả bằng Docker Compose; quan sát điều gì xảy ra khi tắt `user-svc`.
+
+---
+
+## Phần tiếp theo
+
+Microservices và GraphQL subscription đều chạm tới realtime. Ở **Phase 19 — Realtime với WebSockets**, ta đi sâu: WebSocket vs SSE vs polling, dựng server realtime với `ws` và Socket.IO, room và namespace, scale ngang nhiều instance bằng Redis adapter (Phase 13), authentication cho kết nối, và xử lý reconnect.

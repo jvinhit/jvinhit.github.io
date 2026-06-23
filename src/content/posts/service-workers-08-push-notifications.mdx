@@ -1,0 +1,256 @@
+---
+title: 'Service Workers · Phần 8 — Push Notifications'
+description: 'Gửi thông báo đẩy ngay cả khi tab đóng: Push API + Notifications API, xin quyền đúng cách, VAPID keys, đăng ký PushSubscription, server gửi push, event push và notificationclick.'
+pubDate: 2026-07-05
+tags: [service-worker, push-api, notifications, vapid, service_workers_10]
+series: service-workers
+seriesOrder: 8
+draft: false
+---
+
+Đây là tính năng "native nhất" mà web có được: **gửi thông báo cho người dùng ngay cả khi họ đã đóng tab, thậm chí đóng trình duyệt**. Một service worker đang "ngủ" sẽ được trình duyệt đánh thức khi có push từ server, hiển thị notification, và xử lý khi người dùng bấm vào.
+
+Push notifications gồm **hai API phối hợp**: **Push API** (nhận message từ server) và **Notifications API** (hiển thị thông báo). Bài này ta đi trọn vòng: từ xin quyền, tạo subscription, server gửi push, tới xử lý click — kèm cảnh báo về UX để không trở thành cái app bị người dùng tắt thông báo ngay lập tức.
+
+---
+
+## Bức tranh toàn cảnh
+
+```text
+1. Trang xin quyền Notification
+2. Trang đăng ký PushSubscription (qua SW + VAPID public key)
+3. Trang gửi subscription lên SERVER của bạn để lưu
+4. Khi có sự kiện → Server gửi push tới Push Service (FCM/Mozilla/...)
+                    qua thư viện web-push (ký bằng VAPID private key)
+5. Push Service đẩy tới trình duyệt → đánh thức SW → event 'push'
+6. SW gọi showNotification() → người dùng thấy thông báo
+7. Người dùng bấm → event 'notificationclick' → mở/điều hướng app
+```
+
+Ba bên tham gia: **trình duyệt/SW**, **server của bạn**, và **Push Service** (hạ tầng của trình duyệt — bạn không quản nhưng phải đi qua nó). VAPID là cơ chế để Push Service biết push đến từ server **được phép** của bạn.
+
+---
+
+## Bước 1 — Xin quyền (đúng lúc, đúng cách)
+
+```js
+async function requestNotificationPermission() {
+  if (!('Notification' in window)) return 'unsupported';
+  const permission = await Notification.requestPermission();
+  return permission; // 'granted' | 'denied' | 'default'
+}
+```
+
+> **Cạm bẫy UX chí mạng:** đừng xin quyền ngay khi trang vừa load. Người dùng chưa hiểu giá trị → bấm "Block" → bạn **mất vĩnh viễn** khả năng gửi (rất khó để họ bật lại). Hãy xin quyền **sau một hành động có ngữ cảnh** ("Nhận thông báo khi có trả lời?") và giải thích lợi ích trước. Đây là khác biệt giữa tỉ lệ opt-in 5% và 40%.
+
+---
+
+## Bước 2 — Tạo PushSubscription với VAPID
+
+**VAPID** (Voluntary Application Server Identification) là cặp khóa public/private định danh server của bạn với Push Service. Tạo một lần:
+
+```bash
+npx web-push generate-vapid-keys
+# In ra Public Key và Private Key — lưu Private Key vào biến môi trường server,
+# nhúng Public Key vào client.
+```
+
+Đăng ký subscription ở phía trang:
+
+```js
+// Push API yêu cầu key dạng Uint8Array, nên cần chuyển base64url → bytes.
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+}
+
+const VAPID_PUBLIC_KEY = 'BNc...your-public-key...'; // dán public key của bạn
+
+async function subscribeToPush() {
+  const reg = await navigator.serviceWorker.ready;
+
+  const subscription = await reg.pushManager.subscribe({
+    userVisibleOnly: true, // BẮT BUỘC true: mỗi push phải hiện 1 notification
+    applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+  });
+
+  // Gửi subscription lên server của bạn để lưu (dùng khi muốn push sau này).
+  await fetch('/api/save-subscription', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(subscription),
+  });
+
+  return subscription;
+}
+```
+
+> `userVisibleOnly: true` là **bắt buộc** trên hầu hết trình duyệt: bạn không được dùng push "im lặng" để theo dõi người dùng — mỗi push phải dẫn tới một notification nhìn thấy được.
+
+`subscription` là một object JSON chứa `endpoint` (URL riêng của người dùng tại Push Service) và `keys` (để mã hóa payload). Server lưu nó để gửi push về sau.
+
+---
+
+## Bước 3 — Server gửi push (web-push)
+
+Dùng thư viện `web-push` ở Node.js để ký và gửi:
+
+```js
+// server.js (Node.js)
+import webpush from 'web-push';
+
+webpush.setVapidDetails(
+  'mailto:you@example.com',
+  process.env.VAPID_PUBLIC_KEY,
+  process.env.VAPID_PRIVATE_KEY
+);
+
+async function sendPush(subscription, data) {
+  try {
+    await webpush.sendNotification(subscription, JSON.stringify(data));
+  } catch (error) {
+    // 410 Gone / 404 → subscription hết hạn, hãy xóa khỏi DB.
+    if (error.statusCode === 410 || error.statusCode === 404) {
+      await removeSubscriptionFromDB(subscription.endpoint);
+    } else {
+      throw error;
+    }
+  }
+}
+
+// Ví dụ gửi:
+await sendPush(savedSubscription, {
+  title: 'Có trả lời mới',
+  body: 'Minh vừa trả lời bình luận của bạn',
+  url: '/posts/123#comment-456',
+});
+```
+
+> Xử lý lỗi **410 Gone** rất quan trọng: subscription có thể hết hạn (người dùng xóa data, đổi máy). Phải dọn khỏi DB để không gửi mãi vào endpoint chết.
+
+---
+
+## Bước 4 — Service worker nhận push và hiển thị
+
+```js
+// sw.js
+self.addEventListener('push', (event) => {
+  // payload có thể rỗng (một số push không kèm data) → có default an toàn.
+  const data = event.data ? event.data.json() : {};
+
+  const title = data.title || 'Thông báo';
+  const options = {
+    body: data.body || '',
+    icon: '/icons/icon-192.png',
+    badge: '/icons/badge-72.png', // icon đơn sắc trên Android status bar
+    data: { url: data.url || '/' }, // lưu để dùng ở notificationclick
+    actions: [
+      { action: 'open', title: 'Xem' },
+      { action: 'dismiss', title: 'Bỏ qua' },
+    ],
+    tag: data.tag, // cùng tag → notification mới THAY THẾ cái cũ (gộp)
+    renotify: false,
+  };
+
+  // waitUntil giữ SW sống tới khi notification hiển thị xong.
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+```
+
+Vài option đáng giá: `tag` để **gộp** thông báo cùng loại (tránh spam), `actions` để thêm nút, `badge`/`icon` cho nhận diện, `data` để mang URL đích.
+
+---
+
+## Bước 5 — Xử lý khi người dùng bấm
+
+```js
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+
+  // Nếu bấm nút "Bỏ qua" thì không làm gì.
+  if (event.action === 'dismiss') return;
+
+  const targetUrl = event.notification.data?.url || '/';
+
+  event.waitUntil(
+    (async () => {
+      const clients = await self.clients.matchAll({
+        type: 'window',
+        includeUncontrolled: true,
+      });
+
+      // Nếu app đã mở sẵn một tab → focus nó (và điều hướng) thay vì mở tab mới.
+      for (const client of clients) {
+        if ('focus' in client) {
+          await client.focus();
+          if ('navigate' in client) await client.navigate(targetUrl);
+          return;
+        }
+      }
+
+      // Chưa có tab nào → mở mới.
+      await self.clients.openWindow(targetUrl);
+    })()
+  );
+});
+```
+
+Logic "focus tab cũ thay vì mở tab mới" là chuẩn UX — đừng để mỗi lần bấm notification lại đẻ thêm một tab.
+
+Bonus: lắng nghe khi người dùng đóng notification mà không bấm (để đo lường):
+
+```js
+self.addEventListener('notificationclose', (event) => {
+  // ví dụ gửi analytics: notification bị bỏ qua
+});
+```
+
+---
+
+## Hỗ trợ trình duyệt & lưu ý nền tảng
+
+- **Chrome, Edge, Firefox** (desktop & Android): hỗ trợ tốt.
+- **Safari**: hỗ trợ Web Push từ macOS Ventura / iOS 16.4 trở lên, nhưng **trên iOS chỉ hoạt động khi PWA đã được "Add to Home Screen"** (cài đặt). Đây là ràng buộc lớn cần biết.
+- Luôn **feature-detect** (`'PushManager' in window`) và xử lý mượt khi không hỗ trợ.
+
+> Đừng quên: quyền notification gắn với **origin**, và người dùng có thể thu hồi bất cứ lúc nào. Định kỳ kiểm tra `Notification.permission` và `pushManager.getSubscription()` để đồng bộ trạng thái với server.
+
+---
+
+## Tóm tắt
+
+- Push = **Push API** (nhận từ server) + **Notifications API** (hiển thị); SW được **đánh thức** kể cả khi tab đóng.
+- **Xin quyền sau hành động có ngữ cảnh**, không phải lúc vừa load — bị "Block" là mất vĩnh viễn.
+- **VAPID** cặp khóa định danh server; tạo bằng `web-push generate-vapid-keys`.
+- Đăng ký `pushManager.subscribe({ userVisibleOnly: true, applicationServerKey })`, gửi subscription lên server lưu.
+- Server dùng **`web-push`** để gửi; xử lý **410 Gone** để dọn subscription chết.
+- SW xử lý event **`push`** (→ `showNotification`) và **`notificationclick`** (focus tab cũ hoặc mở mới), bọc trong `waitUntil`.
+- Safari/iOS yêu cầu **PWA đã cài**; luôn feature-detect.
+
+---
+
+## Bài tập thực hành
+
+### Bài 1 — Notification cục bộ (cơ bản)
+
+Chưa cần server. Xin quyền, rồi từ trang gọi `registration.showNotification('Xin chào', { body: 'Test', icon: '/icon.png' })`. Thêm handler `notificationclick` trong SW để mở `/`.
+
+**Hướng dẫn:** Đây là cách tách biệt phần **hiển thị** (Notifications API) khỏi phần **push** (cần server) để học từng bước. Test trên `localhost`. Nếu không thấy thông báo: kiểm tra `Notification.permission === 'granted'` và quyền notification của trình duyệt cho `localhost` trong system settings.
+
+### Bài 2 — Subscription + push thật (trung bình)
+
+Tạo VAPID keys, viết một server Node tối giản (Express) với `/api/save-subscription` và một endpoint `/api/send` gọi `web-push`. Đăng ký subscription từ client, rồi trigger `/api/send`.
+
+**Hướng dẫn:** Cài `npm i web-push express`. Lưu subscription vào một biến/array trong memory cho đơn giản. Bấm gửi và xác nhận notification xuất hiện **dù bạn đã chuyển sang tab khác**. Đây là khoảnh khắc "wow" của push. Nhớ chạy client trên HTTPS hoặc localhost.
+
+### Bài 3 — UX hoàn chỉnh (nâng cao)
+
+Hoàn thiện: (a) nút bật/tắt thông báo phản ánh đúng trạng thái subscription; (b) push mang `url`, bấm vào điều hướng đúng trang và focus tab cũ nếu có; (c) server xóa subscription khi gặp 410.
+
+**Hướng dẫn:** Dùng `reg.pushManager.getSubscription()` để biết đã đăng ký chưa và render nút đúng trạng thái. Test logic focus: mở app ở một tab, gửi push, bấm — phải focus đúng tab đó chứ không mở tab mới. Đây là bộ tính năng push "đủ xài production" mà bạn sẽ tích hợp vào capstone Phần 10. Luôn tự hỏi: thông báo này có **đáng** làm phiền người dùng không? — đó mới là tư duy push tử tế.
+
+---
+
+**Phần tiếp theo:** Workbox — thư viện của Google giúp bạn viết tất cả những gì đã học (precaching, routing, strategies, expiration, background sync) chỉ với vài dòng, và tích hợp vào build qua vite-plugin-pwa.

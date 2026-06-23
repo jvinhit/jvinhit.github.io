@@ -1,0 +1,211 @@
+---
+title: 'Node Package Managers · Part 12 — Capstone: Choose, Migrate, Harden'
+description: 'The whole series in one place: a decision guide for picking a package manager, a safe migration playbook between managers, Corepack pinning, and an end-to-end hardened install workflow.'
+pubDate: 2026-06-27
+tags: [package-managers, migration, corepack, security, package_managers_12]
+series: package-managers
+seriesOrder: 12
+draft: false
+---
+
+Đây là **Phần 12, capstone**, của series 12 phần về package manager Node. Ta đã đi từ [mô hình tư duy](/posts/package-managers-01-mental-model) qua mọi manager, lockfile, `node-gyp`, binary native, và [tấn công](/posts/package-managers-09-supply-chain-attacks) cùng [phòng thủ](/posts/package-managers-10-supply-chain-defense) chuỗi cung ứng. Giờ ta ghép lại thành các quyết định bạn hành động được.
+
+---
+
+## 1. Mô hình tư duy một trang
+
+```text
+Every package manager: RESOLVE (ranges → exact tree, recorded in lockfile)
+                     → FETCH (verified by integrity hash)
+                     → LINK (the part where they differ)
+{resolve → fetch → link; chúng khác nhau ở link}
+
+LINK strategies:
+  flat/hoisted   npm, Yarn Classic, Bun   → phantom deps, disk duplication
+  symlink+store  pnpm                       → strict, tiny disk, real node_modules
+  PnP map        Yarn Berry                 → no node_modules, strictest, friction
+
+DANGER: install runs arbitrary lifecycle scripts from your WHOLE tree.
+{install chạy lifecycle script tuỳ ý từ TOÀN BỘ cây}
+```
+
+Nếu chỉ nhớ một sơ đồ từ series này, hãy nhớ cái đó.
+
+---
+
+## 2. Hướng dẫn quyết định
+
+```text
+Which package manager in 2026?
+{Dùng package manager nào năm 2026?}
+
+├── New project / team, want a safe modern default?
+│   └── pnpm   (fast · disk-efficient · strict · real node_modules · best monorepos)
+│
+├── Monorepo of any size?
+│   └── pnpm --filter  (+ Turborepo/Nx for task caching)
+│
+├── Absolute fastest installs, OK with a newer tool?
+│   └── Bun   (especially if already on the Bun runtime)
+│
+├── Want strict + zero-installs and your tooling is PnP-ready?
+│   └── Yarn Berry (PnP)
+│
+├── Maximum compatibility / locked CI / tiny project?
+│   └── npm   (it's already there)
+│
+└── Maintaining an existing repo?
+    └── Keep its current manager — never mix lockfiles
+{giữ manager hiện tại — đừng trộn lockfile}
+```
+
+Mặc định thật cho phần lớn người: **pnpm**, ghim bằng Corepack, script tắt mặc định.
+
+---
+
+## 3. Sổ tay migration
+
+Đổi manager chủ yếu là cơ học, nhưng thứ tự quan trọng. Công thức chung:
+
+```text
+1. Pick the target + pin it:  corepack use pnpm@10
+2. Remove the OLD lockfile + node_modules:
+     rm -rf node_modules package-lock.json   (or yarn.lock)
+3. Install fresh with the new manager:        pnpm install
+4. FIX what the stricter layout reveals:
+     - phantom deps → add them to package.json explicitly
+     - tools that scanned node_modules → update config
+5. Re-wire scripts/CI:  npm ci → pnpm i --frozen-lockfile, etc.
+6. Commit exactly ONE new lockfile + the packageManager field.
+{chọn+ghim → xoá lockfile cũ → cài mới → sửa phantom dep → đổi CI → commit một lockfile}
+```
+
+Migration *dạy* bạn nhiều nhất: **npm/Yarn → pnpm**. Layout nghiêm ngặt lộ ra mọi phantom dependency bạn đã thoát được. Cảm giác như đau; thực ra là bug có sẵn trở nên thấy được. Sửa một lần, đúng mãi mãi.
+
+Bảng dịch lệnh:
+
+| Task | npm | Yarn Berry | pnpm | Bun |
+|---|---|---|---|---|
+| Install | `npm install` | `yarn` | `pnpm install` | `bun install` |
+| CI install | `npm ci` | `yarn install --immutable` | `pnpm i --frozen-lockfile` | `bun install --frozen-lockfile` |
+| Add dep | `npm i react` | `yarn add react` | `pnpm add react` | `bun add react` |
+| Run binary | `npx vite` | `yarn dlx vite` | `pnpm dlx vite` | `bunx vite` |
+| Run script | `npm run build` | `yarn build` | `pnpm build` | `bun run build` |
+
+---
+
+## 4. Install tăng cứng — đầu cuối
+
+Cái này gom Phần 6–10 thành một setup tham chiếu. Config project local:
+
+```ini
+# .npmrc
+registry=https://registry.npmjs.org/
+@myco:registry=https://npm.internal.myco/   # pin private scopes (anti-confusion)
+//npm.internal.myco/:_authToken=${NPM_TOKEN}
+save-exact=true
+ignore-scripts=true        # scripts OFF by default (allow-list natives)
+audit=true
+```
+
+```jsonc
+// package.json
+{
+  "packageManager": "pnpm@10.4.1+sha256.<hash>",   // Corepack pin
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild", "sharp"]    // allow-listed native builds
+  }
+}
+```
+
+Stage cài trong CI:
+
+```bash
+corepack enable
+pnpm install --frozen-lockfile        # reproducible; fails on lockfile drift
+npx lockfile-lint --path pnpm-lock.yaml --allowed-hosts npm --validate-https
+pnpm audit signatures || true         # provenance check (warn or gate)
+# ↑ this stage has NO deploy secrets and limited network egress
+```
+
+```text
+Pipeline separation {tách pipeline}:
+  STAGE 1  install + build   → NO production secrets, egress = registry only
+  STAGE 2  deploy            → has secrets, NO untrusted dependency install
+{stage cài không có secret; stage deploy không cài dep lạ}
+```
+
+Cùng điều đó dưới dạng workflow GitHub Actions thật:
+
+```yaml
+# .github/workflows/ci.yml — the hardened install + build job
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read          # least privilege: no write, no id-token here
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: corepack enable    # uses the packageManager field → exact pnpm
+      - run: pnpm install --frozen-lockfile   # scripts off by .npmrc default
+      - run: npx lockfile-lint --path pnpm-lock.yaml --allowed-hosts npm --validate-https --validate-integrity
+      - run: pnpm -r build      # deploy is a SEPARATE job/workflow with secrets
+```
+
+Đó là toàn bộ câu chuyện phòng thủ-nhiều-lớp (Phần 10) thể hiện thành config.
+
+### Bẫy migration — cái thực sự cắn
+
+Bảng dịch lệnh ở trên là 90% dễ. 10% khó là các bẫy lặp lại khi đổi manager:
+
+| Triệu chứng | Nguyên nhân | Cách sửa |
+|---|---|---|
+| `Cannot find module X` after moving to pnpm/Yarn | `X` từng bị hoist | Thêm `X` rõ ràng |
+| `Cannot find module @esbuild/...` | `optionalDependencies` xử lý sai | Delete lockfile + `node_modules`, reinstall, bump manager |
+| Tool can't see files in `node_modules` | không theo symlink/PnP | `node-linker=hoisted` (pnpm) or `nodeLinker: node-modules` (Yarn) |
+| Lockfile flip-flops in PRs | trộn version manager | Pin with **Corepack** (`packageManager` field) |
+| `postinstall` deps don't build | Scripts off by default (pnpm 10/Yarn 4) | Allow-list: `onlyBuiltDependencies` / `dependenciesMeta.built` |
+| Peer-dep errors appear that npm hid | xử lý peer chặt hơn | Fix the peer range, or `packageExtensions` (Yarn) |
+
+---
+
+## 5. Danh sách kiểm tra cấp senior
+
+Khi vào repo mới, chạy danh sách này trong đầu:
+
+```text
+[ ] Which manager + version? (packageManager field / Corepack)
+[ ] Exactly one lockfile committed?
+[ ] CI using the frozen install, not plain install?
+[ ] Are install scripts on or off? Which natives are allow-listed?
+[ ] Private scopes pinned in .npmrc? (dependency-confusion risk)
+[ ] How many transitive deps? (npm ls --all | wc -l)
+[ ] node-gyp / native modules present? (build toolchain needed?)
+[ ] Are binaries integrity-checked registry artifacts, or postinstall downloads?
+[ ] Monorepo? Which workspace tool + task runner?
+{manager+version · một lockfile · frozen CI · script on/off · scope ghim · số dep · native · nguồn binary · monorepo}
+```
+
+Nếu bạn trả lời được cả chín cho repo bất kỳ, bạn hiểu lớp dependency của nó hơn phần lớn người đã viết nó.
+
+---
+
+## 6. Học gì tiếp theo
+
+- ghép với bài so sánh độc lập cho phía bundler.
+- chạy registry riêng (Verdaccio) để *thấy* resolution và integrity từ phía server.
+- container, sandbox, kiểm soát egress biến "phòng thủ nhiều lớp" thành đảm bảo cứng.
+
+---
+
+## Cả series trong một hơi
+
+Package manager biến *range* thành cây dependency *chính xác, đã xác minh, đã link*. npm là chuẩn; Yarn Classic cải tiến; Yarn Berry tái phát minh với PnP; pnpm tìm điểm cân bằng; Bun làm nhanh nhất. Bên dưới, native module và `node-gyp` biên dịch hoặc tải binary — một năng lực mạnh, nguy hiểm. Và vì install chạy code tuỳ ý từ hàng trăm người lạ, **cây dependency là bề mặt tấn công thật của bạn**. Hãy đối xử với nó bằng sự tôn trọng — và các kiểm soát — mà nó xứng đáng.
+
+---
+
+## Bài tập cuối
+
+Lấy một project thật bạn sở hữu và đưa nó về baseline tăng cứng: ghim manager bằng Corepack, đổi CI sang frozen install, tắt install script với allow-list native, thêm `lockfile-lint`, và tách install khỏi deploy. Rồi chạy danh sách chín điểm và xác nhận từng ô. Đó là cả series, áp dụng.

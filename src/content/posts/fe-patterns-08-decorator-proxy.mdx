@@ -1,0 +1,173 @@
+---
+title: 'Design Patterns in Frontend · Part 8 — Decorator & Proxy'
+description: 'Add behavior without modifying the original object: function decorators (logging, retry, cache), HOCs in React, and JavaScript Proxy as the foundation for Vue/MobX reactivity — plus performance trap warnings.'
+pubDate: 2026-08-08
+tags: [design-patterns, decorator, proxy, hoc, fe_patterns_12]
+series: fe-patterns
+seriesOrder: 8
+draft: true
+---
+
+Hai pattern này trả lời câu hỏi: *làm sao thêm hành vi (logging, cache, kiểm soát truy cập) vào một thứ đã có mà không sửa nó?* **Decorator** bọc thêm chức năng; **Proxy** chặn và can thiệp vào truy cập. Cả hai đều có hiện thân rất quen ở frontend — từ HOC tới reactivity của Vue.
+
+---
+
+## 1. Bọc thêm chức năng
+
+Decorator "gói" một đối tượng/hàm trong một lớp khác cung cấp thêm hành vi, **giữ nguyên giao diện**. Vì giao diện không đổi, người gọi không cần biết mình đang dùng bản đã trang trí.
+
+Ở JS, dạng phổ biến nhất là **function decorator** — hàm nhận một hàm, trả về hàm mới có thêm hành vi:
+
+```ts
+type AnyFn = (...args: never[]) => unknown;
+
+// Decorator adds logging — wraps any function, preserves signature
+function withLogging<F extends AnyFn>(fn: F, name: string): F {
+  return ((...args: Parameters<F>) => {
+    console.log(`→ ${name}(`, args, ')');
+    const result = fn(...args);
+    console.log(`← ${name} =`, result);
+    return result;
+  }) as F;
+}
+
+// Decorator adds retry for async functions
+function withRetry<A extends never[], R>(
+  fn: (...args: A) => Promise<R>,
+  retries = 3,
+): (...args: A) => Promise<R> {
+  return async (...args: A): Promise<R> => {
+    let lastError: unknown;
+    for (let i = 0; i <= retries; i++) {
+      try {
+        return await fn(...args);
+      } catch (err) {
+        lastError = err;
+        await new Promise((r) => setTimeout(r, 2 ** i * 100)); // exponential backoff
+      }
+    }
+    throw new Error('Retries exhausted', { cause: lastError });
+  };
+}
+```
+
+Vẻ đẹp của decorator là **xếp chồng (compose)** được — mỗi cái lo một mối quan tâm (cross-cutting concern):
+
+```ts
+const fetchUser = (id: string) => fetch(`/api/users/${id}`).then((r) => r.json());
+
+// Stack decorators: logging + retry, each independent and reusable
+const robustFetch = withLogging(withRetry(fetchUser), 'fetchUser');
+```
+
+`memoize` ở series thuật toán (Phần 7 bên kia) cũng chính là một decorator — nó bọc một hàm và thêm cache. Bạn đã dùng pattern này mà không biết tên.
+
+---
+
+## 2. Decorator trong React
+
+HOC là một hàm nhận một component và trả về component mới có thêm hành vi — **chính là Decorator** áp cho component:
+
+```tsx
+// HOC adds loading state based on a prop
+function withLoading<P extends object>(Component: React.ComponentType<P>) {
+  return function WithLoading(props: P & { isLoading: boolean }) {
+    const { isLoading, ...rest } = props;
+    if (isLoading) return <Spinner />;
+    return <Component {...(rest as P)} />; // preserve original component interface
+  };
+}
+
+const UserListWithLoading = withLoading(UserList);
+```
+
+> HOC từng rất phổ biến nhưng nay **custom hooks** (Phần 9) thường là lựa chọn tốt hơn cho việc chia sẻ logic — chúng tránh "wrapper hell" (nhiều lớp component lồng nhau) và rõ ràng hơn về luồng dữ liệu. HOC vẫn hợp khi cần *bọc render* (như `withErrorBoundary`), nhưng để chia sẻ *logic*, hãy ưu tiên hook.
+
+---
+
+## 3. Chặn mọi truy cập
+
+`Proxy` là tính năng JavaScript cho phép **chặn** các thao tác cơ bản trên object (đọc thuộc tính, ghi, gọi, xóa) thông qua "trap". Đây là Proxy pattern ở cấp ngôn ngữ.
+
+```ts
+const user = { name: 'An', age: 30 };
+
+const logged = new Proxy(user, {
+  get(target, prop, receiver) {
+    console.log(`read .${String(prop)}`);
+    return Reflect.get(target, prop, receiver); // Reflect: perform default operation correctly
+  },
+  set(target, prop, value, receiver) {
+    console.log(`write .${String(prop)} =`, value);
+    return Reflect.set(target, prop, value, receiver);
+  },
+});
+
+logged.name; // log "read .name" → "An"
+logged.age = 31; // log "write .age = 31"
+```
+
+### Proxy là nền của reactivity (Vue 3, MobX)
+
+Khi `set` trap chạy, ta biết *chính xác* thuộc tính nào vừa đổi → có thể thông báo cho các "người theo dõi" re-render. Đây đúng là cách **Vue 3** và **MobX** làm reactive state. Một bản tối giản:
+
+```ts
+function reactive<T extends object>(target: T, onChange: (key: string) => void): T {
+  return new Proxy(target, {
+    set(obj, prop, value, receiver) {
+      const ok = Reflect.set(obj, prop, value, receiver);
+      onChange(String(prop)); // notify "this prop changed" → trigger UI update
+      return ok;
+    },
+  });
+}
+
+const state = reactive({ count: 0 }, (key) => render());
+state.count++; // automatically triggers render() — no manual setState needed
+```
+
+Đây là lý do trong Vue bạn gán `state.count++` là UI tự cập nhật, khác hẳn React đòi `setState`. Proxy "nhìn thấy" phép gán và phản ứng.
+
+### Proxy cho validation / giá trị mặc định
+
+```ts
+// Return an object that always has a default value for missing keys
+function withDefaults<T extends object>(target: T, defaultValue: unknown): T {
+  return new Proxy(target, {
+    get(obj, prop, receiver) {
+      return prop in obj ? Reflect.get(obj, prop, receiver) : defaultValue;
+    },
+  });
+}
+```
+
+---
+
+## 4. Khác ở đâu
+
+| | Decorator | Proxy |
+|---|-----------|-------|
+| Cách hoạt động | **wraps** and adds behavior explicitly | **intercepts** basic operations (get/set/...) |
+| Interface | adds/keeps methods clearly | transparent — looks identical to the original object |
+| Used for | logging, retry, cache, HOC | reactivity, validation, defaults, virtualized access |
+| Level | library/ordinary code | language feature (`Proxy`/`Reflect`) |
+
+---
+
+## 5. Cạm bẫy hiệu năng & cảnh báo
+
+- Proxy có chi phí: mỗi truy cập đi qua trap chậm hơn truy cập trực tiếp. Đừng bọc Proxy quanh object bị đọc trong vòng lặp nóng (hot loop) hàng triệu lần. Reactivity framework tối ưu kỹ điều này; tự viết thì cẩn thận.
+- Decorator chồng quá sâu làm stack trace khó đọc và khó debug. Giữ số lớp hợp lý.
+- HOC lồng nhiều tầng → "wrapper hell"; ưu tiên hook (Phần 9).
+- Cả hai đều thêm **gián tiếp**: tốt cho tách mối quan tâm, nhưng mỗi lớp là một thứ phải hiểu khi đọc code.
+
+---
+
+## Tóm tắt
+
+- **Decorator** bọc thêm hành vi, giữ nguyên giao diện; **function decorator** (logging, retry, cache) compose được, `memoize` chính là một decorator.
+- **HOC** là Decorator cho component; nhưng để chia sẻ *logic*, ưu tiên **custom hooks** để tránh wrapper hell.
+- **Proxy** chặn truy cập object qua trap (dùng `Reflect` để giữ hành vi mặc định) — là nền của **reactivity** Vue/MobX, và validation/default.
+- Cẩn thận chi phí Proxy trong hot loop và độ sâu decorator/HOC.
+
+**Phần tiếp theo:** Compound Components, Render Props & Custom Hooks — các pattern composition đặc trưng của React.

@@ -1,0 +1,211 @@
+---
+title: 'Service Workers · Phần 12 — Update flows mastery'
+description: 'Xử lý cập nhật service worker như production: skipWaiting an toàn vs prompt, bug "double reload" của controllerchange, lệch phiên bản giữa SW và asset, deploy nguyên tử, và kill switch để gỡ SW khi sự cố.'
+pubDate: 2026-07-13
+tags: [service-worker, update, versioning, deployment, service_workers_10]
+series: service-workers
+seriesOrder: 12
+draft: false
+---
+
+Không có gì làm hỏng niềm tin vào PWA nhanh bằng một bản cập nhật hỏng: người dùng kẹt ở bản cũ, hoặc tệ hơn — thấy giao diện mới chạy với code/asset cũ rồi crash. Phần 2 đã giới thiệu lifecycle; phần này biến hiểu biết đó thành **quy trình cập nhật production** an toàn, kèm những cạm bẫy mà chỉ ai từng deploy PWA thật mới gặp.
+
+Bài toán cốt lõi: service worker mới luôn vào trạng thái `waiting` cho tới khi mọi tab của bản cũ đóng. Bạn phải *thiết kế* khoảnh khắc chuyển giao đó, không để mặc định.
+
+---
+
+## 1. Vì sao SW mới bị "kẹt" ở waiting (nhắc nhanh)
+
+Khi bạn deploy `sw.js` mới, trình duyệt cài nó nhưng **không** kích hoạt ngay — nó chờ ở `waiting` để không phá vỡ tab đang chạy bản cũ (vốn đang dùng cache/cấu trúc cũ). SW mới chỉ activate khi tất cả client của bản cũ biến mất. Đây là tính năng *an toàn*, không phải bug — nhưng nó nghĩa là người dùng có thể chạy bản cũ rất lâu (tab pin để hàng tuần).
+
+Bạn có hai con đường: **ép cập nhật ngay** (`skipWaiting`) hoặc **hỏi người dùng** (prompt). Mỗi cái có chỗ đúng.
+
+---
+
+## 2. `skipWaiting` tự động — nhanh nhưng nguy hiểm
+
+```js
+// sw.js — kích hoạt ngay, bỏ qua waiting
+self.addEventListener('install', (event) => {
+  self.skipWaiting();
+});
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+```
+
+Nghe hấp dẫn, nhưng có **rủi ro chí mạng**: nếu tab đang mở của bản cũ vừa `skipWaiting`, SW mới sẽ phục vụ asset *mới* cho một trang HTML *cũ* đang chạy. Nếu bản mới đổi tên file JS (lazy chunk), trang cũ đi tải chunk theo tên cũ → 404 → crash giữa chừng.
+
+`skipWaiting` tự động chỉ an toàn khi: app không lazy-load theo hash *hoặc* bạn chấp nhận reload ngay sau activate. Với app thật, **prompt** an toàn hơn.
+
+---
+
+## 3. Prompt update — pattern production chuẩn
+
+Để người dùng bấm "Tải bản mới" rồi mới chuyển — kiểm soát hoàn toàn thời điểm reload:
+
+```js
+// sw.js — KHÔNG tự skipWaiting; chờ lệnh từ trang
+self.addEventListener('message', (event) => {
+  if (event.data?.type === 'SKIP_WAITING') self.skipWaiting();
+});
+```
+
+```js
+// trang chính — phát hiện SW mới đang waiting
+const reg = await navigator.serviceWorker.register('/sw.js');
+
+reg.addEventListener('updatefound', () => {
+  const newWorker = reg.installing;
+  newWorker?.addEventListener('statechange', () => {
+    // Có SW mới đã cài và đang waiting (đã có controller = không phải lần đầu)
+    if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+      showUpdateToast(() => {
+        newWorker.postMessage({ type: 'SKIP_WAITING' });
+      });
+    }
+  });
+});
+```
+
+Khi người dùng bấm toast → gửi `SKIP_WAITING` → SW mới activate → `controllerchange` bắn → ta reload (mục 4).
+
+---
+
+## 4. Bug "double reload" và cách diệt
+
+Khi SW mới chiếm quyền, sự kiện `controllerchange` bắn. Cách ngây thơ là reload ngay trong đó:
+
+```js
+navigator.serviceWorker.addEventListener('controllerchange', () => {
+  window.location.reload();
+});
+```
+
+Bẫy: nếu nhiều tab cùng mở, hoặc nếu `clients.claim()` chạy lúc load đầu (lần đầu cài SW), `controllerchange` có thể bắn ngoài ý muốn → **reload vòng lặp** hoặc reload hai lần. Chốt bằng một cờ:
+
+```js
+let refreshing = false;
+navigator.serviceWorker.addEventListener('controllerchange', () => {
+  if (refreshing) return; // chặn reload lần hai
+  refreshing = true;
+  window.location.reload();
+});
+```
+
+Và quan trọng: chỉ reload khi việc chuyển giao đến từ *hành động update có chủ đích* của người dùng (đã bấm toast), không phải từ lần cài đầu tiên. Điều kiện `navigator.serviceWorker.controller` ở mục 3 đã lọc bớt: nếu chưa có controller (lần đầu) thì *đừng* hiện toast update.
+
+---
+
+## 5. Lệch phiên bản giữa SW và asset (version skew)
+
+Đây là lỗi tinh vi nhất. Kịch bản: bạn deploy lúc 10:00. Người dùng tải `index.html` (bản A). Lúc 10:05 bạn deploy lại (bản B), đổi tên `main.[hash].js`. Người dùng (vẫn ở bản A) đi tải một lazy chunk → server giờ chỉ có chunk bản B → 404.
+
+Phòng vệ nhiều lớp:
+
+- **Giữ asset cũ một thời gian**: đừng xoá file build cũ ngay khi deploy mới. Để chúng sống vài giờ/ngày để tab cũ còn tải được.
+- **Cache-first cho asset có hash** (Phần 4, 6): file tên có hash là immutable → SW phục vụ từ cache, không phụ thuộc server còn file đó.
+- **Bắt lỗi import chunk** → gợi ý reload:
+
+```js
+// Khi React.lazy/dynamic import thất bại vì chunk cũ biến mất
+import.meta.glob; // (ví dụ minh hoạ)
+window.addEventListener('vite:preloadError', () => {
+  // Chunk không tải được → nhiều khả năng do deploy mới → mời reload.
+  showUpdateToast(() => window.location.reload());
+});
+```
+
+> Quy tắc deploy nguyên tử: **HTML phải `no-cache`, asset hash hoá phải `immutable`.** HTML luôn lấy bản mới nhất; asset hash an toàn cache vĩnh viễn. Lệch quy tắc này là nguồn gốc của hầu hết "cache độc".
+
+---
+
+## 6. Kill switch — đường thoát hiểm
+
+Một ngày nào đó SW của bạn sẽ gây sự cố (cache độc, bug fetch). Cần một **kill switch**: một bản SW tối giản tự gỡ chính nó và xoá cache, deploy đè lên `sw.js`:
+
+```js
+// sw.js KHẨN CẤP — gỡ SW và dọn cache cho mọi người dùng
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    (async () => {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+      await self.registration.unregister();
+      const clients = await self.clients.matchAll();
+      clients.forEach((c) => (c as WindowClient).navigate((c as WindowClient).url));
+    })(),
+  );
+});
+```
+
+Vì `sw.js` được phục vụ với `no-cache` (mục 5), trình duyệt sẽ nhặt bản kill switch trong vòng vài giờ và tự dọn. Đây là lý do **không bao giờ** để `sw.js` bị cache lâu — nếu không, bạn mất luôn khả năng cứu vãn.
+
+---
+
+## 7. Kiểm soát tần suất kiểm tra update
+
+Trình duyệt tự kiểm tra `sw.js` khi điều hướng và định kỳ (~24h). Với app dùng lâu trong một tab (SPA, dashboard), chủ động kiểm tra:
+
+```js
+// Kiểm tra update mỗi khi tab được focus lại
+let reg;
+navigator.serviceWorker.register('/sw.js').then((r) => (reg = r));
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') reg?.update();
+});
+```
+
+`reg.update()` ép trình duyệt đi lấy `sw.js` mới ngay, kích hoạt luồng `updatefound` nếu có thay đổi. Đừng gọi quá dày (mỗi vài giây) — focus là nhịp hợp lý.
+
+---
+
+## 8. Bài tập
+
+**1.** Vì sao `skipWaiting` tự động lại nguy hiểm với app lazy-load theo hash?
+
+<details>
+<summary>Lời giải</summary>
+
+`skipWaiting` khiến SW mới phục vụ asset mới ngay cho một trang HTML cũ đang chạy. Nếu bản mới đổi tên các lazy chunk, trang cũ đi tải chunk theo tên cũ và nhận 404 → crash giữa phiên. Vì vậy với app lazy-load, nên dùng prompt (cho user reload) thay vì skipWaiting tự động.
+
+</details>
+
+**2.** "Double reload" xảy ra do đâu và chặn thế nào?
+
+<details>
+<summary>Lời giải</summary>
+
+`controllerchange` có thể bắn nhiều lần hoặc ngoài ý muốn (nhiều tab, hoặc `clients.claim` lúc cài lần đầu), khiến `location.reload()` chạy nhiều lần. Chặn bằng một cờ `refreshing` (reload đúng một lần) và chỉ hiện toast update khi đã có `controller` (không phải lần cài đầu tiên).
+
+</details>
+
+**3.** Quy tắc cache cho HTML và asset hash-hoá là gì, và vì sao?
+
+<details>
+<summary>Lời giải</summary>
+
+HTML để `no-cache` (luôn lấy bản mới nhất, biết về asset mới); asset có hash trong tên để `immutable`/cache vĩnh viễn (nội dung không đổi theo tên). Quy tắc này cho deploy nguyên tử: trang luôn cập nhật điểm vào, asset cũ vẫn tải được cho tab cũ, tránh version skew và cache độc.
+
+</details>
+
+**Nâng cao:** Cài đặt prompt-update đầy đủ (toast + `SKIP_WAITING` + reload chống double), rồi deploy hai lần liên tiếp. Xác nhận lần hai hiện toast, bấm vào ra đúng bản mới, và không bị reload lặp. Sau đó deploy một kill switch và xác nhận SW tự gỡ + cache bị xoá.
+
+---
+
+## Tóm tắt
+
+- SW mới luôn vào `waiting` để bảo vệ tab cũ; bạn phải *thiết kế* lúc chuyển giao.
+- `skipWaiting` tự động nhanh nhưng nguy hiểm với lazy-load hash (asset mới + HTML cũ → 404). **Prompt** an toàn hơn cho app thật.
+- Pattern prompt: `updatefound` → toast → `postMessage({SKIP_WAITING})` → `controllerchange` → reload **có cờ chống double**.
+- **Version skew**: giữ asset cũ một thời gian, cache-first cho asset hash, bắt lỗi import chunk → mời reload. HTML `no-cache`, asset `immutable`.
+- **Kill switch**: SW khẩn cấp tự `unregister` + xoá cache; chỉ cứu được nhờ `sw.js` luôn `no-cache`.
+- Chủ động `reg.update()` khi tab focus lại cho app dùng lâu.
+
+---
+
+## Phần tiếp theo
+
+**Phần 13 — Navigation Preload:** vì sao việc khởi động (boot) service worker có thể *làm chậm* navigation, và cách `navigationPreload` chạy request mạng song song với lúc SW thức dậy — kèm cách đọc `preloadResponse` và kết hợp với network-first.

@@ -1,0 +1,150 @@
+---
+title: 'Web Performance · Part 21 — Budgets, Automation & Performance Culture at Scale'
+description: 'Giữ hiệu năng không trôi theo thời gian: ngân sách bundle với size-limit/bundlesize, treemap analysis, cổng CI, bisect hồi quy, scorecard, và xây văn hóa performance bền vững.'
+pubDate: 2026-09-27
+tags: [performance, budgets, ci, culture, web_perf_12]
+series: web-perf
+seriesOrder: 21
+draft: true
+---
+
+Phần 12 đặt budget cho một trang. Phần này nâng lên quy mô **tổ chức và thời gian**: làm sao giữ hiệu năng *không trôi* khi hàng chục người merge code mỗi ngày trong nhiều năm. Hiệu năng bền vững không đến từ một đợt tối ưu anh hùng — nó đến từ **guardrails tự động** chặn hồi quy ngay khi nó sinh ra, cộng văn hóa coi tốc độ là trách nhiệm chung.
+
+> Định luật entropy hiệu năng: nếu không có guardrails, mọi codebase chậm dần theo thời gian. Mỗi tính năng thêm vài KB; không ai cố ý làm chậm, nhưng tổng lại thì có.
+
+---
+
+## 1. Ba loại budget
+
+```text
+① Budget số lượng (quantity)   — kích thước/số request
+   vd: JS ≤ 170KB nén, ảnh ≤ 500KB, ≤ 50 request
+② Budget chỉ số (milestone)    — thời gian/metric
+   vd: LCP p75 ≤ 2.5s, INP p75 ≤ 200ms, TTFB ≤ 600ms
+③ Budget điểm (rule-based)     — điểm Lighthouse ≥ 90
+```
+
+Budget tốt phải **cụ thể, đo được, và gắn với field data** (Part 13). "Làm trang nhanh" không phải budget; "INP p75 < 200ms trên mobile" thì có. Đặt budget hơi chặt hơn ngưỡng "Good" để có biên an toàn.
+
+---
+
+## 2. Ngân sách bundle — size-limit & bundlesize
+
+Bundle JS là thứ dễ trôi nhất. Công cụ như **size-limit** chặn PR nếu bundle vượt ngưỡng — đo *cả thời gian chạy ước tính*, không chỉ byte.
+
+```js
+// .size-limit.js — fail CI nếu vượt
+module.exports = [
+  { path: 'dist/main.*.js', limit: '170 KB', gzip: true },
+  { path: 'dist/vendor.*.js', limit: '120 KB', gzip: true },
+];
+```
+
+```bash
+# Chạy trong CI; exit code != 0 nếu vượt budget → chặn merge
+npx size-limit
+```
+
+```text
+size-limit:  theo entry point, ước tính cả "time to run" trên mạng/CPU mô phỏng
+bundlesize:  đơn giản hơn, theo glob file + ngưỡng gzip/brotli
+→ đặt budget cho TỪNG bundle quan trọng, không chỉ tổng (tổng giấu chi tiết)
+```
+
+---
+
+## 3. Treemap analysis — biết byte đến từ đâu
+
+Khi vượt budget, cần biết *cái gì* phình. Treemap trực quan hóa bundle theo module.
+
+```bash
+# Rollup/Vite
+npx vite-bundle-visualizer
+# Webpack
+npx webpack-bundle-analyzer stats.json
+# Phân tích phụ thuộc
+npx source-map-explorer dist/*.js
+```
+
+```text
+Tìm trong treemap:
+  - thư viện to bất ngờ (moment.js, lodash full, cả icon set)
+  - phụ thuộc trùng lặp (nhiều version cùng lib)
+  - polyfill không cần cho target hiện đại
+  - import nguyên package thay vì tree-shakeable import
+→ thay bằng lib nhẹ, import lẻ, hoặc code-split (đẩy ra khỏi entry chính).
+```
+
+> Mẹo: trước khi thêm một dependency, kiểm tra "cost" (bundlephobia / import cost extension). Một lib 80KB cho một tính năng nhỏ thường có thay thế 5KB hoặc tự viết.
+
+---
+
+## 4. Cổng CI — chặn hồi quy nhiều tầng
+
+Tự động hóa nhiều tầng để bắt hồi quy ở các góc khác nhau:
+
+```text
+Pipeline guardrails:
+  ① Pre-commit/PR   size-limit → chặn bundle phình
+  ② Lighthouse CI   chạy trên build preview → assert LCP/INP/CLS/score
+  ③ RUM alert       cảnh báo khi field p75 xấu đi sau deploy
+  ④ Bundle diff bot  comment PR: "+12KB so với main"
+```
+
+```yml
+# Lighthouse CI: assert budget trên mỗi PR (lab data để chặn hồi quy thô)
+# lighthouserc.yml
+ci:
+  assert:
+    assertions:
+      largest-contentful-paint: ['error', { maxNumericValue: 2500 }]
+      interaction-to-next-paint: ['error', { maxNumericValue: 200 }]
+      cumulative-layout-shift: ['error', { maxNumericValue: 0.1 }]
+```
+
+Quan trọng: lab CI (Lighthouse) bắt hồi quy *thô* sớm và rẻ; RUM (field) là chân lý cuối cùng. Dùng cả hai — lab để chặn ở PR, field để xác nhận thực tế sau deploy.
+
+---
+
+## 5. Bisect hồi quy — tìm commit làm chậm
+
+Khi field data cho thấy hiệu năng xấu đi sau một khoảng deploy, cần tìm *commit nào*. Quy trình:
+
+```text
+1. Khoanh vùng theo thời gian deploy (RUM cho thấy bước nhảy ngày nào)
+2. So bundle diff giữa hai build (size report theo commit)
+3. git bisect trên metric đo được (script đo tự động pass/fail)
+4. Xác nhận bằng đo lại lab + field sau khi revert/sửa
+```
+
+Lưu lịch sử bundle size theo commit (artifact CI) giúp bisect nhanh: thường một bước nhảy size trùng với commit thêm dependency nặng.
+
+---
+
+## 6. Scorecard & văn hóa hiệu năng
+
+Guardrails kỹ thuật chỉ bền khi có văn hóa đỡ. Cách nhúng hiệu năng vào quy trình:
+
+```text
+- Performance scorecard: dashboard p75 LCP/INP/CLS theo route, công khai cho cả team
+- Đưa metric vào Definition of Done: "không hồi quy CWV" là tiêu chí merge
+- Owner cho từng metric/route → có người chịu trách nhiệm, không "của chung = của không ai"
+- Perf review cho thay đổi lớn (thêm dep, đổi kiến trúc render)
+- Ăn mừng cải thiện (giảm INP cũng đáng kể như thêm tính năng)
+- Đào tạo: chia sẻ kỹ thuật (chính series này) cho cả team
+```
+
+> Nguyên tắc: làm cho việc đúng trở thành việc dễ. Nếu budget tự động chặn hồi quy và dashboard hiển thị rõ, dev không cần "nhớ" tối ưu — hệ thống nhắc họ. Đó là khác biệt giữa hiệu năng như nỗ lực cá nhân và hiệu năng như thuộc tính hệ thống.
+
+---
+
+## 7. Tóm tắt
+
+- Không có guardrails, hiệu năng **trôi dần** theo entropy; cần ngân sách + tự động hóa, không chỉ một đợt tối ưu.
+- Ba loại **budget**: số lượng (KB/request), chỉ số (LCP/INP/CLS/TTFB), điểm (Lighthouse); đặt cụ thể, đo được, gắn field data, chặt hơn ngưỡng "Good" một biên.
+- **size-limit/bundlesize** chặn bundle phình trong CI; **treemap** (vite-bundle-visualizer/source-map-explorer) cho biết byte đến từ đâu; kiểm "cost" trước khi thêm dep.
+- **Cổng CI nhiều tầng**: size-limit (PR) + Lighthouse CI (lab, chặn hồi quy thô) + RUM alert (field, chân lý cuối) + bundle diff bot.
+- **Bisect hồi quy** bằng lịch sử bundle size + git bisect trên metric khi field data xấu đi.
+- Bền vững nhờ **văn hóa**: scorecard công khai, metric trong Definition of Done, owner rõ ràng, perf review — làm việc đúng thành việc dễ.
+
+**Phần tiếp theo:** Capstone 2 — điều tra hiệu năng end-to-end: một khung quyết định triệu chứng → metric → công cụ → cách sửa, ghép mọi phần chuyên sâu thành quy trình chẩn đoán một app chậm thật.

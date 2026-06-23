@@ -1,0 +1,216 @@
+---
+title: 'Vue.js 3 · Phần 12 — Testing & Capstone'
+description: 'Khép lại series: test component với Vitest + Vue Test Utils (mount, kích sự kiện, mock store/router), test composable, vài lưu ý e2e với Playwright, rồi capstone gộp router + Pinia + form validate + data fetching.'
+pubDate: 2026-06-22
+tags: [vue, testing, vitest, capstone, vue_12]
+series: vue
+seriesOrder: 12
+draft: false
+---
+
+Đây là phần cuối. App reactive, type-safe và nhanh vẫn cần **test** để đổi code mà không sợ vỡ. Ta đi bộ công cụ test chuẩn của Vue — Vitest + Vue Test Utils — rồi gộp toàn bộ series vào một capstone hoàn chỉnh.
+
+---
+
+## 1. Bộ công cụ & triết lý
+
+- **Vitest** — test runner trên Vite, nhanh, API giống Jest.
+- **Vue Test Utils (VTU)** — mount component và tương tác với nó.
+- **Playwright/Cypress** — test end-to-end qua trình duyệt thật.
+
+```bash
+npm install -D vitest @vue/test-utils @vitest/ui jsdom
+```
+
+Triết lý: **test hành vi người dùng thấy, không phải chi tiết nội bộ**. Ưu tiên test "click nút → thấy kết quả" hơn là kiểm tra biến state riêng tư. Kim tự tháp test: nhiều unit/composable, vừa phải component, ít e2e cho luồng then chốt.
+
+---
+
+## 2. Test composable (đơn giản nhất)
+
+Composable là hàm thuần reactive — test trực tiếp, không cần mount:
+
+```ts
+// useCounter.test.ts
+import { describe, it, expect } from 'vitest';
+import { useCounter } from '@/composables/useCounter';
+
+describe('useCounter', () => {
+  it('tăng giảm đúng', () => {
+    const { count, increment, reset } = useCounter(5);
+    expect(count.value).toBe(5);
+    increment();
+    expect(count.value).toBe(6);
+    reset();
+    expect(count.value).toBe(5);
+  });
+});
+```
+
+Composable dùng lifecycle (`onMounted`) cần mount trong một component thử — VTU có helper, hoặc test phần logic tách riêng.
+
+---
+
+## 3. Test component với VTU
+
+```ts
+// Counter.test.ts
+import { mount } from '@vue/test-utils';
+import { describe, it, expect } from 'vitest';
+import Counter from '@/components/Counter.vue';
+
+describe('Counter', () => {
+  it('tăng count khi click', async () => {
+    const wrapper = mount(Counter, { props: { start: 0 } });
+
+    expect(wrapper.text()).toContain('0');
+    await wrapper.find('button').trigger('click'); // await vì DOM cập nhật bất đồng bộ
+    expect(wrapper.text()).toContain('1');
+  });
+
+  it('emit "change" với giá trị mới', async () => {
+    const wrapper = mount(Counter);
+    await wrapper.find('button').trigger('click');
+    expect(wrapper.emitted('change')?.[0]).toEqual([1]); // kiểm tra emit
+  });
+});
+```
+
+`await` trước mỗi tương tác là bắt buộc — Vue cập nhật DOM bất đồng bộ (nextTick), thiếu `await` sẽ assert vào DOM cũ. Đây là lỗi test phổ biến nhất.
+
+---
+
+## 4. Mock Pinia store & router
+
+Component thật phụ thuộc store và router. Cô lập chúng khi test:
+
+```ts
+import { mount } from '@vue/test-utils';
+import { createTestingPinia } from '@pinia/testing';
+import { useAuthStore } from '@/stores/auth';
+
+const wrapper = mount(Navbar, {
+  global: {
+    plugins: [createTestingPinia({ createSpy: vi.fn })], // store giả, action bị spy
+    stubs: ['RouterLink'],   // không cần router thật để render link
+  },
+});
+
+const auth = useAuthStore();
+auth.user = { name: 'An', role: 'admin' }; // set state trực tiếp trong test
+await wrapper.vm.$nextTick();
+expect(wrapper.text()).toContain('An');
+```
+
+`createTestingPinia` cho store cô lập, mặc định stub action (assert được "action có được gọi"). `stubs` thay component con bằng placeholder để test tập trung.
+
+---
+
+## 5. Mock fetch & test trạng thái async
+
+Dùng `vi.fn`/`vi.mock` hoặc **MSW** (mock ở tầng network — gần thật nhất):
+
+```ts
+import { vi } from 'vitest';
+
+globalThis.fetch = vi.fn().mockResolvedValue({
+  ok: true,
+  json: async () => [{ id: 1, name: 'An' }],
+} as Response);
+
+const wrapper = mount(UserList);
+await flushPromises(); // chờ promise + DOM
+expect(wrapper.text()).toContain('An');
+```
+
+`flushPromises` (từ VTU) chờ mọi microtask resolve — cần cho component fetch trong setup.
+
+---
+
+## 6. Capstone — "Task Manager"
+
+Gộp toàn series thành một feature thật. Yêu cầu:
+
+```text
+Định tuyến (Phần 7)      /tasks (list)  /tasks/:id (detail, watch param)
+Store Pinia (Phần 8)     useTasksStore: state tasks, getters filter, actions CRUD
+Form + validate (P6)     thêm/sửa task với zod (title bắt buộc, due hợp lệ)
+Data fetching (Phần 9)   load tasks: loading/error/empty/data + AbortController
+Component (Phần 4)       TaskCard (props), emit toggle/delete, slot cho action
+Composable (Phần 5)      useTasks (logic), useLocalStorage (persist filter)
+TypeScript (Phần 10)     Task type, store/props typed, TypedList generic
+Hiệu năng (Phần 11)      lazy-load route detail, virtualize list khi nhiều task
+Auth guard (Phần 7)      /tasks cần đăng nhập → redirect /login
+```
+
+Lát cắt code lõi gắn kết mọi mảnh:
+
+```ts
+// stores/tasks.ts
+export const useTasksStore = defineStore('tasks', () => {
+  const tasks = ref<Task[]>([]);
+  const loading = ref(false);
+  const remaining = computed(() => tasks.value.filter((t) => !t.done).length);
+
+  async function fetchAll() {
+    loading.value = true;
+    try { tasks.value = await api.get<Task[]>('/tasks'); }
+    finally { loading.value = false; }
+  }
+  async function add(input: NewTask) {
+    const created = await api.post<Task>('/tasks', input); // optimistic được thì càng tốt
+    tasks.value.push(created);
+  }
+  function toggle(id: string) {
+    const t = tasks.value.find((x) => x.id === id);
+    if (t) t.done = !t.done;
+  }
+  return { tasks, loading, remaining, fetchAll, add, toggle };
+});
+```
+
+Test bao phủ capstone: unit cho `remaining`/`toggle`, component cho TaskCard (emit), và một e2e Playwright cho luồng "đăng nhập → thêm task → đánh dấu xong".
+
+---
+
+## 7. Bài tập
+
+**1.** Vì sao phải `await wrapper.find('button').trigger('click')`?
+
+<details>
+<summary>Lời giải</summary>
+
+Vue cập nhật DOM bất đồng bộ (nextTick). `await` đảm bảo DOM đã cập nhật trước khi assert; thiếu nó sẽ kiểm tra DOM cũ và test sai.
+</details>
+
+**2.** `createTestingPinia` cho lợi ích gì khi test component?
+
+<details>
+<summary>Lời giải</summary>
+
+Một Pinia cô lập cho mỗi test, set state trực tiếp, và spy action (mặc định stub) để assert action được gọi mà không chạy logic thật.
+</details>
+
+**3.** Nên ưu tiên test gì: state nội bộ hay hành vi người dùng thấy?
+
+<details>
+<summary>Lời giải</summary>
+
+Hành vi người dùng thấy (click → kết quả hiển thị, emit). Test chi tiết nội bộ làm test giòn, vỡ khi refactor dù hành vi không đổi.
+</details>
+
+---
+
+## Điểm chính
+
+- **Vitest + Vue Test Utils** cho unit/component; Playwright cho e2e luồng then chốt.
+- **Test composable trực tiếp**; component thì `mount` + `await trigger` (DOM bất đồng bộ).
+- Cô lập bằng **`createTestingPinia`**, `stubs`, và mock `fetch`/MSW + `flushPromises`.
+- Test **hành vi**, không phải chi tiết nội bộ.
+- Capstone gộp router + Pinia + form/zod + fetching + TS + hiệu năng + test.
+
+---
+
+## Hết series
+
+Bạn đã đi từ "reactivity là gì" đến một app Vue 3 production: declarative rendering, Composition API và composable, component và slot, form và `v-model` tùy biến, router, Pinia, async/Suspense, TypeScript, hiệu năng, và testing. Bước tiếp theo tự nhiên là **Nuxt** (SSR/SSG, file-based routing, server route) — nó dựng thẳng trên mọi thứ bạn vừa học. Chúc bạn build vui.

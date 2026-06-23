@@ -1,0 +1,288 @@
+---
+title: 'Service Workers · Phần 10 — Capstone: build PWA offline-first hoàn chỉnh'
+description: 'Ghép cả series thành một PWA production: web app manifest, install prompt, update UX chuẩn, offline + background sync + push, checklist testing/debugging, Lighthouse và deploy. Tổng kết toàn bộ kiến thức.'
+pubDate: 2026-07-09
+tags: [service-worker, pwa, manifest, capstone, service_workers_10]
+series: service-workers
+seriesOrder: 10
+draft: false
+---
+
+Đây là phần cuối — nơi mọi mảnh ghép của chín bài trước hợp lại thành một thứ chạy thật: **"Notes PWA"**, một app ghi chú offline-first mà người dùng có thể **cài như app native**, dùng **khi mất mạng**, **đồng bộ khi có mạng lại**, và **nhận thông báo đẩy**. Sau bài này, bạn không còn "học về" service worker nữa — bạn **đã xây** một PWA hoàn chỉnh.
+
+Ta đi theo đúng thứ tự một dự án thật: manifest → cài đặt → offline → sync → push → update UX → test → deploy.
+
+---
+
+## Tổng quan kiến trúc
+
+```text
+Notes PWA
+├── App shell (precache, cache-first)         ← Phần 4, 5
+│   └── header, nav, CSS, JS khung
+├── Notes list (network-first + cache)        ← Phần 4, 5
+├── Tạo/sửa note offline → outbox → sync      ← Phần 7
+├── Push notification (nhắc nhở)              ← Phần 8
+├── Update flow (toast "Có bản mới")          ← Phần 2
+└── Workbox qua vite-plugin-pwa               ← Phần 9
+```
+
+---
+
+## 1. Web App Manifest — điều kiện để "cài"
+
+Service worker cho offline; **manifest** cho khả năng **cài đặt** (installable). Đây là file JSON khai báo app trông thế nào khi cài.
+
+```json
+// public/manifest.webmanifest
+{
+  "name": "Notes — Ghi chú offline",
+  "short_name": "Notes",
+  "description": "App ghi chú hoạt động offline",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#0d0d0d",
+  "background_color": "#0d0d0d",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
+```
+
+Link trong `<head>`:
+
+```html
+<link rel="manifest" href="/manifest.webmanifest" />
+<meta name="theme-color" content="#0d0d0d" />
+```
+
+**Tiêu chí installable** (để trình duyệt cho phép cài): có manifest hợp lệ (name, icons 192+512, start_url, display), có service worker, chạy trên HTTPS. Thiếu một cái là không hiện được lời mời cài.
+
+> Icon **maskable** (`purpose: "maskable"`) quan trọng trên Android: nó đảm bảo icon không bị cắt xấu khi hệ điều hành bo tròn/đổ bóng. Test bằng maskable.app.
+
+---
+
+## 2. Install prompt — mời cài đúng cách
+
+Trình duyệt bắn event `beforeinstallprompt` khi app đủ điều kiện cài. Bắt nó để hiện nút "Cài app" của riêng bạn (thay vì để banner mặc định).
+
+```js
+let deferredPrompt = null;
+
+window.addEventListener('beforeinstallprompt', (event) => {
+  // Chặn mini-infobar mặc định để tự kiểm soát thời điểm.
+  event.preventDefault();
+  deferredPrompt = event;
+  showInstallButton(); // hiện nút "Cài app" của bạn
+});
+
+async function onInstallClick() {
+  if (!deferredPrompt) return;
+  deferredPrompt.prompt(); // hiện hộp thoại cài đặt của trình duyệt
+  const { outcome } = await deferredPrompt.userChoice;
+  console.log('Người dùng', outcome); // 'accepted' | 'dismissed'
+  deferredPrompt = null;
+  hideInstallButton();
+}
+
+// App đã được cài → ẩn nút, có thể đo lường.
+window.addEventListener('appinstalled', () => {
+  hideInstallButton();
+});
+```
+
+> UX: chỉ hiện nút cài **sau khi người dùng đã dùng app một chút** (tạo vài note). Mời cài ngay lập tức = tỉ lệ từ chối cao. Trên iOS không có `beforeinstallprompt` — bạn cần hướng dẫn thủ công "Bấm Share → Add to Home Screen".
+
+---
+
+## 3. Service worker hoàn chỉnh (injectManifest + Workbox)
+
+Gộp offline + sync + push từ Phần 5, 7, 8, 9:
+
+```ts
+// src/sw.ts
+import { precacheAndRoute, cleanupOutdatedCaches } from 'workbox-precaching';
+import { registerRoute, NavigationRoute } from 'workbox-routing';
+import { NetworkFirst, NetworkOnly, CacheFirst } from 'workbox-strategies';
+import { ExpirationPlugin } from 'workbox-expiration';
+import { CacheableResponsePlugin } from 'workbox-cacheable-response';
+import { BackgroundSyncPlugin } from 'workbox-background-sync';
+
+declare let self: ServiceWorkerGlobalScope;
+
+precacheAndRoute(self.__WB_MANIFEST);
+cleanupOutdatedCaches();
+
+// Navigation → network-first, fallback app shell precache (Phần 5)
+const navHandler = new NetworkFirst({ cacheName: 'pages', networkTimeoutSeconds: 3 });
+registerRoute(new NavigationRoute(navHandler));
+
+// Ảnh → cache-first + expiration (Phần 4, 6)
+registerRoute(
+  ({ request }) => request.destination === 'image',
+  new CacheFirst({
+    cacheName: 'images',
+    plugins: [
+      new CacheableResponsePlugin({ statuses: [0, 200] }),
+      new ExpirationPlugin({ maxEntries: 60, maxAgeSeconds: 30 * 24 * 60 * 60 }),
+    ],
+  })
+);
+
+// Đọc notes → network-first (Phần 4)
+registerRoute(
+  ({ url }) => url.pathname === '/api/notes',
+  new NetworkFirst({ cacheName: 'notes', networkTimeoutSeconds: 3 }),
+  'GET'
+);
+
+// Ghi notes offline → background sync queue (Phần 7).
+// NetworkOnly: POST chỉ gửi đi, queue lại nếu offline rồi retry — không đọc cache.
+const notesSync = new BackgroundSyncPlugin('notes-outbox', { maxRetentionTime: 24 * 60 });
+registerRoute(
+  ({ url }) => url.pathname === '/api/notes',
+  new NetworkOnly({ plugins: [notesSync] }),
+  'POST'
+);
+
+// Push (Phần 8)
+self.addEventListener('push', (event) => {
+  const data = event.data?.json() ?? {};
+  event.waitUntil(
+    self.registration.showNotification(data.title ?? 'Notes', {
+      body: data.body ?? '',
+      icon: '/icons/icon-192.png',
+      data: { url: data.url ?? '/' },
+    })
+  );
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const url = event.notification.data?.url ?? '/';
+  event.waitUntil(
+    (async () => {
+      const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      const existing = all.find((c) => 'focus' in c);
+      if (existing) {
+        await existing.focus();
+        if ('navigate' in existing) await existing.navigate(url);
+      } else {
+        await self.clients.openWindow(url);
+      }
+    })()
+  );
+});
+```
+
+---
+
+## 4. Update UX chuẩn production
+
+Đây là pattern "hỏi người dùng trước" đã hứa từ Phần 2 — an toàn versioning, không tự ý reload giữa chừng:
+
+```ts
+// main.ts
+import { registerSW } from 'virtual:pwa-register';
+
+const updateSW = registerSW({
+  onNeedRefresh() {
+    showToast({
+      message: 'Có phiên bản mới',
+      action: { label: 'Tải lại', onClick: () => updateSW(true) },
+    });
+  },
+  onOfflineReady() {
+    showToast({ message: 'App đã sẵn sàng dùng offline ✅' });
+  },
+});
+```
+
+Tương ứng `vite.config.ts` dùng `registerType: 'prompt'` và `strategies: 'injectManifest'` như Phần 9.
+
+---
+
+## 5. Checklist testing
+
+Đừng tin "chạy trên máy mình là xong". Test theo checklist:
+
+- [ ] **Offline cold start**: cài SW, tắt mạng, **đóng hẳn rồi mở lại** → app vẫn mở.
+- [ ] **Offline navigation**: điều hướng giữa các route khi offline → không thấy trang lỗi.
+- [ ] **Tạo note offline**: tạo khi offline → vào IndexedDB outbox → bật mạng → tự đồng bộ.
+- [ ] **Update flow**: deploy bản mới → thấy toast → bấm → reload đúng bản mới, không kẹt.
+- [ ] **Install**: hiện nút cài → cài → mở từ home screen ở chế độ standalone.
+- [ ] **Push**: đăng ký → gửi từ server → nhận dù tab đóng → bấm điều hướng đúng.
+- [ ] **Cache không phình**: kiểm tra `navigator.storage.estimate()` sau khi dùng lâu.
+- [ ] **Kill switch sẵn sàng**: có SW khẩn cấp để gỡ khi sự cố (Phần 6).
+
+---
+
+## 6. Debug — bộ công cụ
+
+- **Application → Service Workers**: trạng thái, skipWaiting, update, unregister, "Update on reload", "Bypass for network".
+- **Application → Cache Storage / IndexedDB**: soi nội dung cache và outbox.
+- **Application → Storage → Clear site data**: reset về "người dùng mới".
+- **Network**: cột Size `(ServiceWorker)` xác nhận response từ SW.
+- **Lighthouse** (tab Lighthouse): chạy audit **PWA** + **Performance**. Nó kiểm tra installable, offline, manifest, HTTPS — sửa hết cảnh báo trước khi ship.
+- **`chrome://inspect/#service-workers`** và **`about:debugging`** (Firefox): xem mọi SW đang chạy, kể cả khi tab đóng.
+
+---
+
+## 7. Deploy — những điều bắt buộc
+
+- **HTTPS** (bắt buộc — Phần 1). GitHub Pages / Cloudflare Pages / Vercel / Netlify đều miễn phí.
+- **`sw.js` với `Cache-Control: no-cache`** (Phần 2, 6) để update nhanh, tránh cache độc.
+- **Asset có hash trong tên** (Vite làm sẵn) → cache-first an toàn vĩnh viễn.
+- **Scope đúng**: SW ở gốc (`/sw.js`) nếu muốn kiểm soát toàn site (Phần 1). Lưu ý nếu deploy dưới subpath (GitHub Pages project site `/repo/`) thì cấu hình `base` và scope cho khớp.
+- **Test trên thiết bị thật**, đặc biệt iOS Safari (push cần PWA đã cài, không có `beforeinstallprompt`).
+
+> Cạm bẫy deploy subpath: GitHub Pages kiểu `user.github.io/repo/` khiến `start_url`, `scope`, và đường dẫn precache lệch nếu bạn để mặc định `/`. Đặt `base: '/repo/'` trong Vite và để vite-plugin-pwa tự khớp scope.
+
+---
+
+## Tổng kết toàn series
+
+Bạn đã đi một hành trình hoàn chỉnh:
+
+1. **Mental model** — SW là network proxy chạy nền, stateless, event-driven.
+2. **Lifecycle** — install/waiting/activate, skipWaiting, update flow.
+3. **Fetch interception** — respondWith, Request/Response, clone.
+4. **Caching strategies** — cache-first, network-first, SWR, và khi nào dùng cái nào.
+5. **Offline-first** — app shell, navigation fallback, trang offline.
+6. **Advanced caching** — versioning, cleanup, expiration, opaque/CORS, kill switch.
+7. **Background Sync** — outbox IndexedDB, retry tự động.
+8. **Push** — Push API + Notifications, VAPID, click handling.
+9. **Workbox** — đóng gói mọi thứ, precache manifest tự động.
+10. **Capstone** — PWA hoàn chỉnh: manifest, install, update UX, deploy.
+
+Quan trọng nhất: bạn **hiểu bản chất**, không chỉ copy config. Khi DevTools báo lỗi lúc 2 giờ sáng, bạn biết chính xác chuyện gì đang xảy ra bên dưới. Đó mới là kinh nghiệm service worker thật sự.
+
+---
+
+## Bài tập thực hành (capstone)
+
+### Bài 1 — Dựng Notes PWA (cơ bản → trung bình)
+
+Build app Notes với Vite + vite-plugin-pwa: danh sách note, tạo note, manifest, install prompt. Test installable bằng Lighthouse (mục tiêu: pass hết kiểm tra PWA).
+
+**Hướng dẫn:** Bắt đầu từ `generateSW` cho nhanh, có app + manifest + offline đọc note. Chạy Lighthouse, sửa từng cảnh báo (thiếu icon 512? thiếu theme_color? thiếu maskable?). Đạt "installable" là cột mốc đầu tiên.
+
+### Bài 2 — Offline ghi + sync (nâng cao)
+
+Chuyển sang `injectManifest`, thêm `BackgroundSyncPlugin` cho POST note. Quy trình test: offline → tạo 3 note → kiểm tra IndexedDB `notes-outbox` → online → note tự lên server.
+
+**Hướng dẫn:** Hiển thị note đang chờ với badge ⏳, và dùng `postMessage` từ SW báo về để đổi thành ✅ (Phần 7). Đây là tính năng "ghi offline không mất dữ liệu" — linh hồn của một PWA tử tế. Test cả việc đóng tab giữa chừng rồi mở lại.
+
+### Bài 3 — Update flow + push + deploy (chuyên sâu)
+
+Hoàn thiện: (a) `registerType: 'prompt'` với toast "Có bản mới"; (b) push notification nhắc nhở (server từ Phần 8); (c) deploy lên Cloudflare Pages / GitHub Pages với HTTPS và test trên điện thoại thật.
+
+**Hướng dẫn:** Với update flow, deploy hai lần và xác nhận lần hai hiện toast, bấm reload ra đúng bản mới (không kẹt waiting — Phần 2). Với push trên iOS, nhớ phải **Add to Home Screen** trước. Sau khi deploy, chạy lại Lighthouse trên URL production và chụp điểm PWA. Khi mọi mục trong **checklist testing** ở trên đều xanh, bạn đã có một PWA production thực thụ — và đã hoàn thành series. 🎉
+
+---
+
+**Hết series.** Bạn giờ có thể tự tin nhận một dự án PWA từ đầu: thiết kế caching strategy, xử lý offline, đồng bộ nền, push, và deploy an toàn. Bước tiếp theo gợi ý: đọc lại source của Workbox để thấy chính những pattern này ở quy mô production, và thử biến một app hiện có của bạn thành PWA.

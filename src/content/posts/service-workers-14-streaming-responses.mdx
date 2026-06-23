@@ -1,0 +1,208 @@
+---
+title: 'Service Workers · Phần 14 — Streaming responses'
+description: 'Dùng ReadableStream và TransformStream trong service worker để ghép app shell từ cache với nội dung động từ mạng thành một response chảy dần — render tiến triển, cải thiện TTFB/LCP, và stream từ cache.'
+pubDate: 2026-07-17
+tags: [service-worker, streams, performance, lcp, service_workers_10]
+series: service-workers
+seriesOrder: 14
+draft: false
+---
+
+Một service worker thường trả response "trọn gói": chờ toàn bộ nội dung rồi mới đưa cho trình duyệt. Nhưng trình duyệt vốn giỏi **render tiến triển** — nó bắt đầu dựng trang ngay khi nhận những byte HTML đầu tiên. Nếu SW có thể **stream** phần header/app-shell (lấy từ cache, *tức thì*) trong khi vẫn đang chờ phần nội dung động từ mạng, người dùng thấy khung trang gần như ngay lập tức.
+
+Phần này dùng Streams API trong SW để làm điều đó — một kỹ thuật mạnh nối thẳng với Navigation Preload (Phần 13).
+
+---
+
+## 1. Vì sao streaming nhanh hơn "trọn gói"
+
+So sánh hai cách trả một trang gồm shell (header, nav, CSS) + content (data từ server):
+
+```text
+Trọn gói:   [chờ cả shell + content] ───────────► gửi hết một lần → render
+Streaming:  gửi shell ngay ──► render khung ──► content chảy về ──► render tiếp
+```
+
+Với cách trọn gói, byte đầu tiên (TTFB) chỉ đến *sau khi* phần chậm nhất (content từ mạng) xong. Với streaming, shell từ cache đến gần như tức thì → trình duyệt dựng layout, tải CSS/font sớm → **LCP và FCP cải thiện rõ**, dù tổng thời gian tải content không đổi.
+
+---
+
+## 2. `ReadableStream` cơ bản trong SW
+
+`Response` chấp nhận một `ReadableStream` làm body. Bạn tự đẩy từng đoạn (chunk) vào:
+
+```js
+function streamResponse() {
+  const stream = new ReadableStream({
+    async start(controller) {
+      const encoder = new TextEncoder();
+      controller.enqueue(encoder.encode('<!doctype html><h1>Đang tải…</h1>'));
+      // ... đẩy thêm chunk ...
+      controller.close();
+    },
+  });
+  return new Response(stream, {
+    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+  });
+}
+```
+
+`controller.enqueue(bytes)` đẩy một đoạn xuống trình duyệt *ngay*. `controller.close()` báo hết. Trình duyệt render dần theo từng `enqueue`.
+
+---
+
+## 3. Ghép app shell (cache) + content (network)
+
+Đây là pattern chủ lực: stream phần đầu shell từ cache, rồi nối body content từ mạng, rồi phần đuôi shell:
+
+```js
+async function streamPage(event) {
+  const cache = await caches.open('shell');
+
+  // Các mảnh shell tĩnh đã precache (Phần 5): phần đầu và phần đuôi HTML.
+  const [shellTop, shellBottom] = await Promise.all([
+    cache.match('/shell-top.html'),
+    cache.match('/shell-bottom.html'),
+  ]);
+
+  // Nội dung động: từ navigation preload (Phần 13) hoặc fetch.
+  const contentPromise = event.preloadResponse.then(
+    (p) => p || fetch(`/content${new URL(event.request.url).pathname}`),
+  );
+
+  const { readable, writable } = new TransformStream();
+  // Bơm tuần tự: top → content → bottom (không await toàn bộ trước khi trả).
+  pump(writable, shellTop, contentPromise, shellBottom);
+
+  return new Response(readable, {
+    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+  });
+}
+
+async function pump(writable, shellTop, contentPromise, shellBottom) {
+  const writer = writable.getWriter();
+  await pipeBody(writer, shellTop);                 // shell đầu — từ cache, tức thì
+  await pipeBody(writer, await contentPromise);     // content — từ mạng
+  await pipeBody(writer, shellBottom);              // shell đuôi — từ cache
+  await writer.close();
+}
+
+async function pipeBody(writer, response) {
+  const reader = response.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    await writer.write(value);
+  }
+}
+```
+
+Trình duyệt nhận `shell-top.html` ngay (đã ở cache) → render header + bắt đầu tải CSS/font; rồi content chảy vào giữa; rồi đuôi đóng tài liệu. Người dùng thấy khung app gần như tức thì.
+
+---
+
+## 4. `TransformStream` — đường ống gọn hơn
+
+`TransformStream` cho bạn một cặp `{ readable, writable }`: ghi vào `writable`, đọc ra `readable`. Trả `readable` cho `Response`, ghi dần vào `writable` ở nền — đúng mô hình "producer/consumer" như mục 3. Nó tránh việc tự quản lý `controller` thủ công và xử lý backpressure tự nhiên.
+
+> **Backpressure** là cơ chế stream tự "phanh" producer khi consumer chưa kịp tiêu thụ. `TransformStream` và `writer.write()` (trả Promise) tôn trọng nó — `await writer.write(...)` sẽ chờ khi buffer đầy, tránh ngốn bộ nhớ.
+
+---
+
+## 5. Stream thẳng từ cache cho file lớn
+
+Khi phục vụ một file lớn (video, dataset) từ Cache API, đừng `await response.arrayBuffer()` (nạp hết vào RAM). `Response` lấy từ `cache.match` *đã* là streaming — trả thẳng nó để trình duyệt nhận dần:
+
+```js
+const cached = await cache.match(request);
+if (cached) return cached; // body là stream — trình duyệt đọc dần, không nạp hết vào RAM
+```
+
+Nếu cần biến đổi giữa chừng (vd chèn marker), dùng `pipeThrough(new TransformStream({ transform }))` thay vì gom hết rồi sửa.
+
+---
+
+## 6. Xử lý lỗi giữa stream
+
+Streaming có một bất lợi: một khi đã gửi header `200` và vài chunk, bạn **không thể đổi status thành lỗi**. Nếu phần content từ mạng hỏng giữa chừng, cách tử tế là **stream một khối lỗi inline** (HTML thông báo) thay vì để trang treo:
+
+```js
+async function pipeBody(writer, response) {
+  try {
+    const reader = response.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await writer.write(value);
+    }
+  } catch {
+    const enc = new TextEncoder();
+    await writer.write(enc.encode('<p role="alert">Không tải được nội dung. Vui lòng thử lại.</p>'));
+  }
+}
+```
+
+Vì shell đã render, người dùng vẫn thấy app (header, nav) và một thông báo lỗi gọn — tốt hơn nhiều một trang trắng.
+
+---
+
+## 7. Khi nào dùng streaming
+
+| Hợp | Không cần |
+|---|---|
+| Trang HTML có shell tĩnh + content động | SPA render hoàn toàn client (chỉ cần shell) |
+| Server hỗ trợ trả fragment (Phần 13) | API JSON nhỏ |
+| File lớn phục vụ từ cache | Asset nhỏ đã cache-first |
+| Muốn tối ưu LCP/FCP cho first paint | Trang đã rất nhanh sẵn |
+
+Streaming là kỹ thuật "đáng tiền" cho trang nội dung (blog, e-commerce, tin tức) nơi shell ổn định còn content thay đổi. Với SPA thuần client-render, app shell cache-first (Phần 5) đã đủ.
+
+---
+
+## 8. Bài tập
+
+**1.** Vì sao streaming shell trước cải thiện LCP dù tổng thời gian tải content không đổi?
+
+<details>
+<summary>Lời giải</summary>
+
+Trình duyệt render tiến triển: nhận shell từ cache gần như tức thì → dựng layout, bắt đầu tải CSS/font/ảnh sớm hơn, nên phần tử nội dung lớn (LCP) được vẽ sớm hơn. Với cách trọn gói, byte đầu tiên chỉ đến sau khi phần chậm nhất (content mạng) xong, đẩy lùi mọi mốc render.
+
+</details>
+
+**2.** Vì sao `TransformStream` + `await writer.write()` quan trọng cho bộ nhớ?
+
+<details>
+<summary>Lời giải</summary>
+
+Chúng tôn trọng backpressure: `await writer.write(chunk)` chờ khi buffer đầy (consumer chưa kịp đọc), nên producer không bơm dữ liệu nhanh hơn mức tiêu thụ. Điều này tránh tích luỹ chunk trong RAM khi stream file lớn — khác với gom hết vào một buffer rồi trả một lần.
+
+</details>
+
+**3.** Nhược điểm của streaming khi gặp lỗi giữa chừng là gì, và xử lý ra sao?
+
+<details>
+<summary>Lời giải</summary>
+
+Một khi đã gửi status `200` và vài chunk, không thể đổi thành mã lỗi. Khắc phục: bắt lỗi trong vòng đọc và stream một khối HTML lỗi inline (`role="alert"`). Vì shell đã render, người dùng vẫn thấy app + thông báo lỗi gọn thay vì trang treo/trắng.
+
+</details>
+
+**Nâng cao:** Tách trang thành `shell-top.html` / `shell-bottom.html` (precache) và một endpoint `/content/...` trả fragment. Stream ghép chúng trong SW, đo FCP/LCP so với trả trọn gói bằng tab Performance.
+
+---
+
+## Tóm tắt
+
+- Streaming gửi **shell từ cache tức thì** rồi nối content động — cải thiện TTFB/FCP/LCP nhờ render tiến triển.
+- `Response` nhận một `ReadableStream`; `controller.enqueue()` đẩy chunk, trình duyệt render dần.
+- `TransformStream` (`{readable, writable}`) cho đường ống gọn, tôn trọng **backpressure** qua `await writer.write()`.
+- Phục vụ file lớn từ cache: trả thẳng `Response` (đã là stream), đừng nạp hết vào RAM; biến đổi bằng `pipeThrough`.
+- Lỗi giữa stream không đổi được status → stream khối lỗi HTML inline; shell đã render nên UX vẫn ổn.
+- Dùng cho trang shell-tĩnh + content-động; SPA thuần client chỉ cần app shell cache-first.
+
+---
+
+## Phần tiếp theo
+
+**Phần 15 — Storage, quota & persistence:** đo và xin dung lượng bền với StorageManager (`estimate`, `persist`), hiểu chính sách eviction (best-effort vs persistent), pattern dùng IndexedDB trong service worker, và dọn cache theo LRU để không bao giờ vượt quota.

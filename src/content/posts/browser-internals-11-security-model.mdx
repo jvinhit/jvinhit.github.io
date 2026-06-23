@@ -1,0 +1,262 @@
+---
+title: 'How Browsers Work · Part 11 — The Security Model'
+description: 'The browser''s defenses: the same-origin policy, CORS, Content Security Policy, cookie protections (SameSite/HttpOnly), the sandbox and site isolation, and how they combine to contain hostile code.'
+pubDate: 2026-10-25
+tags: [browser, internals, security, cors, csp, browser_internals_12]
+series: browser-internals
+seriesOrder: 11
+draft: true
+---
+
+Mỗi trang bạn mở chạy **code không đáng tin** — app của bạn, quảng cáo bên thứ ba, script analytics, widget nhúng — trên cùng máy với tab email, ngân hàng, và file cục bộ. Việc của trình duyệt không phải tin bạn; mà là **giam giữ** code đó để một origin bị chiếm quyền không đọc được dữ liệu site khác hay thoát ra HĐH.
+
+Phần 1–10 đã đi qua kiến trúc, render, JavaScript, bộ nhớ, mạng, và lưu trữ — tất cả giả định một thế giới đối địch. Phần này là **mô hình bảo mật**: các lớp phòng thủ biến "trang web ngẫu nhiên trên laptop" từ thảm họa thành thứ có thể sống sót.
+
+```text
+Defense in depth (simplified)
+─────────────────────────────────────────────────────────────
+  HTTPS / mixed-content blocking     → transport integrity
+  Sandbox + Site Isolation (Part 1)  → OS/process boundary
+  Same-Origin Policy (SOP)           → default: no cross-origin reads
+  CORS                               → server opt-in to cross-origin reads
+  CSP                                → restrict what code/styles can run/load
+  Cookie flags (HttpOnly/SameSite)   → limit token theft & CSRF
+  iframe sandbox / COOP+COEP         → isolate documents & enable SAB
+─────────────────────────────────────────────────────────────
+```
+
+---
+
+## 1. Mối đe dọa: bạn chạy code đối địch trên máy cục bộ
+
+Web app không phải đồ chơi sandbox; nó là **code gốc** (JS biên dịch, WASM, GPU shader) chạy với quyền truy cập API mạnh. Kẻ tấn công nhắm tới:
+
+- **Đánh cắp dữ liệu liên site** — đọc cookie, localStorage, hoặc DOM của tab khác.
+- **CSRF** — lừa trình duyệt gửi request đã xác thực mà user không hề muốn.
+- **XSS** — tiêm script chạy với đặc quyền của site bạn.
+- **Lộ bộ nhớ** — lỗi kiểu Spectre cho code một origin đọc bộ nhớ origin khác trong cùng tiến trình.
+- **Thoát sandbox** — phá renderer để chạm filesystem hay mạng trực tiếp.
+
+Không cơ chế đơn lẻ nào chặn hết. Trình duyệt xếp chồng **phòng thủ nhiều lớp**: sandbox tiến trình (Phần 1), ranh giới origin, header opt-in từ server, và chính sách do developer kiểm soát.
+
+---
+
+## 2. Same-Origin Policy (SOP): bức tường mặc định
+
+Một **origin** là bộ **scheme + host + port**:
+
+```text
+https://app.example.com:443/page   → origin: https://app.example.com
+http://app.example.com/page        → DIFFERENT (scheme)
+https://api.example.com/data         → DIFFERENT (host)
+https://app.example.com:8443/page    → DIFFERENT (port, if non-default)
+```
+
+Hai URL cùng origin chỉ khi cả ba khớp. **SOP** là quy tắc nền của trình duyệt: JavaScript ở origin A **không được đọc** dữ liệu từ origin B trừ khi có ngoại lệ rõ ràng.
+
+SOP chặn gì (ví dụ):
+
+| Action | Bị chặn? |
+|--------|---------------------|
+| Read another origin's DOM via `iframe.contentDocument` | Có |
+| Read another origin's `localStorage` | Có |
+| `fetch('https://other.com/api')` and read the response body | Có (trừ khi CORS cho phép) |
+| Load `<img src="https://other.com/secret.png">` | Không — nhúng được phép; đọc pixel cross-origin bị hạn chế |
+| Submit a `<form>` POST to another origin | Không — điều hướng/gửi form được phép |
+
+> SOP **bất đối xứng**: bạn thường *gửi* dữ liệu cross-origin (form, `<img>`, `<script src>`), nhưng không *đọc* phản hồi từ JS trừ khi bên kia hợp tác. Bất đối xứng đó là lý do CSRF tồn tại và CORS cần cho API.
+
+Khi SOP chặn đọc, DevTools hiện lỗi chung — script tấn công không nhận gì hữu ích. Đây là **fail-closed có chủ đích**.
+
+---
+
+## 3. CORS: server opt-in cho phép đọc cross-origin
+
+**Cross-Origin Resource Sharing (CORS)** là cách server nói: "Tôi cho phép `https://app.example.com` đọc phản hồi này bằng JavaScript". CORS **nới lỏng** SOP; không siết chặt.
+
+### Request đơn giản vs preflight
+
+Với request cross-origin "đơn giản" (method, header, content-type nhất định), trình duyệt gửi request trực tiếp rồi kiểm tra header phản hồi sau. Với phần còn lại, trình duyệt trước hết gửi **`OPTIONS` preflight** xin phép:
+
+```text
+Browser (https://app.example.com)
+    │
+    ├─ OPTIONS /api/data          ← preflight (if needed)
+    │     Origin: https://app.example.com
+    │     Access-Control-Request-Method: POST
+    │     Access-Control-Request-Headers: Content-Type, Authorization
+    │
+    ◄─┤ 204 No Content
+    │     Access-Control-Allow-Origin: https://app.example.com
+    │     Access-Control-Allow-Methods: POST, GET
+    │     Access-Control-Allow-Headers: Content-Type, Authorization
+    │
+    ├─ POST /api/data             ← actual request
+    │     Origin: https://app.example.com
+    │
+    ◄─┤ 200 OK
+          Access-Control-Allow-Origin: https://app.example.com
+          (body visible to JS ✓)
+```
+
+Header phản hồi chính:
+
+| Header | Vai trò |
+|--------|----------------|
+| `Access-Control-Allow-Origin` | Origin nào được đọc phản hồi (`*` hoặc origin cụ thể) |
+| `Access-Control-Allow-Credentials` | Cookie/Authorization có được gửi không (`true`; không kết hợp với `*`) |
+| `Access-Control-Allow-Methods` | Method được phép trong preflight |
+| `Access-Control-Allow-Headers` | Header request được phép trong preflight |
+| `Access-Control-Max-Age` | Thời gian cache kết quả preflight |
+
+Phía client, `fetch(url, { credentials: 'include' })` gửi cookie chỉ khi server trả `Access-Control-Allow-Credentials: true` và `Allow-Origin` cụ thể — không phải `*`.
+
+### Hiểu lầm CORS phổ biến
+
+- **"CORS bảo vệ API của tôi"** — Không. CORS được enforce **trong trình duyệt** để bảo vệ *user* khỏi site độc đọc phản hồi. `curl` bỏ qua CORS hoàn toàn.
+- **"Lỗi CORS nghĩa là request thất bại"** — Thường server **đã** nhận và xử lý request; trình duyệt chỉ giấu phản hồi khỏi JS.
+- **"Thêm `Access-Control-Allow-Origin: *` sửa mọi thứ"** — Không chạy với credentials, và cho phép mọi site đọc phản hồi công khai trong trình duyệt — có thể ổn với API public nhưng không với dữ liệu riêng.
+
+---
+
+## 4. Content Security Policy (CSP): thu hẹp bề mặt tấn công
+
+Nếu XSS tiêm `<script>alert(document.cookie)</script>`, SOP không cứu được — script chạy **với tư cách origin của bạn**. **Content Security Policy** bảo trình duyệt nguồn script, style, ảnh, kết nối, và frame nào được phép.
+
+Gửi qua HTTP header (ưu tiên) hoặc `<meta http-equiv="Content-Security-Policy">`:
+
+```http
+Content-Security-Policy:
+  default-src 'self';
+  script-src 'self' https://cdn.example.com;
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data: https:;
+  connect-src 'self' https://api.example.com;
+  frame-ancestors 'none';
+  base-uri 'self';
+  object-src 'none';
+```
+
+Để cho phép inline script mà không dùng `'unsafe-inline'`, dùng **nonce** (ngẫu nhiên mỗi phản hồi, gắn trên từng `<script>`) hoặc **hash** nội dung script chính xác:
+
+```html
+<!-- Header: script-src 'nonce-abc123' -->
+<script nonce="abc123">
+  initApp(); // allowed — nonce matches
+</script>
+<script>
+  evil(); // blocked — no nonce
+</script>
+```
+
+Chế độ **Report-Only** (`Content-Security-Policy-Report-Only`) ghi log vi phạm mà không chặn — lý tưởng khi triển khai dần. Vi phạm có thể POST tới endpoint `report-uri` / `report-to`.
+
+> CSP không thay thế escape input user, nhưng là **tuyến phòng thứ hai** tốt nhất khi XSS lọt qua. Kết hợp với `script-src` nghiêm và tránh `'unsafe-eval'` trừ khi thật sự cần.
+
+---
+
+## 5. Bảo vệ cookie: HttpOnly, Secure, SameSite
+
+Cookie (Phần 10) mang token phiên — mục tiêu hàng đầu cho đánh cắp và giả mạo. Ba cờ quan trọng nhất:
+
+| Flag | Tác dụng |
+|------|---------------------|
+| **HttpOnly** | JS không đọc cookie (`document.cookie`) — giảm đánh cắp token qua XSS |
+| **Secure** | Cookie chỉ gửi qua HTTPS |
+| **SameSite** | Kiểm soát gửi cross-site: `Strict` (không bao giờ trên điều hướng cross-site), `Lax` (chỉ GET top-level), `None` (luôn — cần `Secure`) |
+
+```http
+Set-Cookie: session=abc123; Path=/; HttpOnly; Secure; SameSite=Lax
+```
+
+**SameSite=Lax** (mặc định hiện đại) chặn hầu hết CSRF: site độc không thể POST kèm session cookie của bạn. Nhúng cross-site cần cookie (vd iframe thanh toán) phải khai báo `SameSite=None; Secure` rõ ràng.
+
+HttpOnly chặn **đọc** token từ JS; không chặn trình duyệt **gửi** nó trên request — nên vẫn cần phòng CSRF (SameSite, CSRF token, double-submit cookie).
+
+---
+
+## 6. Sandbox, Site Isolation, và ranh giới tiến trình
+
+Nhắc Phần 1: mỗi **tiến trình renderer** chạy với quyền HĐH tối thiểu — không truy cập filesystem hay socket trực tiếp. Thao tác đặc quyền đi qua IPC tới tiến trình browser đáng tin.
+
+**Site Isolation** đi xa hơn: tài liệu từ **site** khác nhau (scheme + eTLD+1) chạy ở **tiến trình renderer riêng**, kể cả khi một cái là iframe trong cái kia. Đây là phòng thủ nhiều lớp chống tấn công **kiểu Spectre** khi JS đọc bộ nhớ không được phép — dù logic SOP hỏng, byte nhạy cảm có thể nằm hẳn tiến trình khác.
+
+```text
+Before Site Isolation          After Site Isolation
+─────────────────────          ────────────────────
+Tab: bank.com                  Tab: bank.com  → Renderer A
+  └─ iframe: evil.com              └─ iframe: evil.com → Renderer B (OOPIF)
+     (same process ✗)                 (separate process ✓)
+```
+
+Thuộc tính **`sandbox`** trên `<iframe>` hạn chế thêm việc nội dung nhúng làm — không form, không script, không điều hướng top, v.v., tùy token bạn bỏ qua:
+
+```html
+<!-- Heavily restricted embed -->
+<iframe
+  src="https://untrusted.example/widget"
+  sandbox="allow-scripts allow-same-origin"
+></iframe>
+```
+
+Bỏ `allow-same-origin` cho iframe origin riêng; bỏ `allow-scripts` chặn JS hoàn toàn. Coi `sandbox` như **danh sách capability** — chỉ cấp thứ embed thật sự cần.
+
+---
+
+## 7. Cô lập cross-origin, HTTPS, và mixed content
+
+Một số API mạnh (`SharedArrayBuffer`, timer độ phân giải cao, `performance.measureUserAgentSpecificMemory`) cần **cross-origin isolation** — trang cô lập khỏi tài liệu cross-origin theo cách khiến khai thác Spectre khó thực tế. Bật bằng hai header:
+
+```http
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+Cùng CORP/COEP trên tài nguyên nhúng, trang có `crossOriginIsolated === true` trong JS. **COOP** cô lập nhóm browsing context; **COEP** yêu cầu quyền rõ (`Cross-Origin-Resource-Policy`) cho tài nguyên cross-origin bạn nhúng.
+
+Ở tầng vận chuyển, **HTTPS** cung cấp mã hóa và toàn vẹn. Trình duyệt **chặn mixed content**: trang HTTPS không được nạp subresource HTTP active (script, XHR) — nội dung passive (ảnh) có thể bị chặn hoặc nâng cấp tùy chính sách. Header **`Upgrade-Insecure-Requests`** và HSTS (`Strict-Transport-Security`) đẩy site về luôn-HTTPS.
+
+> Lỗi bảo mật trong DevTools thường truy về stack này: SOP chặn đọc, thiếu header CORS, CSP chặn inline script, hoặc mixed content bị nâng cấp/chặn. Ánh triệu chứng vào lớp trước khi nới chính sách một cách mù quáng.
+
+---
+
+## 8. Phòng thủ nhiều lớp: các lớp kết hợp thế nào
+
+Hãy coi bảo mật như các vòng đồng tâm — hỏng một lớp không nên sập toàn bộ:
+
+```text
+Attacker injects script via XSS
+        │
+        ▼
+   CSP script-src        → block if not allowlisted (may stop execution)
+        │ (if bypassed)
+        ▼
+   HttpOnly cookies      → script cannot exfiltrate session token via document.cookie
+        │ (if token leaked another way)
+        ▼
+   SameSite cookies      → cross-site requests don't carry session
+        │ (if same-site XSS)
+        ▼
+   SOP                   → script cannot read other origins' data
+        │ (if Spectre in same process)
+        ▼
+   Site Isolation        → sensitive origin's memory in another process
+        │ (if renderer compromised)
+        ▼
+   OS sandbox            → no direct filesystem/network; must IPC to browser process
+```
+
+Là developer, bạn kiểm soát CSP, cờ cookie, và `sandbox` iframe. Backend kiểm soát CORS và `Set-Cookie`. Trình duyệt enforce SOP, Site Isolation, và sandbox bất kể. **Mặc định an toàn + opt-in rõ ràng** là pattern khắp nơi — SOP chặn trừ khi CORS cho phép; CSP chặn trừ khi allowlist; sandbox chặn trừ khi cấp token.
+
+---
+
+## Tóm tắt
+
+- Trình duyệt chạy **code không đáng tin** cạnh dữ liệu nhạy cảm; bảo mật là **giam giữ**, không phải tin tưởng.
+- **Same-Origin Policy** là mặc định: không đọc cross-origin từ JS; nhúng và gửi form thường vẫn được phép.
+- **CORS** cho server opt-in đọc cross-origin qua header `Access-Control-*`; request đơn giản vs **preflight**; credentials cần ghép cặp rõ — CORS nới SOP, không bảo vệ server khỏi client ngoài trình duyệt.
+- **CSP** hạn chế nguồn script/style/tải để giảm XSS; dùng **nonce/hash** thay `'unsafe-inline'`; **Report-Only** để triển khai an toàn.
+- Cookie **HttpOnly**, **Secure**, và **SameSite** giảm đánh cắp token và CSRF.
+- **Sandbox + Site Isolation** (Phần 1) cùng **iframe sandbox**, **COOP/COEP**, và quy tắc **HTTPS/mixed-content** tạo phòng thủ nhiều lớp chống lộ bộ nhớ và thoát sandbox.
+
+**Phần tiếp theo:** Capstone — biến toàn bộ series thành quy trình thực tế đọc trace Performance DevTools và ánh triệu chứng vào nguyên nhân gốc.

@@ -1,0 +1,122 @@
+---
+title: 'How Browsers Work · Part 14 — Scrolling Internals'
+description: 'Vì sao cuộn thường mượt kể cả khi JS bận: compositor scrolling, main-thread scrolling, passive listeners, scroll anchoring, và cơ chế của scroll-linked effects.'
+pubDate: 2026-10-31
+tags: [browser, internals, scrolling, performance, browser_internals_12]
+series: browser-internals
+seriesOrder: 14
+draft: true
+---
+
+Cuộn là tương tác phổ biến nhất trên web, và nó là minh hoạ hoàn hảo cho kiến trúc đa luồng từ Phần 13. Câu hỏi trung tâm: vì sao trang vẫn cuộn mượt ngay cả khi luồng chính đang kẹt chạy JS? Câu trả lời nằm ở chỗ cuộn — như transform/opacity — có thể sống hoàn toàn trên **compositor thread**.
+
+---
+
+## 1. Compositor scrolling (đường nhanh)
+
+Mặc định, cuộn là **fast path**: compositor thread xử lý trực tiếp, không cần luồng chính.
+
+```text
+Người dùng lăn chuột
+      │
+      ▼
+Compositor thread ── dịch chuyển layer/tile sẵn có ──► GPU composite ──► màn hình
+(luồng chính có thể đang bận chạy JS — không ảnh hưởng)
+```
+
+Compositor đã có sẵn các tile đã raster của trang. Cuộn chỉ là đổi **offset** rồi ghép lại — y hệt animate transform. Vì thế cuộn mượt 60/120fps độc lập với JS. Khi cuộn tới vùng chưa raster, compositor giao tile mới cho raster threads (đôi khi thấy checkerboard nếu không kịp — Phần 13).
+
+---
+
+## 2. Main-thread scrolling (đường chậm)
+
+Có những thứ buộc cuộn rớt về **luồng chính** — gọi là *main-thread scrolling*. Khi đó mỗi khung cuộn phải đợi luồng chính, nên JS nặng làm cuộn giật.
+
+Nguyên nhân thường gặp:
+
+- **Non-passive `wheel`/`touchstart` listener**: trình duyệt phải hỏi luồng chính "bạn có gọi `preventDefault()` không?" *trước khi* cuộn → không thể cuộn trên compositor.
+- `background-attachment: fixed` (phải vẽ lại khi cuộn).
+- Một số hiệu ứng phụ thuộc vị trí cuộn cần luồng chính.
+
+```text
+wheel listener KHÔNG passive
+      │
+      ▼
+Compositor: "đợi đã, main thread có preventDefault không?"
+      │ (round-trip)
+      ▼
+Main thread (đang bận?) ──► trả lời ──► mới cuộn được  ← giật
+```
+
+---
+
+## 3. Passive listeners — mở khoá đường nhanh
+
+Vì trình duyệt không biết trước listener có gọi `preventDefault()` hay không, nó phải chờ. **Passive listener** là lời hứa "tôi sẽ không `preventDefault()`", cho phép compositor cuộn ngay.
+
+```js
+// Hứa không chặn cuộn → compositor cuộn ngay, không round-trip
+window.addEventListener('wheel', onWheel, { passive: true });
+window.addEventListener('touchstart', onTouch, { passive: true });
+```
+
+Trình duyệt hiện đại mặc định `passive: true` cho `wheel`/`touchstart`/`touchmove` ở cấp document để bảo vệ hiệu năng cuộn. Nếu bạn *thật sự* cần chặn (vd vẽ canvas, custom gesture), khai báo `{ passive: false }` — nhưng hiểu rằng nó đẩy cuộn về luồng chính.
+
+> Gọi `preventDefault()` trong một passive listener sẽ bị bỏ qua và cảnh báo trong console.
+
+---
+
+## 4. Scroll anchoring — chống "nhảy" layout
+
+Bạn đang đọc giữa trang, một ảnh phía trên load xong và đẩy nội dung xuống — nhưng vị trí đọc *không* nhảy. Đó là **scroll anchoring**: trình duyệt chọn một phần tử neo trong viewport và điều chỉnh offset cuộn để giữ nó đứng yên khi nội dung phía trên thay đổi chiều cao.
+
+```text
+Trước: [ảnh đang load]      Sau khi ảnh load (cao thêm 200px)
+       ▼ bạn đang đọc       trình duyệt +200px offset
+       đoạn văn  ───────►   đoạn văn  ← vẫn đứng yên
+```
+
+Tắt khi cần bằng `overflow-anchor: none`. Lưu ý: scroll anchoring giảm layout shift *do cuộn*, nhưng CLS (Core Web Vitals) vẫn tính các dịch chuyển không mong muốn khác — hai thứ khác nhau.
+
+---
+
+## 5. Scroll-linked effects — làm đúng cách
+
+"Scroll-linked effect" là hiệu ứng chạy theo vị trí cuộn (parallax, thanh tiến trình đọc, header thu nhỏ). Làm sai (đọc `scrollY` trong listener rồi set style) gây giật vì:
+
+1. Listener chạy trên luồng chính (đẩy cuộn về đường chậm nếu non-passive).
+2. Đọc `scrollY` rồi ghi style → forced reflow (Phần 5).
+
+**Cách cũ (dễ giật):**
+
+```js
+window.addEventListener('scroll', () => {
+  const y = window.scrollY;          // đọc
+  el.style.transform = `translateY(${y * 0.5}px)`; // ghi → có thể reflow
+});
+```
+
+**Cách mới — scroll-driven animations (CSS, chạy off-main-thread):**
+
+```css
+/* Hiệu ứng gắn thẳng vào tiến trình cuộn, compositor lo — không cần JS */
+.progress {
+  animation: grow linear;
+  animation-timeline: scroll(root block);
+}
+@keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+```
+
+`animation-timeline: scroll()` / `view()` cho phép trình duyệt chạy hiệu ứng theo cuộn ở tầng compositor, không round-trip luồng chính. Nếu buộc dùng JS, dùng `IntersectionObserver` (cho mốc xuất hiện) hoặc đọc trong `requestAnimationFrame` thay vì trong scroll listener.
+
+---
+
+## 6. Tóm tắt
+
+- Cuộn mặc định là **fast path** trên compositor thread: chỉ đổi offset rồi composite, mượt độc lập với JS bận.
+- **Main-thread scrolling** (đường chậm) bị kích hoạt bởi non-passive `wheel`/`touch` listener, `background-attachment: fixed`,… → cuộn phụ thuộc luồng chính.
+- **Passive listeners** (`{ passive: true }`) hứa không `preventDefault()`, mở khoá cuộn off-main-thread; trình duyệt mặc định passive cho touch/wheel ở document.
+- **Scroll anchoring** giữ vị trí đọc khi nội dung phía trên đổi chiều cao; tắt bằng `overflow-anchor: none`.
+- **Scroll-linked effects** nên dùng CSS `animation-timeline: scroll()/view()` để chạy off-main-thread; tránh đọc `scrollY` + ghi style trong scroll listener (forced reflow + giật).
+
+**Phần tiếp theo:** Rendering scheduling & frame lifecycle — chính xác điều gì xảy ra trong một khung 16.6ms, thứ tự `requestAnimationFrame`/style/layout/paint, và cách `content-visibility` cùng `requestIdleCallback` xếp việc vào đúng khe thời gian.

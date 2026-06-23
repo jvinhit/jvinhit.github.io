@@ -1,0 +1,168 @@
+---
+title: 'Service Workers · Phần 18 — Bảo mật service worker'
+description: 'Vì sao SW cần HTTPS và scope quan trọng, những gì tuyệt đối không được cache (Authorization, PII), toàn vẹn nội dung và CSP cho SW, rủi ro chuỗi cung ứng, và cách tránh cache poisoning biến SW thành lỗ hổng.'
+pubDate: 2026-07-25
+tags: [service-worker, security, csp, https, service_workers_10]
+series: service-workers
+seriesOrder: 18
+draft: false
+---
+
+Service worker là đoạn code mạnh nhất bạn deploy lên trình duyệt người dùng: nó **chặn mọi request**, **sống lâu hơn tab**, và **cache mọi thứ**. Sức mạnh đó cũng là bề mặt tấn công: một SW viết ẩu có thể rò token, phục vụ nội dung độc đã cache, hay biến một XSS nhất thời thành thường trú. Phần này là "tư duy bảo mật" cho service worker — thứ hay bị bỏ qua cho tới khi có sự cố.
+
+---
+
+## 1. HTTPS không phải tuỳ chọn
+
+Service worker **chỉ** đăng ký được trên HTTPS (ngoại lệ duy nhất: `localhost` khi dev). Lý do đúng về bản chất: SW là man-in-the-middle *hợp pháp* cho chính origin của bạn. Nếu cho phép trên HTTP, một kẻ tấn công trên cùng mạng (Wi-Fi quán cà phê) có thể tiêm một SW độc, và nó sẽ **thường trú** — chặn request mãi mãi, kể cả sau khi bạn rời mạng đó.
+
+HTTPS đảm bảo SW bạn nhận đúng là SW server gửi. Đây là tuyến phòng thủ đầu tiên và không thể thương lượng.
+
+---
+
+## 2. Scope — đừng cấp quyền rộng hơn cần
+
+SW chỉ điều khiển các trang trong **scope** của nó (mặc định = thư mục chứa file SW). `/sw.js` ở gốc kiểm soát toàn site; `/app/sw.js` chỉ kiểm soát `/app/`.
+
+```js
+// Giới hạn scope hẹp nếu SW chỉ cần phục vụ một phần site
+navigator.serviceWorker.register('/app/sw.js', { scope: '/app/' });
+```
+
+Nguyên tắc least-privilege: nếu chỉ phần `/app/` cần offline, đừng đặt SW ở gốc kiểm soát cả site. Header `Service-Worker-Allowed` cho phép mở rộng scope vượt thư mục, nhưng dùng dè dặt — scope rộng = nhiều thứ có thể hỏng nếu SW lỗi.
+
+> Trên hosting dùng chung (nhiều app cùng origin), scope rộng nguy hiểm: SW của app A có thể chặn request của app B. Tách origin (subdomain) hoặc giới hạn scope chặt.
+
+---
+
+## 3. TUYỆT ĐỐI không cache dữ liệu nhạy cảm
+
+Đây là lỗi nghiêm trọng nhất. Cache API **lưu cả response lẫn header**. Nếu bạn vô tình cache một response chứa `Authorization`, cookie nhạy cảm, hay PII, nó nằm trong Cache Storage — đọc được bằng JS bất kỳ trong origin (kể cả XSS), và tồn tại qua các phiên.
+
+```js
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+
+  // KHÔNG cache endpoint nhạy cảm.
+  if (url.pathname.startsWith('/api/me') || url.pathname.startsWith('/api/payment')) {
+    return; // để request đi thẳng mạng, không đụng cache
+  }
+
+  // KHÔNG cache request có credentials/Authorization header.
+  if (event.request.headers.has('Authorization')) return;
+
+  // ... caching cho tài nguyên công khai ...
+});
+```
+
+Quy tắc: **chỉ cache thứ công khai** (asset, ảnh, nội dung không nhạy cảm). Dữ liệu cá nhân hoá hoặc cần auth thì network-only, hoặc nếu phải cache thì cache trong IndexedDB *đã mã hoá* và xoá khi logout.
+
+---
+
+## 4. Dọn sạch khi logout
+
+Cache và IndexedDB **sống qua phiên đăng nhập**. Khi user logout, dữ liệu của họ vẫn nằm đó cho user tiếp theo trên cùng máy. Phải dọn:
+
+```js
+// trang, khi logout — ra lệnh SW dọn
+navigator.serviceWorker.controller?.postMessage({ type: 'PURGE_USER_DATA' });
+```
+
+```js
+// sw.js
+self.addEventListener('message', (event) => {
+  if (event.data?.type === 'PURGE_USER_DATA') {
+    event.waitUntil(
+      (async () => {
+        await caches.delete('api');       // cache response API
+        await caches.delete('user-data');
+        await clearUserIndexedDB();       // xoá IndexedDB chứa data user
+      })(),
+    );
+  }
+});
+```
+
+Trên máy dùng chung (thư viện, quán net), bỏ qua bước này là rò rỉ dữ liệu cá nhân giữa các người dùng.
+
+---
+
+## 5. Cache poisoning — biến XSS nhất thời thành thường trú
+
+Kịch bản đáng sợ: site bị một XSS nhất thời. Bình thường XSS hết khi reload. Nhưng nếu kẻ tấn công dùng XSS đó để **ghi một response độc vào Cache** (hoặc đăng ký một SW độc), nội dung độc sẽ được phục vụ **mãi mãi** từ cache — kể cả sau khi lỗ hổng XSS gốc đã vá. SW khuếch đại tác hại của XSS từ "một lần" thành "thường trú".
+
+Phòng vệ:
+
+- **CSP mạnh** (Phần 13 của series Web Security) để chặn XSS từ đầu — gốc rễ vấn đề.
+- **Chỉ cache response cùng origin / từ nguồn tin cậy**; validate `response.ok` và `response.type` trước khi `cache.put`.
+- **Đừng cache response opaque** một cách mù quáng (Phần 6) — bạn không đọc được nội dung/status của nó.
+- Có **kill switch** (Phần 12) để xoá cache độc khẩn cấp.
+
+---
+
+## 6. CSP và file service worker
+
+Bản thân `sw.js` thực thi trong worker context với CSP riêng. Vài lưu ý:
+
+- Chỉ thị `worker-src`/`script-src` trong CSP kiểm soát việc đăng ký SW. Đảm bảo `sw.js` đến từ origin của bạn (`'self'`).
+- Trong SW, tránh `importScripts()` từ CDN bên thứ ba không kiểm soát — đó là code chạy với toàn quyền chặn request của bạn. Nếu phải, ghim phiên bản và xác minh tính toàn vẹn.
+- `eval`/`new Function` trong SW cũng nguy hiểm như trong trang — đừng dùng (đúng prohibition của dự án).
+
+---
+
+## 7. Chuỗi cung ứng: Workbox & dependency
+
+Nếu dùng Workbox (Phần 9) hay bất kỳ thư viện SW nào, chúng chạy với toàn quyền của SW. Rủi ro chuỗi cung ứng (Phần series Package Managers): một bản cập nhật độc của thư viện SW có thể chèn logic chặn/đánh cắp request.
+
+- Ghim phiên bản (lockfile), review changelog trước khi nâng.
+- Build SW từ source bạn kiểm soát (Workbox `injectManifest`) thay vì nạp runtime từ CDN.
+- Giới hạn số dependency chạy *bên trong* SW — càng ít càng tốt.
+
+---
+
+## 8. Bài tập
+
+**1.** Vì sao service worker bắt buộc HTTPS (trừ localhost)?
+
+<details>
+<summary>Lời giải</summary>
+
+SW là một man-in-the-middle hợp pháp cho origin: nó chặn mọi request và thường trú. Trên HTTP, kẻ tấn công cùng mạng có thể tiêm một SW độc tồn tại lâu dài, chặn request mãi kể cả sau khi rời mạng. HTTPS đảm bảo SW nhận được đúng là SW server gửi — điều kiện tiên quyết cho an toàn.
+
+</details>
+
+**2.** Vì sao cache dữ liệu có `Authorization`/PII là lỗi nghiêm trọng, và xử lý thế nào?
+
+<details>
+<summary>Lời giải</summary>
+
+Cache API lưu cả response lẫn header vào Cache Storage — đọc được bởi JS bất kỳ trong origin (kể cả XSS) và tồn tại qua phiên/người dùng trên cùng máy. Chỉ cache thứ công khai; bỏ qua endpoint nhạy cảm và request có `Authorization`; dọn cache + IndexedDB khi logout.
+
+</details>
+
+**3.** Service worker khuếch đại tác hại của một XSS nhất thời như thế nào?
+
+<details>
+<summary>Lời giải</summary>
+
+XSS nhất thời thường hết khi reload. Nhưng nếu kẻ tấn công dùng nó để ghi response độc vào Cache hoặc đăng ký SW độc, nội dung độc được phục vụ *thường trú* từ cache kể cả sau khi vá XSS gốc. Phòng vệ: CSP mạnh (chặn XSS từ gốc), chỉ cache nguồn tin cậy/cùng origin, validate trước khi `cache.put`, và có kill switch.
+
+</details>
+
+**Nâng cao:** Rà fetch handler của bạn: liệt kê mọi đường dẫn được cache và xác nhận không có endpoint auth/PII nào lọt vào. Thêm handler `PURGE_USER_DATA` chạy lúc logout và kiểm tra Cache Storage + IndexedDB trống sau khi đăng xuất.
+
+---
+
+## Tóm tắt
+
+- **HTTPS bắt buộc** (trừ localhost): SW là MITM hợp pháp, thường trú — HTTP cho phép tiêm SW độc.
+- **Scope least-privilege**: đặt SW hẹp nhất có thể; cẩn thận `Service-Worker-Allowed` và hosting dùng chung.
+- **Không cache** `Authorization`/PII/endpoint nhạy cảm; chỉ cache nội dung công khai; **dọn cache + IndexedDB khi logout**.
+- **Cache poisoning** biến XSS nhất thời thành thường trú — chống bằng CSP mạnh, validate trước `cache.put`, kill switch.
+- File SW: tránh `importScripts` từ CDN không kiểm soát, không `eval`; chuỗi cung ứng — ghim phiên bản, build từ source, ít dependency.
+
+---
+
+## Phần tiếp theo
+
+**Phần 19 — Hiệu năng & gỡ lỗi chuyên sâu:** chi phí khởi động SW và cái bẫy "fetch handler rỗng làm chậm mọi request", ngân sách precache, gộp request trùng (coalescing), tận dụng asset immutable, và bộ công cụ đo lường SW trong DevTools.

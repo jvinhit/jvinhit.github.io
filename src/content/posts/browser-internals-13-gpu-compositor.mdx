@@ -1,0 +1,125 @@
+---
+title: 'How Browsers Work · Part 13 — GPU & the Compositor: Raster, Tiles & Layers'
+description: 'Đi sâu vào nửa sau pipeline render: compositor thread, layerization, chia tile và raster, GPU process & Viz, và vì sao transform/opacity mượt ở tận tầng phần cứng.'
+pubDate: 2026-10-29
+tags: [browser, internals, compositing, gpu, browser_internals_12]
+series: browser-internals
+seriesOrder: 13
+draft: true
+---
+
+Phần 5 dừng ở "composite layer". Mười phần chuyên sâu này mở từng hộp đen còn lại — bắt đầu bằng nửa sau của pipeline render, nơi lệnh paint biến thành pixel trên màn hình. Đây là lãnh địa của **compositor thread** và **GPU process**, và hiểu nó giải thích vì sao một số animation mượt 60fps còn số khác giật, dù nhìn code "giống nhau".
+
+Sự thật cốt lõi từ Phần 1 quay lại ở đây: luồng chính ghi *lệnh paint*, nhưng việc biến chúng thành bitmap và ghép lên màn hình diễn ra **ngoài** luồng chính. Đó là lý do tồn tại của cả phần này.
+
+---
+
+## 1. Layer — vì sao trang được chia tầng
+
+Trình duyệt không vẽ cả trang thành một ảnh phẳng. Nó chia trang thành **compositing layers** — các lớp độc lập có thể được vẽ và di chuyển riêng. Hình dung như các tấm kính trong suốt xếp chồng.
+
+Một phần tử được "thăng" thành layer riêng khi có dấu hiệu nó sẽ thay đổi độc lập:
+
+- `transform` hoặc `opacity` đang animate
+- `will-change: transform/opacity`
+- `<video>`, `<canvas>`, phần tử 3D (`transform: translateZ(0)`)
+- `position: fixed`/`sticky` trong vài trường hợp
+
+Lợi ích: nếu một layer chỉ *di chuyển* (transform) hay *mờ đi* (opacity), compositor ghép lại các layer cũ ở vị trí mới — **không cần vẽ lại** gì cả.
+
+```text
+Trang  ──► layerize ──►  Layer 0 (nội dung tĩnh)
+                         Layer 1 (modal đang fade — opacity)
+                         Layer 2 (sidebar đang trượt — transform)
+                              │
+                  compositor ghép lại → 1 ảnh cuối
+```
+
+---
+
+## 2. Tiling — chia layer thành ô
+
+Một layer có thể rất lớn (trang cuộn dài hàng chục nghìn px). Vẽ toàn bộ là phí. Compositor chia mỗi layer thành **tiles** (thường 256×256 hoặc 512×512px) và chỉ raster những tile **gần viewport**.
+
+```text
+Layer (cao 20000px)        Chỉ raster tile quanh viewport
+┌──────────┐               ┌──────────┐
+│ tile     │               │░░░░░░░░░░│ ← chưa raster
+│ tile     │   tiling →     │██████████│ ← viewport (raster)
+│ tile     │               │██████████│ ← + vùng đệm
+│ ...      │               │░░░░░░░░░░│
+└──────────┘               └──────────┘
+```
+
+Đây là lý do cuộn nhanh tới vùng chưa raster đôi khi thấy **checkerboard** (ô trắng) chớp một nhịp trước khi nội dung xuất hiện — tile chưa kịp raster.
+
+---
+
+## 3. Raster — biến lệnh paint thành bitmap
+
+**Raster** là quá trình thực thi danh sách lệnh paint (vẽ chữ nhật này, text kia, ảnh nọ) để tạo ra **bitmap** (mảng pixel) cho mỗi tile. Raster chạy trên **raster threads**, thường được tăng tốc bằng GPU.
+
+```text
+Paint records (lệnh)         Raster              Bitmap (pixel)
+"fillRect #fff"      ──►   raster thread   ──►   [pixel...]
+"drawText 'Hi'"            (GPU-accelerated)     mỗi tile một ảnh
+```
+
+Điểm quan trọng: **raster ≠ paint**. "Paint" (Phần 5) là *ghi lệnh* trên luồng chính; "raster" là *thực thi lệnh thành pixel* ngoài luồng chính. Tách hai bước cho phép raster song song và dùng GPU.
+
+---
+
+## 4. Compositor thread — người điều phối
+
+Compositor thread là ngôi sao của phần này. Nó:
+
+1. Nhận **layer tree** + paint records từ luồng chính (sau commit).
+2. Quyết định tile nào cần raster (theo viewport), giao cho raster threads.
+3. Khi có bitmap, tạo **draw quads** (lệnh "đặt tile này tại toạ độ kia") gửi cho GPU.
+4. Có thể tự xử lý **scroll** và **animation transform/opacity** mà *không* đánh thức luồng chính.
+
+Bước 4 là siêu năng lực: khi bạn cuộn hoặc animate transform, compositor thread di chuyển layer/tile có sẵn — luồng chính có thể đang bận chạy JS mà animation vẫn mượt.
+
+```text
+Main thread          Compositor thread        GPU process (Viz)
+style→layout→paint ─commit─► layer tree
+(record lệnh)               ├─ chọn tile → raster threads → bitmap
+                            └─ draw quads ──────────────► composite → màn hình
+```
+
+---
+
+## 5. GPU process & Viz — vẽ ra màn hình thật
+
+Compositor thread không nói chuyện trực tiếp với phần cứng. Nó gửi draw quads tới **GPU process** (Phần 1), nơi component **Viz** (display compositor) gom draw quads của *mọi* renderer + UI trình duyệt thành một khung hình cuối và đẩy lên màn hình theo nhịp **VSync** (thường 60Hz).
+
+Vì sao tách GPU ra process riêng: driver GPU dễ crash và là bề mặt tấn công; cô lập nó giữ renderer (và trình duyệt) sống sót khi driver lỗi.
+
+---
+
+## 6. Vì sao transform/opacity "rẻ" ở tầng phần cứng
+
+Giờ ta thấy lý do *thật sự*, không chỉ "compositor lo":
+
+| Thay đổi | Cần làm lại |
+|---|---|
+| Đổi `width`/`top`/`left` | **Layout** lại (Phần 5) → paint → raster → composite — đắt |
+| Đổi `color`/`background` | **Paint** lại → raster → composite — vừa |
+| Đổi `transform`/`opacity` của layer | **Chỉ composite** — compositor đổi ma trận biến đổi của layer đã raster sẵn, GPU ghép lại — rẻ |
+
+`transform`/`opacity` chỉ đổi *cách ghép* một bitmap đã có — không vẽ lại pixel nào. GPU làm phép biến đổi ma trận trên layer cực nhanh. Đó là nền tảng phần cứng của lời khuyên "chỉ animate transform và opacity".
+
+> Cạm bẫy: thăng quá nhiều layer (`will-change` tràn lan) tốn bộ nhớ GPU và thời gian composite. Mỗi layer là một bitmap trong VRAM. "Layer explosion" có thể làm chậm thay vì nhanh — chỉ thăng phần tử thật sự animate.
+
+---
+
+## 7. Tóm tắt
+
+- Trang được chia thành **compositing layers** (các "tấm kính") để di chuyển/mờ độc lập mà không vẽ lại.
+- Mỗi layer chia thành **tiles**; chỉ tile gần viewport được raster (cuộn quá nhanh → checkerboard).
+- **Raster** biến lệnh paint thành bitmap trên raster threads (GPU-accelerated) — khác với "paint" (ghi lệnh trên luồng chính).
+- **Compositor thread** điều phối tile/raster/draw quads và tự xử lý scroll + transform/opacity animation **không cần luồng chính**.
+- **GPU process/Viz** gom draw quads thành khung hình cuối, đẩy lên màn hình theo VSync.
+- `transform`/`opacity` rẻ vì chỉ đổi cách ghép bitmap có sẵn (phép ma trận GPU); nhưng đừng thăng quá nhiều layer (tốn VRAM).
+
+**Phần tiếp theo:** Scrolling internals — vì sao cuộn thường chạy trên compositor thread (mượt kể cả khi JS bận), khi nào nó rớt về luồng chính, và cơ chế của passive listeners, scroll anchoring và scroll-linked effects.

@@ -1,0 +1,188 @@
+---
+title: 'Service Workers · Phần 19 — Hiệu năng & gỡ lỗi chuyên sâu'
+description: 'Chi phí khởi động service worker, cái bẫy fetch handler rỗng làm chậm mọi request, ngân sách precache, gộp request trùng (coalescing), tận dụng asset immutable, và bộ công cụ đo lường SW trong DevTools.'
+pubDate: 2026-07-27
+tags: [service-worker, performance, debugging, devtools, service_workers_10]
+series: service-workers
+seriesOrder: 19
+draft: false
+---
+
+Service worker được kỳ vọng làm app *nhanh hơn* — nhưng viết sai, nó làm app *chậm hơn* một cách âm thầm. Phần 13 đã chạm chi phí khởi động qua Navigation Preload; phần này gom toàn bộ các cạm bẫy hiệu năng của SW và cách đo lường chúng, để bạn biết chắc SW đang giúp chứ không hại.
+
+Tinh thần xuyên suốt: **đo trước, đừng đoán**. SW chạy ở một luồng riêng, ngủ/thức bất thường, nên trực giác về hiệu năng dễ sai — DevTools là trọng tài.
+
+---
+
+## 1. Chi phí khởi động (startup cost)
+
+SW bị kill khi rảnh và phải boot lại trước mỗi đợt sự kiện. Boot gồm: tải file SW (thường từ disk cache), parse + compile JS, chạy toàn bộ code **top-level**. Hệ quả:
+
+- **Giữ file SW nhỏ**: mọi byte top-level đều chạy lại mỗi lần thức dậy.
+- **Đừng làm việc nặng ở top-level**: khởi tạo tốn kém (mở IndexedDB, tính toán lớn) nên hoãn vào trong handler, không chạy ngay khi SW load.
+
+```js
+// ❌ Chạy mỗi lần SW boot, kể cả khi không cần
+const db = await openHugeDatabase();
+const config = computeExpensiveConfig();
+
+// ✅ Hoãn — chỉ chạy khi handler thực sự cần
+let dbPromise;
+function getDb() {
+  return (dbPromise ??= openHugeDatabase());
+}
+```
+
+---
+
+## 2. Cái bẫy "fetch handler rỗng làm chậm MỌI request"
+
+Đây là cạm bẫy nổi tiếng nhất. Chỉ cần **có** một `fetch` listener, trình duyệt phải khởi động SW (nếu đang ngủ) và cho request đi qua nó — **kể cả khi handler không làm gì**:
+
+```js
+// ❌ Phản tác dụng: thêm độ trễ boot SW cho mọi request mà không có lợi ích gì
+self.addEventListener('fetch', () => {});
+```
+
+Nếu một request bạn không định xử lý, hãy **return sớm** để trình duyệt đi đường mạng mặc định (nhanh hơn việc SW tự `fetch` lại):
+
+```js
+self.addEventListener('fetch', (event) => {
+  // Chỉ chen vào những request bạn THỰC SỰ muốn cache/biến đổi.
+  if (!shouldHandle(event.request)) return; // KHÔNG gọi respondWith → trình duyệt tự lo
+  event.respondWith(handle(event.request));
+});
+```
+
+> Khi bạn **không** gọi `event.respondWith()`, trình duyệt thực hiện fetch mặc định — thường tối ưu hơn việc SW gọi `fetch()` rồi trả lại. Chỉ `respondWith` khi bạn có lý do (cache, biến đổi, offline).
+
+---
+
+## 3. Đừng biến `await` thành tuần tự khi có thể song song
+
+Trong handler, gom các thao tác độc lập bằng `Promise.all` thay vì await nối tiếp:
+
+```js
+// ❌ tuần tự
+const cache = await caches.open('v1');
+const cached = await cache.match(req);
+const fresh = await fetch(req);
+
+// ✅ mở cache và bắt đầu mạng song song
+const [cache, fresh] = await Promise.all([caches.open('v1'), fetch(req)]);
+```
+
+Chi tiết nhỏ nhưng cộng dồn trên mỗi request. Đặc biệt tránh `await` một việc không cần thiết *trước* khi gọi `respondWith` — nó trì hoãn cả response.
+
+---
+
+## 4. Request coalescing — gộp request trùng
+
+Nếu nhiều phần app cùng yêu cầu một tài nguyên gần như đồng thời (vd ba component cùng fetch `/api/config`), SW có thể **gộp** chúng vào một network request và chia sẻ kết quả:
+
+```js
+const inflight = new Map();
+
+function coalescedFetch(request) {
+  const key = request.url;
+  if (inflight.has(key)) return inflight.get(key).then((r) => r.clone());
+
+  const promise = fetch(request).finally(() => inflight.delete(key));
+  inflight.set(key, promise);
+  return promise.then((r) => r.clone()); // clone vì body đọc một lần
+}
+```
+
+Nhớ `clone()` cho mỗi consumer (response body chỉ đọc được một lần — Phần 3). Coalescing đặc biệt giá trị cho tài nguyên "nóng" mà nhiều nơi cùng cần lúc khởi động.
+
+---
+
+## 5. Ngân sách precache (precache budget)
+
+Precache (Phần 5, 9) nạp tài nguyên ngay lúc `install`. Precache **quá nhiều** làm install chậm và tốn quota ngay từ đầu — người dùng tải bộ asset khổng lồ dù chưa chắc dùng hết.
+
+- Precache chỉ **app shell tối thiểu** (HTML khung, CSS/JS critical, font, logo) để app mở offline.
+- Mọi thứ khác (ảnh nội dung, route phụ, data) dùng **runtime caching** (cache khi truy cập thật).
+- Đặt một "ngân sách": vd precache ≤ 1–2MB. Vượt là dấu hiệu nên chuyển sang runtime cache.
+
+Workbox cho biết kích thước precache manifest khi build — theo dõi nó như theo dõi bundle size.
+
+---
+
+## 6. Tận dụng asset immutable
+
+Asset có hash trong tên (Vite/webpack tạo sẵn) là **immutable**: nội dung không bao giờ đổi với tên đó. Đây là cấu hình cache-first lý tưởng:
+
+```js
+// Asset hash-hoá: cache-first vĩnh viễn, không cần revalidate
+if (/\.[0-9a-f]{8,}\.(js|css|woff2)$/.test(url.pathname)) {
+  event.respondWith(cacheFirst(event.request, 'assets'));
+}
+```
+
+Cache-first cho asset immutable nghĩa là sau lần đầu, chúng phục vụ từ cache **0ms, 0 byte mạng** — và an toàn vì tên đổi khi nội dung đổi (Phần 12). Đây là nguồn tăng tốc lớn nhất, đáng tin nhất của một SW tốt.
+
+---
+
+## 7. Bộ công cụ đo lường & gỡ lỗi
+
+| Công cụ | Dùng để |
+|---|---|
+| **Application → Service Workers** | Trạng thái, update, "Update on reload", "Bypass for network" (tắt SW tạm để so sánh) |
+| **Network → cột Size `(ServiceWorker)`** | Xác nhận request nào do SW phục vụ; thời gian từng request |
+| **Performance tab** | Ghi lại boot SW + fetch handler; throttle CPU 4–6x để thấy chi phí trên máy yếu |
+| **Application → Cache Storage** | Soi nội dung & kích thước cache |
+| **`chrome://serviceworker-internals`** | Trạng thái chi tiết, start/stop thủ công |
+| **Lighthouse** | Audit PWA + Performance toàn cục |
+
+Mẹo gỡ lỗi vàng: bật **"Bypass for network"** để chạy app *như không có SW*, rồi tắt đi để so sánh — phân biệt rõ vấn đề do SW hay do chỗ khác.
+
+---
+
+## 8. Bài tập
+
+**1.** Vì sao một `fetch` handler rỗng (`addEventListener('fetch', () => {})`) lại làm chậm mọi request?
+
+<details>
+<summary>Lời giải</summary>
+
+Chỉ cần *có* fetch listener, trình duyệt phải khởi động SW (nếu đang ngủ) và định tuyến request qua nó — kể cả khi handler không làm gì. Điều này thêm chi phí boot SW vào mọi request mà không đem lại lợi ích. Hãy `return` sớm cho request không xử lý (không gọi `respondWith`) để trình duyệt đi đường mạng mặc định.
+
+</details>
+
+**2.** Vì sao không gọi `respondWith` lại thường nhanh hơn `respondWith(fetch(request))`?
+
+<details>
+<summary>Lời giải</summary>
+
+Khi không gọi `respondWith`, trình duyệt thực hiện fetch mặc định bằng đường tối ưu nội bộ. Còn `respondWith(fetch(request))` bắt SW tự gọi `fetch` rồi chuyển response qua lại, thêm một lớp trung gian. Chỉ nên `respondWith` khi cần cache/biến đổi/offline — không phải để "chuyển tiếp" request y nguyên.
+
+</details>
+
+**3.** Vì sao asset hash-hoá là ứng viên hoàn hảo cho cache-first, và lợi ích là gì?
+
+<details>
+<summary>Lời giải</summary>
+
+Tên chứa hash nội dung nên file là immutable: nội dung đổi → tên đổi. Cache-first an toàn vĩnh viễn vì không bao giờ phục vụ nội dung cũ dưới tên cũ. Lợi ích: sau lần đầu, asset phục vụ từ cache gần như 0ms và 0 byte mạng — nguồn tăng tốc lớn và đáng tin nhất của SW.
+
+</details>
+
+**Nâng cao:** Mở Performance tab, throttle CPU 4x, ghi lại một lần load lạnh có SW. Tìm khối "boot service worker" và đo thời gian. Thử chuyển một thao tác nặng từ top-level vào lazy-init (mục 1), đo lại. Sau đó dùng "Bypass for network" để so sánh thời gian với/không SW.
+
+---
+
+## Tóm tắt
+
+- SW boot lại sau khi ngủ: **giữ file nhỏ**, **lazy-init** việc nặng thay vì chạy ở top-level.
+- **Fetch handler rỗng làm chậm mọi request**; `return` sớm cho request không xử lý (đừng gọi `respondWith`) để trình duyệt đi đường mặc định.
+- Song song hoá thao tác độc lập (`Promise.all`); tránh `await` thừa trước `respondWith`.
+- **Coalescing** gộp request trùng (nhớ `clone()`); **ngân sách precache** nhỏ (app shell), phần còn lại runtime cache.
+- **Asset immutable** (hash) → cache-first vĩnh viễn: 0ms/0 byte sau lần đầu — nguồn tăng tốc lớn nhất.
+- Đo bằng DevTools (Network `(ServiceWorker)`, Performance + CPU throttle, "Bypass for network" để so sánh).
+
+---
+
+## Phần tiếp theo
+
+**Phần 20 — Patterns nâng cao & tích hợp framework (Capstone 2):** service worker trong Next.js/Astro/Angular, runtime caching cho API có auth/token refresh, hàng đợi analytics offline, feature flag & kill switch cho SW, và quan trọng nhất — *khi nào KHÔNG nên dùng service worker*. Tổng kết toàn bộ 20 phần.

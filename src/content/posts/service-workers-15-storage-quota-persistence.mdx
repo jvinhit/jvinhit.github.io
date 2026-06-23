@@ -1,0 +1,210 @@
+---
+title: 'Service Workers · Phần 15 — Storage, quota & persistence'
+description: 'Đo và xin dung lượng bền với StorageManager (estimate, persist), hiểu chính sách eviction best-effort vs persistent, pattern dùng IndexedDB trong service worker, và dọn cache theo LRU để không vượt quota.'
+pubDate: 2026-07-19
+tags: [service-worker, storage, indexeddb, quota, service_workers_10]
+series: service-workers
+seriesOrder: 15
+draft: false
+---
+
+Một PWA offline-first sống nhờ dữ liệu lưu trên máy: cache tài nguyên, hàng đợi outbox (Phần 7), dữ liệu app. Nhưng storage trình duyệt **không vô hạn** và **có thể bị xoá** khi máy thiếu chỗ. Nếu không hiểu quota và eviction, một ngày người dùng mở app thấy mất sạch dữ liệu offline — và bạn không biết tại sao.
+
+Phần này đi sâu vào lớp storage dưới service worker: đo dung lượng, xin lưu trữ *bền*, và dọn dẹp chủ động để không bao giờ chạm trần.
+
+---
+
+## 1. Bức tranh storage của một origin
+
+Mọi storage của một origin (Cache API, IndexedDB, localStorage) chia sẻ **một bể quota** chung do trình duyệt cấp, thường tính theo % dung lượng đĩa còn trống (có thể hàng GB trên desktop, ít hơn trên mobile).
+
+Mặc định, storage của bạn là **best-effort**: trình duyệt được phép xoá nó khi máy thiếu chỗ ("storage pressure"), thường theo LRU — origin ít dùng nhất bị xoá trước. Đây là lý do dữ liệu offline có thể "bốc hơi".
+
+---
+
+## 2. `estimate()` — biết mình đang dùng bao nhiêu
+
+`navigator.storage.estimate()` cho biết quota và lượng đã dùng (chạy được cả trong trang lẫn trong SW):
+
+```js
+const { usage, quota } = await navigator.storage.estimate();
+const percent = ((usage / quota) * 100).toFixed(1);
+console.log(`Đang dùng ${(usage / 1e6).toFixed(1)}MB / ${(quota / 1e6).toFixed(0)}MB (${percent}%)`);
+
+// Một số trình duyệt trả usageDetails phân tách theo loại storage:
+const detailed = await navigator.storage.estimate();
+console.log(detailed.usageDetails); // { caches, indexedDB, ... } (nếu hỗ trợ)
+```
+
+Theo dõi `usage/quota` để chủ động dọn *trước khi* chạm trần (mục 6). Đừng đợi `QuotaExceededError` mới xử lý — lúc đó ghi đã fail.
+
+---
+
+## 3. `persist()` — xin lưu trữ bền
+
+`navigator.storage.persist()` xin trình duyệt **không** tự xoá storage của origin khi thiếu chỗ. Storage trở thành "persistent" — chỉ bị xoá khi *người dùng chủ động* xoá:
+
+```js
+async function requestPersistentStorage() {
+  if (!navigator.storage?.persist) return false;
+  const alreadyPersisted = await navigator.storage.persisted();
+  if (alreadyPersisted) return true;
+  const granted = await navigator.storage.persist();
+  return granted;
+}
+```
+
+Trình duyệt **không** luôn cấp. Tiêu chí (Chrome) thường dựa trên mức độ "gắn bó": app đã được cài (PWA), có mức tương tác cao, hoặc được bookmark. Vì vậy hãy xin *sau* khi người dùng đã dùng app một lúc, hoặc sau khi cài — đúng lúc bạn cũng nhắc cài (Phần 11).
+
+| | Best-effort (mặc định) | Persistent (đã `persist()`) |
+|---|---|---|
+| Bị xoá khi máy thiếu chỗ | Có (LRU) | Không |
+| Bị xoá khi user clear data | Có | Có |
+| Cách bật | Mặc định | `navigator.storage.persist()` được cấp |
+
+---
+
+## 4. IndexedDB trong service worker
+
+`localStorage` **không** dùng được trong SW (đồng bộ, không có trong worker scope). Lưu trữ có cấu trúc trong SW phải dùng **IndexedDB** (đã gặp ở Phần 7 với outbox). Vì IndexedDB API thô khá rườm, một wrapper mỏng giúp code SW gọn:
+
+```js
+// idb.js — dùng được cả trong SW lẫn trang (idb-keyval rất nhẹ)
+import { openDB } from 'idb';
+
+const dbPromise = openDB('app-db', 1, {
+  upgrade(db) {
+    db.createObjectStore('outbox', { keyPath: 'id', autoIncrement: true });
+    db.createObjectStore('kv');
+  },
+});
+
+export async function addToOutbox(req) {
+  return (await dbPromise).add('outbox', req);
+}
+export async function allOutbox() {
+  return (await dbPromise).getAll('outbox');
+}
+```
+
+> **Cẩn thận transaction trong SW:** transaction IndexedDB tự đóng khi vòng microtask "rỗng". Trong SW, đừng `await` một việc không liên quan (vd `fetch`) *giữa* lúc đang mở transaction — nó sẽ đóng transaction và ném `TransactionInactiveError`. Đọc/ghi IndexedDB xong rồi mới fetch, hoặc ngược lại.
+
+---
+
+## 5. Phân tách cache & versioning quota
+
+Chia cache theo *mục đích* để dọn có chọn lọc (nối tiếp Phần 6):
+
+```js
+const CACHE = {
+  shell: 'shell-v3',       // app shell — ít, đời dài
+  assets: 'assets-v3',     // JS/CSS hash — immutable
+  images: 'images-v3',     // ảnh — cần giới hạn số lượng
+  api: 'api-v3',           // response API — đời ngắn
+};
+```
+
+Mỗi nhóm có chính sách riêng: `shell`/`assets` giữ lâu (nhỏ, ổn định); `images`/`api` cần **giới hạn** vì chúng phình nhanh và là thủ phạm chính làm vượt quota.
+
+---
+
+## 6. Dọn cache theo LRU & giới hạn số lượng
+
+Cache API không tự giới hạn — bạn phải tự cắt. Pattern: sau mỗi lần `put`, nếu vượt giới hạn thì xoá entry **cũ nhất** (Cache API giữ thứ tự chèn, nên `keys()[0]` là cũ nhất):
+
+```js
+async function putWithLimit(cacheName, request, response, maxEntries) {
+  const cache = await caches.open(cacheName);
+  await cache.put(request, response);
+  const keys = await cache.keys();
+  if (keys.length > maxEntries) {
+    // Xoá các entry cũ nhất cho tới khi về giới hạn (FIFO ≈ LRU đơn giản).
+    const overflow = keys.length - maxEntries;
+    await Promise.all(keys.slice(0, overflow).map((k) => cache.delete(k)));
+  }
+}
+
+// Dùng cho ảnh:
+await putWithLimit(CACHE.images, request, response.clone(), 60);
+```
+
+Đây chính là điều `ExpirationPlugin` của Workbox làm (Phần 9): `maxEntries` + `maxAgeSeconds`. Nếu tự viết SW, bạn cần tự cắt; nếu dùng Workbox, khai báo plugin là xong.
+
+> **LRU "thật"** cần ghi lại thời điểm truy cập (trong IndexedDB) và xoá theo đó. FIFO theo thứ tự chèn ở trên là xấp xỉ đủ tốt cho phần lớn trường hợp và rẻ hơn nhiều.
+
+---
+
+## 7. Phản ứng với `QuotaExceededError`
+
+Dù dọn chủ động, vẫn cần bắt lỗi khi ghi:
+
+```js
+async function safePut(cacheName, request, response) {
+  try {
+    const cache = await caches.open(cacheName);
+    await cache.put(request, response);
+  } catch (err) {
+    if (err.name === 'QuotaExceededError') {
+      // Dọn khẩn cấp các cache "rẻ" (ảnh/api) rồi thử lại một lần.
+      await caches.delete(CACHE.images);
+      try {
+        await (await caches.open(cacheName)).put(request, response);
+      } catch {
+        /* đành bỏ qua — không để ghi cache làm sập fetch handler */
+      }
+    }
+  }
+}
+```
+
+Nguyên tắc vàng: **lỗi ghi cache không bao giờ được làm hỏng việc trả response**. Cache là tối ưu; nếu nó fail, trang vẫn phải nhận được nội dung từ mạng.
+
+---
+
+## 8. Bài tập
+
+**1.** Khác biệt giữa storage "best-effort" và "persistent" là gì, và làm sao chuyển sang persistent?
+
+<details>
+<summary>Lời giải</summary>
+
+Best-effort (mặc định) có thể bị trình duyệt tự xoá khi máy thiếu chỗ (thường LRU theo origin). Persistent thì không tự bị xoá, chỉ mất khi người dùng chủ động xoá. Chuyển bằng `navigator.storage.persist()` — nhưng trình duyệt chỉ cấp khi origin "gắn bó" (đã cài PWA, tương tác cao, bookmark), nên nên xin sau khi user đã dùng/đã cài.
+
+</details>
+
+**2.** Vì sao không được `await fetch()` không liên quan giữa lúc một transaction IndexedDB đang mở trong SW?
+
+<details>
+<summary>Lời giải</summary>
+
+Transaction IndexedDB tự đóng (auto-commit) khi hàng đợi microtask rỗng. `await` một việc không liên quan (như `fetch`) nhả quyền điều khiển và làm transaction đóng; thao tác IndexedDB tiếp theo trên transaction đó ném `TransactionInactiveError`. Hãy hoàn tất đọc/ghi IndexedDB trước, rồi mới fetch (hoặc ngược lại).
+
+</details>
+
+**3.** Vì sao lỗi ghi cache không nên làm hỏng fetch handler?
+
+<details>
+<summary>Lời giải</summary>
+
+Cache chỉ là tối ưu tốc độ/offline; nếu `cache.put` ném (vd `QuotaExceededError`) mà không bắt, nó có thể làm `respondWith` reject → trang không nhận được response. Phải bọc try/catch quanh ghi cache, dọn khẩn cấp rồi thử lại, và trong trường hợp xấu nhất vẫn trả response từ mạng cho người dùng.
+
+</details>
+
+**Nâng cao:** Thêm `putWithLimit` (max 60 ảnh) cho cache ảnh và một panel hiện `estimate()` trong app. Tải nhiều ảnh để vượt giới hạn, xác nhận cache giữ đúng 60 và `usage` không phình vô hạn. Thử `persist()` trước/sau khi cài PWA và so kết quả.
+
+---
+
+## Tóm tắt
+
+- Mọi storage của origin chia sẻ một quota; mặc định **best-effort** (có thể bị xoá khi thiếu chỗ, theo LRU).
+- `navigator.storage.estimate()` đo `usage`/`quota` (dùng được trong SW) — dọn *trước* khi chạm trần.
+- `navigator.storage.persist()` xin storage **bền**; chỉ được cấp khi origin gắn bó (PWA đã cài, tương tác cao).
+- SW không có `localStorage`; lưu có cấu trúc bằng **IndexedDB** — đừng `await` việc lạ giữa transaction (auto-commit → `TransactionInactiveError`).
+- Phân tách cache theo mục đích; **giới hạn số lượng** (`putWithLimit` / Workbox `ExpirationPlugin`) cho ảnh/API.
+- Bắt `QuotaExceededError`, dọn khẩn cấp, và **không để lỗi cache làm hỏng việc trả response**.
+
+---
+
+## Phần tiếp theo
+
+**Phần 16 — Clients API & messaging hai chiều:** giao tiếp giữa trang và service worker đúng cách — `postMessage` + `MessageChannel` để có phản hồi, `BroadcastChannel` cho nhiều tab, và `clients.matchAll/openWindow/focus/navigate` để SW điều phối các cửa sổ (vd khi bấm notification).

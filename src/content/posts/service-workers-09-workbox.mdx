@@ -1,0 +1,272 @@
+---
+title: 'Service Workers · Phần 9 — Workbox: viết SW production trong vài dòng'
+description: 'Workbox của Google gói gọn mọi thứ đã học: precaching tự động, routing, strategies, expiration, background sync. Hai chế độ generateSW và injectManifest, tích hợp build qua vite-plugin-pwa.'
+pubDate: 2026-07-07
+tags: [service-worker, workbox, vite-plugin-pwa, pwa, service_workers_10]
+series: service-workers
+seriesOrder: 9
+draft: false
+---
+
+Tám phần qua, bạn đã tự tay viết mọi thứ: lifecycle, fetch handler, năm strategy, versioning, cleanup, background sync, push. Đó là kiến thức **nền tảng không thể thiếu**. Nhưng trong dự án thật, viết tay từng dòng đó dễ sai và tốn công — đặc biệt là **versioning tự động** (hash từng file) và **precache manifest** (danh sách file build ra).
+
+**Workbox** là bộ thư viện của Google giải quyết đúng phần nhàm chán đó. Nó **không phải phép thuật** — nó chỉ gói lại chính xác những pattern bạn đã học. Vì bạn đã hiểu bản chất, dùng Workbox sẽ thấy "à, cái này là cache-first mình viết ở Phần 4", chứ không phải học mù.
+
+---
+
+## Workbox giải quyết gì?
+
+| Việc bạn làm tay (Phần 1–8) | Workbox lo giúp |
+|---|---|
+| Viết fetch handler router | `registerRoute()` |
+| Năm caching strategy | `CacheFirst`, `NetworkFirst`, `StaleWhileRevalidate`... |
+| Versioning + precache manifest | `precacheAndRoute(self.__WB_MANIFEST)` — build tool tự sinh hash |
+| Dọn cache cũ ở activate | Tự động (precache cleanup) |
+| Trim số lượng + expiration | `ExpirationPlugin` |
+| Chỉ cache response.ok | `CacheableResponsePlugin` |
+| Background Sync queue | `BackgroundSyncPlugin` |
+
+Điểm mạnh lớn nhất: **precache manifest tự động**. Build tool quét output, sinh danh sách `[{ url, revision }]` với hash nội dung — khi file đổi, hash đổi, Workbox tự cập nhật chính xác file đó. Hết cảnh sửa `VERSION` bằng tay (Phần 6).
+
+---
+
+## Hai chế độ: generateSW vs injectManifest
+
+Workbox có hai cách dùng, phải hiểu để chọn đúng:
+
+- **`generateSW`** — Workbox **tự sinh toàn bộ file service worker** từ config. Bạn không viết SW. Nhanh, hợp 80% trường hợp (offline asset + runtime caching cơ bản). Hạn chế: không thêm được logic tùy biến (push, background sync phức tạp).
+- **`injectManifest`** — bạn **tự viết file SW**, Workbox chỉ **chèn precache manifest** vào chỗ `self.__WB_MANIFEST`. Toàn quyền kiểm soát: thêm push, sync, route tùy ý. Hợp khi cần tính năng nâng cao (như Phần 7–8).
+
+> Quy tắc chọn: cần **push/background sync/logic riêng** → `injectManifest`. Chỉ cần **offline + caching** → `generateSW`. Có thể bắt đầu generateSW rồi chuyển sang injectManifest khi cần.
+
+---
+
+## Cách nhanh nhất: vite-plugin-pwa
+
+Trong hệ sinh thái Vite, `vite-plugin-pwa` bọc Workbox lại còn gọn hơn. Cài đặt:
+
+```bash
+npm i -D vite-plugin-pwa
+```
+
+### generateSW — zero config offline
+
+```ts
+// vite.config.ts
+import { defineConfig } from 'vite';
+import { VitePWA } from 'vite-plugin-pwa';
+
+export default defineConfig({
+  plugins: [
+    VitePWA({
+      registerType: 'autoUpdate', // hoặc 'prompt' (xem dưới)
+      workbox: {
+        // file nào được precache (mặc định đã hợp lý)
+        globPatterns: ['**/*.{js,css,html,svg,png,ico,woff2}'],
+        // runtime caching cho request động
+        runtimeCaching: [
+          {
+            urlPattern: ({ request }) => request.destination === 'image',
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'images',
+              expiration: { maxEntries: 60, maxAgeSeconds: 30 * 24 * 60 * 60 },
+            },
+          },
+          {
+            urlPattern: ({ url }) => url.pathname.startsWith('/api/'),
+            handler: 'NetworkFirst',
+            options: {
+              cacheName: 'api',
+              networkTimeoutSeconds: 3, // chính cái timeout ở Phần 4!
+            },
+          },
+        ],
+      },
+      manifest: {
+        name: 'My PWA',
+        short_name: 'PWA',
+        theme_color: '#0d0d0d',
+        background_color: '#0d0d0d',
+        display: 'standalone',
+        icons: [
+          { src: '/icons/icon-192.png', sizes: '192x192', type: 'image/png' },
+          { src: '/icons/icon-512.png', sizes: '512x512', type: 'image/png' },
+        ],
+      },
+    }),
+  ],
+});
+```
+
+Nhìn `runtimeCaching` — đó **chính xác** là router strategy bạn viết tay ở Phần 4, chỉ là khai báo thay vì code. `networkTimeoutSeconds` là timeout của Phần 4. `expiration` là trim + max-age của Phần 6. Mọi thứ khớp.
+
+### registerType: 'autoUpdate' vs 'prompt'
+
+- **`autoUpdate`** — SW mới tự `skipWaiting` + reload. Tiện, nhưng có rủi ro versioning đã bàn ở Phần 2 (nên ổn vì Workbox versioning chặt).
+- **`prompt`** — hiện UI "Có bản mới, tải lại" cho người dùng chủ động — đúng pattern production ở Phần 2/10.
+
+Với `prompt`, dùng helper đăng ký của plugin:
+
+```ts
+// main.ts
+import { registerSW } from 'virtual:pwa-register';
+
+const updateSW = registerSW({
+  onNeedRefresh() {
+    // Hiện toast của bạn; khi người dùng bấm "Tải lại":
+    showUpdateToast(() => updateSW(true)); // true = skipWaiting + reload
+  },
+  onOfflineReady() {
+    showToast('App đã sẵn sàng chạy offline');
+  },
+});
+```
+
+---
+
+## injectManifest — khi cần push & sync
+
+Khi cần tính năng Phần 7–8, chuyển sang `injectManifest` và tự viết SW:
+
+```ts
+// vite.config.ts
+VitePWA({
+  strategies: 'injectManifest',
+  srcDir: 'src',
+  filename: 'sw.ts', // file SW bạn tự viết
+  injectManifest: {
+    globPatterns: ['**/*.{js,css,html,svg,png,woff2}'],
+  },
+});
+```
+
+```ts
+// src/sw.ts — bạn viết, Workbox chèn precache manifest
+import { precacheAndRoute, cleanupOutdatedCaches } from 'workbox-precaching';
+import { registerRoute } from 'workbox-routing';
+import { CacheFirst, NetworkFirst, NetworkOnly } from 'workbox-strategies';
+import { ExpirationPlugin } from 'workbox-expiration';
+import { CacheableResponsePlugin } from 'workbox-cacheable-response';
+import { BackgroundSyncPlugin } from 'workbox-background-sync';
+
+declare let self: ServiceWorkerGlobalScope;
+
+// Precache toàn bộ app shell — manifest do build sinh, hash tự động (Phần 6 tự động hóa).
+precacheAndRoute(self.__WB_MANIFEST);
+cleanupOutdatedCaches(); // dọn precache cũ — đúng việc của activate ở Phần 6
+
+// Ảnh: cache-first + expiration (Phần 4 + Phần 6)
+registerRoute(
+  ({ request }) => request.destination === 'image',
+  new CacheFirst({
+    cacheName: 'images',
+    plugins: [
+      new CacheableResponsePlugin({ statuses: [0, 200] }),
+      new ExpirationPlugin({ maxEntries: 60, maxAgeSeconds: 30 * 24 * 60 * 60 }),
+    ],
+  })
+);
+
+// API: network-first (Phần 4)
+registerRoute(
+  ({ url }) => url.pathname.startsWith('/api/'),
+  new NetworkFirst({ cacheName: 'api', networkTimeoutSeconds: 3 })
+);
+
+// Background Sync cho POST (Phần 7 — Workbox tự lo IndexedDB queue + retry).
+// Dùng NetworkOnly: POST không bao giờ đọc cache, chỉ gửi đi (queue nếu fail).
+const bgSync = new BackgroundSyncPlugin('outbox', {
+  maxRetentionTime: 24 * 60, // phút
+});
+registerRoute(
+  ({ url }) => url.pathname === '/api/comments',
+  new NetworkOnly({ plugins: [bgSync] }),
+  'POST'
+);
+
+// Push (Phần 8 — Workbox không có abstraction, ta dùng event thuần như đã học)
+self.addEventListener('push', (event) => {
+  const data = event.data?.json() ?? {};
+  event.waitUntil(
+    self.registration.showNotification(data.title ?? 'Thông báo', {
+      body: data.body,
+      data: { url: data.url ?? '/' },
+    })
+  );
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil(self.clients.openWindow(event.notification.data?.url ?? '/'));
+});
+```
+
+Để ý: **`BackgroundSyncPlugin` thay thế toàn bộ helper IndexedDB bạn viết ở Phần 7** — nó tự tạo queue, tự retry. Nhưng vì bạn đã hiểu cơ chế, bạn biết chính xác nó làm gì bên dưới và debug được khi cần.
+
+---
+
+## Workbox không qua bundler (CDN)
+
+Nếu dự án không dùng Vite/Webpack, vẫn dùng được Workbox qua `importScripts` từ CDN — hữu ích cho trang tĩnh đơn giản:
+
+```js
+// sw.js
+importScripts('https://storage.googleapis.com/workbox-cdn/releases/7.0.0/workbox-sw.js');
+
+workbox.routing.registerRoute(
+  ({ request }) => request.destination === 'image',
+  new workbox.strategies.CacheFirst({ cacheName: 'images' })
+);
+```
+
+Hạn chế: không có precache manifest tự động (bạn vẫn phải liệt kê file). Cho production thật, dùng build plugin (`vite-plugin-pwa` / `workbox-webpack-plugin`) để có versioning tự động.
+
+---
+
+## Khi nào KHÔNG cần Workbox?
+
+Workbox tuyệt cho app phức tạp, nhưng:
+
+- App **rất nhỏ**, chỉ cần cache vài file → SW viết tay (Phần 4) có khi gọn hơn và không thêm dependency.
+- Cần **kiểm soát tuyệt đối** từng byte → viết tay.
+- Mục tiêu **học** → viết tay trước (như series này), dùng Workbox sau.
+
+> Lời khuyên thực tế: với hầu hết PWA production, **dùng Workbox qua vite-plugin-pwa**. Tự viết để học và để hiểu, nhưng đừng tái phát minh versioning/precache manifest — đó là chỗ Workbox thắng tuyệt đối.
+
+---
+
+## Tóm tắt
+
+- Workbox **gói lại chính xác** những pattern bạn đã học; điểm thắng lớn nhất là **precache manifest + versioning tự động** (hash theo nội dung).
+- Hai chế độ: **`generateSW`** (Workbox tự viết SW, hợp caching cơ bản) và **`injectManifest`** (bạn viết SW, hợp push/sync/logic riêng).
+- **`vite-plugin-pwa`** là cách gọn nhất trong hệ Vite; `runtimeCaching` = router strategy, `networkTimeoutSeconds`/`expiration` khớp Phần 4/6.
+- `registerType: 'prompt'` + `registerSW` cho update flow chuẩn production.
+- Các plugin: `ExpirationPlugin`, `CacheableResponsePlugin`, `BackgroundSyncPlugin` thay thế code tay Phần 6/7.
+- App rất nhỏ hoặc cần kiểm soát tuyệt đối thì viết tay vẫn hợp lý.
+
+---
+
+## Bài tập thực hành
+
+### Bài 1 — generateSW zero-to-offline (cơ bản)
+
+Tạo một app Vite tối giản (`npm create vite`), cài `vite-plugin-pwa`, cấu hình `generateSW` với manifest. Build (`npm run build`), preview (`npm run preview`), rồi test offline.
+
+**Hướng dẫn:** SW chỉ chạy trên build/preview, **không** trên `npm run dev` (trừ khi bật `devOptions.enabled`). Mở **Application → Service Workers** xác nhận SW do Workbox sinh đang active, và **Cache Storage** thấy precache `workbox-precache-...`. Tắt mạng, reload — app vẫn mở. So sánh công sức với Phần 5 bạn làm tay.
+
+### Bài 2 — runtimeCaching mapping (trung bình)
+
+Thêm `runtimeCaching` cho ảnh (CacheFirst + expiration) và `/api/` (NetworkFirst + timeout). Đối chiếu từng dòng config với code tay bạn viết ở Phần 4 và Phần 6.
+
+**Hướng dẫn:** Viết ra giấy: dòng `expiration.maxEntries` tương ứng hàm `trimCache` nào? `networkTimeoutSeconds` là đoạn `Promise.race` nào? Bài tập "ánh xạ ngược" này khẳng định Workbox không có gì huyền bí — nó là code của bạn được đóng gói.
+
+### Bài 3 — injectManifest với push + background sync (nâng cao)
+
+Chuyển sang `strategies: 'injectManifest'`, tự viết `src/sw.ts` với `precacheAndRoute`, một `BackgroundSyncPlugin` cho POST, và handler `push`/`notificationclick`. Test gửi offline (queue) + push (dùng server từ Phần 8).
+
+**Hướng dẫn:** So sánh `BackgroundSyncPlugin('outbox')` với ~80 dòng IndexedDB bạn viết ở Phần 7 — cùng kết quả, ít code hơn nhiều. Nhưng nhờ Phần 7 bạn biết nó tạo object store gì, retry ra sao, nên khi DevTools báo lỗi IndexedDB bạn không hoảng. Đây là cấu hình SW bạn sẽ mang thẳng vào capstone Phần 10.
+
+---
+
+**Phần tiếp theo:** Capstone — build một PWA offline-first hoàn chỉnh từ A đến Z: web app manifest, install prompt, update UX, testing, debugging, và checklist deploy production.

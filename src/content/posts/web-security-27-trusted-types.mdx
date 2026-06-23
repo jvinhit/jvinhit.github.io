@@ -1,0 +1,238 @@
+---
+title: 'Web Security for Frontend Devs · Part 27 — Trusted Types: Killing DOM-XSS by Construction'
+description: 'Bonus track: instead of remembering to sanitize at every sink, Trusted Types makes the browser reject raw strings at innerHTML, eval, and script.src — values must come from a registered policy. Enforce vs report-only, with a live simulator.'
+pubDate: 2026-06-30
+tags: [web-security, frontend, trusted-types, web_security_10]
+series: web-security
+seriesOrder: 27
+draft: false
+---
+
+> **Phần 27 — Nhánh bonus** trong series Web Security for Frontend Devs. Trước: Tiếp:
+
+Mọi cách chống XSS từ trước tới giờ đều có một điểm yếu chung: chúng dựa vào việc bạn **nhớ** làm đúng — escape ở đây, sanitize ở kia, đừng quên cái sink nọ. Trong một codebase lớn với hàng trăm chỗ chạm `innerHTML`, "nhớ ở mọi nơi" là cuộc chiến thua. **Trusted Types** lật bài toán: thay vì nhắc bạn sanitize, nó để **trình duyệt từ chối** mọi chuỗi thô tại các sink nguy hiểm — biến cả một lớp DOM-XSS thành **không thể xảy ra theo thiết kế**.
+
+---
+
+## Mô hình tư duy: cấm chuỗi thô tại sink
+
+DOM-XSS xảy ra khi dữ liệu không tin cậy chảy vào một **sink nguy hiểm**: `innerHTML`, `outerHTML`, `document.write`, `script.src`, `eval`, `setHTMLUnsafe`… Trusted Types yêu cầu các sink đó nhận **không phải chuỗi**, mà một **đối tượng đã được đánh dấu tin cậy** (`TrustedHTML`, `TrustedScript`, `TrustedScriptURL`) — và những đối tượng này **chỉ** tạo ra được qua một **policy** bạn đăng ký:
+
+```js
+// bật bằng CSP rồi:
+el.innerHTML = userInput;                 // ❌ TypeError: requires 'TrustedHTML'
+el.innerHTML = policy.createHTML(userInput); // ✓ phải đi qua policy
+```
+
+Khác biệt cốt lõi với sanitize thủ công: bạn **không thể quên**. Quên gọi policy → code ném lỗi ngay, không âm thầm tạo lỗ hổng. Bạn rút gọn bề mặt kiểm duyệt từ "mọi sink trong app" xuống "vài policy tập trung".
+
+---
+
+## Bật bằng CSP
+
+Trusted Types điều khiển qua [CSP (Phần 3)](/blog/web-security-03-content-security-policy/):
+
+```http
+Content-Security-Policy:
+  require-trusted-types-for 'script';
+  trusted-types app dompurify;
+```
+
+- `require-trusted-types-for 'script'` — **bật cưỡng chế**: mọi sink injection-vào-script giờ đòi giá trị tin cậy.
+- `trusted-types app dompurify` — **allowlist tên policy** được phép tạo. Gọi `createPolicy('evil', …)` với tên ngoài danh sách → ném lỗi. Thêm `'allow-duplicates'` nếu cần.
+
+---
+
+## Định nghĩa một policy
+
+Policy là nơi **tập trung** việc làm sạch — thường gói [DOMPurify (Phần 22)](/blog/web-security-22-html-sanitization-and-mutation-xss/):
+
+```ts
+const policy = trustedTypes.createPolicy('app', {
+  createHTML: (s: string) => DOMPurify.sanitize(s),
+  createScriptURL: (u: string) => {
+    const url = new URL(u, location.origin);
+    if (url.origin !== location.origin) throw new Error('blocked cross-origin script URL');
+    return url.href;
+  },
+});
+
+el.innerHTML = policy.createHTML(userInput); // trả về TrustedHTML
+```
+
+### Default policy — lưới cho code bạn không sửa được
+
+Một policy tên đặc biệt `'default'` được gọi **tự động** khi một chuỗi thô chạm sink. Hữu ích để bọc thư viện bên thứ ba bạn chưa migrate được — nhưng dùng dè dặt: nó dễ trở thành điểm "sanitize-tất-cả" mơ hồ, làm yếu lợi ích của TT.
+
+```ts
+trustedTypes.createPolicy('default', {
+  createHTML: (s) => DOMPurify.sanitize(s), // áp cho mọi gán chuỗi thô còn sót
+});
+```
+
+---
+
+## Triển khai: report-only trước, enforce sau
+
+Bật `enforce` ngay trên app lớn sẽ làm vỡ hàng loạt chỗ. Quy trình an toàn dùng bản **report-only**:
+
+```http
+Content-Security-Policy-Report-Only:
+  require-trusted-types-for 'script';
+  report-uri /csp-reports
+```
+
+Report-only **không chặn** — nó để gán chuỗi thô chạy bình thường nhưng **báo cáo** mỗi vi phạm kèm vị trí sink. Bạn thu thập report ở production, sửa từng sink (đưa qua policy hoặc dùng API an toàn), tới khi sạch thì chuyển sang `require-trusted-types-for 'script'` cưỡng chế.
+
+---
+
+## Những sink được Trusted Types canh
+
+```text
+Element.innerHTML / outerHTML / insertAdjacentHTML   → TrustedHTML
+document.write() / writeln()                          → TrustedHTML
+Element.setHTMLUnsafe() / Document.parseHTMLUnsafe()  → TrustedHTML
+HTMLScriptElement.src / .text / .textContent          → TrustedScript(URL)
+eval() / new Function()                               → TrustedScript
+iframe.srcdoc, setAttribute('on…'), …                 → trusted value
+```
+
+Lưu ý API sanitizer an toàn `setHTML()` ([Phần 22](/blog/web-security-22-html-sanitization-and-mutation-xss/)) **không** cần TrustedHTML (nó tự an toàn), trong khi `setHTMLUnsafe()` thì cần — đúng tinh thần "an toàn không cần policy, nguy hiểm thì phải qua policy".
+
+---
+
+## Thử ngay — trình mô phỏng sink Trusted Types
+
+Chọn chế độ (disabled / report-only / enforce) và cách đưa giá trị vào `innerHTML` (chuỗi thô vs qua policy), rồi xem điều gì xảy ra: chuỗi thô khi enforce **ném TypeError**, report-only **cho chạy nhưng báo cáo**, qua policy thì **luôn an toàn**. Hoàn toàn không thực thi gì — payload phân tích trong `<template>` trơ và preview trong iframe `sandbox` tắt script.
+
+<iframe
+  src="/tools/trusted-types-demo/"
+  title="Interactive Trusted Types DOM-XSS sink simulator"
+  loading="lazy"
+  style="width:100%;height:1240px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Mở demo đầy đủ:
+
+---
+
+## Lab thực hành — thấy sink ném lỗi
+
+Trusted Types là tính năng trình duyệt thật (Chromium); lab này chạy trong Chrome/Edge.
+
+### Lab — enforce làm `innerHTML` thô ném lỗi
+
+```bash
+mkdir -p /tmp/tt && cd /tmp/tt
+cat > tt.html <<'EOF'
+<!doctype html><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="require-trusted-types-for 'script'; trusted-types app">
+<div id="out"></div>
+<pre id="log"></pre>
+<script>
+  const log = (m) => document.getElementById("log").textContent += m + "\n";
+
+  // 1) chuỗi thô → ném lỗi
+  try { out.innerHTML = "<b>raw</b>"; }
+  catch (e) { log("raw innerHTML blocked: " + e.name); }
+
+  // 2) qua policy → chạy được
+  const policy = trustedTypes.createPolicy("app", {
+    createHTML: (s) => s.replace(/<script[\s\S]*?<\/script>/gi, "") // sanitize tối giản
+  });
+  out.innerHTML = policy.createHTML("<b>via policy ✓</b>");
+  log("policy.createHTML worked");
+
+  // 3) tên policy ngoài allowlist → ném lỗi
+  try { trustedTypes.createPolicy("evil", { createHTML: (s) => s }); }
+  catch (e) { log("createPolicy('evil') blocked: " + e.name); }
+</script>
+EOF
+python3 -m http.server 5000 >/dev/null 2>&1 &
+echo "open http://localhost:5000/tt.html in Chrome/Edge"
+```
+
+Mở trong Chrome: gán `innerHTML` chuỗi thô **ném lỗi**, qua policy `app` thì chạy, và tạo policy tên `evil` (ngoài allowlist) cũng bị chặn.
+
+Đã chứng minh: sink đòi giá trị tin cậy; chỉ policy được allowlist tạo ra nó.
+
+### Dọn dẹp
+
+```bash
+kill %1 2>/dev/null; rm -rf /tmp/tt
+```
+
+> Hỗ trợ: Trusted Types là API của Chromium (Chrome/Edge). Firefox và Safari chưa hỗ trợ tính tới giữa 2026, nên coi nó là **phòng thủ chiều sâu** trên nền sanitize đúng — không phải lớp duy nhất.
+
+---
+
+## Checklist phòng tránh
+
+1. Bật **`require-trusted-types-for 'script'`** qua CSP để cưỡng chế sink.
+2. Tập trung làm sạch trong **vài policy** (gói DOMPurify), allowlist tên qua `trusted-types`.
+3. Triển khai bằng **report-only** trước; sửa hết sink rồi mới enforce.
+4. Dùng **`'default'` policy** dè dặt cho code third-party chưa migrate.
+5. Coi TT là **phòng thủ chiều sâu** (Chromium-only) trên nền sanitize + CSP.
+6. Ưu tiên **API an toàn** (`setHTML()`, `textContent`) thay vì sink cần policy.
+
+---
+
+## Liên hệ các phần trước
+
+Trusted Types là lớp cưỡng chế trên nền [XSS (Phần 2)](/blog/web-security-02-xss-cross-site-scripting/) và [sanitization (Phần 22)](/blog/web-security-22-html-sanitization-and-mutation-xss/): policy là nơi DOMPurify sống, còn TT đảm bảo **không sink nào** bị bỏ qua. Nó bật qua [CSP (Phần 3)](/blog/web-security-03-content-security-policy/) và là mảnh ghép cuối khép lại bộ phòng thủ chống injection của series.
+
+---
+
+## Bài tập / Exercises
+
+**1.** Vì sao Trusted Types mạnh hơn "nhớ sanitize ở mọi nơi"?
+
+<details>
+<summary>Lời giải</summary>
+
+Vì nó **cưỡng chế ở runtime**: mọi sink nguy hiểm từ chối chuỗi thô và ném lỗi, nên *không thể quên* sanitize — một sink bỏ sót sẽ vỡ ngay lúc dev/test thay vì âm thầm thành lỗ hổng. Bề mặt kiểm duyệt co về vài policy tập trung.
+</details>
+
+**2.** Trong simulator, đặt mode = report-only, path = raw string. Mô tả điều xảy ra và vì sao chế độ này hữu ích khi migrate.
+
+<details>
+<summary>Lời giải</summary>
+
+Gán chuỗi thô **vẫn chạy** (không vỡ app), nhưng một **CSP violation report** được gửi kèm vị trí sink. Nó cho bạn tìm và sửa từng sink trên app lớn trước khi bật enforce — không downtime.
+</details>
+
+**3.** Một thư viện bên thứ ba bạn không sửa được dùng `innerHTML` thô. Làm sao bật enforce mà không vỡ nó, và rủi ro là gì?
+
+<details>
+<summary>Lời giải</summary>
+
+Đăng ký một policy tên **`'default'`** (tự gọi cho mọi chuỗi thô còn sót) bọc DOMPurify. Rủi ro: nó thành điểm "sanitize tất cả" mơ hồ, làm yếu lợi ích của TT — nên chỉ dùng tạm để bắc cầu, và migrate thư viện dần sang policy tường minh.
+</details>
+
+Nâng cao:Trong simulator, so sánh "via policy" ở cả ba mode và giải thích một câu vì sao nó luôn an toàn bất kể mode.
+
+---
+
+## Điểm chính
+
+- Trusted Types khiến sink nguy hiểm (`innerHTML`, `eval`, `script.src`…) **từ chối chuỗi thô** — giá trị phải đến từ policy.
+- Bật qua CSP: **`require-trusted-types-for 'script'`** + allowlist `trusted-types`.
+- Tập trung sanitize trong **policy** (gói DOMPurify); **không thể quên** vì sink sẽ ném lỗi.
+- Triển khai **report-only → enforce**; `'default'` policy để bắc cầu code cũ.
+- Là **phòng thủ chiều sâu** (Chromium-only) trên nền sanitize + CSP, không phải lớp duy nhất.
+
+---
+
+## Nguồn
+
+- web.dev — [Prevent DOM-based XSS with Trusted Types](https://web.dev/articles/trusted-types).
+- MDN — [Trusted Types API](https://developer.mozilla.org/docs/Web/API/Trusted_Types_API) và [`require-trusted-types-for`](https://developer.mozilla.org/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/require-trusted-types-for).
+- W3C — [Trusted Types spec](https://w3c.github.io/trusted-types/dist/spec/).
+- [DOMPurify](https://github.com/cure53/DOMPurify) — hỗ trợ trả về `TrustedHTML` sẵn (`RETURN_TRUSTED_TYPE`).
+
+---
+
+## Series
+
+Đây khép lại nhánh bonus về injection. Sợi chỉ từ [Phần 2](/blog/web-security-02-xss-cross-site-scripting/) tới đây: **chống XSS bằng kỷ luật con người rồi cũng rò; chống bằng bất biến do trình duyệt cưỡng chế thì cả một lớp lỗ hổng biến mất theo thiết kế**.

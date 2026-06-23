@@ -1,0 +1,328 @@
+---
+title: 'Build a Real React App · Part 3 — Routing & Architecture with React Router v7'
+description: 'Turn the shell into a real route tree: createBrowserRouter + RouterProvider in a Vite SPA, nested layout routes, lazy code-split routes, typed params and search params, navigation helpers, error boundaries, and why TanStack Query owns data.'
+pubDate: 2026-07-03
+tags: [react, react-router, architecture, routing, react_stack_12]
+series: react-stack
+seriesOrder: 3
+draft: true
+---
+
+Vỏ app từ Phần 2 có `<Sidebar />`, `<Topbar />`, và một `<Outlet />` trống chờ trang. Phần này dựng **cây route** lấp nó — dùng **React Router v7** ở *data mode*, phù hợp cho SPA Vite.
+
+Ta cũng ra một quyết định kiến trúc định hình phần còn lại: **route lo điều hướng, TanStack Query lo dữ liệu**.
+
+---
+
+## 1. Ba chế độ của React Router v7
+
+*Docs: [React Router — picking a mode](https://reactrouter.com/start/modes).*
+
+v7 gộp Remix vào React Router nên giờ có ba cách dùng:
+
+| Mode | What it is | When |
+|------|-----------|------|
+| **Declarative** | `<BrowserRouter>` + `<Routes>`/`<Route>` JSX | Tiny apps, no data APIs |
+| **Data** | `createBrowserRouter` + `<RouterProvider>` (route objects, loaders, actions, lazy) | **SPAs that need data routing — us** |
+| **Framework** | File-based routes + SSR/build integration (Remix-style) | Full-stack apps with a server runtime |
+
+Pulse là SPA render client gọi API riêng, nên ta dùng **data mode**. Nó cho route object, params có type, lazy load, và error boundary — mà không phải cam kết runtime server.
+
+### Tóm tắt một dòng
+
+Dùng **data mode** của React Router v7 — hợp SPA, có route object và lazy load.
+
+---
+
+## 2. Cây route
+
+*Docs: [createBrowserRouter](https://reactrouter.com/start/data/routing).*
+
+### Vấn đề
+
+Trang chung layout (vỏ) và lồng nhau (chi tiết customer nằm dưới customers). Route phẳng lặp vỏ ở mọi trang và không diễn đạt được "trang này render trong layout kia".
+
+### Công cụ: route object lồng nhau
+
+```tsx
+// src/app/router.tsx
+import { createBrowserRouter } from 'react-router';
+import { AppShell } from '@/components/layout/AppShell';
+import { RequireAuth } from '@/features/auth/RequireAuth'; // built in Part 9
+import { OverviewPage } from '@/features/overview/OverviewPage';
+import { RootError } from '@/components/RootError';
+
+export const router = createBrowserRouter([
+  // public, outside the shell
+  { path: '/login', lazy: () => import('@/features/auth/LoginPage') },
+
+  {
+    element: <RequireAuth />,        // guard (Part 9); renders <Outlet/> when authed
+    errorElement: <RootError />,     // catches anything that escapes a child boundary
+    children: [
+      {
+        path: '/',
+        Component: AppShell,         // layout route — renders chrome + <Outlet/>
+        children: [
+          { index: true, Component: OverviewPage },
+          {
+            path: 'customers',
+            children: [
+              { index: true, lazy: () => import('@/features/customers/CustomersPage') },
+              { path: ':customerId', lazy: () => import('@/features/customers/CustomerDetailPage') },
+            ],
+          },
+          { path: 'settings', lazy: () => import('@/features/settings/SettingsPage') },
+          { path: '*', Component: NotFoundPage },
+        ],
+      },
+    ],
+  },
+]);
+```
+
+- *layout route* không có trang riêng; render khung + `<Outlet />`.
+- con render đúng path cha (`/` → Overview).
+- đoạn động; `/customers/42` khớp với `customerId = '42'`.
+- bắt-tất cho 404.
+
+### Mount một lần, với stack provider
+
+```tsx
+// src/main.tsx
+import { createRoot } from 'react-dom/client';
+import { RouterProvider } from 'react-router';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { queryClient } from '@/lib/query-client'; // Part 4
+import { router } from '@/app/router';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <QueryClientProvider client={queryClient}>
+    <RouterProvider router={router} />
+  </QueryClientProvider>,
+);
+```
+
+`QueryClientProvider` bọc `RouterProvider` vì route, guard và trang đều gọi `useQuery`/`useMutation` và cần client từ context.
+
+### Tóm tắt một dòng
+
+Một layout route (`Component: AppShell`) bọc route con qua `<Outlet />`; lồng nhau map cấu trúc URL sang cấu trúc UI.
+
+---
+
+## 3. Route lazy — chia bundle theo trang
+
+*Docs: [React Router — lazy](https://reactrouter.com/start/data/route-object#lazy).*
+
+Mỗi route `lazy: () => import(...)` được chia thành chunk riêng, chỉ tải khi user điều hướng tới. Module export các phần của route với tên quy ước:
+
+```tsx
+// src/features/customers/CustomersPage.tsx
+export function Component() {
+  return <CustomersTable />;
+}
+
+// optional: an error boundary scoped to just this route
+export function ErrorBoundary() {
+  return <RouteError />;
+}
+```
+
+Giữ lần vẽ đầu eager (route index/overview import tĩnh), và lazy-load trang nặng, ít ghé như settings hay detail. Đây là phòng thủ đầu tiên chống ship một bundle khổng lồ — ta đo lợi ích ở Phần 10.
+
+### Tóm tắt một dòng
+
+`lazy: () => import(...)` chia mỗi trang thành chunk riêng tải khi điều hướng — giữ route đầu eager.
+
+---
+
+## 4. Params & search params
+
+*Docs: [useParams](https://reactrouter.com/api/hooks/useParams) · [useSearchParams](https://reactrouter.com/api/hooks/useSearchParams).*
+
+Đọc đoạn động bằng `useParams`, và coi query string như state bằng `useSearchParams`:
+
+```tsx
+import { useParams, useSearchParams } from 'react-router';
+
+function CustomerDetailPage() {
+  const { customerId } = useParams(); // string | undefined under strict types
+
+  // guard the missing case — noUncheckedIndexedAccess from Part 1 forces this
+  if (!customerId) return <NotFound />;
+  // …use customerId to fetch (Part 4)…
+}
+
+function CustomersSearch() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const query = searchParams.get('q') ?? '';
+
+  return (
+    <input
+      value={query}
+      onChange={(e) => setSearchParams({ q: e.target.value }, { replace: true })}
+    />
+  );
+}
+```
+
+URL trở thành nguồn chân lý cho state *chia sẻ được* — filter, tìm kiếm, phân trang. Reload hoặc chia sẻ link thì state sống sót. `{ replace: true }` tránh spam history khi gõ. Phần 8 dựng bảng lọc đầy đủ trên ý này.
+
+### Lỗi thường gặp
+
+- **Giá trị `useParams` là `string | undefined`** — với TypeScript strict bạn phải xử lý trường hợp thiếu; đừng giả định `customerId` tồn tại.
+- **Để state chia sẻ trong `useState`** — refresh là mất. Nếu đồng nghiệp paste URL phải thấy view giống, nó thuộc về search params.
+
+### Tóm tắt một dòng
+
+`useParams` đọc đoạn động (chắn `undefined`); `useSearchParams` biến query string thành state chia sẻ được, an toàn reload.
+
+---
+
+## 5. Helper điều hướng
+
+*Docs: [Link & NavLink](https://reactrouter.com/api/components/Link) · [useNavigate](https://reactrouter.com/api/hooks/useNavigate).*
+
+Ba công cụ phủ gần hết điều hướng:
+
+```tsx
+import { Link, NavLink, useNavigate } from 'react-router';
+
+<Link to="/customers">All customers</Link>                 // plain navigation
+<Link to={`/customers/${id}`}>View</Link>                  // dynamic target
+<NavLink to="/settings" className={({ isActive }) => …}>…</NavLink> // active-aware (Part 2)
+
+function Row({ id }: { id: string }) {
+  const navigate = useNavigate();
+  return <tr onClick={() => navigate(`/customers/${id}`)} />; // programmatic
+  // navigate(-1) goes back; navigate('/login', { replace: true }) replaces history
+}
+```
+
+Ưu tiên `Link`/`NavLink` cho thứ user bấm (chúng render `<a>` thật — dễ tiếp cận, middle-click được, thân thiện SEO) và để `useNavigate` cho điều hướng *bằng code*.
+
+### Tóm tắt một dòng
+
+`Link`/`NavLink` cho điều hướng bấm được (`<a>` thật), `useNavigate` cho redirect bằng code.
+
+---
+
+## 6. Quyết định lớn: loader vs TanStack Query
+
+*Docs: [React Router loaders](https://reactrouter.com/start/data/data-loading) · [TanStack Query](https://tanstack.com/query/latest).*
+
+### Sự căng thẳng
+
+Data mode của React Router có **loader** — hàm fetch *trước khi* route render. TanStack Query cũng fetch, kèm cache, refetch nền, và mutation. Dùng cả hai một cách ngây thơ là hai cache và hai mô hình.
+
+### Quyết định
+
+Với Pulse, **TanStack Query lo server state**; React Router lo *điều hướng*. Ta fetch trong component bằng `useQuery`, không trong route loader. Vì sao:
+
+- **Một cache, một mô hình** — mọi màn hình đọc server data một cách.
+- **Cache & đồng bộ nền miễn phí** — loader refetch mỗi lần điều hướng; Query phục vụ cache tức thì rồi revalidate nền.
+- **Mutation thuộc về query của nó** — optimistic update và invalidation (Phần 5) tự nhiên trong Query.
+
+Loader vẫn tỏa sáng trong app SSR/framework. Và có *một* chỗ nâng cao loader xứng đáng ngay cả ở đây — gọi `queryClient.ensureQueryData` để **prefetch** song song với tải chunk lazy — ta nói ở Phần 10.
+
+### Tóm tắt một dòng
+
+Route lo điều hướng; **TanStack Query lo dữ liệu**. Fetch bằng `useQuery` trong component — một cache, một mô hình.
+
+---
+
+## 7. Error boundary
+
+*Docs: [errorElement / ErrorBoundary](https://reactrouter.com/start/data/route-object#errorboundary).*
+
+Một route có thể export `ErrorBoundary` (hay set `errorElement`) bắt lỗi render *và* response ném ra, nên một trang hỏng không làm trắng cả app. Đặt boundary chi tiết trên route rủi ro và một root làm chốt chặn:
+
+```tsx
+// src/components/RootError.tsx
+import { useRouteError, isRouteErrorResponse, useNavigate } from 'react-router';
+
+export function RootError() {
+  const error = useRouteError();
+  const navigate = useNavigate();
+
+  const message = isRouteErrorResponse(error)
+    ? `${error.status} ${error.statusText}`
+    : error instanceof Error
+      ? error.message
+      : 'Something went wrong';
+
+  return (
+    <div className="grid min-h-screen place-items-center p-6 text-center">
+      <div>
+        <p className="text-destructive">{message}</p>
+        <button className="mt-4 underline" onClick={() => navigate(-1)}>
+          Go back
+        </button>
+      </div>
+    </div>
+  );
+}
+```
+
+- lỗi mà boundary này bắt.
+- phân biệt `Response` ném ra (vd 404) với `Error` chung.
+- boundary có **phạm vi**: `ErrorBoundary` của route con xử lý lỗi của nó trước; chỉ thứ thoát ra mới nổi lên `errorElement` của cha.
+
+### Tóm tắt một dòng
+
+Đặt `ErrorBoundary` mỗi route rủi ro cộng một root `errorElement` chốt chặn; `isRouteErrorResponse` phân biệt response HTTP với lỗi.
+
+---
+
+## 8. Bài tập
+
+**1.** Vì sao `AppShell` cấu hình là route có `children` thay vì bọc quanh `<RouterProvider>`?
+
+<details>
+<summary>Lời giải</summary>
+
+Là layout route, nó render `<Outlet />`, nên React Router chỉ đổi route con khớp trong khi vỏ giữ mount. Bọc `<RouterProvider>` đặt vỏ *ngoài* routing và mất layout lồng nhau cùng error boundary theo route.
+</details>
+
+**2.** Đồng nghiệp lưu từ khóa tìm trong `useState`. Cái gì hỏng, sửa thế nào?
+
+<details>
+<summary>Lời giải</summary>
+
+Refresh hoặc chia sẻ URL mất từ khóa — nó không trong URL. Chuyển sang `useSearchParams` để query string là nguồn chân lý, view an toàn reload và chia sẻ được.
+</details>
+
+**3.** Vì sao TanStack Query thay vì route loader cho dữ liệu trong SPA này?
+
+<details>
+<summary>Lời giải</summary>
+
+Một cache và một mô hình; cache/refetch nền có sẵn (loader refetch mỗi lần điều hướng); mutation + optimistic update + invalidation tự nhiên với query. Loader hợp mode SSR/framework hơn.
+</details>
+
+**4.** Khi nào dùng `useNavigate` thay vì `<Link>`?
+
+<details>
+<summary>Lời giải</summary>
+
+Cho điều hướng *bằng code* — sau submit form thành công, redirect auth, hay nút "quay lại" — nơi không có anchor user bấm. Thứ bấm được thì dùng `Link`/`NavLink` để là `<a>` thật, dễ tiếp cận.
+</details>
+
+Nâng cao:thêm export `RouteError` cho route `customers/:customerId` để lỗi load detail hiện lỗi cục bộ trong vỏ (sidebar vẫn thấy), trong khi lỗi ở guard nổi lên `RootError`.
+
+---
+
+## Điểm chính
+
+- Dùng **data mode** của React Router v7; mount dưới `QueryClientProvider`.
+- **Layout route + `<Outlet />`** map lồng URL sang lồng UI; `lazy` chia mỗi trang thành chunk riêng.
+- Để **state chia sẻ trong URL** qua `useSearchParams`; đọc (và chắn) đoạn động bằng `useParams`.
+- Quy tắc kiến trúc: **route lo điều hướng, TanStack Query lo dữ liệu**; đặt error boundary theo phạm vi với root chốt chặn.
+
+---
+
+## Tiếp theo
+
+**Phần 4 — Server state với TanStack Query**: cấu hình QueryClient, dựng `api-client` có type validate bằng zod, thiết kế query key scale được, và fetch danh sách customers bằng `useQuery` — cache, `staleTime`/`gcTime`, trạng thái loading/error, và devtools.

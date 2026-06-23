@@ -1,0 +1,292 @@
+---
+title: 'TanStack Query · Phần 10 — SSR, Next.js App Router & Hydration'
+description: 'Chạy React Query trên server: prefetch rồi truyền cache xuống client bằng dehydrate + HydrationBoundary, dùng QueryClient đúng cách trong React Server Components, và streaming data với gói next-experimental.'
+pubDate: 2026-07-01
+tags: [react, tanstack-query, react-query, nextjs, tanstack_query_8]
+series: tanstack-query
+seriesOrder: 10
+draft: false
+---
+
+Tới giờ mọi query đều chạy trong trình duyệt: trang trắng → spinner → data. Với app cần **SEO** hoặc **first paint nhanh**, bạn muốn server gửi HTML đã có data sẵn. Phần này ghép React Query với **server rendering** — trọng tâm là Next.js App Router (mô hình phổ biến nhất 2026), nhưng nguyên lý đúng cho mọi SSR.
+
+Mấu chốt là một vòng tròn: **server fetch → "đông cứng" (dehydrate) cache thành JSON → gửi xuống client → client "rã đông" (hydrate) vào QueryClient của nó**. Sau đó client tiếp quản với đầy đủ cache, refetch, optimistic update như thường.
+
+> Nhắc lại từ Phần 9: **server tạo `QueryClient` mới mỗi request**, browser dùng singleton. Quy tắc này là nền của cả phần này.
+
+---
+
+## 1. Vì sao không "dùng useQuery trên server là xong"?
+
+`useQuery` chỉ trả data khi `queryFn` resolve — nhưng server render là **đồng bộ một nhịp**: nó render component ra HTML ngay, không chờ promise. Nếu chỉ gọi `useQuery`, server xuất HTML ở trạng thái `isPending` (spinner), và data chỉ về sau khi client chạy. Mất luôn lợi ích SSR.
+
+Giải pháp: **prefetch trước khi render**. Ta nạp data vào một `QueryClient` phía server *trước*, rồi truyền cache đã có sẵn xuống client.
+
+```
+┌── Server (mỗi request) ──────────────┐      ┌── Client ──────────────┐
+│ new QueryClient()                    │      │ getQueryClient()       │
+│ await prefetchQuery(...)             │      │ (singleton)            │
+│ dehydrate(client) → state (JSON) ────┼─────▶│ <HydrationBoundary>    │
+│ render HTML kèm <script> state       │      │ useQuery() thấy data   │
+└──────────────────────────────────────┘      │ ngay, không spinner    │
+                                               └────────────────────────┘
+```
+
+---
+
+## 2. `getQueryClient()` an toàn cho cả hai môi trường
+
+Đây là helper bắt buộc cho Next App Router. Server tạo mới mỗi lần; browser tái dùng:
+
+```ts
+// app/get-query-client.ts
+import { QueryClient, isServer } from '@tanstack/react-query';
+
+function makeQueryClient() {
+  return new QueryClient({
+    defaultOptions: {
+      queries: {
+        // QUAN TRỌNG: staleTime > 0 để data prefetch không bị client
+        // refetch ngay lập tức sau khi hydrate (sẽ phí công server).
+        staleTime: 60_000,
+      },
+      dehydrate: {
+        // Mặc định chỉ dehydrate query "success". Thêm 'pending' để
+        // streaming các query CHƯA xong cũng truyền được xuống (mục 6).
+        shouldDehydrateQuery: (query) =>
+          defaultShouldDehydrateQuery(query) || query.state.status === 'pending',
+      },
+    },
+  });
+}
+
+let browserQueryClient: QueryClient | undefined;
+
+export function getQueryClient() {
+  if (isServer) return makeQueryClient();
+  browserQueryClient ??= makeQueryClient();
+  return browserQueryClient;
+}
+```
+
+```ts
+import { defaultShouldDehydrateQuery } from '@tanstack/react-query';
+```
+
+> **`staleTime: 60_000` không phải tuỳ chọn — nó gần như bắt buộc cho SSR.** Nếu để mặc định `0`, mọi query vừa hydrate đã bị coi là stale và client refetch ngay → server prefetch trở nên vô nghĩa.
+
+---
+
+## 3. Provider phía client
+
+App Router cần một Client Component bọc `QueryClientProvider`. Lưu ý dùng `getQueryClient()` chứ không `new QueryClient()` trực tiếp trong component:
+
+```tsx
+// app/providers.tsx
+'use client';
+
+import { QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
+import { getQueryClient } from './get-query-client';
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  // getQueryClient() lo việc server-mới / browser-singleton.
+  const queryClient = getQueryClient();
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      {children}
+      <ReactQueryDevtools initialIsOpen={false} />
+    </QueryClientProvider>
+  );
+}
+```
+
+```tsx
+// app/layout.tsx
+import { Providers } from './providers';
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="vi">
+      <body>
+        <Providers>{children}</Providers>
+      </body>
+    </html>
+  );
+}
+```
+
+---
+
+## 4. Prefetch trong Server Component + `HydrationBoundary`
+
+Trong một Server Component (mặc định ở App Router), ta prefetch rồi bọc cây con bằng `<HydrationBoundary>` với state đã `dehydrate`:
+
+```tsx
+// app/customers/page.tsx  (Server Component — không có 'use client')
+import { dehydrate, HydrationBoundary } from '@tanstack/react-query';
+import { getQueryClient } from '../get-query-client';
+import { customersQuery } from '@/features/customers/queries';
+import { CustomerList } from '@/features/customers/CustomerList';
+
+export default async function CustomersPage() {
+  const queryClient = getQueryClient();
+
+  // Prefetch trên server — await để cache có data trước khi dehydrate.
+  await queryClient.prefetchQuery(customersQuery());
+
+  return (
+    <HydrationBoundary state={dehydrate(queryClient)}>
+      {/* CustomerList là Client Component dùng useQuery(customersQuery()) */}
+      <CustomerList />
+    </HydrationBoundary>
+  );
+}
+```
+
+`CustomerList` vẫn là Client Component dùng `useQuery` **y hệt** như app client-only — không cần biết data tới từ server. Đó là vẻ đẹp của mô hình: cùng một `queryOptions` (Phần 3) chạy được ở cả hai phía.
+
+```tsx
+// features/customers/CustomerList.tsx
+'use client';
+import { useQuery } from '@tanstack/react-query';
+import { customersQuery } from './queries';
+
+export function CustomerList() {
+  // Khi hydrate, data đã nằm trong cache → render ngay, không spinner.
+  const { data } = useQuery(customersQuery());
+  return <ul>{data?.map((c) => <li key={c.id}>{c.name}</li>)}</ul>;
+}
+```
+
+---
+
+## 5. `queryOptions` dùng chung — chìa khoá tránh lệch key
+
+Đừng định nghĩa `queryKey`/`queryFn` hai lần (một cho server, một cho client) — rất dễ lệch và hydrate trượt. Khai báo **một** `queryOptions` rồi import ở cả hai phía:
+
+```ts
+// features/customers/queries.ts
+import { queryOptions } from '@tanstack/react-query';
+import { fetchCustomers } from './api';
+import { customerKeys } from './keys';
+
+export const customersQuery = () =>
+  queryOptions({
+    queryKey: customerKeys.lists(),
+    queryFn: fetchCustomers,
+  });
+```
+
+Server gọi `prefetchQuery(customersQuery())`, client gọi `useQuery(customersQuery())` — cùng key, cùng fn, hydrate khớp tuyệt đối. Nếu key lệch dù chỉ một ký tự, client sẽ coi là query khác và fetch lại.
+
+---
+
+## 6. Streaming với gói `next-experimental`
+
+Cách ở mục 4 **chờ** prefetch xong rồi mới gửi HTML (blocking). Muốn **streaming** — gửi shell ngay, data chảy về sau khi sẵn sàng — dùng provider chuyên dụng:
+
+```bash
+pnpm add @tanstack/react-query-next-experimental
+```
+
+```tsx
+// app/providers.tsx
+'use client';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryStreamedHydration } from '@tanstack/react-query-next-experimental';
+import { getQueryClient } from './get-query-client';
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  const queryClient = getQueryClient();
+  return (
+    <QueryClientProvider client={queryClient}>
+      <ReactQueryStreamedHydration>{children}</ReactQueryStreamedHydration>
+    </QueryClientProvider>
+  );
+}
+```
+
+Với provider này, bạn dùng `useSuspenseQuery` **ngay trong cây render trên server**; nó tự dehydrate từng query đang `pending` và stream xuống khi resolve — không cần `prefetchQuery` + `HydrationBoundary` thủ công. Đây là lý do mục 2 thêm `'pending'` vào `shouldDehydrateQuery`.
+
+> **Chọn cách nào?** Prefetch + `HydrationBoundary` (mục 4) cho kiểm soát rõ ràng và ổn định. Streamed hydration cho TTFB tốt hơn với data chậm, nhưng còn "experimental" — cân nhắc cho production.
+
+---
+
+## 7. Request-scoped QueryClient trong RSC với `cache()`
+
+Nếu nhiều Server Component trong cùng một request cùng cần một `QueryClient` (vd layout và page đều prefetch), đừng gọi `getQueryClient()` nhiều lần tạo nhiều client. Bọc bằng `cache()` của React để **một client cho mỗi request**:
+
+```ts
+// app/get-query-client.ts (bản cho RSC)
+import { cache } from 'react';
+import { QueryClient } from '@tanstack/react-query';
+
+// cache() đảm bảo cùng một request → cùng một QueryClient,
+// nhưng request khác nhau → client khác nhau (không rò data giữa user).
+export const getServerQueryClient = cache(() => new QueryClient());
+```
+
+Layout prefetch `user`, page prefetch `customers`, cả hai dùng `getServerQueryClient()` → cùng một cache → một lần `dehydrate` ở ngoài cùng truyền hết xuống.
+
+---
+
+## 8. Những lỗi SSR hay gặp
+
+| Triệu chứng | Nguyên nhân | Cách sửa |
+|---|---|---|
+| Hydrate xong client refetch ngay | `staleTime: 0` | Đặt `staleTime > 0` ở `makeQueryClient` |
+| "Text content does not match" | Data server ≠ client (vd `Date.now()`, random trong render) | Đừng dùng giá trị không tất định khi render |
+| Data của user A hiện cho user B | Dùng chung 1 client toàn cục trên server | `getQueryClient()` tạo mới mỗi request |
+| Hydrate không khớp, fetch lại | `queryKey` server ≠ client | Dùng chung `queryOptions` (mục 5) |
+| Lỗi prefetch làm sập trang | `prefetchQuery` không throw, nhưng `fetchQuery` thì có | Dùng `prefetchQuery` (nuốt lỗi) cho data không bắt buộc |
+
+---
+
+## 9. Bài tập
+
+**1.** Vì sao SSR gần như luôn cần `staleTime > 0`?
+
+<details>
+<summary>Lời giải</summary>
+
+Khi hydrate, mọi query nhận `dataUpdatedAt` từ lúc server fetch. Nếu `staleTime` là 0, data lập tức bị coi là stale và client refetch ngay khi mount (theo `refetchOnMount`), làm phí toàn bộ công prefetch của server và gây nháy. `staleTime > 0` giữ data "tươi" đủ lâu để client không fetch lại ngay.
+
+</details>
+
+**2.** Vì sao trên server phải tạo `QueryClient` mới mỗi request, còn browser thì singleton?
+
+<details>
+<summary>Lời giải</summary>
+
+Trên server, một client dùng chung sẽ trộn cache của nhiều user/request → rò rỉ dữ liệu và race. Mỗi request phải có cache riêng. Trên browser chỉ có một user và một phiên, nên singleton giúp giữ cache xuyên suốt các lần re-render/Suspense; tạo mới sẽ xoá sạch cache.
+
+</details>
+
+**3.** Lợi ích và rủi ro của streamed hydration so với prefetch + `HydrationBoundary`?
+
+<details>
+<summary>Lời giải</summary>
+
+Streamed hydration gửi shell ngay rồi stream data khi sẵn sàng (TTFB tốt, dùng `useSuspenseQuery` trực tiếp trên server, ít boilerplate). Rủi ro: gói còn "experimental", hành vi có thể đổi, và khó kiểm soát thứ tự/ưu tiên data hơn cách prefetch tường minh. Cách prefetch + `HydrationBoundary` ổn định và dễ debug hơn cho production.
+
+</details>
+
+**Nâng cao:** Dựng một route Next App Router prefetch danh sách trên server, hydrate xuống một Client Component dùng `useQuery`. Mở Network tab, tắt JS — xác nhận HTML đã chứa data (SEO). Bật lại JS — xác nhận client **không** refetch ngay (nhờ `staleTime`).
+
+---
+
+## Tóm tắt
+
+- SSR React Query = **server prefetch → `dehydrate` → client `<HydrationBoundary>` → hydrate**; sau đó client tiếp quản như app thường.
+- `getQueryClient()` phải **tạo mới trên server, singleton trên browser** (`isServer`); trong RSC bọc bằng `cache()` để một client cho mỗi request.
+- Đặt `staleTime > 0` để data prefetch không bị refetch ngay sau hydrate.
+- Dùng chung **một `queryOptions`** cho cả prefetch (server) và `useQuery` (client) để key khớp tuyệt đối.
+- `@tanstack/react-query-next-experimental` cho **streaming** với `useSuspenseQuery` trực tiếp trên server; đổi lại còn experimental.
+
+---
+
+## Phần tiếp theo
+
+**Phần 11 — Prefetching & tích hợp Router nâng cao:** vượt khỏi prefetch-on-hover cơ bản — prefetch theo *ý định* (hover/focus/viewport), `ensureQueryData` vs `prefetchQuery`, `prefetchInfiniteQuery` cho danh sách vô hạn, tích hợp route loader (TanStack Router + React Router) và cách triệt tiêu request waterfall.

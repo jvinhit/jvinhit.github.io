@@ -1,0 +1,171 @@
+---
+title: 'Web Performance · Part 16 — INP Deep & Main-Thread Scheduling'
+description: 'Đào sâu INP: phân rã input delay / processing / presentation, Long Animation Frames (LoAF) API để tìm thủ phạm, scheduler.postTask/yield, isInputPending, và đẩy việc nặng sang worker.'
+pubDate: 2026-09-17
+tags: [performance, inp, scheduling, long-tasks, web_perf_12]
+series: web-perf
+seriesOrder: 16
+draft: true
+---
+
+Phần 6 giới thiệu INP và cách tối ưu cơ bản. Phần này đi sâu vào *cơ chế* main thread quyết định INP, và bộ công cụ lập lịch hiện đại để giữ trang luôn phản hồi. INP (Interaction to Next Paint) là Core Web Vital khó nhất vì nó phản ánh sức khỏe của main thread suốt toàn bộ phiên — không chỉ lúc tải.
+
+> Mô hình nền: main thread đơn luồng (như đã biết). Mọi tương tác phải xếp hàng sau tác vụ đang chạy. INP đo độ trễ tệ nhất giữa "người dùng tương tác" và "khung hình kế phản ánh kết quả".
+
+---
+
+## 1. Phân rã INP — ba phần
+
+Một tương tác (click, tap, gõ phím) chia thành ba giai đoạn. Biết phần nào lớn → biết sửa ở đâu (dùng Attribution, Part 13).
+
+```text
+Người dùng bấm                                          Khung hình hiển thị kết quả
+   │                                                            │
+   ├── Input delay ──┬── Processing time ──┬── Presentation delay ┤
+   │  (main thread   │  (chạy event        │  (style/layout/paint  │
+   │   đang bận)     │   handler)          │   cho khung kế)       │
+```
+
+| Phần | Nguyên nhân | Cách sửa |
+|---|---|---|
+| **Input delay** | main thread bận lúc bấm (task dài, hydration) | chia nhỏ task, yield, ít JS khởi động |
+| **Processing** | event handler nặng | tối ưu handler, debounce, đẩy sang worker |
+| **Presentation** | layout/paint nặng sau handler | giảm DOM update, tránh reflow (Part 17) |
+
+---
+
+## 2. Long tasks & quy tắc 50ms
+
+Bất kỳ tác vụ nào chạy >50ms trên main thread là **long task** — trong khoảng đó trình duyệt không thể phản hồi input. Đây là kẻ thù trực tiếp của INP.
+
+```ts
+// Phát hiện long task trong RUM
+new PerformanceObserver((list) => {
+  for (const entry of list.getEntries()) {
+    if (entry.duration > 50) report('long-task', entry.duration);
+  }
+}).observe({ type: 'longtask', buffered: true });
+```
+
+Mục tiêu: giữ mỗi tác vụ dưới 50ms để main thread luôn có "khe thở" xử lý input. Nhưng `longtask` API thô — không cho biết *script nào* gây ra. Đó là lý do LoAF ra đời.
+
+---
+
+## 3. Long Animation Frames (LoAF) — công cụ chẩn đoán mới
+
+**Long Animation Frames API** thay thế `longtask`: nó báo cáo cả *khung hình* bị chậm (>50ms) kèm **script nào, hàm nào, nguồn nào** gây ra — chính xác hơn nhiều để săn thủ phạm INP.
+
+```ts
+new PerformanceObserver((list) => {
+  for (const loaf of list.getEntries()) {
+    // loaf.duration, blockingDuration, và phân rã chi tiết
+    for (const script of loaf.scripts) {
+      report('loaf-script', {
+        duration: script.duration,
+        invoker: script.invoker,        // ai gọi (vd 'IMG#hero.onclick')
+        sourceURL: script.sourceURL,    // file script gây chậm
+        sourceFunctionName: script.sourceFunctionName,
+      });
+    }
+  }
+}).observe({ type: 'long-animation-frame', buffered: true });
+```
+
+```text
+LoAF cho biết:
+  - startTime, duration, blockingDuration của khung chậm
+  - renderStart / styleAndLayoutStart (tách thời gian script vs render)
+  - scripts[]: từng script với sourceURL + functionName + invoker
+→ "khung này chậm 120ms vì hàm X trong vendor.js" — đủ để hành động.
+```
+
+Kết hợp LoAF (gắn script gây chậm) với INP Attribution (gắn tương tác) cho bức tranh đầy đủ. Đây là cách điều tra INP ở mức production.
+
+---
+
+## 4. Chia nhỏ tác vụ & yield
+
+Cách trực tiếp nhất giảm input delay: **chia tác vụ dài thành mảnh nhỏ và nhường (yield)** main thread giữa chừng để xử lý input đang chờ.
+
+```ts
+// scheduler.yield(): nhường main thread, tiếp tục sau (ưu tiên cao hơn setTimeout)
+async function processLargeList(items: Item[]) {
+  for (const item of items) {
+    process(item);
+    if (navigator.scheduling?.isInputPending?.()) {
+      await scheduler.yield(); // có input đang chờ → nhường ngay
+    }
+  }
+}
+```
+
+```ts
+// Fallback yield khi chưa có scheduler.yield
+const yieldToMain = () =>
+  'scheduler' in window && 'yield' in scheduler
+    ? scheduler.yield()
+    : new Promise((r) => setTimeout(r, 0));
+```
+
+`isInputPending()` cho biết có input đang chờ để yield *đúng lúc cần*, tránh yield thừa (mỗi yield tốn một chút). Đây là pattern then chốt cho việc xử lý danh sách/tính toán lớn mà không chặn input.
+
+---
+
+## 5. scheduler.postTask — lập lịch theo ưu tiên
+
+`scheduler.postTask` cho phép xếp việc với **ba mức ưu tiên** rõ ràng, thay cho `setTimeout` (vốn không có khái niệm ưu tiên).
+
+```ts
+// user-blocking: gấp, chặn người dùng (cao nhất)
+// user-visible: bình thường (mặc định)
+// background: không gấp (thấp nhất)
+scheduler.postTask(() => renderCriticalUI(), { priority: 'user-blocking' });
+scheduler.postTask(() => prefetchData(), { priority: 'background' });
+
+// có thể hủy bằng AbortController/TaskController
+const controller = new TaskController({ priority: 'background' });
+scheduler.postTask(work, { signal: controller.signal });
+controller.abort(); // hủy nếu không cần nữa
+```
+
+```text
+Chọn công cụ lập lịch:
+  cập nhật UI do tương tác        → postTask('user-blocking') / chạy ngay
+  việc nền không gấp              → postTask('background') / requestIdleCallback
+  chia tác vụ dài + giữ phản hồi  → vòng lặp + scheduler.yield + isInputPending
+  tính toán thật nặng/độc lập DOM → Web Worker (mục 6)
+```
+
+---
+
+## 6. Đẩy việc nặng sang Web Worker
+
+Nếu tính toán nặng và *không cần DOM* (parse, sort lớn, xử lý ảnh, mã hóa), đẩy hẳn sang **Web Worker** — main thread hoàn toàn rảnh cho input. **Comlink** làm việc với worker dễ như gọi hàm.
+
+```ts
+// worker.ts
+import * as Comlink from 'comlink';
+Comlink.expose({ heavySort: (data: number[]) => data.sort((a, b) => a - b) });
+
+// main.ts
+import * as Comlink from 'comlink';
+const api = Comlink.wrap<{ heavySort(d: number[]): Promise<number[]> }>(
+  new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' })
+);
+const sorted = await api.heavySort(bigArray); // chạy off-main-thread, INP không bị ảnh hưởng
+```
+
+> Cân nhắc chi phí: chuyển dữ liệu sang worker tốn (structured clone) — dùng `transferable` cho buffer lớn. Worker đáng giá khi tính toán đủ nặng để bù chi phí truyền. Việc nhẹ thì `scheduler.yield` đủ.
+
+---
+
+## 7. Tóm tắt
+
+- INP phân rã thành **input delay / processing / presentation**; dùng Attribution + LoAF để biết phần nào lớn.
+- **Long task** (>50ms) chặn input; mục tiêu giữ mỗi tác vụ &lt;50ms.
+- **Long Animation Frames (LoAF) API** chỉ ra *script/hàm/file* gây khung chậm — công cụ chẩn đoán INP chính ở production.
+- Chia tác vụ dài + **`scheduler.yield()`** (kèm `isInputPending()`) để nhường main thread đúng lúc; fallback `setTimeout(0)`.
+- **`scheduler.postTask`** lập lịch theo ưu tiên (user-blocking/user-visible/background), hủy được qua TaskController.
+- Đẩy tính toán nặng độc-lập-DOM sang **Web Worker** (Comlink + transferable) để main thread rảnh cho input.
+
+**Phần tiếp theo:** Rendering pipeline & CSS performance — forced reflow/layout thrashing, `content-visibility`, CSS containment, kỷ luật `will-change`, và animation chỉ chạm compositor.

@@ -1,0 +1,204 @@
+---
+title: 'Build a Real React App · Part 10 — Performance & Bundle Optimization'
+description: 'Make Pulse fast: route-level code splitting, prefetching queries on hover and route entry, Suspense boundaries, memoization and selector discipline, and analyzing the production bundle to find what to trim.'
+pubDate: 2026-07-24
+tags: [react, performance, vite, tanstack-query, react_stack_12]
+series: react-stack
+seriesOrder: 10
+draft: true
+---
+
+Pulse chạy. Giờ làm nó *nhanh*. Việc hiệu năng chia ba nhóm, và kỹ sư senior tấn công theo thứ tự: **gửi ít JavaScript** (bundle), **fetch sớm và song song** (dữ liệu), và chỉ sau đó **render ít** (re-render). Thứ tự quan trọng — tối ưu render 50 KB là nhiễu so với bundle 500 KB bạn không cần gửi.
+
+Đo trước khi tối ưu. Mỗi kỹ thuật dưới gắn với một phép đo, không phải linh cảm.
+
+---
+
+## 1. Chia code theo route
+
+*Docs: [React — lazy](https://react.dev/reference/react/lazy).*
+
+Thắng lợi lớn nhất, dễ nhất: đừng gửi code mọi màn hình trong bundle ban đầu. Ta đã dùng lazy route của React Router ở Phần 3 — đó là chia code. Mỗi `lazy: () => import(...)` thành chunk riêng tải theo yêu cầu:
+
+```ts
+// src/app/router.tsx — each route is a separate chunk
+{ path: '/customers', lazy: () => import('@/features/customers/CustomersPage') },
+{ path: '/settings', lazy: () => import('@/features/settings/SettingsPage') },
+```
+
+Màn login, trang settings, thư viện vẽ biểu đồ nặng — không cái nào cần trong bundle người dùng lần đầu tải để thấy dashboard. Chia ở ranh giới route trước; chia *component* nặng (rich text editor, biểu đồ) sau bằng `React.lazy`.
+
+### Tránh import barrel-file
+
+Một `index.ts` barrel re-export cả thư mục phá tree-shaking: import một helper có thể kéo cả đồ thị module vào chunk. Import trực tiếp từ file nguồn (ta đã cấm barrel ở Phần 1 đúng vì lý do này).
+
+### Tóm tắt một dòng
+
+Chia ở ranh giới route (lazy route) và component nặng (`React.lazy`); tránh barrel file phá tree-shaking.
+
+---
+
+## 2. Ranh giới Suspense
+
+Chunk lazy cần fallback khi tải. Đặt ranh giới `Suspense` có chủ ý để chỉ vùng đang tải hiện spinner, không phải cả app:
+
+```tsx
+// keep the shell instant; only the routed content suspends
+<Suspense fallback={<RouteSkeleton />}>
+  <Outlet />
+</Suspense>
+```
+
+Một ranh giới đặt khéo giữ app shell (sidebar, topbar) tương tác được khi chunk route tải — user không bao giờ thấy trang trắng.
+
+### Tóm tắt một dòng
+
+Bọc nội dung lazy trong `Suspense` với fallback skeleton để chỉ vùng đó tải, giữ shell tương tác.
+
+---
+
+## 3. Prefetch dữ liệu trước khi cần
+
+*Docs: [prefetching](https://tanstack.com/query/latest/docs/framework/react/guides/prefetching).*
+
+Chia code đánh đổi bundle ban đầu nhỏ hơn lấy độ trễ nhỏ khi vào route. Prefetch giấu độ trễ đó bằng cách bắt đầu fetch *trước* khi user đến.
+
+**Khi hover** — bắt đầu fetch chi tiết khi user hover một hàng bảng:
+
+```tsx
+function CustomerRow({ customer }: { customer: Customer }) {
+  const queryClient = useQueryClient();
+  return (
+    <tr
+      onMouseEnter={() => queryClient.prefetchQuery(customerQuery(customer.id))}
+    >
+      {/* … */}
+    </tr>
+  );
+}
+```
+
+**Trong loader route** — khởi động fetch khi điều hướng bắt đầu, để dữ liệu và chunk route tải song song thay vì nối tiếp:
+
+```ts
+// src/features/customers/CustomersPage.tsx
+export async function loader() {
+  // warms the cache; the component's useQuery reads it instantly
+  void queryClient.ensureQueryData(customersQuery(defaultParams));
+  return null;
+}
+```
+
+`ensureQueryData` trả dữ liệu cached nếu có hoặc fetch — hoàn hảo cho loader. Điều này loại bỏ **waterfall router→component→fetch** kinh điển: fetch loader và tải chunk lazy chồng lên nhau.
+
+### Tóm tắt một dòng
+
+Prefetch khi hover và trong loader để dữ liệu tải song song với chunk route — không waterfall khi vào.
+
+---
+
+## 4. Tối ưu re-render — đo trước
+
+Chỉ sau bundle và dữ liệu mới đuổi re-render, và chỉ nơi **profiler** cho thấy chi phí thật. Cách sửa rẻ nhất là cấu trúc, không phải `memo` khắp nơi:
+
+- **Subscribe hẹp** — kỷ luật selector từ Phần 4 & 7: đọc `isPending`, không phải cả object query/store, để component chỉ re-render khi lát *của nó* đổi.
+- **Suy ra, đừng lưu** — tính giá trị dẫn xuất lúc render thay vì nhân vào state có thể lệch.
+- **Đừng định nghĩa component trong component** — component con inline là *type mới* mỗi render, nên React remount và mất state. Đưa lên phạm vi module.
+- **Callback/dữ liệu ổn định** — đưa mảng/object tĩnh lên phạm vi module (ta đã làm với `NAV` và `columns`); dùng `useCallback`/`useMemo` chỉ khi identity thực sự nuôi child memo hoặc mảng phụ thuộc.
+- **`React.memo` có chọn lọc** — bọc component thực sự đắt với props ổn định; là công cụ, không phải mặc định.
+
+Mẹo render điều kiện dùng xuyên suốt: render bằng **ternary** (`cond ? <A/> : null`), không `cond && <A/>`, để tránh vô tình render `0` falsy.
+
+### Tóm tắt một dòng
+
+Sửa re-render bằng cấu trúc trước (selector hẹp, suy state, đưa static lên, không component inline); dùng `memo`/`useCallback` chỉ nơi profiler chứng minh chi phí.
+
+---
+
+## 5. Phân tích bundle production
+
+Không cắt được thứ không thấy. Thêm visualizer để xem thực sự có gì trong mỗi chunk:
+
+```bash
+pnpm add -D rollup-plugin-visualizer
+```
+
+```ts
+// vite.config.ts
+import { visualizer } from 'rollup-plugin-visualizer';
+
+export default defineConfig({
+  plugins: [
+    react(),
+    tailwindcss(),
+    visualizer({ filename: 'dist/stats.html', gzipSize: true }),
+  ],
+  build: {
+    target: 'es2022',
+    sourcemap: true, // readable production stack traces
+  },
+});
+```
+
+Chạy `pnpm build` và mở `dist/stats.html`. Tìm: một dependency to có thể thay (moment → date-fns/Temporal), thư viện import sớm mà nên lazy, hoặc bản trùng của một package do lệch version.
+
+Với thư viện *phải* tải nhưng không ngay, tách vào chunk riêng:
+
+```ts
+build: {
+  rollupOptions: {
+    output: {
+      manualChunks: { charts: ['recharts'] }, // heavy, route-specific
+    },
+  },
+},
+```
+
+### Tóm tắt một dòng
+
+Dùng `rollup-plugin-visualizer` khi `pnpm build` để tìm dep quá to/trùng/sớm, rồi thay, lazy-load, hoặc `manualChunks`.
+
+---
+
+## 6. Bài tập
+
+**1.** Nên xử lý kích thước bundle, fetch dữ liệu, và re-render theo thứ tự nào — và vì sao?
+
+<details>
+<summary>Lời giải</summary>
+
+Bundle → dữ liệu → re-render. Gửi ít JS và fetch sớm/song song cho thắng lợi lớn nhất, phổ quát nhất; chỉnh re-render thường là lợi nhỏ, cục bộ, chỉ đuổi nơi profiler cho thấy chi phí thật.
+</details>
+
+**2.** Prefetch trong loader route loại bỏ waterfall thế nào?
+
+<details>
+<summary>Lời giải</summary>
+
+Không có nó, chunk route tải, component mount, *rồi* `useQuery` mới fetch — nối tiếp. Loader gọi `ensureQueryData` bắt đầu fetch khi điều hướng bắt đầu, nên request dữ liệu và tải chunk lazy song song, và component đọc cache ấm.
+</details>
+
+**3.** Sao ưu tiên selector hẹp và hoisting hơn bọc mọi thứ trong `React.memo`?
+
+<details>
+<summary>Lời giải</summary>
+
+Sửa cấu trúc (subscribe chỉ lát bạn render, đưa data/component tĩnh lên) chặn re-render tại nguồn không chi phí kéo dài. `React.memo` thêm so sánh props mỗi render và chỉ giúp khi props thật ổn định và component đắt — lạm dụng thêm phức tạp mà ít lợi.
+</details>
+
+Nâng cao:thêm hover-prefetch cho hàng bảng customer và loader `ensureQueryData` cho `CustomerDetailPage`, rồi xác nhận ở tab Network rằng dữ liệu chi tiết ấm trước khi route render.
+
+---
+
+## Điểm chính
+
+- Tối ưu theo thứ tự: **bundle → dữ liệu → re-render**; đo trước mỗi bước.
+- Chia code ở route và component nặng; bọc nội dung lazy trong `Suspense`.
+- **Prefetch** khi hover và trong loader để diệt waterfall khi vào.
+- Sửa re-render bằng cấu trúc; dùng **bundle visualizer** để tìm thứ cắt.
+
+---
+
+## Tiếp theo
+
+**Phần 11 — Test & chất lượng**: chốt lại bằng Vitest + React Testing Library + MSW — mock API ở tầng mạng, test validate form, một query hook, và rollback mutation optimistic, rồi nối oxlint + typecheck + test thành cổng chất lượng.

@@ -1,0 +1,170 @@
+---
+title: 'Web Performance · Part 12 — Capstone: Audit, Budget & CI Monitoring'
+description: 'Combine all 11 parts into a real A–Z audit workflow, set concrete performance budgets, and block regressions with Lighthouse CI plus RUM alerts. Includes a full checklist.'
+pubDate: 2026-09-09
+tags: [performance, audit, budget, lighthouse-ci, web_perf_12]
+series: web-perf
+seriesOrder: 12
+draft: true
+---
+
+Mười một phần trước cho bạn từng kỹ thuật. Phần này biến chúng thành một **quy trình lặp lại**: audit một trang, sửa theo thứ tự ưu tiên, đặt budget để giữ thành quả, và tự động chặn hồi quy trong CI. Đây là cách hiệu năng trở thành kỷ luật, không phải đợt "tổng vệ sinh" một lần rồi trôi.
+
+---
+
+## 1. Quy trình audit một trang thật
+
+Theo đúng tinh thần "đo trước, sửa sau" (Phần 1):
+
+### Bước 1 — Đo field trước (có thật sự là vấn đề?)
+
+Mở CrUX/PageSpeed Insights hoặc RUM (Phần 3). Trang này có **trượt CWV với người dùng thật** không? Chỉ số nào (LCP/INP/CLS)? Trên thiết bị/mạng nào (cắt theo p75)? Đây xác định *có nên sửa* và *sửa cái gì*.
+
+### Bước 2 — Tái hiện & chẩn đoán bằng lab
+
+Chạy Lighthouse + tab Performance với **throttle CPU 4× + Slow 4G** (Phần 3). Đọc:
+
+- LCP cao → phần tử LCP là gì? Thành phần nào lớn (TTFB / load delay / load time / render delay)? (Phần 5)
+- INP cao → long task nào chặn main thread? (Phần 6)
+- CLS cao → node nào nhảy (xem `sources`)? (Phần 7)
+
+### Bước 3 — Sửa theo thứ tự ROI
+
+Sửa bottleneck lớn nhất trước. Bản đồ "triệu chứng → phần":
+
+| Triệu chứng | Xem phần |
+|-------------|----------|
+| High TTFB | 5 (CDN/cache/SSG), 11 |
+| Slow LCP image | 5, 9 (format, preload, fetchpriority) |
+| Long task / INP | 6 (yield, worker), 8 (bundle) |
+| Layout shift | 7 (dimensions, size-adjust), 10 (font) |
+| JS too heavy | 8 (split, tree shake) |
+| Reload still slow | 11 (caching) |
+
+### Bước 4 — Đo lại & xác nhận
+
+Sau mỗi thay đổi, đo lại (lab để xác nhận cơ chế, field để xác nhận tác động thật). Đừng gộp 5 thay đổi rồi đo một lần — bạn sẽ không biết cái nào hiệu quả.
+
+---
+
+## 2. Performance Budget: chốt ngưỡng để không trôi
+
+Tối ưu xong mà không có budget thì vài sprint sau lại chậm (ai đó thêm thư viện nặng). **Budget** là ngưỡng bạn cam kết không vượt. Ba loại:
+
+| Loại budget | Ví dụ ngưỡng |
+|-------------|--------------|
+| **Metric** | LCP < 2.5s, INP < 200ms, CLS < 0.1 |
+| **Size** | JS ≤ 170KB (gzip), total images ≤ 500KB/page |
+| **Count** | ≤ 50 requests, ≤ 1 critical font file |
+
+Khai báo budget cho công cụ tự kiểm:
+
+```json
+// budget.json — Lighthouse reads this to fail when exceeded
+[
+  {
+    "path": "/*",
+    "resourceSizes": [
+      { "resourceType": "script", "budget": 170 },
+      { "resourceType": "image", "budget": 500 },
+      { "resourceType": "total", "budget": 1000 }
+    ],
+    "timings": [
+      { "metric": "largest-contentful-paint", "budget": 2500 },
+      { "metric": "cumulative-layout-shift", "budget": 100 }
+    ]
+  }
+]
+```
+
+---
+
+## 3. Lighthouse CI: chặn hồi quy tự động
+
+Đặt budget rồi phải có ai đó *gác cổng*. Lighthouse CI chạy trong pipeline, fail build nếu vượt budget — biến hiệu năng thành một phần của code review.
+
+```yaml
+# .github/workflows/perf.yml
+name: Performance
+on: [pull_request]
+jobs:
+  lighthouse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci && npm run build
+      - name: Lighthouse CI
+        run: |
+          npm install -g @lhci/cli
+          lhci autorun
+```
+
+```js
+// lighthouserc.js — threshold "assert" configuration
+export default {
+  ci: {
+    collect: { staticDistDir: './dist', numberOfRuns: 3 }, // run 3 times, take median
+    assert: {
+      assertions: {
+        'categories:performance': ['error', { minScore: 0.9 }],
+        'largest-contentful-paint': ['error', { maxNumericValue: 2500 }],
+        'cumulative-layout-shift': ['error', { maxNumericValue: 0.1 }],
+        'total-blocking-time': ['warn', { maxNumericValue: 300 }], // lab proxy for INP
+      },
+    },
+  },
+};
+```
+
+> Lighthouse CI là **lab** — nó chặn hồi quy *cơ chế* (bundle phình, ảnh không tối ưu). Nhưng nhớ: nó không thay field data. Hãy ghép với cảnh báo RUM.
+
+---
+
+## 4. Giám sát RUM liên tục (field)
+
+Lab chặn hồi quy lúc build; RUM (Phần 3) cho bạn biết *thực tế người dùng* sau khi deploy. Thiết lập:
+
+- Thu LCP/INP/CLS qua `web-vitals` → gửi `sendBeacon` về backend.
+- Dashboard tính **p75 theo route + thiết bị**.
+- **Cảnh báo** khi p75 một chỉ số vượt ngưỡng (ví dụ INP p75 > 200ms ở route checkout) → điều tra ngay.
+
+Đây khép kín vòng lặp: budget + Lighthouse CI ngăn hồi quy *trước* khi lên production; RUM bắt vấn đề *thật* mà lab không thấy (thiết bị/mạng đa dạng).
+
+---
+
+## 5. Checklist hiệu năng tổng hợp (cả series)
+
+Mang theo khi audit bất kỳ trang nào:
+
+Đo lường
+1. Có field data (CrUX/RUM) xác định vấn đề & route chưa? (Phần 1, 3)
+2. Đã profile với throttle CPU 4× + Slow 4G? (Phần 3)
+
+**Loading & LCP**
+3. TTFB thấp (CDN/cache/SSG)? (Phần 5, 11)
+4. Ảnh LCP: `<img>` thật, `fetchpriority="high"`, preload, **không** lazy? (Phần 5, 9)
+5. CSS critical inline, JS `defer`/split? (Phần 4, 8)
+
+**Interactivity & INP**
+6. Không còn long task lớn (yield/worker)? (Phần 6)
+7. Bundle đã đo, split theo route, tree-shake? (Phần 8)
+
+**Stability & CLS**
+8. Ảnh/video/iframe có kích thước; nội dung động chừa chỗ? (Phần 7, 9)
+9. Font: woff2, swap, preload, `size-adjust`? (Phần 10)
+
+**Network**
+10. Asset hash cache immutable, HTML revalidate, Brotli, HTTP/2-3? (Phần 11)
+
+Kỷ luật
+11. Có performance budget + Lighthouse CI + cảnh báo RUM? (bài này)
+
+---
+
+## Kết series
+
+Hiệu năng web không phải phép thuật, cũng không phải một lần "tối ưu cho xong". Nó là một **vòng lặp kỷ luật**: đo người dùng thật → chẩn đoán bằng lab → sửa bottleneck lớn nhất → chốt bằng budget → tự động gác cổng trong CI → giám sát lại bằng RUM. Mỗi kỹ thuật trong 12 phần chỉ là công cụ; điều biến bạn thành kỹ sư hiệu năng là **quy trình** dùng chúng.
+
+Hãy chọn một trang quan trọng nhất trong sản phẩm của bạn, chạy quy trình audit ở mục 1, và sửa đúng một bottleneck lớn nhất. Đo lại, thấy con số cải thiện — đó là cách kiến thức này thành phản xạ. Cảm ơn bạn đã đi hết series.

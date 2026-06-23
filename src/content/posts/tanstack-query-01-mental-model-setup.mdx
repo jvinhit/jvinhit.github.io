@@ -1,0 +1,314 @@
+---
+title: 'TanStack Query · Phần 1 — Mental Model & Cài đặt'
+description: 'Mở màn series: server state là gì và vì sao nó khác client state, vì sao đừng tự viết fetch + useEffect + useState, rồi cài QueryClient + Provider + Devtools và viết useQuery đầu tiên.'
+pubDate: 2026-06-22
+tags: [react, tanstack-query, react-query, data-fetching, tanstack_query_8]
+series: tanstack-query
+seriesOrder: 1
+draft: false
+---
+
+Gần như mọi app React đều phải lấy dữ liệu từ server: danh sách user, chi tiết sản phẩm, thông báo... Và gần như ai cũng bắt đầu bằng `useEffect` + `useState`. Nó *chạy được*, nhưng rồi bạn phải tự viết lại cache, chống request trùng, retry, refetch nền, chống race condition... ở **mọi màn hình**. Đó chính là khoảng trống mà **TanStack Query** (tên cũ: React Query) lấp đầy.
+
+Series này (8 phần) đưa bạn từ "fetch tay bằng useEffect" đến chỗ tự tin dùng React Query v5 trong dự án thật — có cache, có optimistic update, có test. Phần 1 đặt nền: tư duy đúng về **server state**, rồi cài đặt và viết query đầu tiên.
+
+| Phần | Chủ đề |
+|------|--------|
+| 1 | Mental model & cài đặt (bài này) |
+| 2 | `useQuery` sâu, `staleTime`/`gcTime` & vòng đời cache |
+| 3 | Query keys, API client (zod) & `queryOptions` |
+| 4 | Pagination & `useInfiniteQuery` |
+| 5 | Mutations & invalidation |
+| 6 | Optimistic updates & quản lý cache |
+| 7 | Error handling, retry, Suspense & performance |
+| 8 | Testing & capstone (CRUD hoàn chỉnh) |
+
+> Phiên bản dùng trong series: **React 19** + **@tanstack/react-query v5** + **TypeScript strict**. Code không dùng `any`, không `as` (trừ sau khi validate runtime bằng zod).
+
+---
+
+## 1. Server state không phải state của bạn
+
+Đây là bước chuyển tư duy quan trọng nhất. Trong một app, có hai loại "state" hoàn toàn khác bản chất:
+
+- **Client state** — state bạn *sở hữu*: modal đang mở hay đóng, tab đang chọn, giá trị input, theme dark/light. Nó sống trong bộ nhớ trình duyệt, đồng bộ, và chỉ bạn thay đổi. Công cụ: `useState`, `useReducer`, Zustand...
+- **Server state** — state bạn *mượn*: danh sách đơn hàng, hồ sơ user, số dư tài khoản. Nó sống trên **server**, có thể bị **người khác thay đổi** mà bạn không hề biết, và cái bạn cầm trên tay chỉ là một **ảnh chụp (snapshot) đã được cache**.
+
+Server state có những đặc tính mà client state không có:
+
+1. **Bất đồng bộ** — lấy về cần thời gian, có thể lỗi.
+2. **Có thể cũ (stale)** — dữ liệu trên màn hình có thể đã lỗi thời so với server.
+3. **Được chia sẻ** — nhiều component cùng cần một dữ liệu, không nên fetch nhiều lần.
+4. **Cần đồng bộ lại (revalidate)** — khi user quay lại tab, khi mạng kết nối lại, sau khi ghi dữ liệu.
+
+Đặt cạnh nhau cho dễ nhớ:
+
+| | Client state | Server state |
+|---|---|---|
+| Ai sở hữu | Bạn (trong trình duyệt) | Server (bạn chỉ mượn) |
+| Đồng bộ hay bất đồng bộ | Đồng bộ, có ngay | Bất đồng bộ, cần chờ |
+| Có thể cũ không | Không | Có — luôn có thể stale |
+| Ai thay đổi | Chỉ bạn | Bạn *và* người khác |
+| Công cụ phù hợp | `useState`, `useReducer`, Zustand | **TanStack Query** |
+
+Khi bạn cố nhét server state vào `useState`, bạn đang dùng sai công cụ — và phải tự tay viết lại tất cả những thứ trên. React Query được sinh ra để lo đúng phần này.
+
+> **Khi nào *không* cần React Query?** Nếu dữ liệu thuần cục bộ (theme, form đang gõ, trạng thái UI) — đó là client state, dùng `useState`/Zustand. Nếu bạn đã dùng một client GraphQL có cache riêng (Apollo, urql) thì nó đã lo phần server state. React Query toả sáng nhất với REST/fetch và bất kỳ nguồn dữ liệu bất đồng bộ nào chưa có lớp cache.
+
+---
+
+## 2. Vì sao không dùng `useEffect` + `useState`?
+
+### Cách "ngây thơ" ai cũng từng viết
+
+```tsx
+function UserList() {
+  const [data, setData] = useState<User[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+
+  useEffect(() => {
+    setLoading(true);
+    fetch('/api/users')
+      .then((res) => res.json())
+      .then(setData)
+      .catch(setError)
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <Spinner />;
+  if (error) return <p>Lỗi: {error.message}</p>;
+  return <ul>{data.map((u) => <li key={u.id}>{u.name}</li>)}</ul>;
+}
+```
+
+Đoạn này *chạy được* nhưng thiếu rất nhiều thứ, và bạn sẽ phải tự thêm từng cái:
+
+- **Không có cache** — mỗi lần component mount lại là fetch lại từ đầu, kể cả vừa fetch xong 2 giây trước.
+- **Không dedup (gộp request)** — hai component cùng cần `/api/users` mount cùng lúc → hai request giống hệt nhau.
+- **Không refetch nền** — dữ liệu cũ cứ nằm đó mãi, không tự làm mới khi user quay lại tab.
+- **Không retry** — mạng chập một cái là hiện lỗi luôn, không thử lại.
+- **Có race condition** — nếu tham số đổi giữa chừng (vd ô search), response cũ có thể về *sau* response mới và **đè** lên dữ liệu đúng.
+
+Cái bẫy race condition đáng sợ nhất vì nó im lặng:
+
+```tsx
+// Khi `query` đổi nhanh, request cũ có thể resolve sau request mới
+useEffect(() => {
+  fetch(`/api/search?q=${query}`)
+    .then((r) => r.json())
+    .then(setResults); // ❌ không có gì đảm bảo đây là response mới nhất
+}, [query]);
+```
+
+Bạn *có thể* sửa bằng cờ `ignore` / `AbortController`, thêm cache bằng `useRef`, thêm retry bằng vòng lặp... Nhưng đến lúc đó bạn đang **tự viết lại React Query**, chỉ là phiên bản tệ hơn và lặp ở mọi màn hình.
+
+### React Query cho bạn cái gì "miễn phí"
+
+Với cùng nhu cầu, bạn viết:
+
+```tsx
+function UserList() {
+  const { data, isPending, isError, error } = useQuery({
+    queryKey: ['users'],
+    queryFn: () => fetch('/api/users').then((r) => r.json()),
+  });
+
+  if (isPending) return <Spinner />;
+  if (isError) return <p>Lỗi: {error.message}</p>;
+  return <ul>{data.map((u) => <li key={u.id}>{u.name}</li>)}</ul>;
+}
+```
+
+Và bạn nhận được sẵn: **cache** theo `queryKey`, **dedup** request trùng, **refetch nền** khi quay lại tab/khi reconnect, **retry** khi lỗi, **chống race condition**, và một bộ trạng thái rõ ràng (`isPending`/`isError`/`data`). Ít code hơn, lại nhiều tính năng hơn.
+
+---
+
+## 3. Cài đặt
+
+*Tài liệu: [TanStack Query — Installation](https://tanstack.com/query/latest/docs/framework/react/installation).*
+
+```bash
+# npm
+npm i @tanstack/react-query
+npm i -D @tanstack/react-query-devtools
+
+# pnpm
+pnpm add @tanstack/react-query
+pnpm add -D @tanstack/react-query-devtools
+```
+
+`@tanstack/react-query` là thư viện chính. `@tanstack/react-query-devtools` là panel debug (chỉ dùng khi dev, không vào bundle production).
+
+---
+
+## 4. Tạo `QueryClient`
+
+`QueryClient` là **bộ não** của React Query: nó giữ cache, biết query nào đang chạy, khi nào cần refetch. Toàn app chỉ cần **một** instance, tạo ở module scope (không tạo lại mỗi lần render).
+
+```ts
+// src/lib/query-client.ts
+import { QueryClient } from '@tanstack/react-query';
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // Dữ liệu được coi là "tươi" trong 60s — trong khoảng này không refetch.
+      // Mặc định là 0 (luôn stale). Đặt > 0 để giảm refetch thừa. (Phần 2 nói kỹ.)
+      staleTime: 60_000,
+      // Cache entry không còn ai dùng sẽ bị dọn sau 5 phút. (Phần 2 nói kỹ.)
+      gcTime: 5 * 60_000,
+      retry: 2, // thử lại 2 lần khi query lỗi (chống chập mạng nhất thời)
+      refetchOnWindowFocus: true, // tự refetch khi user quay lại tab
+    },
+  },
+});
+```
+
+> **Tại sao không `new QueryClient()` ngay trong component App?** Vì mỗi lần App re-render sẽ tạo client mới → mất sạch cache. Luôn tạo ở module scope, hoặc nếu bắt buộc đặt trong component thì bọc bằng `useState(() => new QueryClient())`.
+
+---
+
+## 5. Bọc app bằng `QueryClientProvider`
+
+React Query đẩy `queryClient` xuống cây component qua Context. Đặt provider ở gốc, kèm Devtools:
+
+```tsx
+// src/main.tsx
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
+import { queryClient } from './lib/query-client';
+import App from './App';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <App />
+      {/* Devtools chỉ render ở dev; an toàn để tree-shake khỏi production build */}
+      <ReactQueryDevtools initialIsOpen={false} />
+    </QueryClientProvider>
+  </StrictMode>,
+);
+```
+
+Khi dự án lớn lên, nên tách phần "providers" ra một component riêng cho gọn và dễ test:
+
+```tsx
+// src/app/providers.tsx
+import type { ReactNode } from 'react';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
+import { queryClient } from '@/lib/query-client';
+
+export function Providers({ children }: { children: ReactNode }) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      {children}
+      <ReactQueryDevtools initialIsOpen={false} />
+    </QueryClientProvider>
+  );
+}
+```
+
+---
+
+## 6. Query đầu tiên với `useQuery`
+
+`useQuery` cần tối thiểu hai thứ:
+
+- **`queryKey`** — một mảng định danh dữ liệu này trong cache. Cùng key = cùng cache.
+- **`queryFn`** — hàm async trả về dữ liệu. **Bắt buộc** phải `throw` khi lỗi để React Query biết là thất bại.
+
+```tsx
+// src/features/users/UserList.tsx
+import { useQuery } from '@tanstack/react-query';
+
+type User = { id: number; name: string };
+
+async function fetchUsers(): Promise<User[]> {
+  const res = await fetch('https://jsonplaceholder.typicode.com/users');
+  // fetch KHÔNG tự throw khi HTTP 4xx/5xx — phải tự kiểm tra và throw,
+  // nếu không React Query sẽ tưởng request thành công.
+  if (!res.ok) throw new Error(`Request lỗi: ${res.status}`);
+  return res.json();
+}
+
+export function UserList() {
+  const { data, isPending, isError, error } = useQuery({
+    queryKey: ['users'],
+    queryFn: fetchUsers,
+  });
+
+  if (isPending) return <p>Đang tải…</p>;
+  if (isError) return <p>Có lỗi: {error.message}</p>;
+
+  return (
+    <ul>
+      {data.map((user) => (
+        <li key={user.id}>{user.name}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+Vài điểm cần nhớ ngay từ bài đầu:
+
+- **`queryFn` phải throw khi lỗi.** `fetch` chỉ reject khi mất mạng; với HTTP 404/500 nó vẫn "thành công". Luôn kiểm tra `res.ok`. (Ở Phần 3 ta sẽ gói chuyện này vào một `apiFetch` dùng chung + validate bằng zod.)
+- **Sau khi qua `isPending` và `isError`, TypeScript tự hiểu `data` không còn `undefined`** — bạn map thẳng `data` mà không cần `?.` hay `!`.
+- **`isPending` vs `isLoading`**: trong v5, `isPending` nghĩa là "chưa có dữ liệu nào trong cache". Ta sẽ phân biệt kỹ `status` và `fetchStatus` ở Phần 2.
+
+---
+
+## 7. Mở Devtools để "nhìn thấy" cache
+
+Mở app ở chế độ dev, bạn sẽ thấy logo React Query ở góc màn hình. Bấm vào để xem panel: mỗi query là một dòng kèm `queryKey`, trạng thái (fresh / stale / fetching / inactive), thời điểm cập nhật, và dữ liệu đang cache.
+
+Hãy tập thói quen mở Devtools trong suốt series. Rất nhiều khái niệm trừu tượng (stale, refetch nền, invalidation) sẽ trở nên hiển nhiên khi bạn *nhìn thấy* cache đổi màu theo thời gian thực. Thử ngay: load trang, chuyển sang tab khác rồi quay lại — bạn sẽ thấy query chuyển sang `fetching` (refetch nền nhờ `refetchOnWindowFocus`).
+
+---
+
+## 8. Bài tập
+
+**1.** Trong cách viết "ngây thơ" với `useEffect`, race condition xảy ra khi nào và vì sao React Query miễn nhiễm?
+
+<details>
+<summary>Lời giải</summary>
+
+Race condition xảy ra khi tham số (vd ô search) đổi nhanh: request cũ resolve *sau* request mới và `setState` đè lên dữ liệu mới. React Query miễn nhiễm vì mỗi `queryKey` khác nhau là một query riêng; khi key đổi, kết quả của request cũ thuộc về key cũ và không bao giờ ghi đè dữ liệu của key mới. Ngoài ra Query còn tự huỷ/bỏ qua kết quả lỗi thời.
+</details>
+
+**2.** Vì sao phải kiểm tra `res.ok` và `throw` trong `queryFn`, thay vì cứ `return res.json()`?
+
+<details>
+<summary>Lời giải</summary>
+
+`fetch` chỉ reject promise khi lỗi mạng. Với HTTP 404/500, promise vẫn resolve bình thường, nên nếu không tự kiểm tra `res.ok` và `throw`, React Query sẽ coi đó là *thành công* và đưa nội dung lỗi (vd trang HTML 500) vào `data`. Throw thủ công giúp Query chuyển sang trạng thái `error` và kích hoạt retry.
+</details>
+
+**3.** Tại sao không nên tạo `new QueryClient()` bên trong component App mà không bọc gì?
+
+<details>
+<summary>Lời giải</summary>
+
+Mỗi lần App re-render sẽ tạo một `QueryClient` mới, xoá sạch cache cũ → mọi query refetch lại liên tục. Hãy tạo ở module scope, hoặc nếu cần trong component thì dùng `useState(() => new QueryClient())` để chỉ tạo một lần.
+</details>
+
+**Nâng cao:** Cài React Query vào một project Vite + React mới, fetch danh sách từ `https://jsonplaceholder.typicode.com/users`, mở Devtools và quan sát query đổi trạng thái khi bạn rời tab rồi quay lại.
+
+---
+
+## Tóm tắt
+
+- **Server state ≠ client state.** Server state là ảnh chụp đã cache của dữ liệu sống trên server — bất đồng bộ, có thể cũ, được chia sẻ, cần revalidate.
+- Tự viết `fetch + useEffect + useState` thiếu cache, dedup, retry, refetch nền và an toàn race — đúng những thứ React Query cho sẵn.
+- Cài `@tanstack/react-query`, tạo **một** `QueryClient` ở module scope, bọc app bằng `QueryClientProvider`, thêm Devtools.
+- `useQuery` cần `queryKey` (định danh cache) và `queryFn` (async, **phải throw khi lỗi**). Sau khi chắn `isPending`/`isError`, `data` đã có type chuẩn.
+
+---
+
+## Phần tiếp theo
+
+**Phần 2 — `useQuery` sâu, `staleTime`/`gcTime` & vòng đời cache:** phân biệt `status` (có dữ liệu chưa) với `fetchStatus` (có đang gọi mạng không), xử lý đầy đủ loading/error/empty, và hiểu chính xác hai bộ đếm `staleTime` (độ tươi) vs `gcTime` (tuổi cache) điều khiển khi nào Query refetch và khi nào xoá cache.

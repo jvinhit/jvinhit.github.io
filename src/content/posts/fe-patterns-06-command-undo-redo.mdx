@@ -1,0 +1,221 @@
+---
+title: 'Design Patterns in Frontend · Part 6 — Command (Undo/Redo)'
+description: 'Turn actions into objects for undo/redo, queues, macros, and logging. Build a complete history stack, compare inverse-command vs snapshot-state approaches, and wire it into React.'
+pubDate: 2026-08-04
+tags: [design-patterns, command, undo-redo, behavioral, fe_patterns_12]
+series: fe-patterns
+seriesOrder: 6
+draft: true
+---
+
+Mọi app cho người dùng *chỉnh sửa* thứ gì đó — editor văn bản, công cụ vẽ, form builder, bảng tính — sớm muộn cần **undo/redo**. Pattern đứng sau tính năng này là **Command**: biến mỗi hành động thành một **object** có thể thực thi, hoàn tác, lưu lại, xếp hàng.
+
+---
+
+## 1. Vấn đề: hành động "thực thi rồi quên"
+
+Khi bạn gọi thẳng `addItem()`, `deleteItem()`, hành động xảy ra và **biến mất** — không còn cách nào hoàn tác vì bạn không lưu lại "đã làm gì" và "làm sao đảo ngược".
+
+Command giải quyết bằng cách đóng gói mỗi hành động thành object có hai khả năng: **`execute`** (làm) và **`undo`** (đảo ngược).
+
+```ts
+interface Command {
+  execute(): void;
+  undo(): void;
+  readonly label: string; // for display in history / menu
+}
+```
+
+---
+
+## 2. Một Command cụ thể
+
+Ví dụ thêm/xóa phần tử trong một danh sách. Mỗi command **tự biết cách đảo ngược chính nó**:
+
+```ts
+class AddItemCommand implements Command {
+  readonly label: string;
+  constructor(
+    private list: Item[],
+    private item: Item,
+  ) {
+    this.label = `Add "${item.name}"`;
+  }
+
+  execute(): void {
+    this.list.push(this.item);
+  }
+
+  undo(): void {
+    const index = this.list.indexOf(this.item);
+    if (index !== -1) this.list.splice(index, 1); // precisely reverse what execute did
+  }
+}
+
+class RemoveItemCommand implements Command {
+  readonly label: string;
+  private removedIndex = -1;
+  constructor(
+    private list: Item[],
+    private item: Item,
+  ) {
+    this.label = `Remove "${item.name}"`;
+  }
+
+  execute(): void {
+    this.removedIndex = this.list.indexOf(this.item);
+    if (this.removedIndex !== -1) this.list.splice(this.removedIndex, 1);
+  }
+
+  undo(): void {
+    if (this.removedIndex !== -1) this.list.splice(this.removedIndex, 0, this.item); // re-insert at the original position
+  }
+}
+```
+
+Lưu ý `RemoveItemCommand` **nhớ vị trí cũ** để undo chèn lại đúng chỗ. Mỗi command tự gói đủ thông tin để hoàn tác — đó là tinh thần của pattern.
+
+---
+
+## 3. History Manager: trái tim của undo/redo
+
+`CommandHistory` quản lý hai stack (hoặc một mảng + con trỏ): mọi command đã thực thi và vị trí hiện tại trong lịch sử.
+
+```ts
+class CommandHistory {
+  private history: Command[] = [];
+  private pointer = -1; // points to the most recently executed command
+
+  execute(command: Command): void {
+    command.execute();
+    // Cut off the "future" if we're mid-history and do something new
+    // (like every editor: undo a few steps then type again → old redo branch is gone)
+    this.history = this.history.slice(0, this.pointer + 1);
+    this.history.push(command);
+    this.pointer++;
+  }
+
+  undo(): void {
+    if (!this.canUndo) return;
+    this.history[this.pointer].undo();
+    this.pointer--;
+  }
+
+  redo(): void {
+    if (!this.canRedo) return;
+    this.pointer++;
+    this.history[this.pointer].execute();
+  }
+
+  get canUndo(): boolean {
+    return this.pointer >= 0;
+  }
+
+  get canRedo(): boolean {
+    return this.pointer < this.history.length - 1;
+  }
+}
+```
+
+```ts
+const history = new CommandHistory();
+history.execute(new AddItemCommand(list, item1)); // do
+history.execute(new AddItemCommand(list, item2)); // do
+history.undo(); // undo item2
+history.redo(); // redo item2
+history.execute(new RemoveItemCommand(list, item1)); // new action → redo branch is cut
+```
+
+Chi tiết quan trọng: khi làm việc mới sau khi undo, ta **cắt bỏ phần redo** (`slice`). Đây đúng hành vi mọi editor — và là lỗi hay quên nếu tự code undo/redo lần đầu.
+
+---
+
+## 4. Hai trường phái: Inverse Command vs Snapshot
+
+Có hai cách làm undo, chọn theo bài toán:
+
+| | Inverse command (above) | Snapshot state |
+|---|--------------------------|----------------|
+| Cách làm | mỗi command tự biết `undo` | lưu ảnh chụp toàn bộ state trước/sau |
+| Bộ nhớ | tiết kiệm (chỉ lưu delta) | tốn (lưu cả state mỗi bước) |
+| Độ phức tạp | phải viết `undo` đúng cho từng loại | đơn giản: chỉ gán lại state |
+| Hợp với | hành động rời rạc, dữ liệu lớn | state nhỏ, hoặc state bất biến |
+
+Với state **bất biến** (immutable) — như khi dùng Redux/Immer — snapshot rất rẻ vì các phiên bản chia sẻ cấu trúc (structural sharing). Khi đó undo/redo chỉ là giữ một mảng các snapshot và đổi con trỏ:
+
+```ts
+// Snapshots are very lean with immutable state: just store references to versions
+class SnapshotHistory<S> {
+  private snapshots: S[] = [];
+  private pointer = -1;
+
+  push(state: S): void {
+    this.snapshots = this.snapshots.slice(0, this.pointer + 1);
+    this.snapshots.push(state);
+    this.pointer++;
+  }
+
+  undo(): S | undefined {
+    if (this.pointer > 0) this.pointer--;
+    return this.snapshots[this.pointer];
+  }
+
+  redo(): S | undefined {
+    if (this.pointer < this.snapshots.length - 1) this.pointer++;
+    return this.snapshots[this.pointer];
+  }
+}
+```
+
+---
+
+## 5. Command trong React
+
+Gói history vào một hook để component chỉ cần gọi `execute/undo/redo`:
+
+```tsx
+function useCommandHistory() {
+  const historyRef = useRef(new CommandHistory());
+  const [, forceUpdate] = useReducer((n) => n + 1, 0); // force re-render after external state changes
+
+  return {
+    execute: (cmd: Command) => {
+      historyRef.current.execute(cmd);
+      forceUpdate();
+    },
+    undo: () => {
+      historyRef.current.undo();
+      forceUpdate();
+    },
+    redo: () => {
+      historyRef.current.redo();
+      forceUpdate();
+    },
+    canUndo: historyRef.current.canUndo,
+    canRedo: historyRef.current.canRedo,
+  };
+}
+```
+
+Bind phím tắt là một ứng dụng đẹp của Command — `Ctrl+Z`/`Ctrl+Shift+Z` ánh xạ thẳng vào `undo`/`redo`.
+
+> Command còn dùng cho nhiều thứ ngoài undo: **hàng đợi hành động** (gửi tuần tự khi online lại), **macro** (gộp nhiều command thành một), **log/replay** (ghi lại chuỗi command để tái hiện bug). Mỗi cái đều nhờ việc "hành động giờ là object".
+
+---
+
+## 6. Khi nào KHÔNG dùng
+
+- App **chỉ đọc** hoặc không có thao tác chỉnh sửa cần hoàn tác → không cần Command.
+- Undo cho state cực đơn giản → snapshot vài dòng có thể đủ, không cần hệ thống command đầy đủ.
+- Cẩn thận **rò rỉ bộ nhớ**: history giữ tham chiếu tới object; giới hạn độ dài lịch sử (ví dụ 100 bước gần nhất) để không phình mãi.
+
+---
+
+## Tóm tắt
+
+- **Command** biến hành động thành object có `execute` + `undo` — nền của undo/redo, hàng đợi, macro, log.
+- **CommandHistory** dùng con trỏ trên mảng; nhớ **cắt nhánh redo** khi làm việc mới sau undo.
+- Hai trường phái: **inverse command** (tiết kiệm bộ nhớ, phải viết undo) vs **snapshot** (đơn giản, hợp state bất biến).
+- Trong React, gói vào hook; bind phím tắt ánh xạ thẳng vào undo/redo. Giới hạn độ dài lịch sử để tránh rò rỉ.
+
+**Phần tiếp theo:** Facade & Adapter — bọc API/SDK phức tạp sau giao diện sạch và chống vendor lock-in.

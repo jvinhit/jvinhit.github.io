@@ -1,0 +1,265 @@
+---
+title: 'Service Workers · Phần 3 — Fetch event & chặn request'
+description: 'Trái tim của service worker: event fetch và respondWith. Đọc Request, tạo Response, hiểu request mode/destination, xử lý lỗi mạng, khi nào nên và không nên chặn, đặt nền cho mọi caching strategy.'
+pubDate: 2026-06-25
+tags: [service-worker, fetch, network, frontend, service_workers_10]
+series: service-workers
+seriesOrder: 3
+draft: false
+---
+
+Đây là phần khiến service worker trở nên đặc biệt. Web Worker không làm được, AppCache cũng không: **chặn từng request mạng và tự quyết định trả lời**. Toàn bộ sức mạnh offline, tốc độ, và caching strategy của các phần sau đều xây trên một event duy nhất — `fetch` — và một method duy nhất — `event.respondWith()`.
+
+Bài này ta đào sâu vào cơ chế đó: `Request` và `Response` hoạt động ra sao, khi nào nên chặn, và những cạm bẫy phổ biến khiến app vỡ.
+
+---
+
+## Event `fetch` — SW nghe mọi request
+
+Khi service worker đang **control** một trang, **mọi** request từ trang đó đều phát ra event `fetch` trong SW: tải HTML, CSS, JS, ảnh, gọi API, font... tất cả.
+
+```js
+self.addEventListener('fetch', (event) => {
+  console.log('[SW] fetch:', event.request.method, event.request.url);
+});
+```
+
+`event.request` là một đối tượng **`Request`** — bất biến (immutable), chứa mọi thông tin về request: URL, method, headers, mode, credentials... Nếu bạn **không làm gì**, request đi ra mạng bình thường (default behavior). Service worker chỉ thay đổi cuộc chơi khi bạn gọi `respondWith()`.
+
+---
+
+## `event.respondWith()` — chiếm quyền trả lời
+
+`respondWith()` nhận vào một `Response` (hoặc Promise resolve thành `Response`) và bảo trình duyệt: "dùng cái này, đừng đi ra mạng".
+
+```js
+self.addEventListener('fetch', (event) => {
+  event.respondWith(
+    // Trả về một Response tự chế cho MỌI request
+    new Response('Hello from SW', {
+      headers: { 'Content-Type': 'text/plain' },
+    })
+  );
+});
+```
+
+Hai quy tắc sống còn:
+
+1. **Phải gọi `respondWith()` đồng bộ** (synchronously) trong handler. Không được `await` thứ gì rồi mới gọi. Nếu cần async, hãy truyền **một Promise** vào trong `respondWith()`:
+
+```js
+self.addEventListener('fetch', (event) => {
+  // ✅ ĐÚNG: gọi respondWith ngay, truyền vào một async function
+  event.respondWith(handleRequest(event.request));
+});
+
+async function handleRequest(request) {
+  const cached = await caches.match(request);
+  return cached || fetch(request);
+}
+```
+
+```js
+self.addEventListener('fetch', async (event) => {
+  // ❌ SAI: await trước khi gọi respondWith → trình duyệt đã đi ra mạng mất rồi
+  const cached = await caches.match(event.request);
+  event.respondWith(cached || fetch(event.request));
+});
+```
+
+2. **Nếu Promise trong `respondWith()` reject**, người dùng sẽ thấy lỗi mạng (như khi mất kết nối). Vì vậy luôn có fallback và `try/catch`.
+
+---
+
+## Hiểu `Request` — không phải request nào cũng giống nhau
+
+Trước khi chặn, bạn cần biết mình đang chặn cái gì. `Request` có vài thuộc tính cực hữu ích để ra quyết định:
+
+```js
+self.addEventListener('fetch', (event) => {
+  const { request } = event;
+
+  console.log(request.method);      // GET, POST, ...
+  console.log(request.url);         // URL đầy đủ
+  console.log(request.mode);        // 'navigate' | 'cors' | 'no-cors' | 'same-origin'
+  console.log(request.destination); // 'document' | 'script' | 'style' | 'image' | 'font' | ...
+});
+```
+
+- **`request.method`** — chỉ nên cache `GET`. Đừng bao giờ cache `POST/PUT/DELETE` (chúng thay đổi dữ liệu trên server).
+- **`request.mode === 'navigate'`** — đây là request tải một **trang HTML** (người dùng điều hướng). Cực quan trọng cho offline fallback (Phần 5).
+- **`request.destination`** — cho biết tài nguyên dùng để làm gì (`image`, `script`, `style`, `font`). Giúp bạn áp strategy khác nhau cho từng loại (ví dụ: ảnh thì cache-first, API thì network-first).
+
+### Lọc request trước khi xử lý
+
+Một thói quen tốt: chỉ can thiệp request bạn thật sự muốn, để yên phần còn lại.
+
+```js
+self.addEventListener('fetch', (event) => {
+  const { request } = event;
+
+  // Bỏ qua mọi request không phải GET — để trình duyệt xử lý mặc định.
+  if (request.method !== 'GET') return;
+
+  // Bỏ qua request sang origin khác nếu không muốn dính líu (tùy chiến lược).
+  const url = new URL(request.url);
+  if (url.origin !== self.location.origin) return;
+
+  event.respondWith(handleRequest(request));
+});
+```
+
+> Khi bạn `return` mà không gọi `respondWith()`, request đi ra mạng như thường. Đây là cách "từ chối can thiệp" sạch sẽ.
+
+---
+
+## Hiểu `Response` — và cái bẫy "dùng một lần"
+
+`Response` là kết quả trả về. Bạn có thể tạo mới, hoặc lấy từ `fetch()`/cache. Có **một cạm bẫy chí mạng** mọi người đều dính một lần:
+
+> **Response body chỉ đọc được MỘT lần.** Nếu bạn vừa muốn trả response về cho trang, vừa muốn lưu nó vào cache, bạn phải `clone()` trước.
+
+```js
+async function networkThenCache(request) {
+  const response = await fetch(request);
+
+  // Body là stream, đọc một lần là hết. Phải clone TRƯỚC khi dùng.
+  const copy = response.clone();
+
+  const cache = await caches.open('runtime');
+  // Lưu bản sao vào cache (không await để không chặn việc trả response).
+  cache.put(request, copy);
+
+  return response; // trả bản gốc về cho trang
+}
+```
+
+Quên `clone()` sẽ gây lỗi `Failed to execute 'put' on 'Cache': Response body is already used`.
+
+### Tạo Response tự chế
+
+Bạn có thể "chế" bất kỳ response nào — hữu ích cho trang offline, ảnh placeholder, JSON giả:
+
+```js
+// Response text
+new Response('Bạn đang offline', { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+
+// Response JSON
+new Response(JSON.stringify({ error: 'offline' }), {
+  status: 503,
+  headers: { 'Content-Type': 'application/json' },
+});
+
+// Response chuyển hướng
+Response.redirect('/offline.html', 302);
+```
+
+---
+
+## Một fetch handler "đời thực" đầu tiên
+
+Ghép tất cả lại: cache-first đơn giản cho cùng origin, có fallback khi lỗi mạng. (Phần 4 sẽ hệ thống hóa các strategy; đây là để bạn thấy bức tranh.)
+
+```js
+self.addEventListener('fetch', (event) => {
+  const { request } = event;
+  if (request.method !== 'GET') return;
+
+  event.respondWith(
+    (async () => {
+      // 1. Thử cache trước
+      const cached = await caches.match(request);
+      if (cached) return cached;
+
+      // 2. Không có thì ra mạng
+      try {
+        const response = await fetch(request);
+
+        // 3. Lưu lại bản sao cho lần sau (chỉ cache response hợp lệ)
+        if (response.ok) {
+          const copy = response.clone();
+          const cache = await caches.open('runtime-v1');
+          cache.put(request, copy);
+        }
+        return response;
+      } catch (error) {
+        // 4. Mạng lỗi và không có cache → trả fallback
+        return new Response('Tài nguyên không khả dụng khi offline', {
+          status: 503,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+        });
+      }
+    })()
+  );
+});
+```
+
+---
+
+## Khi nào KHÔNG nên chặn
+
+Service worker mạnh, nhưng chặn bừa sẽ gây rắc rối. Tránh can thiệp:
+
+- **Request không phải GET** — cache POST/PUT/DELETE là sai về mặt ngữ nghĩa.
+- **Request có `Range` header** (video/audio streaming) — chúng cần xử lý byte-range; cache ngây thơ sẽ làm vỡ tua video.
+- **Request tới analytics/tracking** thường nên đi thẳng mạng (hoặc dùng Background Sync ở Phần 7).
+- **Cross-origin request bạn không kiểm soát** — coi chừng **opaque response** (response từ origin khác ở mode `no-cors`): bạn không đọc được nội dung, `response.ok` luôn `false`, và nó chiếm dung lượng cache rất lớn (sẽ bàn kỹ ở Phần 6).
+
+> Nguyên tắc: **chỉ chặn cái bạn hiểu rõ**. Mọi request khác hãy `return` để trình duyệt lo.
+
+---
+
+## Debug fetch trong DevTools
+
+- Tab **Network**: cột **Size** ghi `(ServiceWorker)` nghĩa là response đến từ SW chứ không phải mạng. Đây là cách nhanh nhất xác nhận SW đang phục vụ.
+- Tích **Application → Service Workers → Bypass for network** để tạm vô hiệu SW, so sánh hành vi.
+- Mở thêm một Network panel "của service worker": trong một số phiên bản DevTools, request do SW tự `fetch()` ra mạng hiện như một luồng riêng — đừng nhầm với request gốc của trang.
+
+---
+
+## Tóm tắt
+
+- Khi SW control trang, **mọi request** phát event `fetch`; không gọi `respondWith()` thì request đi ra mạng như thường.
+- `event.respondWith()` phải gọi **đồng bộ**, truyền vào một `Response` hoặc Promise. Promise reject → người dùng thấy lỗi mạng.
+- Dùng `request.method`, `request.mode` (`navigate`), `request.destination` để **ra quyết định** theo loại request. Chỉ cache `GET`.
+- **`Response` body đọc một lần** — phải `clone()` trước khi vừa trả vừa cache.
+- Tạo được Response tự chế (text/JSON/redirect) cho offline fallback.
+- **Không chặn bừa**: bỏ qua non-GET, `Range`, analytics, và cross-origin/opaque mà bạn không hiểu.
+
+---
+
+## Bài tập thực hành
+
+### Bài 1 — Logger phân loại request (cơ bản)
+
+Viết fetch handler **chỉ log, không chặn**, in ra `method`, `destination`, và liệu request là same-origin hay cross-origin cho mỗi request.
+
+**Hướng dẫn:** Dùng `new URL(request.url).origin === self.location.origin`. Load một trang có ảnh + CSS + một lời gọi `fetch()` tới API ngoài (ví dụ `https://api.github.com`). Quan sát `destination` khác nhau (`image`, `style`, `document`, `''` cho fetch API). Mục tiêu là "đọc" được traffic trước khi can thiệp.
+
+### Bài 2 — Chặn có chọn lọc (trung bình)
+
+Chặn **chỉ** request ảnh (`request.destination === 'image'`): nếu mạng lỗi, trả về một ảnh SVG placeholder tự chế.
+
+**Hướng dẫn:**
+
+```js
+const PLACEHOLDER = `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="150">
+  <rect width="100%" height="100%" fill="#222"/>
+  <text x="50%" y="50%" fill="#c8ff00" text-anchor="middle">offline</text>
+</svg>`;
+
+// trong handler, khi destination === 'image' và fetch fail:
+return new Response(PLACEHOLDER, { headers: { 'Content-Type': 'image/svg+xml' } });
+```
+
+Test bằng cách bật **Offline** trong tab Network rồi reload — ảnh hỏng sẽ được thay bằng placeholder. Các tài nguyên khác vẫn báo lỗi bình thường (vì bạn chỉ chặn ảnh).
+
+### Bài 3 — Clone đúng cách (nâng cao)
+
+Viết handler network-first có cache: ra mạng trước, lưu bản sao vào cache; nếu mạng lỗi thì lấy từ cache. **Cố tình quên `clone()`** để gặp lỗi, đọc thông báo lỗi, rồi sửa lại cho đúng.
+
+**Hướng dẫn:** Lỗi bạn sẽ thấy là `Response body is already used`. Việc tự gặp lỗi này một lần sẽ giúp bạn không bao giờ quên `clone()` nữa. Sau khi sửa, xác nhận trong tab Network rằng lần thứ hai (offline) response đến từ `(ServiceWorker)`/cache. Đây chính là strategy ta sẽ chính thức hóa ở Phần 4.
+
+---
+
+**Phần tiếp theo:** Cache API & caching strategies — ta sẽ hệ thống hóa cache-first, network-first, stale-while-revalidate, cache-only, network-only, và biết chọn strategy nào cho loại tài nguyên nào.

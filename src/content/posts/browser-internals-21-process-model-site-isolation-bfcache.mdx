@@ -1,0 +1,141 @@
+---
+title: 'How Browsers Work · Part 21 — Process Model Deep: Site Isolation, BFCache & Prerender'
+description: 'Mô hình đa tiến trình ở mức sâu: Site Isolation và OOPIF, Back/Forward Cache, prerender và Speculation Rules, cùng Page Lifecycle API quản lý tài nguyên giữa các tab.'
+pubDate: 2026-11-14
+tags: [browser, internals, process-model, performance, browser_internals_12]
+series: browser-internals
+seriesOrder: 21
+draft: true
+---
+
+Phần 1 và Phần 11 giới thiệu kiến trúc đa tiến trình. Phần này đi sâu vào các cơ chế hiện đại dựng trên nền đó: **Site Isolation** (mỗi site một process), **BFCache** (đóng băng cả trang để back/forward tức thì), và **prerender** (dựng trước trang sắp tới). Đây là những tính năng định hình hiệu năng điều hướng và bảo mật trên web hiện đại.
+
+---
+
+## 1. Site Isolation — mỗi site một tiến trình
+
+Mặc định Chrome đặt **mỗi site vào một renderer process riêng**, kể cả khi site đó nằm trong iframe của trang khác. Mục tiêu: ngay cả khi Spectre cho phép đọc bộ nhớ trong process, kẻ tấn công cũng không đọc được dữ liệu của site khác — vì nó ở process khác.
+
+```text
+Trang a.com nhúng iframe b.com:
+
+┌─ Renderer process (a.com) ─┐   ┌─ Renderer process (b.com) ─┐
+│  document a.com            │   │  iframe b.com (OOPIF)      │
+└────────────────────────────┘   └────────────────────────────┘
+        cùng hiển thị trên một tab, nhưng bộ nhớ tách biệt
+```
+
+Iframe khác site chạy trong process riêng gọi là **OOPIF** (Out-of-Process Iframe). "Site" ở đây là eTLD+1 (vd `example.com`), không phải full origin. Hệ quả: cross-origin data không bao giờ nằm chung process với code có thể bị khai thác — đây cũng là nền của cross-origin isolation (Phần 20).
+
+---
+
+## 2. BFCache — đóng băng cả trang
+
+**Back/Forward Cache** giữ một snapshot *đầy đủ, đang sống* của trang (DOM, JS heap, cả call stack tạm dừng) trong bộ nhớ khi bạn điều hướng đi. Bấm Back → trang **khôi phục tức thì** thay vì tải lại từ đầu.
+
+```text
+Rời trang A → B:
+  Không BFCache:  A bị huỷ. Back → tải A lại từ mạng (chậm).
+  Có BFCache:     A bị "đóng băng" trong bộ nhớ. Back → rã đông, hiện ngay (~tức thì).
+```
+
+Vào/ra BFCache phát sự kiện `pageshow`/`pagehide` với cờ `persisted`:
+
+```js
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted) refreshTimestamp(); // trang vừa khôi phục từ BFCache → làm tươi dữ liệu
+});
+```
+
+Những gì *chặn* BFCache (nên tránh nếu muốn back/forward tức thì):
+
+- Listener `unload` (đã lỗi thời — dùng `pagehide` thay thế).
+- Kết nối mở: `Cache-Control: no-store`, đôi khi WebSocket/IndexedDB transaction đang mở.
+- Header `Cache-Control: no-store` trên tài liệu chính.
+
+> Đừng dùng sự kiện `unload`. Nó vừa không đáng tin (không chạy trên mobile) vừa làm trang mất tư cách vào BFCache. Dùng `visibilitychange`/`pagehide`.
+
+---
+
+## 3. Page Lifecycle — trình duyệt quản lý tài nguyên tab
+
+Trình duyệt chủ động *đóng băng* và thậm chí *loại bỏ* (discard) tab nền để tiết kiệm CPU/RAM. **Page Lifecycle API** cho trang biết trạng thái của mình:
+
+```text
+ACTIVE ──► PASSIVE ──► HIDDEN ──► FROZEN ──► (TERMINATED / DISCARDED)
+ (đang dùng)          (tab nền)   (CPU bị dừng)
+```
+
+```js
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    saveStateNow();         // lưu ngay — có thể bị freeze/discard sau đó
+    flushAnalytics();       // dùng sendBeacon, không fetch thường
+  }
+});
+document.addEventListener('freeze', () => releaseResources()); // sắp bị đóng băng
+document.addEventListener('resume', () => reconnect());        // được rã đông
+```
+
+Quy tắc vàng: coi `visibilitychange → hidden` là "cơ hội cuối để lưu", vì freeze/discard có thể tới mà không báo thêm.
+
+---
+
+## 4. Prerender & Speculation Rules — dựng trước trang sau
+
+Trình duyệt hiện đại có thể **prerender** (dựng sẵn toàn bộ) một trang bạn *có thể* sắp vào, trong một process ẩn. Khi bạn thật sự điều hướng tới → hiện gần như tức thì. Điều khiển bằng **Speculation Rules**:
+
+```html
+<script type="speculationrules">
+{
+  "prerender": [{
+    "where": { "href_matches": "/product/*" },
+    "eagerness": "moderate"
+  }],
+  "prefetch": [{
+    "where": { "selector_matches": "a.next" },
+    "eagerness": "eager"
+  }]
+}
+</script>
+```
+
+- **prefetch**: tải trước *tài liệu* (rẻ, an toàn).
+- **prerender**: dựng *cả trang* (chạy JS, render) trong process ẩn — mạnh nhưng tốn tài nguyên.
+- `eagerness`: `immediate`/`eager`/`moderate`/`conservative` — đánh đổi tốc độ vs lãng phí.
+
+Trang được prerender chạy với `document.prerendering === true`; nên hoãn việc có side-effect (analytics, ghi log) tới khi `prerenderingchange`:
+
+```js
+if (document.prerendering) {
+  document.addEventListener('prerenderingchange', () => sendAnalytics(), { once: true });
+} else {
+  sendAnalytics(); // đã là điều hướng thật
+}
+```
+
+---
+
+## 5. Hệ quả thực tế cho developer
+
+```text
+Bảo mật:   Site Isolation/OOPIF → cross-origin data tách process (kết hợp COOP/COEP).
+Back/Fwd:  giữ trang đủ điều kiện BFCache → bỏ 'unload', tránh 'no-store' không cần thiết.
+Tab nền:   xử lý visibilitychange/freeze/resume → lưu sớm, nhả tài nguyên.
+Điều hướng: Speculation Rules để prefetch/prerender → vào trang sau tức thì.
+Đo lường:  phân biệt prerender vs điều hướng thật để analytics không sai lệch.
+```
+
+Tất cả đều xây trên một ý tưởng: trình duyệt quản lý *nhiều trang ở nhiều giai đoạn sống* cùng lúc, và cho web app các hook để hợp tác.
+
+---
+
+## 6. Tóm tắt
+
+- **Site Isolation** đặt mỗi site vào process riêng; iframe khác site thành **OOPIF** → cross-origin data tách biệt bộ nhớ (nền của cross-origin isolation).
+- **BFCache** đóng băng cả trang (DOM + heap) để back/forward tức thì; nghe `pageshow.persisted`, tránh `unload` và `no-store` không cần thiết.
+- **Page Lifecycle** (active→passive→hidden→frozen→discarded): coi `visibilitychange→hidden` là cơ hội cuối để lưu; nghe `freeze`/`resume`.
+- **Speculation Rules** cho prefetch (tải tài liệu) và prerender (dựng cả trang trong process ẩn); chỉnh `eagerness` để cân tốc độ vs lãng phí.
+- Hoãn side-effect khi `document.prerendering` cho tới `prerenderingchange` để không làm sai analytics.
+
+**Phần tiếp theo:** Capstone 2 — ghép mọi tầng nội bộ lại bằng profiling end-to-end: đọc Performance panel/Perfetto, quy trách một jank cụ thể về đúng process/thread/giai đoạn của pipeline.

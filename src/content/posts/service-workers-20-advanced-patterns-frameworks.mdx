@@ -1,0 +1,220 @@
+---
+title: 'Service Workers · Phần 20 — Patterns nâng cao & tích hợp framework (Capstone 2)'
+description: 'Service worker trong Next.js/Astro/Angular, runtime caching cho API có auth & token refresh, hàng đợi analytics offline, feature flag & kill switch, và khi nào KHÔNG nên dùng service worker. Tổng kết 20 phần.'
+pubDate: 2026-07-29
+tags: [service-worker, nextjs, patterns, capstone, service_workers_10]
+series: service-workers
+seriesOrder: 20
+draft: false
+---
+
+Đây là **bài kết** của hành trình 20 phần. Phần 10 đã build một PWA hoàn chỉnh; mười phần chuyên sâu sau đó cho bạn từng năng lực production. Phần này lắp chúng vào **thế giới thật** — nơi service worker phải sống chung với framework, API có auth, analytics, và quan trọng nhất: nơi bạn phải biết **khi nào đừng dùng nó**.
+
+Mục tiêu cuối: rời series với khả năng đánh giá *có nên thêm SW không*, và nếu có thì triển khai tử tế trong bất kỳ stack nào.
+
+---
+
+## 1. Service worker trong framework hiện đại
+
+Bạn hiếm khi viết `sw.js` thuần trong dự án thật — framework có lối riêng:
+
+| Framework | Cách phổ biến |
+|---|---|
+| **Vite (React/Vue/Svelte)** | `vite-plugin-pwa` (Phần 9) — `generateSW` hoặc `injectManifest` |
+| **Next.js** | `@serwist/next` (kế thừa next-pwa) hoặc tự đăng ký + Workbox |
+| **Astro** | `@vite-pwa/astro` (cùng nền vite-plugin-pwa) |
+| **Angular** | `@angular/service-worker` (`ng add @angular/pwa`) — cấu hình qua `ngsw-config.json` |
+| **Nuxt** | `@vite-pwa/nuxt` |
+
+Điểm chung: tất cả đều dựa trên Workbox bên dưới. Hiểu nguyên lý (Phần 1–8) giúp bạn debug bất kỳ cái nào khi nó "ảo thuật" hỏng — vì lúc đó bạn đọc được SW sinh ra và biết nó đang làm gì.
+
+> **Astro/SSG (như blog này):** site tĩnh hợp với SW: app shell + asset hash-hoá cache-first (Phần 19), runtime cache cho ảnh. `@vite-pwa/astro` lo phần precache manifest tự động.
+
+---
+
+## 2. Runtime caching cho API có auth
+
+Cache API công khai dễ; cache API **cần token** mới khó. Vấn đề: token hết hạn, và bạn không được cache response cá nhân hoá lâu (Phần 18). Pattern an toàn: **network-first, cache làm fallback ngắn hạn**, và **không** cache khi thiếu/expired token.
+
+```js
+async function authedApiStrategy(request) {
+  try {
+    const response = await fetch(request); // gửi kèm credentials/cookie
+    if (response.ok) {
+      // Cache bản sao CHỈ cho fallback offline ngắn hạn (không phải dữ liệu nhạy cảm).
+      const cache = await caches.open('api-fallback');
+      cache.put(request, response.clone());
+    }
+    if (response.status === 401) {
+      // Token hết hạn → để app xử lý refresh; đừng cache 401.
+      return response;
+    }
+    return response;
+  } catch {
+    // Offline → trả bản cache gần nhất (nếu có) để app vẫn hiện gì đó.
+    const cached = await caches.open('api-fallback').then((c) => c.match(request));
+    return cached || Response.json({ offline: true }, { status: 503 });
+  }
+}
+```
+
+Token refresh nên do **tầng app** lo (interceptor/React Query — series TanStack Query Phần 9), không phải SW. SW chỉ chuyển tiếp request kèm credentials và làm fallback offline. Đừng để SW giữ/refresh token — đó là trách nhiệm sai chỗ và rủi ro bảo mật.
+
+---
+
+## 3. Hàng đợi analytics offline
+
+Analytics bắn lúc offline thường mất. SW + Background Sync (Phần 7) giữ chúng lại và gửi khi online — quan trọng với app dùng nhiều offline:
+
+```js
+// Bắt request analytics, xếp hàng nếu offline
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+  if (url.pathname === '/analytics' && event.request.method === 'POST') {
+    event.respondWith(
+      fetch(event.request.clone()).catch(async () => {
+        await queueAnalytics(event.request.clone()); // lưu vào IndexedDB outbox
+        return new Response(null, { status: 202 }); // "đã nhận, sẽ gửi sau"
+      }),
+    );
+  }
+});
+
+self.addEventListener('sync', (event) => {
+  if (event.tag === 'flush-analytics') event.waitUntil(flushAnalyticsQueue());
+});
+```
+
+Dùng `navigator.sendBeacon` ở trang cho analytics lúc đóng tab, và để SW lo phần offline — hai mảnh bù nhau.
+
+---
+
+## 4. Feature flag & kill switch cho chính SW
+
+SW thường trú nên cần "công tắc" điều khiển từ xa. Pattern: SW fetch một file cấu hình nhỏ (cache ngắn) và đổi hành vi theo đó — vd tắt một caching strategy đang gây lỗi mà không cần deploy SW mới:
+
+```js
+async function getFlags() {
+  try {
+    const res = await fetch('/sw-flags.json', { cache: 'no-store' });
+    return res.ok ? await res.json() : {};
+  } catch {
+    return {};
+  }
+}
+
+self.addEventListener('fetch', (event) => {
+  event.respondWith(
+    (async () => {
+      const flags = await getFlags();
+      if (flags.disableImageCache && isImage(event.request)) {
+        return fetch(event.request); // bỏ qua cache nếu cờ bật
+      }
+      return handleNormally(event.request);
+    })(),
+  );
+});
+```
+
+Kết hợp với **kill switch** (Phần 12) làm tầng phòng vệ cuối: flag để *điều chỉnh*, kill switch để *gỡ hẳn* khi sự cố nghiêm trọng.
+
+---
+
+## 5. Khi nào KHÔNG nên dùng service worker
+
+Quan trọng nhất phần này. SW thêm phức tạp đáng kể và một lớp lỗi mới (cache độc, update kẹt). Đừng dùng khi:
+
+- **App không cần offline** và đã nhanh nhờ HTTP cache + CDN. SW không tự làm app nhanh hơn nếu bạn không có chiến lược cache rõ ràng.
+- **Nội dung thay đổi liên tục, không có gì đáng cache** (vd trang giá realtime thuần). Cache sai còn hại hơn không cache.
+- **Đội ngũ chưa sẵn sàng vận hành**: SW cần quy trình deploy đúng (HTML no-cache, asset immutable, kill switch). Thiếu kỷ luật đó, SW dễ làm người dùng kẹt bản cũ.
+- **Chỉ muốn push notification**: trên một số ca, có thể không cần caching strategy phức tạp — chỉ cần SW tối thiểu cho push.
+
+> Quy tắc: thêm SW khi bạn có **mục tiêu cụ thể** (offline, tốc độ lặp lại, push, background sync) và sẵn sàng vận hành nó. Đừng thêm vì "PWA nghe ngầu".
+
+---
+
+## 6. Checklist "SW production-ready" (tổng hợp series)
+
+- [ ] HTTPS + scope đúng (Phần 1, 18)
+- [ ] Lifecycle hiểu rõ; update flow có prompt + chống double-reload (Phần 2, 12)
+- [ ] Caching strategy đúng theo loại tài nguyên (Phần 4); asset immutable cache-first (Phần 19)
+- [ ] App shell + offline fallback (Phần 5); versioning + cleanup + kill switch (Phần 6, 12)
+- [ ] Không cache auth/PII; dọn khi logout (Phần 18)
+- [ ] Precache budget nhỏ; runtime cache phần còn lại (Phần 19)
+- [ ] Background sync cho ghi offline; analytics queue (Phần 7, này)
+- [ ] Quota: giới hạn entry, bắt `QuotaExceededError`, `persist()` (Phần 15)
+- [ ] Test theo checklist + Lighthouse PWA (Phần 10)
+
+---
+
+## 7. Bài tập (capstone)
+
+**1.** Vì sao token refresh nên do tầng app lo, không phải service worker?
+
+<details>
+<summary>Lời giải</summary>
+
+SW chặn request ở tầng mạng nhưng không nên giữ/refresh token: quản lý vòng đời token là logic ứng dụng (interceptor, React Query), và để SW giữ token làm tăng bề mặt rủi ro bảo mật + lẫn lộn trách nhiệm. SW chỉ nên chuyển tiếp request kèm credentials và làm fallback offline; gặp 401 thì trả về để app refresh.
+
+</details>
+
+**2.** Nêu hai tình huống *không* nên thêm service worker.
+
+<details>
+<summary>Lời giải</summary>
+
+(1) App không cần offline và đã nhanh nhờ HTTP cache/CDN — SW chỉ thêm phức tạp và rủi ro cache độc mà không lợi ích rõ. (2) Nội dung thay đổi liên tục, không có gì đáng cache (trang realtime thuần) — cache sai hại hơn không cache. (Thêm: đội chưa sẵn sàng vận hành deploy đúng quy tắc.)
+
+</details>
+
+**3.** Feature flag cho SW giải quyết vấn đề gì mà deploy SW mới không?
+
+<details>
+<summary>Lời giải</summary>
+
+SW thường trú và update có độ trễ (chờ waiting/activate). Feature flag (file cấu hình fetch no-store) cho phép *đổi hành vi tức thì từ xa* — vd tắt một strategy đang lỗi — mà không cần chờ chu trình update SW. Nó là van điều chỉnh nhanh; kill switch là tầng gỡ hẳn khi sự cố nặng.
+
+</details>
+
+**Nâng cao:** Lấy PWA capstone (Phần 10) và thêm: (a) runtime cache cho một API có auth (network-first + fallback, không cache nhạy cảm), (b) analytics queue offline, (c) một `sw-flags.json` tắt được image cache. Chạy lại toàn bộ checklist mục 6.
+
+---
+
+## Tóm tắt
+
+- Framework đều dùng Workbox bên dưới (`vite-plugin-pwa`, `@serwist/next`, `@vite-pwa/astro`, `@angular/service-worker`) — hiểu nguyên lý để debug "ảo thuật".
+- API có auth: **network-first + fallback ngắn hạn**, không cache nhạy cảm; **token refresh ở tầng app**, không ở SW.
+- Analytics offline: SW + Background Sync xếp hàng IndexedDB, gửi khi online; `sendBeacon` cho lúc đóng tab.
+- **Feature flag** (config no-store) đổi hành vi SW tức thì; **kill switch** gỡ hẳn khi sự cố.
+- **Đừng dùng SW** khi không cần offline/không có gì đáng cache/đội chưa sẵn sàng vận hành — thêm SW phải có mục tiêu cụ thể.
+
+---
+
+## Toàn series
+
+- [Phần 1 — Mental model & "Hello Service Worker"](/blog/service-workers-01-mental-model/)
+- [Phần 2 — Lifecycle: install, waiting, activate & update](/blog/service-workers-02-lifecycle/)
+- [Phần 3 — Fetch event & chặn request](/blog/service-workers-03-fetch-interception/)
+- [Phần 4 — Cache API & caching strategies](/blog/service-workers-04-cache-api-strategies/)
+- [Phần 5 — Offline-first & app shell](/blog/service-workers-05-offline-first-app-shell/)
+- [Phần 6 — Advanced caching: versioning, cleanup & giới hạn](/blog/service-workers-06-advanced-caching-versioning/)
+- [Phần 7 — Background Sync & hàng đợi offline](/blog/service-workers-07-background-sync/)
+- [Phần 8 — Push Notifications](/blog/service-workers-08-push-notifications/)
+- [Phần 9 — Workbox](/blog/service-workers-09-workbox/)
+- [Phần 10 — Capstone: PWA offline-first hoàn chỉnh](/blog/service-workers-10-capstone-pwa/)
+- [Phần 11 — Web App Manifest & Install nâng cao](/blog/service-workers-11-manifest-install-deep-dive/)
+- [Phần 12 — Update flows mastery](/blog/service-workers-12-update-flows-mastery/)
+- [Phần 13 — Navigation Preload](/blog/service-workers-13-navigation-preload/)
+- [Phần 14 — Streaming responses](/blog/service-workers-14-streaming-responses/)
+- [Phần 15 — Storage, quota & persistence](/blog/service-workers-15-storage-quota-persistence/)
+- [Phần 16 — Clients API & messaging hai chiều](/blog/service-workers-16-clients-api-messaging/)
+- [Phần 17 — Background Fetch & Periodic Sync nâng cao](/blog/service-workers-17-background-fetch-periodic-sync/)
+- [Phần 18 — Bảo mật service worker](/blog/service-workers-18-security/)
+- [Phần 19 — Hiệu năng & gỡ lỗi chuyên sâu](/blog/service-workers-19-performance-debugging/)
+- **Phần 20 — Patterns nâng cao & tích hợp framework** (bạn đang ở đây)
+
+---
+
+## Điều cốt lõi
+
+Service worker là một con dao hai lưỡi cực sắc: dùng đúng, nó cho bạn offline, tốc độ lặp lại tức thì, push, và đồng bộ nền — dùng sai, nó làm người dùng kẹt bản cũ và rò dữ liệu. Sau 20 phần, bạn không chỉ biết *cách viết* SW mà còn biết *khi nào nên* và *khi nào đừng*. Đó là sự khác biệt giữa một người copy config và một kỹ sư hiểu nền tảng. Giờ hãy đi biến một app thật thành PWA tử tế — có chủ đích.

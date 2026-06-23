@@ -1,0 +1,199 @@
+---
+title: 'Build a Real React App · Part 12 — Capstone: Full Feature, CI & Deploy'
+description: 'Tie the whole stack together: a complete customers feature flow from URL to table to form to optimistic mutation, environment builds, a GitHub Actions CI pipeline with pnpm caching, deploying a Vite SPA, and an architecture recap.'
+pubDate: 2026-07-30
+tags: [react, ci, deployment, capstone, react_stack_12]
+series: react-stack
+seriesOrder: 12
+draft: true
+---
+
+Đây là capstone. Ta lắp mọi thứ từ Phần 1–11 thành một luồng feature mạch lạc, rồi ship: build môi trường, pipeline GitHub Actions, và Vite SPA đã deploy. Mục tiêu là *thấy các đường nối biến mất* — cách routing, dữ liệu, form, state và auth ghép thành thứ cảm giác như một app, không phải mười một kỹ thuật.
+
+---
+
+## 1. Luồng feature đầy đủ
+
+Lần theo một hành động user qua mọi tầng của stack:
+
+```text
+1. User edits the search box        → local useState (transient typing)      [Part 8]
+2. Debounced commit                 → URL query string                       [Part 8]
+3. URL change                       → validated params (zod)                  [Part 8]
+4. Params                           → TanStack Query key                      [Part 4]
+5. Query key change                 → apiFetch + zod parse                    [Part 4]
+6. Authenticated request            → token attach + refresh-on-401          [Part 9]
+7. Data returns                     → TanStack Table renders rows            [Part 8]
+8. User clicks "New customer"       → shadcn Dialog opens (UI state)         [Part 7]
+9. Form submit                      → react-hook-form + zod validation       [Part 6]
+10. Valid input                     → useMutation (optimistic create)        [Part 5]
+11. onSuccess                       → invalidate lists → table refetches     [Part 5]
+12. Lazy route + prefetch           → fast navigation, no waterfall          [Part 10]
+```
+
+Để ý ranh giới sở hữu sạch: **URL** sở hữu state view chia sẻ, **TanStack Query** sở hữu server state, **react-hook-form** sở hữu state form, **Zustand** sở hữu state UI toàn cục, và **React Router** sở hữu điều hướng. Không tầng nào thò vào trách nhiệm tầng khác.
+
+### Tóm tắt một dòng
+
+Một hành động chảy URL → params → Query → bảng → form → mutation → invalidate, mỗi tầng sở hữu đúng một mối quan tâm.
+
+---
+
+## 2. Build môi trường
+
+Môi trường khác cần API URL khác. Vite phân giải file `.env` theo mode; nhớ `env` validate-zod từ Phần 1 làm build fail nhanh nếu thiếu biến:
+
+```bash
+# .env.development
+VITE_API_URL=http://localhost:3001
+
+# .env.production
+VITE_API_URL=https://api.pulse.example.com
+```
+
+```bash
+pnpm build              # uses .env.production by default
+pnpm build --mode staging   # uses .env.staging
+```
+
+Đừng commit secret vào file `.env` — chỉ config *công khai*, lúc build (API base URL thì được; *key* API thì không). Bất cứ gì trong biến `VITE_` đều gửi tới client và ai cũng đọc được.
+
+### Tóm tắt một dòng
+
+Vite chọn `.env.[mode]` mỗi build; `env` validate-zod fail nhanh khi thiếu biến; đừng để secret trong biến `VITE_`.
+
+---
+
+## 3. Pipeline GitHub Actions
+
+*Docs: [GitHub Actions](https://docs.github.com/en/actions) · [pnpm/action-setup](https://github.com/pnpm/action-setup).*
+
+CI chạy cùng cổng `pnpm verify` từ Phần 11 mỗi push và PR, rồi build:
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4   # reads packageManager from package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm                 # cache the pnpm store across runs
+
+      - run: pnpm install --frozen-lockfile  # fail if lockfile is out of date
+      - run: pnpm verify                      # typecheck + lint + format + tests
+      - run: pnpm build
+```
+
+Chi tiết then chốt: `--frozen-lockfile` làm CI fail nếu `pnpm-lock.yaml` không khớp `package.json` (không lệch dependency bất ngờ), và `cache: pnpm` tái dùng store nên install nhanh. `pnpm/action-setup@v4` đọc version ghim từ `packageManager`, nên local và CI dùng đúng cùng pnpm — kỷ luật Corepack từ Phần 1 sinh lợi.
+
+### Tóm tắt một dòng
+
+CI chạy `pnpm install --frozen-lockfile` rồi `pnpm verify` + `pnpm build`, với cache pnpm và version pnpm ghim từ `packageManager`.
+
+---
+
+## 4. Deploy Vite SPA
+
+`pnpm build` xuất `dist/` tĩnh — HTML/CSS/JS thuần deploy lên bất kỳ host tĩnh nào. Hai thứ mọi host SPA phải làm đúng:
+
+**SPA fallback** — server phải trả `index.html` cho path lạ để routing phía client chạy khi refresh cứng `/customers/42`:
+
+```text
+# Netlify (_redirects)
+/*    /index.html   200
+```
+
+Không có nó, deep link và refresh 404, vì không có file `/customers/42` trên đĩa — React Router phân giải lúc chạy.
+
+**Cache header** — Vite vân tay tên file asset, nên cache chúng bất biến nhưng đừng bao giờ cache `index.html` (nó trỏ tới vân tay hiện tại):
+
+```text
+/assets/*   Cache-Control: public, max-age=31536000, immutable
+/index.html Cache-Control: no-cache
+```
+
+Kết hợp này cho lần tải lại tức thì (asset bất biến) đồng thời đảm bảo user nhận deploy mới nhất (HTML không cache).
+
+### Tóm tắt một dòng
+
+Deploy `dist/` tĩnh với SPA fallback `index.html` và cache asset bất biến nhưng `no-cache` cho `index.html`.
+
+---
+
+## 5. Tổng kết kiến trúc
+
+Cả series, trong một bản đồ:
+
+| Concern | Tool | Owns |
+|---------|------|------|
+| Tooling | pnpm · Vite · oxlint/oxfmt | Fast, strict, reproducible builds |
+| UI | Tailwind v4 · shadcn/ui | Styling + accessible primitives |
+| Navigation | React Router v7 | Routes, lazy loading, guards |
+| Server state | TanStack Query | Caching, mutations, optimistic UI |
+| Forms | react-hook-form + zod | Validation, performance |
+| Client state | Zustand | Global UI-only state |
+| Shareable state | The URL | Filters, sort, pagination |
+| Auth | in-memory + httpOnly + Query | Tokens, session, guards |
+| Quality | Vitest · RTL · MSW · CI | Confidence to refactor |
+
+Sợi chỉ xuyên suốt: **ranh giới sở hữu rõ ràng**. Mỗi mảnh state có đúng một nhà, validate xảy ra ở mọi biên (zod cho env, API, form, URL), và hệ type + test bắt lỗi trước khi user gặp.
+
+### Tóm tắt một dòng
+
+Mỗi mối quan tâm có một công cụ và một chủ; validate ở mọi biên và để type + test bắt lỗi sớm.
+
+---
+
+## 6. Bài tập
+
+**1.** Sao host SPA phải trả `index.html` cho path lạ?
+
+<details>
+<summary>Lời giải</summary>
+
+Không có file `/customers/42` trên đĩa — route đó chỉ tồn tại trong router phía client. Khi refresh cứng hay deep link, server phải trả `index.html` để app khởi động và React Router phân giải path; nếu không sẽ 404.
+</details>
+
+**2.** Sao `pnpm install --frozen-lockfile` trong CI thay vì install thường?
+
+<details>
+<summary>Lời giải</summary>
+
+Nó làm build fail nếu `pnpm-lock.yaml` không khớp `package.json`, đảm bảo CI install đúng cây dependency như đã commit. Install thường có thể âm thầm cập nhật lockfile và build với version khác cái đã review.
+</details>
+
+**3.** Sao cache `/assets/*` bất biến nhưng `index.html` với `no-cache`?
+
+<details>
+<summary>Lời giải</summary>
+
+Vite vân tay tên file asset, nên nội dung không đổi với một tên — cache mãi an toàn. `index.html` giữ tên ổn định nhưng trỏ tới vân tay mới nhất; cache nó sẽ ghim user vào deploy cũ. `no-cache` đảm bảo họ luôn lấy HTML hiện tại và do đó asset hiện tại.
+</details>
+
+Dự án capstone:ship Pulse đầu-cuối — scaffold (Phần 1), dựng feature customer (Phần 4–8), thêm auth (Phần 9), viết test rollback (Phần 11), và deploy qua pipeline CI với SPA fallback + cache header (phần này).
+
+---
+
+## Điểm chính
+
+- Stack ghép được vì mỗi tầng có **một trách nhiệm rõ** và validate ở biên của nó.
+- Vite phân giải env theo mode; `env` validate-zod fail nhanh; đừng ship secret trong biến `VITE_`.
+- CI = `install --frozen-lockfile` + `verify` + `build`, với cache pnpm và version pnpm ghim.
+- Deploy `dist/` tĩnh với **SPA fallback** và **cache header** đúng.
+
+---
+
+## Kết
+
+Bạn giờ có cả stack production React hiện đại — từ `pnpm create` tới một SPA đã deploy, đã test, type-safe. Các mẫu ở đây scale từ Pulse tới sản phẩm thật: sở hữu rõ ràng, validate ở biên, và một cổng chất lượng bạn tin. Giờ đi xây thứ gì đó thật.

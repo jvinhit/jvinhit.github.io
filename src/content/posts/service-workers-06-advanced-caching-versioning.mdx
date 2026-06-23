@@ -1,0 +1,246 @@
+---
+title: 'Service Workers · Phần 6 — Advanced caching: versioning, cleanup & giới hạn'
+description: 'Cache versioning đúng cách, dọn cache cũ khi activate, giới hạn số lượng và expiration, quota & eviction, opaque response và cạm bẫy CORS, cùng cách tránh "cache độc" làm kẹt người dùng ở bản cũ.'
+pubDate: 2026-07-01
+tags: [service-worker, caching, versioning, cors, service_workers_10]
+series: service-workers
+seriesOrder: 6
+draft: false
+---
+
+Caching cơ bản thì dễ. Caching **đúng và bền** mới khó. Bài này là phần tách biệt một service worker "demo" với một service worker **production**: làm sao để cập nhật không kẹt người dùng ở bản cũ, làm sao để cache không phình vô tận, và làm sao để không dính những cái bẫy âm thầm như opaque response.
+
+Đây cũng là nơi nhiều dự án "tự bắn vào chân": deploy bản mới mà người dùng vẫn thấy bản cũ hàng tuần, vì cache versioning sai. Ta sẽ giải quyết triệt để.
+
+---
+
+## Vì sao versioning là bắt buộc
+
+Cache API **không tự hết hạn**. Một response bạn `put` vào hôm nay sẽ nằm đó **mãi mãi** cho tới khi bạn xóa. Đây vừa là sức mạnh (offline bền), vừa là cái bẫy (kẹt bản cũ).
+
+Giải pháp: **đặt phiên bản vào tên cache**. Khi deploy bản mới, đổi version → SW mới tạo cache mới → cache cũ được dọn ở `activate`.
+
+```js
+// Đổi con số này mỗi lần deploy có thay đổi asset.
+const VERSION = 'v3';
+
+const CACHES = {
+  shell: `shell-${VERSION}`,
+  runtime: `runtime-${VERSION}`,
+  images: `images-${VERSION}`,
+};
+```
+
+> Trong dự án thật, `VERSION` thường được **build tool tự sinh** (hash của bundle, hoặc số build). Đừng sửa tay — dễ quên. Phần 9 (Workbox) tự động hóa hoàn toàn việc này.
+
+---
+
+## Dọn cache cũ khi `activate`
+
+Đây là mảnh ghép sống còn. Ở `activate` (lúc chắc chắn không tab nào còn dùng SW cũ), xóa mọi cache **không** thuộc danh sách hiện hành:
+
+```js
+const EXPECTED = Object.values(CACHES); // ['shell-v3', 'runtime-v3', 'images-v3']
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    (async () => {
+      const keys = await caches.keys();
+      await Promise.all(
+        keys
+          .filter((key) => !EXPECTED.includes(key))
+          .map((key) => {
+            console.log('[SW] xóa cache cũ:', key);
+            return caches.delete(key);
+          })
+      );
+      // Control ngay các tab hiện có sau khi đã dọn sạch.
+      await self.clients.claim();
+    })()
+  );
+});
+```
+
+Không có bước này, mỗi lần đổi version bạn lại **chồng thêm** một bộ cache mới mà không xóa cái cũ → storage phình to, và tệ hơn, các strategy `caches.match()` toàn cục có thể vô tình trả entry cũ.
+
+---
+
+## Giới hạn số lượng entry (LRU thủ công)
+
+Cache ảnh hay API có thể phình vô hạn. Ta giới hạn bằng cách giữ tối đa N entry, xóa cái cũ nhất (FIFO/LRU đơn giản):
+
+```js
+async function trimCache(cacheName, maxItems) {
+  const cache = await caches.open(cacheName);
+  const keys = await cache.keys(); // theo thứ tự được thêm vào
+  if (keys.length <= maxItems) return;
+
+  // Xóa từ đầu (cũ nhất) cho tới khi còn maxItems.
+  const toDelete = keys.slice(0, keys.length - maxItems);
+  await Promise.all(toDelete.map((key) => cache.delete(key)));
+}
+
+// Gọi sau khi cache một ảnh mới:
+async function cacheImage(request, response) {
+  const cache = await caches.open(CACHES.images);
+  await cache.put(request, response.clone());
+  await trimCache(CACHES.images, 60); // giữ tối đa 60 ảnh
+}
+```
+
+> Cache API **không** có expiration hay max-size sẵn. Bạn phải tự làm — hoặc dùng Workbox `ExpirationPlugin` (Phần 9) lo cả số lượng lẫn tuổi thọ. Đây là một lý do lớn để dùng Workbox cho dự án thật.
+
+---
+
+## Expiration theo thời gian
+
+Muốn entry "hết hạn" sau X ngày, bạn cần lưu timestamp. Cách thủ công: nhét timestamp vào header response khi cache, kiểm tra khi đọc.
+
+```js
+async function cacheWithTimestamp(cacheName, request, response) {
+  const cache = await caches.open(cacheName);
+  const cloned = response.clone();
+  const headers = new Headers(cloned.headers);
+  headers.set('sw-cached-at', Date.now().toString());
+  const body = await cloned.blob();
+  await cache.put(request, new Response(body, { status: cloned.status, headers }));
+}
+
+async function getFresh(cacheName, request, maxAgeMs) {
+  const cache = await caches.open(cacheName);
+  const cached = await cache.match(request);
+  if (!cached) return null;
+  const cachedAt = Number(cached.headers.get('sw-cached-at') || 0);
+  if (Date.now() - cachedAt > maxAgeMs) {
+    await cache.delete(request);
+    return null; // coi như hết hạn
+  }
+  return cached;
+}
+```
+
+Cách này hoạt động nhưng rườm rà — lại một điểm cộng nữa cho Workbox. Tuy vậy, hiểu cơ chế giúp bạn debug khi Workbox "không xóa cache như mong đợi".
+
+---
+
+## Quota & eviction — trình duyệt có thể xóa cache của bạn
+
+Storage không phải vô hạn. Trình duyệt cấp một **quota** (thường là một tỉ lệ % dung lượng đĩa trống). Khi gần đầy, trình duyệt có thể **evict** (xóa) dữ liệu của origin ít dùng — gồm cả Cache API và IndexedDB.
+
+Kiểm tra quota:
+
+```js
+if (navigator.storage && navigator.storage.estimate) {
+  const { usage, quota } = await navigator.storage.estimate();
+  console.log(`Đã dùng ${(usage / 1e6).toFixed(1)}MB / ${(quota / 1e6).toFixed(0)}MB`);
+}
+```
+
+Xin **persistent storage** để giảm khả năng bị evict (trình duyệt cấp tùy mức độ tương tác của người dùng):
+
+```js
+if (navigator.storage && navigator.storage.persist) {
+  const persisted = await navigator.storage.persist();
+  console.log('Persistent storage:', persisted);
+}
+```
+
+> Đừng coi cache là vĩnh viễn. Code của bạn phải **luôn xử lý được trường hợp cache trống** (rơi về mạng). Persistent storage giảm rủi ro chứ không loại bỏ.
+
+---
+
+## Opaque response — cái bẫy âm thầm
+
+Khi bạn `fetch()` một tài nguyên **cross-origin** mà không có CORS (ví dụ `<img>` từ CDN khác, hay fetch `mode: 'no-cors'`), bạn nhận về một **opaque response**:
+
+- `response.status === 0`, `response.ok === false`.
+- Bạn **không đọc được** body hay header (vì lý do bảo mật).
+- Nó **vẫn cache được**, nhưng...
+
+**Hai cái bẫy lớn:**
+
+1. **Tốn dung lượng khổng lồ.** Opaque response được "đệm" (padding) khi tính quota — một file 5KB có thể bị tính như 7MB. Cache nhiều opaque response sẽ đốt quota cực nhanh.
+2. **Không kiểm tra được tính hợp lệ.** Vì `response.ok` luôn `false`, bạn không phân biệt được response 200 hay 404. Nếu bạn vô tình cache một lỗi 404 opaque, người dùng kẹt với nó.
+
+```js
+async function cacheFirstSafe(request) {
+  const cached = await caches.match(request);
+  if (cached) return cached;
+
+  const response = await fetch(request);
+
+  // CHỈ cache khi response thật sự OK. Bỏ qua opaque (status 0) và lỗi.
+  if (response.ok) {
+    const cache = await caches.open(CACHES.runtime);
+    cache.put(request, response.clone());
+  }
+  return response;
+}
+```
+
+> Quy tắc vàng: **chỉ cache response có `response.ok === true`** (status 2xx). Với cross-origin cần đọc nội dung, hãy đảm bảo server bật **CORS** để nhận response "trong suốt" (status thật, header đọc được) thay vì opaque.
+
+---
+
+## "Cache độc" — và cách thoát hiểm
+
+Tình huống ác mộng: bạn deploy một `sw.js` lỗi, nó cache nhầm asset hỏng, và **mọi người dùng kẹt** ở bản hỏng vì SW cache-first cứ trả bản hỏng. Phòng và chữa:
+
+- **Luôn versioning** — bản SW mới đổi tên cache, dọn cache cũ ở activate.
+- **Serve `sw.js` với `Cache-Control: no-cache`** — để trình duyệt luôn thấy SW mới (Phần 2).
+- **Có "kill switch"**: chuẩn bị sẵn một SW tối giản chỉ `self.registration.unregister()` + xóa hết cache, để deploy khi cần "reset" toàn bộ người dùng.
+
+```js
+// sw.js "kill switch" khẩn cấp — deploy khi cần gỡ SW khỏi mọi người dùng
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', async (event) => {
+  event.waitUntil(
+    (async () => {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+      await self.registration.unregister();
+      const clients = await self.clients.matchAll();
+      clients.forEach((client) => client.navigate(client.url));
+    })()
+  );
+});
+```
+
+> Có sẵn kill switch là khác biệt giữa "sửa trong 5 phút" và "support ticket cả tuần". Cache độc là một trong những sự cố đáng sợ nhất của PWA.
+
+---
+
+## Tóm tắt
+
+- Cache API **không tự hết hạn** → bắt buộc **versioning** (đặt version vào tên cache), tốt nhất do build tool sinh.
+- Dọn cache cũ ở **`activate`** (lúc an toàn nhất), kèm `clients.claim()`.
+- Tự giới hạn **số lượng** (trim LRU) và **tuổi thọ** (timestamp) — hoặc để Workbox lo.
+- Trình duyệt cấp **quota** và có thể **evict**; xin **persistent storage**, nhưng luôn code chịu được cache trống.
+- **Opaque response** (cross-origin no-CORS) tốn quota khủng và không kiểm tra được — **chỉ cache `response.ok`**, bật CORS khi cần đọc nội dung.
+- Phòng **cache độc**: versioning + `sw.js` no-cache + chuẩn bị **kill switch**.
+
+---
+
+## Bài tập thực hành
+
+### Bài 1 — Versioning + cleanup (cơ bản)
+
+Refactor SW của bạn dùng hằng `VERSION` cho mọi tên cache, và cài đoạn dọn cache ở `activate`. Đổi `VERSION` từ `v1` lên `v2`, reload, quan sát **Application → Cache Storage**.
+
+**Hướng dẫn:** Bạn phải thấy cache `*-v1` biến mất và `*-v2` xuất hiện sau khi SW mới activate. Nếu cache cũ vẫn còn: kiểm tra SW mới đã activate chưa (có thể đang kẹt waiting — Phần 2), và `EXPECTED` có khớp đúng tên không.
+
+### Bài 2 — Giới hạn cache ảnh (trung bình)
+
+Cài `trimCache` giữ tối đa 5 ảnh. Load một trang có 10 ảnh, rồi kiểm tra Cache Storage chỉ còn 5.
+
+**Hướng dẫn:** Gọi `trimCache(CACHES.images, 5)` sau mỗi lần `cache.put` ảnh. Lưu ý `cache.keys()` trả về theo thứ tự thêm vào, nên `slice(0, ...)` xóa cái cũ nhất. Quan sát số entry trong DevTools để xác nhận. Tự hỏi: con số 5/60/200 nên đặt bao nhiêu cho ảnh sản phẩm của một app thật?
+
+### Bài 3 — Bẫy opaque response (nâng cao)
+
+Fetch một ảnh từ origin khác bằng `<img src="https://...">` rồi thử cache nó trong fetch handler **không** kiểm tra `response.ok`. Quan sát `navigator.storage.estimate()` trước và sau.
+
+**Hướng dẫn:** Bạn sẽ thấy `usage` tăng **vọt** bất thường so với kích thước ảnh thật — đó là padding của opaque response. Sau đó thêm điều kiện `if (response.ok)` và thấy ảnh cross-origin **không** được cache nữa (vì opaque có `ok === false`). Rút ra: vì sao production luôn cần CORS hoặc một allowlist origin rõ ràng. Đây là kiến thức cứu bạn khỏi sự cố "app ngốn 2GB storage".
+
+---
+
+**Phần tiếp theo:** Background Sync — gửi lại request thất bại khi có mạng trở lại, dùng hàng đợi IndexedDB; cùng Periodic Background Sync để cập nhật dữ liệu định kỳ.

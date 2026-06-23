@@ -1,0 +1,236 @@
+---
+title: 'Node Package Managers · Part 11 — Monorepos & Workspaces'
+description: 'How workspaces work across npm, Yarn, pnpm and Bun: a single install for many packages, the workspace: protocol, filtered task running, hoisting trade-offs, and pairing with Turborepo or Nx.'
+pubDate: 2026-06-26
+tags: [monorepo, workspaces, pnpm, turborepo, package_managers_12]
+series: package-managers
+seriesOrder: 11
+draft: false
+---
+
+Đây là **Phần 11 của series 12 phần** về package manager Node. Mọi thứ tới giờ giả định một `package.json`. Codebase thật lớn lên thành **monorepo** — nhiều package (app, thư viện, config) trong một repo, dùng chung một lần install. Đây là nơi package manager khác nhau nhất về công thái học.
+
+---
+
+## 1. Workspace thực ra là gì
+
+**Workspace** là tập package trong một repo mà manager cài **cùng nhau**, với **một lockfile** và **`node_modules` chung**:
+
+```text
+my-monorepo/
+├── package.json          ← root: declares the workspaces + shared dev tools
+├── pnpm-lock.yaml        ← ONE lockfile for the whole repo
+├── node_modules/         ← shared install (hoisted/symlinked)
+├── apps/
+│   ├── web/package.json   ← @myco/web
+│   └── api/package.json   ← @myco/api
+└── packages/
+    ├── ui/package.json    ← @myco/ui
+    └── utils/package.json ← @myco/utils
+{một lockfile, một install dùng chung cho cả repo}
+```
+
+Tính năng đắt giá: `@myco/web` có thể phụ thuộc `@myco/ui` và manager **link thẳng source local** — không publish, không copy. Sửa `ui`, thấy ngay trong `web`.
+
+---
+
+## 2. Khai báo workspace (mỗi manager)
+
+Config khác nhau, nhưng khái niệm giống hệt:
+
+```jsonc
+// npm / Yarn / Bun → in the ROOT package.json
+{
+  "name": "my-monorepo",
+  "private": true,            // a workspace root must be private
+  "workspaces": ["apps/*", "packages/*"]
+}
+```
+
+```yaml
+# pnpm → a dedicated pnpm-workspace.yaml (NOT package.json)
+packages:
+  - "apps/*"
+  - "packages/*"
+```
+
+> Chú ý `"private": true`: root workspace không bao giờ nên publish được — nó là vùng chứa tổ chức, không phải package.
+
+---
+
+## 3. Giao thức `workspace:`
+
+Khi một workspace phụ thuộc cái khác, dùng giao thức `workspace:` để manager link package **local**, không bao giờ version registry:
+
+```jsonc
+// apps/web/package.json
+{
+  "dependencies": {
+    "@myco/ui":    "workspace:*",     // always the local ui, any version
+    "@myco/utils": "workspace:^"      // local, but pin a range on publish
+  }
+}
+```
+
+Khi **publish**, manager viết lại `workspace:^` thành version thật (vd `^1.4.0`) để người dùng ngoài nhận dependency bình thường. Cái này giải lớp lỗi cũ "tôi quên bump version nội bộ". Quy tắc viết lại:
+
+```text
+in the repo            published to npm becomes
+workspace:*       →    1.4.0     (the exact current version of the sibling)
+workspace:^       →    ^1.4.0
+workspace:~       →    ~1.4.0
+workspace:1.4.0   →    1.4.0
+```
+
+### Một version khắp nơi — `catalog:` của pnpm
+
+Trong monorepo lớn, lệch kiểu "package A dùng React 19.1, B dùng 19.0" là cơn đau đầu thường trực. **Catalog** của pnpm định nghĩa version *một lần* và tham chiếu theo tên:
+
+```yaml
+# pnpm-workspace.yaml
+packages: ["apps/*", "packages/*"]
+catalog:
+  react: ^19.1.0
+  react-dom: ^19.1.0
+```
+
+```jsonc
+// any workspace package.json — no version number, just the catalog ref
+{ "dependencies": { "react": "catalog:", "react-dom": "catalog:" } }
+```
+
+Bump version một chỗ và cả repo dịch chuyển cùng nhau. Đây là cách nhẹ thay cho `constraints` của Yarn Berry cho nhu cầu phổ biến nhất: một version dùng chung của các dep lõi.
+
+---
+
+## 4. Chạy task qua các package
+
+Đây là bài kiểm tra công thái học hằng ngày, và là nơi pnpm toả sáng:
+
+```bash
+# npm — basic
+npm run build --workspaces           # build every workspace
+npm run build -w @myco/ui            # build one
+
+# Yarn Berry — powerful
+yarn workspaces foreach -A run build           # all
+yarn workspaces foreach -pt run build          # parallel + topological order
+
+# pnpm — best-in-class filtering
+pnpm -r run build                    # recursive: build all
+pnpm --filter @myco/web build        # just one package
+pnpm --filter @myco/web... build     # web AND its local dependencies
+pnpm --filter ...@myco/ui build      # ui AND everything depending on it
+pnpm --filter "./packages/*" build   # by path glob
+pnpm --filter "[origin/main]" build  # only packages changed since main!
+
+# Bun — fast, npm-like
+bun run --filter '*' build
+```
+
+Filter pnpm cuối — *"chỉ package đổi từ `main`"* — là nền tảng của CI monorepo nhanh: build/test chỉ cái thực sự đổi.
+
+---
+
+## 5. Hoisting trong monorepo — cái bẫy
+
+Workspace khuếch đại vấn đề phantom-dependency từ Phần 2. Với hoisting, một dependency của `apps/web` bị hoist lên `node_modules` **gốc**, nơi `packages/ui` có thể vô tình import:
+
+```text
+HOISTED monorepo (npm/Bun):
+  web depends on "axios" → axios hoisted to ROOT node_modules
+  → ui can `import axios` even though ui never declared it
+  → ui publishes broken: consumers don't get axios   ← PHANTOM in the wild!
+{ui import được axios dù không khai báo → publish ra ngoài bị vỡ}
+
+pnpm monorepo (symlinked, strict):
+  each workspace only sees ITS declared deps
+  → ui importing undeclared axios fails IMMEDIATELY, in dev
+{pnpm: mỗi workspace chỉ thấy dep đã khai báo → vỡ ngay trong dev}
+```
+
+Đây là lý do lớn nhất pnpm thống trị monorepo năm 2026: layout symlink nghiêm ngặt của nó khiến phantom dep liên-package là không thể, nên thư viện không thể vô tình ship lỗi.
+
+---
+
+## 6. Workspaces vs task runner
+
+Một nhầm lẫn phổ biến: workspace và Turborepo/Nx giải bài toán **khác nhau** và dùng **cùng nhau**:
+
+```text
+WORKSPACES (the package manager)     TASK RUNNERS (Turborepo / Nx)
+{package manager}                    {bộ chạy task}
+- install many packages, one lockfile - cache task OUTPUTS (build/test/lint)
+- link local packages together        - skip tasks whose inputs didn't change
+- run scripts across packages          - parallelize across the dep graph
+                                       - remote caching across the team/CI
+```
+
+```jsonc
+// turbo.json — cache + orchestrate the tasks pnpm/yarn run
+{
+  "tasks": {
+    "build": { "dependsOn": ["^build"], "outputs": ["dist/**"] },
+    "test":  { "dependsOn": ["build"] }
+  }
+}
+```
+
+Stack monorepo 2026: **pnpm workspaces** để cài + link + lọc, **Turborepo hoặc Nx** ở trên để cache output và điều phối task. pnpm tìm *cái gì* để chạy; Turborepo quyết định *có cần chạy hay không*.
+
+### Cách tính key cache — và bẫy biến môi trường
+
+Task runner chỉ bỏ qua công việc an toàn nếu **key cache** nắm bắt *mọi* input:
+
+```text
+cache key = hash(
+  source files of this package + its internal deps,
+  the task's declared inputs/outputs,
+  relevant environment variables,   ← the one people forget
+  the lockfile / tool versions
+)
+{key = hash của source + input/output + env var + lockfile}
+```
+
+Lỗi kinh điển: một build đọc `process.env.API_URL` nhưng config task không liệt kê nó, nên Turborepo trả về **build cache cũ** nướng sẵn với URL sai. Luôn khai báo input env:
+
+```jsonc
+// turbo.json
+{
+  "tasks": {
+    "build": { "dependsOn": ["^build"], "outputs": ["dist/**"], "env": ["API_URL"] }
+  }
+}
+```
+
+**Remote cache** mở rộng việc này qua team và CI: máy đầu tiên (hoặc lần chạy CI) build một key sẽ upload output lên store dùng chung; mọi người khác *tải* về thay vì build lại. Một build CI sạch có thể từ vài phút xuống vài giây — nhưng cũng nghĩa một entry cache bị đầu độc sẽ lan ra, nên remote cache bản thân là ranh giới tin cậy đáng bảo vệ.
+
+---
+
+## 7. Bảng phán quyết
+
+| Manager | Workspace config | Lọc | An toàn phantom? | Kết luận |
+|---|---|---|---|---|
+| npm | `workspaces` field | `-w` (basic) | ✗ (hoisted) | Chạy được, tối thiểu |
+| Yarn Berry | `workspaces` field | `foreach`, constraints | ✓ with PnP | Mạnh |
+| pnpm | `pnpm-workspace.yaml` | `--filter` (rich) | nghiêm ngặt | **Tốt nhất** |
+| Bun | `workspaces` field | `--filter` | ✗ (hoisted) | Nhanh, mới |
+
+---
+
+## Giờ bạn đã biết gì
+
+- Workspace cài nhiều package với **một lockfile + `node_modules` chung** và link package local.
+- Giao thức `workspace:` link package local và viết lại thành range thật khi publish.
+- `--filter` của pnpm là nhắm task tốt nhất; layout nghiêm ngặt ngăn phantom dep liên-package.
+- Workspaces + task runner bổ trợ nhau, không phải thay thế.
+
+---
+
+## Bài tập
+
+1. Dựng monorepo pnpm nhỏ, nối `workspace:*`, sửa `ui` và thấy thay đổi trong `web`.
+2. Cho `ui` import dep chưa khai báo và xem pnpm từ chối; thử lại trong npm workspace.
+3. Thêm Turborepo, định nghĩa task `build`, chạy hai lần để thấy cache hit.
+
+Tiếp theo — Phần 12: Capstone:

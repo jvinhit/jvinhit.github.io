@@ -1,0 +1,128 @@
+---
+title: 'How Browsers Work · Part 1 — Mental Model: The Multi-Process Architecture'
+description: 'Opening the series: the browser is not one program but many cooperating processes. Understand the browser/renderer/GPU/network split, sandboxing, site isolation, and the threads inside a renderer — the foundation for everything else.'
+pubDate: 2026-10-05
+tags: [browser, internals, architecture, chromium, browser_internals_12]
+series: browser-internals
+seriesOrder: 1
+draft: true
+---
+
+Bạn ship code lên trình duyệt mỗi ngày, nhưng với phần lớn kỹ sư nó là một hộp đen: HTML và JS đi vào, pixel đi ra. Series này mở hộp đó ra. Một khi bạn hình dung được *cách* trình duyệt biến code thành pixel — và ranh giới, nút thắt nằm ở đâu — thì hiệu năng, bảo mật, và những bug kỳ quặc không còn là điều bí ẩn.
+
+Qua **12 phần**, ta đi từ kiến trúc tới toàn bộ pipeline render, JS engine, event loop, bộ nhớ, mạng, lưu trữ, và bảo mật — kết bằng capstone về debug hiệu năng. Ví dụ dựa trên **Chromium** (Chrome/Edge), nhưng khái niệm áp dụng cho mọi engine hiện đại.
+
+| Part | Chủ đề |
+|------|--------|
+| 1 | Mental model: kiến trúc đa tiến trình |
+| 2 | Từ URL đến pixel |
+| 3 | Phân tích HTML & DOM |
+| 4 | CSS & CSSOM |
+| 5 | Layout, paint & compositing |
+| 6 | JS engine (V8) |
+| 7 | Event loop & microtask |
+| 8 | Bộ nhớ & thu gom rác |
+| 9 | Mạng & HTTP caching |
+| 10 | Lưu trữ & nền tảng |
+| 11 | Mô hình bảo mật |
+| 12 | Capstone: debug hiệu năng |
+
+---
+
+## 1. Vì sao trình duyệt là nhiều tiến trình, không phải một
+
+Trình duyệt thời đầu chạy mọi thứ trong một tiến trình duy nhất. Một tab crash kéo sập cả trình duyệt, một trang lỗi có thể đóng băng mọi tab khác, và một trang bị tấn công có thể đọc bất cứ thứ gì trong bộ nhớ. Trình duyệt hiện đại giải quyết bằng cách chia việc ra **nhiều tiến trình của hệ điều hành**.
+
+Lợi ích ứng thẳng với các vấn đề cũ:
+
+- **Ổn định** — một renderer crash chỉ làm chết tab của nó, không phải cả trình duyệt.
+- **Bảo mật** — mỗi renderer bị **sandbox** với quyền hệ điều hành tối thiểu, nên trang bị chiếm quyền không chạm được file của bạn.
+- **Hiệu năng** — các tiến trình chạy song song trên nhiều nhân CPU.
+
+Đánh đổi là bộ nhớ: mỗi tiến trình có chi phí, đó là lý do Chrome nổi tiếng ngốn RAM.
+
+---
+
+## 2. Các tiến trình chính
+
+Một trình duyệt Chromium hiện đại được tổ chức đại khái như sau:
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│ Browser process  (the "brain": UI, address bar, tabs,    │
+│                   permissions, coordinates everything)    │
+└───────┬───────────────┬───────────────┬─────────────────┘
+        │               │               │
+┌───────▼──────┐ ┌──────▼───────┐ ┌─────▼────────┐
+│ Renderer     │ │ Renderer     │ │ GPU process  │
+│ process      │ │ process      │ │ (rasterize,  │
+│ (tab/site A) │ │ (tab/site B) │ │  composite)  │
+│ — SANDBOXED  │ │ — SANDBOXED  │ └──────────────┘
+└──────────────┘ └──────────────┘
+        ┌──────────────┐  ┌──────────────────┐
+        │ Network      │  │ Utility / Storage │
+        │ service      │  │ services          │
+        └──────────────┘  └──────────────────┘
+```
+
+| Process | Trách nhiệm |
+|---------|----------------|
+| **Browser** | "Bộ não" có đặc quyền — UI cửa sổ/tab, address bar, bookmark; xử lý quyền, yêu cầu mạng và lưu trữ thay cho renderer |
+| **Renderer** | Biến HTML/CSS/JS thành pixel cho một site; chạy DOM, pipeline render, và JS engine — **bị sandbox** |
+| **GPU** | Raster hóa và composite layer, vẽ ra màn hình; dùng chung cho các tab |
+| **Network** | Thực hiện mọi I/O mạng (DNS, TCP/TLS, HTTP); cô lập để renderer không bao giờ chạm socket trực tiếp |
+| **Utility** | Audio, storage và dịch vụ khác tách ra để cô lập |
+
+Quan hệ then chốt: **renderer không đáng tin và bị sandbox; tiến trình browser đáng tin**. Mọi việc cần đặc quyền (đọc file, mở socket) phải yêu cầu tiến trình browser qua IPC.
+
+---
+
+## 3. Cô lập theo site
+
+Ban đầu Chrome dùng đại khái một renderer **cho mỗi tab**. Sau lớp tấn công CPU **Spectre/Meltdown** (cho phép code đọc bộ nhớ không được phép), thế là chưa đủ — một `<iframe>` khác origin độc hại trong tab của bạn dùng chung tiến trình (và không gian địa chỉ) với trang chính.
+
+**Site Isolation** đặt ranh giới tiến trình theo **site** (scheme + eTLD+1), nên tài liệu từ các site khác nhau luôn nằm ở tiến trình renderer khác nhau — kể cả iframe khác site cũng được tách ra tiến trình riêng (**out-of-process iframes**, OOPIF).
+
+> Điểm cốt lõi: ranh giới tiến trình của HĐH giờ là **ranh giới bảo mật** giữa các site. Dữ liệu nhạy cảm của một site không bao giờ nằm chung bộ nhớ mà code của site khác có thể chạy. Ta sẽ quay lại ở Phần 11.
+
+---
+
+## 4. Bên trong renderer: các luồng
+
+Phần lớn công việc của bạn với tư cách frontend engineer diễn ra bên trong **một tiến trình renderer**, mà bản thân nó chạy nhiều luồng:
+
+- **Luồng chính** — chạy JavaScript, phân tích HTML/CSS, tính style, layout, và lệnh paint. Đây là luồng bạn phải giành giật; nếu JS chiếm nó, trang không render hay phản hồi được.
+- **Luồng compositor & raster** — biến lệnh paint thành bitmap và composite layer, thường không cần luồng chính, đó là lý do animation `transform`/`opacity` luôn mượt.
+- **Luồng worker** — Web Worker và tương tự chạy JS ngoài luồng chính.
+
+```text
+Renderer process
+├─ Main thread        → JS, DOM, style, layout, paint (record)
+├─ Compositor thread  → assembles & moves layers (can run alone)
+├─ Raster threads     → paint instructions → bitmaps
+└─ Worker threads     → Web Workers (your JS, off-main-thread)
+```
+
+Riêng sự thật này — **JS và việc render phần lớn dùng chung một luồng chính** — giải thích hầu hết lời khuyên về hiệu năng frontend. Ta sẽ gặp lại nó liên tục: ở layout (Phần 5), event loop (Phần 7), và xa hơn.
+
+---
+
+## 5. Các tiến trình nói chuyện thế nào: IPC
+
+Vì các tiến trình không chia sẻ bộ nhớ, chúng giao tiếp qua **Inter-Process Communication (IPC)** — trong Chromium là một hệ thống tên **Mojo**. Khi trang gọi `fetch()`, renderer không mở socket; nó gửi một thông điệp IPC tới network service, nơi làm việc đó và stream byte trả về.
+
+Sự gián tiếp này là cái giá của sandbox, và đó là lý do "chỉ tiến trình browser được phép chạm vào HĐH" là chủ đề lặp đi lặp lại của bảo mật trình duyệt.
+
+> Bạn có thể xem toàn bộ điều này trực tiếp trong Chrome: mở **More tools → Task Manager** để theo dõi CPU/bộ nhớ từng tiến trình, mỗi dòng một tab, iframe, và dịch vụ.
+
+---
+
+## Tóm tắt
+
+- Trình duyệt hiện đại là **nhiều tiến trình hợp tác**, không phải một — để ổn định, bảo mật và song song, đổi lại tốn bộ nhớ.
+- Các tiến trình chính: **browser** (bộ não đáng tin), **renderer** (bị sandbox, biến code thành pixel), **GPU**, và **network**.
+- **Site Isolation** biến ranh giới tiến trình thành ranh giới bảo mật giữa các site, chống lại tấn công kiểu Spectre.
+- Bên trong renderer, JS và render phần lớn dùng chung **một luồng chính** — gốc rễ của hầu hết vấn đề hiệu năng.
+- Các tiến trình giao tiếp qua **IPC (Mojo)**; chỉ tiến trình browser được chạm HĐH trực tiếp.
+
+**Phần tiếp theo:** Từ URL đến pixel — điều gì thực sự diễn ra giữa lúc nhấn Enter ở address bar và lúc thấy lần paint đầu tiên.

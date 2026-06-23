@@ -218,11 +218,15 @@ export default defineConfig({
 
   markdown: {
     shikiConfig: {
-      // Custom theme khớp với accent lime + dark bg
+      // Dual-theme: github-light cho theme sáng, github-dark cho tối.
+      // `defaultColor: false` → Shiki KHÔNG gắn màu inline mặc định mà chỉ
+      // expose `--shiki-light(-bg)` / `--shiki-dark(-bg)`; prose.css tự chọn
+      // bộ màu theo class theme trên <html> (xem prose.css).
       themes: {
-        light: 'github-dark-default',
+        light: 'github-light-default',
         dark: 'github-dark-default',
       },
+      defaultColor: false,
       wrap: true,
     },
   },

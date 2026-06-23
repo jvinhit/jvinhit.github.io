@@ -1,0 +1,309 @@
+---
+title: 'TanStack Query · Phần 4 — Pagination & useInfiniteQuery'
+description: 'Chuyển trang mượt không nhấp nháy với placeholderData keepPreviousData, rồi dựng infinite scroll thực thụ bằng useInfiniteQuery với getNextPageParam, fetchNextPage và IntersectionObserver.'
+pubDate: 2026-06-25
+tags: [react, tanstack-query, react-query, pagination, tanstack_query_8]
+series: tanstack-query
+seriesOrder: 4
+draft: false
+---
+
+Danh sách dài là chỗ React Query toả sáng. Phần này giải quyết hai mẫu UI phổ biến nhất: **phân trang (pagination)** kiểu "Trang trước / Trang sau", và **cuộn vô hạn (infinite scroll)** kiểu "tải thêm khi cuộn tới đáy". Cả hai đều có cạm bẫy UX (nhấp nháy, mất vị trí cuộn) mà React Query xử lý gọn.
+
+Ta tiếp tục dùng `queryOptions`, `apiFetch` + zod từ [Phần 3](/blog/tanstack-query-03-query-keys-zod-queryoptions/).
+
+---
+
+## 1. Pagination ngây thơ và vấn đề nhấp nháy
+
+Cách đơn giản nhất là cho `page` vào query key:
+
+```tsx
+function CustomersPage() {
+  const [page, setPage] = useState(1);
+
+  const { data, isPending, isError } = useQuery({
+    queryKey: ['customers', { page }],
+    queryFn: () => apiFetch(`/customers?page=${page}`, pageSchema),
+  });
+
+  if (isPending) return <TableSkeleton />; // ❌ nhấp nháy mỗi lần đổi trang
+  // ...
+}
+```
+
+Vấn đề: mỗi `page` là một **cache entry khác**. Khi bấm "Trang sau", key đổi, query mới chưa có cache → `isPending` lại bật → bảng biến thành skeleton → **nhấp nháy** và nhảy layout. Trải nghiệm rất tệ với bảng dữ liệu.
+
+---
+
+## 2. `placeholderData: keepPreviousData` — giữ trang cũ khi tải trang mới
+
+*Tài liệu: [Paginated Queries](https://tanstack.com/query/latest/docs/framework/react/guides/paginated-queries).*
+
+Giải pháp là giữ **data của trang trước** hiển thị trong lúc trang mới đang fetch nền. React Query v5 có helper `keepPreviousData`:
+
+```tsx
+import { useQuery, keepPreviousData } from '@tanstack/react-query';
+
+function CustomersPage() {
+  const [page, setPage] = useState(1);
+
+  const { data, isPlaceholderData, isFetching, isPending, isError } = useQuery({
+    queryKey: ['customers', { page }],
+    queryFn: () => apiFetch(`/customers?page=${page}`, pageSchema),
+    placeholderData: keepPreviousData, // ← giữ data trang trước trong lúc fetch trang mới
+  });
+
+  if (isPending) return <TableSkeleton />; // chỉ chạy đúng lần đầu tiên
+  if (isError) return <ErrorState />;
+
+  return (
+    <div>
+      {/* data luôn có nội dung (trang trước hoặc trang mới) → KHÔNG nhấp nháy */}
+      <CustomerTable rows={data.items} />
+
+      <div className="flex items-center gap-2">
+        <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page === 1}>
+          Trang trước
+        </button>
+        <span>Trang {page}</span>
+        <button
+          onClick={() => setPage((p) => p + 1)}
+          // isPlaceholderData = true nghĩa là data hiện tại là của trang CŨ,
+          // trang mới chưa về → khoá nút "Sau" để tránh nhảy 2 trang.
+          disabled={isPlaceholderData || !data.hasMore}
+        >
+          Trang sau
+        </button>
+        {isFetching ? <span>Đang tải…</span> : null}
+      </div>
+    </div>
+  );
+}
+```
+
+Hai cờ quan trọng:
+
+- **`isPlaceholderData`** — `true` khi `data` đang là dữ liệu của trang *trước* (trang mới chưa về). Dùng để khoá nút "Trang sau" và làm mờ bảng nhẹ.
+- **`isFetching`** — đang tải trang mới nền; dùng cho indicator nhỏ.
+
+Kết quả: bấm chuyển trang, bảng cũ vẫn hiện (có thể mờ nhẹ), trang mới về thì thay chỗ — **không skeleton, không nhảy layout**.
+
+> **Prefetch trang kế tiếp** để cảm giác tức thì hơn nữa: khi trang hiện tại load xong, gọi `queryClient.prefetchQuery` cho `page + 1`. Ta sẽ làm prefetch ở Phần 7.
+
+---
+
+## 3. Schema cho response phân trang
+
+Response phân trang thường kèm metadata. Validate cả phần đó bằng zod:
+
+```ts
+// src/features/customers/schema.ts
+import { z } from 'zod';
+
+export const customerSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  email: z.string().email(),
+});
+
+export const pageSchema = z.object({
+  items: z.array(customerSchema),
+  nextCursor: z.number().nullable(), // null = hết trang
+  hasMore: z.boolean(),
+});
+
+export type CustomerPage = z.infer<typeof pageSchema>;
+```
+
+---
+
+## 4. Infinite scroll với `useInfiniteQuery`
+
+*Tài liệu: [Infinite Queries](https://tanstack.com/query/latest/docs/framework/react/guides/infinite-queries).*
+
+Pagination thay thế trang cũ bằng trang mới. **Infinite query** thì *nối thêm* trang mới vào danh sách đang có (feed mạng xã hội, kết quả tìm kiếm cuộn vô hạn). `useInfiniteQuery` quản lý một mảng các "page" trong cùng một cache entry.
+
+Ba mảnh ghép bắt buộc:
+
+- **`initialPageParam`** — tham số trang đầu tiên (vd cursor `0`).
+- **`queryFn`** nhận `{ pageParam }` để biết đang tải trang nào.
+- **`getNextPageParam`** — từ trang cuối cùng, suy ra param cho trang kế (trả `undefined`/`null` khi hết).
+
+```ts
+// src/features/customers/api.ts
+import { infiniteQueryOptions } from '@tanstack/react-query';
+import { apiFetch } from '@/lib/api-client';
+import { pageSchema } from './schema';
+
+export function customersInfiniteQuery(q: string = '') {
+  return infiniteQueryOptions({
+    queryKey: ['customers', 'infinite', { q }],
+    queryFn: ({ pageParam }) =>
+      apiFetch(`/customers?cursor=${pageParam}&q=${q}`, pageSchema),
+    initialPageParam: 0,
+    // Lấy cursor của trang mới nhất để biết trang kế. null → hết, dừng fetch.
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+  });
+}
+```
+
+Hook + component:
+
+```tsx
+import { useInfiniteQuery } from '@tanstack/react-query';
+import { customersInfiniteQuery } from './api';
+
+function CustomerFeed({ q }: { q: string }) {
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isPending,
+    isError,
+  } = useInfiniteQuery(customersInfiniteQuery(q));
+
+  if (isPending) return <FeedSkeleton />;
+  if (isError) return <ErrorState />;
+
+  // data.pages là MẢNG các trang; gộp items lại để render phẳng.
+  const customers = data.pages.flatMap((page) => page.items);
+
+  return (
+    <div>
+      <ul>
+        {customers.map((c) => (
+          <li key={c.id}>{c.name}</li>
+        ))}
+      </ul>
+
+      <button
+        onClick={() => fetchNextPage()}
+        disabled={!hasNextPage || isFetchingNextPage}
+      >
+        {isFetchingNextPage ? 'Đang tải…' : hasNextPage ? 'Tải thêm' : 'Hết rồi'}
+      </button>
+    </div>
+  );
+}
+```
+
+Cấu trúc `data` khác `useQuery`: nó là `{ pages, pageParams }`, trong đó `data.pages` là mảng kết quả từng trang. Dùng `flatMap` để gộp về một danh sách phẳng cho render.
+
+---
+
+## 5. Tự động tải khi cuộn tới đáy
+
+Thay vì nút "Tải thêm", dùng `IntersectionObserver` để gọi `fetchNextPage` khi một "sentinel" ở cuối danh sách lọt vào viewport. Tách thành hook tái dùng (logic tách khỏi UI):
+
+```ts
+// src/hooks/useIntersectionObserver.ts
+import { useEffect, useRef } from 'react';
+
+export function useIntersectionObserver(onIntersect: () => void, enabled: boolean) {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const node = ref.current;
+    if (!node || !enabled) return;
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) onIntersect();
+      },
+      { rootMargin: '200px' }, // kích hoạt sớm 200px trước khi tới đáy
+    );
+
+    observer.observe(node);
+    return () => observer.disconnect(); // dọn observer khi unmount/đổi deps
+  }, [onIntersect, enabled]);
+
+  return ref;
+}
+```
+
+```tsx
+function CustomerFeed({ q }: { q: string }) {
+  const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending } =
+    useInfiniteQuery(customersInfiniteQuery(q));
+
+  // Chỉ quan sát khi còn trang và không đang tải, tránh gọi chồng.
+  const sentinelRef = useIntersectionObserver(
+    fetchNextPage,
+    hasNextPage && !isFetchingNextPage,
+  );
+
+  if (isPending) return <FeedSkeleton />;
+  const customers = data.pages.flatMap((p) => p.items);
+
+  return (
+    <div>
+      <ul>{customers.map((c) => <li key={c.id}>{c.name}</li>)}</ul>
+      {isFetchingNextPage ? <Spinner /> : null}
+      {/* sentinel: lọt viewport → fetchNextPage */}
+      <div ref={sentinelRef} aria-hidden />
+    </div>
+  );
+}
+```
+
+> **Lưu ý hiệu năng:** infinite list dài có thể nặng DOM. Khi danh sách lớn (hàng nghìn dòng), kết hợp với **virtualization** (vd `@tanstack/react-virtual`) để chỉ render phần thấy được. React Query lo *dữ liệu*, virtualizer lo *DOM*.
+
+---
+
+## 6. `useQuery` hay `useInfiniteQuery`? Chọn sao cho đúng
+
+| Tiêu chí | `useQuery` + `keepPreviousData` | `useInfiniteQuery` |
+|---|---|---|
+| Mẫu UI | Trang rời (1, 2, 3…) | Nối thêm / cuộn vô hạn |
+| Cache | Mỗi trang một entry | Mọi trang chung một entry |
+| Hành vi | Thay thế trang | Tích luỹ trang |
+| Hợp với | Bảng quản trị, kết quả có số trang | Feed, timeline, gallery |
+
+Đừng cố nhồi infinite scroll vào `useQuery` thường (sẽ phải tự gộp mảng và mất các cờ `hasNextPage`/`fetchNextPage`). Chọn đúng tool cho đúng mẫu UI.
+
+---
+
+## 7. Bài tập
+
+**1.** Vì sao pagination ngây thơ (cho `page` vào key, dựa vào `isPending`) gây nhấp nháy, và `keepPreviousData` sửa nó thế nào?
+
+<details>
+<summary>Lời giải</summary>
+
+Mỗi `page` là cache entry riêng; đổi trang → key mới chưa có cache → `isPending` bật → bảng thành skeleton (nhấp nháy). `placeholderData: keepPreviousData` giữ data trang trước hiển thị trong khi trang mới fetch nền, nên không bao giờ về trạng thái rỗng giữa các trang.
+</details>
+
+**2.** `data` của `useInfiniteQuery` có cấu trúc gì? Làm sao render thành một danh sách phẳng?
+
+<details>
+<summary>Lời giải</summary>
+
+`data` là `{ pages, pageParams }`, với `data.pages` là mảng kết quả từng trang. Dùng `data.pages.flatMap((p) => p.items)` để gộp thành danh sách phẳng.
+</details>
+
+**3.** `getNextPageParam` nên trả về gì khi đã hết dữ liệu, và điều đó ảnh hưởng `hasNextPage` ra sao?
+
+<details>
+<summary>Lời giải</summary>
+
+Trả `undefined` (hoặc `null`). Khi đó `hasNextPage` thành `false`, `fetchNextPage` không làm gì nữa — dùng để khoá nút "Tải thêm" / ngừng observer.
+</details>
+
+**Nâng cao:** Thêm `IntersectionObserver` để auto-load, rồi kết hợp `@tanstack/react-virtual` để virtualize danh sách 10.000 dòng mà vẫn mượt.
+
+---
+
+## Tóm tắt
+
+- Pagination trang rời: cho `page` vào key + **`placeholderData: keepPreviousData`** để giữ trang cũ trong lúc tải trang mới (không nhấp nháy). Dùng `isPlaceholderData` để khoá nút "Trang sau".
+- **`useInfiniteQuery`** cho cuộn vô hạn: cần `initialPageParam`, `queryFn({ pageParam })`, `getNextPageParam`. `data.pages` là mảng trang → `flatMap` để render.
+- Auto-load bằng `IntersectionObserver` (tách thành hook), chỉ quan sát khi `hasNextPage && !isFetchingNextPage`.
+- Danh sách rất dài → thêm **virtualization**; Query lo dữ liệu, virtualizer lo DOM.
+
+---
+
+## Phần tiếp theo
+
+**Phần 5 — Mutations & invalidation:** ghi dữ liệu (tạo/sửa/xoá) bằng `useMutation`, hiểu vòng đời `onMutate`/`onSuccess`/`onError`/`onSettled`, và sau khi ghi xong thì **invalidate đúng query** để UI tự đồng bộ với server.

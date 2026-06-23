@@ -1,0 +1,268 @@
+---
+title: 'Build a Real React App · Part 8 — Data Table with Filters & URL State'
+description: 'Build the flagship feature: a sortable, filterable, paginated customers table with TanStack Table where filter/sort/page state lives in the URL, feeds the Query key, and stays shareable and reload-safe — tying routing, data and UI together.'
+pubDate: 2026-07-18
+tags: [react, tanstack-table, url-state, data-table, react_stack_12]
+series: react-stack
+seriesOrder: 8
+draft: true
+---
+
+Đây là nơi cả stack hội tụ. Ta dựng màn hình chủ lực của Pulse: bảng customer sắp xếp, lọc, phân trang. Điểm nhấn kiến trúc — **URL là nguồn chân lý duy nhất cho state bảng**. Filter, sort, trang sống trong query string, nuôi Query key, điều khiển fetch.
+
+Vì sao? Vì URL-as-state khiến view **chia sẻ được** (dán link, thấy cùng bảng đã lọc), **an toàn reload** (refresh giữ filter), và **thân thiện back/forward** (lịch sử trình duyệt chạy ngay).
+
+---
+
+## 1. Luồng dữ liệu
+
+```text
+URL query string  ──►  parsed + validated params  ──►  Query key  ──►  fetch
+       ▲                                                                  │
+       └──────────────  user changes filter/sort/page  ◄──────────────────┘
+```
+
+Mỗi tương tác ghi vào URL; URL đổi suy lại params; params đổi Query key; Query refetch. Không có `useState` riêng cho filter — URL *chính là* state.
+
+### Tóm tắt một dòng
+
+Hành động → URL → params đã validate → Query key → fetch; URL là nguồn chân lý duy nhất, không `useState` song song.
+
+---
+
+## 2. Phân tích & validate URL params bằng zod
+
+URL params là chuỗi và hoàn toàn không tin được (người dùng sửa). Phân tích qua zod với **default và coercion** để phần còn lại làm việc với object sạch, có type:
+
+```ts
+// src/features/customers/use-customers-params.ts
+import { useSearchParams } from 'react-router';
+import { useMemo } from 'react';
+import { z } from 'zod';
+
+const paramsSchema = z.object({
+  q: z.string().default(''),
+  plan: z.enum(['all', 'starter', 'pro', 'enterprise']).catch('all'),
+  sort: z.enum(['name', 'mrr', 'status']).catch('name'),
+  dir: z.enum(['asc', 'desc']).catch('asc'),
+  page: z.coerce.number().int().min(1).catch(1),
+});
+
+export type CustomersParams = z.infer<typeof paramsSchema>;
+
+export function useCustomersParams() {
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // derive a typed, validated params object from the URL
+  const params = useMemo(
+    () => paramsSchema.parse(Object.fromEntries(searchParams)),
+    [searchParams],
+  );
+
+  function setParams(patch: Partial<CustomersParams>) {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        for (const [key, value] of Object.entries(patch)) {
+          next.set(key, String(value));
+        }
+        // any filter/sort change resets to page 1
+        if (!('page' in patch)) next.set('page', '1');
+        return next;
+      },
+      { replace: true },
+    );
+  }
+
+  return { params, setParams };
+}
+```
+
+`.catch(...)` khiến giá trị sai về default an toàn thay vì ném — quan trọng vì ai cũng có thể dán URL hỏng. `useMemo` giữ object params ổn định tham chiếu khi search string không đổi, nên an toàn trong Query key.
+
+### Tóm tắt một dòng
+
+Phân tích query string qua schema zod với default + `.catch` để URL không tin được thành object params sạch, có type, ổn định.
+
+---
+
+## 3. Đưa params vào Query key
+
+Object params thành một phần của key, nên đổi filter nào cũng tự kích fetch mới — và cache mỗi tổ hợp riêng:
+
+```ts
+// src/features/customers/api.ts
+export function customersQuery(params: CustomersParams) {
+  return queryOptions({
+    queryKey: customerKeys.list(params),
+    queryFn: () => apiFetch(`/customers?${toSearchString(params)}`, customerPageSchema),
+    placeholderData: keepPreviousData, // keep old rows visible while refetching
+  });
+}
+```
+
+```tsx
+function CustomersTable() {
+  const { params, setParams } = useCustomersParams();
+  const { data, isPending, isError, isPlaceholderData } = useQuery(customersQuery(params));
+  // …
+}
+```
+
+`placeholderData: keepPreviousData` là chi tiết UX then chốt: khi user đổi filter, hàng trang trước ở lại màn hình (mờ qua `isPlaceholderData`) thay vì nháy skeleton — không nhảy layout.
+
+### Tóm tắt một dòng
+
+Đặt params đã validate vào Query key (cache mỗi tổ hợp) và dùng `keepPreviousData` để bảng không nháy skeleton mỗi lần đổi filter.
+
+---
+
+## 4. Dựng bảng bằng TanStack Table
+
+*Docs: [TanStack Table](https://tanstack.com/table/latest/docs/framework/react/react-table).*
+
+```bash
+pnpm add @tanstack/react-table
+```
+
+TanStack Table **không giao diện** — nó quản lý logic bảng (cột, hàng, model sort) và đưa *bạn* markup, nên ghép hoàn hảo với `Table` của shadcn. Định nghĩa cột ở phạm vi module để không tạo lại mỗi render:
+
+```tsx
+// src/features/customers/columns.tsx
+import { type ColumnDef } from '@tanstack/react-table';
+import { type Customer } from './schema';
+
+export const customerColumns: ColumnDef<Customer>[] = [
+  { accessorKey: 'name', header: 'Name' },
+  { accessorKey: 'email', header: 'Email' },
+  { accessorKey: 'plan', header: 'Plan' },
+  {
+    accessorKey: 'mrr',
+    header: 'MRR',
+    cell: ({ getValue }) => formatCurrency(getValue<number>()),
+  },
+];
+```
+
+Vì sort/phân trang **do server điều khiển qua URL**, ta bảo bảng đừng tự làm — nó chỉ render:
+
+```tsx
+const table = useReactTable({
+  data: data?.rows ?? [],
+  columns: customerColumns,
+  getCoreRowModel: getCoreRowModel(),
+  manualSorting: true,
+  manualPagination: true,
+  rowCount: data?.total ?? 0,
+});
+```
+
+```tsx
+<Table>
+  <TableHeader>
+    {table.getHeaderGroups().map((hg) => (
+      <TableRow key={hg.id}>
+        {hg.headers.map((header) => (
+          <TableHead
+            key={header.id}
+            onClick={() => setParams({ sort: header.column.id as CustomersParams['sort'] })}
+          >
+            {flexRender(header.column.columnDef.header, header.getContext())}
+          </TableHead>
+        ))}
+      </TableRow>
+    ))}
+  </TableHeader>
+  <TableBody>
+    {table.getRowModel().rows.map((row) => (
+      <TableRow key={row.id}>
+        {row.getVisibleCells().map((cell) => (
+          <TableCell key={cell.id}>
+            {flexRender(cell.column.columnDef.cell ?? cell.column.columnDef.header, cell.getContext())}
+          </TableCell>
+        ))}
+      </TableRow>
+    ))}
+  </TableBody>
+</Table>
+```
+
+`manualSorting`/`manualPagination` nghĩa bảng render đúng hàng server trả — nguồn chân lý vẫn là pipeline URL→query→server, không phải state cục bộ bảng.
+
+### Tóm tắt một dòng
+
+TanStack Table không giao diện; với `manualSorting`/`manualPagination` nó render hàng server còn pipeline URL→Query lo sort/trang.
+
+---
+
+## 5. Ô tìm kiếm — debounce vào URL
+
+Ghi URL mỗi phím làm rác lịch sử và refetch. Debounce văn bản, rồi commit vào URL:
+
+```tsx
+function CustomerSearch() {
+  const { params, setParams } = useCustomersParams();
+  const [text, setText] = useState(params.q);
+
+  // commit to the URL 300ms after the user stops typing
+  useEffect(() => {
+    const id = setTimeout(() => {
+      if (text !== params.q) setParams({ q: text });
+    }, 300);
+    return () => clearTimeout(id);
+  }, [text, params.q, setParams]);
+
+  return <Input value={text} onChange={(e) => setText(e.target.value)} placeholder="Search…" />;
+}
+```
+
+Ở đây `useState` *cục bộ* là đúng: văn bản đang gõ là state tạm, không chia sẻ — chỉ query *đã commit* vào URL. Đó là ranh giới Phần 7 áp dụng chính xác.
+
+### Tóm tắt một dòng
+
+Giữ văn bản tìm đang gõ trong `useState` cục bộ, debounce ~300ms, rồi chỉ commit query cuối vào URL.
+
+---
+
+## 6. Bài tập
+
+**1.** Vì sao lưu filter bảng trong URL thay vì `useState` hay Zustand?
+
+<details>
+<summary>Lời giải</summary>
+
+URL khiến view đã lọc chia sẻ được, an toàn reload, thân thiện back/forward. State `useState`/Zustand mất khi reload và không chia sẻ được.
+</details>
+
+**2.** Vì sao phân tích query string với default `.catch()` của zod thay vì đọc chuỗi thô?
+
+<details>
+<summary>Lời giải</summary>
+
+URL params là chuỗi không tin được người dùng sửa tùy ý. zod với default + `.catch` ép type (vd `page` thành số) và về an toàn khi rác, nên app luôn làm việc với object params sạch, có type.
+</details>
+
+**3.** `placeholderData: keepPreviousData` cải thiện gì, và sao debounce ô tìm?
+
+<details>
+<summary>Lời giải</summary>
+
+`keepPreviousData` giữ hàng trước hiển thị khi refetch để bảng không nháy skeleton hay nhảy layout mỗi lần đổi filter. Debounce tìm tránh ghi URL (và refetch) mỗi phím — chỉ commit sau khi dừng.
+</details>
+
+Nâng cao:thêm điều khiển phân trang gọi `setParams({ page })`, vô hiệu Prev ở trang 1 và Next khi `page * pageSize >= total`, và phản ánh trang trong URL.
+
+---
+
+## Điểm chính
+
+- **URL là nguồn chân lý** cho filter/sort/trang — chia sẻ được, an toàn reload, thân thiện lịch sử.
+- Phân tích query string với **default zod + `.catch`**; memo params cho Query key ổn định.
+- TanStack Table **không giao diện**; dùng `manualSorting`/`manualPagination` để server (qua URL) lo sort/trang.
+- `keepPreviousData` tránh nháy skeleton; debounce tìm; giữ gõ tạm trong state cục bộ.
+
+---
+
+## Tiếp theo
+
+**Phần 9 — Auth & lớp API**: bảo vệ app — wrapper fetch có xác thực với refresh token, query người dùng hiện tại, chắn route (`RequireAuth`), và login/logout phối hợp tốt với cache Query.

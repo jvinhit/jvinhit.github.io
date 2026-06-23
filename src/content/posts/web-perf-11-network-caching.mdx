@@ -1,0 +1,140 @@
+---
+title: 'Web Performance · Part 11 — Network & Caching'
+description: 'The network layer matters: HTTP caching (Cache-Control, ETag, immutable), CDN and edge, Brotli/Gzip compression, HTTP/2-3, and service workers for offline-first cache.'
+pubDate: 2026-09-07
+tags: [performance, caching, cdn, http, service-worker, web_perf_12]
+series: web-perf
+seriesOrder: 11
+draft: true
+---
+
+Request nhanh nhất là request **không bao giờ xảy ra**. Lớp mạng và caching quyết định bao nhiêu byte phải đi qua dây, từ đâu, và bao lâu một lần. Tối ưu tốt ở đây làm lần truy cập thứ hai gần như tức thì và giảm tải LCP/TTFB cho lần đầu.
+
+---
+
+## 1. HTTP Caching: trình duyệt tự nhớ tài nguyên
+
+Trình duyệt cache tài nguyên dựa trên header server gửi. Header quan trọng nhất là `Cache-Control`.
+
+### Tài nguyên có hash (immutable)
+
+Asset build ra với hash trong tên (`app.a1b2c3.js`) **không bao giờ đổi nội dung** — đổi nội dung thì đổi tên file. Cache vĩnh viễn:
+
+```http
+Cache-Control: public, max-age=31536000, immutable
+```
+
+`max-age=31536000` (1 năm) + `immutable` báo trình duyệt: "đừng bao giờ hỏi lại". Lần sau tải trang, các asset này lấy từ cache đĩa — 0 byte mạng.
+
+### HTML và tài nguyên hay đổi
+
+HTML không nên cache lâu (nếu không người dùng thấy bản cũ). Dùng revalidation:
+
+```http
+Cache-Control: no-cache
+# no-cache does NOT mean "don't cache" — it means "cache but revalidate before use"
+```
+
+### ETag & revalidation
+
+`ETag` là "vân tay" của tài nguyên. Lần sau trình duyệt gửi `If-None-Match: <etag>`; nếu chưa đổi, server trả `304 Not Modified` (không body) — tiết kiệm băng thông dù vẫn tốn một vòng request.
+
+> Chiến lược tổng quát: **asset có hash → cache 1 năm immutable; HTML → no-cache (revalidate)**. Đây là nền của "lần đầu tải đủ, lần sau gần như tức thì".
+
+---
+
+## 2. CDN & Edge
+
+CDN đặt bản sao tài nguyên ở nhiều điểm (edge) gần người dùng địa lý. Lợi ích:
+
+- **Giảm TTFB**: phục vụ từ edge gần thay vì origin server xa (ảnh hưởng LCP — Phần 5).
+- **Giảm tải origin**: edge xử lý phần lớn request tĩnh.
+- **Edge compute**: chạy logic nhẹ (A/B, redirect, personalization) ngay tại edge.
+
+Static site (như blog này) hợp với CDN hoàn hảo: toàn bộ HTML/asset là file tĩnh, đẩy lên CDN là có hiệu năng toàn cầu gần như miễn phí.
+
+---
+
+## 3. Nén: Brotli & Gzip
+
+Nén văn bản (HTML, CSS, JS, SVG, JSON) giảm dung lượng truyền 60–80%. Thứ tự ưu tiên:
+
+- **Brotli (`br`)**: nén tốt hơn Gzip ~15–20% cho text — ưu tiên nếu server/CDN hỗ trợ.
+- **Gzip**: fallback rộng khắp.
+
+Hầu hết CDN/host bật nén tự động; nếu tự cấu hình server, đảm bảo bật Brotli cho text. Lưu ý: **đừng nén lại** ảnh đã nén (JPEG/AVIF/WebP) — vô ích và tốn CPU.
+
+> Mẹo: với asset tĩnh, nén sẵn lúc build (pre-compress thành `.br`/`.gz`) để server chỉ việc gửi file đã nén, không nén lại mỗi request.
+
+---
+
+## 4. HTTP/2 & HTTP/3
+
+Phiên bản giao thức ảnh hưởng cách request song song:
+
+- **HTTP/1.1**: mỗi kết nối xử lý một request một lúc → nghẽn (head-of-line blocking), phải mở nhiều kết nối.
+- **HTTP/2**: **multiplexing** — nhiều request song song trên một kết nối. Giảm overhead, không cần "domain sharding" hay gộp file thái quá nữa.
+- **HTTP/3 (QUIC)**: chạy trên UDP, loại bỏ head-of-line blocking ở tầng vận chuyển, kết nối lại nhanh hơn — đặc biệt tốt trên mạng di động chập chờn.
+
+Hệ quả thực tế: với HTTP/2-3, **gộp tất cả vào một file khổng lồ không còn cần thiết** (thậm chí hại vì phá caching từng phần). Chia bundle hợp lý (Phần 8) + nhiều file nhỏ cache độc lập là ổn.
+
+---
+
+## 5. Service Worker: cache có lập trình
+
+Service Worker là một proxy chạy nền, chặn request và quyết định trả từ cache hay mạng — cho phép offline và kiểm soát cache tinh vi. Một chiến lược phổ biến:
+
+```ts
+// sw.ts — cache-first for static assets, network-first for API
+self.addEventListener('fetch', (event: FetchEvent) => {
+  const url = new URL(event.request.url);
+
+  if (url.pathname.startsWith('/assets/')) {
+    // hashed asset → cache-first: return from cache immediately, nearly instant
+    event.respondWith(
+      caches.match(event.request).then((hit) => hit ?? fetch(event.request)),
+    );
+  } else if (url.pathname.startsWith('/api/')) {
+    // API → network-first: prefer fresh data, fallback to cache when offline
+    event.respondWith(
+      fetch(event.request).catch(() => caches.match(event.request) as Promise<Response>),
+    );
+  }
+});
+```
+
+Các chiến lược chính: **cache-first** (asset tĩnh), **network-first** (dữ liệu tươi), **stale-while-revalidate** (trả cache ngay rồi cập nhật nền — cân bằng tốt). Thư viện **Workbox** đóng gói các chiến lược này, đỡ phải tự viết.
+
+> Cảnh báo: service worker mạnh nhưng phức tạp (vòng đời, cập nhật, cache cũ kẹt lại). Chỉ thêm khi cần offline/PWA hoặc cache nâng cao; cấu hình sai có thể khiến người dùng kẹt ở bản cũ.
+
+---
+
+## 6. Giảm số lượng & kích thước request
+
+- **Loại request thừa**: gộp icon thành sprite/SVG symbol, bỏ thư viện không dùng (Phần 8).
+- **Tránh redirect chain**: mỗi redirect là một vòng mạng; trỏ thẳng URL cuối.
+- **`preconnect`/`dns-prefetch`** cho origin bên thứ ba quan trọng (Phần 4).
+- **Phân trang/lazy** dữ liệu lớn thay vì tải hết một lần.
+
+---
+
+## 7. Checklist network & caching
+
+1. Asset có hash đặt **`Cache-Control: immutable, max-age=1 năm`**?
+2. HTML đặt **`no-cache`** (revalidate) để không kẹt bản cũ?
+3. Phục vụ qua **CDN** để giảm TTFB toàn cầu?
+4. Bật **Brotli** cho text (pre-compress nếu được)?
+5. Dùng **HTTP/2-3** (không gộp file thái quá)?
+6. Cần offline/PWA → **service worker** với chiến lược phù hợp (cẩn thận vòng đời)?
+7. Cắt **redirect chain** và request thừa?
+
+---
+
+## Tóm tắt
+
+- Request nhanh nhất là request **không xảy ra** — caching là đòn bẩy lớn nhất ở lớp mạng.
+- **Asset có hash**: cache 1 năm `immutable`; **HTML**: `no-cache` revalidate; `ETag` cho 304.
+- **CDN** giảm TTFB; **Brotli** nén text tốt hơn Gzip; **HTTP/2-3** cho multiplexing (khỏi gộp file thái quá).
+- **Service Worker** (cache-first / network-first / stale-while-revalidate, qua Workbox) cho offline — dùng có ý thức vì vòng đời phức tạp.
+
+**Phần tiếp theo:** Capstone — audit một trang thật từ A–Z, đặt performance budget và giám sát trong CI.

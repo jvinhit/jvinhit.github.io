@@ -1,0 +1,308 @@
+---
+title: 'TanStack Query · Phần 9 — QueryClient & Defaults sâu'
+description: 'Cấu hình QueryClient ở mức senior: defaultOptions cho queries/mutations, QueryCache & MutationCache với onError/onSuccess toàn cục, networkMode, structuralSharing, và setQueryDefaults theo từng nhóm key.'
+pubDate: 2026-06-30
+tags: [react, tanstack-query, react-query, configuration, tanstack_query_8]
+series: tanstack-query
+seriesOrder: 9
+draft: false
+---
+
+Tám phần đầu đưa bạn từ mental model tới một feature CRUD có test. Mười phần tiếp theo là **phần chuyên sâu** — những thứ tách một app "chạy được" khỏi một codebase mà cả team senior duyệt mà gật đầu. Mở màn là thứ bạn đã chạm từ Phần 1 nhưng chưa đào tận đáy: **`QueryClient`**.
+
+`QueryClient` không chỉ là "nơi chứa cache". Nó là điểm cấu hình tập trung cho retry, refetch, garbage collection, xử lý lỗi toàn cục, và hành vi offline. Cấu hình đúng một lần ở đây giúp bạn xoá hàng trăm dòng lặp ở từng `useQuery`.
+
+> Phiên bản dùng trong series: **React 19** + **@tanstack/react-query v5** + **TypeScript strict**. Không `any`, không `as` (trừ sau khi validate runtime bằng zod).
+
+---
+
+## 1. Hai lớp cấu hình: client-level vs query-level
+
+Mỗi option (vd `staleTime`, `retry`) có thể đặt ở **hai nơi**, và query-level luôn thắng:
+
+```ts
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: { staleTime: 60_000 }, // mặc định cho MỌI query
+  },
+});
+
+// Query này ghi đè default → fresh trong 5 phút
+useQuery({ queryKey: ['config'], queryFn: fetchConfig, staleTime: 5 * 60_000 });
+```
+
+Thứ tự ưu tiên (cao → thấp):
+
+| Mức | Đặt ở đâu | Phạm vi |
+|---|---|---|
+| Query-level | Trong chính lời gọi `useQuery` | Một query |
+| Key-level | `queryClient.setQueryDefaults(key, ...)` | Mọi query khớp prefix key (mục 6) |
+| Client-level | `defaultOptions.queries` | Mọi query trong app |
+
+Quy tắc tư duy: **đặt mặc định hợp lý ở client-level, chỉ ghi đè ở query-level khi có lý do**. Đừng copy `staleTime` vào 50 query — sửa default một chỗ.
+
+---
+
+## 2. `defaultOptions` đầy đủ cho production
+
+Đây là cấu hình khởi điểm tốt cho hầu hết app, kèm giải thích **vì sao**:
+
+```ts
+// src/lib/query-client.ts
+import { QueryClient } from '@tanstack/react-query';
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // Đa số data không đổi từng giây. 60s cắt phần lớn refetch thừa
+      // mà vẫn đủ tươi cho dashboard. Data "gần như tĩnh" tự nâng ở query-level.
+      staleTime: 60_000,
+      // Giữ cache 5 phút sau khi không còn observer — back/forward thấy data ngay.
+      gcTime: 5 * 60_000,
+      // Thử lại lỗi mạng/5xx tối đa 2 lần; bỏ qua 4xx (xem Phần 7).
+      retry: (failureCount, error) => {
+        if (error instanceof ApiError && error.status >= 400 && error.status < 500) return false;
+        return failureCount < 2;
+      },
+      retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 30_000),
+      // Refetch khi user quay lại tab — phù hợp data "sống".
+      refetchOnWindowFocus: true,
+      // KHÔNG refetch mỗi lần component mount nếu data còn fresh (đỡ nháy).
+      refetchOnMount: true,
+    },
+    mutations: {
+      // Mutation mặc định KHÔNG retry (tránh tạo bản ghi trùng).
+      retry: 0,
+    },
+  },
+});
+```
+
+> **`ApiError`** là lớp lỗi tự định nghĩa từ Phần 3 (bọc `status` HTTP). Nếu chưa có, mục 4 dưới đây nhắc lại bản tối thiểu.
+
+---
+
+## 3. `networkMode` — hành vi khi mất mạng
+
+`networkMode` quyết định query/mutation cư xử thế nào khi trình duyệt **offline**. Đây là option dễ bị bỏ quên nhưng đổi hẳn UX offline-first (Phần 13 dùng lại).
+
+| Giá trị | Hành vi khi offline |
+|---|---|
+| `'online'` (mặc định) | Query **không chạy**, chuyển sang trạng thái `paused` (`fetchStatus: 'paused'`). Tự chạy lại khi có mạng. |
+| `'always'` | Luôn chạy `queryFn`, kể cả offline. Hợp khi `queryFn` đọc từ cache/AsyncStorage chứ không gọi mạng. |
+| `'offlineFirst'` | Chạy **một lần**; nếu lỗi thì pause. Hợp với service worker / HTTP cache đứng trước. |
+
+```ts
+new QueryClient({
+  defaultOptions: {
+    queries: { networkMode: 'offlineFirst' }, // tận dụng cache của SW trước
+  },
+});
+```
+
+Phân biệt ba trạng thái khi đọc `fetchStatus`: `'fetching'` (đang gọi), `'paused'` (muốn gọi nhưng offline), `'idle'` (không làm gì). UI nên hiện badge "đang chờ mạng" khi `paused`.
+
+---
+
+## 4. `QueryCache` — xử lý lỗi & sự kiện toàn cục
+
+`QueryClient` chứa một `QueryCache`. Bạn có thể gắn handler **toàn cục** vào đây để log lỗi, bắn toast, hoặc đăng xuất khi 401 — thay vì lặp ở mọi query.
+
+```ts
+import { QueryClient, QueryCache, MutationCache } from '@tanstack/react-query';
+import { toast } from 'sonner';
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+export const queryClient = new QueryClient({
+  queryCache: new QueryCache({
+    onError: (error, query) => {
+      // 401 toàn cục → đăng xuất. Một chỗ duy nhất, không lặp.
+      if (error instanceof ApiError && error.status === 401) {
+        redirectToLogin();
+        return;
+      }
+      // Chỉ toast lỗi cho query ĐÃ từng có data (refetch nền thất bại),
+      // tránh toast trùng với UI error state của lần load đầu.
+      if (query.state.data !== undefined) {
+        toast.error(`Làm mới thất bại: ${error.message}`);
+      }
+    },
+  }),
+  mutationCache: new MutationCache({
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : 'Thao tác thất bại');
+    },
+  }),
+});
+```
+
+Vì sao kiểm tra `query.state.data !== undefined`? Vì lỗi **lần đầu** (chưa có data) thường đã render thành error state trong component; toast thêm là thừa. Còn lỗi khi **refetch nền** thì component vẫn hiện data cũ, nên toast là cách duy nhất báo cho user biết.
+
+> **Mẹo:** `MutationCache.onError` chạy *trước* `onError` của từng `useMutation`. Dùng global cho việc chung (toast, log), dùng local cho rollback đặc thù (Phần 6).
+
+---
+
+## 5. `onSuccess`/`onSettled` toàn cục cho mutation — pattern invalidation tập trung
+
+Một pattern mạnh: cho phép mỗi mutation khai báo "tôi đụng tới key nào" qua `meta`, rồi invalidate tập trung ở `MutationCache`:
+
+```ts
+import { MutationCache } from '@tanstack/react-query';
+
+declare module '@tanstack/react-query' {
+  interface Register {
+    mutationMeta: {
+      /** Danh sách query key cần invalidate sau khi mutation thành công */
+      invalidates?: ReadonlyArray<ReadonlyArray<unknown>>;
+    };
+  }
+}
+
+const mutationCache = new MutationCache({
+  onSuccess: (_data, _vars, _ctx, mutation) => {
+    const keys = mutation.meta?.invalidates;
+    if (keys) {
+      keys.forEach((key) => queryClient.invalidateQueries({ queryKey: key }));
+    }
+  },
+});
+
+// Dùng:
+useMutation({
+  mutationFn: createCustomer,
+  meta: { invalidates: [customerKeys.lists()] }, // khai báo, không gọi tay
+});
+```
+
+Cách này gom logic "ghi xong thì làm mới gì" về một chỗ, và `meta` được type-check nhờ module augmentation (`Register`). Phần 17 sẽ đào sâu kỹ thuật augmentation này.
+
+---
+
+## 6. `setQueryDefaults` — mặc định theo nhóm key
+
+Không phải mọi query cần cùng `staleTime`. Thay vì ghi đè ở từng query, đặt mặc định theo **prefix key**:
+
+```ts
+// Data ít đổi (danh mục, cấu hình) → fresh lâu hơn
+queryClient.setQueryDefaults(['config'], { staleTime: Infinity });
+
+// Data realtime (giá, thông báo) → luôn stale, refetch tích cực
+queryClient.setQueryDefaults(['ticker'], { staleTime: 0, refetchInterval: 5_000 });
+
+// Mọi query bắt đầu bằng ['customers', ...] → 2 phút
+queryClient.setQueryDefaults(['customers'], { staleTime: 2 * 60_000 });
+```
+
+Khớp theo **prefix**: `['customers']` áp cho cả `['customers', 'list']` lẫn `['customers', 'detail', 5]`. Đây là nơi hệ query key phân cấp (Phần 3) phát huy: thiết kế key tốt → cấu hình theo nhóm gọn gàng.
+
+Tương tự có `setMutationDefaults(mutationKey, options)` cho mutation (Phần 15 dùng để bật retry cho offline queue).
+
+---
+
+## 7. `staleTime: Infinity` vs `gcTime` — đừng nhầm hai trục
+
+Hai bộ đếm độc lập, hay bị lẫn:
+
+- **`staleTime`** — bao lâu data còn được coi là *tươi* (không tự refetch). Trục "độ mới".
+- **`gcTime`** — bao lâu cache entry còn nằm trong RAM sau khi *không còn component nào dùng*. Trục "tuổi thọ".
+
+```
+staleTime = 60s, gcTime = 5min
+
+t=0   fetch xong, data FRESH
+t=60s data thành STALE (lần focus/mount sau sẽ refetch)
+t=...  component unmount → entry thành "inactive"
+t=...+5min  không ai dùng lại → entry bị xoá khỏi cache
+```
+
+Nhầm phổ biến: đặt `staleTime: Infinity` để "cache mãi", nhưng `gcTime` mặc định 5 phút vẫn xoá entry khi không ai dùng. Muốn giữ thật lâu, nâng **cả hai**. Ngược lại, `gcTime` ngắn mà `staleTime` dài thì data biến mất sớm hơn bạn tưởng.
+
+---
+
+## 8. Một QueryClient cho mỗi request (chuẩn bị cho SSR)
+
+Ở app client-only, một `QueryClient` module-scope là đủ. Nhưng trên **server** (Phần 10), dùng chung một client giữa các request là lỗi bảo mật: data của user A rò sang user B. Quy tắc:
+
+```tsx
+// ❌ Trên server: KHÔNG dùng client toàn cục dùng chung
+// ✅ Tạo MỚI mỗi request, hoặc dùng useState để mỗi browser session có 1 client
+
+function makeQueryClient() {
+  return new QueryClient({
+    defaultOptions: { queries: { staleTime: 60_000 } },
+  });
+}
+
+let browserQueryClient: QueryClient | undefined;
+
+export function getQueryClient() {
+  if (typeof window === 'undefined') {
+    // Server: luôn tạo mới để không chia sẻ cache giữa request.
+    return makeQueryClient();
+  }
+  // Browser: tái dùng để không mất cache khi React Suspense re-render.
+  browserQueryClient ??= makeQueryClient();
+  return browserQueryClient;
+}
+```
+
+Pattern `getQueryClient()` này là nền cho phần SSR sắp tới. Nhớ nó: **server tạo mới, browser singleton**.
+
+---
+
+## 9. Bài tập
+
+**1.** Một option đặt cả ở `defaultOptions.queries` lẫn trong lời gọi `useQuery`. Cái nào thắng, và vì sao thiết kế vậy lại hợp lý?
+
+<details>
+<summary>Lời giải</summary>
+
+Query-level thắng client-level. Hợp lý vì client-level là "mặc định an toàn cho số đông", còn query-level là ngoại lệ có chủ đích cho một loại data cụ thể (vd cấu hình ít đổi cần `staleTime` dài). Nếu client-level mà thắng thì không thể tinh chỉnh từng query.
+
+</details>
+
+**2.** Khi nào nên dùng `QueryCache.onError` thay vì `onError` trong từng `useQuery`?
+
+<details>
+<summary>Lời giải</summary>
+
+Dùng `QueryCache.onError` cho xử lý *toàn cục, đồng nhất*: đăng xuất khi 401, log về Sentry, toast khi refetch nền thất bại. Dùng `onError` local khi cần phản ứng *đặc thù* cho một query (rollback, cập nhật state riêng). Global giảm lặp; local cho kiểm soát chi tiết.
+
+</details>
+
+**3.** Vì sao `staleTime: Infinity` *một mình* không đủ để "giữ cache mãi mãi"?
+
+<details>
+<summary>Lời giải</summary>
+
+`staleTime` chỉ điều khiển *độ tươi* (khi nào refetch), còn `gcTime` điều khiển *khi nào xoá entry khỏi RAM* sau khi không còn observer. Với `gcTime` mặc định 5 phút, entry vẫn bị dọn dù `staleTime` là vô hạn. Muốn giữ lâu phải nâng cả `gcTime` (hoặc persist — Phần 13).
+
+</details>
+
+**Nâng cao:** Thiết lập `MutationCache` với pattern `meta.invalidates` ở mục 5, rồi chuyển 2–3 mutation của bạn sang khai báo invalidation qua `meta`. Xác nhận chỉ cần một chỗ xử lý invalidate cho toàn app.
+
+---
+
+## Tóm tắt
+
+- Option có **hai lớp**: client-level (mặc định) và query-level (ghi đè). Đặt mặc định hợp lý một chỗ, chỉ ghi đè khi có lý do.
+- `QueryCache.onError` / `MutationCache.onError` là nơi xử lý lỗi **toàn cục** (401 → logout, toast khi refetch nền lỗi) — bớt lặp.
+- `networkMode` (`online` / `always` / `offlineFirst`) định đoạt hành vi offline; `paused` là trạng thái "muốn gọi nhưng đang offline".
+- `setQueryDefaults(prefixKey, …)` cấu hình theo **nhóm key** — phần thưởng của hệ query key phân cấp.
+- `staleTime` (độ tươi) ≠ `gcTime` (tuổi thọ cache); muốn giữ lâu phải nâng cả hai.
+- Server **tạo client mới mỗi request**, browser dùng singleton — nền cho SSR.
+
+---
+
+## Phần tiếp theo
+
+**Phần 10 — SSR, Next.js App Router & Hydration:** prefetch trên server rồi truyền cache xuống client qua `dehydrate` + `<HydrationBoundary>`, dùng `getQueryClient()` đúng cách trong React Server Components, và streaming data với `@tanstack/react-query-next-experimental` để vừa giữ SEO vừa có cache tương tác phía client.

@@ -1,0 +1,204 @@
+---
+title: "Node Package Managers · Part 4 — Yarn Berry (v2–v4) & Plug'n'Play"
+description: "The Yarn rewrite that deletes node_modules: how Plug'n'Play resolves imports from a .pnp.cjs map, zero-installs, the node-modules linker escape hatch, and a head-to-head of Yarn v1 vs v4."
+pubDate: 2026-06-19
+tags: [yarn, pnp, package-managers, monorepo, package_managers_12]
+series: package-managers
+seriesOrder: 4
+draft: false
+---
+
+Đây là **Phần 4 của series 12 phần** về package manager Node. Ở [Phần 3](/posts/package-managers-03-yarn-classic) ta thấy Yarn Classic — một npm tốt hơn với *cùng* mô hình `node_modules`. **Yarn Berry** vứt bỏ hoàn toàn mô hình đó.
+
+Đây là tool bị hiểu lầm nhiều nhất trong hệ sinh thái JS. Người ta nói "Yarn" mà ám chỉ hai sản phẩm chỉ chung cái tên. Hãy sửa điều đó.
+
+---
+
+## 1. Ý tưởng cốt lõi — diệt `node_modules`
+
+Tính năng nổi bật của Berry là **Plug'n'Play (PnP)**. Nhận thức: `node_modules` là một *cache* chậm, mất mát của thông tin mà package manager đã biết chính xác. Vậy tại sao phải ghi hàng nghìn file lên disk chỉ để Node tái khám phá cây bằng cách quét thư mục?
+
+```text
+Classic (v1):  yarn.lock → unzip & COPY everything → flat node_modules/
+               Node resolves by walking folders (slow, ambiguous)
+
+Berry PnP:     yarn.lock + .pnp.cjs  → NO node_modules at all
+               deps stay ZIPPED in .yarn/cache/*.zip
+               .pnp.cjs is a perfect lookup table:
+                 "package X v1.2.3 → this exact zip, and it may import
+                  ONLY these dependencies"
+{deps nằm nén trong .yarn/cache; .pnp.cjs là bảng tra cứu hoàn hảo}
+```
+
+Thay vì cây thư mục, Berry sinh một file — `.pnp.cjs` — ánh xạ *mọi* `(package, version)` tới vị trí và các dependency **được phép** của nó. Node được vá (qua runtime PnP) để tra map này thay vì quét disk.
+
+---
+
+## 2. PnP đem lại gì
+
+```text
+✓ INSTANT installs   no file copying — just write the map + zips
+{install tức thì}     {không copy file — chỉ ghi map + zip}
+
+✓ STRICT by design   a package can import ONLY its declared deps.
+{nghiêm ngặt}         Phantom dependencies become IMPOSSIBLE — the map
+                      simply has no entry for an undeclared import.
+
+✓ ZERO-INSTALLS      commit .yarn/cache + .pnp.cjs → `git clone` and run
+{không cần install}    with NO install step at all. CI install time ≈ 0.
+
+✓ SMALL footprint    zipped deps, no millions of inode-heavy files
+{dung lượng nhỏ}
+```
+
+Điểm nghiêm ngặt là điều lớn: lỗi phantom-dependency từ Phần 2 *không thể xảy ra* dưới PnP. Nếu bạn `import lodash` mà không khai báo, Node ném lỗi ngay vì map PnP không có cạnh cho phép.
+
+---
+
+## 3. Cái giá — ma sát tương thích
+
+Không có bữa trưa miễn phí. Rất nhiều tooling được viết với giả định `node_modules` là thư mục thật quét được:
+
+```text
+Tools that read node_modules directly may break under PnP:
+{tool đọc thẳng node_modules có thể vỡ dưới PnP}
+  - some bundlers / older build tools
+  - tools that shell out and glob node_modules/**
+  - editors needing TypeScript SDK setup (yarn dlx @yarnpkg/sdks vscode)
+```
+
+Berry giảm thiểu bằng **`pnpify`/SDK** và trường **`packageExtensions`** để vá package có peer dep sai/thiếu. Tuy vậy, ma sát này là lý do nhiều team dùng Berry nhưng **chuyển linker về `node_modules`**.
+
+### SDK cho editor — bước ai cũng quên
+
+Dưới PnP không có `node_modules` để TypeScript server của VS Code quét, nên TS/ESLint/Prettier trông "hỏng" cho tới khi bạn tạo **editor SDK**:
+
+```bash
+yarn dlx @yarnpkg/sdks vscode   # writes .yarn/sdks + .vscode settings
+# then point VS Code at the workspace TypeScript version
+```
+
+### Vá dependency tại chỗ — `yarn patch`
+
+Berry có cách hạng-nhất để sửa một dependency hỏng *mà không* fork — nó sinh một file patch được commit, áp lúc install:
+
+```bash
+yarn patch left-pad          # opens an editable copy, prints a temp path
+# edit the files, then:
+yarn patch-commit -s /tmp/...  # writes .yarn/patches/left-pad-*.patch
+```
+
+```jsonc
+// package.json — Berry rewires the dependency through the patch protocol
+{ "resolutions": { "left-pad": "patch:left-pad@npm:1.3.0#.yarn/patches/left-pad.patch" } }
+```
+
+Đây là cách thay thế sạch, review được cho hack `patch-package` postinstall cũ.
+
+---
+
+## 4. Cửa thoát — `nodeLinker`
+
+Berry được cấu hình trong `.yarnrc.yml`. Cài đặt quan trọng nhất là `nodeLinker`:
+
+```yaml
+# .yarnrc.yml
+nodeLinker: pnp           # default: Plug'n'Play, no node_modules
+# nodeLinker: pnp-loose   # PnP but tolerate some hoisting (less strict)
+# nodeLinker: node-modules# generate a real node_modules (max compatibility)
+
+yarnPath: .yarn/releases/yarn-4.x.cjs   # pin the exact Yarn version in-repo
+enableGlobalCache: false                # keep cache in-repo for zero-installs
+```
+
+Vài key `.yarnrc.yml` đáng biết:
+
+```yaml
+pnpFallbackMode: none          # forbid resolving undeclared deps (strictest)
+pnpMode: strict                # vs "loose" — controls phantom tolerance
+enableScripts: false           # disable lifecycle scripts by default (Part 10!)
+supportedArchitectures:        # which native binaries to fetch (zero-installs
+  os: [current, linux]         # across platforms / Docker)
+  cpu: [current, arm64, x64]
+packageExtensions:             # patch wrong/missing metadata of a dependency
+  "debug@*":
+    peerDependenciesMeta:
+      supports-color:
+        optional: true
+```
+
+`supportedArchitectures` rất quan trọng cho **zero-install đa nền tảng**: nếu bạn commit cache trên Mac nhưng deploy trên Linux, bạn phải bảo Berry fetch cả binary Linux nếu không install production sẽ fail (câu chuyện phân phối binary ở Phần 8).
+
+| `nodeLinker` | Layout | Strictness | Compatibility |
+|---|---|---|---|
+| `pnp` | `.pnp.cjs` + zips | Cao nhất | Thấp nhất |
+| `pnp-loose` | PnP + some hoist | Medium | Medium |
+| `node-modules` | Thư mục thật | Như npm | Cao nhất |
+
+> Nhìn thẳng: nếu đặt `nodeLinker: node-modules`, bạn đã biến Berry thành "một Yarn hiện đại nhanh với `node_modules` thật" — bạn giữ CLI tốt, plugin, workspaces, nhưng bỏ tính nghiêm ngặt của PnP. Nhiều team thấy đây là điểm cân bằng thực dụng.
+
+---
+
+## 5. Bộ lệnh Berry (đã đổi!)
+
+Berry đổi tên và thêm lệnh. Trộn trí nhớ cơ bắp v1 với v4 là vấp ngã phổ biến:
+
+```bash
+yarn                         # install (same)
+yarn add react               # add (same)
+yarn dlx create-vite         # ← Berry's `npx` equivalent (v1 had no dlx)
+yarn install --immutable     # ← CI flag (v1 used --frozen-lockfile)
+yarn workspaces foreach -A run build   # run a script across the monorepo
+yarn plugin import interactive-tools   # plugins are a first-class system
+yarn constraints             # enforce repo-wide dependency policies
+```
+
+**Hệ thống plugin** và **constraints** thực sự mạnh cho monorepo lớn: constraints cho phép khẳng định quy tắc như "mọi workspace phải dùng cùng version React" và fail install nếu vi phạm.
+
+---
+
+## 6. Yarn v1 vs v4 — đối đầu
+
+Đây là bảng mà cả phần này hướng tới:
+
+| Khía cạnh | Yarn Classic (v1) | Yarn Berry (v4) |
+|---|---|---|
+| Trạng thái | Chỉ bảo trì | Phát triển tích cực |
+| Layout mặc định | Flat `node_modules` | **Plug'n'Play** (no `node_modules`) |
+| Phantom dep | Có thể | **Không thể** dưới PnP |
+| Lockfile | `yarn.lock` (custom text) | `yarn.lock` (YAML-ish) + `.pnp.cjs` |
+| Zero-installs | No | **Có** |
+| CI flag | `--frozen-lockfile` | `--immutable` |
+| `npx` equivalent | (use `npx`) | `yarn dlx` |
+| Plugins / constraints | No | **Có** |
+| Config file | `.yarnrc` | `.yarnrc.yml` |
+| Version pinning | toàn cục | `yarnPath` trong repo |
+
+Chúng chung cái tên và động từ `yarn add`. Gần như mọi thứ khác — mô hình dữ liệu, file đi kèm lockfile, config, bề mặt CLI — đều khác.
+
+---
+
+## 7. Khi nào chọn Berry
+
+- **Muốn nghiêm ngặt + zero-install** và toolchain sẵn sàng PnP → Berry với `pnp`.
+- **Monorepo lớn** muốn constraints/plugin nhưng dè dặt với PnP → Berry với linker `node-modules`.
+- **Chỉ muốn nghiêm ngặt + tiết kiệm disk** ít ma sát → cân nhắc **pnpm** (Phần 5) — đạt 80% lợi ích với ít rắc rối tooling hơn nhiều.
+
+---
+
+## Giờ bạn đã biết gì
+
+- **PnP** của Berry thay `node_modules` bằng map `.pnp.cjs` + cache nén.
+- PnP làm install tức thì và **phantom dep là không thể**, đổi lại tương thích tooling.
+- `nodeLinker: node-modules` là cửa thoát thực dụng.
+- v1 và v4 chung tên và ít thứ khác; nhớ CLI đã đổi tên.
+
+---
+
+## Bài tập
+
+1. Tạo repo nháp với `corepack use yarn@4`, chạy `yarn`, xem `.pnp.cjs` và `.yarn/cache`.
+2. Thêm `import` package chưa khai báo và xem PnP từ chối — rồi so với npm thành công âm thầm.
+3. Đổi `nodeLinker` sang `node-modules`, cài lại, và thấy `node_modules` xuất hiện lại.
+
+Tiếp theo — Phần 5: pnpm & store địa chỉ-theo-nội-dung:

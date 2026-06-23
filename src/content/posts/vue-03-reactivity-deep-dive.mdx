@@ -1,0 +1,246 @@
+---
+title: 'Vue.js 3 · Phần 3 — Reactivity Deep Dive'
+description: 'Mở nắp capo reactivity của Vue 3: ref vs reactive, track/trigger qua Proxy, computed được cache thế nào, watch vs watchEffect, các bẫy mất reactivity (destructure, toRefs), và shallowRef/readonly.'
+pubDate: 2026-06-22
+tags: [vue, reactivity, computed, watch, vue_12]
+series: vue
+seriesOrder: 3
+draft: false
+---
+
+Phần 1 nói "reactivity là trái tim của Vue". Giờ ta mổ xẻ nó. Hiểu sâu phần này là biên giới giữa người *dùng được* Vue và người *giải thích được* vì sao UI cập nhật (hoặc không). Phần lớn bug "UI không đổi" đều bắt nguồn từ một hiểu lầm reactivity ở đây.
+
+---
+
+## 1. Track & trigger — cơ chế thật
+
+Vue reactivity dựa trên hai động tác:
+
+- **track**: khi một hàm render/effect *đọc* một state reactive, Vue ghi lại "effect này phụ thuộc state đó".
+- **trigger**: khi state đó bị *ghi*, Vue chạy lại đúng những effect đã đăng ký.
+
+```text
+effect chạy ──đọc state──▶ track: state ➜ {effect}
+state ghi   ──────────────▶ trigger: chạy lại các effect phụ thuộc
+```
+
+Cơ chế chặn đọc/ghi: `ref` dùng getter/setter trên `.value`; `reactive` dùng **Proxy** để bẫy mọi truy cập property. Đây là lý do reactivity của Vue 3 tự động và fine-grained — bạn không khai báo phụ thuộc bằng tay (khác mảng dependency của React `useEffect`).
+
+---
+
+## 2. `ref` vs `reactive`
+
+Hai cách tạo state reactive, hai sự đánh đổi.
+
+```ts
+import { ref, reactive } from 'vue';
+
+const count = ref(0);                       // primitive → ref
+const user = reactive({ name: 'An', age: 30 }); // object → reactive (tùy chọn)
+
+count.value++;          // ref cần .value
+user.age++;             // reactive truy cập trực tiếp
+```
+
+| | `ref` | `reactive` |
+|---|---|---|
+| Dùng cho | mọi giá trị (primitive & object) | chỉ object/array/Map/Set |
+| Truy cập | qua `.value` | trực tiếp |
+| Gán lại cả giá trị | `x.value = newObj` ✓ | `obj = newObj` ✗ (mất reactivity) |
+| Destructure | mất reactivity (cần `toRefs`) | mất reactivity (cần `toRefs`) |
+
+**Khuyến nghị thực dụng**: dùng `ref` cho gần như mọi thứ. Nó nhất quán (luôn `.value` trong script), không vướng giới hạn "không gán lại được" của `reactive`. Để `reactive` cho nhóm state cục bộ gắn bó chặt khi bạn thấy `.value` lặp lại phiền.
+
+---
+
+## 3. `computed` — giá trị dẫn xuất, được cache
+
+`computed` tạo state **dẫn xuất** từ state khác. Điểm vàng: nó **cache** — chỉ tính lại khi một phụ thuộc đổi.
+
+```ts
+import { ref, computed } from 'vue';
+
+const price = ref(100);
+const qty = ref(3);
+
+const total = computed(() => {
+  console.log('tính total'); // chỉ log khi price hoặc qty đổi
+  return price.value * qty.value;
+});
+
+console.log(total.value); // "tính total" → 300
+console.log(total.value); // (không log) → 300, lấy từ cache
+qty.value = 5;
+console.log(total.value); // "tính total" → 500
+```
+
+So với gọi hàm thường trong template (`{{ getTotal() }}`) — chạy lại mỗi lần render — `computed` rẻ hơn nhiều cho phép tính nặng. Quy tắc: **giá trị dẫn xuất → luôn dùng `computed`**, không phải method hay `watch`.
+
+`computed` cũng có thể ghi được (getter + setter), hiếm dùng nhưng hữu ích cho `v-model` lên giá trị dẫn xuất:
+
+```ts
+const fullName = computed({
+  get: () => `${first.value} ${last.value}`,
+  set: (v) => { [first.value, last.value] = v.split(' '); },
+});
+```
+
+---
+
+## 4. `watch` vs `watchEffect`
+
+`computed` để *tính* giá trị. Khi cần chạy **side effect** (gọi API, ghi localStorage, thao tác thủ công) lúc state đổi, dùng watcher.
+
+### `watch` — chỉ định nguồn, có giá trị cũ/mới
+
+```ts
+import { watch } from 'vue';
+
+watch(query, async (newVal, oldVal) => {
+  results.value = await search(newVal);
+});
+
+// nhiều nguồn
+watch([page, filter], ([newPage, newFilter]) => { /* ... */ });
+
+// watch property của reactive object → cần getter
+watch(() => user.id, (id) => loadProfile(id));
+```
+
+### `watchEffect` — tự gom phụ thuộc
+
+`watchEffect` chạy ngay lập tức và tự track mọi state nó đọc:
+
+```ts
+import { watchEffect } from 'vue';
+
+watchEffect(() => {
+  // tự phụ thuộc query.value — không cần khai báo
+  console.log(`Tìm: ${query.value}`);
+});
+```
+
+| | `watch` | `watchEffect` |
+|---|---|---|
+| Nguồn phụ thuộc | khai báo tường minh | tự gom khi đọc |
+| Giá trị cũ | có (`oldVal`) | không |
+| Chạy lần đầu | mặc định không (set `immediate: true`) | có, ngay lập tức |
+| Hợp cho | phản ứng đúng một/vài nguồn rõ ràng | side effect phụ thuộc nhiều state |
+
+Dọn dẹp side effect (hủy request cũ, clear timer) qua `onCleanup`:
+
+```ts
+watch(id, async (newId, _old, onCleanup) => {
+  const controller = new AbortController();
+  onCleanup(() => controller.abort()); // hủy request trước khi chạy lần sau
+  data.value = await fetch(`/api/${newId}`, { signal: controller.signal });
+});
+```
+
+---
+
+## 5. Các bẫy mất reactivity
+
+Đây là nơi người mới sa lầy nhiều nhất.
+
+### Bẫy 1 — destructure làm đứt liên kết
+
+```ts
+const user = reactive({ name: 'An', age: 30 });
+const { name } = user;   // ✗ name giờ là chuỗi thường, không reactive
+user.name = 'Bình';      // name vẫn là 'An'
+```
+
+Sửa bằng `toRefs` — biến mỗi property thành `ref` giữ liên kết:
+
+```ts
+import { toRefs } from 'vue';
+const { name, age } = toRefs(user); // ✓ name là ref, .value sync với user.name
+```
+
+### Bẫy 2 — gán lại cả `reactive` object
+
+```ts
+let state = reactive({ count: 0 });
+state = reactive({ count: 5 }); // ✗ binding cũ trong template mất reactivity
+```
+
+Cách đúng: dùng `ref` cho object có thể bị thay nguyên cục, rồi gán `.value`:
+
+```ts
+const state = ref({ count: 0 });
+state.value = { count: 5 }; // ✓ vẫn reactive
+```
+
+### Bẫy 3 — đọc state ngoài effect
+
+Đọc `count.value` trong một callback `setTimeout` *không* tự re-run khi `count` đổi — track chỉ xảy ra trong các reactive effect (render, `computed`, `watchEffect`). Nếu cần phản ứng, đặt nó trong watcher.
+
+---
+
+## 6. `shallowRef`, `readonly`, và khi nào cần
+
+Mặc định `reactive`/`ref` là **deep** — Vue proxy đệ quy mọi tầng object lồng nhau. Với cấu trúc lớn (ví dụ instance của thư viện bên thứ ba, dataset khổng lồ), deep proxy tốn kém.
+
+```ts
+import { shallowRef, readonly, triggerRef } from 'vue';
+
+const chart = shallowRef(createChart()); // chỉ track .value, không deep
+chart.value.update();      // không trigger
+triggerRef(chart);         // ép trigger thủ công khi cần
+
+const config = readonly({ apiBase: '/api' }); // chặn ghi, cảnh báo nếu cố sửa
+```
+
+`shallowRef` là van xả hiệu năng cho state không cần reactivity sâu. `readonly` bảo vệ state dùng chung (ví dụ giá trị `provide` cho con — Phần 4) khỏi bị sửa ngoài ý muốn.
+
+---
+
+## 7. Bài tập
+
+**1.** `computed` khác gì gọi một method trong template?
+
+<details>
+<summary>Lời giải</summary>
+
+`computed` cache theo phụ thuộc — chỉ tính lại khi một phụ thuộc đổi. Method chạy lại mỗi lần component render, kể cả khi dữ liệu liên quan không đổi.
+</details>
+
+**2.** Đoạn này vì sao không cập nhật? `const { items } = reactive({ items: [] }); items.push(1);`
+
+<details>
+<summary>Lời giải</summary>
+
+Destructure tách `items` khỏi proxy reactive → nó là mảng thường. Dùng `toRefs`, hoặc giữ truy cập qua object: `state.items.push(1)`.
+</details>
+
+**3.** Cần gọi API mỗi khi `userId` đổi và hủy request cũ. Dùng `watch` hay `watchEffect`? Viết sườn.
+
+<details>
+<summary>Lời giải</summary>
+
+`watch` (một nguồn rõ ràng, cần cleanup):
+```ts
+watch(userId, async (id, _old, onCleanup) => {
+  const c = new AbortController();
+  onCleanup(() => c.abort());
+  profile.value = await fetchUser(id, c.signal);
+});
+```
+</details>
+
+---
+
+## Điểm chính
+
+- Reactivity = **track** (đọc) + **trigger** (ghi); `ref` dùng `.value`, `reactive` dùng Proxy.
+- Ưu tiên `ref` cho mọi thứ vì nhất quán và gán lại được; `reactive` chỉ cho object.
+- **Giá trị dẫn xuất → `computed`** (được cache); **side effect → `watch`/`watchEffect`**.
+- Mất reactivity hay do destructure hoặc gán lại `reactive` — sửa bằng `toRefs` hoặc `ref`.
+- `shallowRef` cho hiệu năng, `readonly` cho state bảo vệ.
+
+---
+
+## Phần tiếp theo
+
+Bạn đã làm chủ state bên trong một component. **Phần 4 — Component: Props, Emits, Slots, Provide/Inject** mở rộng ra giao tiếp giữa component: truyền dữ liệu xuống qua props (typed với `defineProps`), bắn sự kiện lên qua `defineEmits`, tùy biến nội dung bằng slot, và chia sẻ xuyên nhiều tầng với provide/inject.

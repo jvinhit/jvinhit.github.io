@@ -1,0 +1,257 @@
+---
+title: 'Service Workers · Phần 2 — Lifecycle: install, waiting, activate & update'
+description: 'Mổ xẻ trọn vòng đời service worker: install, waiting, activate; vì sao SW mới bị "kẹt" ở waiting; skipWaiting và clients.claim; cơ chế update; controllerchange; và cách debug lifecycle trong DevTools.'
+pubDate: 2026-06-23
+tags: [service-worker, lifecycle, pwa, frontend, service_workers_10]
+series: service-workers
+seriesOrder: 2
+draft: false
+---
+
+Ở Phần 1 ta đã đăng ký service worker đầu tiên và thấy nó "sống". Nhưng có một sự thật khiến **mọi lập trình viên mới đều vấp**: bạn sửa code trong `sw.js`, reload trang, mà code mới **không có tác dụng**. SW cũ vẫn chạy. Vì sao?
+
+Câu trả lời nằm ở **lifecycle (vòng đời)** — phần quan trọng nhất, và cũng dễ hiểu sai nhất, của service worker. Nắm vững nó, bạn sẽ tránh được 80% bug "vì sao cache không cập nhật". Bài này ta đi từng trạng thái một, với code và quan sát thực tế trong DevTools.
+
+---
+
+## Bức tranh toàn cảnh
+
+Một service worker đi qua các trạng thái sau:
+
+```text
+register
+   │
+   ▼
+installing ──(install thành công)──► installed / waiting
+   │                                       │
+ (install lỗi)                    (chưa có SW nào control,
+   │                              hoặc skipWaiting)
+   ▼                                       │
+ redundant                                 ▼
+                                       activating ──► activated ──► (idle / terminated)
+```
+
+Hai trạng thái gây đau đầu nhất là **waiting** và **activated**. Ta sẽ tập trung vào chúng.
+
+---
+
+## 1. `installing` — sự kiện `install`
+
+Ngay sau khi `register()` tìm thấy một file SW **mới** (byte khác với SW đang chạy), trình duyệt tải nó về và phát event `install`. Đây là nơi bạn làm **chuẩn bị một lần**: thường là **precache** các file cốt lõi của app (app shell).
+
+```js
+self.addEventListener('install', (event) => {
+  console.log('[SW] installing…');
+
+  // event.waitUntil() kéo dài trạng thái "installing" cho tới khi Promise hoàn tất.
+  // Nếu Promise reject → install thất bại → SW chuyển sang "redundant".
+  event.waitUntil(
+    caches.open('app-shell-v1').then((cache) => {
+      return cache.addAll(['/', '/index.html', '/styles.css', '/app.js']);
+    })
+  );
+});
+```
+
+Điểm cốt lõi: **`event.waitUntil()`**. Service worker là event-driven và có thể bị tắt bất cứ lúc nào. `waitUntil()` nói với trình duyệt: "đừng coi event này xong, và đừng giết tôi, cho tới khi Promise này resolve". Không có nó, trình duyệt có thể tắt SW giữa chừng khi cache chưa xong.
+
+> Nếu **bất kỳ** file nào trong `cache.addAll()` tải lỗi (404, mạng đứt), toàn bộ install **thất bại** và SW bị loại. Vì vậy chỉ precache những file bạn chắc chắn tồn tại.
+
+---
+
+## 2. `waiting` — trạng thái gây "kẹt" kinh điển
+
+Đây là phần khiến nhiều người bối rối nhất. Sau khi install xong, nếu **đã có một service worker khác đang control** trang, SW mới **không kích hoạt ngay**. Nó chuyển sang trạng thái **waiting** và... chờ.
+
+**Chờ cái gì?** Chờ cho tới khi **tất cả các tab đang dùng SW cũ đều đóng lại**. Chỉ khi không còn client nào bị SW cũ control, SW mới mới được activate.
+
+Vì sao trình duyệt làm vậy? Để **đảm bảo nhất quán**. Hãy tưởng tượng tab A đang chạy app phiên bản 1 (HTML, JS, CSS v1). Nếu SW v2 nhảy vào control ngay, nó có thể trả về asset v2 cho một trang vốn được build cho v1 → vỡ giao diện, lỗi runtime. Nên mặc định trình duyệt giữ SW cũ cho tới khi mọi tab cũ biến mất.
+
+> Đây chính xác là lý do bạn "sửa code mà không thấy đổi": reload **không** đóng tab, nên SW cũ vẫn còn client → SW mới mãi kẹt ở waiting. Trong DevTools → **Application → Service Workers**, bạn sẽ thấy dòng "waiting to activate" với nút **skipWaiting**.
+
+### Thoát kẹt khi dev
+
+Ba cách, từ tay đến tự động:
+
+1. **Update on reload** (tích trong DevTools) — ép cài và activate SW mới mỗi lần reload. Dùng khi dev.
+2. Bấm nút **skipWaiting** trong DevTools.
+3. Đóng hết tab của origin rồi mở lại.
+
+---
+
+## 3. `skipWaiting()` — bỏ qua hàng chờ
+
+Bạn có thể chủ động bảo SW mới **đừng chờ** mà activate luôn:
+
+```js
+self.addEventListener('install', (event) => {
+  // Ép SW mới rời waiting và activate ngay khi install xong,
+  // kể cả khi tab cũ vẫn mở.
+  self.skipWaiting();
+
+  event.waitUntil(precache());
+});
+```
+
+Hoặc gọi có điều kiện qua message (cách phổ biến để hỏi người dùng trước):
+
+```js
+self.addEventListener('message', (event) => {
+  if (event.data?.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
+});
+```
+
+**Cẩn trọng:** `skipWaiting()` khiến SW mới control các tab vốn đang chạy phiên bản cũ. Nếu caching strategy của bạn không versioning kỹ, người dùng có thể nhận asset lệch phiên bản. Pattern an toàn cho production: **không** tự động skip, mà hiện một toast "Có bản cập nhật — Tải lại" để người dùng chủ động (ta làm đầy đủ ở Phần 10).
+
+---
+
+## 4. `activate` — dọn dẹp và sẵn sàng
+
+Khi SW được activate, event `activate` phát ra. Đây là nơi lý tưởng để **dọn cache cũ** (xóa các phiên bản cache không còn dùng), vì lúc này chắc chắn không còn tab nào phụ thuộc SW phiên bản trước.
+
+```js
+const CURRENT_CACHES = ['app-shell-v2', 'runtime-v2'];
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) => {
+      return Promise.all(
+        keys
+          .filter((key) => !CURRENT_CACHES.includes(key))
+          .map((key) => {
+            console.log('[SW] xóa cache cũ:', key);
+            return caches.delete(key);
+          })
+      );
+    })
+  );
+});
+```
+
+---
+
+## 5. `clients.claim()` — control ngay từ lần đầu
+
+Có một chi tiết tinh tế: ngay cả khi SW đã activate, nó **chưa control** các tab **đã mở từ trước khi nó tồn tại**. Mặc định, một trang chỉ bị một SW control nếu SW đó đã active **tại thời điểm trang được load**. Đây là lý do ở Phần 1, lần load đầu tiên bạn không thấy log `fetch`.
+
+`clients.claim()` bảo SW: "hãy control ngay tất cả client trong scope, kể cả những trang đã mở":
+
+```js
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+```
+
+Kết hợp `skipWaiting()` (trong install) + `clients.claim()` (trong activate) cho hiệu ứng: **SW mới chiếm quyền điều khiển ngay lập tức**. Cực tiện khi dev, nhưng nhớ cảnh báo versioning ở trên khi lên production.
+
+---
+
+## 6. Cơ chế update — SW tự cập nhật thế nào
+
+Trình duyệt **tự động** kiểm tra bản SW mới trong các trường hợp:
+
+- Người dùng điều hướng tới một trang trong scope (navigation).
+- Có event `push` hoặc `sync`.
+- Bạn gọi `registration.update()` thủ công.
+
+Khi kiểm tra, trình duyệt tải lại `sw.js` và **so sánh byte-by-byte** với bản đang chạy. **Chỉ cần khác 1 byte** là nó coi như SW mới → bắt đầu lại chu trình install.
+
+> Cạm bẫy: nếu HTTP cache của bạn cache file `sw.js` quá lâu, trình duyệt có thể không thấy bản mới. May là các trình duyệt hiện đại mặc định **không cache `sw.js` quá 24 giờ** và thường bỏ qua HTTP cache khi check update. Nhưng best practice: serve `sw.js` với header `Cache-Control: no-cache` (hoặc max-age rất ngắn) để update nhanh.
+
+### Lắng nghe update từ phía trang
+
+Từ trang chính, bạn có thể phát hiện khi có SW mới đang chờ để hiện UI cập nhật:
+
+```js
+const registration = await navigator.serviceWorker.register('/sw.js');
+
+registration.addEventListener('updatefound', () => {
+  const newWorker = registration.installing;
+  newWorker.addEventListener('statechange', () => {
+    if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+      // Có SW mới đã install xong và đang waiting → đã có controller cũ.
+      // → Đây là thời điểm hiện toast "Có bản mới, tải lại".
+      showUpdateToast(newWorker);
+    }
+  });
+});
+```
+
+### `controllerchange` — biết khi nào controller đổi
+
+Khi SW mới activate và chiếm quyền (qua skipWaiting hoặc đóng tab), event `controllerchange` phát ra trên `navigator.serviceWorker`. Pattern phổ biến: reload trang một lần để chạy với SW mới hoàn toàn nhất quán.
+
+```js
+let refreshing = false;
+navigator.serviceWorker.addEventListener('controllerchange', () => {
+  // Cờ chống reload lặp vô hạn.
+  if (refreshing) return;
+  refreshing = true;
+  window.location.reload();
+});
+```
+
+---
+
+## Debug lifecycle trong DevTools
+
+Tab **Application → Service Workers** cho bạn nhìn xuyên suốt:
+
+- Thấy đồng thời **SW đang active** và **SW đang waiting** (nếu có).
+- Nút **skipWaiting** để ép activate bản waiting.
+- **Update** — ép check bản mới ngay.
+- **Unregister** — gỡ sạch để làm lại.
+- Tích **Update on reload** và **Bypass for network** (bỏ qua SW, đi thẳng mạng — hữu ích khi nghi SW gây lỗi).
+
+Một mẹo debug: vào **Application → Storage → Clear site data** để xóa sạch SW + cache + storage, đưa mọi thứ về trạng thái "người dùng mới hoàn toàn".
+
+---
+
+## Tóm tắt
+
+- Vòng đời: `installing → (waiting) → activating → activated`. Cài lỗi → `redundant`.
+- `install` là nơi **precache**; luôn bọc trong `event.waitUntil()` để SW không bị tắt giữa chừng.
+- SW mới **kẹt ở waiting** cho tới khi mọi tab dùng SW cũ đóng — đây là lý do "sửa code không thấy đổi". Đó là **cố ý**, để đảm bảo nhất quán phiên bản.
+- `skipWaiting()` bỏ qua hàng chờ (cẩn thận versioning); `clients.claim()` control ngay cả tab đã mở.
+- `activate` là nơi **dọn cache cũ**.
+- Update dựa trên **so sánh byte** của `sw.js`; serve nó với `Cache-Control: no-cache`. Dùng `updatefound`/`statechange` để hiện UI cập nhật và `controllerchange` để reload đúng lúc.
+
+---
+
+## Bài tập thực hành
+
+### Bài 1 — Quan sát waiting (cơ bản)
+
+1. Dùng lại demo Phần 1. Trong `sw.js`, thêm `console.log('SW version 1')` ở đầu file. Load trang.
+2. Sửa thành `console.log('SW version 2')`, reload (KHÔNG đóng tab). Vào **Application → Service Workers**.
+
+**Hướng dẫn:** Bạn sẽ thấy version 2 ở trạng thái **waiting**, version 1 vẫn **active**. Console vẫn in "SW version 1". Bấm **skipWaiting** → quan sát version 2 lên active và "SW version 2" xuất hiện. Đây là bằng chứng trực quan cho cơ chế waiting.
+
+### Bài 2 — skipWaiting + clients.claim (trung bình)
+
+Thêm `self.skipWaiting()` trong `install` và `event.waitUntil(self.clients.claim())` trong `activate`. Lặp lại Bài 1.
+
+**Hướng dẫn:** Lần này SW mới activate **ngay** không cần bấm nút. Hãy tự hỏi: trong app thật có asset versioning, điều gì có thể hỏng nếu SW v2 trả asset v2 cho trang đang chạy v1? Ghi lại suy nghĩ — đó là động lực cho pattern "hỏi người dùng trước" ở Phần 10.
+
+### Bài 3 — UI "Có bản cập nhật" (nâng cao)
+
+Trong `index.html`, viết hàm `showUpdateToast(worker)` hiện một nút "Tải bản mới". Khi bấm, gửi message `{ type: 'SKIP_WAITING' }` tới `worker`, và lắng nghe `controllerchange` để `location.reload()`.
+
+**Hướng dẫn khung sườn:**
+
+```js
+function showUpdateToast(worker) {
+  const btn = document.createElement('button');
+  btn.textContent = 'Có bản mới — Tải lại';
+  btn.onclick = () => worker.postMessage({ type: 'SKIP_WAITING' });
+  document.body.appendChild(btn);
+}
+```
+
+Và trong `sw.js` nhớ xử lý message `SKIP_WAITING` như mục 3. Test bằng cách đổi nội dung `sw.js`, reload, thấy nút hiện ra, bấm nút → trang reload với SW mới. Đây chính là **update flow chuẩn production** mà ta sẽ hoàn thiện ở Phần 10.
+
+---
+
+**Phần tiếp theo:** Fetch event & chặn request — ta sẽ dùng `event.respondWith()` để thực sự can thiệp vào mạng: đọc `Request`, tạo `Response`, và đặt nền cho mọi caching strategy.

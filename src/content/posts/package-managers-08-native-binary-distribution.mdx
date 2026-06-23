@@ -1,0 +1,214 @@
+---
+title: 'Node Package Managers · Part 8 — Native Modules & Binary Distribution'
+description: 'How packages ship prebuilt native binaries: node-pre-gyp, prebuild/prebuildify, and the modern per-platform optionalDependencies pattern used by esbuild and SWC — plus the security risk of postinstall binary downloads.'
+pubDate: 2026-06-23
+tags: [native-addons, optional-dependencies, esbuild, security, package_managers_12]
+series: package-managers
+seriesOrder: 8
+draft: false
+---
+
+Đây là **Phần 8 của series 12 phần** về package manager Node. [Phần 7](/posts/package-managers-07-lifecycle-scripts-node-gyp) giải thích *vì sao* code native cần biên dịch và `node-gyp` làm ra sao. Phần này nói về việc tránh hẳn bước biên dịch — cách hệ sinh thái **ship binary prebuilt** — và bề mặt tấn công nó tạo ra.
+
+Đây chính là chủ đề "thư viện kết hợp binary", và vì sao đó là câu chuyện bảo mật.
+
+---
+
+## 1. Bài toán phân phối
+
+Biên dịch từ source mỗi lần cài thì chậm và mong manh (Phần 7). Nên đa số package native giờ **biên dịch trước** binary cho nền tảng phổ biến và ship chúng. Ma trận mà publisher phải phủ:
+
+```text
+OS         × CPU arch  × libc        = a binary per cell
+{HĐH}        {kiến trúc}  {thư viện C}
+linux        x64         glibc
+linux        x64         musl (Alpine!)
+linux        arm64       glibc
+darwin       x64         —
+darwin       arm64       —            ← Apple Silicon
+win32        x64         —
+...
+```
+
+Mỗi ô cần `.node` (hay file thực thi) riêng. Câu hỏi thú vị — và có hệ luỵ bảo mật — là **làm sao binary đúng tới máy đúng**. Ba cách lịch sử.
+
+---
+
+## 2. Cách 1 — tải trong postinstall
+
+Cách kinh điển: một script `postinstall` phát hiện nền tảng của bạn và **tải** binary prebuilt khớp từ một host (thường GitHub Releases hoặc S3):
+
+```text
+npm install sqlite3
+        │  postinstall: node-pre-gyp install --fallback-to-build
+        ▼
+detect platform → fetch  https://.../sqlite3-v5-napi-linux-x64.tar.gz
+                → unpack → place addon.node
+                → if download fails: fall back to node-gyp source build
+{nếu tải lỗi: dự phòng build từ source bằng node-gyp}
+```
+
+Công cụ: `node-pre-gyp` và `prebuild`/`prebuildify` nhẹ hơn. `prebuildify` còn gói mọi prebuild *bên trong tarball npm*, nên không cần gọi mạng khi cài — một nâng cấp bảo mật có ý nghĩa.
+
+Vấn đề bảo mật của mô hình tải-trong-postinstall:
+
+```text
+⚠️ The binary is fetched from a URL OUTSIDE the npm registry.
+   → NOT covered by the lockfile integrity hash (Part 6)!
+   → the registry tarball is verified; the downloaded binary is NOT
+   → a compromised release host = malicious native code, silently
+{binary tải từ URL NGOÀI registry → KHÔNG được hash integrity lockfile bảo vệ}
+```
+
+Đây là mấu chốt: lockfile ghim và xác minh package *JavaScript*, nhưng *file thực thi native thật* tới từ một server riêng với xác minh yếu hơn (hoặc không có).
+
+Các package có trách nhiệm dùng mô hình này thêm xác minh *riêng* — một file checksum ship trong tarball npm mà postinstall đối chiếu với binary đã tải:
+
+```text
+download binary → sha256(binary) == checksum-in-tarball ?
+   match    → install                {khớp → cài}
+   mismatch → abort (tampered host)   {lệch → hủy (host bị giả mạo)}
+```
+
+Nhưng điều này **tự nguyện và tự giám sát**: nó chỉ bảo vệ nếu publisher hiện thực đúng, và vô dụng nếu chính pipeline release *của publisher* bị xâm nhập.
+
+---
+
+## 3. Cách 2 — `optionalDependencies` theo nền tảng (cách hiện đại)
+
+Cách esbuild phổ biến hoá và SWC, Rollup/Rolldown, Turbopack, và nhiều tool dùng giờ đây: publish **một package npm nhỏ xíu mỗi nền tảng**, mỗi cái chứa đúng binary nền tảng đó, và liệt kê tất cả là `optionalDependencies` với ràng buộc nền tảng:
+
+```json
+{
+  "name": "esbuild",
+  "optionalDependencies": {
+    "@esbuild/linux-x64":   "0.x.x",
+    "@esbuild/linux-arm64": "0.x.x",
+    "@esbuild/darwin-arm64":"0.x.x",
+    "@esbuild/win32-x64":   "0.x.x"
+  }
+}
+```
+
+Mỗi sub-package nền tảng khai báo **nó dành cho ai** bằng trường `os`, `cpu`, và (cho Linux) `libc`:
+
+```json
+{
+  "name": "@esbuild/linux-x64",
+  "version": "0.x.x",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"]
+}
+```
+
+```text
+On install, the manager looks at each optionalDependency:
+  os/cpu matches this machine?  → install it  (you get YOUR binary)
+  doesn't match?                → SKIP silently (optional!)
+{khớp os/cpu → cài; không khớp → bỏ qua âm thầm (vì optional)}
+```
+
+Vì sao đây là cải tiến lớn:
+
+```text
+✓ Every binary is a real npm package → COVERED by the lockfile +
+  integrity hash (Part 6). No off-registry download.
+✓ No postinstall script needed → fewer arbitrary-code-execution hooks.
+✓ The manager only downloads the ONE binary your platform needs.
+{mọi binary là package npm thật → được lockfile + integrity bảo vệ; không cần postinstall}
+```
+
+> Đây là nghĩa của "thư viện kết hợp binary" làm *đúng cách*: binary nằm trong registry, được kiểm tra integrity, và không cần thực thi code lúc cài.
+
+Lỗi nổi tiếng: nếu manager xử lý sai `optionalDependencies` (lỗi npm ở vài version), bạn gặp `Error: Cannot find module @esbuild/<platform>` — cách sửa thường là xoá `node_modules` + lockfile và cài lại, hoặc nâng cấp manager.
+
+### Cách entry point JS tìm binary của nó
+
+Lúc **chạy**, JS của package chính chọn sub-package đúng bằng cách đọc `process.platform` và `process.arch`:
+
+```js
+// roughly what esbuild's entry does
+const pkg = `@esbuild/${process.platform}-${process.arch}`; // e.g. @esbuild/darwin-arm64
+const binPath = require.resolve(`${pkg}/bin/esbuild`);       // resolve the installed one
+// if that optionalDependency was skipped (wrong platform) → it isn't there → throw
+```
+
+### Build image đa nền tảng — flag install
+
+Vì binary không khớp bị *bỏ qua*, một dev Mac build image Docker **Linux** có thể không có binary Linux trừ khi ép. npm/pnpm hiện đại có flag cho đúng việc này:
+
+```bash
+# fetch binaries for a target platform regardless of the host
+npm install --cpu=x64 --os=linux --libc=glibc
+pnpm install --config.supportedArchitectures.os='[linux]' \
+             --config.supportedArchitectures.cpu='[x64]'
+```
+
+Đây là tương đương `supportedArchitectures` của Berry (Phần 4), và là cách sửa thường gặp cho "chạy trên Mac tôi, container Linux không tìm thấy binary".
+
+---
+
+## 4. Cách 3 — gói binary vào tarball
+
+Đơn giản và an toàn nhất cho binary nhỏ: ship file `.node` prebuilt *bên trong* tarball npm của chính package (điều `prebuildify` làm):
+
+```text
+the-package-1.2.3.tgz
+├── package.json
+├── index.js
+└── prebuilds/
+    ├── darwin-arm64/the-package.node
+    ├── linux-x64/the-package.node
+    └── win32-x64/the-package.node
+{at runtime, index.js loads the prebuild matching process.platform/arch}
+```
+
+Đánh đổi: tarball npm lớn hơn (nó mang binary của mọi nền tảng), nhưng **không có mạng khi cài**, **không postinstall**, và **mọi thứ được kiểm tra integrity**. Với setup nhạy cảm bảo mật, đây là chuẩn vàng.
+
+---
+
+## 5. So sánh ba cách
+
+| Approach | Binary ở đâu | Lockfile xác minh? | Cần postinstall? | Cỡ tarball |
+|---|---|---|---|---|
+| `node-pre-gyp`/`prebuild` download | Host ngoài | ✗ No | ✓ Yes | Nhỏ |
+| per-platform `optionalDependencies` | npm registry | ✓ **Yes** | ✗ No | Nhỏ |
+| `prebuildify` bundled | Trong tarball | ✓ **Yes** | ✗ No | Lớn |
+
+Xu hướng rõ ràng rời xa cách 1: mọi tool native hiện đại dùng cách 2 hoặc 3, chính vì chúng giữ binary **trong registry được kiểm tra integrity** và tránh thực thi code postinstall.
+
+---
+
+## 6. Vì sao điều này quan trọng cho bảo mật
+
+Một binary native là **mục tiêu giá trị nhất** trong cây dependency: nó chạy như mã máy đã biên dịch, khó audit hơn JS, và thường có năng lực rộng. Kết hợp với "tải từ host ngoài qua postinstall, không xác minh" và bạn có cơ chế giao payload chuỗi cung ứng hoàn hảo.
+
+```text
+Attacker's dream {giấc mơ của kẻ tấn công}:
+  compromise the RELEASE HOST (not npm) of a popular native package
+  → postinstall downloads attacker's .node
+  → lockfile integrity never checked the binary
+  → arbitrary native code on every CI runner + dev machine
+```
+
+Đó là lý do Phần 9 (tấn công) và Phần 10 (phòng thủ) dựa nhiều vào bài học ở đây: **ưu tiên package có binary là artifact registry được kiểm tra integrity, và tắt install script mặc định**.
+
+---
+
+## Giờ bạn đã biết gì
+
+- Package native phủ ma trận OS × CPU × libc; tránh build source bằng ship **binary prebuilt**.
+- Cách cũ: postinstall **tải** binary từ host ngoài — **không** được lockfile xác minh.
+- Cách hiện đại: **`optionalDependencies` theo nền tảng** hoặc **prebuild gói sẵn** — đều ở trong registry kiểm tra integrity.
+- Tải binary không xác minh là vector giao chuỗi cung ứng hàng đầu.
+
+---
+
+## Bài tập
+
+1. Xem `optionalDependencies` của esbuild; rồi kiểm tra `@esbuild/*` nào thực sự được cài trên máy bạn.
+2. Với package dùng `node-pre-gyp`, tìm URL tải trong log và xem nó là URL registry hay host ngoài.
+3. Mở một package kiểu `prebuildify` và liệt kê `prebuilds/`.
+
+Tiếp theo — Phần 9: Tấn công chuỗi cung ứng:

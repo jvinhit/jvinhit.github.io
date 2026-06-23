@@ -1,0 +1,277 @@
+---
+title: 'Service Workers · Phần 4 — Cache API & caching strategies'
+description: 'Làm chủ Cache API (open, put, match, addAll) và năm caching strategy kinh điển: cache-first, network-first, stale-while-revalidate, cache-only, network-only. Biết chọn strategy đúng cho từng loại tài nguyên.'
+pubDate: 2026-06-27
+tags: [service-worker, cache-api, caching, performance, service_workers_10]
+series: service-workers
+seriesOrder: 4
+draft: false
+---
+
+Ở Phần 3 ta đã biết cách chặn request và trả response. Bài này trả lời câu hỏi quan trọng nhất khi xây offline app: **lấy response từ đâu, và theo logic nào?** Đáp án là **Cache API** kết hợp với một bộ **caching strategy** đã được cộng đồng đúc kết.
+
+Nắm vững năm strategy ở bài này, bạn sẽ có thể trả lời được mọi tình huống thực tế: "trang nên load tức thì hay luôn mới?", "ảnh cache bao lâu?", "API offline thì sao?". Đây là kiến thức lõi mà cả Workbox (Phần 9) cũng chỉ là lớp bọc tiện lợi bên trên.
+
+---
+
+## Cache API — kho lưu response
+
+Cache API là một kho key–value, nơi **key là `Request`** và **value là `Response`**. Nó tách biệt hoàn toàn với HTTP cache của trình duyệt và do **bạn toàn quyền điều khiển**.
+
+```js
+// Mở (hoặc tạo) một cache có tên
+const cache = await caches.open('my-cache-v1');
+
+// Thêm response vào cache, key là request/URL
+await cache.put('/data.json', response);
+
+// Tải và cache nhiều URL cùng lúc (dùng trong install để precache)
+await cache.addAll(['/', '/styles.css', '/app.js']);
+
+// Tìm response khớp với một request
+const response = await cache.match('/data.json');
+
+// Xóa một entry
+await cache.delete('/data.json');
+
+// Liệt kê tên mọi cache hiện có
+const names = await caches.keys();
+
+// match toàn cục — tìm trong TẤT CẢ cache (tiện nhưng kém kiểm soát)
+const any = await caches.match('/data.json');
+```
+
+Vài điểm cần nhớ:
+
+- **`caches`** là object toàn cục (CacheStorage), có cả trong service worker lẫn trang chính (`window`).
+- **`cache.match()`** chỉ tìm trong cache đó; **`caches.match()`** (số nhiều) tìm trong mọi cache — tiện nhưng nên ưu tiên match theo cache cụ thể để kiểm soát phiên bản.
+- Cache **bền vững** qua các lần SW bị tắt/khởi động lại — đây là lý do ta lưu state ở đây thay vì biến toàn cục.
+- Khi match, có thể bỏ qua query string bằng `{ ignoreSearch: true }`, hoặc bỏ qua method/vary bằng các option khác.
+
+---
+
+## Precaching vs Runtime caching
+
+Có hai thời điểm cache:
+
+- **Precaching** — cache **lúc install**, danh sách file biết trước (app shell: HTML, CSS, JS, logo). Đảm bảo app **mở được offline ngay lần đầu sau khi cài SW**.
+- **Runtime caching** — cache **khi request thực sự xảy ra** (ảnh người dùng xem, dữ liệu API họ gọi). Linh hoạt, áp theo strategy.
+
+```js
+// Precache trong install
+const APP_SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/logo.svg'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open('app-shell-v1').then((cache) => cache.addAll(APP_SHELL))
+  );
+});
+```
+
+---
+
+## Năm caching strategy kinh điển
+
+Mỗi strategy là một cách cân bằng giữa **tốc độ** (cache) và **độ mới** (network). Không có cái nào "tốt nhất" — chỉ có cái **phù hợp với loại tài nguyên**.
+
+### 1. Cache-first (cache, falling back to network)
+
+Tìm cache trước; có thì trả ngay, không thì ra mạng (và cache lại). **Nhanh nhất**, nhưng có thể trả nội dung cũ.
+
+```js
+async function cacheFirst(request) {
+  const cached = await caches.match(request);
+  if (cached) return cached;
+
+  const response = await fetch(request);
+  const cache = await caches.open('runtime-v1');
+  cache.put(request, response.clone());
+  return response;
+}
+```
+
+**Dùng cho:** tài nguyên **bất biến / ít đổi** — file có hash trong tên (`app.abc123.js`), font, ảnh, icon. Vì tên file đổi khi nội dung đổi, cache cũ không bao giờ "sai".
+
+### 2. Network-first (network, falling back to cache)
+
+Ra mạng trước để lấy bản mới nhất; mạng lỗi mới dùng cache. **Mới nhất khi online, vẫn chạy khi offline.**
+
+```js
+async function networkFirst(request) {
+  const cache = await caches.open('runtime-v1');
+  try {
+    const response = await fetch(request);
+    cache.put(request, response.clone());
+    return response;
+  } catch (error) {
+    const cached = await cache.match(request);
+    if (cached) return cached;
+    throw error; // không có cache → để lỗi nổi lên (hoặc trả fallback)
+  }
+}
+```
+
+**Dùng cho:** dữ liệu **cần tươi** nhưng vẫn muốn offline — API tin tức, feed, dashboard. Nên thêm **timeout** (xem dưới) để mạng chậm không treo app.
+
+### 3. Stale-while-revalidate (SWR)
+
+Trả cache **ngay lập tức** (nhanh), đồng thời **âm thầm fetch bản mới** để cập nhật cache cho lần sau. Cân bằng tuyệt vời giữa tốc độ và độ mới.
+
+```js
+async function staleWhileRevalidate(request) {
+  const cache = await caches.open('runtime-v1');
+  const cached = await cache.match(request);
+
+  // Fetch nền — không await trước khi trả về.
+  const fetching = fetch(request).then((response) => {
+    cache.put(request, response.clone());
+    return response;
+  });
+
+  // Có cache thì trả ngay; chưa có thì chờ mạng.
+  return cached || fetching;
+}
+```
+
+**Dùng cho:** tài nguyên đổi vừa phải mà người dùng chấp nhận "trễ một nhịp" — avatar, danh sách, CSS không hash, trang content. Đây là strategy mặc định cực phổ biến.
+
+### 4. Cache-only
+
+Chỉ lấy từ cache, không bao giờ ra mạng. Lỗi nếu không có trong cache.
+
+```js
+async function cacheOnly(request) {
+  return caches.match(request); // undefined nếu không có → cần đảm bảo đã precache
+}
+```
+
+**Dùng cho:** tài nguyên đã **precache chắc chắn** ở install và không đổi giữa các phiên bản (app shell trong một số kiến trúc).
+
+### 5. Network-only
+
+Luôn ra mạng, không đụng cache.
+
+```js
+async function networkOnly(request) {
+  return fetch(request);
+}
+```
+
+**Dùng cho:** thứ **không bao giờ nên cache** — request thanh toán, đăng nhập, ghi dữ liệu (POST), analytics realtime. (Thực ra với những request này, thường bạn chỉ cần `return` để trình duyệt tự xử lý.)
+
+---
+
+## Bảng chọn strategy nhanh
+
+| Loại tài nguyên | Strategy nên dùng | Vì sao |
+|---|---|---|
+| JS/CSS có hash tên file | Cache-first | Bất biến, cache an toàn vĩnh viễn |
+| Font, icon, ảnh logo | Cache-first | Hiếm khi đổi |
+| HTML trang (navigation) | Network-first hoặc SWR | Cần mới nhưng phải offline được |
+| API dữ liệu (feed, list) | Network-first (+ timeout) | Ưu tiên tươi |
+| Avatar, ảnh nội dung | Stale-while-revalidate | Nhanh, cập nhật ngầm |
+| App shell precache | Cache-first / cache-only | Đã có sẵn từ install |
+| Login, payment, POST | Network-only | Không bao giờ cache |
+
+---
+
+## Network-first có timeout — chi tiết hay bị bỏ quên
+
+Network-first ngây thơ có nhược điểm: nếu mạng **chậm** (không phải lỗi hẳn), app treo chờ vô hạn. Giải pháp: đua giữa fetch và một timeout, hết giờ thì rơi về cache.
+
+```js
+function timeout(ms) {
+  return new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('timeout')), ms)
+  );
+}
+
+async function networkFirstWithTimeout(request, ms = 3000) {
+  const cache = await caches.open('runtime-v1');
+  try {
+    const response = await Promise.race([fetch(request), timeout(ms)]);
+    cache.put(request, response.clone());
+    return response;
+  } catch (error) {
+    const cached = await cache.match(request);
+    if (cached) return cached;
+    throw error;
+  }
+}
+```
+
+> Mẹo: với mạng chậm, "cache cũ trong 200ms" gần như luôn tốt hơn "bản mới sau 8 giây". Timeout giúp UX ổn định trên mạng 3G.
+
+---
+
+## Router: gắn strategy theo loại request
+
+Trong thực tế, một fetch handler **phân tuyến (route)** request tới strategy phù hợp:
+
+```js
+self.addEventListener('fetch', (event) => {
+  const { request } = event;
+  if (request.method !== 'GET') return;
+
+  const url = new URL(request.url);
+
+  // Navigation (tải trang) → network-first để luôn mới, fallback cache
+  if (request.mode === 'navigate') {
+    event.respondWith(networkFirstWithTimeout(request));
+    return;
+  }
+
+  // Ảnh → stale-while-revalidate
+  if (request.destination === 'image') {
+    event.respondWith(staleWhileRevalidate(request));
+    return;
+  }
+
+  // API → network-first
+  if (url.pathname.startsWith('/api/')) {
+    event.respondWith(networkFirstWithTimeout(request));
+    return;
+  }
+
+  // Asset tĩnh có hash → cache-first
+  event.respondWith(cacheFirst(request));
+});
+```
+
+Đây chính là "bộ não" của một service worker production. Phần 9 (Workbox) sẽ cho bạn cách viết router này gọn hơn nhiều, nhưng hiểu bản chất ở đây mới giúp bạn debug khi có sự cố.
+
+---
+
+## Tóm tắt
+
+- **Cache API** là kho key (`Request`) → value (`Response`) do bạn toàn quyền điều khiển, bền vững qua các lần SW restart.
+- Phân biệt **precaching** (lúc install, biết trước) và **runtime caching** (khi request xảy ra).
+- Năm strategy: **cache-first** (nhanh, cho asset bất biến), **network-first** (tươi, cho dữ liệu), **stale-while-revalidate** (cân bằng), **cache-only**, **network-only**.
+- Network-first nên có **timeout** để không treo trên mạng chậm.
+- Một fetch handler thật là một **router** gắn strategy theo `mode`/`destination`/đường dẫn.
+
+---
+
+## Bài tập thực hành
+
+### Bài 1 — Cài đặt cả năm strategy (cơ bản)
+
+Viết năm hàm `cacheFirst`, `networkFirst`, `staleWhileRevalidate`, `cacheOnly`, `networkOnly` như trên trong `sw.js`. Tạm thời gắn từng cái cho toàn bộ request và quan sát khác biệt trong tab Network (bật/tắt Offline).
+
+**Hướng dẫn:** Với mỗi strategy, hãy thử cả online lẫn offline và ghi lại hành vi: cái nào load tức thì, cái nào fail khi offline, cái nào trả cũ rồi tự cập nhật. Trải nghiệm trực tiếp giúp bạn nhớ lâu hơn đọc bảng.
+
+### Bài 2 — Router theo loại tài nguyên (trung bình)
+
+Dựng router như mục trên cho một trang có: HTML, CSS hash, ảnh, và một lời gọi `/api/...` (có thể giả bằng một file `api/data.json`).
+
+**Hướng dẫn:** Xác minh từng nhánh: tắt mạng → trang vẫn mở (navigation fallback cache), ảnh hiện từ cache, API trả bản cache cũ. Mở **Application → Cache Storage** để thấy các cache `app-shell-v1`, `runtime-v1` được điền dần. Đây là bộ khung bạn sẽ tái dùng ở Phần 5.
+
+### Bài 3 — Network-first có timeout (nâng cao)
+
+Thêm `networkFirstWithTimeout` và test với DevTools → Network → throttling **Slow 3G**. Đặt timeout 2s và quan sát: khi mạng quá chậm, app có rơi về cache đúng lúc không?
+
+**Hướng dẫn:** Để test có cache sẵn, hãy load trang một lần ở mạng nhanh (điền cache), rồi chuyển Slow 3G và reload. Bạn sẽ thấy nội dung xuất hiện sau ~2s (từ cache) thay vì chờ mạng. Thử chỉnh timeout 500ms vs 5000ms và cảm nhận khác biệt UX — đây là loại tinh chỉnh tạo nên trải nghiệm "nhanh" thật sự.
+
+---
+
+**Phần tiếp theo:** Offline-first & app shell — ghép mọi thứ thành một app thật sự mở được khi mất mạng: kiến trúc app shell, xử lý navigation request, và trang offline fallback đẹp.

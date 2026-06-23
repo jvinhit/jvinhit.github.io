@@ -1,0 +1,372 @@
+---
+title: 'Build a Real React App · Part 4 — Server State with TanStack Query'
+description: 'Stop reinventing fetch + useState + useEffect. Configure the QueryClient, build a typed api-client validated with zod, design query keys that scale, fetch with queryOptions + useQuery, avoid waterfalls, and master staleTime vs gcTime.'
+pubDate: 2026-07-06
+tags: [react, tanstack-query, data-fetching, zod, react_stack_12]
+series: react-stack
+seriesOrder: 4
+draft: true
+---
+
+Ở Phần 3 ta đã quyết **TanStack Query lo server state**. Phần này thực hiện điều đó: `QueryClient` đã cấu hình, `api-client` có type và validate, hệ query-key scale được, và danh sách customers fetch bằng `useQuery`.
+
+Bước chuyển tư duy: **server state không phải state của bạn**. Nó sống trên server, đổi mà không cần bạn, và bạn chỉ giữ một *ảnh chụp cache*. Query được xây quanh sự thật đó.
+
+---
+
+## 1. Vì sao không `useEffect` + `useState`?
+
+### Cách ngây thơ
+
+```tsx
+function Customers() {
+  const [data, setData] = useState<Customer[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+
+  useEffect(() => {
+    setLoading(true);
+    fetch('/api/customers')
+      .then((r) => r.json())
+      .then(setData)
+      .catch(setError)
+      .finally(() => setLoading(false));
+  }, []);
+  // …render loading / error / data…
+}
+```
+
+Cách này *chạy* nhưng thiếu cache (mỗi mount refetch), gộp request (hai component mount = hai request), refetch nền, retry, và có **race condition**: nếu input đổi giữa chừng, response cũ có thể về sau cùng và đè cái mới. Bạn sẽ tự làm lại tất cả, tệ hơn, ở mỗi màn hình.
+
+### Tóm tắt một dòng
+
+`fetch + useState + useEffect` tự viết thiếu cache, dedup, retry và an toàn race — đúng thứ Query cung cấp.
+
+---
+
+## 2. Cấu hình QueryClient
+
+*Docs: [TanStack Query — quick start](https://tanstack.com/query/latest/docs/framework/react/quick-start).*
+
+```bash
+pnpm add @tanstack/react-query
+pnpm add -D @tanstack/react-query-devtools
+```
+
+```ts
+// src/lib/query-client.ts
+import { QueryClient } from '@tanstack/react-query';
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 60_000,        // data is "fresh" for 60s — no refetch in that window
+      gcTime: 5 * 60_000,       // unused cache entries are GC'd after 5 min
+      retry: 2,                 // retry failed queries twice (network blips)
+      refetchOnWindowFocus: true,
+    },
+    mutations: { retry: 0 },    // don't auto-retry writes (Part 5)
+  },
+});
+```
+
+Tách một component `Providers` để gốc gọn và provider test độc lập được:
+
+```tsx
+// src/app/providers.tsx
+import { QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
+import { Toaster } from '@/components/ui/sonner';
+import { queryClient } from '@/lib/query-client';
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      {children}
+      <Toaster richColors />
+      <ReactQueryDevtools initialIsOpen={false} />
+    </QueryClientProvider>
+  );
+}
+```
+
+```tsx
+// src/main.tsx
+createRoot(document.getElementById('root')!).render(
+  <Providers>
+    <RouterProvider router={router} />
+  </Providers>,
+);
+```
+
+### `staleTime` vs `gcTime` — hai bộ đếm hay nhầm
+
+| Timer | Question it answers | Default |
+|-------|---------------------|---------|
+| **`staleTime`** | How long is cached data considered *fresh* (no background refetch)? | `0` (always stale) |
+| **`gcTime`** | After a query has no observers, how long until its cache is deleted? | `5 min` |
+
+`staleTime` điều khiển *refetch*; `gcTime` điều khiển *bộ nhớ*. Một query có thể stale nhưng vẫn cached — phục vụ tức thì rồi revalidate.
+
+### Tóm tắt một dòng
+
+Một `QueryClient` với `staleTime`/`gcTime` hợp lý, mount qua component `Providers`; `staleTime` = cửa sổ tươi, `gcTime` = tuổi cache sau lần dùng cuối.
+
+---
+
+## 3. API client có type, đã validate
+
+*Docs: [zod](https://zod.dev/).*
+
+### Vấn đề
+
+`response.json()` trả `any` — TypeScript tin server mù quáng. Nếu API đổi field, bạn biết qua crash runtime sâu trong component, không phải tại biên.
+
+### Công cụ: validate tại biên bằng zod
+
+```ts
+// src/lib/api-client.ts
+import { env } from '@/lib/env';
+import { z } from 'zod';
+
+export class ApiError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+export async function apiFetch<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  init?: RequestInit,
+): Promise<T> {
+  const res = await fetch(`${env.VITE_API_URL}${path}`, {
+    headers: { 'Content-Type': 'application/json', ...init?.headers },
+    ...init,
+  });
+
+  if (!res.ok) {
+    throw new ApiError(res.status, `Request failed: ${res.status}`);
+  }
+
+  const json: unknown = await res.json();
+  // validate the shape before it enters the app — fail loudly at the boundary
+  return schema.parse(json);
+}
+```
+
+Định nghĩa schema của feature và suy ra type — một nguồn chân lý cho cả runtime *lẫn* compile time:
+
+```ts
+// src/features/customers/schema.ts
+import { z } from 'zod';
+
+export const customerSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  email: z.string().email(),
+  plan: z.enum(['starter', 'pro', 'enterprise']),
+  mrr: z.number(),
+  status: z.enum(['active', 'trial', 'churned']),
+});
+
+export const customerListSchema = z.array(customerSchema);
+export type Customer = z.infer<typeof customerSchema>;
+```
+
+`z.infer` suy type `Customer` *từ* schema, nên validator và type không bao giờ lệch. Điều này tôn trọng quy tắc không-`any`, không-`as`-thiếu-kiểm từ Phần 1: ta đọc `unknown` và chỉ tin dữ liệu *sau* `schema.parse`.
+
+### Tóm tắt một dòng
+
+Validate mọi response bằng zod tại biên API và suy type qua `z.infer` — `any` không bao giờ vào app.
+
+---
+
+## 4. Query key scale được
+
+*Docs: [TanStack Query — query keys](https://tanstack.com/query/latest/docs/framework/react/guides/query-keys).*
+
+### Vấn đề
+
+Query key định danh dữ liệu cached và điều khiển invalidation. Rải chuỗi literal thì một lỗi gõ âm thầm tạo cache thứ hai, hoặc invalidation trượt.
+
+### Công cụ: một factory key mỗi feature
+
+```ts
+// src/features/customers/keys.ts
+export const customerKeys = {
+  all: ['customers'] as const,
+  lists: () => [...customerKeys.all, 'list'] as const,
+  list: (filters: { q?: string; plan?: string }) =>
+    [...customerKeys.lists(), filters] as const,
+  details: () => [...customerKeys.all, 'detail'] as const,
+  detail: (id: string) => [...customerKeys.details(), id] as const,
+};
+```
+
+Key phân cấp cho invalidation chính xác *hoặc* rộng:
+
+```ts
+queryClient.invalidateQueries({ queryKey: customerKeys.detail('42') }); // one detail
+queryClient.invalidateQueries({ queryKey: customerKeys.all });          // every customer query
+```
+
+Vì key là mảng lồng nhau, `customerKeys.all` là *tiền tố* của mọi key customer khác, nên invalidate nó lan ra tất cả.
+
+### Tóm tắt một dòng
+
+Factory key mỗi feature cho key chống-gõ-sai, phân cấp — invalidate một entry hoặc cả tiền tố.
+
+---
+
+## 5. Fetch bằng `queryOptions` + `useQuery`
+
+*Docs: [useQuery](https://tanstack.com/query/latest/docs/framework/react/reference/useQuery) · [queryOptions](https://tanstack.com/query/latest/docs/framework/react/guides/query-options).*
+
+Bọc fetch trong helper `queryOptions` để key, hàm và type tái dùng giữa `useQuery`, prefetch (Phần 10) và `setQueryData` (Phần 5):
+
+```ts
+// src/features/customers/api.ts
+import { queryOptions } from '@tanstack/react-query';
+import { apiFetch } from '@/lib/api-client';
+import { customerListSchema } from './schema';
+import { customerKeys } from './keys';
+
+export function customersQuery(filters: { q?: string } = {}) {
+  return queryOptions({
+    queryKey: customerKeys.list(filters),
+    queryFn: () => {
+      const params = new URLSearchParams(filters as Record<string, string>);
+      return apiFetch(`/customers?${params}`, customerListSchema);
+    },
+  });
+}
+```
+
+```tsx
+// src/features/customers/hooks.ts
+import { useQuery } from '@tanstack/react-query';
+import { customersQuery } from './api';
+
+export function useCustomers(filters: { q?: string } = {}) {
+  return useQuery(customersQuery(filters));
+}
+```
+
+Component giữ mỏng và xử lý cả ba trạng thái rõ ràng — gồm cả **rỗng**:
+
+```tsx
+function CustomersTable() {
+  const { data, isPending, isError, error } = useCustomers();
+
+  if (isPending) return <TableSkeleton />;
+  if (isError) return <ErrorState message={error.message} />;
+  if (data.length === 0) return <EmptyState label="No customers yet" />;
+
+  return <DataTable data={data} />; // data is fully typed Customer[]
+}
+```
+
+### Một ví dụ cụ thể: vòng đời cache
+
+```text
+t=0    Mount CustomersTable → key ['customers','list',{}] has no cache
+       → queryFn runs, isPending=true → fetch + zod parse → data cached
+t=10s  Navigate away, come back → data is FRESH (within staleTime 60s)
+       → cached data shown instantly, NO refetch
+t=90s  Come back again → data is STALE (>60s)
+       → cached data shown instantly, refetch in BACKGROUND, then updates
+later  No component observes the query for >gcTime → cache entry deleted
+```
+
+Hành vi tức-thì-rồi-revalidate đó chính là thứ `useEffect` tự viết không cho miễn phí.
+
+### Tóm tắt một dòng
+
+`queryOptions` + `useQuery` cho dữ liệu cached, dedup, revalidate nền, type đầy đủ; xử lý loading, error **và** rỗng.
+
+---
+
+## 6. Tránh waterfall — fetch song song
+
+*Docs: [useQueries](https://tanstack.com/query/latest/docs/framework/react/reference/useQueries).*
+
+### Vấn đề
+
+Sát thủ hiệu năng phổ biến là **waterfall request**: component A fetch, render con B, B *rồi mới* fetch của nó — round-trip nối tiếp chồng lên.
+
+### Công cụ: khởi động query độc lập cùng lúc
+
+Nếu một trang cần nhiều tài nguyên độc lập, bắn song song thay vì lồng nhau. Hai lời gọi `useQuery` trong cùng component đã chạy song song:
+
+```tsx
+function OverviewPage() {
+  // these two run in parallel — no waterfall
+  const stats = useQuery(statsQuery());
+  const recent = useQuery(recentActivityQuery());
+  // …
+}
+```
+
+Cho danh sách query động, `useQueries` chạy cả lô cùng lúc:
+
+```tsx
+const results = useQueries({
+  queries: customerIds.map((id) => customerQuery(id)),
+});
+```
+
+Phản mẫu là render cha fetch, và chỉ *trong nhánh thành công của nó* mới mount con fetch — điều đó nối tiếp hai request độc lập. Đưa query độc lập lên cùng cấp để chồng lên nhau.
+
+### Tóm tắt một dòng
+
+Query độc lập nên chạy **song song** (`useQuery` anh em hoặc `useQueries`), không lồng trong nhánh thành công của nhau.
+
+---
+
+## 7. Bài tập
+
+**1.** Một query có `staleTime: 60_000` và `gcTime: 300_000`. Bạn xem trang, rời 2 phút, rồi quay lại. Điều gì xảy ra?
+
+<details>
+<summary>Lời giải</summary>
+
+Cache vẫn còn (2 phút < 5 phút `gcTime`), nên dữ liệu cached hiện **tức thì**. Nhưng nó stale (>60s), nên Query refetch nền và cập nhật khi response về.
+</details>
+
+**2.** Vì sao validate `response.json()` bằng zod thay vì ép `as Customer[]`?
+
+<details>
+<summary>Lời giải</summary>
+
+`as` là lời nói dối lúc compile — bảo TypeScript tin dữ liệu runtime chưa biết, nên API đổi/lỗi âm thầm tạo type sai và crash sau. `schema.parse` kiểm hình thật tại biên và ném ngay khi lệch.
+</details>
+
+**3.** Một trang render `<Stats/>` (fetch) và chỉ sau khi stats load mới render `<Activity/>` (cũng fetch). Vì sao chậm, và sửa thế nào?
+
+<details>
+<summary>Lời giải</summary>
+
+Đó là waterfall: hai fetch độc lập chạy nối tiếp. Đưa cả hai query lên cùng cấp (gọi `useQuery` anh em, hoặc `useQueries`) để chạy song song và tổng chờ giảm còn cái chậm hơn.
+</details>
+
+Nâng cao:thêm hook `useCustomer(id)` dùng `customerKeys.detail(id)` và `customerSchema` object đơn, render trong `CustomerDetailPage` dùng giá trị `useParams` đã chắn từ Phần 3.
+
+---
+
+## Điểm chính
+
+- **Server state không phải state của bạn** — Query giữ ảnh chụp cache và revalidate; đừng tái phát minh bằng `useEffect`.
+- Cấu hình một `QueryClient`; hiểu `staleTime` (tươi) vs `gcTime` (tuổi cache).
+- Validate response bằng **zod tại biên** và suy type bằng `z.infer`; dùng **factory key** cho invalidation.
+- Fetch qua `queryOptions` + `useQuery`; xử lý loading/error/rỗng; chạy query độc lập **song song** để tránh waterfall.
+
+---
+
+## Tiếp theo
+
+**Phần 5 — Mutation & optimistic update**: đổi dữ liệu bằng `useMutation`, invalidate đúng query, và dựng UI lạc quan cập nhật tức thì và rollback khi lỗi — mẫu `onMutate` / `onError` / `onSettled`.

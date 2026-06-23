@@ -1,0 +1,199 @@
+---
+title: 'Vue.js 3 · Phần 9 — Async, Suspense & Data Fetching'
+description: 'Xử lý bất đồng bộ trong Vue 3: pattern fetch có loading/error/empty, async component với <Suspense> và async setup, error boundary qua onErrorCaptured, race condition, và khi nào nên dùng TanStack Query để cache server state.'
+pubDate: 2026-06-22
+tags: [vue, async, suspense, data-fetching, vue_12]
+series: vue
+seriesOrder: 9
+draft: false
+---
+
+Phần lớn UI thật là *hiển thị dữ liệu từ server*. Làm đúng nghĩa là xử lý đủ trạng thái loading/error/empty, tránh race condition, và bắt lỗi gọn gàng. Phần này đi từ pattern fetch tay đến `<Suspense>` của Vue, và chỉ ra ranh giới khi nên dùng thư viện cache server state.
+
+---
+
+## 1. Pattern fetch nền tảng
+
+Tối thiểu mọi fetch cần ba state: `loading`, `error`, `data`. Đóng gói thành composable (Phần 5):
+
+```ts
+// composables/useAsyncData.ts
+import { ref, watchEffect, toValue, type MaybeRefOrGetter } from 'vue';
+
+export function useAsyncData<T>(url: MaybeRefOrGetter<string>) {
+  const data = ref<T | null>(null);
+  const error = ref<Error | null>(null);
+  const loading = ref(false);
+
+  watchEffect(async (onCleanup) => {
+    loading.value = true;
+    error.value = null;
+    const controller = new AbortController();
+    onCleanup(() => controller.abort()); // hủy request cũ → chống race
+
+    try {
+      const res = await fetch(toValue(url), { signal: controller.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      data.value = (await res.json()) as T;
+    } catch (e) {
+      if ((e as Error).name !== 'AbortError') error.value = e as Error;
+    } finally {
+      loading.value = false;
+    }
+  });
+
+  return { data, error, loading };
+}
+```
+
+```vue
+<script setup lang="ts">
+const { data, error, loading } = useAsyncData<User[]>('/api/users');
+</script>
+
+<template>
+  <p v-if="loading">Đang tải…</p>
+  <p v-else-if="error">Lỗi: {{ error.message }}</p>
+  <p v-else-if="!data?.length">Chưa có dữ liệu</p>
+  <ul v-else>
+    <li v-for="u in data" :key="u.id">{{ u.name }}</li>
+  </ul>
+</template>
+```
+
+Bốn nhánh `v-if/v-else-if` — loading, error, empty, data — là khung chuẩn. Đừng quên **empty state**, nó hay bị bỏ sót.
+
+---
+
+## 2. Race condition — vì sao `AbortController`
+
+Khi `url` đổi nhanh (gõ tìm kiếm), request cũ có thể trả *sau* request mới và ghi đè kết quả đúng. `onCleanup(() => controller.abort())` hủy request cũ trước khi chạy lần kế — `data` luôn ứng với truy vấn hiện tại. Đây là bug tinh vi mà fetch tay không cẩn thận sẽ dính.
+
+---
+
+## 3. `<Suspense>` & async setup
+
+Vue cho `setup` trả Promise (top-level `await`). Component như vậy là **async component**, và `<Suspense>` ở cha hiển thị fallback đến khi nó resolve:
+
+```vue
+<!-- UserProfile.vue — async setup -->
+<script setup lang="ts">
+const props = defineProps<{ id: number }>();
+const user = await fetch(`/api/users/${props.id}`).then((r) => r.json());
+</script>
+
+<template>
+  <h2>{{ user.name }}</h2>
+</template>
+```
+
+```vue
+<!-- cha -->
+<template>
+  <Suspense>
+    <UserProfile :id="1" />
+    <template #fallback>
+      <p>Đang tải hồ sơ…</p>
+    </template>
+  </Suspense>
+</template>
+```
+
+`<Suspense>` gom *nhiều* async component con và chỉ hiện nội dung khi **tất cả** resolve — bỏ được rừng cờ `loading` rải rác. Lưu ý: `<Suspense>` ở Vue 3 vẫn là **experimental** về API, nhưng ổn định trong thực tế và được Nuxt dùng rộng rãi.
+
+---
+
+## 4. Error boundary với `onErrorCaptured`
+
+Lỗi trong async setup (và component con) lan lên trên. Bắt nó ở một component "boundary" bằng `onErrorCaptured`:
+
+```vue
+<!-- ErrorBoundary.vue -->
+<script setup lang="ts">
+import { ref, onErrorCaptured } from 'vue';
+const error = ref<Error | null>(null);
+
+onErrorCaptured((err) => {
+  error.value = err as Error;
+  return false; // ngăn lỗi lan tiếp lên trên
+});
+</script>
+
+<template>
+  <div v-if="error" class="error">Có lỗi xảy ra: {{ error.message }}</div>
+  <slot v-else />
+</template>
+```
+
+```vue
+<ErrorBoundary>
+  <Suspense>
+    <RiskyAsyncComponent />
+    <template #fallback>Đang tải…</template>
+  </Suspense>
+</ErrorBoundary>
+```
+
+Bọc `<Suspense>` trong một error boundary cho bạn bộ ba hoàn chỉnh: **loading (fallback), success (nội dung), error (boundary)** — ở mức cây component thay vì từng `v-if`.
+
+---
+
+## 5. Khi nào dùng TanStack Query
+
+Fetch tay nhanh chóng cần thêm: cache, dedupe request trùng, refetch khi focus, phân trang, invalidation, optimistic update. Tự viết hết là tái phát minh một thư viện. **TanStack Query (Vue Query)** lo trọn:
+
+```ts
+import { useQuery } from '@tanstack/vue-query';
+
+const { data, isLoading, error } = useQuery({
+  queryKey: ['users', userId],          // cache theo key
+  queryFn: () => fetchUser(userId.value),
+});
+// tự cache, dedupe, refetch, và đồng bộ giữa các component dùng cùng key
+```
+
+Quy tắc ranh giới: **server state** (dữ liệu sở hữu bởi server, có thể stale) → TanStack Query. **Client state** (UI, form, theme) → `ref`/Pinia. Đừng nhét server state vào Pinia rồi tự quản cache — đó là việc của Query.
+
+---
+
+## 6. Bài tập
+
+**1.** Bốn trạng thái UI cần xử lý cho mọi danh sách fetch là gì?
+
+<details>
+<summary>Lời giải</summary>
+
+loading, error, empty (data rỗng), và success (có data). Empty hay bị quên.
+</details>
+
+**2.** `<Suspense>` giải quyết vấn đề gì so với cờ `loading` thủ công?
+
+<details>
+<summary>Lời giải</summary>
+
+Gom nhiều async component và hiện một fallback chung đến khi tất cả resolve, bỏ được nhiều `loading` rời rạc và logic phối hợp giữa chúng.
+</details>
+
+**3.** Khi nào nên dùng TanStack Query thay vì Pinia để giữ dữ liệu user?
+
+<details>
+<summary>Lời giải</summary>
+
+Khi đó là server state cần cache/refetch/dedupe/invalidate. Pinia hợp client state. Query lo vòng đời cache server tốt hơn store tự viết.
+</details>
+
+---
+
+## Điểm chính
+
+- Mọi fetch cần **loading / error / empty / data**; đóng gói thành composable.
+- Hủy request cũ bằng **`AbortController`** + `onCleanup` để chống race condition.
+- **`<Suspense>`** + async setup gom loading state; vẫn experimental nhưng dùng được.
+- **`onErrorCaptured`** dựng error boundary ở mức cây component.
+- **Server state → TanStack Query**; client state → ref/Pinia.
+
+---
+
+## Phần tiếp theo
+
+Toàn bộ series đã dùng `lang="ts"`. **Phần 10 — TypeScript với Vue** gom lại đúng cách: type props/emits, generic component, ép kiểu template ref và `$el`, type cho composable và store, và những bẫy type thường gặp — để app vừa reactive vừa an toàn kiểu.

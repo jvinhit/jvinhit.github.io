@@ -1,0 +1,251 @@
+---
+title: 'How Browsers Work · Part 3 — HTML Parsing & the DOM'
+description: 'How the renderer turns a byte stream into the DOM tree: tokenization, tree construction, the preload scanner, why scripts block parsing, and how async/defer change the picture.'
+pubDate: 2026-10-09
+tags: [browser, internals, html, dom, parsing, browser_internals_12]
+series: browser-internals
+seriesOrder: 3
+draft: true
+---
+
+Phần 2 kết thúc khi renderer nhận stream byte HTML sau khi commit điều hướng. Phần này zoom vào phép biến đổi đầu tiên: **biến byte đó thành Document Object Model (DOM)** — cây sống trong bộ nhớ mà JavaScript và CSS thực sự thao tác.
+
+HTML bạn viết là văn bản; DOM là đồ thị **đối tượng node** nối bằng con trỏ cha/con/anh em. Parse là tăng dần — trình duyệt dựng cây khi byte đến, đó là lý do server chậm vẫn hiện nội dung một phần từ trên xuống.
+
+---
+
+## 1. Từ byte sang ký tự: encoding
+
+HTTP giao HTML dưới dạng **byte** thô. Trước tokenization, parser phải giải mã byte thành ký tự Unicode.
+
+Encoding lấy từ (theo thứ tự ưu tiên):
+
+1. **BOM** (Byte Order Mark) ở đầu stream, nếu có.
+2. **charset trong `Content-Type`** — vd. `text/html; charset=utf-8` từ phản hồi HTTP.
+3. **`<meta charset="utf-8">`** — phải xuất hiện trong ~1024 byte đầu hay parser có thể parse lại.
+4. **Heuristic dự phòng** — UTF-8 là mặc định hiện đại; trang cũ có thể kích hoạt phát hiện charset.
+
+Nếu encoding khai báo mâu thuẫn với `<meta charset>` tìm thấy sau trong stream, parser có thể **parse lại** từ đầu với encoding đúng — lỗi tốn kém nên tránh.
+
+```text
+Raw bytes:  3C 21 44 4F 43 54 59 50 45 …
+                │
+                ▼  (decode with UTF-8, or declared charset)
+Characters: < ! D O C T Y P E …
+                │
+                ▼
+           Tokenizer → tokens → Tree builder → DOM
+```
+
+> Luôn khai báo charset sớm: `<meta charset="utf-8">` là phần tử đầu trong `<head>`.
+
+---
+
+## 2. Tokenization: tách HTML thành mảnh có nghĩa
+
+**Tokenizer** là máy trạng thái duyệt stream ký tự và phát **token** — từ vựng của parse HTML.
+
+Các loại token phổ biến:
+
+| Token | Ví dụ input |
+|-------|-------------------------------|
+| **Start tag** | `<div class="box">` |
+| **End tag** | `</div>` |
+| **Character** | `Hello` (text content) |
+| **Comment** | `<!-- note -->` |
+| **DOCTYPE** | `<!DOCTYPE html>` |
+| **EOF** | End of stream |
+
+Tokenizer xử lý edge case sẽ làm hỏng regex naïve — thẻ không đóng, nội dung `<script>` trông như HTML, text thô `<textarea>`, và tham chiếu ký tự như `&amp;` → `&`.
+
+```text
+Input:  <p>Hello <strong>world</strong></p>
+
+Tokens:
+  StartTag(p)
+  Character("Hello ")
+  StartTag(strong)
+  Character("world")
+  EndTag(strong)
+  EndTag(p)
+```
+
+Tokenization **stream** — token phát ngay khi đủ ký tự, không chờ `</html>`.
+
+---
+
+## 3. Dựng cây: token thành DOM
+
+**Tree builder** tiêu thụ token và dựng DOM theo **thuật toán parse HTML5**. Nó giữ **stack phần tử mở** và áp dụng quy tắc chèn — ví dụ, thẻ mở `<p>` bên trong `<p>` đang mở ngầm đóng đoạn đầu.
+
+```text
+Token stream                    DOM (grows incrementally)
+─────────────                   ────────────────────────────
+StartTag(html)          →       html
+StartTag(head)          →       html
+  StartTag(title)       →         head
+  Character("Page")     →           title → "Page"
+  EndTag(title)         →
+StartTag(body)          →       html
+StartTag(h1)            →         body
+Character("Hi")         →           h1 → "Hi"
+EndTag(h1)              →
+```
+
+Kết quả là **cây sống** các đối tượng node:
+
+- **`Document`** — gốc
+- **`Element`** — thẻ như `<div>`, `<p>`
+- **`Text`** — nội dung văn bản
+- **`Comment`**, **`DocumentType`**, v.v.
+
+Mỗi node lộ thuộc tính (`nodeType`, `nodeName`, `childNodes`, …) và API JavaScript dùng (`querySelector`, `appendChild`, …). DOM **không phải** chuỗi nguồn HTML — bạn có thể mutate và HTML serialize sẽ khác.
+
+---
+
+## 4. Vì sao `<script>` chặn parse
+
+Đây là quy tắc parse quan trọng nhất cho hiệu năng frontend: khi tree builder gặp **`<script>` classic (không defer, không async)**, nó **phải tạm dừng parse HTML**, fetch script (nếu external), thực thi, rồi mới tiếp tục.
+
+Vì sao? Hai lý do gắn vào nền tảng web:
+
+1. **`document.write()`** — script đồng bộ có thể inject HTML vào stream *khi parse tạm dừng*, và parser phải chèn HTML đó tại điểm chèn hiện tại.
+2. **Script có thể truy vấn DOM** — code như `document.body` giả định mọi thứ đã parse tồn tại.
+
+```text
+Parser:  <html> <head> … </head> <body>
+           │
+           ▼
+         <script src="app.js">   ← PAUSE parsing
+           │
+           ├─ Fetch app.js (network wait)
+           ├─ Execute on main thread (JS wait)
+           │
+           ▼
+         Resume parsing → <div> … rest of page
+```
+
+Mọi thứ dưới script chặn vô hình với parser cho đến khi script xong — kể cả node DOM và tài nguyên phát hiện được. Đó là lý do đặt `<script>` cuối `<body>` từng là lời khuyên kinh điển, và script trong `<head>` nên dùng `defer` hay `async`.
+
+---
+
+## 5. Script async, defer, và module
+
+Thuộc tính hiện đại đổi thời điểm script fetch và chạy:
+
+| Attribute | Fetch | Execute | Order | Chặn parse? |
+|-----------|-------|---------|-------|-------------------------------|
+| *(none)* | Ngay | Ngay | Theo thứ tự tài liệu | **Yes** |
+| **`defer`** | Song song | Sau khi parse xong | Theo thứ tự tài liệu | No |
+| **`async`** | Song song | Ngay khi tải xong | **Không theo thứ tự** | Không (trừ lúc thực thi) |
+| **`type="module"`** | Song song | Defer mặc định | Theo thứ tự tài liệu | No |
+
+```html
+<!-- Blocks parsing until fetched AND executed -->
+<script src="legacy.js"></script>
+
+<!-- Downloads in parallel; runs after DOM is fully parsed, in order -->
+<script defer src="app.js"></script>
+<script defer src="analytics.js"></script>
+
+<!-- Downloads in parallel; runs whenever ready — order NOT guaranteed -->
+<script async src="ads.js"></script>
+
+<!-- ES modules: deferred + strict mode + defer semantics by default -->
+<script type="module" src="main.js"></script>
+```
+
+**`async`** cho script độc lập (analytics, quảng cáo) không cần thứ tự; **`defer`** cho script phụ thuộc DOM đầy đủ hay lẫn nhau. Script **`type="module"`** defer mặc định và hỗ trợ resolve đồ thị `import`.
+
+> Script inline không `defer`/`async` chặn như external. Inline `type="module"` được defer; inline classic thì không.
+
+---
+
+## 6. Preload scanner: fetch trước khi bị chặn
+
+Script chặn tạo nghịch lý: parser tạm dừng nên không phát hiện thẻ `<img>` và `<link>` phía dưới — nhưng bạn vẫn muốn tài nguyên đó tải song song.
+
+Câu trả lời của trình duyệt là **preload scanner** (đôi khi gọi "lookahead preloader") — quét phụ nhẹ trên stream byte thô **không dựng node DOM** nhưng nhận ra URL tài nguyên.
+
+```text
+Main parser (blocked on <script>)
+  │
+  │  paused at: <script src="big.js">
+  │
+Preload scanner (runs in parallel on raw bytes ahead)
+  │
+  ├─ found: <link rel="stylesheet" href="styles.css">  → fetch CSS
+  ├─ found: <img src="hero.jpg">                         → fetch image
+  └─ found: <script defer src="app.js">                  → fetch JS (won't execute yet)
+```
+
+Nó phát hiện:
+
+- `<link rel="stylesheet">`, `<link rel="preload">`, `<link rel="modulepreload">`
+- `<script src>` (including `async`, `defer`, and `type="module"`)
+- `<img src>`, `<img srcset>`
+- `<video poster>`, `@import` inside inline `<style>` blocks
+
+Preload scanner là lý do đặt CSS trong `<head>` và script với `defer` vẫn đạt song song tốt — tài nguyên được fetch dù script chặn làm parser chính dừng. Nó **heuristic** — URL inject động (qua JS sau parse) vô hình với nó.
+
+---
+
+## 7. CSS, render, và tương tác parse
+
+CSS tương tác với parse HTML theo cách tinh vi:
+
+- **CSS không chặn parse HTML** — tokenizer và tree builder HTML vẫn chạy khi CSS tải.
+- **CSS chặn render** — trình duyệt không paint cho đến khi có đủ CSSOM để tính style (tránh FOUC).
+- **CSS có thể chặn thực thi JavaScript** — nếu script gọi `element.offsetWidth` hay buộc resolve style, mà CSS chưa tải, script phải chờ.
+
+```text
+Timeline (simplified):
+
+HTML parse:  ████████████████████░░░░░░  (script pauses ░)
+CSS fetch:   ██████████████
+CSS parse:              ████████
+JS fetch:        ████
+JS exec:                  ████  (may wait for CSS if querying layout)
+First paint:                       ★ (needs DOM + CSSOM)
+```
+
+Phần 4 đi chi tiết dựng CSSOM. Tạm thời nhớ: **parse và render tách nhưng phối hợp** — bạn có thể có DOM đầy đủ với style chưa đủ, nhưng không paint đúng cho đến khi style được tính.
+
+---
+
+## 8. Khoan dung lỗi và document.write
+
+Parse HTML5 cố ý **khoan dung**. Trình duyệt không từ chối markup lỗi — chúng áp dụng quy tắc phục hồi:
+
+| HTML của bạn | Parser làm gì |
+|---------------------------|----------------------------------------|
+| `<p><div></div></p>` | `<div>` tự đóng `<p>` (block trong inline) |
+| `<table><tr><td>A` | Chèn `<tbody>` thiếu, đóng thẻ |
+| Unclosed `<strong>` | Giữ format mở đến khi đóng ngầm |
+
+Đó là lý do `<div>` trong `<p>` "chạy" nhưng tạo DOM bất ngờ — `<p>` bị đóng ngầm trước `<div>`. Validator bắt lỗi; trình duyệt sửa im lặng.
+
+**`document.write()`** là lưỡi dao sắc. Gọi khi đang parse, nó inject HTML vào stream sống; gọi **sau** khi parse xong, nó **xóa sạch cả tài liệu** và mở lại — pattern thảm họa trên mạng chậm.
+
+```js
+// During parse — inserts markup at current position (blocks parser)
+document.write('<div>Injected</div>');
+
+// After parse — WIPES the page and starts over (never do this)
+document.write('<p>This destroys everything</p>');
+```
+
+SPA hiện đại không bao giờ dùng `document.write()`; nó tồn tại cho inject quảng cáo legacy và snippet bên thứ ba đồng bộ. Thấy trong codebase, coi là cờ đỏ.
+
+---
+
+## Tóm tắt
+
+- Parse HTML **tăng dần**: byte → ký tự (encoding) → token (tokenizer) → DOM (tree builder).
+- DOM là **cây sống đối tượng node**, không phải chuỗi HTML nguồn — JavaScript đọc và mutate.
+- **`<script>` classic chặn parse** cho đến khi fetch và thực thi xong, vì `document.write()` và đảm bảo DOM hiển thị.
+- **`defer`** chạy sau parse theo thứ tự; **`async`** chạy khi sẵn sàng (không thứ tự); **`type="module"`** defer mặc định.
+- **Preload scanner** fetch tài nguyên phát hiện song song dù parser chính bị chặn.
+- CSS không chặn parse HTML nhưng **chặn render** và có thể chặn script buộc resolve style.
+
+**Phần tiếp theo:** CSS & CSSOM — stylesheet thành cây thế nào, cascade chọn thắng thế nào, và render tree được dựng ra sao.

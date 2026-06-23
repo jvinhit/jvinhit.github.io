@@ -1,0 +1,224 @@
+---
+title: 'Service Workers · Phần 17 — Background Fetch & Periodic Sync nâng cao'
+description: 'Tải file lớn chạy nền với Background Fetch API có progress UI và sống sót khi đóng tab, cập nhật nội dung định kỳ bằng Periodic Background Sync, cùng permission, recordPayment-style UX và fallback.'
+pubDate: 2026-07-23
+tags: [service-worker, background-fetch, periodic-sync, offline, service_workers_10]
+series: service-workers
+seriesOrder: 17
+draft: false
+---
+
+Background Sync (Phần 7) giỏi gửi lại **request nhỏ** (một POST note) khi có mạng. Nhưng nó không hợp cho hai bài toán khác: tải **file lớn** (video offline, dataset, bộ truyện) cần chạy cả khi đóng tab và có thanh tiến trình; và **cập nhật định kỳ** (làm mới tin tức buổi sáng) không cần người dùng mở app. Hai API chuyên dụng giải hai bài toán này: **Background Fetch** và **Periodic Background Sync**.
+
+Đây là những API "nặng đô", hỗ trợ còn hạn chế (chủ yếu Chromium), nên phần này cũng nhấn mạnh phát hiện hỗ trợ và fallback.
+
+---
+
+## 1. Background Fetch là gì
+
+Background Fetch cho phép bắt đầu một (nhóm) tải xuống mà **trình duyệt** quản lý: nó hiện UI tiến trình của hệ điều hành (như tải file thường), tiếp tục **kể cả khi tab/đóng app**, và báo cho service worker khi xong. Hợp với: tải khoá học offline, video, podcast, gói dữ liệu game.
+
+Khác biệt then chốt so với `fetch` thường: `fetch` chết khi tab đóng; Background Fetch sống tiếp dưới sự quản lý của trình duyệt và người dùng thấy nó trong khay tải xuống.
+
+---
+
+## 2. Bắt đầu một background fetch
+
+Từ trang, gọi `registration.backgroundFetch.fetch(id, requests, options)`:
+
+```js
+async function downloadCourse(courseId, fileUrls) {
+  const reg = await navigator.serviceWorker.ready;
+  if (!('backgroundFetch' in reg)) {
+    return downloadFallback(fileUrls); // trình duyệt không hỗ trợ → fetch thường
+  }
+
+  const bgFetch = await reg.backgroundFetch.fetch(
+    `course-${courseId}`, // id duy nhất cho lần tải này
+    fileUrls,             // mảng URL hoặc Request
+    {
+      title: `Đang tải khoá học ${courseId}`,
+      icons: [{ sizes: '192x192', src: '/icons/192.png', type: 'image/png' }],
+      downloadTotal: 50 * 1024 * 1024, // ước lượng tổng byte (cho thanh % chính xác)
+    },
+  );
+
+  // Theo dõi tiến trình ở trang (nếu tab còn mở)
+  bgFetch.addEventListener('progress', () => {
+    const percent = bgFetch.downloadTotal
+      ? Math.round((bgFetch.downloaded / bgFetch.downloadTotal) * 100)
+      : 0;
+    updateProgressBar(percent);
+  });
+}
+```
+
+`id` cho phép bạn tra cứu/huỷ lần tải sau (`reg.backgroundFetch.get(id)`). `downloadTotal` giúp UI hệ thống hiện % đúng.
+
+---
+
+## 3. Hoàn tất: xử lý trong service worker
+
+Trình duyệt báo kết quả cho SW qua các sự kiện `backgroundfetchsuccess` / `backgroundfetchfail` / `backgroundfetchabort`. Khi thành công, **lưu các response vào Cache** để dùng offline:
+
+```js
+// sw.js
+self.addEventListener('backgroundfetchsuccess', (event) => {
+  const bgFetch = event.registration;
+  event.waitUntil(
+    (async () => {
+      const cache = await caches.open('courses');
+      const records = await bgFetch.matchAll();
+      await Promise.all(
+        records.map(async (record) => {
+          const response = await record.responseReady; // chờ response sẵn sàng
+          await cache.put(record.request, response);
+        }),
+      );
+      // Cập nhật UI hệ thống thành "đã xong"
+      event.updateUI({ title: 'Khoá học đã tải xong ✅' });
+
+      // Báo cho các tab (Phần 16)
+      const clients = await self.clients.matchAll();
+      clients.forEach((c) => c.postMessage({ type: 'COURSE_READY', id: bgFetch.id }));
+    })(),
+  );
+});
+
+self.addEventListener('backgroundfetchfail', (event) => {
+  event.waitUntil(event.updateUI({ title: 'Tải khoá học thất bại' }));
+});
+```
+
+`record.responseReady` là Promise vì response có thể chưa hoàn tất ngay lúc sự kiện bắn. Luôn `event.waitUntil` để SW không bị kill giữa lúc ghi cache.
+
+---
+
+## 4. `backgroundfetchclick` — mở app khi bấm vào tiến trình
+
+Người dùng bấm vào ô tiến trình trong khay hệ thống → SW nhận `backgroundfetchclick`, mở app tới trang phù hợp (dùng Clients API — Phần 16):
+
+```js
+self.addEventListener('backgroundfetchclick', (event) => {
+  const id = event.registration.id;
+  event.waitUntil(self.clients.openWindow(`/courses/${id.replace('course-', '')}`));
+});
+```
+
+---
+
+## 5. Periodic Background Sync — làm mới định kỳ
+
+`periodicSync` cho phép SW thức dậy **theo lịch** (do trình duyệt quyết định tần suất, dựa trên thói quen dùng + mạng + pin) để làm mới nội dung — vd tải sẵn tin buổi sáng để mở app là có ngay.
+
+Cần **permission** và app thường phải đã được cài (PWA):
+
+```js
+async function registerPeriodicSync() {
+  const reg = await navigator.serviceWorker.ready;
+  if (!('periodicSync' in reg)) return; // không hỗ trợ
+
+  const status = await navigator.permissions.query({
+    name: 'periodic-background-sync',
+  });
+  if (status.state !== 'granted') return;
+
+  await reg.periodicSync.register('refresh-news', {
+    minInterval: 12 * 60 * 60 * 1000, // tối thiểu 12h (trình duyệt có thể giãn ra)
+  });
+}
+```
+
+```js
+// sw.js — thức dậy theo lịch để làm mới cache
+self.addEventListener('periodicsync', (event) => {
+  if (event.tag === 'refresh-news') {
+    event.waitUntil(updateNewsCache());
+  }
+});
+
+async function updateNewsCache() {
+  const cache = await caches.open('news');
+  const res = await fetch('/api/news/latest');
+  if (res.ok) await cache.put('/api/news/latest', res.clone());
+}
+```
+
+> **`minInterval` là gợi ý, không phải cam kết.** Trình duyệt quyết định thật sự chạy khi nào (và có chạy không) dựa trên site engagement, mạng, pin. Đừng thiết kế logic phụ thuộc thời điểm chính xác — coi đây là "cập nhật cơ hội", không phải cron.
+
+---
+
+## 6. Quyền, gỡ đăng ký & kiểm tra
+
+```js
+// Liệt kê các periodic sync đã đăng ký
+const reg = await navigator.serviceWorker.ready;
+const tags = await reg.periodicSync.getTags();
+
+// Gỡ khi user tắt tính năng "tải nền"
+await reg.periodicSync.unregister('refresh-news');
+```
+
+Tôn trọng người dùng: cho một toggle "Tự động làm mới nền" trong cài đặt, và `unregister` khi họ tắt. Tải nền tốn pin/dữ liệu — đừng bật ngầm.
+
+---
+
+## 7. Fallback & phát hiện hỗ trợ
+
+Cả hai API hỗ trợ hẹp (chủ yếu Chrome/Edge Android). Luôn kiểm tra và có đường lui:
+
+| API | Kiểm tra | Fallback |
+|---|---|---|
+| Background Fetch | `'backgroundFetch' in reg` | `fetch` thường + lưu cache (chỉ khi tab mở) |
+| Periodic Sync | `'periodicSync' in reg` + permission | Làm mới khi mở app / `visibilitychange` |
+
+Triết lý xuyên suốt PWA: **progressive enhancement**. Tính năng nền là "phần thưởng" cho trình duyệt hỗ trợ; app vẫn phải chạy đầy đủ khi không có.
+
+---
+
+## 8. Bài tập
+
+**1.** Background Fetch khác `fetch` thường (kể cả trong background sync) ở điểm cốt lõi nào?
+
+<details>
+<summary>Lời giải</summary>
+
+Background Fetch do *trình duyệt* quản lý: nó hiện UI tiến trình hệ thống, tiếp tục **kể cả khi tab/app đóng**, và báo SW khi xong. `fetch` thường chết khi tab đóng; Background Sync hợp cho request nhỏ retry, không cho tải file lớn có tiến trình. Vì vậy Background Fetch hợp video/dataset/khoá học offline.
+
+</details>
+
+**2.** Vì sao không nên coi `minInterval` của Periodic Sync như một cron chính xác?
+
+<details>
+<summary>Lời giải</summary>
+
+`minInterval` chỉ là *khoảng tối thiểu gợi ý*; trình duyệt tự quyết có chạy không và chạy khi nào dựa trên engagement, mạng, pin. Nó có thể giãn ra nhiều hoặc không chạy. Hãy dùng cho "cập nhật cơ hội" (làm mới nếu có dịp), không cho logic phụ thuộc thời điểm chính xác.
+
+</details>
+
+**3.** Vì sao `record.responseReady` là Promise, và vì sao cần `event.waitUntil` khi xử lý `backgroundfetchsuccess`?
+
+<details>
+<summary>Lời giải</summary>
+
+`responseReady` là Promise vì tại lúc sự kiện bắn, response có thể chưa hoàn tất — phải chờ. `event.waitUntil` giữ SW sống suốt quá trình lấy response + ghi cache; thiếu nó SW có thể bị kill giữa chừng, làm cache lưu dở dang hoặc thất bại.
+
+</details>
+
+**Nâng cao:** Cài Background Fetch tải một nhóm file lớn với progress UI ở trang, lưu vào cache khi `backgroundfetchsuccess`, và `postMessage` báo các tab. Test: bắt đầu tải rồi **đóng tab** — xác nhận tải vẫn tiếp tục (khay hệ thống), mở lại app thấy nội dung đã offline.
+
+---
+
+## Tóm tắt
+
+- **Background Fetch** do trình duyệt quản lý: UI tiến trình hệ thống, sống sót khi đóng tab, báo SW khi xong — hợp file lớn (video, dataset, khoá học offline).
+- Bắt đầu bằng `reg.backgroundFetch.fetch(id, requests, {title, icons, downloadTotal})`; theo dõi `progress`; xử lý `backgroundfetchsuccess` (lưu `responseReady` vào cache, `updateUI`, báo tab).
+- `backgroundfetchclick` mở app tới đúng trang (Clients API).
+- **Periodic Background Sync** (`periodicSync.register(tag, {minInterval})` + permission) làm mới định kỳ — `minInterval` chỉ là gợi ý, coi như "cập nhật cơ hội".
+- Cả hai hỗ trợ hẹp: phát hiện (`'backgroundFetch'/'periodicSync' in reg`) + fallback; progressive enhancement.
+
+---
+
+## Phần tiếp theo
+
+**Phần 18 — Bảo mật service worker:** vì sao SW yêu cầu HTTPS và scope quan trọng, những gì **tuyệt đối không** được cache (Authorization, PII), toàn vẹn nội dung và CSP cho SW, rủi ro chuỗi cung ứng, và cách tránh "cache poisoning" biến SW thành lỗ hổng.

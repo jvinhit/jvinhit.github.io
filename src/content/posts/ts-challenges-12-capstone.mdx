@@ -1,0 +1,597 @@
+---
+title: 'TS Type Challenges · Part 12 — Capstone: A Typed Path Utility'
+description: 'Part 12: turn the series into a real, fully-typed deep-get utility with autocompleted paths, then master the meta-skills — debugging types, recursion and performance limits, a one-page pattern cheat sheet, and a practice plan.'
+pubDate: 2026-01-23
+tags: [typescript, type-system, challenges, learning, ts_challenges_12]
+series: ts-challenges
+seriesOrder: 12
+draft: false
+---
+
+Đây là **Phần 12 — capstone** của series 12 bài về TypeScript type challenges. Lập trình tầng type không phải trò vui: cùng những mẫu đó tạo nên autocomplete, an toàn kiểu đầu-cuối, và API của các thư viện như Prisma, tRPC, Zod. Ta sẽ chứng minh bằng cách dựng một **utility deep-get thực, gõ type đầy đủ**, rồi bàn các kỹ năng meta biến người giải challenge thành kỹ sư type năng suất.
+
+> Ghi nguồn: kỹ thuật theo type-challenges (giấy phép MIT).
+
+---
+
+## Capstone — `get(obj, path)` gõ type đầy đủ
+
+Mục tiêu: một hàm mà editor **gợi ý mọi đường dẫn chấm hợp lệ** và suy ra **đúng type trả về** cho cái bạn chọn. Thư viện như lodash có `get` lúc chạy, nhưng đường dẫn chỉ là `string` — gõ sai và type trả về sai chỉ lộ lúc runtime. Bản của ta đẩy cả hai bảo đảm lên **lúc biên dịch**.
+
+```ts
+const user = {
+  name: 'Ada',
+  address: { city: 'London', geo: { lat: 51.5 } },
+};
+
+get(user, 'address.geo.lat'); // ✅ typed as number, autocompleted
+get(user, 'address.city');    // ✅ typed as string
+get(user, 'address.zip');     // ❌ compile error: not a valid path
+```
+
+Thư viện có ba mảnh phối hợp: `Paths<T>` sinh các chuỗi đường dẫn hợp lệ, `Get<T, P>` phân giải đường dẫn thành type giá trị, và `get()` nối cả hai vào một hàm lúc chạy. Mỗi mảnh tái dùng mẫu từ Phần 1–11 — không có gì mới, chỉ ghép lại.
+
+### Mảnh 1 — sinh mọi đường dẫn hợp lệ
+
+#### `Paths<T>` làm gì và vì sao quan trọng
+
+`Paths<T>` là **động cơ autocomplete** của thư viện. Nó duyệt hình dạng của `T` và tạo **union mọi chuỗi đường dẫn chấm** thật sự tồn tại trên object. Khi bạn gõ tham số thứ hai của `get()`, editor chỉ gợi ý thành viên của union đó — đường dẫn không hợp lệ như `'address.zip'` bị từ chối trước khi chạy gì.
+
+```ts
+type Paths<T> = T extends object
+  ? {
+      [K in keyof T & (string | number)]: T[K] extends object
+        ? `${K}` | `${K}.${Paths<T[K]>}`
+        : `${K}`;
+    }[keyof T & (string | number)]
+  : never;
+```
+
+#### Cách làm ngây thơ
+
+Bản năng đầu tiên có thể là tái dùng `keyof T`:
+
+```ts
+// ❌ only top-level keys — no nesting
+type NaivePaths<T> = keyof T & string;
+// for our user: 'name' | 'address'   (missing 'address.city', 'address.geo.lat', …)
+```
+
+`keyof` chỉ thấy **một tầng**. Một field lồng như `address.geo.lat` là ba key nối bằng dấu chấm, không phải một key trên `user`. Bạn cần **đệ quy** vào object lồng và **dựng chuỗi đường dẫn** khi đi xuống.
+
+#### Kỹ thuật trước đó được kết hợp thế nào
+
+| Kỹ thuật | Ở đâu trong `Paths<T>` | Part |
+|---|---|---|
+| **Mapped type** — iterate keys, transform values | `[K in keyof T & (string | number)]: …` | [2](/blog/ts-challenges-02-mapped-types/) |
+| **Template literal types** — glue key segments with `.` | `` `${K}` ``, `` `${K}.${Paths<T[K]>}` `` | [7](/blog/ts-challenges-07-template-literal-types/) |
+| **Recursion** — call `Paths` again on nested values | `Paths<T[K]>` inside the mapped value | [5](/blog/ts-challenges-05-recursion-over-tuples/) |
+| **Union collection** — collapse mapped values to one union | `…[keyof T & (string \| number)]` | [9](/blog/ts-challenges-09-hard-utility-types/) |
+| **Conditional type** — branch on object vs leaf | `T extends object ? … : never` | [3](/blog/ts-challenges-03-conditional-distribution/) |
+
+Mapped type tạo **object mà value là union đường dẫn theo từng key**; `[keyof T]` ở cuối index vào object đó và TypeScript **gom** mọi value thành một union lớn. Chiêu "lọc key → union" giống utility kiểu `Pick` ở Phần 9.
+
+#### Từng dòng
+
+```ts
+type Paths<T> = T extends object          // ① guard: only objects have keys to walk
+  ? {
+      [K in keyof T & (string | number)]: // ② loop every key; & filters out symbol keys
+        T[K] extends object               // ③ is this value another object?
+          ? `${K}` | `${K}.${Paths<T[K]>}` // ④a nested: emit "K" AND "K.deeper…"
+          : `${K}`;                       // ④b leaf: emit just "K"
+    }[keyof T & (string | number)]        // ⑤ unionize all per-key path unions
+  : never;                                 // ⑥ non-object base case
+```
+
+- Dừng đệ quy ở primitive. `number` không có key nên đường dẫn vào nó là `never`.
+- `keyof` có thể gồm `symbol`; ta chỉ muốn key thành segment hợp lệ trong template literal.
+- Phân biệt record lồng với lá. Lưu ý: **mảng cũng là object** trong TypeScript, nên nhánh này cũng đi vào mảng (gotcha bên dưới).
+- Với value lồng, phát **cả** đường dẫn prefix (`'address'`) lẫn mọi đường sâu hơn có tiền tố `K.` (`'address.city'`, `'address.geo.lat'`, …). `|` gom chúng thành union.
+- idiom indexed-access trên mapped type. `{ a: '1', b: '2' }['a' | 'b']` thành `'1' | '2'`.
+- Nếu `T` không phải object, không có đường dẫn để phát.
+
+#### Đánh giá type từng bước
+
+```ts
+type User = {
+  name: string;
+  address: { city: string; geo: { lat: number } };
+};
+
+type AllPaths = Paths<User>;
+```
+
+```ts
+// step 1: User extends object → enter the mapped type
+// step 2: keys = 'name' | 'address'
+
+// step 3: branch on K = 'name'
+//   T['name'] = string → not object → emit 'name'
+
+// step 4: branch on K = 'address'
+//   T['address'] = { city: string; geo: { lat: number } } → object
+//   recurse Paths<{ city: string; geo: { lat: number } }>
+//     step 4a: K = 'city'  → leaf → 'city'
+//     step 4b: K = 'geo'   → object → 'geo' | 'geo.lat'
+//     step 4b-i: Paths<{ lat: number }>
+//       K = 'lat' → leaf → 'lat'
+//     inner result: 'city' | 'geo' | 'geo.lat'
+//   emit: 'address' | 'address.city' | 'address.geo' | 'address.geo.lat'
+
+// step 5: unionize via [keyof User]
+// AllPaths = 'name' | 'address' | 'address.city' | 'address.geo' | 'address.geo.lat'
+```
+
+Hover `AllPaths` trong Playground và bạn sẽ thấy đúng union đó — năm chuỗi hợp lệ, không gì thêm.
+
+#### Cạm bẫy
+
+- Mảng là object: `Paths<{ items: string[] }>` sẽ đi vào type mảng và phát `'items.0'`, `'items.length'`, `'items.push'` — hiếm khi là điều bạn muốn. Phòng bằng `T extends readonly any[] ? never : …` hoặc nhánh mảng riêng (xem Bài tập 2).
+- Key optional vẫn xuất hiện: `Paths<{ a?: string }>` vẫn gồm `'a'` dù runtime có thể `undefined`. Đường dẫn hợp lệ; *giá trị* có thể không — đó là chuyện khác cho `get`.
+- Value union phân phối: Nếu type field là union object, `Paths` sinh đường dẫn vào **mọi** thành viên. Thường tốt cho discriminated union, ồn với union object `A | B`.
+- Độ sâu = chi phí đệ quy: Cây 30 tầng có thể chạm giới hạn khởi tạo compiler. Config thật hiếm khi sâu vậy; nếu có, cân nhắc làm phẳng type hoặc giới hạn độ sâu.
+
+#### Tóm tắt một dòng
+
+`Paths<T>` là **mapped type đệ quy** duyệt cây object, dựng **chuỗi đường dẫn template literal**, rồi **gom union** — cho editor menu đầy đủ các đường dẫn hợp lệ.
+
+### Mảnh 2 — phân giải đường dẫn thành type
+
+#### `Get<T, K>` làm gì và vì sao quan trọng
+
+`Paths<T>` cho biết **chuỗi nào hợp lệ**; `Get<T, K>` cho biết **type gì nằm ở cuối một chuỗi cho trước**. Cùng nhau cho autocomplete *và* return type chính xác. Đây chính là `Get` từ [Phần 11](/blog/ts-challenges-11-extreme-challenges/) — challenge #270 trong repo.
+
+```ts
+type Get<T, K extends string> = K extends `${infer Head}.${infer Rest}`
+  ? Head extends keyof T
+    ? Get<T[Head], Rest>
+    : never
+  : K extends keyof T
+    ? T[K]
+    : never;
+```
+
+#### Cách làm ngây thơ
+
+Indexed access `T[K]` chỉ hoạt động khi `K` là **một key**, không phải đường dẫn chấm:
+
+```ts
+// ❌ 'address.geo.lat' is not a key of User — it's three keys joined
+type Bad = User['address.geo.lat']; // error or nonsense
+
+// ❌ manual chaining doesn't scale and can't accept a runtime string
+type AlsoBad = User['address']['geo']['lat']; // works as a type, but not parametric
+```
+
+Bạn cần **tách** đường dẫn ở dấu chấm, **đi xuống** từng key một, và **đệ quy** đến khi hết dấu chấm.
+
+#### Kỹ thuật trước đó được kết hợp thế nào
+
+| Kỹ thuật | Vai trò trong `Get` | Part |
+|---|---|---|
+| **Template literal split** | `` K extends `${infer Head}.${infer Rest}` `` peels the first segment | [7](/blog/ts-challenges-07-template-literal-types/) |
+| **`infer`** | Captures `Head` and `Rest` from the pattern match | [4](/blog/ts-challenges-04-infer-mastery/) |
+| **Indexed access** | `T[Head]` steps into the sub-object | [1](/blog/typescript-type-challenges-explained/) |
+| **Recursion** | `Get<T[Head], Rest>` continues on the remainder | [5](/blog/ts-challenges-05-recursion-over-tuples/) |
+| **Conditional branching** | Dot present → recurse; no dot → final lookup | [3](/blog/ts-challenges-03-conditional-distribution/) |
+
+Hãy coi nó như **parser đệ quy xuống**: chuỗi đường dẫn là input, mỗi `Head` là một token, và `T` là cây bạn duyệt.
+
+#### Từng dòng
+
+```ts
+type Get<T, K extends string> =
+  K extends `${infer Head}.${infer Rest}`  // ① does K contain a dot?
+    ? Head extends keyof T                 // ② is Head a real key on T?
+      ? Get<T[Head], Rest>                 // ③ yes → descend and recurse on Rest
+      : never                              // ④ bad key → invalid path
+    : K extends keyof T                    // ⑤ no dot → K is the final key
+      ? T[K]                               // ⑥ return the leaf type
+      : never;                             // ⑦ final key doesn't exist
+```
+
+- Tách template — khớp `'address.geo.lat'` thành `Head = 'address'`, `Rest = 'geo.lat'`. Đường không dấu chấm (`'name'`) không vào nhánh này, rơi xuống ⑤.
+- Chứng minh lúc biên dịch segment đầu tồn tại. `'address.zip'` fail vì `'zip'` không phải key của object address.
+- Đệ quy cốt lõi. Type sub-object thành `T` mới; phần đuôi chưa xử lý thành `K` mới.
+- Segment cuối — khi `K` không còn dấu chấm, là lookup một key: `T[K]` hoặc `never`.
+
+#### Đánh giá type từng bước
+
+```ts
+type Result = Get<typeof user, 'address.geo.lat'>;
+```
+
+```ts
+// step 1: 'address.geo.lat' extends `${infer Head}.${infer Rest}`?
+//   Head = 'address', Rest = 'geo.lat'
+
+// step 2: 'address' extends keyof user?  yes (user has address)
+
+// step 3: recurse → Get<user['address'], 'geo.lat'>
+//   i.e. Get<{ city: string; geo: { lat: number } }, 'geo.lat'>
+
+// step 4: 'geo.lat' extends `${infer Head}.${infer Rest}`?
+//   Head = 'geo', Rest = 'lat'
+
+// step 5: 'geo' extends keyof address?  yes
+
+// step 6: recurse → Get<{ lat: number }, 'lat'>
+
+// step 7: 'lat' has no dot → final branch
+//   'lat' extends keyof { lat: number }?  yes
+//   return { lat: number }['lat'] → number
+
+// Result = number ✅
+```
+
+Đường dẫn không hợp lệ:
+
+```ts
+type Bad = Get<typeof user, 'address.zip'>;
+// step 1: Head = 'address', Rest = 'zip'
+// step 2: 'address' extends keyof user? yes
+// step 3: Get<{ city: string; geo: { lat: number } }, 'zip'>
+// step 7: 'zip' extends keyof address? NO → never
+// Bad = never ✅
+```
+
+#### Cạm bẫy
+
+- `never` nghĩa là "đường dẫn không hợp lệ", không phải "thiếu giá trị lúc runtime". `get(user, 'address.zip')` là lỗi biên dịch; `get(user, 'address.city')` trên object mà `city` là `undefined` vẫn type-check là `string`.
+- Key chuỗi số: `Get<{ items: [string, number] }, 'items.0'>` ra `string` vì index `0` của tuple là key. Đúng với tuple, bất ngờ với mảng nói chung.
+- Đừng truyền `string` rộng cho `K`: `Get<User, string>` phân phối trên mọi string thành union khổng lồ. Ràng buộc `K` bằng `Paths<T>` tại chỗ gọi (Mảnh 3).
+
+#### Tóm tắt một dòng
+
+`Get<T, K>` **tách** đường dẫn chấm ở dấu chấm đầu, **đi xuống** bằng `T[Head]`, và **đệ quy** đến khi còn một key — parser trên chuỗi điều khiển indexed access.
+
+### Mảnh 3 — hàm lúc chạy, gõ type bằng cả hai
+
+#### `get()` làm gì và vì sao quan trọng
+
+Type một mình không lấy giá trị — bạn vẫn cần **hàm runtime** duyệt object. Chiêu là cho chữ ký hàm **suy ra** ràng buộc từ `Paths<T>` và return từ `Get<T, P>` để người gọi có autocomplete và type chính xác mà không viết thêm gì.
+
+```ts
+function get<T extends object, P extends Paths<T>>(obj: T, path: P): Get<T, P> {
+  // runtime: walk the dotted path
+  return path
+    .split('.')
+    .reduce<unknown>((acc, key) => (acc as Record<string, unknown>)[key], obj) as Get<T, P>;
+}
+```
+
+#### Cách làm ngây thơ
+
+```ts
+// ❌ no path validation, no return type precision
+function naiveGet(obj: object, path: string): unknown {
+  return path.split('.').reduce((acc: any, key) => acc?.[key], obj);
+}
+```
+
+Chạy được, nhưng editor chấp nhận **mọi** string và return là `unknown` (hoặc `any`) — bạn mất hết thứ tầng type đã cho. Tệ hơn, `any` trong reducer lan nhiễm cả chuỗi.
+
+#### Kỹ thuật trước đó được kết hợp thế nào
+
+| Mảnh | Vai trò tầng type | Vai trò runtime |
+|---|---|---|
+| `Paths<T>` | Constrains `P` — legal path autocomplete | `path.split('.')` must match the same segments |
+| `Get<T, P>` | Return type for the specific `P` inferred at the call site | Result should match (types guarantee structure) |
+| Generic inference | `T` inferred from `obj`; `P` inferred from `path` literal | — |
+
+Ý ghép: `P extends Paths<T>` và `Get<T, P>` dùng chung `T` và `P`, nên khi gọi `get(user, 'address.geo.lat')`, TypeScript suy ra `T = typeof user`, `P = 'address.geo.lat'`, kiểm tra `'address.geo.lat' extends Paths<typeof user>` (có), và phân giải `Get<typeof user, 'address.geo.lat'>` → `number`.
+
+#### Từng dòng
+
+```ts
+function get<T extends object, P extends Paths<T>>(
+//     ① T: shape of the object (inferred from arg 1)
+//     ② P: exact path literal (inferred from arg 2), constrained to legal paths
+  obj: T,
+  path: P,
+): Get<T, P> {
+//  ③ return type computed from T + P — not a hand-written union
+  return path
+    .split('.')                              // ④ runtime split mirrors type-level Head/Rest
+    .reduce<unknown>(                        // ⑤ acc starts as unknown, not any
+      (acc, key) => (acc as Record<string, unknown>)[key],
+      obj,
+    ) as Get<T, P>;                          // ⑥ assertion: types proved correctness
+}
+```
+
+- Đảm bảo `keyof T` có nghĩa. Suy ra từ tham số đầu, mỗi chỗ gọi có `T` riêng.
+- Autocomplete + chặn gõ sai. Literal `'address.zip'` fail vì không nằm trong `Paths<typeof user>`.
+- Vì `P` được suy ra là literal **cụ thể** (không phải `string`), `Get` phân giải thành type **cụ thể** (`number`, không phải `string | number`).
+- Duyệt runtime cấu trúc giống đệ quy tầng type: tách `.`, đi từng key. `reduce<unknown>` tránh `any` trong accumulator.
+- Một assertion duy nhất, chỉ trong thân hàm. Hệ type đã chứng minh đường dẫn hợp lệ và return khớp; dòng này bảo TypeScript "tin bước duyệt runtime".
+
+#### Suy luận từng bước tại chỗ gọi
+
+```ts
+const user = {
+  name: 'Ada',
+  address: { city: 'London', geo: { lat: 51.5 } },
+};
+
+const lat = get(user, 'address.geo.lat');
+```
+
+```ts
+// step 1: infer T from first arg
+//   T = { name: string; address: { city: string; geo: { lat: number } } }
+
+// step 2: infer P from second arg (must be a string literal or union of literals)
+//   P = 'address.geo.lat'
+
+// step 3: check constraint P extends Paths<T>
+//   Paths<T> = 'name' | 'address' | 'address.city' | 'address.geo' | 'address.geo.lat'
+//   'address.geo.lat' is a member → ✅
+
+// step 4: resolve return type Get<T, P>
+//   Get<typeof user, 'address.geo.lat'> → number (see Piece 2 walkthrough)
+
+// step 5: lat is typed as number
+//   editor autocompletes the path; hovering lat shows: const lat: number
+```
+
+Từ chối lúc biên dịch:
+
+```ts
+get(user, 'address.zip');
+// step 3: 'address.zip' extends Paths<typeof user>?  NO
+// ❌ Argument of type '"address.zip"' is not assignable to parameter of type Paths<...>
+```
+
+#### Cạm bẫy
+
+- Mở rộng literal: `const p = 'address.geo.lat'; get(user, p)` fail vì `p` có type `string`, không phải literal. Dùng `as const` hoặc helper generic.
+- Đường dẫn động cố ý không hỗ trợ: `get(user, someRuntimeString)` không thể type-safe — đó là đánh đổi. Dùng type guard hoặc overload không gõ type cho truy cập động thật sự.
+- Runtime vẫn có thể trả `undefined`: Nếu key có trong type nhưng `undefined` lúc runtime, `get` trả `undefined` trong khi type nói `string`. Optional chaining trong reducer hoặc `getOr` (Bài tập 1) xử lý việc này.
+- Ép `as` là ranh giới có chủ đích: Giữ assertion trong implementation, không trong type public. Người gọi không thấy `as` — chỉ có suy luận thuần.
+
+#### Ba mảnh khớp với nhau thế nào
+
+1. `P extends Paths<T>` ràng buộc `path` về **union các đường dẫn hợp lệ**, nên editor gợi ý và từ chối gõ sai.
+2. Type trả về `Get<T, P>` phân giải **đúng** type cho **đúng** đường dẫn truyền vào.
+3. Các ép `as` chỉ nằm trong thân runtime, *sau khi* type đã bảo đảm đúng — đúng kiểu dùng assertion có kỷ luật mà quy tắc dự án cho phép.
+
+#### Tóm tắt một dòng
+
+`get()` là lúc lập trình tầng type đáng giá: **`Paths` bảo vệ input**, **`Get` gõ output**, và một bước duyệt runtime mỏng nối chúng — mười hai phần mẫu thành utility bạn thật sự ship.
+
+Mười hai phần mẹo "hàn lâm" vừa trở thành một utility bạn thật sự dùng được.
+
+---
+
+## Gỡ lỗi type
+
+Lỗi tầng type lặng lẽ — không có stack trace, chỉ kết quả sai hoặc thông báo lỗi khó hiểu. Khi `Paths<T>` hiện `never` hoặc `Get<T, P>` không ra như mong đợi, bạn cần **quy trình debug**, không đoán mò. Bộ đồ nghề của bạn:
+
+### 1. Làm đẹp khi hover
+
+Compiler thường hiển thị type dạng mở rộng khó đọc — giao của mapped type, union phân phối, alias đệ quy. Bọc type để buộc làm phẳng:
+
+```ts
+type Prettify<T> = { [K in keyof T]: T[K] } & {};
+type Debug = Prettify<Get<typeof user, 'address'>>;
+// hover Debug → { city: string; geo: { lat: number } }  (readable!)
+```
+
+`Prettify` là mapped type sao chép key nguyên vẹn, rồi giao với `{}` — mẹo khiến TypeScript **thu gọn** cách hiển thị. Dùng trên mọi type khó đọc khi hover.
+
+### 2. Alias trung gian
+
+Đừng debug conditional type 40 dòng một lúc — **đặt tên từng bước**:
+
+```ts
+type UserPaths = Paths<typeof user>;
+type GeoPath = Extract<UserPaths, `address.geo.${string}`>;
+type GeoValue = Get<typeof user, 'address.geo.lat'>;
+
+// hover UserPaths → see the full union
+// hover GeoPath  → 'address.geo' | 'address.geo.lat'
+// hover GeoValue → number
+```
+
+Khi kết quả cuối sai, hover **bước đúng cuối cùng** — lỗi nằm ở phép biến đổi tiếp theo. Đây là tương đương `console.log` giữa các dòng ở tầng type.
+
+### 3. Bộ `Expect` / `Equal`
+
+Khẳng định kết quả mong đợi như **test lúc biên dịch** (đồ nghề từ [Phần 3](/blog/ts-challenges-03-conditional-distribution/)):
+
+```ts
+type Expect<T extends true> = T;
+type Equal<X, Y> =
+  (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2)
+    ? true
+    : false;
+
+type cases = [
+  Expect<Equal<Paths<typeof user>, 'name' | 'address' | 'address.city' | 'address.geo' | 'address.geo.lat'>>,
+  Expect<Equal<Get<typeof user, 'address.geo.lat'>, number>>,
+  Expect<Equal<Get<typeof user, 'name'>, string>>,
+];
+```
+
+Nếu ca nào fail, TypeScript báo lỗi tại dòng `Expect<Equal<…>>` với "not assignable to `true`" — bạn tìm được regression ngay. Giữ tuple `cases` ở cuối mỗi file type utility.
+
+### 4. `@ts-expect-error` cho ca phủ định
+
+Test dương chứng minh đường hợp lệ chạy; **test âm** chứng minh đường không hợp lệ bị từ chối:
+
+```ts
+// @ts-expect-error 'address.zip' is not a valid path
+get(user, 'address.zip');
+
+// @ts-expect-error 'name.foo' is not a valid path (name is a string leaf)
+get(user, 'name.foo');
+```
+
+Nếu bỏ ràng buộc mà dòng **không còn lỗi**, guard `Paths` bị hỏng. Nếu thêm `@ts-expect-error` vào dòng vốn không lỗi, TypeScript cảnh báo directive thừa — bắt false negative.
+
+#### Tóm tắt một dòng
+
+Debug type bằng **`Prettify` để đọc**, **alias để chia đôi**, **`Expect`/`Equal` để test**, và **`@ts-expect-error` để bảo vệ** — cùng kỷ luật với unit test, nhưng lúc biên dịch.
+
+---
+
+## Hiệu năng & giới hạn cần tôn trọng
+
+Compiler làm việc thật cho mỗi type bạn viết — khởi tạo generic, mở rộng mapped type, phân phối union. `Paths<T>` trên type lồng lớn có thể làm IDE chậm rõ. Giữ nhanh và trong giới hạn:
+
+### Độ sâu đệ quy
+
+TypeScript giới hạn số lần conditional type đệ quy — khoảng **~50** cho đệ quy thường, **~1000** cho conditional **đệ quy đuôi** (TypeScript 4.5+). `Paths` và `Get` đệ quy một lần mỗi tầng lồng. Type 60 tầng sẽ gặp "Type instantiation is excessively deep". Với input dài (xử lý tuple, tách string), dùng dạng **accumulator** từ [Phần 5](/blog/ts-challenges-05-recursion-over-tuples/) — mang tiến trình trong tham số type để compiler tối ưu đệ quy.
+
+### Tránh số học đơn nguyên lớn
+
+Mẹo đếm tuple từ [Phần 8](/blog/ts-challenges-08-type-level-arithmetic/) (`Add<500, 500>` dựng tuple 1000 phần tử) để **học**, không phải production. Mỗi số là tuple compiler phải mở rộng và so sánh hết. Nếu cần type số ở quy mô lớn, dùng mẹo template literal hoặc dừng ở tầng type và dùng số runtime.
+
+### Để ý distribution trên union lớn
+
+Khi input của conditional type là union, TypeScript **phân phối** — chạy conditional một lần mỗi thành viên ([Phần 3](/blog/ts-challenges-03-conditional-distribution/)). `Paths<{ a: A | B | C | … }>` trên union 100 thành viên làm gấp 100 lần việc mapped type. Bọc `[T]` khi cần xử lý union như một khối: `[T] extends [object] ? … : never`.
+
+### Ưu tiên built-in trong production
+
+`Pick`, `Omit`, `Exclude`, `Awaited`, `ReturnType` cài trong native compiler và resolve nhanh hơn bản tự viết. Viết lại để **học** cách hoạt động; import từ TypeScript để **ship**. Cùng quy tắc cho `satisfies` (TS 4.9+) thay mẹo widening thủ công khi validate hình object.
+
+#### Tóm tắt một dòng
+
+Coi compiler như runtime: **tôn trọng độ sâu đệ quy**, **tránh công việc union theo cấp số nhân**, và **dùng built-in** khi type đã dạy xong bạn.
+
+---
+
+## Cheat sheet — mọi mẫu, một trang
+
+Capstone dùng sáu mẫu này trong ba type. Cả series có ~20 — đây là bản đồ **mẫu → cú pháp → nơi bạn học**. In ra, ghim lên.
+
+| Mẫu | Trông như | Part | Dùng trong capstone |
+|---|---|---|---|
+| Mapped type | `{ [K in keyof T]: T[K] }` | 2 | `Paths` iterates keys |
+| Modifier add/remove | `readonly` / `?` / `-readonly` / `-?` | 2 | — |
+| Key remap / filter | `[K in keyof T as ...]` | 2, 9 | Filter `keyof T & (string \| number)` |
+| Conditional | `A extends B ? X : Y` | 3 | `T extends object ? …` guard |
+| Disable distribution | `[A] extends [B]` | 3 | — |
+| Detect `never` | `[T] extends [never]` | 3 | — |
+| `infer` capture | `T extends Promise<infer V> ? V : ...` | 4 | `infer Head`, `infer Rest` in `Get` |
+| Constrained `infer` | `` `${infer N extends number}` `` | 4 | — |
+| Tuple peel | `[infer H, ...infer R]` / `[...infer R, infer L]` | 4, 5 | — |
+| Tuple recursion | `T extends [infer H, ...infer R] ? ... : base` | 5 | Same shape as `Get` recursion |
+| Tail recursion | carry an `Acc extends any[] = []` | 5, 8 | For deep inputs, not `Paths` |
+| Distribute a union | `U extends any ? f<U> : never` | 6 | Paths into union-typed fields |
+| Union → last/tuple | `UnionToIntersection` + `infer` | 6 | — |
+| Template split | `` `${infer H}${sep}${infer T}` `` | 7 | `Get` splits on `.` |
+| String wildcard | `` `${U}${string}` `` | 7 | Filter paths: `` `address.${string}` `` |
+| Count via length | tuple `['length']` | 1, 7, 8 | — |
+| Add / Subtract | concat / pattern-match tuples | 8 | — |
+| Filter keys → union | `{ [K in keyof T]: ... }[keyof T]` | 9 | `Paths` union collection |
+| Detect optional key | `{} extends Pick<T, K>` | 9 | — |
+| State in a type param | `Chainable<T = {}>` | 9 | — |
+| Strict equality | the `Equal` gadget | 3, 5, 11 | Debug harness |
+
+Khi kẹt ở challenge mới, quét bảng: xác định **cột** bài toán thuộc về, rồi lấy cú pháp của hàng đó. Challenge cực khó (Phần 11) hiếm khi là hàng mới — thường là hai ba hàng ghép lại.
+
+#### Tóm tắt một dòng
+
+~20 mẫu, một trang — cả repo type-challenges là remix của bảng này.
+
+---
+
+## Cách tiếp tục giỏi lên
+
+Giải challenge xây nhận dạng mẫu; **các thói quen này** biến mẫu thành kỹ năng production:
+
+### 1. Đọc test case trước
+
+Type-challenges có tuple `cases` và điều kiện biên trong mô tả issue. Trước khi viết một dòng type, đọc output mong đợi cho input rỗng, `never`, union, readonly, và key optional. Test **là** spec — type sai nếu ca nào fail, dù "cảm giác đúng" trên một ví dụ.
+
+### 2. Giải xong, đọc lời giải người khác
+
+Thảo luận GitHub trong repo có lời giải ngắn hơn, khéo hơn, hoặc hiệu năng hơn. Sau khi lời giải của bạn pass, đọc ít nhất hai lời khác — bạn sẽ gặp idiom (như mẹo union `[keyof T]`) mà một mình khó nghĩ ra.
+
+### 3. Hover không ngừng trong Playground
+
+Dán type vào [TS Playground](https://www.typescriptlang.org/play), đổi từng phần một, và xem panel hover. Đây là cách nhanh nhất để có trực giác **khi nào** distribution chạy, **đệ quy** mở ra thế nào, và `infer` **bắt** gì.
+
+### 4. Học mẫu từ thư viện thật
+
+Mở `.d.ts` của [type-fest](https://github.com/sindresorhus/type-fest), [Zod](https://github.com/colinhacks/zod), hoặc [tRPC](https://trpc.io/) và tìm `infer`, mapped type, template literal. Type production lộn xộn hơn challenge nhưng cho thấy **ghép ở quy mô lớn** — utility kiểu `Paths` có trong `dot-path-value`, `Prisma.validator`, và thư viện form khắp nơi.
+
+### 5. Dựng gì đó
+
+Challenge là câu đố cô lập; **ship utility gõ type** (event emitter, query builder, path getter) buộc bạn xử lý suy luận tại chỗ gọi, edge case, và DX. Capstone `get()` là mẫu: một hàm thật, ba type ghép, test lúc biên dịch. Chọn công cụ tiếp theo bạn muốn type tốt hơn và dựng nó.
+
+#### Tóm tắt một dòng
+
+Test định nghĩa spec, bạn bè mài idiom, Playground xây trực giác, `.d.ts` production cho thấy quy mô, và ship khắc sâu kỹ năng.
+
+---
+
+## Bài tập
+
+**1.** Mở rộng capstone với `getOr(obj, path, fallback)` có type trả về `Get<T, P> | typeof fallback`.
+
+<details>
+<summary>Lời giải</summary>
+
+```ts
+function getOr<T extends object, P extends Paths<T>, F>(
+  obj: T,
+  path: P,
+  fallback: F,
+): Get<T, P> | F {
+  const value = get(obj, path);
+  return (value ?? fallback) as Get<T, P> | F;
+}
+```
+
+Thêm tham số type thứ ba `F` cho fallback và mở rộng return thành union của cả hai. Tại chỗ gọi, `getOr(user, 'address.geo.lat', 0)` suy ra `F = 0` (literal) hoặc `F = number` tùy cách truyền fallback — dùng `as const` trên fallback literal để type hẹp hơn.
+
+```ts
+// step 1: T = typeof user, P = 'address.geo.lat', F = 0
+// step 2: return type = Get<typeof user, 'address.geo.lat'> | 0 → number | 0
+```
+
+</details>
+
+**2.** `Paths<T>` cũng sinh đường dẫn vào mảng qua key số. Một lưu ý khi dùng nó trên type chứa mảng là gì, và làm sao phòng?
+
+<details>
+<summary>Lời giải</summary>
+
+Mảng là object, nên `Paths` sẽ đi vào — phát đường dẫn qua `length`, method mảng (`push`, `map`, …), và chỉ số số, hiếm khi là điều bạn muốn cho config getter.
+
+```ts
+type Paths<T> = T extends readonly any[]
+  ? never  // stop at arrays entirely
+  : T extends object
+    ? { /* … same as before … */ }[keyof T & (string | number)]
+    : never;
+```
+
+Hoặc nếu muốn truy cập index nhưng không method: coi mảng là lá và chỉ phát `` `${K}.${number}` `` cho value kiểu mảng.
+
+</details>
+
+Nâng cao:dựng phía ghi — `set(obj, path, value)` gõ type với `value` ràng buộc bằng `Get<T, P>` — hoàn thiện một lens nhỏ, gõ type đầy đủ.
+
+---
+
+## Điểm chính
+
+- Utility thật (đường dẫn gợi ý, type trả về chính xác) dựng từ **cùng các mẫu** với challenge — `Paths` = mapped + template + đệ quy + unionize; `Get` = tách + đệ quy + indexed access; `get()` = keo suy luận generic.
+- Debug bằng **`Prettify`**, **alias trung gian**, bộ **`Expect`/`Equal`** và **`@ts-expect-error`** — test lúc biên dịch cho cả ca dương và âm.
+- Tôn trọng giới hạn: **đệ quy đuôi** cho độ sâu, tránh toán đơn nguyên nặng, để ý **distribution**, và ưu tiên **built-in** trong production.
+- ~20 mẫu (cheat sheet) bao trùm cả repo type-challenges — challenge cực khó chỉ là mẹo quen xếp chồng.
+
+---
+
+## Kết thúc — và khởi đầu
+
+Bạn bắt đầu series này khi còn đọc utility type như chữ tượng hình. Giờ bạn đọc, viết, và **debug** được chúng — và quan trọng hơn, biết dùng lập trình tầng type ở nơi nó thật sự cải thiện một API. Capstone `get()` là bằng chứng: không phải đồ chơi, mà cùng cỗ máy đằng sau query gõ type của Prisma và output suy ra của Zod. Hãy đi giải nốt [repo type-challenges](https://github.com/type-challenges/type-challenges), rồi mang các mẹo này về codebase của bạn.
+
+Cảm ơn bạn đã đi hết mười hai phần. Quay lại [Phần 1](/blog/typescript-type-challenges-explained/) bất cứ khi nào cần ôn năm khối nền tảng.
+
+Nguồn & bộ đầy đủ:

@@ -1,0 +1,170 @@
+---
+title: 'Node.js Super Senior · Phase 16 — Message Queues & Background Jobs'
+description: 'Bonus Phase 16: đẩy việc nặng ra khỏi request. Vì sao cần hàng đợi, BullMQ trên Redis (job, worker, retry, backoff, scheduling), at-least-once và idempotency, dead-letter queue, và khi nào nâng cấp lên RabbitMQ hay Kafka.'
+pubDate: 2026-06-22
+tags: [nodejs, queue, bullmq, redis, node_10]
+series: nodejs
+seriesOrder: 16
+draft: false
+---
+
+Đây là **Bonus Phase 16**, mở một nhánh mới: vận hành ở quy mô thật. Suốt 15 phase trước, mọi việc xảy ra *bên trong* vòng đời request. Nhưng gửi email, resize ảnh, gọi API bên thứ ba, sinh báo cáo — những việc này **không nên** bắt người dùng chờ, và càng không nên làm sập request khi chúng lỗi. Lời giải của senior là **đẩy việc ra hàng đợi (queue)** và xử lý nền bằng **worker**.
+
+---
+
+## Vì sao cần hàng đợi
+
+Làm việc nặng ngay trong handler có ba vấn đề: người dùng chờ lâu, một lỗi tạm thời (API bên thứ ba sập) làm hỏng cả request, và bạn không thể giới hạn tốc độ (gửi 10.000 email sẽ bão hòa SMTP).
+
+```text
+KHÔNG queue:  POST /signup ─▶ tạo user ─▶ gửi email (chờ SMTP...) ─▶ 200  (chậm, dễ vỡ)
+
+CÓ queue:     POST /signup ─▶ tạo user ─▶ enqueue("welcome-email") ─▶ 200  (nhanh)
+                                                    │
+                            Worker  ◀───────────────┘  xử lý nền, retry nếu lỗi
+```
+
+Hàng đợi tách **nhận việc** khỏi **làm việc**: producer chỉ bỏ job vào hàng đợi rồi trả lời ngay; một hoặc nhiều worker tiêu thụ job độc lập. Đây là kiến trúc bất đồng bộ Phase 10, áp vào lớp tác vụ nền.
+
+---
+
+## BullMQ trên Redis
+
+Bạn đã có Redis từ Phase 13. **BullMQ** là thư viện queue chuẩn cho Node, dùng Redis làm backend — đủ mạnh cho phần lớn app, ít hạ tầng hơn hẳn một message broker riêng.
+
+```bash
+npm install bullmq
+```
+
+### Producer — bỏ job vào hàng đợi
+
+```ts
+import { Queue } from 'bullmq';
+
+const connection = { host: '127.0.0.1', port: 6379 };
+export const emailQueue = new Queue('email', { connection });
+
+// trong handler /signup — trả response ngay, không chờ
+await emailQueue.add(
+  'welcome',                          // tên job
+  { to: user.email, name: user.name }, // payload
+  { attempts: 5, backoff: { type: 'exponential', delay: 1000 } }
+);
+```
+
+### Worker — tiêu thụ job
+
+Worker thường chạy ở **process riêng** (deploy độc lập, scale riêng — Phase 7):
+
+```ts
+import { Worker } from 'bullmq';
+
+const worker = new Worker(
+  'email',
+  async (job) => {
+    const { to, name } = job.data;
+    await sendEmail(to, `Chào ${name}!`); // có thể throw → BullMQ tự retry
+  },
+  { connection, concurrency: 5 } // xử lý 5 job song song mỗi worker
+);
+
+worker.on('completed', (job) => console.log(`done ${job.id}`));
+worker.on('failed', (job, err) => console.error(`fail ${job?.id}`, err.message));
+```
+
+`concurrency` + nhiều instance worker = throughput điều chỉnh được, mà không đụng gì tới web server.
+
+---
+
+## Retry, backoff & job theo lịch
+
+Sức mạnh thật của queue nằm ở chính sách thử lại. Một job throw sẽ được **retry tự động** theo `attempts` và `backoff`:
+
+```ts
+await queue.add('charge', data, {
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 2000 }, // 2s, 4s, 8s, 16s...
+});
+```
+
+Exponential backoff tránh dội bom một dịch vụ đang chập chờn. BullMQ còn hỗ trợ:
+
+```ts
+// trễ: chạy sau 1 giờ
+await queue.add('reminder', data, { delay: 60 * 60 * 1000 });
+
+// lặp theo lịch (cron) — báo cáo hằng đêm
+await queue.add('nightly-report', {}, { repeat: { pattern: '0 2 * * *' } });
+```
+
+`delay` và `repeat` thay thế việc tự viết cron rời rạc — lịch chạy nằm cùng hệ thống job, có retry và quan sát được.
+
+---
+
+## At-least-once & idempotency
+
+Đây là tư duy phân biệt junior với senior. Phần lớn queue (BullMQ gồm) đảm bảo **at-least-once**: một job có thể chạy **nhiều hơn một lần** (worker chết sau khi làm xong nhưng trước khi ack, retry sau lỗi mạng tạm…). Vì vậy job phải **idempotent** — chạy lại không gây hại.
+
+```ts
+// ✗ NGUY HIỂM — retry sẽ tính tiền khách hai lần
+await chargeCard(order.amount);
+
+// ✓ AN TOÀN — khóa theo id duy nhất, lần chạy thứ hai là no-op
+const key = `charge:${order.id}`;
+if (await redis.set(key, '1', 'NX', 'EX', 86400)) {
+  await chargeCard(order.amount);
+}
+```
+
+Quy tắc: thiết kế job sao cho **kết quả không đổi dù chạy 1 hay N lần**. Dùng khóa idempotency, `INSERT ... ON CONFLICT DO NOTHING`, hoặc kiểm tra trạng thái trước khi hành động.
+
+---
+
+## Dead-letter & job hỏng
+
+Job vượt quá `attempts` chuyển sang trạng thái **failed** và được giữ lại để bạn điều tra — đó là "dead-letter" của BullMQ. Đừng để mất chúng âm thầm:
+
+```ts
+// dọn job thành công nhưng GIỮ job failed để điều tra
+await queue.add('task', data, {
+  removeOnComplete: { age: 3600, count: 1000 },
+  removeOnFail: false, // giữ lại để truy vết và replay thủ công
+});
+```
+
+Production cần một **dashboard** để xem hàng đợi, replay job failed, và cảnh báo khi tồn đọng. `bull-board` cắm vào Express trong vài dòng và đáng giá.
+
+---
+
+## BullMQ vs RabbitMQ vs Kafka — chọn đúng
+
+| | BullMQ (Redis) | RabbitMQ | Kafka |
+|---|---|---|---|
+| Mô hình | job queue | message broker (AMQP) | log phân tán, append-only |
+| Hợp cho | tác vụ nền, scheduling | routing phức tạp, RPC, fan-out | event streaming, throughput cực lớn, replay |
+| Thứ tự | theo từng queue | theo queue | theo partition |
+| Lưu trữ | tạm (Redis) | tới khi ack | giữ lâu, đọc lại được |
+| Hạ tầng | đã có Redis | thêm broker | thêm cụm + vận hành nặng |
+
+Quan điểm senior: **bắt đầu bằng BullMQ** — nó giải quyết 90% nhu cầu "việc nền" với hạ tầng bạn đã có. Lên **RabbitMQ** khi cần routing/topology phức tạp giữa nhiều service. Lên **Kafka** khi bạn làm event streaming thật sự — nhiều consumer cùng đọc lại lịch sử sự kiện ở throughput rất cao. Đừng kéo Kafka vào chỉ để gửi email.
+
+---
+
+## Thực hành
+
+Mở rộng capstone Phase 10 với một lớp tác vụ nền:
+
+1. Tạo `emailQueue`; chuyển email chào mừng ở `/signup` sang enqueue, trả `201` ngay.
+2. Worker process riêng, `concurrency: 5`, retry 5 lần với exponential backoff.
+3. Làm job idempotent bằng khóa Redis `welcome:<userId>`.
+4. Thêm job lặp `repeat` sinh báo cáo hằng đêm lúc 2h sáng.
+5. Giữ `removeOnFail: false`, gắn `bull-board`, và cảnh báo khi hàng đợi tồn đọng > N.
+6. Đóng gói worker thành image Docker riêng, deploy độc lập với web (Phase 7).
+
+---
+
+## Phần tiếp theo
+
+Bạn vừa tách *khi nào nhận việc* khỏi *khi nào làm việc* — nền tảng để app chịu tải và chịu lỗi. Để ý lại mạch xuyên suốt: queue tái dùng Redis (Phase 13), chạy như service độc lập (Phase 7), và là biểu hiện cụ thể của kiến trúc bất đồng bộ (Phase 10).
+
+Ở **Phase 17**, ta đổi sang tầng API: **GraphQL** — schema và type system, resolver, vấn đề N+1 và DataLoader, mutation và subscription, rồi khi nào GraphQL thắng REST và khi nào không.

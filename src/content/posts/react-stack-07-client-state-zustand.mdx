@@ -1,0 +1,234 @@
+---
+title: 'Build a Real React App · Part 7 — Client State with Zustand'
+description: 'Not everything belongs in TanStack Query. Learn the server-vs-client-state boundary, then model UI state with Zustand: a typed store, selectors to avoid re-renders, the slices pattern, persist middleware, and when NOT to use a global store.'
+pubDate: 2026-07-15
+tags: [react, zustand, state-management, react_stack_12]
+series: react-stack
+seriesOrder: 7
+draft: true
+---
+
+TanStack Query lo *server* state. Nhưng vài state không bao giờ chạm server: cờ mở/đóng sidebar, theme đang dùng, bước hiện tại của wizard, hiện/ẩn command palette. Đó là **client state**, và Zustand là cách nhỏ, nhanh, không áp đặt để quản lý.
+
+Ý quan trọng nhất phần này: **đa số vấn đề "global state" thực ra là vấn đề server-state trá hình**. Lấy đúng ranh giới thì store toàn cục của bạn giữ nhỏ xíu.
+
+---
+
+## 1. Ranh giới server-vs-client-state
+
+Hỏi một câu: **dữ liệu này có sống trên server và đổi mà không cần tôi không?**
+
+| If… | It's… | Tool |
+|-----|-------|------|
+| It's fetched from / saved to an API | **Server state** | TanStack Query |
+| It's purely UI / device / session local | **Client state** | Zustand (or `useState`) |
+
+Danh sách customer? Server state — *đừng bao giờ* nhân bản vào Zustand. Cờ "dialog tạo đang mở?" Client state. Đặt dữ liệu server vào store client là nguyên nhân số 1 của UI cũ và logic cache trùng lặp.
+
+### Tóm tắt một dòng
+
+Nếu từ API là server state (Query); nếu UI/session-local là client state (Zustand) — đừng bao giờ nhân đôi dữ liệu server vào store client.
+
+---
+
+## 2. Một store Zustand có type
+
+*Docs: [zustand](https://zustand.docs.pmnd.rs/).*
+
+```bash
+pnpm add zustand
+```
+
+Type state và action cùng nhau, rồi tạo store:
+
+```ts
+// src/features/ui/ui-store.ts
+import { create } from 'zustand';
+
+interface UiState {
+  sidebarOpen: boolean;
+  commandOpen: boolean;
+  toggleSidebar: () => void;
+  setCommandOpen: (open: boolean) => void;
+}
+
+export const useUiStore = create<UiState>((set) => ({
+  sidebarOpen: true,
+  commandOpen: false,
+  toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
+  setCommandOpen: (open) => set({ commandOpen: open }),
+}));
+```
+
+Không provider, không boilerplate context — store là một hook import bất kỳ đâu. Action sống *trong* store, đặt cạnh state nó đổi.
+
+### Tóm tắt một dòng
+
+`create<State>()` tạo store không-provider, type đầy đủ, action nằm cạnh state.
+
+---
+
+## 3. Selector — kỷ luật re-render
+
+Đây là phần đa số làm sai. Đọc cả store khiến component subscribe **mọi** thay đổi:
+
+```tsx
+// ❌ re-renders on ANY store change, even unrelated ones
+const store = useUiStore();
+
+// ✅ subscribes ONLY to sidebarOpen — re-renders only when it changes
+const sidebarOpen = useUiStore((s) => s.sidebarOpen);
+const toggleSidebar = useUiStore((s) => s.toggleSidebar);
+```
+
+Luôn chọn **lát hẹp nhất** bạn cần. Chọn primitive riêng lẻ an toàn nhất vì so sánh mặc định là tham chiếu. Nếu phải chọn nhiều giá trị vào một object, dùng `useShallow` để object mới cùng nội dung không gây re-render:
+
+```tsx
+import { useShallow } from 'zustand/react/shallow';
+
+const { sidebarOpen, commandOpen } = useUiStore(
+  useShallow((s) => ({ sidebarOpen: s.sidebarOpen, commandOpen: s.commandOpen })),
+);
+```
+
+Đây là cùng nguyên tắc re-render từ các phần Query: **subscribe đúng thứ bạn render, không hơn**.
+
+### Tóm tắt một dòng
+
+Chọn lát hẹp nhất (lý tưởng là primitive); với object dùng `useShallow` để tránh re-render từ object mới-nhưng-bằng.
+
+---
+
+## 4. Mẫu slices
+
+Khi store lớn, tách thành slice có type và ghép lại — giữ một store nhưng tổ chức theo mối quan tâm:
+
+```ts
+// src/features/ui/slices.ts
+import { type StateCreator } from 'zustand';
+
+export interface SidebarSlice {
+  sidebarOpen: boolean;
+  toggleSidebar: () => void;
+}
+
+export const createSidebarSlice: StateCreator<SidebarSlice> = (set) => ({
+  sidebarOpen: true,
+  toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
+});
+```
+
+```ts
+// src/features/ui/ui-store.ts
+import { create } from 'zustand';
+import { createSidebarSlice, type SidebarSlice } from './slices';
+import { createCommandSlice, type CommandSlice } from './command-slice';
+
+export const useUiStore = create<SidebarSlice & CommandSlice>((...a) => ({
+  ...createSidebarSlice(...a),
+  ...createCommandSlice(...a),
+}));
+```
+
+Mỗi slice type độc lập và test được; type gộp chỉ là giao.
+
+### Tóm tắt một dòng
+
+Tách store lớn thành slice `StateCreator` có type và ghép bằng type giao — một store, tổ chức theo mối quan tâm.
+
+---
+
+## 5. Middleware persist
+
+*Docs: [persist middleware](https://zustand.docs.pmnd.rs/integrations/persisting-store-data).*
+
+Vài client state nên sống qua reload (theme, sidebar). Bọc store trong `persist` và dùng `partialize` để lưu **chỉ** thứ nên giữ:
+
+```ts
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+
+export const useUiStore = create<UiState>()(
+  persist(
+    (set) => ({
+      sidebarOpen: true,
+      commandOpen: false,
+      toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
+      setCommandOpen: (open) => set({ commandOpen: open }),
+    }),
+    {
+      name: 'pulse-ui',
+      // persist only durable prefs — NOT transient flags like commandOpen
+      partialize: (s) => ({ sidebarOpen: s.sidebarOpen }),
+    },
+  ),
+);
+```
+
+`partialize` quan trọng: lưu cờ tạm (trạng thái mở dialog) khiến app reload vào UI nửa-mở kỳ lạ.
+
+### Tóm tắt một dòng
+
+Bọc store trong `persist` và `partialize` chỉ pref bền — đừng bao giờ lưu cờ UI tạm.
+
+---
+
+## 6. Khi nào KHÔNG dùng store toàn cục
+
+Dùng công cụ đơn giản nhất phù hợp:
+
+- **Dữ liệu server** → TanStack Query, không Zustand.
+- **Chỉ một component (và có thể con) cần** → `useState` + props, hoặc nâng state lên.
+- **State chia sẻ qua URL** (filter, trang, tìm kiếm) → URL (Phần 8), không store.
+- **State form** → react-hook-form (Phần 6).
+
+Zustand cho state thực sự *toàn cục, chỉ-client, không-URL* — mà làm đúng thì là tập nhỏ.
+
+### Tóm tắt một dòng
+
+Chỉ dùng Zustand cho state toàn cục, chỉ-client, không-URL; còn lại ưu tiên Query, `useState`, URL, hay react-hook-form.
+
+---
+
+## 7. Bài tập
+
+**1.** Mỗi thứ nên ở đâu: (a) danh sách customer, (b) filter bảng đang dùng, (c) cờ thu gọn sidebar, (d) giá trị form tạo?
+
+<details>
+<summary>Lời giải</summary>
+
+(a) TanStack Query; (b) URL; (c) Zustand + persist; (d) react-hook-form.
+</details>
+
+**2.** Vì sao `const s = useUiStore()` là bug hiệu năng?
+
+<details>
+<summary>Lời giải</summary>
+
+Nó subscribe component vào *toàn bộ* store, nên đổi field nào cũng re-render — kể cả field không dùng. Chọn lát hẹp nhất để chỉ re-render khi giá trị đó đổi.
+</details>
+
+**3.** Vì sao dùng `partialize` với middleware `persist`?
+
+<details>
+<summary>Lời giải</summary>
+
+Để chỉ lưu pref bền (theme, sidebar) và loại cờ tạm (dialog mở, command palette). Không có nó, reload khôi phục UI tạm vào trạng thái nửa-mở không nhất quán.
+</details>
+
+Nâng cao:nối `useUiStore((s) => s.sidebarOpen)` vào `AppShell` Phần 2 để sidebar thu gọn khi toggle và pref giữ qua reload.
+
+---
+
+## Điểm chính
+
+- Đa số "global state" là server state — giữ trong Query; Zustand cho state *chỉ-client*.
+- Store Zustand là hook có type không-provider; đặt action cạnh state.
+- **Chọn lát hẹp nhất** (dùng `useShallow` cho object) để tránh re-render thừa.
+- Scale bằng **mẫu slices**; lưu chỉ pref bền qua `partialize`.
+
+---
+
+## Tiếp theo
+
+**Phần 8 — Bảng dữ liệu với URL state**: dựng feature chủ lực — bảng customer sắp xếp, lọc, phân trang bằng TanStack Table, nơi state filter/sort/trang sống trong **URL**, nuôi Query key, và giữ chia sẻ được và an toàn reload.

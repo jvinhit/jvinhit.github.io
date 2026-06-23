@@ -1,0 +1,177 @@
+---
+title: 'Algorithms in Frontend · Part 7 — Memoization & LRU Cache'
+description: 'Remember results so you do not recompute: write a general memoize, understand what useMemo/useCallback/React.memo really are, and build an O(1) LRU cache with Map so cache memory does not grow forever.'
+pubDate: 2026-07-13
+tags: [algorithms, memoization, cache, react, fe_algorithms_12]
+series: fe-algorithms
+seriesOrder: 7
+draft: true
+---
+
+Cách nhanh nhất để làm một việc là **không làm lại nó**. Memoization là kỹ thuật ghi nhớ kết quả của một phép tính theo đầu vào, để lần sau gặp đúng đầu vào đó thì trả ngay kết quả đã lưu. Nó đánh đổi **bộ nhớ lấy tốc độ** — và frontend dùng nó ở khắp nơi, từ `useMemo` tới cache ảnh.
+
+Nhưng cache vô hạn là rò rỉ bộ nhớ. Phần này còn dạy bạn xây một **LRU cache** giới hạn kích thước, với mọi thao tác `O(1)`.
+
+---
+
+## 1. Memoize tổng quát
+
+Ý tưởng: bọc một hàm thuần (pure — cùng input luôn cho cùng output) bằng một cache `Map<key, kết quả>`.
+
+```ts
+function memoize<A extends unknown[], R>(
+  fn: (...args: A) => R,
+  keyOf: (...args: A) => string = (...a) => JSON.stringify(a),
+): (...args: A) => R {
+  const cache = new Map<string, R>();
+  return (...args: A): R => {
+    const key = keyOf(...args);
+    const hit = cache.get(key);
+    if (hit !== undefined || cache.has(key)) return hit as R; // has() to cache undefined values too
+    const result = fn(...args);
+    cache.set(key, result);
+    return result;
+  };
+}
+```
+
+```ts
+const slowFib = (n: number): number => (n < 2 ? n : slowFib(n - 1) + slowFib(n - 2));
+const fib = memoize(slowFib); // note: to memoize recursion, the function must call its memoized self
+```
+
+Hai cảnh báo quan trọng:
+
+1. **Chỉ memoize hàm thuần.** Nếu hàm phụ thuộc biến ngoài, thời gian, hay random, cache sẽ trả kết quả sai.
+2. **Hàm sinh key quyết định tất cả.** `JSON.stringify` tiện nhưng chậm và không xử lý được object có thứ tự khóa khác nhau hay `undefined`. Với input đơn giản (số, chuỗi), dùng chính chúng làm key sẽ nhanh hơn nhiều.
+
+---
+
+## 2. `useMemo`, `useCallback`, `React.memo` thực chất là gì
+
+Ba API React này đều là memoization, nhưng nhớ những thứ khác nhau:
+
+| API | Nhớ cái gì | Khi nào tính lại |
+|-----|-----------|------------------|
+| `useMemo` | **giá trị** tính được | khi mảng dependency đổi |
+| `useCallback` | **identity của hàm** | khi mảng dependency đổi |
+| `React.memo` | **kết quả render** của component | khi props (so nông) đổi |
+
+Điểm mấu chốt: React so dependency và props bằng **so sánh nông (`Object.is`)**. Vì vậy truyền object/array/hàm tạo mới mỗi render sẽ phá memoization:
+
+```tsx
+// ❌ style and onClick are NEW every render → Child's React.memo is useless
+function Parent() {
+  return <Child style={{ color: 'red' }} onClick={() => doThing()} />;
+}
+
+// ✅ stable identity → Child only re-renders when needed
+const STYLE = { color: 'red' }; // constant outside component
+function Parent() {
+  const onClick = useCallback(() => doThing(), []);
+  return <Child style={STYLE} onClick={onClick} />;
+}
+```
+
+> Đừng memoize bừa. Mỗi `useMemo`/`useCallback` cũng tốn bộ nhớ và một phép so dependency. Chỉ dùng khi (a) phép tính thật sự nặng, hoặc (b) cần giữ identity ổn định để chặn re-render con. React Compiler (React 19+) đang dần tự động hóa việc này — nhưng hiểu nguyên lý vẫn cần để debug.
+
+---
+
+## 3. Vấn đề của cache không giới hạn
+
+`memoize` ở mục 1 không bao giờ xóa gì. Cache một hàm nhận nhiều input khác nhau (ví dụ thumbnail theo URL) sẽ phình mãi tới khi tab hết RAM. Ta cần một chính sách **trục xuất (eviction)**: khi cache đầy, bỏ phần tử nào?
+
+Chính sách phổ biến và hiệu quả nhất ở frontend là **LRU (Least Recently Used)** — bỏ phần tử *lâu nhất chưa được dùng*, vì dữ liệu mới truy cập thường sẽ được truy cập lại (locality).
+
+---
+
+## 4. LRU cache `O(1)` bằng `Map`
+
+Mẹo ít người biết: **`Map` của JavaScript giữ nguyên thứ tự chèn**. Ta tận dụng điều đó — phần tử mới dùng nhất luôn được đẩy về cuối, nên phần tử *đầu tiên* (`map.keys().next().value`) chính là phần tử cũ nhất cần trục xuất. Mọi thao tác `O(1)`.
+
+```ts
+class LRUCache<K, V> {
+  private cache = new Map<K, V>();
+
+  constructor(private capacity: number) {}
+
+  get(key: K): V | undefined {
+    if (!this.cache.has(key)) return undefined;
+    const value = this.cache.get(key)!;
+    // "touch" → delete then set again to push to end (most recently used)
+    this.cache.delete(key);
+    this.cache.set(key, value);
+    return value;
+  }
+
+  set(key: K, value: V): void {
+    if (this.cache.has(key)) this.cache.delete(key); // update also pushes to end
+    else if (this.cache.size >= this.capacity) {
+      // evict oldest entry = first key in Map
+      const oldest = this.cache.keys().next().value;
+      if (oldest !== undefined) this.cache.delete(oldest);
+    }
+    this.cache.set(key, value);
+  }
+
+  has(key: K): boolean {
+    return this.cache.has(key);
+  }
+}
+```
+
+```ts
+const thumbnails = new LRUCache<string, Blob>(100); // keep at most 100 thumbnails
+function getThumb(url: string): Promise<Blob> {
+  const cached = thumbnails.get(url);
+  if (cached) return Promise.resolve(cached);
+  return fetchThumb(url).then((blob) => {
+    thumbnails.set(url, blob);
+    return blob;
+  });
+}
+```
+
+> Sách giáo khoa thường implement LRU bằng *doubly linked list + hash map*. Bản dùng `Map` ở trên cho cùng độ phức tạp `O(1)` nhưng ngắn gọn hơn nhiều, nhờ đặc tính giữ thứ tự chèn của `Map`. Đây là một ví dụ đẹp về "chọn đúng cấu trúc dữ liệu có sẵn của ngôn ngữ".
+
+---
+
+## 5. Memoize bất biến với `WeakMap` (cache theo object)
+
+Khi key là **object** (ví dụ cache kết quả tính từ một mảng dữ liệu), dùng `WeakMap`: nó cho phép key bị thu gom rác khi không còn ai tham chiếu, nên **không rò rỉ bộ nhớ**.
+
+```ts
+const selectorCache = new WeakMap<object, ProcessedData>();
+
+function processOnce(data: RawData[]): ProcessedData {
+  // data is the same reference (e.g. from store) → return cache, don't recompute
+  const cached = selectorCache.get(data);
+  if (cached) return cached;
+  const result = expensiveTransform(data);
+  selectorCache.set(data, result);
+  return result;
+}
+```
+
+Đây chính là ý tưởng nền của thư viện selector như `reselect`: cache theo reference đầu vào, và vì state Redux là bất biến (đổi reference khi đổi dữ liệu), cache tự đúng. Liên hệ trực tiếp với "cập nhật bất biến" ở Phần 6.
+
+---
+
+## 6. Khi nào nên cache
+
+Cache không miễn phí: tốn bộ nhớ, và sai lầm phổ biến nhất là **trả dữ liệu cũ** (stale). Checklist:
+
+- Phép tính có **đắt** không, và có **lặp lại cùng input** không? Nếu không, đừng cache.
+- Kết quả có **bất biến theo input** không (hàm thuần)? Nếu phụ thuộc thời gian/quyền/dữ liệu ngoài, cần cơ chế làm mới (TTL, invalidation).
+- Cache có **bị giới hạn** không? Dùng LRU/`WeakMap` để không phình vô hạn.
+
+---
+
+## Tóm tắt
+
+- **Memoization** đổi bộ nhớ lấy tốc độ; chỉ dùng cho **hàm thuần** và chú ý hàm sinh key.
+- `useMemo`/`useCallback`/`React.memo` là memoization với **so sánh nông** — truyền object/hàm mới mỗi render sẽ phá nó.
+- Cache vô hạn = rò rỉ bộ nhớ. **LRU cache** giới hạn kích thước; tận dụng `Map` giữ thứ tự chèn để đạt `O(1)`.
+- Cache theo object dùng `WeakMap` để tự thu gom rác — nền tảng của selector kiểu `reselect`.
+
+**Phần tiếp theo:** Scheduling & priority queue — chia nhỏ việc nặng để không chặn UI, và xử lý theo độ ưu tiên.

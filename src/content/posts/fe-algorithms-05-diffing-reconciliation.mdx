@@ -1,0 +1,192 @@
+---
+title: 'Algorithms in Frontend · Part 5 — Diffing & Reconciliation (Virtual DOM)'
+description: 'Why comparing two trees is O(n³), and which heuristics bring React/Vue down to O(n). Write a simple diff from scratch, understand keys at the root, and learn patterns that break reconciliation.'
+pubDate: 2026-07-09
+tags: [algorithms, react, virtual-dom, reconciliation, fe_algorithms_12]
+series: fe-algorithms
+seriesOrder: 5
+draft: true
+---
+
+Khi state đổi, React tạo ra một cây phần tử mới và cần biến DOM hiện tại thành DOM mới với **số thao tác ít nhất** — vì đụng vào DOM là việc đắt nhất ở frontend. Bài toán này gọi là **reconciliation** (hòa giải), và lõi của nó là một thuật toán **diff hai cây**.
+
+Hiểu thuật toán này không phải để "tự viết React", mà để giải thích những thứ bạn gặp hằng ngày: vì sao cần `key`, vì sao đổi `key` lại reset state, vì sao đôi khi ô input giữ nhầm giá trị sau khi sắp xếp lại danh sách.
+
+---
+
+## 1. Vì sao diff cây "đúng tuyệt đối" là quá đắt
+
+So sánh hai cây bất kỳ để tìm tập biến đổi tối thiểu (tree edit distance) có độ phức tạp **`O(n³)`** với `n` là số node. Với một trang có vài nghìn node, `n³` là hàng tỷ phép tính — bất khả thi cho mỗi lần state đổi (phải xong trong 16ms).
+
+React, Vue và mọi thư viện Virtual DOM khác **không** giải bài toán tối ưu này. Thay vào đó chúng dùng **heuristic** (luật kinh nghiệm) để rút xuống `O(n)`, đánh đổi "tối ưu tuyệt đối" lấy "đủ tốt và rất nhanh". Có hai giả định lớn:
+
+1. **Hai phần tử khác kiểu (type) tạo ra hai cây khác hẳn.** `<div>` đổi thành `<span>` → không cố diff con, hủy cả nhánh cũ và dựng nhánh mới.
+2. **Lập trình viên gợi ý phần tử nào ổn định qua các lần render bằng `key`.**
+
+---
+
+## 2. Thuật toán diff, mổ từng bước
+
+Diff làm việc theo từng cặp node "cùng vị trí" trong cây cũ và cây mới:
+
+```text
+compare(old, new):
+  1. old missing          → MOUNT entire new
+  2. new missing          → UNMOUNT entire old
+  3. different type       → REPLACE (unmount old, mount new) — do NOT diff children
+  4. same type:
+       - update differing props/attributes
+       - diff child list (most complex step, section 3)
+```
+
+Một phiên bản tối giản trên cây "phần tử ảo" để thấy hình dạng thuật toán:
+
+```ts
+type VNode =
+  | { type: 'text'; value: string }
+  | { type: string; props: Record<string, unknown>; children: VNode[] };
+
+type Patch =
+  | { op: 'replace'; node: VNode }
+  | { op: 'text'; value: string }
+  | { op: 'props'; changed: Record<string, unknown> }
+  | { op: 'children'; patches: ChildPatch[] };
+
+function diff(oldNode: VNode | undefined, newNode: VNode | undefined): Patch | null {
+  if (!oldNode || !newNode) return null; // mount/unmount handled at children layer
+  if (oldNode.type !== newNode.type) return { op: 'replace', node: newNode }; // rule 1
+
+  if (newNode.type === 'text') {
+    if ('value' in oldNode && oldNode.value !== newNode.value) {
+      return { op: 'text', value: newNode.value };
+    }
+    return null;
+  }
+
+  // same element type: compare props then children
+  const changed = diffProps(
+    (oldNode as Extract<VNode, { props: object }>).props,
+    (newNode as Extract<VNode, { props: object }>).props,
+  );
+  // ... diff children (section 3) ...
+  return Object.keys(changed).length ? { op: 'props', changed } : null;
+}
+```
+
+So props chỉ là duyệt hai object một lần — `O(số prop)`:
+
+```ts
+function diffProps(a: Record<string, unknown>, b: Record<string, unknown>) {
+  const changed: Record<string, unknown> = {};
+  for (const k in b) if (a[k] !== b[k]) changed[k] = b[k]; // new/changed prop
+  for (const k in a) if (!(k in b)) changed[k] = undefined; // removed prop
+  return changed;
+}
+```
+
+---
+
+## 3. Diff danh sách con — nơi `key` phát huy tác dụng
+
+Đây là phần quan trọng nhất. Xét một danh sách đổi từ `[A, B, C]` thành `[B, C, A]` (xoay vòng).
+
+**Không có key**, React so theo **vị trí**: vị trí 0 (`A` vs `B`) khác nội dung → cập nhật; vị trí 1 (`B` vs `C`) → cập nhật; vị trí 2 (`C` vs `A`) → cập nhật. Kết quả: **3 thao tác cập nhật nội dung**, dù thực ra chỉ cần *di chuyển* `A` xuống cuối.
+
+```text
+no key (compare by position):
+  0: A → B  (update)
+  1: B → C  (update)
+  2: C → A  (update)   ⇒ 3 DOM writes, input state per row gets mixed up
+```
+
+**Có key**, React lập một map `key → node cũ`, rồi với mỗi node mới chỉ cần **tra cứu `O(1)`** xem node đó đã tồn tại chưa. `A`, `B`, `C` `A`, `B`, `C` đều còn → chỉ cần **di chuyển** DOM node, không dựng lại, không reset state.
+
+```text
+with key:
+  old map = { A:0, B:1, C:2 }
+  new [B, C, A] all found ⇒ only MOVE, 0 rebuilds
+```
+
+Phác thảo thuật toán keyed diff (đây cũng là ý tưởng trong React/Vue):
+
+```ts
+function diffKeyedChildren(oldKids: KeyedVNode[], newKids: KeyedVNode[]) {
+  const oldByKey = new Map<string, { node: KeyedVNode; index: number }>();
+  oldKids.forEach((node, index) => oldByKey.set(node.key, { node, index }));
+
+  const ops: Array<{ type: 'mount' | 'move' | 'update'; key: string; from?: number; to: number }> = [];
+
+  newKids.forEach((newKid, to) => {
+    const prev = oldByKey.get(newKid.key);
+    if (!prev) {
+      ops.push({ type: 'mount', key: newKid.key, to }); // entirely new node
+    } else {
+      if (prev.index !== to) ops.push({ type: 'move', key: newKid.key, from: prev.index, to });
+      ops.push({ type: 'update', key: newKid.key, to }); // deep-diff this node
+      oldByKey.delete(newKid.key);
+    }
+  });
+
+  // leftovers in map = removed from new list
+  for (const { node } of oldByKey.values()) ops.push({ type: 'unmount', key: node.key, to: -1 } as never);
+  return ops;
+}
+```
+
+Toàn bộ là `O(n)` nhờ `Map` — đúng tinh thần "đổi Array sang Map" của Phần 1.
+
+---
+
+## 4. Hệ quả thực tế bạn gặp hằng ngày
+
+### Đừng dùng index làm key cho danh sách có thể đổi thứ tự
+
+```tsx
+// ❌ key=index: on insert/delete/reorder, key no longer tracks the data
+{todos.map((todo, i) => <TodoItem key={i} todo={todo} />)}
+
+// ✅ key by stable data id
+{todos.map((todo) => <TodoItem key={todo.id} todo={todo} />)}
+```
+
+Với `key={i}`, khi bạn xóa phần tử đầu, mọi phần tử "tụt" một vị trí nhưng giữ nguyên key → React tưởng *nội dung* đổi chứ không phải *vị trí* đổi. Ô input đang gõ dở, checkbox đang tick, animation đang chạy đều bị gán nhầm sang phần tử khác. Đây là bug "ô input giữ nhầm giá trị" kinh điển.
+
+> Dùng `key=index` chỉ chấp nhận được khi danh sách **tĩnh** (không sắp xếp, không chèn/xóa giữa chừng).
+
+### Đổi `key` để chủ động reset state
+
+Cùng một component, đổi `key` = React unmount cái cũ, mount cái mới → **reset toàn bộ state nội bộ**. Đây là kỹ thuật hợp lệ và rất gọn:
+
+```tsx
+// When userId changes, form rebuilds clean instead of keeping old user's state
+<EditUserForm key={userId} userId={userId} />
+```
+
+### Giữ type ổn định để khỏi mất state
+
+```tsx
+// ❌ Conditional wrapper changes the tree → child unmounts/remounts, state lost
+{isWide ? <div className="wide"><Panel /></div> : <Panel />}
+
+// ✅ Keep tree structure stable, only change class
+<div className={isWide ? 'wide' : ''}><Panel /></div>
+```
+
+---
+
+## 5. Liên hệ tới các phần khác
+
+- **Virtual list (Phần 4)** phải key theo id dữ liệu, nếu không reconciliation sẽ tái dùng nhầm DOM node khi cửa sổ cuộn.
+- **Memoization (Phần 7)**: `React.memo` chặn diff cả nhánh con khi props không đổi — bổ trợ cho heuristic này, giảm số node phải so.
+- Hiểu rằng "đổi type = thay cả cây" giúp bạn cấu trúc component để **tránh** vô tình thay cây và mất state/animation.
+
+---
+
+## Tóm tắt
+
+- Diff cây tối ưu tuyệt đối là `O(n³)` — bất khả thi mỗi frame. Virtual DOM dùng **heuristic** để xuống `O(n)`.
+- Hai giả định: **khác type ⇒ thay cả nhánh**, và **`key` báo phần tử nào ổn định**.
+- Keyed diff dùng `Map` để biến "tìm node cũ" thành `O(1)`, cho phép **di chuyển** thay vì dựng lại.
+- Hệ quả: key theo **id**, không theo index cho danh sách động; đổi key để reset state; giữ type ổn định để khỏi mất state.
+
+**Phần tiếp theo:** Cây & đồ thị trong UI — duyệt menu lồng nhau, topological sort cho dependency, và phát hiện chu trình.

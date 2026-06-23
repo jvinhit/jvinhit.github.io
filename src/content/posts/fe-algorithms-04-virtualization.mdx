@@ -1,0 +1,217 @@
+---
+title: 'Algorithms in Frontend · Part 4 — List Virtualization'
+description: 'Render 100,000 rows while the DOM holds only a few dozen nodes. Build a virtual list from scratch for fixed row height, then extend to variable height with prefix-sum + binary search.'
+pubDate: 2026-07-07
+tags: [algorithms, virtualization, performance, react, fe_algorithms_12]
+series: fe-algorithms
+seriesOrder: 4
+draft: true
+---
+
+Giả sử bạn có 100.000 dòng dữ liệu cần hiển thị trong một danh sách cuộn. Cách ngây thơ — render cả 100.000 `<div>` — sẽ tạo 100.000 DOM node, ăn hàng trăm MB RAM, và khiến tab treo vài giây khi mount. Nhưng màn hình chỉ cao chừng 800px, nghĩa là người dùng **chỉ nhìn thấy ~20 dòng** tại một thời điểm.
+
+**Ảo hóa (virtualization / windowing)** khai thác đúng điều đó: chỉ render những dòng *đang trong khung nhìn*, cộng một ít đệm. DOM luôn giữ ~30 node bất kể dữ liệu 100 hay 1 triệu dòng. Đây là một trong những kỹ thuật có "tỷ lệ thắng" cao nhất ở frontend.
+
+---
+
+## 1. Ý tưởng cốt lõi
+
+Ba mảnh ghép của mọi virtual list:
+
+1. **A scroll container** with fixed height and `overflow: auto`.
+2. **A spacer** as tall as the sum of all row heights — so the scrollbar length matches a full render.
+3. **A window** of visible rows, *shifted* to the correct position with `transform: translateY`.
+
+```text
+ ┌─ container (overflow:auto, height 800px) ─┐
+ │  ╎ spacer height = 100000 * rowHeight     │  ← correct scrollbar length
+ │  ╎                                     │
+ │  ▓ row 412  ┐                         │
+ │  ▓ row 413  │ only ~25 nodes here     │  ← render window, translateY to position
+ │  ▓ row 414  │ actually in the DOM     │
+ │  ▓ ...       ┘                         │
+ │  ╎                                     │
+ └────────────────────────────────────────┘
+```
+
+Khi người dùng cuộn, ta tính lại "dòng nào nên hiện" từ `scrollTop` và chỉ thay nội dung cửa sổ.
+
+---
+
+## 2. Trường hợp dễ: dòng cao cố định
+
+Khi mọi dòng cao bằng nhau (`rowHeight`), toán học rất gọn — tất cả là `O(1)`:
+
+```ts
+interface Window {
+  start: number; // index of first row to render
+  end: number; // index of last row (exclusive)
+  offsetY: number; // translateY offset for the window
+}
+
+function computeWindow(
+  scrollTop: number,
+  viewportHeight: number,
+  rowHeight: number,
+  total: number,
+  overscan = 3, // render extra rows above/below to avoid blank flash on fast scroll
+): Window {
+  const first = Math.floor(scrollTop / rowHeight);
+  const visibleCount = Math.ceil(viewportHeight / rowHeight);
+
+  const start = Math.max(0, first - overscan);
+  const end = Math.min(total, first + visibleCount + overscan);
+  return { start, end, offsetY: start * rowHeight };
+}
+```
+
+Triển khai bằng React, không cần thư viện:
+
+```tsx
+import { useRef, useState } from 'react';
+
+function VirtualList({ rows, rowHeight = 40, height = 800 }: {
+  rows: string[];
+  rowHeight?: number;
+  height?: number;
+}) {
+  const [scrollTop, setScrollTop] = useState(0);
+  const { start, end, offsetY } = computeWindow(scrollTop, height, rowHeight, rows.length);
+
+  return (
+    <div
+      style={{ height, overflow: 'auto', position: 'relative' }}
+      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+    >
+      {/* spacer preserves total height so scrollbar is correct */}
+      <div style={{ height: rows.length * rowHeight }} />
+      {/* render window, shifted to the right position */}
+      <div style={{ position: 'absolute', top: 0, transform: `translateY(${offsetY}px)`, width: '100%' }}>
+        {rows.slice(start, end).map((row, i) => (
+          <div key={start + i} style={{ height: rowHeight }}>
+            {row}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+Dù `rows` có 1 triệu phần tử, DOM chỉ chứa khoảng `viewportHeight / rowHeight + 2 * overscan` ≈ 26 node. Cuộn vẫn 60fps.
+
+> **`key` phải ổn định theo dữ liệu**, không phải theo vị trí trong cửa sổ. Ở đây dùng `start + i` (chỉ số tuyệt đối). Nếu dữ liệu có id, dùng id để React tái sử dụng node đúng (lý do sâu hơn ở Phần 5 về reconciliation).
+
+---
+
+## 3. Trường hợp khó: dòng cao thay đổi
+
+Đời thực hiếm khi dòng cao bằng nhau: comment dài ngắn khác nhau, ảnh kích thước khác nhau. Giờ ta **không** thể tính `Math.floor(scrollTop / rowHeight)` nữa, vì mỗi dòng một chiều cao.
+
+Giải pháp: **prefix sum** (mảng cộng dồn) các chiều cao, rồi **binary search** để tìm dòng tại một offset cuộn bất kỳ — đúng `lowerBound` đã học ở Phần 3.
+
+```ts
+// offsets[i] = total height of rows before row i (top position of row i)
+function buildOffsets(heights: number[]): number[] {
+  const offsets = new Array<number>(heights.length + 1);
+  offsets[0] = 0;
+  for (let i = 0; i < heights.length; i++) {
+    offsets[i + 1] = offsets[i] + heights[i]; // prefix sum O(n), computed once
+  }
+  return offsets;
+}
+
+// Find first row whose bottom exceeds scrollTop, via binary search O(log n)
+function findStartIndex(offsets: number[], scrollTop: number): number {
+  let lo = 0;
+  let hi = offsets.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (offsets[mid + 1] <= scrollTop) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+```
+
+```ts
+function computeVariableWindow(
+  scrollTop: number,
+  viewportHeight: number,
+  offsets: number[],
+  overscan = 3,
+) {
+  const total = offsets.length - 1;
+  let start = findStartIndex(offsets, scrollTop); // O(log n)
+  let end = findStartIndex(offsets, scrollTop + viewportHeight) + 1;
+
+  start = Math.max(0, start - overscan);
+  end = Math.min(total, end + overscan);
+  return { start, end, offsetY: offsets[start], totalHeight: offsets[total] };
+}
+```
+
+Tổng chiều cao spacer giờ là `offsets[total]`, và offset cửa sổ là `offsets[start]`. Mọi thứ vẫn `O(log n)` mỗi lần cuộn.
+
+---
+
+## 4. Khi không biết trước chiều cao: đo và sửa dần
+
+Thường ta *không* biết chiều cao dòng cho tới khi nó render xong (text wrap, ảnh load). Chiến lược "đo dần" (measure-on-render):
+
+1. Start with an **estimate** height for every row (e.g. 50px).
+2. After a row renders, **measure** actual height with `ResizeObserver` or `getBoundingClientRect`.
+3. Update the `heights` array, rebuild `offsets` for changed sections, and adjust `scrollTop` if needed to avoid "jumping".
+
+```ts
+const measured = new Map<number, number>(); // index → measured height
+
+const observer = new ResizeObserver((entries) => {
+  let changed = false;
+  for (const entry of entries) {
+    const index = Number((entry.target as HTMLElement).dataset.index);
+    const h = entry.contentRect.height;
+    if (measured.get(index) !== h) {
+      measured.set(index, h);
+      changed = true;
+    }
+  }
+  if (changed) scheduleReflowOfOffsets(); // rebuild offsets + re-render (batch, not per entry)
+});
+```
+
+Đây chính là cơ chế bên trong các thư viện như `@tanstack/virtual`. Hiểu nguyên lý giúp bạn debug khi danh sách "nhảy giật" — gần như luôn là do offsets sai sau khi đo.
+
+---
+
+## 5. Những cạm bẫy hay gặp
+
+- **`key` theo index cửa sổ** thay vì theo id dữ liệu → React tái dùng nhầm node, state ô input bị lẫn. Luôn key theo id ổn định.
+- **Không có overscan** → cuộn nhanh thấy chớp trắng. Thêm 2–5 dòng đệm.
+- **Tính lại window trong `onScroll` đồng bộ quá nặng** → kết hợp `requestAnimationFrame` (Phần 8) để gộp cập nhật theo nhịp vẽ.
+- **Layout thrashing khi đo** → đọc `getBoundingClientRect` cho tất cả rồi mới ghi, đừng xen kẽ (Phần 1, mục layout thrashing).
+- **Cuộn ngang + dọc (grid 2 chiều)** → ảo hóa cả hai trục: chỉ render ô trong vùng `[rowStart, rowEnd] × [colStart, colEnd]`.
+
+---
+
+## 6. Khi nào nên ảo hóa
+
+Ảo hóa thêm độ phức tạp (mất `Ctrl+F` của trình duyệt tìm trong DOM, khó SEO, cần xử lý focus cẩn thận). Quy tắc:
+
+- **< 100 dòng**: đừng ảo hóa, render thẳng.
+- **vài trăm – vài nghìn dòng tĩnh**: cân nhắc, đo trước.
+- **hàng nghìn trở lên, hoặc dòng phức tạp (ảnh, chart)**: ảo hóa gần như bắt buộc.
+
+Trong dự án thật, `@tanstack/virtual` hoặc `react-virtuoso` đã xử lý kỹ đo động, scroll-to-index, sticky header. Tự viết như trên là để *hiểu* và để xử lý các ca đặc thù mà thư viện không cover.
+
+---
+
+## Tóm tắt
+
+- Ảo hóa = chỉ render dòng **trong khung nhìn** + overscan; DOM giữ số node hằng số bất kể dữ liệu lớn cỡ nào.
+- Dòng cao cố định: mọi phép tính cửa sổ là `O(1)`.
+- Dòng cao thay đổi: **prefix sum** chiều cao + **binary search** (`lowerBound`) để map `scrollTop → dòng` trong `O(log n)`.
+- Chiều cao chưa biết: đo dần bằng `ResizeObserver`, dựng lại offsets, cẩn thận tránh "nhảy".
+- Luôn key theo **id dữ liệu**, dùng overscan, và gộp cập nhật scroll theo `requestAnimationFrame`.
+
+**Phần tiếp theo:** Diffing & reconciliation — vì sao React cần `key`, và thuật toán so sánh hai cây để cập nhật DOM tối thiểu.

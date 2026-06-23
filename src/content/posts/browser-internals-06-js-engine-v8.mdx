@@ -1,0 +1,159 @@
+---
+title: 'How Browsers Work · Part 6 — The JavaScript Engine (V8)'
+description: 'Inside V8: parsing to AST, Ignition bytecode, the TurboFan optimizing JIT, hidden classes and inline caches, and how object shape stability makes (or breaks) your JS performance.'
+pubDate: 2026-10-15
+tags: [browser, internals, javascript, v8, jit, browser_internals_12]
+series: browser-internals
+seriesOrder: 6
+draft: true
+---
+
+JavaScript trông dynamically typed và "dễ tính" — bạn thêm property bất cứ lúc nào, object như hash map, số là số. Bên dưới trong **V8** (Chrome, Edge, Node.js), engine **đoán** mạnh về shape và kiểu code của bạn, rồi biên dịch đường nóng thành mã máy gốc. Khi giả định khớp thực tế, JS chạy gần tốc độ native; khi không, bạn trả giá **deoptimization**.
+
+Phần này giải thích *vì sao* idiom JS này nhanh còn kia âm thầm phạt bạn — không phải trivia micro-optimization, mà cơ chế engine bạn có thể suy luận.
+
+```text
+Source JS
+    │
+    ▼
+ Parser ──► AST
+    │
+    ▼
+ Ignition (bytecode interpreter) ──► profile hot code
+    │
+    ▼
+ TurboFan (optimizing JIT) ──► native machine code
+    │                              │
+    │◄──── deoptimize (assumption broken) ────┘
+    ▼
+ Execute
+```
+
+---
+
+## 1. Parsing và AST
+
+Khi V8 nhận source JavaScript, **parser** dựng **Abstract Syntax Tree (AST)** — biểu diễn có cấu trúc của cú pháp chương trình. AST là thứ các giai đoạn sau (sinh bytecode, tối ưu) làm việc trên đó.
+
+V8 dùng **lazy parsing** cho function: lần đầu **pre-parse** function ngoài — đủ để tìm ranh giới function lồng nhau mà không dựng AST đầy đủ cho mọi function lồng. Parse đầy đủ (dựng AST) chỉ khi function **thực sự được gọi**. Giúp parse lúc tải trang rẻ — bạn không trả toàn bộ chi phí mọi function body ngay từ đầu.
+
+Hệ quả cho bạn: bundle khổng lồ với hàng nghìn function không dùng vẫn trả *một phần* chi phí pre-parse, nhưng function lạnh bạn không gọi phần lớn không bị parse đầy đủ. Code splitting giảm cả tải xuống *lẫn* công việc parse.
+
+---
+
+## 2. Ignition: bytecode trước
+
+Sau parse, interpreter **Ignition** của V8 biên dịch AST thành **bytecode** và thực thi. Bytecode gọn và sinh nhanh — mọi function bắt đầu ở đây, lạnh hay nóng.
+
+Trong lúc Ignition chạy, V8 thu **dữ liệu profile**: function nào gọi nhiều, kiểu gì chảy qua, truy cập property nào lặp lại. Function trở nên **hot** (vượt ngưỡng số lần gọi) thành ứng viên cho compiler tối ưu.
+
+Ignition cũng giữ **feedback vector** tại call site — ô ghi nhận engine quan sát được (kiểu, shape object) để nuôi TurboFan sau. Hạ tầng profile này là thứ làm JIT đáng giá.
+
+---
+
+## 3. TurboFan: JIT tối ưu
+
+**TurboFan** là **compiler tối ưu** của V8. Với function hot, nó đọc feedback profile và sinh **mã máy gốc chuyên biệt** có guard nhúng sẵn.
+
+Các guard mã hóa **giả định**:
+
+- `"Biến này luôn là Smi (số nguyên nhỏ)"`.
+- `"Object này luôn có property \`x\` ở offset 16"`.
+- `"Call site này luôn thấy object của hidden class \`Map#42`"`.
+
+Code tối ưu chạy nhanh **miễn giả định còn đúng**. Khi thực tế lệch — bạn truyền kiểu khác, thêm property theo thứ tự mới, xóa key — **guard fail**, V8 **deoptimize**: vứt mã native, quay bytecode, và có thể tối ưu lại với feedback mới.
+
+Deoptimization đúng nhưng tốn kém — nguồn giật spike phổ biến trong vòng lặp nóng thỉnh thoảng gặp kiểu edge case. Giữ kiểu và shape object ổn định trong code nóng không phải tối ưu sớm; đó là hợp tác với engine.
+
+---
+
+## 4. Hidden class (map): shape object quan trọng
+
+Object JavaScript linh hoạt, nhưng V8 **không** coi chúng như hash map generic trong code nóng. Thay vào đó, mỗi object mang **hidden class** (nội bộ là **Map**) mô tả layout property hiện tại: tên property, thứ tự, và offset cố định trong bộ nhớ.
+
+```js
+function Point(x, y) {
+  this.x = x; // hidden class C0 → C1 (adds 'x')
+  this.y = y; // hidden class C1 → C2 (adds 'y')
+}
+
+const a = new Point(1, 2); // follows C0 → C1 → C2
+const b = new Point(3, 4); // same path → same final hidden class C2
+// Property access 'a.x' is a direct offset load — fast
+```
+
+Hai object chia sẻ hidden class khi có **cùng property theo cùng thứ tự**. Đọc property thành truy cập bộ nhớ offset cố định — không tra hash.
+
+Thao tác tạo **hidden class mới** (đường chậm) gồm:
+
+- Thêm property theo **thứ tự khác** so với object "tương tự" khác.
+- **`delete obj.prop`** — hầu như luôn xấu cho shape ổn định; ưu tiên gán `undefined` hoặc `null` nếu cần xóa.
+- Thêm property **sau** construction (trừ khi mọi instance thêm cùng thứ tự tại cùng điểm chương trình).
+
+> Khởi tạo mọi property instance trong **constructor**, **cùng thứ tự**, mỗi lần. Đây là thói quen thân V8 hiệu quả nhất.
+
+---
+
+## 5. Inline cache: monomorphic thắng polymorphic
+
+Tại mỗi call site truy cập property hay gọi method, V8 gắn **inline cache (IC)** — stub nhỏ nhớ hidden class (hoặc tập nhỏ) vừa thấy và nhảy thẳng đường nhanh.
+
+| IC state | Nghĩa | Speed |
+|----------|-------------------|-------|
+| **Uninitialized** | Chưa thấy | Slow |
+| **Monomorphic** | Luôn một hidden class | Fastest |
+| **Polymorphic** | Tập class cố định nhỏ (thường ≤4) | OK |
+| **Megamorphic** | Quá nhiều shape; tra generic | Slow |
+
+Vòng lặp xử lý object `{ id, name }` cùng cách construct giữ **monomorphic** — TurboFan có thể inline truy cập. Vòng lặp đôi khi thấy `{ id, name }` đôi khi `{ id, name, email }` thành **polymorphic** hoặc **megamorphic** tùy độ đa dạng.
+
+Quy tắc thực tế: trên đường nóng, ưu tiên **mảng object cùng shape** hơn túi object không đồng nhất. Nếu cần field tùy chọn, khởi tạo chúng thành `undefined` trong constructor cho *mọi* instance để shape khớp.
+
+---
+
+## 6. Số: Smi vs heap
+
+V8 tối ưu **số nguyên có dấu 32-bit** vừa 31 bit thành **Smi** — giá trị tagged nhúng trực tiếp trong con trỏ, không cấp phát heap. Số học trên Smi ở đường nhanh trong code tối ưu.
+
+Khi số thành **heap-number** (double, hoặc số nguyên ngoài Smi), thao tác có thể boxing/unboxing và guard phức tạp hơn. Điều này hiếm quan trọng trong app code trừ khi bạn viết vòng số chặt — nhưng giải thích vì sao biến `number | string` hỗn hợp trong code nóng gây deopt.
+
+Tránh đổi **kiểu** biến qua các vòng lặp (number → string → object) — trigger deoptimization kinh điển.
+
+---
+
+## 7. Hệ quả thực tế cho code bạn viết
+
+Chi tiết engine hội tụ thành danh sách ngắn thói quen giữ V8 trên đường nhanh:
+
+1. **Tạo object nhất quán** — mọi property trong constructor, cùng thứ tự, mỗi lần.
+2. **Tránh `delete` trên object** trong code nhạy hiệu năng; dùng `Map` nếu cần key động.
+3. **Giữ kiểu ổn định** trong function hot — đừng tái dùng biến cho kiểu không liên quan.
+4. **Ưu tiên call site monomorphic** — một function làm một việc trên một shape thắng một mega-function trên shape ngẫu nhiên.
+5. **Tách code lạnh khỏi nóng** — lazy parsing giúp, nhưng module nhỏ hơn và `import()` động giảm thêm việc ban đầu.
+
+Không có nghĩa viết JS kiểu C hay bỏ pattern động mọi nơi — nghĩa là có chủ đích trong 5% code thực sự chạy nóng. Profile trước (DevTools **Performance** → bottom-up theo function JS); tối ưu nơi bằng chứng chỉ ra.
+
+```js
+// ❌ Shape chaos in a hot loop
+for (const item of items) {
+  if (item.extra) item.bonus = item.extra; // sometimes adds 'bonus' late
+  total += item.value;
+}
+
+// ✅ Stable shape — 'bonus' always exists
+for (const item of items) {
+  total += item.value + (item.bonus ?? 0);
+}
+```
+
+---
+
+## Tóm tắt
+
+- V8 biên dịch JS qua **Parser → Ignition (bytecode) → TurboFan (native JIT)**, với lazy parsing cho function chưa gọi.
+- TurboFan **đoán** bằng feedback profile; giả định sai gây **deoptimization** về bytecode.
+- **Hidden class** làm truy cập property nhanh khi object chia sẻ cùng thứ tự property; construct không nhất quán tạo shape mới.
+- **Inline cache** nhanh nhất khi **monomorphic** (một shape); site megamorphic rơi về tra generic.
+- Viết JS thân engine bằng cách ổn định shape object và kiểu trong code nóng — không phải micro-optimize đường lạnh.
+
+**Phần tiếp theo:** Event loop, task và microtask — cách lập lịch JavaScript gắn với render và vì sao long task đóng băng trang.

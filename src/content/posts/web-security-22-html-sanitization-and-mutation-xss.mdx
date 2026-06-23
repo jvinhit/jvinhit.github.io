@@ -1,0 +1,263 @@
+---
+title: 'Web Security for Frontend Devs · Part 22 — HTML Sanitization & Mutation XSS (mXSS)'
+description: 'Bonus track: why escaping, blacklists, and naive sanitizers fail on untrusted HTML, how mutation XSS resurrects payloads when the parser re-reads your clean string, and the right tools: DOMPurify and the native Sanitizer API.'
+pubDate: 2026-06-25
+tags: [web-security, frontend, sanitization, web_security_10]
+series: web-security
+seriesOrder: 22
+draft: false
+---
+
+> **Phần 22 — Nhánh bonus** trong series Web Security for Frontend Devs. Trước: Tiếp:
+
+[Phần 2 (XSS)](/blog/web-security-02-xss-cross-site-scripting/) dạy quy tắc vàng: đừng nhét chuỗi không tin cậy vào HTML. Nhưng đôi khi bạn **buộc phải render HTML do người dùng tạo** — bình luận có định dạng, bio hồ sơ, email, một editor rich-text, output Markdown. Lúc đó bạn cần **sanitize**: giữ `<b>`, `<a>`, `<ul>` an toàn mà bỏ `<script>`, `onerror`, `javascript:`.
+
+Nghe đơn giản. Thực tế đây là một trong những thứ **khó làm đúng nhất** trên web — và mảnh ghép mà gần như mọi người bỏ sót gọi là **mutation XSS (mXSS)**: trình parser của trình duyệt **viết lại** chuỗi "đã sạch" của bạn sau khi sanitize, làm sống lại payload.
+
+---
+
+## Vì sao ba cách "rõ ràng" đều sai
+
+### Sai 1 — escape khi bạn thật sự cần HTML
+
+Escape (`<` → `&lt;`) là đúng cho **text**, nhưng nếu bạn muốn `<b>` *hoạt động*, escape biến nó thành chữ literal `<b>`. Escape không phải sanitize — nó là phủ định của render HTML.
+
+### Sai 2 — blacklist (lọc cái xấu)
+
+```js
+// the classic mistake
+const clean = dirty.replace(/<script[\s\S]*?<\/script>/gi, "");
+```
+
+Blacklist chỉ bỏ thứ bạn **nghĩ ra**. Còn vô số vector khác:
+
+```html
+<img src=x onerror="steal()">       <!-- không có <script> -->
+<svg><script>steal()</script></svg> <!-- namespace khác -->
+<a href="javascript:steal()">x</a>  <!-- URL scheme -->
+<iframe src="//evil"></iframe>      <!-- nhúng -->
+```
+
+Bảo mật bằng blacklist là thua từ đầu: bạn phải đúng *mọi lần*, kẻ tấn công chỉ cần đúng *một lần*.
+
+### Sai 3 — tự viết allowlist bằng regex
+
+HTML **không phải** ngôn ngữ chính quy — bạn không parse nó đúng bằng regex. Thẻ lồng, thuộc tính không đóng ngoặc, comment, CDATA, foreign content (SVG/MathML) sẽ phá mọi pattern. Cách đúng là **parse bằng chính parser của trình duyệt**, rồi đi qua **cây DOM** với một **allowlist**.
+
+---
+
+## Cách đúng: parse → allowlist trên cây DOM
+
+```ts
+const ALLOWED_TAGS = new Set(['P','B','STRONG','I','EM','A','UL','OL','LI','BR','CODE','PRE']);
+const ALLOWED_ATTR: Record<string, Set<string>> = { A: new Set(['href', 'title']) };
+
+function sanitize(html: string): string {
+  // <template> content is INERT: parsing it runs no script, loads no resource,
+  // fires no onerror — the only safe place to inspect untrusted markup.
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html;
+
+  const walk = (node: Node) => {
+    for (const child of [...node.childNodes]) {
+      if (child.nodeType !== Node.ELEMENT_NODE) continue;
+      const el = child as Element;
+      if (!ALLOWED_TAGS.has(el.tagName)) { el.remove(); continue; }
+      for (const attr of [...el.attributes]) {
+        const name = attr.name.toLowerCase();
+        const ok =
+          (ALLOWED_ATTR[el.tagName]?.has(name) ?? false) &&
+          !(name === 'href' && /^\s*(javascript|data):/i.test(attr.value));
+        if (!ok) el.removeAttribute(attr.name);
+      }
+      walk(el);
+    }
+  };
+  walk(tpl.content);
+  return tpl.innerHTML;
+}
+```
+
+Mấu chốt là `<template>`: nội dung của nó là một `DocumentFragment` **trơ** — gán `innerHTML` vào đó **không** chạy `<script>`, **không** load ảnh, **không** kích hoạt `onerror`. Đây là nơi duy nhất an toàn để soi markup không tin cậy.
+
+Nhưng kể cả allowlist viết tay này vẫn có một cái bẫy ẩn...
+
+---
+
+## mXSS — khi parser viết lại chuỗi "đã sạch"
+
+Sanitizer của bạn làm sạch một **chuỗi**. Rồi chuỗi đó được gán vào DOM thật và **parse lại** — và parser có thể **biến đổi** cây, đôi khi làm sống lại markup tưởng đã vô hại. Đó là **mutation XSS**.
+
+Cốt lõi: kết quả parse phụ thuộc **ngữ cảnh**. Cùng một byte cho ra cây khác nhau bên trong `<div>`, `<style>`, `<noscript>`, hay foreign content `<svg>`/`<math>`. Một sanitizer parse trong ngữ cảnh này, rồi serialize ra chuỗi, rồi trình duyệt parse lại trong ngữ cảnh khác → cây mới mọc ra thẻ và thuộc tính chưa từng bị kiểm.
+
+Ví dụ kinh điển: nội dung bên trong `<noscript>` được parse khác nhau tuỳ scripting có bật không, nên một chuỗi trông như text bên trong `<noscript>` lại trở thành **phần tử thật** ở lần parse sau:
+
+```html
+<noscript><p title="</noscript><img src=x onerror=steal()>">
+```
+
+Trong DOMPurify, lớp phòng thủ chính là **đảm bảo tính ổn định**: nó parse, sanitize, rồi **so sánh round-trip** để chuỗi ra khớp với cây đã làm sạch; nếu parse lại còn biến đổi, đó là cờ đỏ. Đây là lý do **không tự viết sanitizer** cho production — DOMPurify đã đổ hàng năm vá đúng những góc khuất này.
+
+> Tư duy: sanitize **cái cây**, không phải cái chuỗi — và chỉ tin chuỗi nếu parse lại nó cho **đúng cái cây đó**.
+
+---
+
+## Thử ngay — lab sanitization & mXSS (an toàn)
+
+Panel 1: chọn payload, đổi cách chèn (raw `innerHTML`, blacklist, escape, allowlist) và xem markup ra, một **preview đã tắt script**, và phân tích tĩnh "cái gì *sẽ* chạy". Panel 2: round-trip mXSS — parse → serialize → parse lại, và đánh dấu khi markup đổi. **Không gì thực thi**: payload được parse trong `<template>` trơ và preview nằm trong iframe `sandbox` không có `allow-scripts`.
+
+<iframe
+  src="/tools/mxss-sanitizer-demo/"
+  title="Interactive HTML sanitization and mutation XSS lab"
+  loading="lazy"
+  style="width:100%;height:1320px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Mở demo đầy đủ:
+
+---
+
+## Công cụ đúng
+
+### DOMPurify — tiêu chuẩn de facto
+
+```ts
+import DOMPurify from 'dompurify';
+
+el.innerHTML = DOMPurify.sanitize(userHtml);
+
+// thắt chặt allowlist
+const clean = DOMPurify.sanitize(userHtml, {
+  ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'a', 'p', 'ul', 'li', 'code'],
+  ALLOWED_ATTR: ['href', 'title'],
+});
+```
+
+DOMPurify nhanh, được audit kỹ, xử lý mXSS, foreign content, và các quirk parser. Vài lưu ý:
+
+- Chạy nó **phía client** (hoặc server qua `jsdom`) — nó cần một môi trường DOM.
+- Cấu hình hook `afterSanitizeAttributes` để ép `target="_blank"` link đi kèm `rel="noopener"` (nhớ [Phần 18](/blog/web-security-18-reverse-tabnabbing-window-opener/)).
+- Sanitize ở **điểm render**, không phải lúc lưu — quy tắc parse đổi theo thời gian; dữ liệu đã "sạch" lúc lưu vẫn có thể nguy hiểm sau này.
+
+### Sanitizer API gốc của trình duyệt
+
+Nền tảng giờ có sanitizer dựng sẵn, không cần thư viện:
+
+```ts
+// luôn an toàn theo mặc định: tự bỏ <script>, on*=, javascript: — kể cả khi config cho phép
+el.setHTML(userHtml);
+
+// thắt chặt thêm bằng allowlist (vẫn ép baseline XSS-safe lên trên config của bạn)
+el.setHTML(userHtml, {
+  sanitizer: new Sanitizer({ elements: ['p', 'a', 'b', 'i'], attributes: ['href'] }),
+});
+```
+
+Có cặp `setHTML()` (an toàn) và `setHTMLUnsafe()` (chỉ áp đúng config bạn đưa, **không** có lưới an toàn — chỉ dùng khi thật sự cần phần tử "unsafe"). Tính tới giữa 2026, API này đã ship trên Firefox và Chrome bản gần đây nhưng **chưa Baseline** (Safari chưa làm) — nên hãy feature-detect và fallback DOMPurify:
+
+```ts
+function safeSetHTML(el: Element, html: string) {
+  if ('setHTML' in Element.prototype) el.setHTML(html);
+  else el.innerHTML = DOMPurify.sanitize(html);
+}
+```
+
+### Trusted Types — chặn cả lớp lỗi DOM-XSS
+
+Đi cùng [CSP (Phần 3)](/blog/web-security-03-content-security-policy/), **Trusted Types** biến mọi sink nguy hiểm (`innerHTML`, `setHTMLUnsafe`...) thành lỗi trừ khi giá trị đi qua một policy bạn khai báo:
+
+```http
+Content-Security-Policy: require-trusted-types-for 'script'
+```
+
+```ts
+const policy = trustedTypes.createPolicy('app-html', {
+  createHTML: (s) => DOMPurify.sanitize(s),
+});
+el.innerHTML = policy.createHTML(userHtml); // gán chuỗi thô giờ sẽ ném lỗi
+```
+
+Đây là khác biệt then chốt: thay vì *nhớ* sanitize ở mọi nơi, bạn để trình duyệt **ép buộc** không sink nào nhận chuỗi chưa qua policy.
+
+---
+
+## Phòng thủ phân lớp
+
+1. **Mặc định escape**, chỉ render HTML khi tính năng thật sự cần.
+2. Khi cần HTML: dùng **DOMPurify** hoặc **`setHTML()`** — không bao giờ blacklist hay regex tự chế.
+3. Sanitize ở **điểm render** với **allowlist** chặt nhất đủ dùng.
+4. Ép link ngoài `rel="noopener noreferrer"` trong hook sanitize.
+5. Bật **Trusted Types** để biến quên-sanitize thành lỗi runtime.
+6. Thêm **CSP** ([Phần 3](/blog/web-security-03-content-security-policy/)) làm lưới an toàn cuối khi sanitize lọt.
+
+---
+
+## Liên hệ các phần trước
+
+Đây là phần sâu của [Phần 2 (XSS)](/blog/web-security-02-xss-cross-site-scripting/): XSS dạy *vì sao* và *ở đâu*; phần này dạy *làm sao render HTML không tin cậy mà không tự bắn vào chân*. [CSP (Phần 3)](/blog/web-security-03-content-security-policy/) và Trusted Types là lưới an toàn; [DOM clobbering (Phần 12)](/blog/web-security-12-dom-clobbering/) là họ hàng — cả hai cho thấy markup "vô hại" vẫn có thể chiếm quyền điều khiển.
+
+---
+
+## Checklist phòng tránh
+
+1. Không bao giờ `innerHTML = userInput` thô.
+2. Không blacklist, không regex tự viết để "làm sạch" HTML.
+3. Dùng **DOMPurify** (hoặc `setHTML()` + fallback) tại điểm render.
+4. Allowlist **tag + attribute** tối thiểu cần thiết.
+5. Ép `rel="noopener noreferrer"` cho link ngoài.
+6. Bật **Trusted Types** + **CSP** làm phòng thủ chiều sâu.
+
+---
+
+## Bài tập / Exercises
+
+**1.** Đồng đội "làm sạch" bằng `html.replace(/<script.*?>.*?<\/script>/gi, '')` và bảo đã an toàn. Đưa **hai** payload vượt qua.
+
+<details>
+<summary>Lời giải</summary>
+
+`<img src=x onerror="steal()">` (không có thẻ `<script>`) và `<svg><script>steal()</script></svg>` (script trong namespace SVG, regex thường trượt). Cả `<a href="javascript:steal()">` cũng qua. Blacklist luôn thiếu vector.
+</details>
+
+**2.** Vì sao phải sanitize trong `<template>.content` chứ không phải một `<div>` rời rồi gán `innerHTML`?
+
+<details>
+<summary>Lời giải</summary>
+
+Cả hai parse được, nhưng `<template>.content` là `DocumentFragment` **trơ**: script không chạy, ảnh không load, `onerror` không bắn trong lúc bạn còn đang kiểm. Một `<div>` (kể cả chưa gắn vào DOM) **vẫn** kích hoạt tải tài nguyên/handler khi bạn gán `innerHTML`.
+</details>
+
+**3.** mXSS là gì, và vì sao nó là lý do "đừng tự viết sanitizer"?
+
+<details>
+<summary>Lời giải</summary>
+
+mXSS là khi parser **biến đổi** chuỗi đã-sanitize lúc parse lại (do ngữ cảnh `<style>`/`<noscript>`/foreign content), làm mọc thẻ/thuộc tính chưa bị kiểm. Bắt đúng nó đòi so sánh round-trip và hiểu sâu quirk parser — chính xác thứ DOMPurify đã dày công làm đúng còn code tự viết thường bỏ sót.
+</details>
+
+Nâng cao:Trong lab, chạy preset "noscript trick" ở Panel 2 và xác nhận markup đổi sau round-trip; rồi giải thích vì sao một sanitizer chỉ-trên-chuỗi sẽ bị qua mặt.
+
+---
+
+## Điểm chính
+
+- Escape là cho **text**; blacklist và regex tự chế **luôn** thua — sanitize phải **parse rồi allowlist trên cây DOM**.
+- Soi markup không tin cậy trong `<template>.content` **trơ** để không chạy gì.
+- **mXSS**: parser viết lại chuỗi "đã sạch" khi parse lại — lý do không tự viết sanitizer.
+- Dùng **DOMPurify** hoặc **`setHTML()`** (fallback DOMPurify); thêm **Trusted Types + CSP** làm lưới.
+- Sanitize ở **điểm render**, allowlist tối thiểu, ép `rel` an toàn cho link.
+
+---
+
+## Nguồn
+
+- MDN — [HTML Sanitizer API](https://developer.mozilla.org/docs/Web/API/HTML_Sanitizer_API) và [`Element.setHTML()`](https://developer.mozilla.org/docs/Web/API/Element/setHTML) (lưu ý: chưa Baseline).
+- [DOMPurify](https://github.com/cure53/DOMPurify) — sanitizer được audit, và write-up của cure53 về [mXSS](https://cure53.de/fp170.pdf).
+- web.dev / MDN — [Trusted Types](https://developer.mozilla.org/docs/Web/API/Trusted_Types_API) để chặn DOM-XSS theo cả lớp.
+- OWASP — [XSS Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html).
+
+---
+
+## Series
+
+Các phần bonus xếp trên mười phần lõi và nhánh nâng cao. Sợi chỉ từ [Phần 2](/blog/web-security-02-xss-cross-site-scripting/): **render HTML không tin cậy là giao quyền chạy code — chỉ giao qua một parser đã được kiểm chứng, không bao giờ qua một chuỗi bạn tự đoán là sạch**.

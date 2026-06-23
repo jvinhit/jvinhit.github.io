@@ -1,0 +1,264 @@
+---
+title: 'Build a Real React App · Part 9 — Auth & the API Layer'
+description: 'Add real authentication: where to store tokens (and why not localStorage), an authenticated fetch wrapper with automatic token refresh on 401, the current-user query, route guards with RequireAuth, and resetting the Query cache on logout.'
+pubDate: 2026-07-21
+tags: [react, auth, security, tanstack-query, react_stack_12]
+series: react-stack
+seriesOrder: 9
+draft: true
+---
+
+Pulse cần biết *ai* đang dùng. Phần này thêm xác thực như app production làm: chiến lược lưu token hợp lý, wrapper `fetch` có xác thực **tự refresh token khi 401**, query người dùng hiện tại, và chắn route tích hợp với React Router và cache Query.
+
+Lưu ý bảo mật trước: đây là hướng dẫn kiến trúc frontend. Bảo đảm bảo mật thật sống ở **server** — các mẫu client ở đây giả định backend xây đúng.
+
+---
+
+## 1. Lưu token ở đâu
+
+| Option | XSS-safe? | CSRF-safe? | Verdict |
+|--------|-----------|------------|---------|
+| `localStorage` | ❌ readable by any script | ✅ | Avoid for tokens |
+| In-memory (JS variable) | ✅ gone on reload | ✅ | Good for the **access token** |
+| `httpOnly` cookie | ✅ not readable by JS | ⚠️ needs CSRF protection | Best for the **refresh token** |
+
+Mẫu production: **access token ngắn hạn trong bộ nhớ** (mất khi reload, không sao) cộng **refresh token dài hạn trong cookie `httpOnly`** (trình duyệt tự gửi, JS không đọc được). Khi reload, đổi cookie refresh lấy access token mới.
+
+```ts
+// src/features/auth/token-store.ts
+// access token lives ONLY in memory — never localStorage (XSS risk)
+let accessToken: string | null = null;
+
+export const tokenStore = {
+  get: () => accessToken,
+  set: (token: string | null) => {
+    accessToken = token;
+  },
+};
+```
+
+`localStorage` đọc được bởi script chèn vào, nên một bug XSS làm rò mọi token ở đó — vì thế access token ở trong biến module.
+
+### Tóm tắt một dòng
+
+Access token trong bộ nhớ, refresh token trong cookie `httpOnly` — đừng bao giờ để token trong `localStorage`.
+
+---
+
+## 2. Wrapper fetch có xác thực
+
+Mở rộng `apiFetch` Phần 4 để gắn access token và **refresh một lần khi 401, rồi thử lại**. Phần tinh tế là **gộp các refresh đồng thời** — nếu năm request 401 cùng lúc, bạn muốn *một* refresh, không phải năm:
+
+```ts
+// src/lib/api-client.ts
+import { tokenStore } from '@/features/auth/token-store';
+
+// a single in-flight refresh shared by all callers
+let refreshPromise: Promise<void> | null = null;
+
+async function refreshAccessToken(): Promise<void> {
+  // dedupe: if a refresh is already running, await the same promise
+  refreshPromise ??= (async () => {
+    const res = await fetch(`${env.VITE_API_URL}/auth/refresh`, {
+      method: 'POST',
+      credentials: 'include', // send the httpOnly refresh cookie
+    });
+    if (!res.ok) throw new ApiError(401, 'Session expired');
+    const { accessToken } = z
+      .object({ accessToken: z.string() })
+      .parse(await res.json());
+    tokenStore.set(accessToken);
+  })();
+
+  try {
+    await refreshPromise;
+  } finally {
+    refreshPromise = null;
+  }
+}
+
+export async function apiFetch<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  init: RequestInit = {},
+): Promise<T> {
+  const run = () =>
+    fetch(`${env.VITE_API_URL}${path}`, {
+      ...init,
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(tokenStore.get() ? { Authorization: `Bearer ${tokenStore.get()}` } : {}),
+        ...init.headers,
+      },
+    });
+
+  let res = await run();
+
+  // one transparent refresh-and-retry on 401
+  if (res.status === 401) {
+    await refreshAccessToken();
+    res = await run();
+  }
+
+  if (!res.ok) throw new ApiError(res.status, `Request failed: ${res.status}`);
+  return schema.parse(await res.json());
+}
+```
+
+`refreshPromise ??=` chỉ gán khi đang `null`, nên các 401 đồng thời cùng await *một* refresh. Điều này giữ phần còn lại của app vô tư về vòng đời token — gọi `apiFetch` và nó chạy.
+
+### Tóm tắt một dòng
+
+Một `apiFetch` gắn token và, khi 401, chạy một refresh gộp rồi thử lại — caller không chạm logic token.
+
+---
+
+## 3. Query người dùng hiện tại
+
+Mô hình "tôi là ai?" thành query — đó là server state. Khi reload, query này kích luồng refresh và tái lập phiên:
+
+```ts
+// src/features/auth/hooks.ts
+import { useQuery } from '@tanstack/react-query';
+import { apiFetch } from '@/lib/api-client';
+import { userSchema } from './schema';
+
+const authKeys = { me: ['auth', 'me'] as const };
+
+export function useCurrentUser() {
+  return useQuery({
+    queryKey: authKeys.me,
+    queryFn: () => apiFetch('/auth/me', userSchema),
+    retry: false,        // a 401 here means "not logged in" — don't retry
+    staleTime: Infinity, // identity rarely changes during a session
+  });
+}
+```
+
+`retry: false` quan trọng: `/auth/me` lỗi nghĩa "chưa xác thực", là trạng thái bình thường, không phải lỗi tạm để thử lại. `staleTime: Infinity` tránh refetch danh tính mỗi lần focus.
+
+### Tóm tắt một dòng
+
+Mô hình phiên thành query `useCurrentUser` với `retry: false` và `staleTime: Infinity`; 401 đơn giản nghĩa "đã đăng xuất".
+
+---
+
+## 4. Chắn route bằng `RequireAuth`
+
+Nhớ placeholder `RequireAuth` từ Phần 3 — giờ điền vào. Nó đọc query người dùng hiện tại và chắn nhánh được bảo vệ của router:
+
+```tsx
+// src/features/auth/RequireAuth.tsx
+import { Navigate, Outlet, useLocation } from 'react-router';
+import { useCurrentUser } from './hooks';
+
+export function RequireAuth() {
+  const { data: user, isPending } = useCurrentUser();
+  const location = useLocation();
+
+  if (isPending) return <FullPageSpinner />;
+
+  // redirect to login, remembering where the user wanted to go
+  if (!user) return <Navigate to="/login" replace state={{ from: location }} />;
+
+  return <Outlet />;
+}
+```
+
+Truyền `state={{ from: location }}` để trang login đưa user về nơi họ bắt đầu sau khi xác thực. Spinner `isPending` tránh nháy màn hình login trong lúc refresh-khi-reload ban đầu.
+
+### Tóm tắt một dòng
+
+`RequireAuth` đọc `useCurrentUser`: spinner khi pending, chuyển `/login` (nhớ `from`) nếu không có user, còn lại render `Outlet`.
+
+---
+
+## 5. Login & logout với cache Query
+
+Login set token và mồi cache user; logout xóa token và **reset toàn bộ cache Query** để không còn dữ liệu user trước sót lại:
+
+```ts
+// src/features/auth/hooks.ts
+export function useLogin() {
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+
+  return useMutation({
+    mutationFn: (creds: LoginInput) => apiFetch('/auth/login', loginResponseSchema, {
+      method: 'POST',
+      body: JSON.stringify(creds),
+    }),
+    onSuccess: (res) => {
+      tokenStore.set(res.accessToken);
+      queryClient.setQueryData(authKeys.me, res.user); // prime the user cache
+      navigate('/', { replace: true });
+    },
+  });
+}
+
+export function useLogout() {
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+
+  return useMutation({
+    mutationFn: () => apiFetch('/auth/logout', z.unknown(), { method: 'POST' }),
+    onSettled: () => {
+      tokenStore.set(null);
+      queryClient.clear(); // wipe ALL cached data — no leaking between users
+      navigate('/login', { replace: true });
+    },
+  });
+}
+```
+
+`queryClient.clear()` khi logout là bắt buộc về bảo mật: không có nó, user kế (hoặc màn login) có thể thoáng thấy customer cached của user trước.
+
+### Tóm tắt một dòng
+
+Login set token + mồi `auth/me`; logout xóa token và gọi `queryClient.clear()` để không rò dữ liệu giữa user.
+
+---
+
+## 6. Bài tập
+
+**1.** Sao không lưu access token trong `localStorage`?
+
+<details>
+<summary>Lời giải</summary>
+
+`localStorage` đọc được bởi mọi JS trên trang, nên một lỗ XSS làm rò token. Biến trong bộ nhớ không bị script chèn chạm tương tự và biến mất khi reload; refresh token ở cookie `httpOnly` JS không đọc được.
+</details>
+
+**2.** Sao gộp lời gọi refresh bằng `refreshPromise` chung?
+
+<details>
+<summary>Lời giải</summary>
+
+Nếu nhiều request 401 đồng thời, mỗi cái sẽ tự refresh — đua nhau, phí request, và có thể vô hiệu token mới của nhau. Một promise chung nghĩa mọi caller await một refresh rồi thử lại.
+</details>
+
+**3.** Sao gọi `queryClient.clear()` khi logout?
+
+<details>
+<summary>Lời giải</summary>
+
+Cache giữ dữ liệu user trước (customer, hồ sơ). Không xóa, lần login kế có thể render thoáng dữ liệu cũ của user khác — rò riêng tư/bảo mật. `clear()` xóa cache để mỗi phiên bắt đầu sạch.
+</details>
+
+Nâng cao:dựng form `LoginPage` (react-hook-form + zod Phần 6) gọi `useLogin`, map 401 thành lỗi cấp form "sai thông tin", và chuyển về `location.state.from` sau thành công.
+
+---
+
+## Điểm chính
+
+- Access token **trong bộ nhớ**, refresh token trong **cookie `httpOnly`** — đừng `localStorage`.
+- `apiFetch` gắn token và làm **một refresh-và-thử-lại gộp khi 401**.
+- Mô hình phiên thành query `useCurrentUser`; chắn route bằng `RequireAuth`.
+- Login mồi cache; logout xóa token **và** `queryClient.clear()`.
+
+---
+
+## Tiếp theo
+
+**Phần 10 — Hiệu năng & bundle**: làm Pulse nhanh — chia code theo route, prefetch query khi hover và trong loader route, ranh giới Suspense, memo vs kỷ luật selector, và phân tích bundle production để tìm thứ cắt bớt.

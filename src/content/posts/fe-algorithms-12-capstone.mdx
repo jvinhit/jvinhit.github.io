@@ -1,0 +1,205 @@
+---
+title: 'Algorithms in Frontend · Part 12 — Capstone: Command Palette + Data Grid'
+description: 'Fuse all 11 parts into something real: a fuzzy command palette + virtualized data grid, multi-key sort, debounce, memoization, and safe highlight. Includes a performance checklist you can apply to your own project.'
+pubDate: 2026-07-23
+tags: [algorithms, capstone, performance, react, fe_algorithms_12]
+series: fe-algorithms
+seriesOrder: 12
+draft: true
+---
+
+Mười một phần trước, mỗi phần một thuật toán. Phần này ghép chúng lại thành hai tính năng mà ứng dụng "xịn" nào cũng có: một **command palette** kiểu VS Code/Linear, và một **data grid** chịu được 100.000 dòng. Mục tiêu không phải code production hoàn chỉnh, mà là thấy các mảnh khớp vào nhau như thế nào.
+
+---
+
+## 1. Bức tranh tổng thể
+
+Các thuật toán đã học và nơi chúng xuất hiện trong capstone:
+
+| Thuật toán | Phần | Dùng ở đâu trong capstone |
+|------------|------|---------------------------|
+| cấu trúc dữ liệu | 1 | `Set`/`Map` for selection, index |
+| Debounce | 2 | search box in palette & grid |
+| Fuzzy search | 3 | ranking commands in palette |
+| Virtualization | 4 | render 100,000-row grid |
+| Reconciliation / key | 5 | id keys so row state doesn't reset |
+| Memoization / LRU | 7 | cache filter + sort results |
+| Priority queue / time-slicing | 8 | background index without blocking UI |
+| Multi-key sort | 9 | sort grid by multiple columns |
+| Safe highlight | 10 | bold matched segments |
+
+---
+
+## 2. Command Palette
+
+Palette = ô input (debounce) → fuzzy search (xếp hạng) → danh sách kết quả (highlight). Tách logic khỏi UI bằng một hook thuần:
+
+```ts
+interface Command {
+  id: string;
+  label: string;
+  run: () => void;
+}
+
+interface PaletteResult {
+  command: Command;
+  score: number; // fuzzy score for ranking
+  matches: number[]; // matched character indices for highlight (Part 10)
+}
+
+function searchCommands(commands: Command[], query: string): PaletteResult[] {
+  if (!query) return commands.map((command) => ({ command, score: 0, matches: [] }));
+  const results: PaletteResult[] = [];
+  for (const command of commands) {
+    const scored = fuzzyScore(query, command.label); // from Part 3: returns { score, matches } or null
+    if (scored) results.push({ command, score: scored.score, matches: scored.matches });
+  }
+  return results.sort((a, b) => b.score - a.score); // higher score first → ranking
+}
+```
+
+```tsx
+function CommandPalette({ commands }: { commands: Command[] }) {
+  const [query, setQuery] = useState('');
+  const [debounced, setDebounced] = useState('');
+  const setQ = useDebouncedCallback(setDebounced, 120); // Part 2
+
+  // memo on (commands, query): recompute only when inputs change — Part 7
+  const results = useMemo(() => searchCommands(commands, debounced), [commands, debounced]);
+
+  return (
+    <div role="dialog" aria-label="Command palette">
+      <input
+        autoFocus
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value); // update input instantly (controlled)
+          setQ(e.target.value); // but search is debounced
+        }}
+      />
+      <ul role="listbox">
+        {results.map(({ command, matches }) => (
+          <li key={command.id} role="option" onClick={command.run}>
+            <Highlight text={command.label} matches={matches} /> {/* Part 10 */}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
+Hai quyết định "đúng chuẩn senior" ở đây: **input controlled cập nhật tức thì** (gõ không lag) nhưng **tìm kiếm debounce** (không tính mỗi phím), và **memo kết quả** để re-render do hover/focus không tính lại fuzzy.
+
+---
+
+## 3. Data Grid ảo hóa, lọc & sort
+
+Grid kết hợp: lọc (Phần 3) → sort đa khóa (Phần 9) → ảo hóa (Phần 4), với một LRU cache (Phần 7) cho pipeline lọc+sort để đổi cột sort không tính lại từ đầu khi cùng bộ lọc.
+
+```ts
+interface Row {
+  id: string;
+  name: string;
+  role: 'admin' | 'member';
+  createdAt: number;
+}
+
+// Pure pipeline, easy to test: filter → sort. Each step is explicit.
+function processRows(rows: Row[], query: string, sort: SortState): Row[] {
+  const q = query.trim().toLowerCase();
+  const filtered = q ? rows.filter((r) => r.name.toLowerCase().includes(q)) : rows;
+  return [...filtered].sort(makeComparator<Row>(sort)); // toSorted/copy for immutability — Part 9
+}
+
+// Cache by "query|sort" key so re-sorting with same filter doesn't rescan from scratch
+const pipelineCache = new LRUCache<string, Row[]>(8); // Part 7
+
+function getRows(rows: Row[], query: string, sort: SortState): Row[] {
+  const key = `${query}|${sort.key}|${sort.dir}`;
+  const cached = pipelineCache.get(key);
+  if (cached) return cached;
+  const result = processRows(rows, query, sort);
+  pipelineCache.set(key, result);
+  return result;
+}
+```
+
+```tsx
+function DataGrid({ rows }: { rows: Row[] }) {
+  const [query, setQuery] = useState('');
+  const [sort, setSort] = useState<SortState>({ key: 'name', dir: 'asc' });
+
+  const processed = useMemo(() => getRows(rows, query, sort), [rows, query, sort]);
+
+  // Virtualization: render only rows in the viewport (Part 4)
+  const [scrollTop, setScrollTop] = useState(0);
+  const { start, end, offsetY } = computeWindow(scrollTop, 600, 40, processed.length);
+
+  return (
+    <div>
+      <input placeholder="Filter by name" onChange={(e) => setQuery(e.target.value)} />
+      <Header sort={sort} onSort={setSort} />
+      <div style={{ height: 600, overflow: 'auto' }} onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}>
+        <div style={{ height: processed.length * 40 }} />
+        <div style={{ transform: `translateY(${offsetY}px)` }}>
+          {processed.slice(start, end).map((row) => (
+            <div key={row.id} style={{ height: 40 }}> {/* id key — Part 5 */}
+              {row.name} · {row.role}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+Lưu ý cách các phần khớp nhau: **ảo hóa** cần `key` theo id (Phần 5) để khi cuộn/sort lại React không reset DOM dòng; **memo + LRU** đảm bảo sort/lọc không tính lại thừa; **comparator** từ Phần 9 cắm thẳng vào.
+
+---
+
+## 4. Indexing nền không chặn UI
+
+Nếu cần xây index tìm kiếm nặng (ví dụ tiền-tính fuzzy key cho 100.000 dòng), làm lúc rảnh bằng time-slicing (Phần 8) để không chặn lần gõ đầu tiên:
+
+```ts
+function buildIndexInBackground(rows: Row[], onReady: (index: Map<string, string>) => void): void {
+  const index = new Map<string, string>();
+  let i = 0;
+  const step = (deadline: IdleDeadline) => {
+    while (i < rows.length && deadline.timeRemaining() > 1) {
+      index.set(rows[i].id, rows[i].name.toLowerCase()); // pre-normalize
+      i++;
+    }
+    if (i < rows.length) requestIdleCallback(step);
+    else onReady(index); // done → enable faster search
+  };
+  requestIdleCallback(step);
+}
+```
+
+---
+
+## 5. Checklist hiệu năng cho dự án của bạn
+
+Mang theo checklist này khi gặp UI chậm — nó tóm tắt cả series:
+
+1. **Đo trước** bằng `performance.now()` / tab Performance. Chậm CPU hay chậm DOM? (Phần 1).
+2. **Có vòng `O(n²)` ẩn không?** `find`/`includes`/`filter` trong vòng lặp → đổi sang `Map`/`Set`. (Phần 1).
+3. **Sự kiện dồn dập?** Debounce (search) hoặc throttle/rAF (scroll, resize). (Phần 2, 8).
+4. **Danh sách lớn?** Ảo hóa, giới hạn số dòng render. (Phần 3, 4).
+5. **Re-render thừa?** Key theo id, `React.memo`, ổn định identity props. (Phần 5, 7).
+6. **Tính lại cái không đổi?** Memoize, LRU/`WeakMap` cho cache có giới hạn. (Phần 7).
+7. **Việc nặng chặn luồng?** Time-slicing hoặc Web Worker. (Phần 8).
+8. **Sort sai/chậm?** Comparator đúng, `Intl.Collator`, Schwartzian transform. (Phần 9).
+9. **Xử lý chuỗi?** Highlight an toàn XSS, cẩn thận Unicode/grapheme. (Phần 10).
+10. **Animation giật?** Chỉ chạm `transform`/`opacity`, dùng FLIP, tôn trọng `prefers-reduced-motion`. (Phần 11).
+
+---
+
+## Kết series
+
+Thuật toán ở frontend hiếm khi là cài đặt một thuật toán kinh điển từ đầu. Phần lớn thời gian, nó là **nhận ra hình dạng bài toán** (đây là tìm kiếm, đây là cache, đây là lập lịch), **chọn đúng cấu trúc dữ liệu** (`Map` thay vì `Array`), và **làm ít việc hơn** (debounce, ảo hóa, memo). Khi bạn nhìn UI qua lăng kính đó, "tối ưu hiệu năng" không còn là phép thuật — mà là vài quyết định rõ ràng, đo được.
+
+Cảm ơn bạn đã đi hết 12 phần. Hãy mở một component đang chậm trong dự án của bạn và chạy thử checklist ở mục 5 — đó là cách tốt nhất để biến kiến thức này thành phản xạ.

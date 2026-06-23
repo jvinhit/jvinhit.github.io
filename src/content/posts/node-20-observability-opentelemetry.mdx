@@ -1,0 +1,163 @@
+---
+title: 'Node.js Super Senior · Phase 20 — Observability với OpenTelemetry'
+description: 'Bonus Phase 20 — finale: thấy bên trong hệ thống production. Ba trụ cột logs/metrics/traces, structured logging theo request, metrics RED/USE với Prometheus, và distributed tracing với OpenTelemetry.'
+pubDate: 2026-06-22
+tags: [nodejs, observability, opentelemetry, monitoring, node_10]
+series: nodejs
+seriesOrder: 20
+draft: false
+---
+
+Đây là **Bonus Phase 20**, phần đỉnh của nhánh vận hành. Bạn đã dựng API (Phase 3, 17), hệ phân tán (Phase 18), realtime (Phase 19), nền tảng dữ liệu (Phase 11–13). Câu hỏi cuối cùng phân biệt một engineer vận hành được production: **khi 2 giờ sáng có sự cố, bạn có thấy được chuyện gì đang xảy ra không?** Observability là kỹ năng đó.
+
+---
+
+## Monitoring vs Observability
+
+**Monitoring** trả lời câu hỏi bạn *biết trước* (CPU có cao không?). **Observability** cho bạn hỏi câu *chưa lường trước* mà không deploy lại ("vì sao đúng request này của đúng user này chậm 8 giây?"). Ba trụ cột làm nên nó:
+
+```text
+Logs    — sự kiện rời rạc, giàu ngữ cảnh   ("user 42 thanh toán thất bại: card_declined")
+Metrics — số liệu tổng hợp theo thời gian   (p99 latency, req/s, error rate)
+Traces  — hành trình một request xuyên các service  (đâu là chặng tốn 8s?)
+```
+
+---
+
+## Trụ cột 1 — Structured logging
+
+`console.log` không scale. Production cần **log JSON có cấu trúc** để máy truy vấn được. Dùng **pino** (nhanh nhất cho Node):
+
+```ts
+import pino from 'pino';
+const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
+
+logger.info({ userId: 42, orderId: 'o_1' }, 'order created');
+// → {"level":30,"time":...,"userId":42,"orderId":"o_1","msg":"order created"}
+```
+
+Chìa khóa là **correlation id**: gắn một `requestId` (và `traceId`) vào mọi log của cùng một request để ghép lại được. Dùng `AsyncLocalStorage` để truyền ngầm qua call stack mà không phải chuyền tham số khắp nơi:
+
+```ts
+import { AsyncLocalStorage } from 'node:async_hooks';
+const als = new AsyncLocalStorage<{ requestId: string }>();
+
+app.use((req, _res, next) => {
+  als.run({ requestId: req.headers['x-request-id'] ?? crypto.randomUUID() }, next);
+});
+
+// child logger tự đính requestId
+const log = () => logger.child({ requestId: als.getStore()?.requestId });
+```
+
+Quy tắc: **không bao giờ log secret/PII** (mật khẩu, token, thẻ — Phase 5/15). Redact chúng.
+
+---
+
+## Trụ cột 2 — Metrics (RED & USE)
+
+Metrics là số tổng hợp rẻ để lưu và vẽ dashboard/alert. Hai khung tư duy chuẩn:
+
+- **RED** (cho service/request): **R**ate (req/s), **E**rrors (tỉ lệ lỗi), **D**uration (latency p50/p95/p99).
+- **USE** (cho tài nguyên): **U**tilization, **S**aturation, **E**rrors.
+
+Phơi metrics cho **Prometheus** scrape bằng `prom-client`:
+
+```ts
+import client from 'prom-client';
+client.collectDefaultMetrics(); // CPU, memory, event loop lag...
+
+const httpDuration = new client.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Thời lượng request HTTP',
+  labelNames: ['method', 'route', 'status'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],
+});
+
+app.use((req, res, next) => {
+  const end = httpDuration.startTimer();
+  res.on('finish', () => end({ method: req.method, route: req.route?.path ?? 'unknown', status: res.statusCode }));
+  next();
+});
+
+app.get('/metrics', async (_req, res) => res.send(await client.register.metrics()));
+```
+
+Đo **event loop lag** đặc biệt quan trọng với Node — nó là tín hiệu sớm của việc chặn main thread (Phase 8). Alert trên **p99 latency** và **error rate**, không phải trung bình (trung bình giấu đuôi chậm).
+
+---
+
+## Trụ cột 3 — Distributed tracing với OpenTelemetry
+
+Đây là vũ khí mạnh nhất cho hệ phân tán (Phase 18). Một trace theo *một* request qua mọi service, mỗi chặng là một **span**, nối nhau bằng `traceId` truyền qua header.
+
+```text
+trace abc123
+├─ span: API Gateway        2ms
+│  └─ span: order-svc        120ms
+│     ├─ span: gRPC user-svc  15ms
+│     └─ span: DB query       95ms   ← thủ phạm: query chậm!
+```
+
+**OpenTelemetry** là chuẩn trung lập (không khóa nhà cung cấp). Auto-instrumentation cài rất ít code:
+
+```ts
+// tracing.ts — nạp TRƯỚC mọi thứ khác (node --require ./tracing.js)
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+
+const sdk = new NodeSDK({
+  traceExporter: new OTLPTraceExporter({ url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT }),
+  instrumentations: [getNodeAutoInstrumentations()], // tự trace http, express, prisma, redis, grpc...
+});
+sdk.start();
+```
+
+Auto-instrumentation tự tạo span cho Express, Prisma (Phase 12), Redis (Phase 13), gRPC (Phase 18) — và **truyền context** qua các service. Thêm span thủ công cho logic nghiệp vụ quan trọng:
+
+```ts
+import { trace } from '@opentelemetry/api';
+const tracer = trace.getTracer('order-svc');
+
+await tracer.startActiveSpan('charge-card', async (span) => {
+  try { await chargeCard(order); }
+  catch (e) { span.recordException(e as Error); throw e; }
+  finally { span.end(); }
+});
+```
+
+Xuất sang **Jaeger**, **Tempo**, hay **Grafana** để xem waterfall. Khi log, metric và trace cùng mang `traceId`, bạn nhảy từ một alert latency → đúng trace → đúng span chậm → đúng log của request đó. Đó là observability trọn vòng.
+
+---
+
+## Ghép ba trụ cột & alerting
+
+Sức mạnh đến từ **tương quan**: một `traceId` xuyên cả ba.
+
+```text
+Alert (metric p99 tăng) → mở trace mẫu (chậm ở DB span) → đọc log của traceId đó (query thiếu index)
+```
+
+Alert dựa trên **triệu chứng người dùng cảm nhận** (error rate, latency — SLO) chứ không phải nguyên nhân (CPU). Health check (Phase 7) `/healthz` + `/readyz` để orchestrator (K8s) biết khi nào restart/định tuyến.
+
+---
+
+## Thực hành — capstone observability
+
+Gắn quan sát vào hệ phân tán Phase 18:
+
+1. Thêm **pino** + `AsyncLocalStorage` đính `requestId` vào mọi log; redact secret.
+2. Phơi `/metrics` với `prom-client`; histogram latency theo route + default metrics (event loop lag).
+3. Bật **OpenTelemetry** auto-instrumentation trên cả `user-svc` và `order-svc`; xuất sang Jaeger.
+4. Thêm span thủ công quanh lời gọi gRPC và DB; cố ý làm chậm một query và tìm nó trong trace.
+5. Dựng dashboard Grafana RED + event loop lag; đặt alert p99 latency và error rate.
+6. Tái hiện một sự cố (tắt Redis) và dùng cả ba trụ cột để chẩn đoán.
+
+---
+
+## Kết thúc series
+
+Đây là phase cuối của **Node.js Super Senior** — và là tầng làm bạn *vận hành được* mọi thứ đã xây. Nhìn lại toàn cảnh: từ event loop (Phase 1) và HTTP (Phase 2), qua Express (Phase 3), dữ liệu (Phase 4, 11–13), auth (Phase 5, 15), patterns và kiến trúc (Phase 6, 10, 14), DevOps và hiệu năng (Phase 7–8), testing (Phase 9), rồi quy mô production: hàng đợi (Phase 16), GraphQL (Phase 17), microservices (Phase 18), realtime (Phase 19), và observability (Phase 20).
+
+Một super senior backend không chỉ viết code chạy — họ thiết kế hệ thống *chịu lỗi, scale được, và quan sát được*, đồng thời giải thích được vì sao mỗi quyết định là đúng. Bạn giờ có bản đồ đầy đủ. Việc còn lại là build, vận hành, và học từ production thật.

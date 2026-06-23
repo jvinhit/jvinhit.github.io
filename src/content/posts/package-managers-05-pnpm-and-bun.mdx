@@ -1,0 +1,228 @@
+---
+title: 'Node Package Managers · Part 5 — pnpm & the Content-Addressable Store (+ Bun)'
+description: 'How pnpm gets strictness, speed, and near-zero extra disk per project using a single global store with hardlinks and symlinks — plus where Bun fits as the fastest installer.'
+pubDate: 2026-06-20
+tags: [pnpm, bun, package-managers, monorepo, package_managers_12]
+series: package-managers
+seriesOrder: 5
+draft: false
+---
+
+Đây là **Phần 5 của series 12 phần** về package manager Node. Ta đã xong npm và cả hai Yarn. Giờ là **pnpm** — tool đã thành mặc định phổ biến của team năm 2026 — và một ghi chú cuối về **installer của Bun**.
+
+Lời chào của pnpm: tính nghiêm ngặt của Yarn PnP, nhưng với **`node_modules` thật** mà tool hiểu được. Nó đạt được nhờ một ý tưởng thông minh.
+
+---
+
+## 1. Store địa chỉ-theo-nội-dung
+
+npm và Yarn Classic copy package vào `node_modules` của *từng* project. Mười project dùng React = mười bản copy trên disk. pnpm từ chối làm vậy.
+
+Thay vào đó, mỗi version package được lưu **đúng một lần**, toàn cục, đánh địa chỉ bằng **hash nội dung**:
+
+```text
+~/.local/share/pnpm/store/v3/        ← the global content-addressable store
+  files/<hash-of-file-contents>      ← each unique file stored ONCE, ever
+{mỗi file duy nhất lưu một lần, vĩnh viễn}
+
+Two packages share an identical file (e.g. a LICENSE)?  Stored once.
+{Hai package có file giống hệt? Lưu một lần.}
+Same package version across 50 projects?               Stored once.
+{Cùng version package qua 50 project? Lưu một lần.}
+```
+
+Vì key là hash nội dung, file giống hệt tự động khử trùng — kể cả *giữa các package khác nhau*.
+
+---
+
+## 2. Hardlink + symlink = layout ma thuật
+
+`node_modules` của project được lắp từ hai lớp:
+
+```text
+1) The "real" packages live under a hidden folder, HARDLINKED from the store
+   (a hardlink = another name for the SAME bytes on disk, ~free):
+
+   node_modules/.pnpm/react@19.1.4/node_modules/react/...   ← hardlink → store
+   node_modules/.pnpm/react-dom@19.1.4/node_modules/...     ← hardlink → store
+
+2) Your DIRECT deps are exposed at the top via SYMLINKS into .pnpm:
+
+   node_modules/react      → symlink → .pnpm/react@19.1.4/node_modules/react
+   node_modules/react-dom  → symlink → .pnpm/react-dom@19.1.4/...
+   (lodash is NOT symlinked at top → you can't import it = strict)
+{lodash KHÔNG được symlink ở top → không import được = nghiêm ngặt}
+```
+
+Đây là toàn bộ thiết kế:
+
+- **Hardlink** nghĩa byte không bao giờ bị copy — "cài mới" một package đã cache gần như miễn phí.
+- **Symlink** chỉ phơi bày dependency bạn **đã khai báo** ở top level. Dependency transitive nằm dưới `.pnpm/` và vô hình với code của bạn.
+
+Layout symlink đó là thứ diệt **phantom dependency** — mà không bỏ thư mục `node_modules` thật.
+
+---
+
+## 3. Nghiêm ngặt, nhưng tương thích
+
+pnpm trúng điểm cân bằng mà các tool khác bỏ lỡ:
+
+```text
+                Phantom deps  Disk (10 projs)  Real node_modules  Tooling friction
+npm             ✗ allowed     ~10x             ✓ yes              none
+Yarn Classic    ✗ allowed     ~10x             ✓ yes              none
+Yarn Berry PnP  ✓ blocked     small (zips)     ✗ no               HIGH
+pnpm            ✓ blocked     ~1–2x            ✓ yes              LOW   ← sweet spot
+{điểm cân bằng}
+```
+
+Cái giá đánh đổi: vài tool hiếm không theo symlink đúng và cần config. Và migrate *sang* pnpm thường lộ ra phantom dep từng chạy âm thầm — bạn sửa một lần, rồi hưởng đúng đắn mãi mãi.
+
+### `node-linker` — chọn độ nghiêm ngặt
+
+Khi một tool cứng đầu không chịu được symlink, pnpm cho cách dự phòng qua `node-linker`:
+
+```ini
+# .npmrc
+node-linker=isolated     # default: symlinked, strict (the design above)
+# node-linker=hoisted    # build a flat npm-style node_modules (lose strictness)
+# node-linker=pnp        # Plug'n'Play, like Yarn Berry (no node_modules)
+shamefully-hoist=true    # nuclear option: hoist EVERYTHING to top (max compat)
+```
+
+Tên `shamefully-hoist` là sự tự giễu cố ý của tác giả pnpm: nó vá tool hỏng nhưng tái xuất hiện phantom dependency, nên chỉ dùng như phương án cuối.
+
+### Vá dep & hook install
+
+Như Berry, pnpm có luồng patch tích hợp và một file hook lập trình được:
+
+```bash
+pnpm patch left-pad           # edit a copy → pnpm patch-commit writes patches/
+```
+
+```js
+// .pnpmfile.cjs — rewrite dependency metadata BEFORE resolution
+// (e.g. strip a bad peer dep, or block a package entirely)
+function readPackage(pkg) {
+  if (pkg.name === 'some-lib') delete pkg.dependencies['unwanted'];
+  return pkg;
+}
+module.exports = { hooks: { readPackage } };
+```
+
+`.pnpmfile.cjs` mạnh nhưng bản thân là code chạy khi resolution — coi nó là config tin cậy, đã review, không phải bãi rác.
+
+---
+
+## 4. Bộ lệnh pnpm
+
+pnpm cố ý phản chiếu npm, nên trí nhớ cơ bắp chuyển được:
+
+```bash
+pnpm install                  # install using the global store
+pnpm add react                # add a dependency
+pnpm add -D vite              # add a devDependency
+pnpm install --frozen-lockfile# CI: fail if pnpm-lock.yaml would change
+pnpm dlx create-vite          # npx equivalent
+pnpm -r run build             # run "build" in every workspace package (recursive)
+pnpm --filter web dev         # target a single workspace package
+pnpm why lodash               # explain the dependency
+pnpm store prune              # garbage-collect unreferenced store files
+```
+
+Hai thứ thiết yếu riêng của pnpm: `--filter` để nhắm monorepo (tốt nhất — Phần 11) và `pnpm store prune` để thu hồi disk từ store toàn cục.
+
+### `clone` (reflink) — còn rẻ hơn hardlink
+
+Trên filesystem copy-on-write (APFS trên macOS, Btrfs/XFS trên Linux) pnpm có thể dùng **reflink** thay hardlink:
+
+```ini
+# .npmrc
+package-import-method=clone   # reflink (CoW): a writable copy that shares
+                              # the same blocks until modified — best of both
+# fallback order if clone is unsupported: clone → hardlink → copy
+```
+
+Reflink hơn hardlink vì **an toàn để sửa**: một postinstall sửa file sẽ không làm hỏng store dùng chung, vì việc ghi kích hoạt copy-on-write tách. Với hardlink thuần, store và project trỏ tới đúng cùng byte.
+
+### `dedupe-peer-dependents` — ít peer trùng
+
+pnpm đôi khi cài một dependency nhiều lần vì các package cần nó với *ngữ cảnh peer* khác nhau. Cài đặt `dedupe-peer-dependents=true` (mặc định ở pnpm gần đây) gộp chúng khi an toàn, thu nhỏ cây. Nếu bạn thấy bản trùng bất ngờ, đây là nút đầu tiên cần kiểm tra.
+
+---
+
+## 5. Các nút `.npmrc` hữu ích cho pnpm
+
+pnpm đọc `.npmrc` cộng cài đặt riêng. Vài cái quan trọng:
+
+```ini
+# .npmrc
+# How to materialize the store into node_modules:
+#   hardlink (default) | copy | clone (reflink, best on APFS/Btrfs)
+package-import-method=hardlink
+
+# Loosen strictness for a stubborn dependency by hoisting a pattern:
+public-hoist-pattern[]=*eslint*
+
+# Refuse to run install scripts unless explicitly allowed (security, Part 10):
+# (pnpm 10 changed the default — dependency build scripts are NOT run
+#  automatically; you allow-list them.)
+```
+
+> pnpm 10 đổi **mặc định bảo mật** đáng chú ý: build script lifecycle của dependency **không** chạy tự động — bạn opt-in từng package. Ta sẽ xem lại ở Phần 7 và 10.
+
+---
+
+## 6. Installer của Bun nằm ở đâu
+
+`bun install` là package manager độc lập viết bằng Zig — thường là **installer nhanh nhất**, thường nhanh hơn npm 10–25 lần khi cold:
+
+```text
+bun install
+  → resolve → global cache (~/.bun/install/cache, hardlinked)
+  → HOISTED node_modules (npm-compatible layout) → bun.lock (text since 1.2)
+```
+
+Khác biệt then chốt với pnpm: Bun dùng layout **hoisted** như npm, nên chia sẻ sự lỏng lẻo phantom-dependency của npm — nó tối ưu cho tốc độ thô, không phải nghiêm ngặt.
+
+```bash
+bun install                   # blazing cold installs → bun.lock
+bun add react                 # add a dependency
+bun install --frozen-lockfile # CI
+bunx vite                     # fast npx equivalent
+```
+
+Khi nào dùng installer của Bun: bạn muốn install dev/CI **nhanh nhất có thể**, bạn đã dùng Bun runtime, hoặc app mới sẵn sàng dùng tool mới.
+
+---
+
+## 7. Quyết định mặc định 2026
+
+```text
+Most new projects / teams      → pnpm  (speed + disk + strict + real node_modules)
+Monorepos of any size          → pnpm --filter  (± Turborepo/Nx)
+Absolute fastest installs      → Bun   (hoisted, less strict, very fast)
+Strict + zero-installs, PnP-OK → Yarn Berry (Part 4)
+Maximum compatibility / tiny   → npm
+```
+
+Trên thực tế: **pnpm là mặc định hiện đại an toàn**; Bun khi tốc độ install chiếm ưu thế; còn lại theo ràng buộc.
+
+---
+
+## Giờ bạn đã biết gì
+
+- pnpm lưu mỗi version **một lần** trong store địa chỉ-theo-nội-dung toàn cục.
+- **Hardlink** + **symlink** cho tốc độ, disk nhỏ, và nghiêm ngặt — với `node_modules` thật.
+- Installer của Bun nhanh nhất nhưng **hoisted**.
+- pnpm là mặc định 2026 thực dụng cho phần lớn team.
+
+---
+
+## Bài tập
+
+1. Cài cùng dep bằng npm ở hai project, rồi pnpm ở hai project; so tổng disk.
+2. Trong project pnpm, theo symlink top-level vào `.pnpm/`.
+3. Thử import dep transitive chưa khai báo dưới pnpm và xác nhận nó fail như Yarn PnP.
+
+Tiếp theo — Phần 6: Lockfile, tính xác định & integrity:

@@ -22,6 +22,53 @@ export interface SeriesMeta {
 }
 
 export const SERIES: Record<string, SeriesMeta> = {
+  'tanstack-query': {
+    title: 'TanStack Query (React Query) — từ Zero đến Production',
+    blurb:
+      'Series tiếng Việt đưa bạn từ "fetch dữ liệu bằng useEffect + useState" đến làm chủ server state với TanStack Query (React Query) v5 một cách chuyên nghiệp. Bắt đầu với mental model — vì sao server state khác client state và vì sao không nên tự viết fetch tay — rồi cài đặt QueryClient, Provider và Devtools cho query đầu tiên. Tiếp đó đào sâu useQuery (status vs fetchStatus, loading/error/empty), staleTime/gcTime và vòng đời cache, hệ query key phân cấp cùng API client validate bằng zod và queryOptions. Bạn sẽ học dependent/parallel queries, pagination và useInfiniteQuery cho infinite scroll, mutations với invalidate, optimistic update (onMutate/rollback) và quản lý cache thủ công, rồi error handling, retry, Suspense và tối ưu hiệu năng (select, structural sharing, prefetch). Kết thúc bằng phần testing với MSW + React Testing Library và một capstone build feature CRUD hoàn chỉnh. Mỗi bài có code TypeScript/React 19 chạy được và bài tập thực hành.',
+    pin: 3,
+  },
+  'service-workers': {
+    title: 'Service Workers & PWA — từ Zero đến Production',
+    blurb:
+      'Series tiếng Việt đưa bạn từ "service worker là cái gì" đến chỗ tự tin xây dựng một Progressive Web App offline-first chạy thật. Bắt đầu với mental model — service worker là một network proxy chạy nền, vòng đời (lifecycle) và vì sao nó khác Web Worker — rồi đào sâu lifecycle (install, activate, waiting, skipWaiting, clients.claim, update flow) và cách debug trong DevTools. Tiếp đó là chặn request với fetch event và respondWith, Cache API cùng các caching strategy kinh điển (cache-first, network-first, stale-while-revalidate), kiến trúc app shell offline-first và trang fallback, rồi advanced caching (versioning, cleanup, expiration, opaque/CORS). Phần sau là các năng lực nâng cao của nền tảng: Background Sync để retry request thất bại bằng hàng đợi IndexedDB, Push Notifications với Push API + VAPID, và Workbox để giảm boilerplate (precaching, routing, vite-plugin-pwa) — kết bằng capstone build một PWA hoàn chỉnh: manifest, install prompt, update UX, testing và deploy. Mỗi bài có ví dụ code chạy được và bài tập thực hành kèm hướng dẫn.',
+    pin: 2,
+  },
+  'browser-internals': {
+    title: 'How Browsers Work — Internals Deep Dive',
+    blurb:
+      'A bilingual (English-first) journey under the hood of the browser, the runtime every frontend engineer ships to but few truly understand. Start with the multi-process architecture (browser, renderer, GPU, network processes, sandboxing and site isolation), then follow a navigation from URL to pixels. Go deep on the rendering pipeline: HTML parsing and the DOM, CSS and the CSSOM, the render tree, layout/reflow, paint, layers and compositing — and exactly what triggers each. Then the JavaScript engine (V8): parsing, bytecode, the JIT, hidden classes and inline caches; the event loop, tasks, microtasks and the rendering steps; memory management and garbage collection. Finish with the platform layers — networking and HTTP caching, storage (cookies, localStorage, IndexedDB, Cache API, service workers), and the browser security model (same-origin policy, CORS, CSP, site isolation) — capped by a capstone that turns this mental model into sharper performance debugging in DevTools. Every part connects internals to code you actually write.',
+  },
+  'web-a11y': {
+    title: 'Web Accessibility (a11y) — From Zero to Inclusive',
+    blurb:
+      'A bilingual (English-first) deep dive into building web UIs everyone can use. Start with the mental model — why accessibility matters, the POUR principles, disabilities and how assistive technology actually works — then the foundation of semantic HTML and a pragmatic ARIA deep dive (roles, states, live regions, and the rules for when NOT to use ARIA). Master keyboard accessibility and focus management in SPAs (tab order, skip links, focus traps, roving tabindex, dialogs and route changes), accessible forms (labels, fieldsets, errors, aria-describedby), accessible names and image alternatives, and the visual layer (color contrast, zoom, reduced motion, focus indicators). Then build real accessible components following the WAI-ARIA Authoring Practices, test with screen readers (VoiceOver/NVDA) and automated tools (axe-core, eslint-plugin-jsx-a11y, Playwright), and finish with a capstone that audits a real page end-to-end against WCAG and bakes accessibility into your workflow. Every part ships runnable TypeScript/React examples.',
+  },
+  'web-perf': {
+    title: 'Web Performance & Core Web Vitals',
+    blurb:
+      'Series tiếng Việt đưa bạn từ "trang chậm mà không biết tại sao" đến làm chủ hiệu năng web một cách có hệ thống. Bắt đầu với mental model và RAIL, rồi hiểu sâu ba chỉ số Core Web Vitals (LCP, INP, CLS) — định nghĩa, ngưỡng, và khác biệt giữa đo lab và đo field. Tiếp đó là bộ công cụ đo (Lighthouse, tab Performance, WebPageTest, CrUX, RUM), critical rendering path và cách tài nguyên chặn render, rồi đi tối ưu từng chỉ số: LCP (ảnh, font, phản hồi server, resource hints), INP (long task, chia nhỏ việc, web worker), CLS (đặt chỗ trước, font swap). Phần sau đào vào hiệu năng JavaScript (bundle, code splitting, tree shaking), tối ưu ảnh/media (AVIF/WebP, responsive, lazy), chiến lược nạp font, mạng và caching (HTTP cache, CDN, nén, HTTP/2-3, service worker) — kết bằng capstone audit một trang thật, đặt performance budget và giám sát trong CI. Mỗi phần có code và ví dụ đo được.',
+  },
+  'fe-algorithms': {
+    title: 'Thuật toán hay áp dụng trong Frontend',
+    blurb:
+      'Series tiếng Việt đi sâu vào những thuật toán mà frontend engineer thực sự dùng hằng ngày — không phải LeetCode, mà là code chạy trong trình duyệt. Bắt đầu từ mental model và cách đo độ phức tạp trong môi trường browser, rồi tới debounce/throttle, tìm kiếm & lọc client-side (binary search, fuzzy search), ảo hóa danh sách lớn, diffing & reconciliation của Virtual DOM, cây và đồ thị trong UI, memoization và LRU cache, scheduling với priority queue và time-slicing, sắp xếp với comparator phức tạp, thuật toán chuỗi (highlight, text-diff, autocomplete), hình học cho animation và drag-drop — và một capstone gộp tất cả vào một "command palette + data grid". Mỗi phần có code TypeScript/React chạy được và giải thích cặn kẽ tại sao.',
+  },
+  'fe-patterns': {
+    title: 'Design Patterns hay dùng trong Frontend Web',
+    blurb:
+      'Series tiếng Việt về các mẫu thiết kế (design pattern) mà frontend engineer hiện đại dùng để giữ codebase sạch và mở rộng được. Khởi đầu với mental model "pattern là gì, khi nào nên/không nên dùng" và SOLID nhìn qua lăng kính frontend, rồi đi qua Module & Singleton, Observer & Pub/Sub (nền tảng của reactivity/signals), Factory, Strategy, Command (undo/redo), Facade & Adapter (chống vendor lock-in), Decorator & Proxy (HOC, logging, reactive), các pattern composition đặc trưng React (Compound Components, Render Props, Custom Hooks), state patterns (Flux/Redux, State Machine), Container/Presentational, MVVM và dependency injection — kết bằng một capstone refactor một feature rối thành code gọn gàng. Toàn bộ có ví dụ TypeScript/React thực tế.',
+  },
+  stocks: {
+    title: 'Đầu tư Cổ phiếu — từ Zero đến Tự tin',
+    blurb:
+      'A complete, bilingual, education-only path into stock investing — from "what even is a share?" to a written process you can actually follow. Start with the owner mindset and why markets exist, how exchanges, brokers and orders really work, then read the three financial statements and spot accounting games. Go deep on valuation (P/E, P/B, EV/EBITDA, ROE/ROIC) and the price lens (chart patterns, candlesticks, moving averages, RSI, MACD, volume). Then the parts that separate gamblers from investors: building a diversified portfolio, position sizing and risk management, the behavioral biases that wreck returns, long-term compounding with dividends and index funds/ETFs, reading macro and sector cycles, and a capstone that fuses fundamentals, technicals, risk and psychology into one repeatable checklist. Not financial advice.',
+  },
+  'package-managers': {
+    title: 'Node Package Managers & the Supply Chain — Deep Dive',
+    blurb:
+      'Go from "I just run npm install" to understanding the entire dependency layer like a senior. Start with the mental model every package manager shares (resolve → fetch → link, package.json, semver, the registry, lockfiles), then go deep on npm, Yarn Classic (v1), Yarn Berry (v2–v4) with Plug\'n\'Play, and pnpm plus Bun — what each does differently and why. Then the parts most guides skip: lockfiles and integrity hashes, lifecycle scripts and node-gyp, how native modules ship prebuilt binaries, and the dependency supply chain — real-world attacks (typosquatting, dependency confusion, malicious postinstall, account takeover) and a hardened defense playbook. Ends with monorepos/workspaces and a capstone decision-and-migration guide.',
+  },
   ai: {
     title: 'AI for Developers — LLMs, Agents & Coding',
     blurb:
@@ -37,6 +84,11 @@ export const SERIES: Record<string, SeriesMeta> = {
     title: 'Design Patterns in TypeScript',
     blurb:
       'The classic design patterns every senior web engineer should have at hand, explained with runnable TypeScript.',
+  },
+  'ts-challenges': {
+    title: 'TypeScript Type Challenges — Zero to Type Wizard',
+    blurb:
+      'Master type-level programming by solving the famous type-challenges, one concept at a time. Start with the five building blocks and a guided tour, then go deep on mapped types, conditional types and distribution, infer, recursion over tuples, union manipulation, template-literal string math, type-level arithmetic, the hard utility types, parsers and state machines, and a few extreme challenges — finishing with a capstone that turns it all into a reusable typed library. Every challenge shows the goal first, hides the answer behind a toggle, then explains the solution step by step. Solutions follow the canonical community approaches from the MIT-licensed type-challenges project.',
   },
   'web-security': {
     title: 'Web Security for Frontend Devs',
@@ -94,9 +146,19 @@ export const SERIES: Record<string, SeriesMeta> = {
       'Master Vite 8 from the ground up — every part ships a real config and a live, interactive demo. Start with the native-ESM mental model and your first project, then the vite.config.ts anatomy, the dev server and on-demand transform, dependency pre-bundling, HMR internals, CSS and static assets, glob imports, env vars and modes, the Rollup-compatible plugin API, production builds with Rolldown, library mode plus the SSR/Environment API, and finish with performance tuning, a capstone config, and migrating off Webpack/CRA.',
   },
   'tailwind-ui': {
-    title: 'Tailwind, Radix & shadcn/ui — Zero to Pro',
+    title: 'Tailwind, Radix & shadcn/ui — từ Zero đến Pro',
     blurb:
-      'Become fluent in the modern React styling stack — every part ships real config and a live, interactive demo. Start with the Tailwind CSS v4 mental model and setup, then core utilities and layout, design tokens and theming, variants and state composition, and building reusable components the right way (clsx, tailwind-merge, cn, cva) plus the plugin ecosystem. Then go headless and accessible with Radix UI primitives, adopt shadcn/ui (philosophy, CLI, components.json), theme and customize it, build validated forms with react-hook-form + zod, and finish with pro patterns and a dashboard capstone.',
+      'Series tiếng Việt giúp bạn thành thạo bộ công cụ styling React hiện đại — mỗi phần đều có config thật và một demo tương tác trực tiếp. Bắt đầu với tư duy nền tảng và cài đặt Tailwind CSS v4, rồi tới utility cốt lõi và layout, design token và theming, variant và kết hợp trạng thái, cách dựng component tái dùng cho đúng (clsx, tailwind-merge, cn, cva) cùng hệ sinh thái plugin. Tiếp đó đi headless và accessible với Radix UI primitives, áp dụng shadcn/ui (triết lý, CLI, components.json), theme và tùy biến nó, dựng form đã validate với react-hook-form + zod, và kết thúc bằng các mẫu chuyên nghiệp cùng capstone dashboard.',
+  },
+  vue: {
+    title: 'Vue.js 3 — từ Zero đến Production',
+    blurb:
+      'Series tiếng Việt đưa bạn từ "Vue là gì" đến làm chủ Vue 3 hiện đại theo phong cách production: Composition API, TypeScript và Vite. Bắt đầu với mental model — reactivity là gì, Single-File Component, và vì sao Vue khác React — rồi cú pháp template và directive (v-bind, v-if, v-for, v-on, v-model), đào sâu hệ reactivity (ref, reactive, computed, watch/watchEffect và các bẫy thường gặp). Tiếp đó là component thực thụ (props, emits, slots, provide/inject), Composition API và composable để tái dùng logic, form và v-model tùy biến, định tuyến với Vue Router, quản lý state với Pinia, xử lý bất đồng bộ/Suspense/data fetching, dùng TypeScript đúng cách với Vue, tối ưu hiệu năng, và kết bằng phần testing (Vitest + Vue Test Utils) cùng một capstone. Mỗi phần có code chạy được và bài tập thực hành.',
+  },
+  'react-stack': {
+    title: 'Build a Real React App — The Production Stack',
+    blurb:
+      "The hands-on sequel to the Tailwind/Radix/shadcn series: build one real app — \"Pulse\", a small CRM/SaaS dashboard — end-to-end with the modern React production stack. Start by scaffolding with pnpm, Vite and TypeScript strict, plus oxlint + oxfmt for fast linting and formatting, then lay the Tailwind v4 + shadcn/ui foundation and an app shell. Wire routing and architecture with React Router v7 (data mode), then master server state with TanStack Query — typed query keys, caching, mutations and optimistic updates with rollback. Build validated forms with react-hook-form + zod, manage genuine client state with Zustand, and ship a real feature: a data table with filters and URL-as-state. Add an auth + API layer, then tune performance (code splitting, prefetching, bundle analysis) and lock in quality with Vitest, React Testing Library and MSW. Finish with a capstone that assembles a full feature flow and a pnpm + oxlint GitHub Actions CI pipeline.",
   },
   threejs: {
     title: 'Three.js from Zero to Senior',

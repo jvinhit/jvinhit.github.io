@@ -1,0 +1,156 @@
+---
+title: 'Web Performance · Part 18 — Memory & Long-Session Performance'
+description: 'Vì sao SPA chậm dần sau nhiều giờ: rò rỉ bộ nhớ, detached DOM, listener/timer không gỡ, đo bằng heap snapshot và measureUserAgentSpecificMemory, và giữ app nhẹ qua phiên dài.'
+pubDate: 2026-09-21
+tags: [performance, memory, leaks, spa, web_perf_12]
+series: web-perf
+seriesOrder: 18
+draft: true
+---
+
+Hầu hết bài viết hiệu năng tập trung vào *lúc tải*. Nhưng với SPA và app dùng lâu (email, dashboard, editor mở cả ngày), vấn đề lớn lại là **suy giảm theo thời gian**: trang khởi đầu nhanh rồi chậm dần, giật hơn, cuối cùng tab "ngốn" hàng GB. Thủ phạm thường là **rò rỉ bộ nhớ**. Phần này dạy cách phát hiện và ngăn chúng.
+
+> Khác biệt then chốt: hiệu năng tải đo một lần; hiệu năng phiên dài là tích lũy. Một rò rỉ nhỏ mỗi lần điều hướng, nhân với hàng trăm lần điều hướng trong một phiên, thành thảm họa.
+
+---
+
+## 1. Rò rỉ trong JS nghĩa là gì
+
+GC thu hồi mọi thứ *không còn reachable* từ root. Rò rỉ xảy ra khi object **vẫn reachable** (còn tham chiếu) nhưng app *không còn cần* — GC không thể đoán ý định, chỉ thấy tham chiếu.
+
+```text
+Bốn nguồn rò rỉ phổ biến nhất:
+  ① Listener/observer/timer không gỡ khi component unmount
+  ② Detached DOM (node bị xóa khỏi cây nhưng JS vẫn giữ)
+  ③ Cache/Map/mảng phình mãi không xóa
+  ④ Closure giữ object lớn sống lâu hơn cần thiết
+```
+
+Trong SPA, component mount/unmount liên tục; mỗi lần quên gỡ một listener là một mảnh bộ nhớ kẹt lại vĩnh viễn.
+
+---
+
+## 2. Listener & timer — gỡ theo vòng đời
+
+Nguồn rò rỉ số một trong SPA: đăng ký listener/timer/observer khi mount mà không gỡ khi unmount.
+
+```ts
+// ❌ Rò rỉ: listener + interval sống mãi, giữ cả closure + element
+function mount(el: HTMLElement) {
+  window.addEventListener('resize', () => layout(el));
+  setInterval(() => poll(el), 1000);
+  new ResizeObserver(() => layout(el)).observe(el);
+  // không có đường gỡ → mỗi lần mount lại thêm rò rỉ
+}
+
+// ✅ Teardown đối xứng với AbortController
+function mount(el: HTMLElement) {
+  const ctrl = new AbortController();
+  window.addEventListener('resize', () => layout(el), { signal: ctrl.signal });
+  const id = setInterval(() => poll(el), 1000);
+  const ro = new ResizeObserver(() => layout(el));
+  ro.observe(el);
+
+  return () => { ctrl.abort(); clearInterval(id); ro.disconnect(); }; // gọi khi unmount
+}
+```
+
+`AbortController` + `{ signal }` gỡ nhiều listener bằng một `abort()` — gọn và khó quên hơn nhiều `removeEventListener`. Framework (React `useEffect` cleanup, Vue `onUnmounted`) cung cấp móc gỡ; *luôn* dùng chúng.
+
+---
+
+## 3. Detached DOM — kẻ rò rỉ phổ biến
+
+Khi gỡ node khỏi DOM nhưng JS vẫn giữ tham chiếu, node đó (và cả cây con) thành **detached** — không hiển thị nhưng vẫn tốn bộ nhớ.
+
+```ts
+// ❌ giữ tham chiếu tới node đã bị xóa khỏi cây
+const cache = new Map<string, HTMLElement>();
+function show(id: string) {
+  const el = document.getElementById(id)!;
+  cache.set(id, el);          // cache giữ mãi
+  el.remove();                // xóa khỏi DOM nhưng cache vẫn giữ → detached
+}
+
+// ✅ giải phóng khi không cần, hoặc dùng WeakMap để không cản GC
+const meta = new WeakMap<HTMLElement, Info>(); // key không bị giữ sống
+```
+
+`WeakMap`/`WeakSet` lý tưởng cho metadata gắn theo DOM node: khi node bị xóa khỏi mọi nơi khác, entry tự biến mất.
+
+---
+
+## 4. Săn rò rỉ với heap snapshot
+
+DevTools → **Memory** → Heap snapshot. Quy trình **three-snapshot** xác nhận rò rỉ:
+
+```text
+1. Snapshot 1 (baseline) ở trạng thái ổn định
+2. Thực hiện thao tác lặp lại NHIỀU LẦN rồi quay về trạng thái đầu
+   (vd: mở/đóng modal 20 lần, điều hướng qua lại 20 lần)
+3. Snapshot 2 → so sánh (Comparison view)
+4. Object nào tăng TUYẾN TÍNH theo số lần lặp = rò rỉ
+```
+
+```text
+Trong snapshot, chú ý:
+  - lọc "Detached" → thấy node DOM mồ côi
+  - Retained size lớn → "thủ phạm" giữ nhiều thứ
+  - Retainers → lần ngược chuỗi tham chiếu tới root (dây neo cần cắt)
+```
+
+Tab **Performance** → bật "Memory" checkbox: nếu đường JS heap **tăng dần không bao giờ về** sau GC (răng cưa đi lên thay vì phẳng), bạn có rò rỉ.
+
+---
+
+## 5. Đo bộ nhớ trong production
+
+`performance.measureUserAgentSpecificMemory()` đo bộ nhớ thật của tab (gồm cả DOM, worker), dùng được trong RUM — nhưng cần **cross-origin isolation** (COOP/COEP).
+
+```ts
+// Cần crossOriginIsolated === true (header COOP + COEP)
+if (crossOriginIsolated && performance.measureUserAgentSpecificMemory) {
+  const result = await performance.measureUserAgentSpecificMemory();
+  report('memory', result.bytes); // theo dõi xu hướng theo thời gian phiên
+}
+```
+
+```ts
+// performance.memory (cũ, chỉ Chrome, không chuẩn) — chỉ dùng để debug nhanh
+const heap = (performance as any).memory?.usedJSHeapSize;
+```
+
+Theo dõi bộ nhớ theo *thời lượng phiên* trong RUM: nếu bộ nhớ trung bình tăng theo số phút/điều hướng, đó là tín hiệu rò rỉ ở production mà heap snapshot cục bộ có thể bỏ sót.
+
+---
+
+## 6. Page Lifecycle — hợp tác với trình duyệt
+
+Trình duyệt có thể đóng băng/loại bỏ (discard) tab nền để lấy lại bộ nhớ. App phiên dài nên hợp tác: lưu trạng thái sớm và nhả tài nguyên khi ẩn.
+
+```ts
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    saveState();          // lưu ngay — tab có thể bị discard
+    pausePolling();       // dừng timer/kết nối không cần khi ẩn
+    flushRUM();           // gửi metric bằng sendBeacon (Part 13)
+  } else {
+    resumePolling();
+  }
+});
+```
+
+Dừng polling/animation/WebSocket khi tab ẩn vừa tiết kiệm pin/CPU vừa giảm tích lũy bộ nhớ — và giúp tab đủ điều kiện vào BFCache (điều hướng back/forward tức thì).
+
+---
+
+## 7. Tóm tắt
+
+- Hiệu năng phiên dài là **tích lũy**: rò rỉ nhỏ × nhiều điều hướng = app chậm dần, tốn GB.
+- Nguồn rò rỉ chính: **listener/timer/observer không gỡ**, **detached DOM**, cache phình, closure giữ object lớn.
+- Gỡ theo vòng đời bằng **`AbortController` + `{ signal }`** / cleanup của framework; dùng **`WeakMap`/`WeakSet`** cho metadata gắn DOM.
+- Săn rò rỉ bằng **three-snapshot** (object tăng tuyến tính = rò rỉ), lọc "Detached", xem retained size + retainers; theo dõi JS heap tăng-không-về trong Performance.
+- Đo production bằng **`measureUserAgentSpecificMemory`** (cần cross-origin isolation); theo dõi bộ nhớ theo thời lượng phiên trong RUM.
+- Hợp tác **Page Lifecycle**: lưu sớm + nhả tài nguyên khi `visibilitychange → hidden`; giúp cả BFCache.
+
+**Phần tiếp theo:** Network protocol & transport — HTTP/2 vs HTTP/3 (QUIC), head-of-line blocking, nén Brotli/Zstd, TLS 0-RTT, CDN/edge, và cache-control nâng cao.

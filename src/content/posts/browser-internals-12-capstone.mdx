@@ -1,0 +1,207 @@
+---
+title: 'How Browsers Work · Part 12 — Capstone: Debugging Performance Through Internals'
+description: 'Turn the whole series into a debugging superpower: read a DevTools Performance trace through the lens of processes, threads, the rendering pipeline and the event loop, and map symptoms to root causes.'
+pubDate: 2026-10-27
+tags: [browser, internals, performance, devtools, debugging, browser_internals_12]
+series: browser-internals
+seriesOrder: 12
+draft: true
+---
+
+Mười một phần rồi, bạn biết trình duyệt không phải hộp đen — nó là tiến trình, luồng, pipeline, và chính sách với nút thắt dự đoán được. Capstone này biến kiến thức đó thành **siêu năng debug**: khi trang chậm hay giật, bạn ngừng đoán và bắt đầu **đọc bằng chứng**.
+
+Quy trình luôn giống nhau:
+
+```text
+1. Reproduce  →  2. Measure (DevTools)  →  3. Map to internals  →  4. Fix at the right layer
+     ↑                                                              │
+     └──────────────── verify improvement ──────────────────────────┘
+```
+
+Ta đi qua trace Performance, bảng triệu chứng→nguyên nhân gắn mọi phần trước, fix mà internals gợi ý, và tóm tắt một trang cả series.
+
+---
+
+## 1. Trước khi profile: biết "chậm" nghĩa là gì
+
+Hiệu năng không phải một con số. Định nghĩa vấn đề user thấy trước:
+
+| Symptom | Likely metric | Liên kết phần |
+|---------|---------------|-------------------------------|
+| Blank screen too long | LCP, First Contentful Paint | Parts 2, 4, 9 |
+| Tap feels laggy | INP, long tasks | Parts 6, 7 |
+| Scroll stutters | Frame drops, layout/paint cost | Part 5 |
+| Content jumps | CLS | Parts 2, 5 |
+| Tab eats RAM over time | Heap growth | Part 8 |
+| Console security errors | SOP/CORS/CSP | Part 11 |
+
+Tái hiện với **throttling** khớp user: giảm CPU (4× hoặc 6×) và profile mạng (Fast 3G, Slow 3G). Bug vô hình trên MacBook Pro M có thể chi phối trên Android tầm trung.
+
+> Ghi trace **Performance** khi thực hiện đúng hành động user — scroll, click, gõ — không phải nhìn trang idle.
+
+---
+
+## 2. Đọc panel Performance: luồng chính trước
+
+Mở DevTools → **Performance** → ghi → dừng. **Flame chart** trên luồng **Main** là lăng kính chính.
+
+```text
+Performance trace (conceptual)
+──────────────────────────────────────────────────────────────
+ Main thread  ████████████░░░░░░░░  Long Task (>50ms) ← blocks input
+              │ Scripting │ Layout │ Paint │ ...
+              └─ purple ──┘ orange ┘ green ┘
+
+ Compositor   ░░████░░████░░████    Often runs in parallel (Part 5)
+
+ Raster       ░░░░██░░░░██░░░░██    GPU bitmap work
+──────────────────────────────────────────────────────────────
+ Timeline     │ FCP │ LCP │ INP event │
+```
+
+Mã màu (Chromium):
+
+| Color | Category | Nội bộ |
+|-------|----------|---------------------|
+| Yellow | Scripting | JS parse/compile/execute (Part 6), event handlers (Part 7) |
+| Purple | Rendering | Style recalc, layout, update layer tree (Part 5) |
+| Green | Painting | Record paint, raster (Part 5) |
+| Gray | System / idle | Browser overhead, waiting |
+
+**Long task** — việc liên tục trên luồng chính quá **50 ms** — là manh bắt cho INP tệ và scroll giật. Phóng to khối vàng dài: một hàm khổng lồ, cascade handler, hay layout bị JS ép?
+
+Xem pane **Summary** dưới cùng: **Scripting** chi phối thì tối ưu JS; **Rendering** hay **Painting** chi phối thì tối ưu pipeline (Phần 5).
+
+---
+
+## 3. Style, Layout, Paint, Composite xuất hiện ở đâu
+
+Phần 5–7 nối pipeline render với luồng chính và event loop. Trong trace, bạn thấy chúng dưới dạng slice có tên:
+
+- **`Recalculate Style`** — khớp selector và cascade; kích hoạt bởi toggle class, đổi DOM (Phần 4).
+- **`Layout` / `Update Layout Tree`** — reflow; tốn kém, hiệu ứng lan (Phần 5).
+- **`Paint` / `Paint Image` / `Rasterize Paint`** — ghi và raster hóa thao tác vẽ (Phần 5).
+- **`Composite Layers`** — thường trên luồng compositor; animation `transform`/`opacity` có thể ở đây không cần layout luồng chính (Phần 5).
+
+**Layout thrashing** trông như xen kẽ vàng (JS) và tím (Layout) trong vòng lặp chặt — đọc/ghi/đọc thuộc tính hình học kinh điển:
+
+```js
+// ❌ Forces layout every iteration (Part 5)
+for (const el of elements) {
+  el.style.width = container.offsetWidth + 'px'; // read forces layout, then write invalidates
+}
+
+// ✅ Batch reads, then batch writes
+const width = container.offsetWidth;
+for (const el of elements) {
+  el.style.width = width + 'px';
+}
+```
+
+Bật **Rendering → Paint flashing** và **Layer borders** khi debug để thấy vùng repaint và phần tử nào có compositor layer riêng.
+
+---
+
+## 4. Triệu chứng → nguyên nhân → phần: bảng tra cứu
+
+Khi có gì đau, ánh vào internals bạn đã học:
+
+| Symptom | Likely root cause | Fix direction | Series part |
+|---------|-------------------|---------------|-------------|
+| Janky scroll | Layout thrashing; animating `width`/`top` instead of `transform` | Batch DOM reads/writes; compositor-only animation | 5, 7 |
+| Slow tap / high INP | Long tasks blocking main thread; heavy sync work in click handler | Split tasks (`scheduler.yield`, `requestIdleCallback`); defer non-critical work | 6, 7 |
+| Growing memory / tab crash | Detached DOM nodes, closures holding references, unbounded caches | Heap snapshot diff; break reference cycles; cap cache size | 8 |
+| Slow first load | Render-blocking CSS/JS; no HTTP cache; huge bundle | Defer/async scripts; cache headers; code-split (Part 9) | 2, 3, 4, 9 |
+| Layout shift (CLS) | Images/iframes without dimensions; fonts without fallback metrics; late-injected banners | `width`/`height` or aspect-ratio; `font-display`; reserve space | 2, 5 |
+| White screen after navigation | Slow TTFB; parser blocked by sync script; large CSS | Server/cache (Part 9); `defer`; critical CSS inline sparingly | 2, 3, 9 |
+| CORS / blocked request errors | Missing `Access-Control-Allow-Origin`; preflight failure | Fix server headers; don't mistake for network failure | 11 |
+| CSP violations in console | Inline script without nonce; third-party script not allowlisted | Tighten CSP gradually; add nonce/hash | 11 |
+| Worker not helping | Passing large objects copies; main thread still does layout | Transferable objects; move compute not DOM | 1, 6, 8 |
+
+Bảng không đầy đủ — là **giả thuyết khởi đầu** bạn xác nhận trong trace. Một triệu chứng thường nhiều nguyên nhân; flame chart cho biết cái nào chi phối **phiên này**.
+
+---
+
+## 5. Internals thay đổi cách fix của bạn thế nào
+
+Biết kiến trúc nghĩa là chọn **đúng lớp** — không phải mọi vấn đề đều là "dùng `useMemo`".
+
+**Đưa việc ra khỏi luồng chính**. Parse CSV, crypto, decode ảnh — Web Worker chạy JS song song (Phần 1) không chặn render hay input. Truyền object **Transferable** để tránh chép megabyte.
+
+**Animate trên compositor**. Chỉ `transform` và `opacity` (cộng `filter` trên engine hiện đại) thường bỏ qua layout trên đường nóng (Phần 5). Animation "mượt" mà set `left` mỗi frame vẫn layout mỗi frame.
+
+**Cache đúng lớp**. HTTP cache (Phần 9) cho asset tĩnh; cache JS trong bộ nhớ cho dữ liệu đã tính; **không** `localStorage` cho blob lớn (Phần 10) — đồng bộ và chặn luồng chính.
+
+**Ổn định hình dạng object cho V8**. Thêm thuộc tính tùy ý vào object phá hidden class và chậm IC (Phần 6). Khởi tạo field trong constructor; tránh xóa/thêm key trong vòng nóng.
+
+**Tôn trọng event loop**. Microtask (`Promise.then`) chạy trước paint kế (Phần 7) — chuỗi microtask vô hạn đói render. Chia việc thành chunk `setTimeout(0)` hoặc `scheduler.postTask` nếu cần nhường.
+
+**An toàn theo mặc định**. Khi tính năng "chạy Postman nhưng không chạy trình duyệt," nghĩ SOP/CORS (Phần 11) trước khi viết lại logic fetch.
+
+---
+
+## 6. Tóm tắt công cụ: bộ debug của bạn
+
+| Tool | What it shows | When to use |
+|------|---------------|-------------|
+| **Performance** | Flame chart, long tasks, FCP/LCP markers, main vs compositor | Jank, INP, scripting vs rendering split |
+| **Memory** | Heap snapshots, allocation timeline, detached nodes | Leaks, retained objects (Part 8) |
+| **Network** | Waterfall, TTFB, cache status, render-blocking | Slow load, caching issues (Part 9) |
+| **Rendering** (drawer) | Paint flashing, layer borders, FPS meter | Repaint scope, compositor layers (Part 5) |
+| **Task Manager** | Per-process CPU/RAM (tabs, iframes, GPU) | Memory hogs, Site Isolation visibility (Part 1) |
+| **Coverage** | Unused JS/CSS bytes | Bundle bloat (Parts 3, 4, 8) |
+| **Application** | Cookies, storage, service workers | Persistence & quota (Part 10) |
+| **Console / Issues** | CSP, mixed content, CORS errors | Security misconfig (Part 11) |
+
+Dùng kết hợp: Network giải thích *vì sao load chậm*; Performance *vì sao tương tác chậm*; Memory *vì sao tab phình*.
+
+---
+
+## 7. Mental model một trang: cả 12 phần
+
+```text
+HOW THE BROWSER WORKS — consolidated map
+══════════════════════════════════════════════════════════════════
+
+ Part 1  PROCESSES          Browser (trusted) ↔ Renderer (sandboxed) ↔ GPU ↔ Network
+         Site Isolation     Different sites → different renderer processes (Spectre defense)
+
+ Part 2  NAVIGATION         URL → DNS → TCP/TLS → HTTP → response bytes
+ Part 3  HTML → DOM          Tokenizer → tree builder → DOM; script can block parsing
+ Part 4  CSS → CSSOM         Parse → cascade → computed styles → render tree
+ Part 5  RENDER PIPELINE     Style → Layout → Paint → Composite (layer promotion)
+
+ Part 6  V8                  Parse → Ignition bytecode → TurboFan JIT; hidden classes, ICs
+ Part 7  EVENT LOOP           Tasks → microtasks → render steps; long tasks block input
+ Part 8  MEMORY               Generational GC; retainers, leaks, heap snapshots
+
+ Part 9  NETWORK              HTTP/2-3, cache headers, CDN, render-blocking resources
+ Part 10 STORAGE              Cookies, localStorage, IndexedDB, Cache API, service workers
+
+ Part 11 SECURITY             SOP → CORS opt-in → CSP → cookie flags → sandbox/isolation
+ Part 12 DEBUG (this post)    Measure → map symptoms → fix at the correct layer
+
+ THE THREAD YOU FIGHT FOR
+ ────────────────────────
+ Main thread: JS + style + layout + paint (record)
+ Compositor:  transform/opacity animations, layer assembly
+ Workers:     JS off main thread (no DOM)
+
+ THE DEFAULT QUESTION
+ ────────────────────
+ "Which stage of which pipeline is blocking the main thread — and why?"
+```
+
+Ghim sơ đồ này trong đầu. Mọi bug hiệu năng là câu chuyện **tranh chấp trên luồng cụ thể ở giai đoạn cụ thể**.
+
+---
+
+## Tóm tắt
+
+- Định nghĩa **triệu chứng user thấy** trước, tái hiện với throttle CPU/mạng, rồi ghi trace Performance trong lúc hành động.
+- Đọc **flame chart luồng Main**: vàng = scripting (Phần 6–7), tím = rendering (Phần 5), xanh = paint; **long task (>50 ms)** giải thích INP tệ và scroll giật.
+- Dùng bảng **triệu chứng→nguyên nhân→phần** làm giả thuyết, rồi xác nhận trong trace — layout thrashing, tài nguyên chặn render, leak, và header bảo mật mỗi cái có dấu hiệu riêng.
+- Fix ở **đúng lớp**: worker cho tính toán, thuộc tính compositor cho animation, HTTP cache cho load, hình dạng ổn định cho V8, CSP/CORS cho lỗi bảo mật.
+- **Performance + Memory + Network + Rendering + Task Manager** cùng nhau phủ full stack từ Phần 1 tới Phần 11.
+
+Bạn bắt đầu series coi trình duyệt như hộp đen. Bạn kết thúc biết code chạy ở đâu, tranh với gì, và nút nào thật sự tạo khác biệt. Lần tới production chậm, mở DevTools, ghi mười giây, đọc flame chart — trình duyệt sẽ nói chính xác nó đang làm gì. Đó là siêu năng. Giờ hãy build thứ gì đó nhanh — có chủ đích.

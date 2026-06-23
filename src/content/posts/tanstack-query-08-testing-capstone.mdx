@@ -1,0 +1,354 @@
+---
+title: 'TanStack Query · Phần 8 — Testing & Capstone'
+description: 'Test hook query/mutation bằng Vitest + React Testing Library + MSW (mock ở tầng network), kiểm thử optimistic rollback, rồi ghép tất cả thành một feature CRUD hoàn chỉnh.'
+pubDate: 2026-06-29
+tags: [react, tanstack-query, react-query, testing, tanstack_query_8]
+series: tanstack-query
+seriesOrder: 8
+draft: false
+---
+
+Phần cuối của series có hai nửa. Nửa đầu: **test** code React Query đúng cách bằng Vitest + React Testing Library + MSW — vì code fetch không được test sẽ vỡ âm thầm. Nửa sau: một **capstone** ghép tất cả 8 phần thành một feature CRUD hoàn chỉnh, để bạn thấy mọi mảnh khớp với nhau ra sao.
+
+Đây là điểm dừng của series — sau bài này bạn đã có đủ công cụ để dùng React Query trong dự án thật.
+
+---
+
+## 1. Triết lý test: mock ở tầng network, không mock React Query
+
+Sai lầm phổ biến là mock `useQuery` hoặc mock `apiFetch`. Làm vậy bạn test "code giả" chứ không phải hành vi thật. Cách đúng: để React Query chạy *thật*, chỉ **chặn HTTP ở tầng network** bằng **MSW (Mock Service Worker)**. Test của bạn khi đó kiểm chứng đúng luồng người dùng: gọi mạng → cache → render.
+
+```bash
+pnpm add -D vitest @testing-library/react @testing-library/user-event jsdom msw
+```
+
+---
+
+## 2. Thiết lập MSW
+
+```ts
+// src/test/server.ts
+import { setupServer } from 'msw/node';
+import { http, HttpResponse } from 'msw';
+
+export const handlers = [
+  http.get('*/customers', () =>
+    HttpResponse.json([
+      { id: '1', name: 'An', email: 'an@example.com' },
+      { id: '2', name: 'Bình', email: 'binh@example.com' },
+    ]),
+  ),
+  http.post('*/customers', async ({ request }) => {
+    const body = (await request.json()) as { name: string; email: string };
+    return HttpResponse.json({ id: '3', ...body }, { status: 201 });
+  }),
+];
+
+export const server = setupServer(...handlers);
+```
+
+```ts
+// src/test/setup.ts
+import '@testing-library/jest-dom/vitest';
+import { afterAll, afterEach, beforeAll } from 'vitest';
+import { server } from './server';
+
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterEach(() => server.resetHandlers()); // reset override sau mỗi test
+afterAll(() => server.close());
+```
+
+```ts
+// vitest.config.ts
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.ts'],
+    globals: true,
+  },
+});
+```
+
+---
+
+## 3. Helper render kèm provider (quan trọng nhất)
+
+Mỗi test cần một `QueryClient` **mới và cô lập**, với `retry: false` để test lỗi không phải chờ retry, và `gcTime: Infinity` để cache không bị dọn giữa chừng.
+
+```tsx
+// src/test/render.tsx
+import { type ReactElement } from 'react';
+import { render } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+
+export function renderWithClient(ui: ReactElement) {
+  // Client RIÊNG mỗi test → không rò rỉ cache giữa các test.
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false }, // đừng retry trong test, sẽ làm chậm/khó đoán
+      mutations: { retry: false },
+    },
+  });
+
+  return render(
+    <QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>,
+  );
+}
+```
+
+---
+
+## 4. Test một query hook
+
+```tsx
+// src/features/customers/CustomerList.test.tsx
+import { screen } from '@testing-library/react';
+import { describe, it, expect } from 'vitest';
+import { renderWithClient } from '@/test/render';
+import { CustomerList } from './CustomerList';
+
+describe('CustomerList', () => {
+  it('hiển thị khách hàng sau khi tải xong', async () => {
+    renderWithClient(<CustomerList />);
+
+    // Ban đầu là trạng thái loading
+    expect(screen.getByText(/đang tải/i)).toBeInTheDocument();
+
+    // findBy* tự đợi (async) cho tới khi data về và render
+    expect(await screen.findByText('An')).toBeInTheDocument();
+    expect(screen.getByText('Bình')).toBeInTheDocument();
+  });
+});
+```
+
+Mấu chốt: dùng **`findBy*`** (hoặc `waitFor`) cho mọi thứ xuất hiện *sau* khi fetch xong. `getBy*` là đồng bộ, sẽ trượt vì lúc đó data chưa về.
+
+---
+
+## 5. Test trạng thái lỗi (override handler)
+
+```tsx
+import { http, HttpResponse } from 'msw';
+import { server } from '@/test/server';
+
+it('hiển thị lỗi khi server trả 500', async () => {
+  // Override handler chỉ cho test này (afterEach sẽ reset).
+  server.use(
+    http.get('*/customers', () => new HttpResponse(null, { status: 500 })),
+  );
+
+  renderWithClient(<CustomerList />);
+  expect(await screen.findByText(/có lỗi/i)).toBeInTheDocument();
+});
+```
+
+---
+
+## 6. Test optimistic rollback
+
+Đây là test giá trị nhất — kiểm chứng UI cập nhật tức thì *rồi quay lại* khi server lỗi:
+
+```tsx
+import userEvent from '@testing-library/user-event';
+import { http, HttpResponse } from 'msw';
+import { server } from '@/test/server';
+
+it('rollback khi toggle favorite thất bại', async () => {
+  const user = userEvent.setup();
+  renderWithClient(<CustomerList />);
+
+  const toggle = await screen.findByRole('button', { name: /favorite an/i });
+  expect(toggle).toHaveAttribute('aria-pressed', 'false');
+
+  // Bắt server trả lỗi cho thao tác toggle.
+  server.use(
+    http.post('*/customers/1/favorite', () => new HttpResponse(null, { status: 500 })),
+  );
+
+  await user.click(toggle);
+
+  // Optimistic: bật lên NGAY
+  expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+  // Sau khi server lỗi → onError rollback → quay về false
+  await waitFor(() => expect(toggle).toHaveAttribute('aria-pressed', 'false'));
+});
+```
+
+---
+
+## 7. Capstone — feature CRUD hoàn chỉnh
+
+Giờ ghép mọi thứ. Cấu trúc feature theo quy ước feature-first đã dùng suốt series:
+
+```text
+src/features/customers/
+  schema.ts     # zod schema + z.infer types          (Phần 3)
+  keys.ts       # query-key factory                    (Phần 3)
+  api.ts        # queryOptions + mutationFn (apiFetch)  (Phần 3, 5)
+  hooks.ts      # useCustomers, useCreateCustomer, ...  (Phần 2-6)
+  CustomersPage.tsx  # trang ghép tất cả
+```
+
+### `hooks.ts` — gom mọi hook
+
+> Ở capstone này, `customersQuery` là bản phân trang: nhận `{ q?, page? }` và trả về `pageSchema` (`{ items, hasMore }`) như [Phần 4](/blog/tanstack-query-04-pagination-infinite-query/), khác bản `{ q? }` đơn giản ở Phần 3. Nhớ mở rộng `customerKeys.list` để chứa cả `page`.
+
+```tsx
+// src/features/customers/hooks.ts
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { customersQuery, createCustomer, deleteCustomer } from './api';
+import { customerKeys } from './keys';
+import type { Customer } from './schema';
+
+export function useCustomers(filters: { q?: string; page?: number }) {
+  return useQuery({
+    ...customersQuery(filters),
+    placeholderData: keepPreviousData, // chuyển trang/search mượt (Phần 4)
+  });
+}
+
+export function useCreateCustomer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: createCustomer,
+    onSuccess: () => qc.invalidateQueries({ queryKey: customerKeys.lists() }), // Phần 5
+  });
+}
+
+export function useDeleteCustomer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: deleteCustomer,
+    // Optimistic delete (Phần 6)
+    onMutate: async (id: string) => {
+      const key = customerKeys.lists();
+      await qc.cancelQueries({ queryKey: key });
+      const previous = qc.getQueryData<{ items: Customer[] }>(key);
+      qc.setQueryData<{ items: Customer[] }>(key, (old) =>
+        old ? { ...old, items: old.items.filter((c) => c.id !== id) } : old,
+      );
+      return { previous, key };
+    },
+    onError: (_e, _id, ctx) => {
+      if (ctx) qc.setQueryData(ctx.key, ctx.previous); // rollback
+    },
+    onSettled: (_d, _e, _id, ctx) => {
+      if (ctx) qc.invalidateQueries({ queryKey: ctx.key }); // đồng bộ
+    },
+  });
+}
+```
+
+### `CustomersPage.tsx` — trang ghép
+
+```tsx
+// src/features/customers/CustomersPage.tsx
+import { useState } from 'react';
+import { useDebouncedValue } from '@/hooks/useDebouncedValue';
+import { useCustomers, useCreateCustomer, useDeleteCustomer } from './hooks';
+
+export function CustomersPage() {
+  const [q, setQ] = useState('');
+  const [page, setPage] = useState(1);
+  const debouncedQ = useDebouncedValue(q, 300); // tránh fetch mỗi phím gõ
+
+  const list = useCustomers({ q: debouncedQ, page });
+  const create = useCreateCustomer();
+  const remove = useDeleteCustomer();
+
+  return (
+    <section>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Tìm khách hàng…" />
+
+      {list.isPending ? (
+        <TableSkeleton />
+      ) : list.isError ? (
+        <ErrorState message={list.error.message} />
+      ) : list.data.items.length === 0 ? (
+        <EmptyState label="Không tìm thấy" />
+      ) : (
+        <ul style={{ opacity: list.isPlaceholderData ? 0.6 : 1 }}>
+          {list.data.items.map((c) => (
+            <li key={c.id}>
+              {c.name}
+              <button onClick={() => remove.mutate(c.id)}>Xoá</button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <Pagination
+        page={page}
+        hasMore={list.data?.hasMore ?? false}
+        disabled={list.isPlaceholderData}
+        onChange={setPage}
+      />
+
+      <NewCustomerForm
+        onSubmit={(input) =>
+          create.mutate(input, { onSuccess: () => toast.success('Đã thêm') })
+        }
+        pending={create.isPending}
+      />
+    </section>
+  );
+}
+```
+
+Feature này dùng **mọi thứ** trong series: `queryOptions` + zod (Phần 3), `keepPreviousData` + pagination (Phần 4), `useMutation` + invalidate (Phần 5), optimistic delete + rollback (Phần 6), debounced search và loading/error/empty đúng chuẩn (Phần 2). Đó là một feature production-ready thật sự.
+
+---
+
+## 8. Checklist React Query cho dự án thật
+
+- [ ] Một `QueryClient` ở module scope, `defaultOptions` hợp lý (`staleTime`, `retry`).
+- [ ] Mọi response validate bằng **zod** trong `apiFetch`; không `any`, không `as` thiếu kiểm.
+- [ ] **Key factory** mỗi feature; `queryOptions`/`infiniteQueryOptions` cho mọi query.
+- [ ] Component xử lý đủ **loading / error / empty / data**.
+- [ ] Mutation **invalidate** đúng phạm vi; optimistic chỉ ở chỗ cần phản hồi tức thì (đủ cancel/snapshot/rollback/settled).
+- [ ] `retry` không thử lại lỗi 4xx; lỗi nghiêm trọng đẩy lên **Error Boundary**.
+- [ ] Prefetch (hover/loader) cho luồng điều hướng quan trọng.
+- [ ] Test bằng **MSW** ở tầng network, client riêng mỗi test với `retry: false`.
+
+---
+
+## 9. Bài tập
+
+**1.** Vì sao nên mock bằng MSW ở tầng network thay vì mock `useQuery` hay `apiFetch`?
+
+<details>
+<summary>Lời giải</summary>
+
+Mock `useQuery`/`apiFetch` là test "code giả" — bạn không kiểm chứng luồng thật (key, cache, trạng thái, retry). MSW chặn HTTP nên React Query chạy *thật*; test phản ánh đúng hành vi người dùng và không vỡ khi bạn refactor cách gọi API.
+</details>
+
+**2.** Vì sao mỗi test cần một `QueryClient` mới với `retry: false`?
+
+<details>
+<summary>Lời giải</summary>
+
+Client riêng tránh **rò rỉ cache** giữa các test (test này thấy data của test kia). `retry: false` để test ca lỗi không phải chờ các lần retry + backoff, giúp test nhanh và xác định.
+</details>
+
+**3.** Trong capstone, `isPlaceholderData` được dùng để làm gì?
+
+<details>
+<summary>Lời giải</summary>
+
+Báo rằng data đang hiển thị là của trang/lần tìm *trước* trong khi kết quả mới đang fetch nền. Dùng để làm mờ danh sách (`opacity`) và khoá nút phân trang, tránh nhấp nháy và double-fetch.
+</details>
+
+**Nâng cao:** Viết test cho luồng tạo customer: render trang, gõ form, submit, và `findBy*` xác nhận customer mới xuất hiện sau khi invalidate refetch. Thêm một test cho debounced search (chỉ một request sau khi ngừng gõ).
+
+---
+
+## Tóm tắt & kết series
+
+- Test React Query bằng **MSW** (mock network), client riêng mỗi test với `retry: false`, và `findBy*`/`waitFor` cho data async. Test giá trị nhất: **optimistic rollback**.
+- Capstone ghép toàn bộ: zod + key factory + `queryOptions` (Phần 3), pagination với `keepPreviousData` (Phần 4), mutation + invalidate (Phần 5), optimistic delete (Phần 6), loading/error/empty + debounce (Phần 2).
+- Bạn đã đi từ "fetch tay bằng useEffect" tới một feature CRUD production-ready với cache, optimistic, error handling và test.
+
+Cảm ơn bạn đã theo hết series. Quay lại [Phần 1](/blog/tanstack-query-01-mental-model-setup/) bất cứ lúc nào để ôn mental model — và hãy mở Devtools khi code, vì "thấy cache" là cách học React Query nhanh nhất.

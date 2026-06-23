@@ -1,0 +1,210 @@
+---
+title: 'Algorithms in Frontend · Part 8 — Scheduling & Priority Queue'
+description: 'Slice heavy work without blocking the UI: event loop, microtask vs macrotask, requestAnimationFrame and requestIdleCallback, time-slicing, and a binary heap for priority task processing.'
+pubDate: 2026-07-15
+tags: [algorithms, scheduling, event-loop, heap, fe_algorithms_12]
+series: fe-algorithms
+seriesOrder: 8
+draft: true
+---
+
+JavaScript trong trình duyệt chạy **đơn luồng**: cùng một luồng vừa chạy JS, vừa xử lý sự kiện, vừa phối hợp render. Nghĩa là một vòng lặp nặng 200ms sẽ **đóng băng** mọi tương tác trong 200ms đó — không click được, không cuộn được, animation đứng hình.
+
+Scheduling là nghệ thuật **chia việc nặng thành miếng nhỏ** và **trả luồng lại cho trình duyệt** giữa các miếng, để UI luôn phản hồi. Phần này đi từ event loop tới time-slicing và một priority queue thực thụ.
+
+---
+
+## 1. Event loop, microtask & macrotask
+
+Trình duyệt xử lý theo vòng lặp: chạy một tác vụ → vét sạch hàng đợi microtask → (có thể) render → lặp lại.
+
+```text
+[macrotask] → drain all [microtask] → (render if due) → [next macrotask] → ...
+```
+
+- **Macrotask**: `setTimeout`, `setInterval`, sự kiện I/O, message. Mỗi vòng lặp xử lý *một* macrotask.
+- **Microtask**: `Promise.then`, `queueMicrotask`, `MutationObserver`. Được vét **sạch hoàn toàn** sau mỗi macrotask, *trước* khi render.
+
+Hệ quả thực tế: một chuỗi microtask vô tận sẽ **chặn render mãi mãi** (vì render chỉ xảy ra sau khi vét hết microtask). Ngược lại, `setTimeout` cho trình duyệt cơ hội render giữa các lần.
+
+```ts
+console.log('1');
+setTimeout(() => console.log('4 (macrotask)'), 0);
+Promise.resolve().then(() => console.log('3 (microtask)'));
+console.log('2');
+// Output order: 1, 2, 3, 4 — microtask always runs before the next macrotask
+```
+
+---
+
+## 2. Bốn công cụ lập lịch, dùng đúng việc
+
+| Công cụ | Chạy khi | Dùng cho |
+|---------|----------|----------|
+| `queueMicrotask` | ngay sau tác vụ hiện tại, trước render | gộp cập nhật trong cùng tick |
+| `requestAnimationFrame` | ngay trước lần vẽ kế (≈ mỗi 16ms) | animation, đọc/ghi layout, cập nhật theo scroll |
+| `setTimeout(fn, 0)` | macrotask kế, sau khi đã có cơ hội render | nhường luồng cho UI giữa các miếng việc |
+| `requestIdleCallback` | khi trình duyệt rảnh | việc nền không gấp (preload, log, dọn cache) |
+
+`requestAnimationFrame` là công cụ đúng để gộp cập nhật theo scroll (liên hệ Phần 4) — nó tự đồng bộ với nhịp vẽ, tránh tính toán thừa giữa hai khung hình:
+
+```ts
+let ticking = false;
+window.addEventListener('scroll', () => {
+  if (ticking) return; // a rAF is already pending → skip, coalesce
+  ticking = true;
+  requestAnimationFrame(() => {
+    updateOnScroll(window.scrollY);
+    ticking = false;
+  });
+}, { passive: true });
+```
+
+---
+
+## 3. Time-slicing: chia việc nặng thành miếng nhỏ
+
+Giả sử bạn phải xử lý 100.000 bản ghi (parse, tính toán) ngay trên client. Làm một lần sẽ treo tab vài giây. Giải pháp: xử lý theo **lô (chunk)**, sau mỗi lô kiểm tra "còn ngân sách thời gian không", nếu hết thì nhường luồng và tiếp tục ở tick sau.
+
+```ts
+async function processInChunks<T>(
+  items: T[],
+  process: (item: T) => void,
+  budgetMs = 8, // each slice does at most ~8ms to leave room for render
+): Promise<void> {
+  let i = 0;
+  while (i < items.length) {
+    const sliceStart = performance.now();
+    // work until this slice's budget runs out
+    while (i < items.length && performance.now() - sliceStart < budgetMs) {
+      process(items[i]);
+      i++;
+    }
+    // yield so the browser can handle input + paint, then continue
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+```
+
+Phiên bản "xịn" hơn dùng `requestIdleCallback` với `deadline.timeRemaining()` — chính là cách React (Scheduler) chia nhỏ render trong chế độ concurrent:
+
+```ts
+function processWhenIdle<T>(items: T[], process: (item: T) => void): void {
+  let i = 0;
+  const step = (deadline: IdleDeadline) => {
+    while (i < items.length && deadline.timeRemaining() > 1) {
+      process(items[i++]);
+    }
+    if (i < items.length) requestIdleCallback(step); // more work → schedule next idle slot
+  };
+  requestIdleCallback(step);
+}
+```
+
+> Với khối lượng tính toán thực sự lớn và CPU-bound (mã hóa ảnh, parse khổng lồ), giải pháp đúng nhất là **Web Worker** — chạy ở luồng khác, không đụng tới luồng UI. Time-slicing hợp khi việc *phải* ở luồng chính (đụng DOM) hoặc khi không muốn chi phí dựng worker.
+
+---
+
+## 4. Priority Queue: xử lý theo độ ưu tiên
+
+Không phải tác vụ nào cũng ngang nhau. Ví dụ trong một editor: highlight cú pháp vùng đang nhìn thấy **quan trọng hơn** lint cả file. Ta cần một hàng đợi luôn trả ra phần tử **ưu tiên cao nhất** trước. Mảng thường cho việc này là `O(n)` mỗi lần lấy; **binary heap** cho `O(log n)`.
+
+Heap là cây nhị phân gần đầy, lưu trong mảng: con của node `i` nằm ở `2i+1` và `2i+2`. Min-heap luôn giữ phần tử nhỏ nhất ở gốc.
+
+```ts
+class MinHeap<T> {
+  private items: T[] = [];
+
+  constructor(private compare: (a: T, b: T) => number) {}
+
+  get size(): number {
+    return this.items.length;
+  }
+
+  push(item: T): void {
+    this.items.push(item);
+    this.bubbleUp(this.items.length - 1); // bubble up into place — O(log n)
+  }
+
+  pop(): T | undefined {
+    const top = this.items[0];
+    const last = this.items.pop();
+    if (this.items.length && last !== undefined) {
+      this.items[0] = last;
+      this.bubbleDown(0); // sink down — O(log n)
+    }
+    return top;
+  }
+
+  private bubbleUp(i: number): void {
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (this.compare(this.items[i], this.items[parent]) >= 0) break;
+      [this.items[i], this.items[parent]] = [this.items[parent], this.items[i]];
+      i = parent;
+    }
+  }
+
+  private bubbleDown(i: number): void {
+    const n = this.items.length;
+    while (true) {
+      const left = 2 * i + 1;
+      const right = 2 * i + 2;
+      let smallest = i;
+      if (left < n && this.compare(this.items[left], this.items[smallest]) < 0) smallest = left;
+      if (right < n && this.compare(this.items[right], this.items[smallest]) < 0) smallest = right;
+      if (smallest === i) break;
+      [this.items[i], this.items[smallest]] = [this.items[smallest], this.items[i]];
+      i = smallest;
+    }
+  }
+}
+```
+
+Use it as a priority task scheduler:
+
+```ts
+interface Task {
+  run: () => void;
+  priority: number; // smaller number = higher priority
+}
+
+const queue = new MinHeap<Task>((a, b) => a.priority - b.priority);
+
+function schedule(run: () => void, priority: number): void {
+  queue.push({ run, priority });
+}
+
+// Consumer: run by priority, still time-slice so UI isn't blocked
+function drain(): void {
+  const step = (deadline: IdleDeadline) => {
+    while (queue.size > 0 && deadline.timeRemaining() > 1) {
+      queue.pop()!.run();
+    }
+    if (queue.size > 0) requestIdleCallback(step);
+  };
+  requestIdleCallback(step);
+}
+```
+
+Đây chính là kiến trúc của các scheduler thật: một **heap theo ưu tiên** + một **vòng lặp time-slicing**. React Scheduler dùng đúng mô hình này (heap + deadline) để quyết định việc nào render trước.
+
+---
+
+## 5. Cạm bẫy
+
+- **Chuỗi microtask vô tận** chặn render — đừng dùng `Promise`/`queueMicrotask` để chia việc nặng; dùng macrotask hoặc `requestIdleCallback`.
+- **`requestIdleCallback` không đảm bảo chạy** nếu trình duyệt luôn bận — luôn đặt `timeout` dự phòng cho việc cần hoàn thành.
+- **Ngân sách quá lớn** (`budgetMs` ≈ 50ms) vẫn gây giật; giữ mỗi lát ≤ 8–10ms.
+- Việc CPU-bound nặng → cân nhắc **Web Worker** thay vì cố nhồi vào luồng chính.
+
+---
+
+## Tóm tắt
+
+- JS đơn luồng: việc nặng chặn UI. Scheduling = chia nhỏ + nhường luồng.
+- **Microtask** vét sạch trước render; **macrotask** cho cơ hội render giữa các lần. `rAF` đồng bộ nhịp vẽ; `requestIdleCallback` cho việc nền.
+- **Time-slicing** xử lý theo lô trong ngân sách ~8ms/lát, nhường luồng giữa các lát.
+- **Binary heap** cho priority queue `O(log n)`; ghép heap + time-slicing là kiến trúc của scheduler thật (React).
+
+**Phần tiếp theo:** Sắp xếp & comparator phức tạp — multi-key sort ổn định, sort theo locale, và những cái bẫy của `Array.sort`.

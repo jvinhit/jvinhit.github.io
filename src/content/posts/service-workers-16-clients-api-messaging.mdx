@@ -1,0 +1,224 @@
+---
+title: 'Service Workers · Phần 16 — Clients API & messaging hai chiều'
+description: 'Giao tiếp giữa trang và service worker: postMessage một chiều, MessageChannel để có phản hồi, BroadcastChannel cho nhiều tab, và Clients API (matchAll, openWindow, focus, navigate) để SW điều phối cửa sổ.'
+pubDate: 2026-07-21
+tags: [service-worker, postmessage, broadcastchannel, clients-api, service_workers_10]
+series: service-workers
+seriesOrder: 16
+draft: false
+---
+
+Service worker không sống cô lập — nó cần "nói chuyện" với các trang đang mở: báo "có bản mới" (Phần 12), cập nhật badge khi sync xong (Phần 7), hoặc mở/điều hướng cửa sổ khi người dùng bấm notification (Phần 8). Phần này gom toàn bộ công cụ giao tiếp hai chiều giữa **window ↔ service worker** và giữa **các tab**, kèm khi nào dùng cái nào.
+
+Điểm cần nhớ trước: SW có thể điều khiển **nhiều** client (tab/cửa sổ) cùng lúc, và nó **stateless** (mất biến khi ngủ). Mọi giao tiếp phải tính tới hai sự thật đó.
+
+---
+
+## 1. `postMessage` — kênh cơ bản (một chiều)
+
+Trang gửi xuống SW đang điều khiển nó:
+
+```js
+// trang → service worker
+navigator.serviceWorker.controller?.postMessage({ type: 'CLEAR_CACHE' });
+```
+
+SW gửi xuống *một* client cụ thể:
+
+```js
+// service worker → một client
+self.addEventListener('message', (event) => {
+  if (event.data?.type === 'PING') {
+    // event.source là client đã gửi message
+    event.source.postMessage({ type: 'PONG' });
+  }
+});
+```
+
+`postMessage` là "bắn rồi quên" — không có giá trị trả về. Đủ cho lệnh đơn giản (clear cache, skip waiting), nhưng khi cần *phản hồi* thì dùng MessageChannel (mục 2).
+
+---
+
+## 2. `MessageChannel` — request/response có phản hồi
+
+Khi trang cần *hỏi* SW và **chờ trả lời** (vd "phiên bản cache hiện tại là gì?"), tạo một `MessageChannel`: gửi một cổng (`port2`) xuống SW, SW trả lời qua cổng đó.
+
+```js
+// trang: hỏi và chờ trả lời
+function askServiceWorker(message) {
+  return new Promise((resolve, reject) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = (event) => {
+      if (event.data?.error) reject(new Error(event.data.error));
+      else resolve(event.data);
+    };
+    navigator.serviceWorker.controller?.postMessage(message, [channel.port2]);
+  });
+}
+
+const { version } = await askServiceWorker({ type: 'GET_VERSION' });
+```
+
+```js
+// service worker: trả lời qua cổng nhận được
+self.addEventListener('message', (event) => {
+  const port = event.ports[0];
+  if (event.data?.type === 'GET_VERSION' && port) {
+    port.postMessage({ version: CACHE_VERSION });
+  }
+});
+```
+
+Đây là cách dựng một "RPC" gọn giữa trang và SW: mỗi câu hỏi kèm một cổng riêng để nhận đúng câu trả lời, không lẫn.
+
+---
+
+## 3. `BroadcastChannel` — nói với mọi tab cùng lúc
+
+Khi cần phát một thông điệp tới **tất cả** trang cùng origin (kể cả tab khác), `BroadcastChannel` đơn giản hơn nhiều so với lặp qua từng client:
+
+```js
+// service worker phát
+const bc = new BroadcastChannel('app-events');
+bc.postMessage({ type: 'DATA_SYNCED', count: 3 });
+```
+
+```js
+// mọi trang lắng nghe
+const bc = new BroadcastChannel('app-events');
+bc.addEventListener('message', (event) => {
+  if (event.data?.type === 'DATA_SYNCED') {
+    updateBadge(event.data.count); // mọi tab đều cập nhật
+  }
+});
+```
+
+Hợp với: báo "đã đồng bộ outbox" cho mọi tab, đồng bộ trạng thái đăng nhập/đăng xuất, cập nhật badge. Không cần biết có bao nhiêu tab hay chúng ở đâu.
+
+---
+
+## 4. Clients API — SW "nhìn thấy" và điều khiển cửa sổ
+
+`self.clients` cho SW truy cập các client nó điều khiển:
+
+```js
+// Lấy tất cả client đang mở (cả tab chưa được SW điều khiển nếu includeUncontrolled)
+const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+
+// Gửi cho từng client
+for (const client of all) {
+  client.postMessage({ type: 'REFRESH' });
+}
+```
+
+`matchAll` quan trọng vì SW stateless: thay vì nhớ "ai đang mở", nó *hỏi* trình duyệt danh sách client mỗi khi cần.
+
+---
+
+## 5. `notificationclick` — focus tab cũ hoặc mở mới
+
+Đây là use case kinh điển của Clients API (nối Phần 8). Khi người dùng bấm notification, hành vi tử tế là: nếu app đã mở thì **focus** tab đó và điều hướng; nếu chưa thì **mở** cửa sổ mới:
+
+```js
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const targetUrl = event.notification.data?.url || '/';
+
+  event.waitUntil(
+    (async () => {
+      const allClients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+
+      // Tìm tab đang mở cùng origin để tái dùng.
+      for (const client of allClients) {
+        const url = new URL(client.url);
+        if (url.origin === self.location.origin && 'focus' in client) {
+          await client.focus();
+          if ('navigate' in client) await client.navigate(targetUrl);
+          return;
+        }
+      }
+      // Không có tab nào → mở mới.
+      if (self.clients.openWindow) await self.clients.openWindow(targetUrl);
+    })(),
+  );
+});
+```
+
+> **Luôn bọc trong `event.waitUntil`.** SW có thể bị kill ngay sau khi handler trả về; `waitUntil` giữ SW sống cho tới khi promise (focus/openWindow) hoàn tất. Quên nó → notification bấm vào "không làm gì" một cách ngẫu nhiên.
+
+---
+
+## 6. `clients.claim()` & điều khiển ngay từ lần đầu
+
+Mặc định, một trang đang mở *không* được SW mới điều khiển cho tới lần load sau. `clients.claim()` trong `activate` ép SW điều khiển ngay các client hiện có:
+
+```js
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+```
+
+Hữu ích khi bạn muốn SW bắt đầu chặn fetch ngay lần đầu cài (vd để cache lập tức). Nhưng cẩn thận với update flow: `claim()` có thể khiến trang đang chạy đột ngột được SW mới điều khiển — kết hợp đúng với chiến lược update ở Phần 12.
+
+---
+
+## 7. Chọn công cụ nào?
+
+| Nhu cầu | Công cụ |
+|---|---|
+| Trang ra lệnh đơn giản cho SW | `controller.postMessage` |
+| Trang hỏi SW và chờ trả lời | `MessageChannel` (port) |
+| Phát tin cho **mọi** tab | `BroadcastChannel` |
+| SW gửi cho **một** client cụ thể | `client.postMessage` (từ `matchAll`/`event.source`) |
+| SW focus/mở/điều hướng cửa sổ | Clients API (`matchAll`, `focus`, `navigate`, `openWindow`) |
+
+Quy tắc: dùng `BroadcastChannel` cho "thông báo nhiều→nhiều", `MessageChannel` cho "hỏi-đáp 1-1", `postMessage` cho "lệnh một chiều".
+
+---
+
+## 8. Bài tập
+
+**1.** Khi nào cần `MessageChannel` thay vì `postMessage` thường?
+
+<details>
+<summary>Lời giải</summary>
+
+Khi trang cần *phản hồi* từ SW (hỏi-đáp), không chỉ ra lệnh. `postMessage` là một chiều, không trả giá trị. `MessageChannel` gửi kèm một `port` để SW trả lời đúng vào câu hỏi đó, cho phép dựng pattern request/response (RPC) gọn gàng giữa trang và SW.
+
+</details>
+
+**2.** Vì sao `notificationclick` (và các handler dùng Clients API async) phải bọc trong `event.waitUntil`?
+
+<details>
+<summary>Lời giải</summary>
+
+SW có thể bị trình duyệt kill ngay khi handler đồng bộ trả về. `event.waitUntil(promise)` giữ SW sống tới khi promise (focus/openWindow/navigate) hoàn tất. Thiếu nó, công việc async có thể bị cắt giữa chừng → bấm notification "không làm gì" một cách thất thường.
+
+</details>
+
+**3.** Vì sao `clients.matchAll()` phù hợp với bản chất stateless của SW?
+
+<details>
+<summary>Lời giải</summary>
+
+SW mất mọi biến khi ngủ nên không thể "nhớ" danh sách tab đang mở. `matchAll()` hỏi trình duyệt danh sách client *tại thời điểm cần*, nên luôn chính xác dù SW vừa thức dậy. Đó là cách đúng để SW biết nó đang điều khiển những cửa sổ nào.
+
+</details>
+
+**Nâng cao:** Cài đặt `notificationclick` focus-or-open như mục 5, và một `BroadcastChannel` cập nhật badge số mục outbox cho mọi tab khi background sync xong (Phần 7). Mở hai tab, gửi notification, xác nhận đúng tab được focus và cả hai tab cập nhật badge.
+
+---
+
+## Tóm tắt
+
+- `postMessage` (trang↔SW) cho lệnh **một chiều**; `MessageChannel` (port) cho **hỏi-đáp** có phản hồi.
+- `BroadcastChannel` phát tin tới **mọi tab** cùng origin — gọn hơn lặp qua từng client.
+- Clients API: `matchAll` (liệt kê client — hợp với SW stateless), `client.postMessage`, `focus`, `navigate`, `openWindow`.
+- `notificationclick`: focus tab cũ + `navigate`, hoặc `openWindow` mới — **luôn** bọc `event.waitUntil`.
+- `clients.claim()` cho SW điều khiển trang ngay từ lần đầu; phối hợp cẩn thận với update flow (Phần 12).
+
+---
+
+## Phần tiếp theo
+
+**Phần 17 — Background Fetch & Periodic Sync nâng cao:** tải file lớn (video, dataset) chạy nền với Background Fetch API có progress UI và sống sót khi đóng tab, cập nhật nội dung định kỳ bằng Periodic Background Sync, cùng permission và fallback cho trình duyệt chưa hỗ trợ.

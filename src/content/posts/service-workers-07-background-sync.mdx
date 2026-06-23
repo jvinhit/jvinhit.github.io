@@ -1,0 +1,278 @@
+---
+title: 'Service Workers · Phần 7 — Background Sync & hàng đợi offline'
+description: 'Gửi lại request thất bại khi có mạng trở lại với Background Sync API, xây hàng đợi bằng IndexedDB, xử lý event sync và retry, Periodic Background Sync, cùng fallback cho trình duyệt không hỗ trợ.'
+pubDate: 2026-07-03
+tags: [service-worker, background-sync, indexeddb, offline, service_workers_10]
+series: service-workers
+seriesOrder: 7
+draft: false
+---
+
+Đến giờ ta đã giỏi **đọc** dữ liệu offline (cache). Nhưng còn **ghi** thì sao? Người dùng gõ một bình luận, bấm gửi, đúng lúc mất mạng — request thất bại. Cách tệ: hiện lỗi "Gửi thất bại, thử lại". Cách hay của một PWA: **nhận bình luận, xếp vào hàng đợi, và tự gửi khi có mạng lại** — kể cả khi người dùng đã đóng tab.
+
+Đó là **Background Sync**. Bài này ta xây một hàng đợi offline thật: lưu request vào IndexedDB, đăng ký sync, và để service worker tự "flush" hàng đợi khi mạng phục hồi.
+
+---
+
+## Background Sync là gì?
+
+Background Sync cho phép bạn **trì hoãn một tác vụ tới khi người dùng có kết nối ổn định**. Trình duyệt sẽ phát event `sync` trong service worker khi nó cho rằng mạng đã sẵn sàng — ngay cả khi tab đã đóng từ lâu.
+
+Luồng tổng quát:
+
+```text
+1. App thử gửi data → fetch fail (offline)
+2. App lưu data vào IndexedDB (hàng đợi)
+3. App đăng ký:  registration.sync.register('send-data')
+4. (Người dùng có thể đóng tab)
+5. Mạng phục hồi → trình duyệt phát event 'sync' trong SW
+6. SW đọc hàng đợi từ IndexedDB, gửi từng item
+7. Thành công → xóa khỏi hàng đợi.  Thất bại → trình duyệt tự retry sau
+```
+
+Điểm tuyệt vời: bước 5–6 chạy **độc lập với tab**. Người dùng có thể đã chuyển app khác; khi mạng về, service worker vẫn âm thầm hoàn thành việc gửi.
+
+---
+
+## Vì sao cần IndexedDB (không phải Cache API)?
+
+Hàng đợi chứa **dữ liệu có cấu trúc cần ghi/đọc/xóa** (payload, thời gian, số lần thử). Cache API hợp cho cặp Request→Response, còn IndexedDB là **database giao dịch (transactional)** hợp cho hàng đợi. Và nhớ từ Phần 1: service worker **stateless** — không giữ được hàng đợi trong biến, phải lưu xuống IndexedDB.
+
+Để gọn, ta dùng một helper IndexedDB tối giản (trong dự án thật bạn có thể dùng thư viện `idb`):
+
+```js
+// idb-queue.js — helper IndexedDB tối giản cho hàng đợi
+const DB_NAME = 'sync-db';
+const STORE = 'outbox';
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(STORE, { keyPath: 'id', autoIncrement: true });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function addToOutbox(item) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).add({ ...item, createdAt: Date.now() });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getAllOutbox() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function deleteOutbox(id) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+```
+
+---
+
+## Phía trang: xếp hàng và đăng ký sync
+
+Khi gửi thất bại, lưu vào outbox và đăng ký sync:
+
+```js
+import { addToOutbox } from './idb-queue.js';
+
+async function sendComment(text) {
+  const payload = { url: '/api/comments', body: { text } };
+  try {
+    // Thử gửi ngay nếu đang online.
+    const res = await fetch(payload.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload.body),
+    });
+    if (!res.ok) throw new Error('server error');
+    return 'sent';
+  } catch (error) {
+    // Offline hoặc lỗi → xếp hàng và nhờ Background Sync.
+    await addToOutbox(payload);
+    const reg = await navigator.serviceWorker.ready;
+    if ('sync' in reg) {
+      await reg.sync.register('flush-outbox'); // tag đặt tên cho lần sync
+    }
+    return 'queued';
+  }
+}
+```
+
+> `navigator.serviceWorker.ready` đảm bảo SW đã active trước khi đăng ký sync. `tag` ('flush-outbox') là định danh — đăng ký nhiều lần cùng tag chỉ tạo **một** sync chờ, nên an toàn khi gọi lặp.
+
+---
+
+## Phía service worker: xử lý event `sync`
+
+```js
+// sw.js
+import { getAllOutbox, deleteOutbox } from './idb-queue.js';
+
+self.addEventListener('sync', (event) => {
+  if (event.tag === 'flush-outbox') {
+    // waitUntil giữ SW sống tới khi flush xong.
+    // Nếu Promise REJECT → trình duyệt sẽ tự động retry sync sau (backoff).
+    event.waitUntil(flushOutbox());
+  }
+});
+
+async function flushOutbox() {
+  const items = await getAllOutbox();
+
+  for (const item of items) {
+    try {
+      const res = await fetch(item.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(item.body),
+      });
+      if (!res.ok) throw new Error(`server ${res.status}`);
+
+      // Gửi thành công → xóa khỏi hàng đợi.
+      await deleteOutbox(item.id);
+    } catch (error) {
+      // Một item fail → ném lỗi để trình duyệt retry CẢ sync sau.
+      // (Các item đã xóa sẽ không gửi lại; item còn lại sẽ thử lại lần sau.)
+      throw error;
+    }
+  }
+}
+```
+
+Cơ chế retry là **miễn phí**: nếu `flushOutbox()` reject, trình duyệt giữ sync và **tự thử lại** với khoảng cách tăng dần (exponential backoff), thường tối đa vài lần trong ~24 giờ. Bạn không cần tự viết vòng lặp retry.
+
+---
+
+## Thông báo ngược về trang
+
+Sau khi gửi xong, service worker có thể báo cho trang (nếu đang mở) để cập nhật UI:
+
+```js
+async function notifyClients(message) {
+  const clients = await self.clients.matchAll({ includeUncontrolled: true });
+  clients.forEach((client) => client.postMessage(message));
+}
+
+// sau khi deleteOutbox thành công:
+await notifyClients({ type: 'COMMENT_SENT', id: item.id });
+```
+
+Phía trang lắng nghe:
+
+```js
+navigator.serviceWorker.addEventListener('message', (event) => {
+  if (event.data?.type === 'COMMENT_SENT') {
+    markCommentAsSent(event.data.id); // bỏ trạng thái "đang chờ gửi"
+  }
+});
+```
+
+---
+
+## Periodic Background Sync — cập nhật định kỳ
+
+Có một anh em họ: **Periodic Background Sync**, cho phép cập nhật dữ liệu **định kỳ trong nền** (ví dụ tải tin mới mỗi sáng) mà không cần người dùng mở app.
+
+```js
+// Đăng ký (phía trang) — cần quyền và app đã được "cài"
+const reg = await navigator.serviceWorker.ready;
+if ('periodicSync' in reg) {
+  const status = await navigator.permissions.query({ name: 'periodic-background-sync' });
+  if (status.state === 'granted') {
+    await reg.periodicSync.register('update-news', {
+      minInterval: 24 * 60 * 60 * 1000, // tối thiểu 1 ngày
+    });
+  }
+}
+```
+
+```js
+// Xử lý (phía SW)
+self.addEventListener('periodicsync', (event) => {
+  if (event.tag === 'update-news') {
+    event.waitUntil(updateNewsCache());
+  }
+});
+```
+
+> Lưu ý quan trọng: Periodic Background Sync có **điều kiện ngặt** — chỉ chạy cho PWA **đã cài đặt**, do trình duyệt quyết định tần suất thật (dựa trên mức độ người dùng dùng app, pin, mạng), và **hỗ trợ hạn chế** (chủ yếu Chromium). Đừng phụ thuộc vào nó cho logic quan trọng.
+
+---
+
+## Hỗ trợ trình duyệt & fallback
+
+Background Sync hiện **chủ yếu hỗ trợ trên Chromium** (Chrome, Edge). Safari và Firefox **chưa** hỗ trợ. Vì vậy luôn cần fallback:
+
+```js
+async function queueAndSync(payload) {
+  await addToOutbox(payload);
+  const reg = await navigator.serviceWorker.ready;
+
+  if ('sync' in reg) {
+    await reg.sync.register('flush-outbox'); // dùng Background Sync
+  } else {
+    // Fallback: tự flush khi có event 'online'.
+    // (Chỉ chạy khi tab đang mở — không bằng Background Sync nhưng có còn hơn không.)
+    window.addEventListener('online', () => flushOutboxFromPage(), { once: true });
+  }
+}
+```
+
+> Triết lý: Background Sync là **progressive enhancement**. Nơi có hỗ trợ → trải nghiệm tốt nhất (gửi cả khi đóng tab). Nơi không → fallback `online` event (gửi khi tab mở lại). App không bao giờ **mất** dữ liệu của người dùng dù ở trình duyệt nào.
+
+---
+
+## Tóm tắt
+
+- **Background Sync** trì hoãn tác vụ tới khi có mạng, phát event `sync` trong SW — chạy **độc lập với tab**.
+- Hàng đợi lưu trong **IndexedDB** (transactional, bền), vì SW stateless và Cache API không hợp cho dữ liệu có cấu trúc.
+- Luồng: fetch fail → `addToOutbox` → `registration.sync.register(tag)` → event `sync` → `flushOutbox` → xóa item thành công.
+- `event.waitUntil()` giữ SW sống; **reject để trình duyệt tự retry** (backoff miễn phí).
+- **Periodic Background Sync** cập nhật định kỳ nhưng điều kiện ngặt và hỗ trợ hẹp.
+- Hỗ trợ chính trên **Chromium**; luôn có **fallback `online` event** cho Safari/Firefox.
+
+---
+
+## Bài tập thực hành
+
+### Bài 1 — Outbox cơ bản (cơ bản)
+
+Cài helper IndexedDB và viết form gửi bình luận. Bật **Offline**, gửi vài bình luận, kiểm tra **Application → IndexedDB → sync-db → outbox** thấy chúng được xếp hàng.
+
+**Hướng dẫn:** Online thì gửi thẳng; offline thì `addToOutbox`. Mở DevTools xác nhận các bản ghi có `body` và `createdAt`. Chưa cần sync — mục tiêu bài này là làm chủ ghi/đọc IndexedDB, nền tảng của cả hệ thống.
+
+### Bài 2 — Flush bằng Background Sync (trung bình)
+
+Thêm `reg.sync.register('flush-outbox')` và handler `sync` trong SW. Quy trình test: Offline → gửi → Online trở lại → quan sát hàng đợi tự rỗng.
+
+**Hướng dẫn:** Trong DevTools → **Application → Service Workers** có ô nhập **tag** và nút để **kích hoạt sync thủ công** — gõ `flush-outbox` và bấm để mô phỏng mà không cần đợi mạng. Quan sát log trong SW và IndexedDB rỗng dần. Nếu một item fail (giả lập bằng URL sai), xác nhận trình duyệt retry.
+
+### Bài 3 — Fallback + báo ngược UI (nâng cao)
+
+Thêm: (a) fallback `online` event khi `'sync' in reg` là false; (b) `postMessage` từ SW về trang để xóa trạng thái "đang chờ gửi" của từng bình luận.
+
+**Hướng dẫn:** Test fallback bằng cách tạm comment dòng `reg.sync.register` để mô phỏng trình duyệt không hỗ trợ — bình luận phải vẫn được gửi khi `online` bắn. Với báo ngược UI, đánh dấu mỗi bình luận đang chờ bằng icon ⏳, và khi nhận `COMMENT_SENT` thì đổi thành ✅. Trải nghiệm hoàn chỉnh này — gõ offline, đóng tab, mở lại thấy đã gửi — chính là "phép màu" khiến người dùng tin PWA. Ta sẽ tái dùng pattern này ở capstone Phần 10.
+
+---
+
+**Phần tiếp theo:** Push Notifications — nhận thông báo đẩy ngay cả khi tab đóng: Push API + Notifications API, subscription, VAPID keys, event push và notificationclick.

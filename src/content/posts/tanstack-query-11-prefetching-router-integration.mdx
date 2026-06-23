@@ -1,0 +1,284 @@
+---
+title: 'TanStack Query · Phần 11 — Prefetching & tích hợp Router nâng cao'
+description: 'Tải data trước theo ý định người dùng: prefetch on hover/focus/viewport, ensureQueryData vs prefetchQuery, prefetchInfiniteQuery, route loader (React Router & TanStack Router) và cách triệt tiêu request waterfall.'
+pubDate: 2026-07-02
+tags: [react, tanstack-query, react-query, prefetching, tanstack_query_8]
+series: tanstack-query
+seriesOrder: 11
+draft: false
+---
+
+Phần 7 đã giới thiệu prefetch-on-hover và `ensureQueryData` trong route loader. Phần này đào sâu **toàn bộ nghệ thuật prefetch** — vũ khí mạnh nhất để app *cảm giác* tức thì mà không cần server nhanh hơn. Ý tưởng cốt lõi: con người để lộ ý định *trước* khi hành động (rê chuột, focus, cuộn tới gần), và ta dùng những tín hiệu đó để nạp data sớm.
+
+Ta cũng mổ xẻ kẻ thù số một của tốc độ cảm nhận: **request waterfall** — chuỗi request nối đuôi tuần tự khi đáng lẽ chúng chạy song song.
+
+---
+
+## 1. Bốn API prefetch — chọn đúng cái
+
+| API | Trả về | Throw khi lỗi? | Dùng khi |
+|---|---|---|---|
+| `prefetchQuery(opts)` | `Promise<void>` | Không (nuốt lỗi) | Mồi cache "best effort", không chặn |
+| `ensureQueryData(opts)` | `Promise<data>` | Có | Cần data ngay (loader) — trả cache nếu có, fetch nếu chưa |
+| `fetchQuery(opts)` | `Promise<data>` | Có | Cần data + muốn bắt lỗi tường minh |
+| `prefetchInfiniteQuery(opts)` | `Promise<void>` | Không | Mồi infinite list (mục 5) |
+
+Khác biệt quan trọng nhất là **`prefetchQuery` vs `ensureQueryData`**:
+
+- `prefetchQuery` **luôn** trả `Promise<void>` và không throw — hợp với "mồi nền".
+- `ensureQueryData` trả **data** và **dùng cache nếu còn fresh** (không fetch lại) — hợp với loader vì tránh fetch thừa.
+
+```ts
+// Mồi nền, không quan tâm kết quả:
+queryClient.prefetchQuery(customerQuery(id));
+
+// Cần chắc chắn có data, tái dùng cache fresh:
+const customer = await queryClient.ensureQueryData(customerQuery(id));
+```
+
+Cả hai đều tôn trọng `staleTime`: nếu data còn tươi, chúng **không** gọi mạng — nên gọi liên tục (vd mỗi lần hover) cũng an toàn.
+
+---
+
+## 2. Prefetch theo ý định: hover, focus, viewport
+
+Ba tín hiệu "sắp cần data", mỗi cái hợp một ngữ cảnh:
+
+```tsx
+import { useQueryClient } from '@tanstack/react-query';
+
+function CustomerRow({ customer }: { customer: Customer }) {
+  const qc = useQueryClient();
+  const prefetch = () => qc.prefetchQuery(customerQuery(customer.id));
+
+  return (
+    <Link
+      to={`/customers/${customer.id}`}
+      onMouseEnter={prefetch} // chuột: desktop
+      onFocus={prefetch}      // bàn phím / accessibility: tab tới link
+      onTouchStart={prefetch} // mobile: chạm trước khi nhả
+    >
+      {customer.name}
+    </Link>
+  );
+}
+```
+
+> **Đừng quên `onFocus`.** Nếu chỉ prefetch on `mouseenter`, người dùng bàn phím (và screen reader) không bao giờ kích hoạt prefetch. `onFocus` làm prefetch *accessible*.
+
+### Prefetch khi phần tử vào viewport
+
+Cho danh sách dài, prefetch chi tiết của item *sắp lọt vào màn hình* bằng `IntersectionObserver`:
+
+```tsx
+function PrefetchOnVisible({ id }: { id: string }) {
+  const qc = useQueryClient();
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const obs = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting) {
+          qc.prefetchQuery(customerQuery(id));
+          obs.disconnect(); // mồi một lần là đủ
+        }
+      },
+      { rootMargin: '200px' }, // mồi trước khi thực sự thấy
+    );
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [id, qc]);
+
+  return <div ref={ref} />;
+}
+```
+
+---
+
+## 3. Chống lạm dụng: debounce & điều kiện
+
+Prefetch là tối ưu, không phải bắt buộc — đừng để nó thành DDoS chính server của mình. Vài nguyên tắc:
+
+- **Tin vào `staleTime`**: prefetch khi data còn fresh là no-op, nên hover lặp không tạo request mới.
+- **Debounce hover** nếu list dày và `staleTime` thấp: chỉ prefetch sau khi chuột dừng ~100ms.
+- **Đừng prefetch trên mạng yếu**: kiểm tra `navigator.connection?.saveData` hoặc `effectiveType` để bỏ qua khi user bật tiết kiệm dữ liệu.
+
+```ts
+function shouldPrefetch(): boolean {
+  const conn = (navigator as Navigator & { connection?: { saveData?: boolean; effectiveType?: string } }).connection;
+  if (conn?.saveData) return false;
+  if (conn?.effectiveType && /2g/.test(conn.effectiveType)) return false;
+  return true;
+}
+```
+
+---
+
+## 4. Route loader: nạp data song song với code
+
+Đây là nơi prefetch đáng giá nhất. Khi điều hướng bắt đầu, router có thể **đồng thời** tải code của route *và* prefetch data — thay vì "render rồi mới fetch" (waterfall).
+
+### React Router v7 (data mode)
+
+```ts
+import { queryClient } from '@/lib/query-client';
+import { customerQuery } from '@/features/customers/queries';
+
+export async function customerLoader({ params }: LoaderFunctionArgs) {
+  const id = params.id;
+  if (!id) throw new Response('Not found', { status: 404 });
+  // Mồi cache; component vẫn dùng useQuery như thường.
+  await queryClient.ensureQueryData(customerQuery(id));
+  return null;
+}
+```
+
+```tsx
+// Component không đổi — chỉ dùng useQuery, data đã sẵn trong cache:
+function CustomerDetail() {
+  const { id } = useParams();
+  const { data } = useQuery(customerQuery(id!));
+  return <h1>{data?.name}</h1>; // không spinner
+}
+```
+
+### TanStack Router (typed, tích hợp sẵn)
+
+TanStack Router sinh ra để đi cùng React Query: loader và component chia sẻ context, key được type đầy đủ.
+
+```ts
+export const Route = createFileRoute('/customers/$id')({
+  loader: ({ context: { queryClient }, params: { id } }) =>
+    queryClient.ensureQueryData(customerQuery(id)),
+  component: CustomerDetail,
+});
+```
+
+> **Loader nên `ensureQueryData` (không `prefetchQuery`).** Loader cần *chờ* data để router biết khi nào điều hướng xong và có thể hiển thị error boundary nếu fetch hỏng. `ensureQueryData` throw khi lỗi → router bắt được.
+
+---
+
+## 5. `prefetchInfiniteQuery` cho danh sách vô hạn
+
+Infinite list (Phần 4) cũng prefetch được — kể cả nhiều trang đầu:
+
+```ts
+await queryClient.prefetchInfiniteQuery({
+  queryKey: customerKeys.infinite(),
+  queryFn: fetchCustomerPage,
+  initialPageParam: 0,
+  // Mồi sẵn 2 trang đầu để cuộn xuống thấy ngay.
+  pages: 2,
+});
+```
+
+`pages: 2` bảo Query nạp trước hai trang. Hợp khi bạn biết user gần như chắc chắn sẽ cuộn (vd feed). Trên loader, có `ensureInfiniteQueryData` tương ứng để vừa mồi vừa trả data.
+
+---
+
+## 6. Waterfall — nhận diện và triệt tiêu
+
+Waterfall là khi request B chỉ bắt đầu *sau khi* A xong, dù B không phụ thuộc A. Dấu hiệu trong Network tab: các request xếp bậc thang thay vì song song.
+
+### Waterfall do component lồng nhau
+
+```tsx
+// ❌ User load xong → mới render Posts → Posts mới fetch
+function Profile() {
+  const { data: user } = useQuery(userQuery());
+  if (!user) return <Spinner />;
+  return <Posts userId={user.id} />; // posts chỉ fetch sau khi user xong
+}
+```
+
+Nếu `posts` chỉ cần `userId` (mà bạn có sẵn từ route param), hãy fetch **song song**:
+
+```tsx
+// ✅ Cả hai chạy cùng lúc
+function Profile({ userId }: { userId: string }) {
+  const user = useQuery(userQuery(userId));
+  const posts = useQuery(postsQuery(userId)); // không chờ user
+  // ...
+}
+```
+
+### Waterfall do `useSuspenseQuery` lồng nhau
+
+`useSuspenseQuery` suspend component cha → chặn render con → con chưa kịp gọi query. Khắc phục: gọi các suspense query **cạnh nhau** hoặc dùng `useSuspenseQueries`:
+
+```tsx
+import { useSuspenseQueries } from '@tanstack/react-query';
+
+function Dashboard() {
+  // Cả hai khởi chạy đồng thời, cùng suspend một lần.
+  const [{ data: user }, { data: stats }] = useSuspenseQueries({
+    queries: [userQuery(), statsQuery()],
+  });
+  return <Header user={user} stats={stats} />;
+}
+```
+
+### Waterfall do prefetch tuần tự trong loader
+
+```ts
+// ❌ chờ A rồi mới mồi B
+await queryClient.ensureQueryData(aQuery());
+await queryClient.ensureQueryData(bQuery());
+
+// ✅ song song
+await Promise.all([
+  queryClient.ensureQueryData(aQuery()),
+  queryClient.ensureQueryData(bQuery()),
+]);
+```
+
+---
+
+## 7. Bài tập
+
+**1.** Khác biệt cốt lõi giữa `prefetchQuery` và `ensureQueryData`, và vì sao loader nên dùng `ensureQueryData`?
+
+<details>
+<summary>Lời giải</summary>
+
+`prefetchQuery` trả `Promise<void>` và *nuốt lỗi* — hợp mồi nền best-effort. `ensureQueryData` trả *data*, dùng cache nếu còn fresh, và *throw* khi lỗi. Loader nên dùng `ensureQueryData` vì router cần chờ data và cần lỗi được throw để kích hoạt error boundary của route.
+
+</details>
+
+**2.** Vì sao nên thêm `onFocus` (không chỉ `onMouseEnter`) khi prefetch theo ý định?
+
+<details>
+<summary>Lời giải</summary>
+
+Người dùng bàn phím và screen reader điều hướng bằng Tab, kích hoạt `focus` chứ không `mouseenter`. Nếu chỉ prefetch on hover, họ không bao giờ được hưởng lợi. Thêm `onFocus` (và `onTouchStart` cho mobile) làm prefetch bao phủ mọi cách tương tác.
+
+</details>
+
+**3.** Kể hai nguyên nhân gây request waterfall và cách triệt tiêu mỗi cái.
+
+<details>
+<summary>Lời giải</summary>
+
+(1) Component lồng nhau khi con chỉ fetch sau khi cha có data — nâng data con lên fetch song song nếu nó không thực sự phụ thuộc cha. (2) `useSuspenseQuery` lồng nhau — cha suspend chặn con; dùng `useSuspenseQueries` hoặc đặt các query cạnh nhau. (Thêm: prefetch tuần tự trong loader — gói bằng `Promise.all`.)
+
+</details>
+
+**Nâng cao:** Thêm prefetch-on-viewport cho một list dài, rồi mở Network tab cuộn chậm — xác nhận chi tiết item được nạp *trước* khi item lọt vào màn hình, và mở trang chi tiết hiển thị không spinner.
+
+---
+
+## Tóm tắt
+
+- Bốn API: `prefetchQuery` (void, nuốt lỗi), `ensureQueryData` (trả data, dùng cache fresh, throw), `fetchQuery` (data + throw), `prefetchInfiniteQuery` (infinite). Tất cả tôn trọng `staleTime`.
+- Prefetch theo **ý định**: `onMouseEnter` + `onFocus` + `onTouchStart`, và `IntersectionObserver` cho viewport — nhớ làm prefetch *accessible*.
+- Tôn trọng người dùng: tin `staleTime`, debounce khi cần, bỏ qua khi `saveData`/mạng yếu.
+- **Route loader** nạp data song song với code; dùng `ensureQueryData` để router chờ và bắt lỗi (React Router v7 & TanStack Router).
+- **Waterfall** đến từ component lồng, suspense lồng, và prefetch tuần tự — triệt tiêu bằng fetch song song, `useSuspenseQueries`, và `Promise.all`.
+
+---
+
+## Phần tiếp theo
+
+**Phần 12 — QueryClient như một store: thao tác cache chủ động:** dùng `setQueryData`/`getQueriesData`/`setQueriesData` để đọc-ghi cache trực tiếp, invalidate bằng `predicate` và `refetchType`, `cancelQueries`/`removeQueries`, rồi đăng ký `queryClient.subscribe` để đồng bộ chéo nhiều query mà không cần refetch.

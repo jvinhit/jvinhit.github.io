@@ -1,0 +1,293 @@
+---
+title: 'Node Package Managers · Part 2 — npm in Depth'
+description: 'The default package manager, demystified: package-lock.json anatomy, hoisting and phantom dependencies, npm ci vs npm install, lifecycle scripts, npx, .npmrc and scoped registries.'
+pubDate: 2026-06-17
+tags: [npm, package-managers, nodejs, lockfile, package_managers_12]
+series: package-managers
+seriesOrder: 2
+draft: false
+---
+
+Đây là **Phần 2 của series 12 phần** về package manager Node. Ở [Phần 1](/posts/package-managers-01-mental-model) ta dựng mô hình tư duy — *resolve → fetch → link*. Giờ ta đào sâu **npm**, công cụ đi kèm Node và là chuẩn để mọi manager khác đối chiếu.
+
+Bạn đã biết cách *chạy* npm. Phần này nói về những gì nó *làm* — những chỗ cắn bạn lúc production.
+
+---
+
+## 1. `node_modules` phẳng, hoisted
+
+npm thời đầu (v2 trở về trước) lồng dependency theo đúng nghĩa đen:
+
+```text
+node_modules/
+└── a/
+    └── node_modules/
+        └── b/
+            └── node_modules/
+                └── c/   ← path so deep Windows refused to delete it
+```
+
+Việc này tạo ra lỗi "path too long" khét tiếng trên Windows và trùng lặp khổng lồ. npm v3+ sửa bằng **hoisting**: làm phẳng mọi thứ lên đầu `node_modules`.
+
+```text
+node_modules/
+├── a/        ← your direct dep
+├── b/        ← HOISTED (a needs it, but it's now at the top)
+├── c/        ← HOISTED (b needs it)
+└── react/    ← your direct dep
+
+Node's resolution walks UP the folder tree, so a/ can `require('b')`
+even though b is not inside a/node_modules.
+{Node resolve bằng cách đi LÊN cây thư mục, nên a/ require('b') được
+dù b không nằm trong a/node_modules.}
+```
+
+Hoisting giải quyết độ sâu, nhưng tạo ra hai vấn đề mà phần còn lại của thế giới package manager mất một thập kỷ để sửa.
+
+---
+
+## 2. Phantom dependency — lỗi âm thầm
+
+Vì hoisting đặt package transitive lên top level, code của bạn có thể `import` package bạn **chưa từng khai báo**:
+
+```js
+// package.json only declares "express".
+// But express depends on "debug", which got hoisted to the top.
+import debug from 'debug'; // ✅ WORKS — but you never installed it!
+```
+
+Đây là **phantom dependency**. Hôm nay nó chạy được do tình cờ. Nó vỡ vào ngày express bỏ `debug`, hoặc layout hoist đổi, hoặc bạn chuyển sang manager nghiêm ngặt hơn.
+
+Vấn đề thứ hai là **doppelganger** — khi range version xung đột, npm không thể hoist cả hai, nên nó lồng và nhân bản:
+
+```text
+app needs lodash@4 ; plugin needs lodash@3
+node_modules/
+├── lodash/                 ← v4 (hoisted, the "winner")
+└── plugin/
+    └── node_modules/
+        └── lodash/          ← v3 (duplicated copy)
+```
+
+Cả hai bản nằm trên disk. Trong cây lớn, sự trùng lặp này bùng nổ. pnpm và Yarn Berry sinh ra để diệt phantom dep và doppelganger — Phần 4 và 5.
+
+### Giảm trùng lặp — `npm dedupe` và `overrides`
+
+Đôi khi cây có *nhiều* bản hơn mức cần thiết do thứ tự cài. `npm dedupe` chạy lại lượt làm phẳng để gộp các bản trùng tương thích:
+
+```bash
+npm ls lodash            # how many copies, and where?
+npm dedupe               # collapse compatible duplicates higher in the tree
+```
+
+Khi hai range thực sự *không* gộp được nhưng bạn muốn ép một version (vd vá bảo mật trong dep transitive), dùng `overrides`:
+
+```jsonc
+// package.json — force every nested lodash to the patched version
+{ "overrides": { "lodash": "4.17.21" } }
+```
+
+Đây là cách sửa khẩn cấp phổ biến nhất khi `npm audit` báo một package transitive mà parent chưa cập nhật.
+
+---
+
+## 3. Giải phẫu `package-lock.json`
+
+Lockfile dài dòng nhưng đọc được khi đã biết cấu trúc. Định dạng hiện đại (`lockfileVersion: 3`) dùng map `packages` với key là **path** cài đặt:
+
+```json
+{
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "my-app", "dependencies": { "react": "^19.0.0" } },
+    "node_modules/react": {
+      "version": "19.1.4",
+      "resolved": "https://registry.npmjs.org/react/-/react-19.1.4.tgz",
+      "integrity": "sha512-AbCdEf...",
+      "engines": { "node": ">=18" }
+    }
+  }
+}
+```
+
+Đọc từng trường để biết nó đảm bảo gì:
+
+- bản build **chính xác** được chọn (không range).
+- tarball đến từ đâu (audit cái này để bắt registry lạ).
+- hash toàn vẹn; npm từ chối tải nếu byte không khớp.
+
+Key theo **path** (không phải tên) cho phép lockfile mô tả *doppelganger* chính xác — `node_modules/plugin/node_modules/lodash` là entry khác với `node_modules/lodash`.
+
+### Lockfile ẩn trong `node_modules`
+
+npm còn ghi một lockfile *nội bộ* thứ hai: `node_modules/.package-lock.json`. Nó là snapshot của những gì **thực sự đang trên disk lúc này**, dùng để bỏ qua công việc ở lần install kế:
+
+```text
+package-lock.json            ← committed, the source of truth {chân lý, được commit}
+node_modules/.package-lock.json  ← npm's view of the current install (do NOT commit)
+{cái nhìn của npm về install hiện tại — KHÔNG commit}
+```
+
+Nếu hai cái lệch nhau (vd bạn xoá tay một thư mục trong `node_modules`), npm phát hiện và sửa ở lần `npm install` kế. Đây cũng là lý do install hỏng thường được sửa bằng cách xoá hẳn `node_modules` rồi cài lại — bạn vứt snapshot nội bộ cũ.
+
+---
+
+## 4. `npm install` vs `npm ci`
+
+Hai cái này **không** thay thế cho nhau, và dùng sai trong CI là nguyên nhân hàng đầu của build chập chờn:
+
+| | `npm install` | `npm ci` |
+|---|---|---|
+| Reads `package.json` | Có — có thể **đổi** lockfile | Không — lockfile là luật |
+| Existing `node_modules` | Vá tăng dần | **Xoá** trước, cài mới |
+| Missing/mismatched lockfile | Tạo/cập nhật | **Báo lỗi** |
+| Speed | Chậm hơn | Nhanh hơn |
+| Dùng cho | Dev local, thêm dep | **CI, Docker, build tái lập** |
+
+```bash
+# Local: add/update deps, lockfile may change
+npm install
+npm install react@latest    # add/upgrade a specific dep
+
+# CI / Docker: fail fast if lockfile and package.json disagree
+npm ci
+```
+
+> Quy tắc ngón tay cái: nếu con người đang chọn version, dùng `install`; nếu máy chỉ cần tái lập một cây đã biết là tốt, dùng `ci`.
+
+---
+
+## 5. Lifecycle script — sức mạnh và nguy hiểm
+
+`scripts` trong `package.json` được npm chạy tại các thời điểm xác định. Một số bạn gọi (`npm run build`); một số npm gọi **tự động**:
+
+```json
+{
+  "scripts": {
+    "preinstall": "node check-node-version.js",
+    "postinstall": "node-gyp rebuild",   // ← runs after deps install
+    "prepare": "husky install",          // ← runs after install + before publish
+    "build": "vite build",
+    "test": "vitest"
+  }
+}
+```
+
+Thứ tự lifecycle khi install:
+
+```text
+preinstall → install → postinstall → prepublish → prepare
+{npm runs these for YOUR package AND for every dependency that defines them}
+{npm chạy chúng cho package CỦA BẠN VÀ cho mọi dependency có định nghĩa}
+```
+
+Mệnh đề cuối là quả bom security: khi bạn `npm install`, script `postinstall` của *mọi* package trong cây dependency có thể chạy code tuỳ ý. Dùng hợp pháp: biên dịch native addon, tải binary nền tảng. Dùng độc hại: trộm env var, cài backdoor — xem Phần 9.
+
+Bạn có thể tắt toàn cục (và cho phép có chọn lọc cái tin cậy):
+
+```bash
+npm install --ignore-scripts        # skip ALL lifecycle scripts
+npm config set ignore-scripts true  # make it the default for this project
+```
+
+---
+
+## 6. `npx` — chạy mà không cài
+
+`npx` chạy binary của package, tải tạm nếu chưa cài:
+
+```bash
+npx create-vite@latest my-app   # scaffold without a global install
+npx vite                        # run the locally-installed vite binary
+```
+
+Thứ tự resolve: `node_modules/.bin` cục bộ trước, rồi tải tạm. Tiện lợi che giấu rủi ro: tên package gõ sai (`npx vitte`) có thể tải và **chạy** một typosquat của kẻ tấn công ngay lập tức. Ghim version và kiểm tra kỹ tên.
+
+### `.bin` shim — cách `npm run` tìm binary
+
+Khi một package khai báo `bin`, npm tạo một shim trong `node_modules/.bin/` trỏ tới file thực thi của package:
+
+```text
+node_modules/
+├── .bin/
+│   ├── vite      → ../vite/bin/vite.js        (symlink/shim)
+│   └── tsc       → ../typescript/bin/tsc
+└── vite/package.json  → { "bin": { "vite": "bin/vite.js" } }
+```
+
+Chi tiết then chốt: khi bạn chạy `npm run dev`, npm **thêm `node_modules/.bin` vào đầu `PATH`** cho script đó. Đó là lý do `"dev": "vite"` chạy được mà không cần path hay cài global. Nó cũng nghĩa một dependency độc hại có thể ship `bin` trùng tên tool phổ biến và **che** nó trong script — một vector cướp tinh vi sẽ xem lại ở Phần 9.
+
+---
+
+## 7. `.npmrc` và scoped registry
+
+`.npmrc` cấu hình npm theo project, user, hoặc toàn cục. Cài đặt quan trọng nhất định tuyến **scope** tới registry riêng:
+
+```ini
+# .npmrc — route the @myorg scope to a private registry
+@myorg:registry=https://npm.mycompany.com/
+//npm.mycompany.com/:_authToken=${NPM_TOKEN}
+
+# project-wide hardening
+save-exact=true        # write exact versions, not ^ranges
+ignore-scripts=false   # (set true for extra safety in CI)
+audit=true
+```
+
+Hai lưu ý cấp senior:
+
+1. **Đừng hard-code token**. Dùng `${NPM_TOKEN}` và bơm từ môi trường — `.npmrc` có token bị commit là rò rỉ credential.
+2. **Định tuyến scope là ranh giới bảo mật**. Nếu `@myorg/secret` không bị ghim vào registry riêng, kẻ tấn công có thể publish `@myorg/secret` công khai và npm có thể cài bản *của họ* — dependency confusion (Phần 9).
+
+### Thứ tự `.npmrc` — file nào thắng
+
+Có *bốn* vị trí `.npmrc`, gộp theo thứ tự ưu tiên này (cao đè thấp):
+
+```text
+1. project   ./.npmrc                    ← highest, commit this (no secrets!)
+2. user      ~/.npmrc                     ← personal tokens live here
+3. global    $PREFIX/etc/npmrc
+4. built-in  npm's own defaults           ← lowest
+{project → user → global → built-in}
+```
+
+Một lỗi "local chạy, CI hỏng" thường gặp là một cài đặt nằm trong `~/.npmrc` **user** chưa từng commit vào `.npmrc` **project**, nên CI không thấy. Kiểm tra kết quả đã gộp bằng:
+
+```bash
+npm config ls -l           # every effective setting and where it came from
+npm config get registry    # the value that actually wins
+```
+
+### Sửa config bằng lệnh — `npm pkg` & `npm query`
+
+Với script và CI bạn hiếm khi muốn sửa tay JSON. `npm pkg` đọc/ghi trường `package.json`, và `npm query` chạy selector kiểu CSS trên cây dependency:
+
+```bash
+npm pkg get version                       # read a field
+npm pkg set scripts.test="vitest run"     # write a field, no manual edit
+npm query "#lodash"                        # every lodash node in the tree
+npm query ".dev"                           # all dev dependencies, as JSON
+npm query "*:attr(scripts, [postinstall])" # packages WITH a postinstall ← audit!
+```
+
+Câu query cuối là một audit bảo mật thực sự hữu ích: liệt kê mọi dependency có script `postinstall` (Phần 9).
+
+---
+
+## Giờ bạn đã biết gì
+
+- npm dùng `node_modules` **phẳng, hoisted**, gây ra **phantom dep** và **doppelganger**.
+- Lockfile ghim version chính xác + hash toàn vẹn, key theo path cài.
+- Dùng `npm ci` (không phải `install`) trong CI.
+- Lifecycle script chạy code tuỳ ý khi install.
+- Định tuyến scope của `.npmrc` vừa là tính năng vừa là ranh giới bảo mật.
+
+---
+
+## Bài tập
+
+1. Chạy `npm ls debug` và xem nó có bị hoist lên top không.
+2. Tìm một phantom dependency: chọn thứ bạn `import` và xác nhận nó *không* nằm trong `package.json`.
+3. Thêm `postinstall` in một thông báo, rồi chạy hai lệnh để thấy khác biệt.
+
+Tiếp theo — Phần 3: Yarn Classic (v1):

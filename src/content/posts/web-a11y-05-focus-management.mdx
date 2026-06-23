@@ -1,0 +1,287 @@
+---
+title: 'Web Accessibility · Part 5 — Focus Management in SPAs'
+description: 'Single-page apps break the browser focus model. Learn to manage focus on route changes, trap focus in modals, restore it on close, use inert, and never leave keyboard or screen-reader users stranded.'
+pubDate: 2026-09-19
+tags: [accessibility, a11y, focus, spa, react, web_a11y_12]
+series: web-a11y
+seriesOrder: 5
+draft: true
+---
+
+Phần 3–4 đã đi qua accessibility bàn phím: thứ tự tab, skip link, roving tabindex, và vòng focus hiển thị. Điều đó giúp người dùng *tới* control — nhưng **quản lý focus** trả lời chuyện gì xảy ra *tiếp theo*: khi route đổi mà không reload trang, khi modal mở, hay khi drawer đóng.
+
+SPA nổi tiếng vì để người dùng bàn phím và screen reader **mắc kẹt**: focus nằm trên link không còn tồn tại, hoặc biến mất sau overlay mà không ai thông báo. Phần này là cách sửa — thông báo đổi route, bẫy focus, khôi phục focus, và thuộc tính `inert`.
+
+---
+
+## 1. Vì sao SPA phá vỡ mô hình focus của trình duyệt
+
+Trên **điều hướng multi-page truyền thống**, trình duyệt tải document mới. Ba việc xảy ra tự động mà SPA bỏ qua:
+
+1. **Focus reset** — thường về `<body>` hoặc phần tử focusable đầu tiên trên trang mới.
+2. **Tiêu đề trang cập nhật** — screen reader thường đọc nó như ngữ cảnh "tôi đang ở đâu?".
+3. **Cây accessibility được dựng lại** từ đầu — landmark và heading tạo outline mới.
+
+Client-side routing (React Router, TanStack Router, v.v.) đổi nội dung DOM **tại chỗ**. URL và `document.title` có thể đổi, nhưng **focus không di chuyển** trừ khi bạn di chuyển nó. Người dùng vừa bấm "Settings" bằng `Enter` có thể vẫn focus trên link đã unmount — lần `Tab` tiếp theo rơi vào chỗ không đoán được, hoặc không đi đâu cả.
+
+```text
+Full page load:     click link → new document → focus reset → SR announces title
+Client-side route:  click link → DOM patch    → focus STAYS → SR hears… silence
+```
+
+> **WCAG 2.4.3 Focus Order** và **2.4.7 Focus Visible** vẫn áp dụng trong SPA — focus dự đoán được không phải tùy chọn chỉ vì bạn dùng framework.
+
+---
+
+## 2. Focus khi đổi route
+
+Mỗi lần điều hướng client-side nên làm **hai việc**: chuyển focus tới nội dung có nghĩa, và **thông báo** view mới.
+
+### Chuyển focus tới heading hoặc `<main>`
+
+Pattern phổ biến nhất: khi vào route, focus `<h1>` của trang (hoặc heading đầu tiên trong `<main>`). Heading thường **không** focusable sẵn, nên thêm `tabindex="-1"` — đưa phần tử vào tab order **lập trình** mà không thêm vào chu trình `Tab` tuần tự.
+
+```tsx
+// RouteAnnouncer.tsx — call once per route change
+import { useEffect, useRef } from 'react';
+import { useLocation } from 'react-router-dom';
+
+export function RouteFocusManager({ pageTitle }: { pageTitle: string }) {
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const location = useLocation();
+
+  useEffect(() => {
+    document.title = pageTitle;
+    headingRef.current?.focus();
+  }, [location.pathname, pageTitle]);
+
+  return (
+    <h1 ref={headingRef} tabIndex={-1} className="outline-none">
+      {pageTitle}
+    </h1>
+  );
+}
+```
+
+### Live region cho tiêu đề trang
+
+Chỉ chuyển focus có thể chưa đủ — vài screen reader đọc heading được focus, vài cái khác cần **live region** rõ ràng. Một vùng `aria-live="polite"` ẩn thị giác, cập nhật tiêu đề mới mỗi lần điều hướng, là bổ sung đáng tin.
+
+```tsx
+function RouteLiveAnnouncer({ pageTitle }: { pageTitle: string }) {
+  const location = useLocation();
+
+  return (
+    <p
+      key={location.pathname} // force re-announce on route change
+      aria-live="polite"
+      aria-atomic="true"
+      className="sr-only"
+    >
+      {pageTitle}
+    </p>
+  );
+}
+```
+
+| Strategy | Khi nào dùng |
+|----------|------------------------------|
+| Focus `<h1>` with `tabindex="-1"` | Mặc định cho hầu hết chuyển trang |
+| Focus `<main>` | Khi heading mang tính trang trí hoặc dùng chung giữa các route |
+| Live region announcement | Khi focus phải giữ chỗ khác (vd layout split-pane) |
+| Both focus + live region | Tương thích tối đa qua VoiceOver, NVDA, JAWS |
+
+---
+
+## 3. Quản lý focus modal và dialog
+
+Mở overlay đổi **ngữ cảnh tương tác** — người dùng không nên Tab vào nội dung phía sau modal. WAI-ARIA Authoring Practices định nghĩa hợp đồng rõ cho dialog:
+
+1. **Khi mở** — chuyển focus tới phần tử focusable đầu tiên bên trong (thường là chính dialog hoặc action chính).
+2. **Khi đang mở** — **bẫy** focus: `Tab` và `Shift+Tab` chỉ xoay trong dialog.
+3. **Escape** — đóng dialog (trừ khi hành động phá hủy không hoàn tác).
+4. **Khi đóng** — **khôi phục** focus về phần tử đã mở dialog.
+
+```text
+[Trigger: "Delete item"]  →  open modal  →  focus → [Cancel] or [Confirm]
+                                    ↓ Tab cycles inside only
+                              Escape / close  →  focus → [Trigger: "Delete item"]
+```
+
+> Quên bước 4 là lỗi modal phổ biến nhất: người dùng đóng dialog và focus biến mất về `<body>`, buộc họ Tab lại từ đầu trang.
+
+---
+
+## 4. Thuộc tính `inert` và `<dialog>` gốc
+
+### `inert` — im lặng mọi thứ sau overlay
+
+Thuộc tính **`inert`** (hỗ trợ rộng trên trình duyệt hiện đại) khiến cây con **không tương tác** và **ẩn khỏi công nghệ hỗ trợ**. Khi modal mở, đánh dấu `<main>` của trang (hoặc mọi thứ trừ dialog) là `inert`.
+
+```html
+<body>
+  <div id="app-root" inert>
+    <!-- background page — unreachable by Tab and AT -->
+    <header>...</header>
+    <main>...</main>
+  </div>
+
+  <dialog id="confirm-dialog">
+    <p>Delete this item?</p>
+    <button type="button">Cancel</button>
+    <button type="button">Delete</button>
+  </dialog>
+</body>
+```
+
+Không có `inert`, bẫy focus bằng JavaScript là tối thiểu; có `inert`, bạn có đảm bảo **kép** rằng nội dung nền không nhận click hay khám phá bằng screen reader.
+
+### `<dialog>` gốc với `showModal()`
+
+Phần tử HTML **`<dialog>`** với **`showModal()`** cho bạn top layer, `aria-modal="true"` ngầm, Escape để đóng, và focus chuyển vào dialog — miễn phí. Bạn vẫn cần **khôi phục focus khi đóng** và tùy chọn tinh chỉnh phần tử nhận focus ban đầu.
+
+```tsx
+function ConfirmDialog({
+  open,
+  onClose,
+  triggerRef,
+}: {
+  open: boolean;
+  onClose: () => void;
+  triggerRef: React.RefObject<HTMLButtonElement>;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+
+    if (open) {
+      dialog.showModal();
+      dialog.querySelector<HTMLElement>('button')?.focus();
+    } else if (dialog.open) {
+      dialog.close();
+      triggerRef.current?.focus();
+    }
+  }, [open, triggerRef]);
+
+  return (
+    <dialog ref={dialogRef} onClose={onClose}>
+      <p>Delete this item permanently?</p>
+      <button type="button" onClick={onClose}>Cancel</button>
+      <button type="button" onClick={onClose}>Delete</button>
+    </dialog>
+  );
+}
+```
+
+| Approach | Focus trap | Background blocked | Restore focus |
+|----------|------------|-------------------|---------------|
+| Custom div + JS trap | Thủ công | Khuyên dùng `inert` | Thủ công |
+| `<dialog showModal()>` | Trình duyệt xử lý phần lớn | Top layer + optional `inert` on rest | Thủ công khi đóng |
+| Headless UI libs (Radix, etc.) | Có sẵn | Thường có sẵn | Có sẵn |
+
+---
+
+## 5. Hook React bẫy focus tái sử dụng
+
+Khi không dùng được `<dialog>`, hook nhỏ implement pattern bẫy và khôi phục. Thuật toán: thu thập descendant focusable, chặn `Tab` ở biên, lưu `document.activeElement` khi mount, khôi phục khi unmount.
+
+```tsx
+import { useEffect, useRef } from 'react';
+
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function getFocusable(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
+    (el) => !el.closest('[inert]') && el.offsetParent !== null,
+  );
+}
+
+export function useFocusTrap(active: boolean) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!active || !containerRef.current) return;
+
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
+    const focusables = getFocusable(containerRef.current);
+    focusables[0]?.focus();
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== 'Tab' || !containerRef.current) return;
+
+      const items = getFocusable(containerRef.current);
+      if (items.length === 0) return;
+
+      const first = items[0];
+      const last = items[items.length - 1];
+
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      previousFocusRef.current?.focus();
+    };
+  }, [active]);
+
+  return containerRef;
+}
+```
+
+Cách dùng: gắn `containerRef` vào panel modal, truyền `active={isOpen}`, và kết hợp `inert` trên root trang.
+
+---
+
+## 6. `focus-visible` vs focus lập trình
+
+**`:focus-visible`** hiện vòng focus chỉ khi trình duyệt quyết focus đến từ **bàn phím** (hoặc AT), không phải click chuột. Khi bạn **lập trình** gọi `.focus()` sau đổi route, nhiều trình duyệt coi đó không phải bàn phím và **ẩn** vòng hiển thị — thường là điều bạn muốn cho focus heading.
+
+```css
+/* Show ring for keyboard users; avoid ugly ring on mouse click */
+:focus {
+  outline: none;
+}
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+```
+
+**Đừng** xóa style focus toàn cục bằng `outline: none` mà không có thay thế `:focus-visible` — điều đó phá WCAG 2.4.7 cho người dùng bàn phím. Với focus lập trình trên heading, chuyển một lần không cần vòng lâu dài là ổn; với focus trapped trong modal, vòng **nên** hiện khi người dùng tab bên trong.
+
+---
+
+## 7. Lỗi thường gặp — cướp focus và target không focusable
+
+| Pitfall | Vấn đề | Sửa |
+|---------|-------------------|------------|
+| **Auto-focus on load** | Chuyển focus ô search mỗi lần load làm lạc screen reader giữa câu | Chỉ chuyển focus khi **cố ý** điều hướng hoặc mở dialog |
+| **Focus on non-focusable nodes** | Gọi `.focus()` trên `<div>` không có `tabindex="-1"` fail im lặng | Thêm `tabindex="-1"` cho target lập trình |
+| **Positive tabindex** | `tabindex="1"` chiếm tab order | Chỉ dùng `0` (thứ tự tự nhiên) hoặc `-1` (chỉ script) |
+| **No focus restore** | Đóng modal để focus trên `<body>` | Lưu ref trigger; khôi phục trong cleanup |
+| **Scrollable overlay without trap** | Người dùng tab vào trang sau sheet bán trong suốt | Bẫy + `inert` trên nền |
+
+> **Đừng cướp focus** cho analytics, widget chat, hay banner cookie lúc first paint — để người dùng gặp chúng theo thứ tự document hoặc qua skip link.
+
+---
+
+## Tóm tắt
+
+- SPA phá reset focus tự động khi điều hướng — bạn phải **chuyển focus** và **thông báo** view mới một cách rõ ràng.
+- Khi đổi route: focus `<h1>` hoặc `<main>` với `tabindex="-1"`, cập nhật `document.title`, và tùy chọn dùng vùng `aria-live`.
+- Modal cần: focus phần tử đầu khi mở, **bẫy** Tab bên trong, Escape để đóng, **khôi phục** focus về trigger khi đóng.
+- Dùng **`inert`** trên nội dung nền và ưu tiên **`<dialog showModal()>`** khi có thể; không thì hook bẫy focus lấp chỗ trống.
+- Tôn trọng **`:focus-visible`** cho vòng bàn phím; dùng `tabindex="-1"` cho target lập trình, không bao giờ tabindex dương.
+
+**Phần tiếp theo:** Form accessible — label, fieldset, lỗi validation, và các pattern nơi accessibility hay gãy nhất.

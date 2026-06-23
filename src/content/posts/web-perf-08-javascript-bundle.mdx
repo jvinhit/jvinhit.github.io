@@ -1,0 +1,158 @@
+---
+title: 'Web Performance · Part 8 — JavaScript Performance & Bundle'
+description: 'JS is the most expensive resource: download, parse, compile, execute. Measure your bundle, code-split by route and component, tree-shake, lazy-load, and trim third-party libraries.'
+pubDate: 2026-09-01
+tags: [performance, javascript, bundle, code-splitting, web_perf_12]
+series: web-perf
+seriesOrder: 8
+draft: true
+---
+
+JavaScript đắt hơn mọi loại tài nguyên khác cùng kích thước. Một ảnh 200KB chỉ cần tải + giải mã; nhưng 200KB JS phải **tải → parse → compile → execute** — và bước execute chặn main thread, ảnh hưởng cả INP. Vì vậy "ít JS hơn" gần như luôn là "nhanh hơn".
+
+---
+
+## 1. Vì sao byte JS đắt hơn byte ảnh
+
+```text
+Image 200KB:  download ──▶ decode (off main thread) ──▶ paint
+JS 200KB:     download ──▶ parse ──▶ compile ──▶ EXECUTE (blocks main thread) ──▶ ...
+```
+
+Trên điện thoại tầm thấp, parse+compile+execute 200KB JS có thể tốn hàng trăm mili-giây *trên main thread* — đúng thứ gây long task và INP tệ (Phần 6). Đó là lý do giảm JS quan trọng hơn giảm ảnh ở cùng dung lượng.
+
+---
+
+## 2. Đo bundle trước đã
+
+Đừng đoán cái gì nặng. Dùng bundle analyzer để thấy thành phần:
+
+```bash
+# Vite: use rollup-plugin-visualizer
+npm i -D rollup-plugin-visualizer
+```
+
+```ts
+// vite.config.ts
+import { visualizer } from 'rollup-plugin-visualizer';
+
+export default defineConfig({
+  plugins: [visualizer({ open: true, gzipSize: true, brotliSize: true })],
+});
+```
+
+Nhìn treemap để phát hiện: thư viện to bất ngờ (moment.js, lodash full, icon pack nguyên cục), code trùng lặp, hay dependency lẽ ra chỉ cần ở server. Đây là bước cho ROI cao nhất.
+
+---
+
+## 3. Code Splitting: chỉ tải JS cần cho lúc này
+
+Mặc định, bundler gộp tất cả thành một file lớn — người dùng tải cả code của trang họ chưa vào. **Code splitting** chia bundle thành nhiều mảnh tải theo nhu cầu.
+
+### Tách theo route
+
+Mảnh đáng tách nhất là theo trang. Dynamic `import()` báo bundler tạo chunk riêng:
+
+```tsx
+import { lazy, Suspense } from 'react';
+
+// each route becomes its own chunk, loaded only on navigation
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Settings = lazy(() => import('./pages/Settings'));
+
+function App() {
+  return (
+    <Suspense fallback={<PageSkeleton />}>
+      <Routes>
+        <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/settings" element={<Settings />} />
+      </Routes>
+    </Suspense>
+  );
+}
+```
+
+### Tách theo component nặng
+
+Thành phần nặng và ít dùng (editor rich text, biểu đồ, modal phức tạp) nên tải khi cần:
+
+```tsx
+const Chart = lazy(() => import('./Chart')); // load only when user opens the chart tab
+
+function Report({ showChart }: { showChart: boolean }) {
+  return <div>{showChart && <Suspense fallback={<Spinner />}><Chart /></Suspense>}</div>;
+}
+```
+
+> Kết hợp với **prefetch** (Phần 4): khi người dùng *hover* vào link/nút, prefetch chunk để lúc bấm thật đã sẵn — nhanh mà không tải sớm thừa.
+
+---
+
+## 4. Tree Shaking: loại code chết
+
+Tree shaking loại bỏ export không dùng tới lúc build. Để nó hoạt động:
+
+- **Dùng ES modules** (`import`/`export`), không CommonJS (`require`) — tree shaking dựa trên phân tích tĩnh của ESM.
+- **Import có chọn lọc**, không import cả thư viện:
+
+```ts
+// ❌ pulls (nearly) all of lodash into the bundle
+import _ from 'lodash';
+_.debounce(fn, 200);
+
+// ✅ only take what you need (or use lodash-es / sub-modules)
+import debounce from 'lodash-es/debounce';
+```
+
+- **Tránh side-effect ở module top-level** khiến bundler không dám loại; khai báo `"sideEffects": false` trong `package.json` của thư viện nếu an toàn.
+
+---
+
+## 5. Cắt giảm thư viện bên thứ ba
+
+Dependency thường là phần lớn bundle. Chiến lược:
+
+- **Thay thư viện nặng bằng nhẹ/native**: `moment` → `date-fns`/`Temporal`/`Intl`; `axios` → `fetch`; lodash → hàm tự viết nhỏ (nhiều cái chỉ vài dòng — series thuật toán).
+- **Kiểm tra "giá" trước khi thêm**: tra trên bundlephobia để biết một package nặng bao nhiêu trước khi cài.
+- **Import động cho thư viện chỉ dùng đôi khi**: ví dụ thư viện xuất PDF chỉ tải khi người dùng bấm "Xuất PDF".
+
+```ts
+async function exportPdf(data: Report) {
+  const { jsPDF } = await import('jspdf'); // load only when export is actually needed
+  // ...
+}
+```
+
+---
+
+## 6. Giảm chi phí execute, không chỉ tải
+
+Tải ít hơn là một nửa; nửa còn lại là **chạy ít hơn lúc khởi động**:
+
+- **Hoãn khởi tạo không cần ngay**: đừng init mọi thứ lúc load; init khi dùng.
+- **Tránh công việc nặng đồng bộ ở top-level module** (chạy ngay khi import).
+- **Hydration tốn kém** (SSR): cân nhắc partial/islands hydration để không hydrate cả trang một lần (kiến trúc islands của Astro chính là tối ưu này — JS tối thiểu, hydrate theo đảo).
+
+---
+
+## 7. Checklist JS performance
+
+1. Đã **đo bundle** (analyzer) chưa? Có thư viện to bất ngờ không?
+2. **Code-split theo route** chưa?
+3. Thành phần nặng/ít dùng có **lazy load** không?
+4. **Tree shaking** hoạt động (ESM, import chọn lọc)?
+5. Thư viện nặng có thể **thay/bỏ** không (moment, lodash full)?
+6. Có **prefetch** chunk khi hover để vào trang mượt?
+7. Khởi động có làm việc nặng đồng bộ thừa không?
+
+---
+
+## Tóm tắt
+
+- Byte JS đắt hơn byte ảnh vì phải **parse + compile + execute** (chặn main thread → ảnh hưởng INP).
+- **Đo bundle trước** bằng analyzer; tìm thư viện to và code trùng.
+- **Code splitting** theo route + component nặng; ghép với **prefetch** khi hover.
+- **Tree shaking** cần ESM + import chọn lọc; **cắt thư viện** nặng (moment/lodash full).
+- Giảm cả **chi phí execute** lúc khởi động (hoãn init, islands/partial hydration).
+
+**Phần tiếp theo:** Ảnh & media — định dạng hiện đại, responsive images, lazy loading đúng cách.

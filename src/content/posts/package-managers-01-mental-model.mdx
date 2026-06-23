@@ -1,0 +1,296 @@
+---
+title: 'Node Package Managers · Part 1 — The Mental Model'
+description: 'What a package manager actually does under npm install — resolve, fetch, link — plus package.json, semver ranges, the registry, and why the lockfile is the most important file in your repo.'
+pubDate: 2026-06-16
+tags: [package-managers, npm, semver, nodejs, package_managers_12]
+series: package-managers
+seriesOrder: 1
+draft: false
+---
+
+Đây là **Phần 1 của series 12 phần** đưa bạn từ "cứ gõ `npm install` rồi cầu nguyện" đến hiểu toàn bộ lớp dependency như một kỹ sư senior. Ta sẽ đi qua npm, Yarn (v1 và v4), pnpm và Bun, rồi tới những phần mà đa số hướng dẫn bỏ qua — `node-gyp` và binary native, cùng các **tấn công chuỗi cung ứng** ẩn trong `node_modules` của bạn.
+
+Phần đầu tiên này dựng mô hình tư duy mà mọi phần sau dựa vào. Nắm chắc phần này thì npm, Yarn, pnpm và Bun không còn là bốn công cụ bí ẩn nữa, mà là bốn câu trả lời cho **cùng ba câu hỏi**.
+
+---
+
+## 1. Package manager làm đúng ba việc
+
+Bỏ qua thương hiệu thì mọi package manager — npm, Yarn, pnpm, Bun — đều làm cùng ba việc:
+
+```text
+package.json (what you want)              {bạn muốn gì}
+        │
+        ▼
+1. RESOLVE   read your dependency ranges + the whole transitive
+{phân giải}  graph, then pick ONE exact version of every package.
+             Output: a fully-pinned tree (the lockfile).
+        │
+        ▼
+2. FETCH     download each resolved package tarball from a registry
+{tải}        into a local/global cache (skip if already cached).
+        │
+        ▼
+3. LINK      place packages where Node/your bundler can find them
+{liên kết}   — usually node_modules/, sometimes symlinks or a PnP map.
+        │
+        ▼
+node_modules/ (or .pnp.cjs) — ready to import   {sẵn sàng để import}
+```
+
+**Toàn bộ cuộc đua** giữa bốn công cụ nằm ở *cách* chúng làm bước 3, và *tốc độ* làm cả ba. Mọi thứ còn lại trong series chỉ là biến thể của chủ đề này.
+
+> Một **package manager** không phải **build tool**. Package manager đặt dependency lên disk; build tool gói source của bạn *cùng* các dependency đó thành output xuất xưởng. Bạn cần mỗi loại một cái.
+
+---
+
+## 2. `package.json` — bản hợp đồng
+
+Mọi thứ bắt đầu từ đây. `package.json` khai báo bạn phụ thuộc vào **cái gì**, không phải **bản build chính xác nào**:
+
+```json
+{
+  "name": "my-app",
+  "version": "1.0.0",
+  "dependencies": {
+    "react": "^19.0.0",
+    "lodash": "~4.17.21"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "typescript": "^5.6.0"
+  }
+}
+```
+
+Các *trường* dependency mang nghĩa khác nhau, và nhầm chúng sẽ đẩy code chỉ-dùng-cho-dev tới user hoặc làm hỏng thư viện:
+
+| Field | Cài cho người dùng? | Dùng cho |
+|---|---|---|
+| `dependencies` | Có | Code runtime app/lib cần |
+| `devDependencies` | Không | Build tool, test, types |
+| `peerDependencies` | Không (host phải cung cấp) | Thư viện cắm vào host |
+| `optionalDependencies` | Thử, lỗi thì bỏ qua | Binary native theo nền tảng |
+
+Dòng `optionalDependencies` trông vô hại lúc này, nhưng đó chính là cách các tool như esbuild và SWC ship binary theo nền tảng — ta sẽ quay lại ở Phần 8.
+
+### Ngoài semver — các specifier khác
+
+Giá trị một dependency không phải lúc nào cũng là range semver. Manager chấp nhận nhiều **loại specifier**, và biết chúng giúp tiết kiệm hàng giờ debug "sao version này lạ vậy":
+
+```jsonc
+{
+  "dependencies": {
+    "react":       "^19.0.0",                    // semver range (the usual)
+    "left-pad":    "1.3.0",                       // exact pin
+    "rxjs":        "latest",                       // a dist-tag, NOT a version
+    "my-fork":     "github:me/lib#v2.1.0",        // git ref → builds from source
+    "internal":    "https://r.co/internal.tgz",   // direct tarball URL
+    "local-pkg":   "file:../local-pkg",           // local path (copied)
+    "linked-pkg":  "link:../linked-pkg",          // local path (symlinked)
+    "ws-pkg":      "workspace:*",                  // monorepo sibling (Part 11)
+    "lodash-es":   "npm:lodash@^4"                 // ALIAS: install lodash as lodash-es
+  }
+}
+```
+
+Hai cái có cạnh sắc:
+
+- `"latest"` (và các **dist-tag** khác) được resolve *lúc cài* dựa theo registry — nên `latest` **không tái lập** trừ khi lockfile ghim version cụ thể nó đã resolve.
+- specifier `git:`/`github:` và tarball `https:` lấy từ **ngoài registry** — chúng thường bỏ qua đảm bảo integrity của registry — chủ đề lặp lại ở Phần 8/9.
+
+---
+
+## 3. Semver range — gốc rễ của "máy tôi chạy được"
+
+Một version như `^19.0.0` **không phải** một version — nó là một **range**. Package manager được tự do chọn version bất kỳ thoả mãn range. Sự tự do đó là lý do hai dev chạy cùng `npm install` cách nhau một tuần có thể nhận code khác nhau.
+
+Semver là `MAJOR.MINOR.PATCH` — phá vỡ, tính năng, sửa lỗi:
+
+```text
+  ^1.2.3   "compatible with 1.x"   → >=1.2.3  <2.0.0   (most common)
+  ~1.2.3   "approximately 1.2.x"   → >=1.2.3  <1.3.0
+   1.2.3   exact pin               → only 1.2.3
+   *       anything (dangerous)    → any version at all
+  >=1.2.3  open-ended (dangerous)  → no upper bound
+
+  Special: ^0.2.3 → >=0.2.3 <0.3.0   (caret on 0.x locks the MINOR,
+           because 0.x is treated as "unstable, minor can break")
+```
+
+Caret `^` là mặc định của npm và là con ngựa kéo hằng ngày. Cái bẫy: `^` tin rằng mọi tác giả dependency tuân thủ semver hoàn hảo. Nhiều người không. Một bản "patch" có thể làm hỏng bạn. Đó chính là lý do khái niệm tiếp theo tồn tại.
+
+### Bản pre-release phải tự chọn
+
+Một version có hậu tố gạch ngang là một **pre-release**, và range semver **cố ý loại trừ** chúng trừ khi bạn yêu cầu:
+
+```text
+range          matches 2.0.0-beta.3 ?
+^1.0.0         no   — pre-releases of OTHER versions never match
+^2.0.0         no   — even though 2.0.0-beta.3 < 2.0.0, it's a pre-release
+>=2.0.0-0      yes  — you opted in by writing a pre-release in the range
+2.0.0-beta.3   yes  — exact pre-release pin
+```
+
+Đây là lý do `npm install pkg@next` là cách bạn thường lấy bản beta — riêng cơ chế range sẽ không kéo chúng.
+
+### Khi range xung đột — và `peerDependencies`
+
+Resolution phải thoả mãn ràng buộc của *mọi* package cùng lúc. Khi hai range chồng lấn, manager gộp thành **một version chung**; khi không thể, nó cài **nhiều bản**:
+
+```text
+app   needs  lodash ^4.17.0   ┐ overlap → ONE copy: lodash@4.17.21
+ui    needs  lodash ^4.17.21  ┘
+plug  needs  lodash ^3.10.0    → no overlap → SECOND copy: lodash@3.10.1 (nested)
+```
+
+`peerDependencies` đặc biệt: một plugin khai báo "tôi cần *một* React, nhưng **app host** phải cung cấp bản dùng chung duy nhất". Điều này ngăn hai bản React (sẽ làm vỡ hooks):
+
+```text
+your app           react@19.1.4         ← the one real copy
+└─ @mui/material   peerDependencies: { react: ">=17" }
+   → does NOT install its own React; reuses the app's
+   → if the app's React doesn't satisfy ">=17" → peer-dep WARNING/ERROR
+{không tự cài React; dùng lại của app; nếu không thoả → cảnh báo/lỗi peer-dep}
+```
+
+Các manager xử lý peer không thoả khác nhau: npm 7+ cố **tự cài**, còn pnpm/Yarn nghiêm ngặt và lớn tiếng hơn. Ta sẽ xem lại theo từng tool sau.
+
+---
+
+## 4. Lockfile — file quan trọng nhất trong repo
+
+`package.json` nói "Tôi muốn React `^19`". **Lockfile** nói "...và bản build chính xác mọi người nhận là `19.1.4`, với hash toàn vẹn này, resolve từ URL này, cộng 47 package transitive được ghim chính xác".
+
+```text
+package.json   →  RANGES   (^19.0.0)   "what I want"      {tôi muốn gì}
+lockfile       →  EXACT    (19.1.4)    "what everyone gets" {mọi người nhận gì}
+                  + integrity hash + resolved URL + full transitive tree
+```
+
+Mỗi tool có tên và định dạng lockfile riêng, nhưng *mục đích* giống hệt — làm install **tái lập được**:
+
+| Tool | Lockfile |
+|---|---|
+| npm | `package-lock.json` |
+| Yarn Classic / Berry | `yarn.lock` |
+| pnpm | `pnpm-lock.yaml` |
+| Bun | `bun.lock` (text, since 1.2) |
+
+Ba quy tắc ngăn phần lớn nỗi đau "máy tôi chạy được":
+
+1. **Commit lockfile.** Luôn luôn. Nó không phải build artifact — nó là hợp đồng.
+2. **Đừng sửa tay.** Để tool tự tạo lại.
+3. **Một lockfile mỗi repo.** Trộn `package-lock.json` và `yarn.lock` nghĩa là hai tool tranh nhau `node_modules`.
+
+> Trong CI, đừng chạy lệnh install thường. Dùng biến thể **frozen** để lockfile lệch *làm fail build* thay vì âm thầm đổi version: `npm ci`, `pnpm install --frozen-lockfile`, `yarn install --immutable`, `bun install --frozen-lockfile`.
+
+### Ép resolver — `overrides`
+
+Đôi khi một dependency *transitive* bạn không kiểm soát bị hỏng hoặc dính lỗ hổng, và bạn không thể chờ parent cập nhật. Mỗi manager có cửa thoát để **ép** một version sâu trong cây:
+
+```jsonc
+// npm / pnpm / Bun
+{ "overrides":    { "lodash": "4.17.21" } }
+// pnpm also: { "pnpm": { "overrides": { "lodash": "4.17.21" } } }
+
+// Yarn
+{ "resolutions":  { "**/lodash": "4.17.21" } }
+```
+
+Đây là phản ứng khẩn cấp phổ biến nhất khi một dep transitive dính CVE: ghim version đã sửa bằng override, ship, rồi gỡ khi parent bắt kịp. Dùng tiết kiệm — bạn đang ghi đè những gì parent *nói* nó đã test với.
+
+---
+
+## 5. Registry — package đến từ đâu
+
+Khi manager fetch một package, nó nói chuyện với một **registry**: một HTTP API mà khi đưa tên vào, trả về metadata (tất cả version, dependency của chúng, hash toàn vẹn, URL tarball).
+
+```text
+GET https://registry.npmjs.org/react
+→ { "dist-tags": { "latest": "19.1.4" },
+    "versions": { "19.1.4": { "dist": { "tarball": "...", "integrity": "sha512-..." }}}}
+
+npm then downloads the .tgz, verifies the integrity hash, unpacks it.
+{npm tải .tgz, xác minh hash toàn vẹn, rồi giải nén.}
+```
+
+Sự thật quan trọng cho phần security sau:
+
+- **Registry npm công khai** là mặc định cho cả bốn tool.
+- Một **scope** như `@myorg/utils` có thể trỏ tới registry *riêng* qua `.npmrc`. Cấu hình sai và kẻ tấn công có thể publish một package công khai cùng tên — đó là **dependency confusion** (Phần 9).
+- **Hash toàn vẹn** là thứ duy nhất đứng giữa bạn và một tarball bị giả mạo.
+
+### dist-tag — nhãn di động, không phải version
+
+Để ý trường `"dist-tags"` ở trên. Một **dist-tag** là con trỏ có tên mà publisher di chuyển giữa các version:
+
+```text
+dist-tags: { latest: 19.1.4, next: 20.0.0-rc.1, legacy: 18.3.1 }
+
+npm install react          → resolves the `latest` tag  (19.1.4)
+npm install react@next     → resolves the `next` tag    (20.0.0-rc.1)
+npm publish                → moves `latest` to the new version by default
+```
+
+`latest` chỉ là tag mặc định — nó **không** phải "số version cao nhất". Publisher có thể ship patch cho dòng cũ *mà không* di chuyển `latest`, đó là cách backport bảo mật cho major cũ hoạt động.
+
+### Cache — tải một lần, dùng lại mãi
+
+FETCH rẻ nhờ cache cục bộ, địa chỉ-theo-nội-dung. Hash integrity vừa là *xác minh* vừa là *key cache*:
+
+```text
+need react@19.1.4 (integrity sha512-AbC...)
+        │
+        ▼  is sha512-AbC... already in the cache?
+   HIT  → copy/extract from ~/.npm/_cacache — NO network, instant
+   MISS → download .tgz → hash bytes → MUST equal sha512-AbC...
+              match    → store under that hash, then use
+              mismatch → ABORT (corrupted / tampered)
+{HIT: không cần mạng; MISS: tải, hash, so khớp rồi mới lưu}
+```
+
+Hai hệ quả: install **nóng** nhanh hơn hẳn **lạnh** — khoảng cách bạn sẽ thấy đo đạc xuyên suốt series — và vì key cache *chính là* hash nội dung, hai package có byte giống hệt được lưu một lần. Ý tưởng đó, đẩy tới cực hạn, trở thành store toàn cục của pnpm ở Phần 5.
+
+---
+
+## 6. Ghép lại — `npm install` thực sự làm gì
+
+```text
+$ npm install
+1. READ      package.json (ranges) + package-lock.json (if present)
+2. RESOLVE   if lockfile satisfies package.json → reuse it (deterministic);
+             else query the registry, pick versions, build a new tree
+3. FETCH     for each package: cache hit? use it. miss? download tarball,
+             verify integrity hash, store in ~/.npm cache
+4. LINK      hoist + copy packages into ./node_modules
+5. SCRIPTS   run lifecycle scripts (preinstall/install/postinstall) ← ⚠️
+6. WRITE     update package-lock.json if the tree changed
+```
+
+Bước 5 là nơi ẩn náu của nguy hiểm: code tuỳ ý từ *bất kỳ* package nào trong cây của bạn chạy trên máy bạn, với quyền của bạn, ngay khi install. Ta sẽ mổ xẻ điều đó ở Phần 7 và 9.
+
+---
+
+## Giờ bạn đã biết gì
+
+- Mọi package manager làm **resolve → fetch → link**; chúng khác nhau chủ yếu ở *link*.
+- `package.json` giữ **range**; **lockfile** giữ **version chính xác**.
+- Một specifier có thể là range, pin chính xác, **dist-tag**, ref git/url/file/`workspace:`, hay alias `npm:` — chỉ hai cái đầu vốn dĩ tái lập.
+- Range **loại pre-release** mặc định; range xung đột tạo bản trùng; `peerDependencies` ép một bản dùng chung.
+- `overrides`/`resolutions` ép version sâu trong cây — bản vá nóng CVE thường dùng.
+- Cache **địa chỉ-theo-nội-dung** (hash integrity = key); install nóng bỏ qua mạng.
+- Commit một lockfile, đừng sửa, dùng install **frozen** trong CI.
+- Install chạy **lifecycle script tuỳ ý** — nhớ điều này khi tới phần security.
+
+---
+
+## Bài tập
+
+1. Chạy `npm install --dry-run` và đọc xem nó *sẽ* làm gì mà không đụng disk.
+2. Mở `package-lock.json` và tìm một direct dependency. Ghi lại `version`, URL `resolved`, và hash `integrity`.
+3. Với ba dep, quyết định mỗi cái *nên* nằm ở `dependencies` hay `devDependencies` và giải thích.
+4. Chạy `npm view react dist-tags` và `npm view react versions --json`. Xác nhận `latest` *không* nhất thiết là chuỗi version cao nhất.
+5. Thêm một `overrides` cho dep transitive, cài lại, và dùng `npm ls <pkg>` để xác nhận version bị ép đã thắng.
+
+Tiếp theo — Phần 2: npm chuyên sâu:

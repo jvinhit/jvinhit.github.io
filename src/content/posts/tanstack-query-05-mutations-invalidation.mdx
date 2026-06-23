@@ -1,0 +1,304 @@
+---
+title: 'TanStack Query · Phần 5 — Mutations & Invalidation'
+description: 'Ghi dữ liệu (tạo/sửa/xoá) bằng useMutation, hiểu vòng đời onMutate/onSuccess/onError/onSettled, và sau khi ghi thì invalidate đúng query để UI tự đồng bộ với server.'
+pubDate: 2026-06-26
+tags: [react, tanstack-query, react-query, mutations, tanstack_query_8]
+series: tanstack-query
+seriesOrder: 5
+draft: false
+---
+
+Bốn phần trước chỉ **đọc** dữ liệu. Giờ đến phần **ghi**: tạo, sửa, xoá. Trong React Query, đọc dùng `useQuery`, còn ghi dùng **`useMutation`**. Khác biệt cốt lõi: query chạy tự động và được cache; mutation chỉ chạy khi bạn *chủ động gọi* và không được cache (vì mỗi lần ghi là một hành động riêng).
+
+Câu hỏi quan trọng sau khi ghi: *làm sao danh sách trên màn hình tự cập nhật?* Câu trả lời trong phần này là **invalidation** — và đó là cách tiếp cận nên dùng làm mặc định.
+
+---
+
+## 1. `useMutation` cơ bản
+
+*Tài liệu: [Mutations](https://tanstack.com/query/latest/docs/framework/react/guides/mutations).*
+
+`useMutation` cần một **`mutationFn`** (hàm async thực hiện việc ghi). Nó trả về `mutate` (gọi để chạy) và bộ trạng thái riêng:
+
+```ts
+// src/features/customers/api.ts
+import { apiFetch } from '@/lib/api-client';
+import { customerSchema } from './schema';
+import { z } from 'zod';
+
+// Một schema cho input — dùng chung cho form (Phần 7) và mutation.
+export const createCustomerInput = z.object({
+  name: z.string().min(1),
+  email: z.string().email(),
+});
+export type CreateCustomerInput = z.infer<typeof createCustomerInput>;
+
+export function createCustomer(input: CreateCustomerInput) {
+  return apiFetch('/customers', customerSchema, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+```
+
+```tsx
+import { useMutation } from '@tanstack/react-query';
+import { createCustomer } from './api';
+
+function NewCustomerButton() {
+  const mutation = useMutation({
+    mutationFn: createCustomer,
+  });
+
+  return (
+    <button
+      onClick={() => mutation.mutate({ name: 'An', email: 'an@example.com' })}
+      disabled={mutation.isPending}
+    >
+      {mutation.isPending ? 'Đang lưu…' : 'Thêm khách hàng'}
+    </button>
+  );
+}
+```
+
+Các trạng thái của mutation:
+
+- `isIdle` — chưa gọi lần nào.
+- `isPending` — đang chạy `mutationFn`.
+- `isSuccess` / `isError` — đã xong/đã lỗi.
+- `data` — kết quả trả về; `error` — lỗi; `variables` — tham số vừa truyền vào `mutate`.
+- `reset()` — đưa về `idle`.
+
+---
+
+## 2. `mutate` vs `mutateAsync`
+
+- **`mutate(vars, options?)`** — kiểu "fire and forget". Không trả promise; xử lý kết quả qua callback. **Khuyên dùng mặc định.**
+- **`mutateAsync(vars)`** — trả về promise để bạn `await`. Chỉ dùng khi *thật sự* cần chờ (vd chạy nhiều mutation tuần tự). Nhớ `try/catch`, nếu không promise reject sẽ thành unhandled.
+
+```ts
+// Mặc định: dùng mutate + callback
+mutation.mutate(input, {
+  onSuccess: (data) => toast.success(`Đã tạo ${data.name}`),
+  onError: (err) => toast.error(err.message),
+});
+
+// Chỉ khi cần await (cẩn thận try/catch)
+async function handleSubmit(input: CreateCustomerInput) {
+  try {
+    const created = await mutation.mutateAsync(input);
+    // ... làm gì đó với created
+  } catch (err) {
+    // bắt buộc bắt lỗi, nếu không sẽ unhandled rejection
+  }
+}
+```
+
+---
+
+## 3. Vòng đời callback: `onMutate` → `onError` / `onSuccess` → `onSettled`
+
+`useMutation` có bốn callback chạy theo thứ tự rõ ràng:
+
+```text
+gọi mutate()
+   │
+   ├─ onMutate(variables)   ← chạy NGAY trước mutationFn (dùng cho optimistic — Phần 6)
+   │
+   ├─ mutationFn(variables) ← gọi mạng
+   │
+   ├─ thành công → onSuccess(data, variables, context)
+   │   hoặc lỗi → onError(error, variables, context)
+   │
+   └─ onSettled(data, error, variables, context) ← LUÔN chạy cuối (cả thành công lẫn lỗi)
+```
+
+- **`onMutate`** — chạy trước khi gọi mạng; nơi làm optimistic update (Phần 6).
+- **`onSuccess`** — chỉ khi thành công; nơi invalidate / toast / điều hướng.
+- **`onError`** — chỉ khi lỗi; nơi rollback / báo lỗi.
+- **`onSettled`** — luôn chạy cuối; nơi "dọn dẹp" chung (vd invalidate để đồng bộ lại dù thành công hay lỗi).
+
+> **Callback ở chỗ nào?** Bạn có thể đặt callback trong `useMutation({...})` (chạy cho mọi lần gọi) hoặc trong `mutate(vars, {...})` (chỉ lần gọi đó). Quy ước thực dụng: **logic cache** (invalidate, rollback) đặt ở `useMutation` để luôn đúng; **logic UI** (toast, điều hướng, đóng modal) đặt ở `mutate` tại nơi gọi.
+
+---
+
+## 4. Invalidation — cách đồng bộ UI sau khi ghi
+
+Sau khi tạo một customer, danh sách `['customers']` trên màn hình đã **lỗi thời**. Cách đơn giản và đáng tin nhất: bảo React Query đánh dấu các query liên quan là stale và refetch — gọi là **invalidation**.
+
+```tsx
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { createCustomer } from './api';
+import { customerKeys } from './keys';
+
+export function useCreateCustomer() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: createCustomer,
+    onSuccess: () => {
+      // Đánh dấu mọi danh sách customer là stale → Query refetch để lấy data mới.
+      queryClient.invalidateQueries({ queryKey: customerKeys.lists() });
+    },
+  });
+}
+```
+
+`invalidateQueries` làm hai việc với mọi query khớp key:
+
+1. Đánh dấu `stale` ngay.
+2. Refetch nền **những query đang active** (đang được component dùng).
+
+Nhờ **key factory phân cấp** từ [Phần 3](/blog/tanstack-query-03-query-keys-zod-queryoptions/), bạn invalidate đúng phạm vi mong muốn:
+
+```ts
+// Mọi danh sách (mọi filter/trang) — phổ biến nhất sau khi tạo/xoá
+queryClient.invalidateQueries({ queryKey: customerKeys.lists() });
+
+// Một chi tiết cụ thể — sau khi sửa 1 record
+queryClient.invalidateQueries({ queryKey: customerKeys.detail(id) });
+
+// Tất cả liên quan customer — khi không chắc, dọn sạch
+queryClient.invalidateQueries({ queryKey: customerKeys.all });
+```
+
+Vì key khớp theo **tiền tố**, `customerKeys.lists()` (`['customers','list']`) khớp luôn `['customers','list',{q:'a'}]`, `['customers','list',{q:'b'}]`... — một lệnh dọn mọi biến thể danh sách.
+
+---
+
+## 5. Mẫu hoàn chỉnh: tạo / sửa / xoá
+
+```tsx
+// src/features/customers/hooks.ts
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { createCustomer, updateCustomer, deleteCustomer } from './api';
+import { customerKeys } from './keys';
+
+export function useCreateCustomer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: createCustomer,
+    onSuccess: () => qc.invalidateQueries({ queryKey: customerKeys.lists() }),
+  });
+}
+
+export function useUpdateCustomer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: updateCustomer,
+    onSuccess: (updated) => {
+      // Sửa thì invalidate cả chi tiết lẫn danh sách (record có thể đổi vị trí/lọc).
+      qc.invalidateQueries({ queryKey: customerKeys.detail(updated.id) });
+      qc.invalidateQueries({ queryKey: customerKeys.lists() });
+    },
+  });
+}
+
+export function useDeleteCustomer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: deleteCustomer,
+    onSuccess: () => qc.invalidateQueries({ queryKey: customerKeys.lists() }),
+  });
+}
+```
+
+Component gọi hook và chỉ lo UI:
+
+```tsx
+function NewCustomerForm() {
+  const create = useCreateCustomer();
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        const form = new FormData(e.currentTarget);
+        create.mutate(
+          { name: String(form.get('name')), email: String(form.get('email')) },
+          {
+            onSuccess: () => toast.success('Đã thêm khách hàng'),
+            onError: (err) => toast.error(err.message),
+          },
+        );
+      }}
+    >
+      <input name="name" required />
+      <input name="email" type="email" required />
+      <button disabled={create.isPending}>
+        {create.isPending ? 'Đang lưu…' : 'Lưu'}
+      </button>
+    </form>
+  );
+}
+```
+
+---
+
+## 6. `await` invalidation để giữ trạng thái pending
+
+Mặc định `invalidateQueries` không chặn — `onSuccess` xong là mutation hết `isPending` ngay, kể cả khi danh sách còn đang refetch. Nếu muốn nút "Lưu" **vẫn pending cho tới khi danh sách mới về**, hãy `return` (await) promise của invalidate:
+
+```ts
+return useMutation({
+  mutationFn: createCustomer,
+  // Trả về promise → mutation pending cho tới khi refetch xong.
+  onSuccess: () => qc.invalidateQueries({ queryKey: customerKeys.lists() }),
+});
+```
+
+`onSuccess`/`onSettled` nếu trả về một promise, React Query sẽ chờ promise đó trước khi coi mutation là hoàn tất. Hữu ích khi bạn muốn đóng modal *sau khi* danh sách đã đồng bộ.
+
+---
+
+## 7. Khi nào invalidate, khi nào cập nhật cache trực tiếp?
+
+- **Invalidate (mặc định nên dùng):** đơn giản, luôn đúng vì lấy lại sự thật từ server. Đánh đổi: tốn thêm một request.
+- **Cập nhật cache trực tiếp (`setQueryData`):** không tốn request, cập nhật tức thì — nhưng bạn phải tự đảm bảo dữ liệu khớp server. Đây là nền tảng của **optimistic update**, sẽ học ở Phần 6.
+
+Nguyên tắc: bắt đầu bằng **invalidate** cho mọi mutation. Chỉ chuyển sang `setQueryData`/optimistic khi cần phản hồi *tức thì* (vd nút like, toggle) hoặc khi muốn tiết kiệm request.
+
+---
+
+## 8. Bài tập
+
+**1.** Khác nhau cơ bản giữa `useQuery` và `useMutation` là gì?
+
+<details>
+<summary>Lời giải</summary>
+
+`useQuery` chạy tự động (khi mount/khi key đổi) và kết quả được **cache** — dùng để *đọc*. `useMutation` chỉ chạy khi bạn gọi `mutate()`, không được cache — dùng để *ghi* (tạo/sửa/xoá). Mutation cũng có vòng đời callback `onMutate/onSuccess/onError/onSettled`.
+</details>
+
+**2.** Sau khi tạo customer mới, vì sao chỉ cần `invalidateQueries({ queryKey: customerKeys.lists() })` mà không phải liệt kê từng filter?
+
+<details>
+<summary>Lời giải</summary>
+
+Vì query key khớp theo **tiền tố**. `customerKeys.lists()` = `['customers','list']` là tiền tố của mọi key danh sách như `['customers','list',{q:'a'}]`. Một lệnh invalidate phủ hết mọi biến thể filter/trang của danh sách.
+</details>
+
+**3.** Khi nào nên dùng `mutateAsync` thay vì `mutate`?
+
+<details>
+<summary>Lời giải</summary>
+
+Chỉ khi cần `await` kết quả — vd chạy nhiều mutation tuần tự hoặc cần giá trị trả về ngay trong luồng async. Khi đó **bắt buộc** `try/catch` vì `mutateAsync` reject khi lỗi. Mặc định nên dùng `mutate` + callback để tránh unhandled rejection.
+</details>
+
+**Nâng cao:** Viết đủ `useCreateCustomer`, `useUpdateCustomer`, `useDeleteCustomer` với invalidation đúng phạm vi. Đặt logic cache trong `useMutation`, logic UI (toast, đóng modal) trong `mutate` tại nơi gọi.
+
+---
+
+## Tóm tắt
+
+- Ghi dữ liệu dùng **`useMutation`** với `mutationFn`; gọi bằng `mutate` (mặc định) hoặc `mutateAsync` (khi cần await + try/catch).
+- Vòng đời: **`onMutate` → mutationFn → `onSuccess`/`onError` → `onSettled`**. Logic cache đặt ở `useMutation`, logic UI đặt ở `mutate`.
+- Sau khi ghi, **`invalidateQueries`** đánh dấu query liên quan stale và refetch — cách đồng bộ UI đơn giản và đáng tin nhất.
+- Key factory phân cấp giúp invalidate đúng phạm vi (một detail, mọi list, hay tất cả). `await`/`return` invalidate nếu muốn giữ pending tới khi data mới về.
+
+---
+
+## Phần tiếp theo
+
+**Phần 6 — Optimistic updates & quản lý cache:** cập nhật UI *tức thì* trước khi server phản hồi bằng `onMutate` (cancel + snapshot + patch), tự động **rollback** khi lỗi, dùng `setQueryData`/`getQueryData` để chỉnh cache thủ công, và nắm các query filter để thao tác cache chính xác.

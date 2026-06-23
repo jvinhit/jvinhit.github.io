@@ -1,0 +1,265 @@
+---
+title: 'How Browsers Work · Part 4 — CSS & the CSSOM'
+description: 'How the browser parses CSS into the CSSOM, resolves the cascade and specificity, computes the final style for every element, and builds the render tree — and why CSS is render-blocking.'
+pubDate: 2026-10-11
+tags: [browser, internals, css, cssom, rendering, browser_internals_12]
+series: browser-internals
+seriesOrder: 4
+draft: true
+---
+
+Phần 3 dựng DOM từ byte HTML. Nhưng DOM một mình chỉ nói trình duyệt *có gì*, không phải *trông thế nào*. **CSS** cung cấp quy tắc hiển thị, và việc đầu tiên của trình duyệt với các quy tắc đó là parse chúng thành **CSS Object Model (CSSOM)** — cây song song về khái niệm với DOM.
+
+Khi trình duyệt có DOM + CSSOM, nó có thể **tính style** cho mọi phần tử, dựng **render tree**, và tiếp tục layout và paint (Phần 5). Phần này bao quát từ byte stylesheet đến ngưỡng render tree.
+
+---
+
+## 1. Parse CSS thành CSSOM
+
+CSS đến từ nhiều nguồn — `<link rel="stylesheet">`, khối `<style>` inline, chuỗi `@import`, và (sau) thuộc tính `style` inline trên phần tử. Mỗi nguồn được parse độc lập thành **cây con CSSOM**.
+
+```text
+styles.css bytes
+       │
+       ▼
+┌──────────────┐
+│ CSS parser   │  → tokenize CSS (selectors, properties, values)
+└──────┬───────┘
+       ▼
+┌──────────────┐
+│ CSSOM tree   │  → nodes represent style rules
+└──────────────┘
+
+Example CSSOM (conceptual):
+
+StyleSheet
+├─ Rule: h1 { font-size: 2rem; color: white; }
+├─ Rule: .card { padding: 1rem; border: 1px solid #333; }
+└─ Rule: .card > p { margin: 0; }
+```
+
+Khác HTML, **CSS không hợp lệ bị bỏ im lặng** — lỗi chính tả tên property không làm hỏng cả sheet, chỉ declaration đó. CSSOM lưu selector ghép với khối declaration (property → value, có thể có `!important`).
+
+Mọi stylesheet gộp thành một CSSOM logic trước khi tính style. Thứ tự quan trọng cho cascade — ta sẽ thấy ở Mục 3.
+
+---
+
+## 2. Vì sao CSS chặn render
+
+Trình duyệt cố ý **chặn lần paint đầu** cho đến khi parse xong mọi CSS chặn render. Lý do là **FOUC** (Flash of Unstyled Content) — nếu trình duyệt paint sau HTML một mình, người dùng thấy chữ không style nhảy và reflow khi CSS đến.
+
+```text
+Without render-blocking CSS:
+
+  Paint #1: plain Times New Roman, no layout
+  Paint #2: styled — jarring flash and layout shift
+
+With render-blocking CSS:
+
+  (wait for CSSOM…)
+  Paint #1: styled correctly from the start
+```
+
+Cái gì được coi là chặn render:
+
+- **`<link rel="stylesheet">`** không có `media`, hay `media="all"` hay `media="screen"` (khớp thiết bị hiện tại).
+- **Khối `<style>` inline** trong tài liệu.
+- **`@import` trong CSS** — sheet import phải tải trước khi quy tắc còn lại của sheet import áp dụng (lý do khác không khuyến khích `@import`).
+
+Cái **không** chặn render:
+
+- **`media` query không khớp** — `<link rel="stylesheet" media="print">` trên màn hình tải song song nhưng không chặn lần paint đầu.
+- **`rel="preload"` cho CSS** — fetch sớm nhưng không áp dụng cho đến khi promote thành stylesheet.
+
+> Đặt CSS quan trọng trong `<head>`, tải style không quan trọng bằng `media` không khớp + flip `onload`, hay tách theo route. Phần 12 cover pattern debug hiệu năng.
+
+---
+
+## 3. Cascade: quy tắc xung đột được giải quyết thế nào
+
+Hầu hết phần tử khớp **nhiều quy tắc** — `<h1 class="title">` có thể dính selector phần tử, class, property kế thừa từ `body`, và mặc định user-agent. **Cascade** chọn một giá trị thắng cho mỗi property.
+
+Tầng ưu tiên (thấp đến cao):
+
+```text
+1. Origin + importance
+   ├─ User agent (browser defaults)
+   ├─ User (reader stylesheets)
+   └─ Author (your CSS)
+       normal declarations
+       !important declarations  ← flip the order within author/user
+
+2. Specificity (within same origin/importance)
+
+3. Source order (later rules win if specificity ties)
+```
+
+**Specificity** là hệ thống chấm điểm bạn đã biết, tính `(inline, ID, class/attr/pseudo-class, type/pseudo-element)`:
+
+| Selector | Specificity | Ghi chú |
+|----------|-------------|-------------------|
+| `*` | `(0,0,0,0)` | Phổ quát |
+| `p` | `(0,0,0,1)` | Selector kiểu |
+| `.card` | `(0,0,1,0)` | Class |
+| `#hero` | `(0,1,0,0)` | ID |
+| `style="…"` | `(1,0,0,0)` | Style inline |
+| `!important` | — | Thắng mọi khai báo non-important cùng origin |
+
+```css
+p { color: gray; }           /* (0,0,0,1) → loses */
+.intro { color: blue; }       /* (0,0,1,0) → wins */
+#hero p { color: red; }       /* (0,1,0,1) → wins over .intro for #hero p */
+```
+
+**Kế thừa** tách khỏi cascade — vài property (`color`, `font-family`) chảy từ cha xuống con trừ khi set rõ; vài cái khác (`margin`, `border`) thì không.
+
+---
+
+## 4. Tính style: khớp selector với phần tử
+
+Với **mọi phần tử DOM**, engine phải xác định giá trị computed cuối của mọi property CSS. Thuật toán (đơn giản hóa):
+
+1. Thu thập mọi quy tắc có selector khớp phần tử.
+2. Sắp theo ưu tiên cascade (origin → specificity → thứ tự nguồn).
+3. Áp dụng declaration thắng; lấp chỗ trống qua kế thừa và giá trị ban đầu.
+4. Lưu kết quả trong cấu trúc **computed style** gắn với phần tử.
+
+**Khớp selector chạy phải sang trái** để hiệu quả — với `.card > p`, engine tìm mọi `<p>` trước, rồi đi lên kiểm tra cha `.card`, thay vì quét mọi cây con `.card`.
+
+```text
+Selector:  .sidebar .nav li a
+Match:     find all <a> → check parent <li> → check ancestor .nav → check ancestor .sidebar
+
+Cost is roughly O(rules × elements) in the worst case — why
+deeply nested universal selectors (* *) and expensive :not() chains hurt performance
+```
+
+Đó là lý do đổi **một class trên `<body>`** có thể invalidate style cho cả tài liệu nếu class đó xuất hiện trong nhiều selector — engine có thể tính lại rộng. Panel **Performance** của DevTools gọi giai đoạn này **Recalculate Style**.
+
+---
+
+## 5. Giá trị computed, used, và resolved
+
+Property CSS qua vài giai đoạn giá trị — biết chúng giúp debug "vì sao `width` không đúng tôi set?":
+
+| Stage | Nghĩa | Ví dụ |
+|-------|-------------------|-------------------|
+| **Specified** | Bạn viết gì | `width: 50%` |
+| **Computed** | Sau cascade + kế thừa; đơn vị tương đối resolve theo cha nếu có thể | `width: 400px` (if parent is 800px) |
+| **Used** | Giá trị cuối sau ràng buộc layout (min/max, phân phối flex/grid) | `width: 300px` (if max-width caps it) |
+
+```css
+.box {
+  width: 50%;       /* specified: 50%     → computed: 400px (of 800px parent) */
+  max-width: 300px; /* specified: 300px   → used: 300px (max wins) */
+}
+```
+
+**Custom property (`--token`)** đặc biệt — cascade và kế thừa như giá trị specified, được thay thế lúc computed-value. **`em`/`rem`** resolve khi compute; **`vh`/`vw`** resolve theo kích thước viewport lúc compute.
+
+Trong series này, **computed style** là cột mốc đưa vào layout — Phần 5 giả định mọi phần tử có map computed style đầy đủ trước khi tính hình học.
+
+---
+
+## 6. Dựng render tree
+
+**Render tree** không phải DOM hay CSSOM — nó là tập con node DOM thực sự được paint, mỗi cái mang computed style.
+
+```text
+DOM                          Render tree
+───                          ───────────
+html                         (not directly painted — pass-through)
+├─ head                      ✗ excluded (not visible content)
+├─ body                      body (computed styles)
+│  ├─ h1                     h1
+│  ├─ p                      p
+│  ├─ div.hidden             ✗ display: none → excluded entirely
+│  │  └─ span                ✗ (child of display:none — pruned)
+│  └─ p.note                 p.note
+│     └─ ::before (pseudo)   ::before (generated box, gets its own entry)
+└─ script                    ✗ excluded
+```
+
+Quy tắc đưa vào chính:
+
+| DOM node | Trong render tree? |
+|----------|----------------------------------------|
+| **`display: none`** | **Không** — node và mọi con bị cắt |
+| **`visibility: hidden`** | **Có** — chiếm chỗ, không hiển thị, con có thể override bằng `visibility: visible` |
+| **`opacity: 0`** | **Có** — vẫn paint (vô hình nhưng hit-test được trừ khi `pointer-events: none`) |
+| **`<head>`, `<script>`, `<meta>`** | **Không** — metadata không hiển thị |
+| **`::before`, `::after`** | **Có** — pseudo-element thành node render tree |
+| **Text nodes** | **Có** — bọc trong anonymous box nếu cần |
+
+Render tree là thứ **layout** (Phần 5) duyệt để tính hình học — box, dòng, và vị trí. Nếu node không trong render tree, nó không có box model và không có pixel trên màn hình.
+
+---
+
+## 7. Invalidate style và chi phí tính lại
+
+Đổi style kích hoạt lượt **tính lại style** — engine đánh dấu node bẩn và tính lại cây con bị ảnh hưởng. Không phải mọi thay đổi đều như nhau:
+
+```text
+Low cost:
+  .item { color: red }  →  .item { color: blue }
+  (same selector, only computed values change)
+
+Higher cost:
+  Add/remove a class that appears in many selectors site-wide
+  (broad invalidation — many elements re-matched)
+
+High cost:
+  DOM subtree insertion with deep selector chains
+  (new elements need full match pass)
+```
+
+Gạt class trên **`body`** hay **`html`** (chuyển dark mode, class theme) là bẫy hiệu năng phổ biến — thường xuất hiện trong hàng chục selector và buộc recalc rộng. Ưu tiên scope biến theme qua custom property trên container khi có thể.
+
+Trình duyệt cache computed style và invalidate tăng dần, nhưng CSS bệnh lý (hàng trăm quy tắc `:nth-child`, universal sâu) phá tối ưu đó. Trong DevTools, thanh **Recalculate Style** tím dài là tín hiệu audit độ phức tạp selector và phạm vi invalidate.
+
+---
+
+## 8. DOM + CSSOM → render tree: điểm kiểm pipeline
+
+Trước khi layout chạy, ba cấu trúc phải tồn tại:
+
+```text
+┌─────────────┐     ┌─────────────┐
+│    DOM      │     │   CSSOM     │
+│  (Part 3)   │     │  (Part 4)   │
+└──────┬──────┘     └──────┬──────┘
+       │                   │
+       └─────────┬─────────┘
+                 ▼
+       ┌───────────────────┐
+       │  Style computation │  cascade + inheritance → computed styles
+       └─────────┬─────────┘
+                 ▼
+       ┌───────────────────┐
+       │   Render tree     │  visible nodes + pseudo-elements + styles
+       └─────────┬─────────┘
+                 ▼
+            Layout (Part 5)
+            → Paint
+            → Composite
+```
+
+Điểm kiểm này giải thích hai quan sát hàng ngày:
+
+1. **HTML có thể parse xong trước CSS**, nhưng trang trống (hay chỉ paint cũ) cho đến khi CSSOM sẵn sàng — chặn render by design.
+2. **`display: none` gỡ phần tử khỏi render tree hoàn toàn** — gạt nó kích hoạt recalc *và* layout, không chỉ repaint.
+
+Giờ bạn có cấu trúc dữ liệu pipeline render cần; Phần 5 biến box thành tọa độ và pixel.
+
+---
+
+## Tóm tắt
+
+- CSS được parse thành **CSSOM** — cây quy tắc style, tách nhưng ghép với DOM.
+- **CSS chặn render** ngăn FOUC; `media` query không khớp tải mà không chặn lần paint đầu.
+- **Cascade** giải quyết xung đột qua origin/importance, **specificity**, rồi thứ tự nguồn; **kế thừa** lấp property kế thừa chưa set.
+- **Tính style** khớp selector (phải sang trái) với mọi phần tử và tạo **computed style** — lượt kiểu O(rules × elements).
+- **Render tree** gồm node DOM hiển thị và pseudo-element; **`display: none`** cắt cây con; **`visibility: hidden`** vẫn trong cây.
+- Thay đổi class và DOM kích hoạt **recalc style** — scope selector để invalidate hẹp.
+
+**Phần tiếp theo:** Layout, paint & compositing — render tree thành box, pixel, và layer GPU thế nào.

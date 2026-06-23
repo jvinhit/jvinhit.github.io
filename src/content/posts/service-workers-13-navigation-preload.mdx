@@ -1,0 +1,205 @@
+---
+title: 'Service Workers · Phần 13 — Navigation Preload'
+description: 'Vì sao việc khởi động service worker làm chậm navigation, và cách navigationPreload chạy request mạng song song với lúc SW thức dậy: bật preload, đọc preloadResponse, đặt header, và kết hợp với network-first.'
+pubDate: 2026-07-15
+tags: [service-worker, navigation-preload, performance, network, service_workers_10]
+series: service-workers
+seriesOrder: 13
+draft: false
+---
+
+Có một nghịch lý ít người biết: thêm service worker có thể làm trang **chậm đi** ở lần điều hướng đầu. Lý do nằm ở vòng đời của chính SW — nó **ngủ** khi không dùng, và phải **thức dậy** trước khi xử lý request. Với navigation request (tải một trang), độ trễ thức dậy đó nằm thẳng trên đường tới nội dung. **Navigation Preload** là lời giải chính thức.
+
+Phần này nhỏ nhưng quan trọng: nó là một trong vài tối ưu "miễn phí" hiếm hoi mà bạn bật một lần, đo được ngay, và không phải đánh đổi gì.
+
+---
+
+## 1. Vấn đề: service worker ngủ
+
+Service worker không chạy mãi. Trình duyệt **kill** nó sau một khoảng không hoạt động để tiết kiệm bộ nhớ. Lần điều hướng tiếp theo, trình tự là:
+
+```text
+Người dùng bấm link
+   │
+   ├─ 1. Trình duyệt khởi động lại SW (boot JS, chạy top-level)   ← độ trễ!
+   ├─ 2. SW chạy fetch handler
+   ├─ 3. respondWith(fetch(request)) → MỚI bắt đầu gọi mạng
+   ▼
+   Nội dung về
+```
+
+Bước 1 (boot SW) có thể tốn vài chục tới hàng trăm ms trên thiết bị yếu. Tệ hơn: trong lúc SW boot, **request mạng còn chưa bắt đầu** — mạng nằm chờ. Nếu fetch handler của bạn chỉ làm `network-first` cho navigation, bạn vừa thêm một khoảng chết tuần tự vào mỗi lần điều hướng.
+
+---
+
+## 2. Lời giải: chạy mạng *song song* với boot
+
+Navigation Preload bảo trình duyệt: "ngay khi có navigation request, hãy bắt đầu gọi mạng **song song** với lúc khởi động SW". Khi SW thức dậy và chạy fetch handler, response (hoặc một phần) đã đang trên đường về.
+
+```text
+Người dùng bấm link
+   │
+   ├─ Boot SW ─────────────┐
+   ├─ Preload fetch ───────┤  (chạy SONG SONG)
+   ▼                       ▼
+   SW dùng preloadResponse (đã sẵn) thay vì fetch lại
+```
+
+---
+
+## 3. Bật navigation preload
+
+Bật trong sự kiện `activate` (cần kiểm tra hỗ trợ vì không phải mọi trình duyệt có):
+
+```js
+// sw.js
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    (async () => {
+      if (self.registration.navigationPreload) {
+        await self.registration.navigationPreload.enable();
+      }
+      await self.clients.claim();
+    })(),
+  );
+});
+```
+
+Sau khi bật, mỗi navigation request kèm một promise `event.preloadResponse` trong fetch handler.
+
+---
+
+## 4. Dùng `event.preloadResponse` trong fetch handler
+
+Quy tắc: chỉ áp dụng cho **navigation request** (`event.request.mode === 'navigate'`). Ưu tiên dùng preload; nếu không có thì fetch như thường:
+
+```js
+self.addEventListener('fetch', (event) => {
+  if (event.request.mode !== 'navigate') return; // chỉ xử lý điều hướng
+
+  event.respondWith(
+    (async () => {
+      try {
+        // 1. Dùng response preload nếu trình duyệt đã bắt đầu sẵn.
+        const preload = await event.preloadResponse;
+        if (preload) return preload;
+
+        // 2. Không có preload (trình duyệt không hỗ trợ) → fetch thường.
+        return await fetch(event.request);
+      } catch {
+        // 3. Mạng lỗi → trả app shell/trang offline từ cache (Phần 5).
+        const cache = await caches.open('app-shell');
+        return (await cache.match('/offline.html')) ?? Response.error();
+      }
+    })(),
+  );
+});
+```
+
+Điểm tinh tế: `event.preloadResponse` là một **Promise**. Nếu navigation preload không bật hoặc không hỗ trợ, nó resolve thành `undefined` — nên luôn kiểm tra trước khi return.
+
+---
+
+## 5. Header `Service-Worker-Navigation-Preload`
+
+Preload gửi kèm header `Service-Worker-Navigation-Preload: true` để server *biết* đây là request preload và có thể trả nội dung khác (vd chỉ phần động, bỏ phần app shell server sẽ không cần gửi lại). Bạn tuỳ chỉnh giá trị header:
+
+```js
+self.registration.navigationPreload.setHeaderValue('json-fragment');
+```
+
+Server đọc header và phản hồi tương ứng:
+
+```js
+// phía server (ví dụ Express)
+app.get('*', (req, res) => {
+  const preload = req.get('Service-Worker-Navigation-Preload');
+  if (preload === 'json-fragment') {
+    return res.json(getDynamicFragment(req)); // chỉ phần nội dung động
+  }
+  res.send(renderFullPage(req)); // trang đầy đủ
+});
+```
+
+Đây mở ra pattern mạnh: SW phục vụ app shell từ cache (tức thì), còn preload chỉ lấy *phần nội dung động* từ server — ghép lại bằng streaming (Phần 14).
+
+---
+
+## 6. Kết hợp với network-first cho navigation
+
+Pattern thực tế: navigation dùng network-first (luôn ưu tiên nội dung mới), nhưng tận dụng preload để mạng chạy sớm, và cache lại để lần sau offline vẫn mở được:
+
+```js
+async function handleNavigation(event) {
+  const cache = await caches.open('pages');
+  try {
+    // preload (đã chạy song song) hoặc fetch
+    const response = (await event.preloadResponse) || (await fetch(event.request));
+    // Lưu bản sao để offline lần sau (clone vì response chỉ đọc 1 lần — Phần 3)
+    cache.put(event.request, response.clone());
+    return response;
+  } catch {
+    // Offline → bản cache gần nhất, hoặc trang offline
+    return (await cache.match(event.request)) || (await cache.match('/offline.html')) || Response.error();
+  }
+}
+```
+
+> **Đừng quên `.clone()`**: response body là stream đọc một lần. Bạn cần một bản để trả cho trang và một bản để `cache.put` (nhắc lại từ Phần 3).
+
+---
+
+## 7. Khi nào không cần (và cạm bẫy)
+
+- **Nếu navigation của bạn là cache-first** (app shell thuần, không gọi mạng cho HTML) thì preload không giúp gì — bạn đâu có gọi mạng. Chỉ bật khi navigation *có* chạm mạng.
+- **Nhớ "tiêu thụ" preloadResponse**: nếu bật preload nhưng có nhánh code không dùng tới nó, trình duyệt cảnh báo "preload response không được dùng" và bạn phí một request. Đảm bảo mọi nhánh navigation đều `await event.preloadResponse`.
+- **Chỉ cho `mode === 'navigate'`**: preload chỉ áp dụng navigation, không phải fetch tài nguyên con (ảnh, API). Lọc đúng để không nhầm.
+
+---
+
+## 8. Bài tập
+
+**1.** Vì sao service worker đôi khi làm navigation *chậm hơn* khi không có navigation preload?
+
+<details>
+<summary>Lời giải</summary>
+
+SW bị trình duyệt kill khi rảnh; lần điều hướng sau nó phải boot lại (chạy JS top-level) *trước khi* fetch handler chạy. Nếu handler chỉ `network-first`, request mạng chỉ bắt đầu *sau* khi boot xong → thêm một khoảng chết tuần tự (boot rồi mới gọi mạng) vào mỗi navigation.
+
+</details>
+
+**2.** `event.preloadResponse` là gì và phải xử lý ra sao cho an toàn?
+
+<details>
+<summary>Lời giải</summary>
+
+Là một Promise resolve thành Response (nếu preload đã bắt đầu) hoặc `undefined` (nếu không bật/không hỗ trợ). Phải `await` nó và kiểm tra: nếu có thì dùng, nếu `undefined` thì fetch thường. Luôn tiêu thụ nó ở mọi nhánh navigation để tránh cảnh báo "preload không dùng" và phí request.
+
+</details>
+
+**3.** Header `Service-Worker-Navigation-Preload` mở ra pattern gì?
+
+<details>
+<summary>Lời giải</summary>
+
+Server biết request đến từ preload và có thể trả nội dung *khác* (vd chỉ phần động) thay vì cả trang. Kết hợp với SW phục vụ app shell từ cache, ta chỉ tải phần nội dung động từ mạng rồi ghép lại (thường qua streaming — Phần 14), giảm dữ liệu và tăng tốc.
+
+</details>
+
+**Nâng cao:** Bật navigation preload, đo thời gian điều hướng trước/sau bằng tab Performance (throttle CPU 4x để mô phỏng máy yếu, nơi boot SW tốn nhất). Xác nhận request mạng bắt đầu *trước* khi fetch handler chạy trong waterfall.
+
+---
+
+## Tóm tắt
+
+- SW ngủ khi rảnh; boot lại trước khi xử lý request → thêm độ trễ cho navigation nếu handler chạm mạng.
+- **Navigation Preload** chạy request mạng **song song** với lúc SW boot — bật trong `activate` bằng `navigationPreload.enable()`.
+- Trong fetch handler navigation, `await event.preloadResponse`; nếu `undefined` thì `fetch` thường; lỗi thì trả offline shell.
+- Header `Service-Worker-Navigation-Preload` cho server trả nội dung tuỳ biến (chỉ phần động) — ghép với app shell.
+- Kết hợp network-first + cache `.clone()` để vừa nhanh vừa offline-ready. Chỉ bật khi navigation thực sự chạm mạng; luôn tiêu thụ preloadResponse.
+
+---
+
+## Phần tiếp theo
+
+**Phần 14 — Streaming responses:** dùng `ReadableStream`/`TransformStream` để ghép app shell (từ cache, tức thì) với nội dung động (từ mạng/preload) thành một response chảy dần — render tiến triển, cải thiện LCP, và tận dụng đúng pattern preload vừa học.

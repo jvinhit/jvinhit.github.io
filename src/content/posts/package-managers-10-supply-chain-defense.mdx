@@ -1,0 +1,246 @@
+---
+title: 'Node Package Managers · Part 10 — Supply-Chain Defense'
+description: 'A concrete defense playbook: ignore-scripts by default, audit, npm provenance and sigstore, scoped tokens with 2FA, minimum release age, SBOMs, lockfile linting, and a hardened CI install.'
+pubDate: 2026-06-25
+tags: [security, supply-chain, provenance, ci, package_managers_12]
+series: package-managers
+seriesOrder: 10
+draft: false
+---
+
+Đây là **Phần 10 của series 12 phần** về package manager Node. [Phần 9](/posts/package-managers-09-supply-chain-attacks) cho thấy tấn công hoạt động ra sao. Phần này là **sổ tay phòng thủ** — nhiều lớp, thực dụng, sắp theo công-sức-so-với-tác-động. Không kiểm soát đơn lẻ nào đủ; phòng thủ là chiều sâu.
+
+---
+
+## 1. Mô hình mối đe doạ trong một hình
+
+```text
+            INSTALL TIME                 RUNTIME / CI
+{lúc cài}                       {chạy / CI}
+ ┌────────────────────────┐   ┌──────────────────────────┐
+ │ malicious postinstall   │   │ leaked tokens / secrets   │
+ │ wrong/confused package  │   │ exfiltration over network │
+ │ swapped native binary   │   │ deploy-key theft          │
+ └────────────────────────┘   └──────────────────────────┘
+      defend with                    defend with
+  scripts-off, pinning,          least-privilege tokens,
+  audit, provenance              isolated CI, egress control
+```
+
+Ta đánh cả hai cột.
+
+---
+
+## 2. Lớp 1 — Tắt install script mặc định
+
+Kiểm soát tác động cao nhất, công sức thấp nhất. Hook payload chủ đạo (Phần 9) là `postinstall`; loại bỏ nó:
+
+```bash
+# npm / yarn classic
+npm ci --ignore-scripts
+
+# make it the project default
+npm config set ignore-scripts true   # .npmrc → ignore-scripts=true
+
+# pnpm 10+ already does this: dependency build scripts are OFF by default.
+# allow ONLY the native deps you actually trust:
+pnpm approve-builds          # interactive allow-list → onlyBuiltDependencies
+```
+
+Rồi **rõ ràng** rebuild chỉ package native bạn tin:
+
+```bash
+npm rebuild esbuild sharp    # run build steps for a known short list only
+```
+
+Cơ chế chính xác khác nhau theo manager — biết cả bốn:
+
+```text
+npm     --ignore-scripts (flag) or ignore-scripts=true (.npmrc); then `npm rebuild <pkg>`
+pnpm    OFF by default (v10+); allow-list via package.json:
+          { "pnpm": { "onlyBuiltDependencies": ["esbuild","sharp"] } }
+          or run `pnpm approve-builds` interactively
+yarn v4 enableScripts: false in .yarnrc.yml; or per-dep dependenciesMeta.<pkg>.built: true
+bun     --ignore-scripts; allow-list via "trustedDependencies" in package.json
+{mỗi manager có cú pháp allow-list riêng}
+```
+
+Mẫu giống nhau ở cả bốn: **mặc định từ chối, allow-list rõ ràng**.
+
+> Thay đổi đơn lẻ này vô hiệu hoá tấn công phổ biến nhất ở Phần 9 với chi phí gần như bằng không. Đánh đổi là bạn phải allow-list các dep thật sự native.
+
+---
+
+## 3. Lớp 2 — Khoá chặt mọi thứ
+
+```ini
+# .npmrc — make the registry and resolution strict
+registry=https://registry.npmjs.org/
+@myco:registry=https://npm.internal.myco/   # pin private scopes (anti-confusion)
+//npm.internal.myco/:_authToken=${NPM_TOKEN}
+save-exact=true            # write 1.2.3, not ^1.2.3 (reduces auto-adoption)
+ignore-scripts=true
+audit=true
+fund=false
+```
+
+```text
+Checklist {danh sách}:
+[ ] CI uses FROZEN install (npm ci / pnpm i --frozen-lockfile /
+    yarn install --immutable / bun install --frozen-lockfile)
+[ ] every private scope pinned to its registry (dependency-confusion fix)
+[ ] one lockfile, reviewed in PRs like code (lockfile-poisoning fix)
+[ ] Corepack pins the manager version (Part 6)
+```
+
+`lockfile-lint` cưỡng chế quy tắc registry bằng máy:
+
+```bash
+npx lockfile-lint --path package-lock.json \
+  --allowed-hosts npm --validate-https --validate-integrity
+# fails CI if any resolved URL points off your trusted host
+```
+
+`--validate-integrity` là flag bị đánh giá thấp: nó kiểm tra lại mọi entry thực sự có hash integrity (bắt các specifier git/url ngoài registry ở Phần 1 vốn âm thầm bỏ qua integrity).
+
+---
+
+## 4. Lớp 3 — Đừng nhận version vừa mới ra
+
+Đa số version độc hại bị bắt và gỡ trong vài giờ-tới-ngày. Một **tuổi phát hành tối thiểu** nghĩa là bạn không bao giờ tự cài version vừa publish vài phút trước:
+
+```text
+"only install versions at least N days old"
+{chỉ cài version đã ra ít nhất N ngày}
+  → the window where a malicious 0.7.29 (Part 9) hits you shrinks dramatically
+```
+
+Triển khai qua tool như Socket, cài đặt **cooldown** của Renovate/Dependabot, hoặc policy proxy registry. Ghép với PR tự động để vẫn nâng cấp — chỉ là có độ trễ.
+
+Một số manager giờ tích hợp thẳng:
+
+```ini
+# pnpm (.npmrc) — refuse versions younger than N minutes
+minimum-release-age=1440        # 1 day (in minutes)
+minimum-release-age-exclude[]=@myco/*   # trust your own scope instantly
+```
+
+```jsonc
+// Renovate — apply a cooldown before opening upgrade PRs
+{ "minimumReleaseAge": "3 days", "internalChecksFilter": "strict" }
+```
+
+Đánh đổi là độ trễ có chủ ý cả với bản vá bảo mật — nên loại trừ scope tin cậy *của bạn*, và giữ một đường nhanh thủ công cho CVE khẩn.
+
+---
+
+## 5. Lớp 4 — Xác minh nguồn gốc
+
+npm hỗ trợ **provenance** qua Sigstore: package publish từ CI với `--provenance` mang chứng thực công khai có chữ ký, nối tarball tới commit source và build chính xác:
+
+```bash
+# As a PUBLISHER (in CI with OIDC):
+npm publish --provenance --access public
+# → generates a Sigstore attestation: "this tarball was built from
+#   github.com/org/repo @ <commit> by this workflow"
+{chứng thực: tarball này build từ repo @ commit này bởi workflow này}
+
+# As a CONSUMER: verify signatures/attestations of your tree
+npm audit signatures
+```
+
+Cái này trực tiếp chống **bài học xz** (Phần 9): provenance nối artifact đã publish về một build xác minh được từ source công khai. Ưu tiên dependency publish có provenance khi có thể.
+
+---
+
+## 6. Lớp 5 — Bảo vệ việc publish *của bạn*
+
+Nếu bạn publish package, bạn là chuỗi cung ứng của người khác:
+
+```text
+[ ] 2FA / passkeys required on your npm account + org
+[ ] GRANULAR access tokens, scoped to one package, short-lived
+    (never a classic "automation" token with full publish rights)
+[ ] publish ONLY from CI via OIDC (no long-lived token on laptops)
+[ ] enable --provenance on publish
+[ ] require 2FA-for-publish at the org level
+[ ] audit who has publish rights; remove dormant maintainers
+{2FA · token hạt mịn ngắn hạn · publish từ CI qua OIDC · bật provenance · 2FA-để-publish · rà soát quyền}
+```
+
+Sự cố `ua-parser-js` và `event-stream` (Phần 9) bị tạo điều kiện bởi bảo mật tài khoản yếu và quyền maintainer quá rộng.
+
+---
+
+## 7. Lớp 6 — Khả kiến: audit, SBOM, giám sát
+
+Bạn không thể bảo vệ thứ không thấy:
+
+```bash
+npm audit --omit=dev            # known CVEs in production deps
+npm audit signatures            # provenance/signature verification
+
+# Generate an SBOM (Software Bill of Materials) for your whole tree:
+npm sbom --sbom-format cyclonedx > sbom.json
+# feed it to vulnerability scanners / compliance / incident response
+{tạo SBOM cho cả cây → đưa vào scanner / tuân thủ / ứng cứu sự cố}
+```
+
+Tool hành vi (vd Socket) vượt qua CVE đã biết: chúng đánh dấu *hành vi đáng ngờ* ở version mới — package bỗng thêm truy cập mạng, đọc filesystem, hay install script — bắt zero-day mà `npm audit` không bắt được.
+
+---
+
+## 8. Lớp 7 — Cô lập việc cài
+
+Kể cả có tất cả ở trên, hãy giả định install *có thể* chạy code thù địch, và khoanh vùng thiệt hại:
+
+```text
+[ ] run installs in ephemeral, sandboxed CI runners (no persistent state)
+[ ] LEAST-PRIVILEGE: no cloud/deploy credentials present during install
+    → fetch deps in a stage that has NO secrets, deploy in a separate stage
+[ ] restrict network EGRESS during install (only the registry host)
+    → a postinstall can't phone home if it can't reach the internet
+[ ] separate "install" and "build/deploy" phases with different permissions
+{runner phù du · không secret lúc cài · chặn egress · tách phase}
+```
+
+Nguyên tắc: thời điểm dependency cài là thời điểm bạn có **ít lý do nhất** để cũng có secret production trong phạm vi. Tách chúng ra.
+
+---
+
+## 9. Thứ tự ưu tiên
+
+Bạn sẽ không làm tất cả cùng lúc. Làm theo thứ tự này:
+
+```text
+1. Frozen install in CI + commit one lockfile        ← do today {làm hôm nay}
+2. ignore-scripts by default, allow-list native deps ← do today
+3. Pin private scopes in .npmrc (anti-confusion)     ← do this week {tuần này}
+4. Corepack pin + lockfile-lint in CI
+5. Minimum release age (cooldown) on dependency PRs
+6. 2FA + granular tokens + OIDC publishing (if you publish)
+7. SBOM + behavioral monitoring (Socket) + audit signatures
+8. Isolated, secret-free, egress-limited install stage ← ongoing {liên tục}
+```
+
+Hai cái đầu tốn một buổi chiều và loại bỏ phần lớn rủi ro thực tế.
+
+---
+
+## Giờ bạn đã biết gì
+
+- **Tắt script mặc định** diệt hook payload phổ biến nhất.
+- **Install frozen, ghim scope, review lockfile, Corepack** khoá resolution.
+- **Tuổi phát hành tối thiểu** né version độc vừa publish.
+- **Provenance/sigstore** nối artifact tới build xác minh; **2FA + OIDC + token hạt mịn** bảo vệ publish.
+- **SBOM + giám sát hành vi + cô lập install** cho khả kiến và khoanh vùng.
+
+---
+
+## Bài tập
+
+1. Thêm `ignore-scripts=true`, cài sạch, rồi allow-list đúng native dep cần và xác nhận app vẫn build.
+2. Chạy hai lệnh trên project thật; xem kết quả.
+3. Thêm `lockfile-lint` vào CI và xác nhận nó fail với URL `resolved` bị giả mạo.
+
+Tiếp theo — Phần 11: Monorepo & workspaces:

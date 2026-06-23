@@ -1,0 +1,146 @@
+---
+title: 'How Browsers Work · Part 17 — Memory Deep: Heap Snapshots, Leaks & Detached DOM'
+description: 'Săn rò rỉ bộ nhớ như chuyên gia: heap snapshot và ba view, retainer path, detached DOM, Oilpan GC, cùng WeakRef/FinalizationRegistry và measureUserAgentSpecificMemory.'
+pubDate: 2026-11-06
+tags: [browser, internals, memory, debugging, browser_internals_12]
+series: browser-internals
+seriesOrder: 17
+draft: true
+---
+
+Phần 8 giới thiệu garbage collection (generational, mark-sweep). Phần này biến lý thuyết thành kỹ năng điều tra: làm sao tìm ra *cái gì* đang giữ bộ nhớ không cho giải phóng. Rò rỉ trong JS hiếm khi là "quên free" — nó là *vô tình giữ một tham chiếu* khiến GC không thể thu hồi.
+
+---
+
+## 1. Định nghĩa rò rỉ: reachable nhưng vô dụng
+
+GC thu hồi mọi thứ *không reachable* từ root (Phần 8). Một object bị "rò rỉ" khi nó **vẫn reachable** (có đường tham chiếu từ root) nhưng chương trình *không còn cần*. GC không thể đoán ý định của bạn — nó chỉ thấy tham chiếu.
+
+```text
+root (window, stack, ...)
+  │
+  ▼
+cache ──► entry ──► hugeObject   ← bạn quên xoá entry → không bao giờ GC
+```
+
+Bốn nguồn rò rỉ kinh điển: biến toàn cục vô tình, **listener/timer chưa gỡ**, **detached DOM** bị JS giữ, và **closure** giữ tham chiếu sống lâu hơn cần thiết.
+
+---
+
+## 2. Heap snapshot & ba view
+
+DevTools → **Memory** → *Heap snapshot* chụp toàn bộ object đang sống. Ba chế độ xem:
+
+| View | Trả lời câu hỏi |
+|---|---|
+| **Summary** | Có những loại (constructor) gì, bao nhiêu instance, chiếm bao nhiêu? |
+| **Comparison** | Giữa hai snapshot, cái gì *mới sinh ra* mà chưa chết? |
+| **Containment** | Cây sở hữu từ root — duyệt thủ công |
+
+Hai cột quan trọng:
+
+- **Shallow size**: bộ nhớ object tự nó chiếm.
+- **Retained size**: bộ nhớ sẽ được giải phóng nếu object này biến mất (gồm mọi thứ chỉ nó giữ). Retained size lớn = "thủ phạm" giữ nhiều thứ.
+
+---
+
+## 3. Retainer path — vì sao object còn sống
+
+Chọn một object, DevTools hiện **Retainers** (ai đang giữ nó). Lần ngược chuỗi này tới root chính là *retainer path* — bằng chứng trực tiếp của rò rỉ.
+
+```text
+Detached HTMLDivElement
+  ◄── retained by  array "cache" (đối tượng A)
+       ◄── retained by  window.appState
+            ◄── root (window)        ← đây là dây neo cần cắt
+```
+
+Quy trình "three-snapshot" để xác nhận rò rỉ:
+
+1. Chụp snapshot 1 (baseline).
+2. Thực hiện thao tác *nhiều lần* (mở/đóng modal 10 lần) rồi về trạng thái đầu.
+3. Chụp snapshot 2 → so sánh. Object nào tăng tuyến tính theo số lần lặp = rò rỉ.
+
+---
+
+## 4. Detached DOM — kẻ rò rỉ phổ biến nhất
+
+Khi bạn gỡ một node khỏi cây DOM nhưng *JS vẫn giữ tham chiếu*, node đó (và toàn bộ cây con) thành **detached** — không hiển thị nhưng vẫn tốn bộ nhớ.
+
+```js
+// ❌ rò rỉ: list bị xoá khỏi DOM nhưng biến vẫn giữ
+const cached = document.querySelector('#list');
+document.body.removeChild(cached.parentNode);
+// 'cached' (và mọi con) vẫn sống vì còn tham chiếu
+
+// ✅ giải phóng tham chiếu khi không cần
+let cached = document.querySelector('#list');
+cleanup(() => { cached = null; });
+```
+
+Trong heap snapshot, lọc theo "Detached" để thấy ngay các node mồ côi và retainer của chúng. Listener gắn trên node detached cũng giữ cả closure của handler.
+
+---
+
+## 5. Listener & timer — gỡ đúng vòng đời
+
+```js
+// ❌ component huỷ nhưng listener/timer vẫn chạy → giữ closure + node
+function mount(el) {
+  const onResize = () => layout(el);
+  window.addEventListener('resize', onResize);
+  const id = setInterval(() => poll(el), 1000);
+  // không có đường gỡ → rò rỉ khi el bị xoá
+}
+
+// ✅ luôn có teardown đối xứng
+function mount(el) {
+  const ctrl = new AbortController();
+  window.addEventListener('resize', () => layout(el), { signal: ctrl.signal });
+  const id = setInterval(() => poll(el), 1000);
+  return () => { ctrl.abort(); clearInterval(id); }; // gọi khi unmount
+}
+```
+
+`AbortController` + `{ signal }` gỡ nhiều listener bằng một lệnh `abort()` — gọn và khó quên hơn `removeEventListener` từng cái.
+
+---
+
+## 6. Oilpan, WeakRef & đo bộ nhớ
+
+**Oilpan** là GC của Blink cho các đối tượng C++ phía trình duyệt (DOM node...). Nó hợp tác với GC của V8 (cho JS) — nhưng một tham chiếu JS tới DOM node vẫn giữ node sống xuyên qua ranh giới này, nên detached DOM mới rò rỉ được.
+
+Công cụ JS để *không* giữ object sống:
+
+```js
+// WeakRef: tham chiếu KHÔNG ngăn GC thu hồi
+const ref = new WeakRef(bigObject);
+const obj = ref.deref(); // có thể undefined nếu đã bị GC
+
+// FinalizationRegistry: callback (không bảo đảm) khi object bị thu hồi
+const reg = new FinalizationRegistry((key) => cache.delete(key));
+reg.register(obj, 'key-123');
+```
+
+> Dùng `WeakMap`/`WeakSet` cho metadata gắn theo object (key không bị giữ sống). Tránh `WeakRef`/`FinalizationRegistry` cho logic chính — thời điểm GC không xác định.
+
+Đo bộ nhớ trong production (cần cross-origin isolation — Phần 20):
+
+```js
+if (crossOriginIsolated && performance.measureUserAgentSpecificMemory) {
+  const { bytes } = await performance.measureUserAgentSpecificMemory();
+}
+```
+
+---
+
+## 7. Tóm tắt
+
+- Rò rỉ JS = object **vẫn reachable** nhưng không còn cần; GC chỉ thấy tham chiếu, không thấy ý định.
+- **Heap snapshot** với Summary/Comparison/Containment; chú ý **retained size** (thủ phạm giữ nhiều) và **retainer path** (dây neo cần cắt).
+- Quy trình **three-snapshot**: lặp thao tác nhiều lần, object tăng tuyến tính = rò rỉ.
+- **Detached DOM** là nguồn rò rỉ phổ biến nhất; lọc "Detached" trong snapshot, giải phóng tham chiếu JS khi gỡ node.
+- Gỡ **listener/timer** theo vòng đời, ưu tiên `AbortController` + `{ signal }`.
+- **Oilpan** GC cho DOM C++ hợp tác với V8 GC; dùng `WeakMap`/`WeakSet` cho metadata, `measureUserAgentSpecificMemory` để đo trong production.
+
+**Phần tiếp theo:** Accessibility tree internals — trình duyệt dựng cây a11y song song với DOM thế nào, name/role được tính ra sao, và screen reader truy vấn qua nền tảng (UIA/AX/AT-SPI) như thế nào.

@@ -1,0 +1,256 @@
+---
+title: 'Service Workers · Phần 1 — Mental model & "Hello Service Worker"'
+description: 'Mở màn series: service worker thực sự là gì, vì sao nó tồn tại, kiến trúc network proxy chạy nền, khác biệt với Web Worker, scope, yêu cầu HTTPS, và đăng ký service worker đầu tiên của bạn.'
+pubDate: 2026-06-21
+tags: [service-worker, pwa, offline, frontend, service_workers_10]
+series: service-workers
+seriesOrder: 1
+draft: false
+---
+
+Đây là **Phần 1 của series 10 phần** đưa bạn từ "service worker là cái gì?" đến chỗ tự tay xây một Progressive Web App (PWA) offline-first chạy thật trên production. Trước khi viết một dòng code nào, ta cần một **mental model** đúng — bởi vì hầu hết bug khó chịu với service worker không phải do cú pháp, mà do hiểu sai bản chất cách nó hoạt động.
+
+Bài này không vội nhồi API. Ta sẽ trả lời ba câu hỏi nền tảng: service worker **là gì**, nó **giải quyết vấn đề gì**, và nó **chạy ở đâu** trong kiến trúc trình duyệt. Cuối bài bạn sẽ đăng ký được service worker đầu tiên và nhìn thấy nó "sống" trong DevTools.
+
+| Phần | Chủ đề |
+|------|--------|
+| 1 | Mental model & hello world (bài này) |
+| 2 | Lifecycle deep dive — install, activate, update |
+| 3 | Fetch event & chặn request |
+| 4 | Cache API & caching strategies |
+| 5 | Offline-first & app shell |
+| 6 | Advanced caching & versioning |
+| 7 | Background Sync |
+| 8 | Push Notifications |
+| 9 | Workbox |
+| 10 | Capstone — build PWA hoàn chỉnh |
+
+---
+
+## Service worker là gì?
+
+Một **service worker** là một file JavaScript chạy **ở một luồng riêng, tách khỏi trang web**, do trình duyệt quản lý. Nó nằm **giữa ứng dụng của bạn và mạng (network)** — giống một proxy server, nhưng chạy ngay trong trình duyệt của người dùng.
+
+Hãy hình dung luồng request bình thường:
+
+```text
+Trang web  ──fetch──►  Network  ──►  Server
+```
+
+Khi có service worker, mọi request đi ra đều phải đi qua nó trước:
+
+```text
+Trang web  ──fetch──►  Service Worker  ──►  Network  ──►  Server
+                            │
+                            └──►  Cache (trả lời ngay, không cần mạng)
+```
+
+Điểm mấu chốt: service worker có quyền **nghe (intercept)** từng request mạng và tự quyết định trả lời thế nào — lấy từ cache, gọi mạng, ghép cả hai, hay trả về một response tự chế. Đây chính là siêu năng lực biến web app thành thứ chạy được **offline**.
+
+> Mental model một câu: **service worker là một network proxy lập trình được, chạy nền, sống lâu hơn cả tab của bạn.**
+
+---
+
+## Vì sao service worker tồn tại?
+
+Trước khi có service worker, web có vài cách làm offline nhưng đều tệ. `AppCache` (Application Cache) từng là giải pháp chính thức nhưng nó "ngu" — bạn khai báo file trong một manifest, trình duyệt cache theo luật cứng nhắc, và khi sai thì cực kỳ khó debug (nó nổi tiếng với bài viết "Application Cache is a Douchebag").
+
+Service worker ra đời để thay thế, với triết lý ngược lại: **thay vì khai báo, bạn lập trình**. Bạn viết code quyết định cái gì được cache, khi nào, và trả lời ra sao. Điều này mở ra:
+
+- **Offline** — app vẫn mở được khi mất mạng.
+- **Tốc độ** — trả nội dung từ cache gần như tức thì, không chờ round-trip mạng.
+- **Push notifications** — nhận thông báo đẩy ngay cả khi tab đã đóng.
+- **Background sync** — gửi lại dữ liệu thất bại khi có mạng trở lại.
+- **PWA** — nền tảng để web app "cài đặt" được như app native.
+
+---
+
+## Service worker vs Web Worker — đừng nhầm
+
+Cả hai đều chạy ở luồng riêng (off the main thread), nhưng mục đích hoàn toàn khác:
+
+| | Web Worker | Service Worker |
+|---|---|---|
+| Mục đích | Tính toán nặng, không chặn UI | Network proxy, offline, push |
+| Vòng đời | Sống cùng trang tạo ra nó | Sống độc lập, lâu hơn trang |
+| Số lượng | Nhiều worker mỗi trang | Một SW điều khiển nhiều trang (theo scope) |
+| Chặn request | Không | Có (`fetch` event) |
+| Truy cập DOM | Không | Không |
+| Chạy khi tab đóng | Không | Có (push, sync) |
+
+Điểm chung quan trọng: **service worker KHÔNG truy cập được DOM**. Nó không thấy `window`, `document`. Muốn nói chuyện với trang, nó dùng `postMessage` (ta sẽ học ở Phần 2). Service worker cũng **không nên giữ state trong biến toàn cục**, vì trình duyệt có thể "giết" nó bất cứ lúc nào để tiết kiệm bộ nhớ rồi khởi động lại khi cần. State phải nằm ở nơi bền vững: Cache API hoặc IndexedDB.
+
+> Ghi nhớ: service worker là **event-driven và stateless**. Nó tỉnh dậy khi có event (fetch, push, sync), xử lý xong rồi có thể bị tắt. Đừng giả định biến của bạn còn nguyên ở lần chạy sau.
+
+---
+
+## Scope — phạm vi điều khiển
+
+Mỗi service worker chỉ điều khiển các trang nằm trong **scope** của nó. Scope mặc định là **thư mục chứa file service worker**.
+
+- SW đặt ở `/sw.js` → scope `/` → điều khiển **toàn bộ** site.
+- SW đặt ở `/app/sw.js` → scope `/app/` → chỉ điều khiển các trang dưới `/app/`.
+
+Đây là lý do **gần như luôn luôn** ta đặt file service worker ở **thư mục gốc** (`/sw.js`) để nó kiểm soát toàn bộ origin. Bạn có thể giới hạn scope nhỏ hơn, nhưng **không thể** mở rộng scope ra ngoài vị trí của file (vì lý do bảo mật — một SW ở `/app/` không được phép điều khiển `/`).
+
+```js
+// Đặt scope hẹp hơn vị trí file (hợp lệ)
+navigator.serviceWorker.register('/sw.js', { scope: '/app/' });
+
+// Mở rộng scope rộng hơn vị trí file → LỖI
+navigator.serviceWorker.register('/app/sw.js', { scope: '/' }); // ❌
+```
+
+---
+
+## Yêu cầu HTTPS (và ngoại lệ localhost)
+
+Service worker là một công cụ cực mạnh — nó chặn được mọi request. Nếu kẻ tấn công chèn được service worker qua kết nối không an toàn, họ có thể đọc/sửa toàn bộ traffic của bạn (man-in-the-middle). Vì vậy trình duyệt bắt buộc:
+
+> **Service worker chỉ chạy trên HTTPS** (secure context).
+
+Ngoại lệ duy nhất: **`localhost`** (và `127.0.0.1`) được coi là secure context để bạn dev thoải mái. Khi deploy thật, bắt buộc phải có HTTPS — may là ngày nay GitHub Pages, Cloudflare Pages, Vercel, Netlify đều cho HTTPS miễn phí.
+
+---
+
+## "Hello Service Worker" — đăng ký SW đầu tiên
+
+Bắt tay vào code. Ta cần hai file: một file HTML (trang chính) và một file service worker.
+
+**`index.html`** — đăng ký service worker từ trang chính:
+
+```html
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Hello Service Worker</title>
+  </head>
+  <body>
+    <h1>Service Worker Demo</h1>
+    <p id="status">Đang kiểm tra service worker…</p>
+
+    <script>
+      // Luôn kiểm tra feature detection trước — không phải mọi môi trường đều hỗ trợ.
+      if ('serviceWorker' in navigator) {
+        // Đăng ký sau khi trang load xong để không tranh tài nguyên với việc render.
+        window.addEventListener('load', async () => {
+          try {
+            const registration = await navigator.serviceWorker.register('/sw.js');
+            document.getElementById('status').textContent =
+              '✅ Service worker đã đăng ký, scope: ' + registration.scope;
+          } catch (error) {
+            console.error('Đăng ký service worker thất bại:', error);
+          }
+        });
+      } else {
+        document.getElementById('status').textContent =
+          '❌ Trình duyệt không hỗ trợ service worker';
+      }
+    </script>
+  </body>
+</html>
+```
+
+**`sw.js`** — file service worker (đặt ở gốc để scope là `/`):
+
+```js
+// File này chạy ở luồng service worker, KHÔNG có window/document.
+// `self` là global scope của service worker (ServiceWorkerGlobalScope).
+
+self.addEventListener('install', (event) => {
+  console.log('[SW] install — service worker đang được cài đặt');
+});
+
+self.addEventListener('activate', (event) => {
+  console.log('[SW] activate — service worker đã kích hoạt và sẵn sàng');
+});
+
+self.addEventListener('fetch', (event) => {
+  // Bài này chỉ "nghe" để chứng minh SW đang chặn request.
+  // Ta CHƯA can thiệp — cứ để request đi ra mạng bình thường.
+  console.log('[SW] fetch:', event.request.url);
+});
+```
+
+### Chạy thử
+
+Service worker **không chạy** khi bạn mở file bằng `file://`. Bạn cần một HTTP server. Cách nhanh nhất:
+
+```bash
+# Trong thư mục chứa index.html và sw.js
+npx serve .
+# hoặc
+python3 -m http.server 8080
+```
+
+Mở `http://localhost:8080`, bật DevTools → tab **Console**. Bạn sẽ thấy log `[SW] install` rồi `[SW] activate`. Reload trang vài lần, bạn sẽ thấy hàng loạt log `[SW] fetch:` — đó là service worker đang **nghe từng request** đi qua nó.
+
+---
+
+## Nhìn service worker "sống" trong DevTools
+
+Mở DevTools → tab **Application** → mục **Service Workers** (Chrome/Edge). Đây sẽ là người bạn thân nhất của bạn trong cả series:
+
+- **Status** — `activated and is running` nghĩa là SW đang hoạt động.
+- **Source** — link tới file `sw.js` đang chạy.
+- **Update on reload** — ✅ **bật ngay tích này khi dev**. Nó ép trình duyệt cài lại SW mỗi lần reload, tránh việc bạn sửa code mà SW cũ vẫn chạy (một nguồn nhầm lẫn kinh điển mà ta sẽ mổ xẻ ở Phần 2).
+- **Unregister** — gỡ SW, hữu ích khi muốn làm lại từ đầu.
+
+> Mẹo sống còn: trong lúc dev, hãy luôn bật **"Update on reload"**. Nếu không, bạn sẽ mất hàng giờ tự hỏi vì sao code mới không có tác dụng — đơn giản vì SW cũ đang "mắc kẹt" (ta sẽ hiểu cơ chế `waiting` ở Phần 2).
+
+---
+
+## Tóm tắt
+
+- Service worker là một **network proxy lập trình được, chạy nền**, nằm giữa app và mạng; nó nghe và quyết định cách trả lời từng request.
+- Nó tồn tại để mang lại **offline, tốc độ, push, background sync** — nền tảng của **PWA**.
+- Khác Web Worker: SW **sống lâu hơn trang**, **điều khiển nhiều trang theo scope**, **chặn được request**, nhưng **không truy cập DOM** và **stateless** (đừng giữ state trong biến toàn cục).
+- **Scope** mặc định = thư mục chứa file SW → thường đặt ở `/sw.js` để kiểm soát toàn site.
+- Chỉ chạy trên **HTTPS** (ngoại lệ `localhost`).
+- Đăng ký bằng `navigator.serviceWorker.register('/sw.js')`; theo dõi vòng đời qua tab **Application → Service Workers** và luôn bật **Update on reload** khi dev.
+
+---
+
+## Bài tập thực hành
+
+> Mục tiêu: tự tay dựng và quan sát một service worker, làm quen DevTools. Đừng chỉ đọc — hãy gõ và chạy.
+
+### Bài 1 — Dựng và quan sát (cơ bản)
+
+Tạo thư mục `sw-demo/` với `index.html` và `sw.js` như trên. Chạy bằng `npx serve .`, mở `localhost`, rồi:
+
+1. Mở Console và xác nhận thấy log `install` → `activate`.
+2. Vào **Application → Service Workers**, chụp lại trạng thái `activated and is running`.
+3. Reload trang và đếm số log `[SW] fetch:` xuất hiện. Ghi lại các URL bị chặn.
+
+**Hướng dẫn:** Nếu không thấy log `fetch` ở lần load đầu tiên, đó là **bình thường** — SW chưa "control" trang ở lần load nó được cài. Reload thêm một lần là sẽ thấy. (Phần 2 sẽ giải thích vì sao cần `clients.claim()` để control ngay lần đầu.)
+
+### Bài 2 — Thử nghiệm scope (trung bình)
+
+1. Di chuyển `sw.js` vào thư mục con `/app/sw.js` và sửa đăng ký thành `register('/app/sw.js')`.
+2. Đặt `index.html` ở gốc `/`. Reload và quan sát: service worker có chặn request của trang gốc không?
+
+**Hướng dẫn:** Trang gốc `/index.html` **nằm ngoài** scope `/app/`, nên SW sẽ **không** điều khiển nó → bạn sẽ không thấy log `fetch` cho trang gốc. Đây là cách scope hoạt động. Hãy thử tạo thêm `/app/index.html` và mở nó — lúc này SW mới control. Rút ra kết luận vì sao ta thường đặt SW ở gốc.
+
+### Bài 3 — Chặn và trả lời tự chế (nâng cao, nhá hàng Phần 3)
+
+Trong `sw.js`, sửa handler `fetch` để **mọi** request trả về một dòng chữ cố định:
+
+```js
+self.addEventListener('fetch', (event) => {
+  event.respondWith(
+    new Response('Xin chào từ service worker! 👋', {
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+    })
+  );
+});
+```
+
+Reload trang. Bạn sẽ thấy toàn bộ nội dung biến mất, chỉ còn dòng chữ.
+
+**Hướng dẫn:** `event.respondWith()` bảo trình duyệt "đừng đi ra mạng, dùng response tôi đưa". Đây là cốt lõi của mọi caching strategy ta sẽ học. Sau khi thử xong, **nhớ gỡ đoạn này** (hoặc bật Update on reload + Unregister) để trang trở lại bình thường — nếu không bạn sẽ "kẹt" ở dòng chữ vì SW cũ vẫn control. Trải nghiệm chính cái "kẹt" này sẽ giúp bạn thấm bài học về lifecycle ở Phần 2.
+
+---
+
+**Phần tiếp theo:** Lifecycle deep dive — ta sẽ mổ xẻ trọn vẹn vòng đời `install → waiting → activate`, vì sao SW mới hay bị "kẹt" ở trạng thái waiting, và cách dùng `skipWaiting()` + `clients.claim()` để cập nhật mượt mà.

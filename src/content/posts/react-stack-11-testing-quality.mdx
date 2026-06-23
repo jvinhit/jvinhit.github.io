@@ -1,0 +1,271 @@
+---
+title: 'Build a Real React App · Part 11 — Testing & Quality'
+description: 'Lock it in with Vitest + React Testing Library + MSW: set up the runner, mock the API at the network layer, test form validation, a query hook, and an optimistic mutation rollback, then wire oxlint + typecheck + tests as the quality gate.'
+pubDate: 2026-07-27
+tags: [react, vitest, testing, msw, react_stack_12]
+series: react-stack
+seriesOrder: 11
+draft: true
+---
+
+App thật cần lưới an toàn để refactor không âm thầm hỏng feature. Ta test Pulse bằng **Vitest** (runner), **React Testing Library** (render + tương tác), và **MSW** (mock API ở tầng mạng).
+
+Nguyên tắc dẫn đường: **test hành vi, không phải hiện thực**. Khẳng định thứ *user* thấy và làm — không phải state nội bộ, tên prop, hay hook nào chạy. Test đó sống qua refactor; test bám hiện thực vỡ mỗi lần đổi tên.
+
+---
+
+## 1. Cài Vitest
+
+*Docs: [Vitest](https://vitest.dev/guide/).*
+
+```bash
+pnpm add -D vitest @testing-library/react @testing-library/user-event \
+  @testing-library/jest-dom jsdom
+```
+
+```ts
+// vitest.config.ts
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+import { fileURLToPath } from 'node:url';
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    environment: 'jsdom',       // browser-like DOM for component tests
+    globals: true,              // describe/it/expect without imports
+    setupFiles: ['./src/test/setup.ts'],
+  },
+  resolve: {
+    alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
+  },
+});
+```
+
+```ts
+// src/test/setup.ts
+import '@testing-library/jest-dom/vitest'; // adds toBeInTheDocument, etc.
+```
+
+Vitest tái dùng pipeline transform của Vite, nên alias và config TS "chạy ngay" không cần Babel/Jest riêng.
+
+### Tóm tắt một dòng
+
+Vitest + jsdom + Testing Library tái dùng config Vite; `setup.ts` thêm matcher jest-dom.
+
+---
+
+## 2. Mock API bằng MSW
+
+*Docs: [MSW](https://mswjs.io/docs/).*
+
+Đừng mock `fetch` hay stub module. MSW chặn request ở **tầng mạng**, nên code chạy nguyên — nó thực sự gọi `apiFetch`, request chỉ được handler trả lời:
+
+```ts
+// src/test/server.ts
+import { setupServer } from 'msw/node';
+import { http, HttpResponse } from 'msw';
+
+export const handlers = [
+  http.get('*/customers', () =>
+    HttpResponse.json({
+      rows: [{ id: '1', name: 'Acme', email: 'a@acme.com', plan: 'pro', mrr: 99, status: 'active' }],
+      total: 1,
+    }),
+  ),
+];
+
+export const server = setupServer(...handlers);
+```
+
+```ts
+// src/test/setup.ts
+import { server } from './server';
+
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterEach(() => server.resetHandlers()); // undo per-test overrides
+afterAll(() => server.close());
+```
+
+`onUnhandledRequest: 'error'` báo lỗi to nếu code chạm endpoint chưa mock — không bất ngờ âm thầm. Vì MSW validate hình request/response thật, test của bạn chạy đúng phần parse zod từ Phần 4.
+
+### Tóm tắt một dòng
+
+MSW chặn ở tầng mạng để code thật chạy; báo lỗi khi request chưa xử lý và reset handler giữa các test.
+
+---
+
+## 3. Helper render tái dùng
+
+Component phụ thuộc provider Query và Router, nên bọc một lần. Cho mỗi test một **`QueryClient` mới** tắt retry để lỗi hiện ngay:
+
+```tsx
+// src/test/render.tsx
+import { render } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { type ReactElement } from 'react';
+
+export function renderWithProviders(ui: ReactElement) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>,
+  );
+}
+```
+
+Client mỗi test ngăn cache rò giữa các test — mỗi cái bắt đầu cache rỗng.
+
+### Tóm tắt một dòng
+
+Bọc UI trong helper `renderWithProviders` với `QueryClient` mới, tắt retry mỗi test để tránh rò cache.
+
+---
+
+## 4. Test validate form
+
+Lái form như user bằng `user-event`, và khẳng định trên thông điệp lỗi hiển thị — không phải nội bộ form:
+
+```tsx
+import { screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+
+it('shows an error for an invalid email', async () => {
+  const user = userEvent.setup();
+  renderWithProviders(<CreateCustomerForm onDone={() => {}} />);
+
+  await user.type(screen.getByLabelText(/email/i), 'not-an-email');
+  await user.click(screen.getByRole('button', { name: /create/i }));
+
+  expect(await screen.findByText(/valid email/i)).toBeInTheDocument();
+});
+```
+
+Truy vấn như `getByLabelText`/`getByRole` khẳng định a11y *và* hành vi cùng lúc — nếu test không tìm được input có label hay button có tên, thì user screen-reader cũng không.
+
+### Tóm tắt một dòng
+
+Dùng `user-event` + truy vấn role/label để lái form và khẳng định lỗi hiển thị — test hành vi và a11y cùng lúc.
+
+---
+
+## 5. Test một query hook
+
+Hook render bằng `renderHook`; chờ kết quả async bằng `waitFor`/cờ kết quả:
+
+```tsx
+import { renderHook, waitFor } from '@testing-library/react';
+
+it('fetches customers', async () => {
+  const { result } = renderHook(() => useCustomers(), {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={new QueryClient()}>{children}</QueryClientProvider>
+    ),
+  });
+
+  await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  expect(result.current.data?.rows).toHaveLength(1); // from the MSW handler
+});
+```
+
+### Tóm tắt một dòng
+
+Test hook bằng `renderHook` + wrapper provider, chờ `isSuccess` qua `waitFor`; dữ liệu từ MSW.
+
+---
+
+## 6. Test rollback optimistic
+
+Test giá trị cao nhất cho Phần 5: ghi đè handler để **lỗi**, kích mutation optimistic, và khẳng định UI rollback về giá trị gốc:
+
+```tsx
+it('rolls back an optimistic status change on error', async () => {
+  // force this endpoint to fail for this test only
+  server.use(
+    http.patch('*/customers/:id', () => new HttpResponse(null, { status: 500 })),
+  );
+  const user = userEvent.setup();
+  renderWithProviders(<CustomersTable />);
+
+  const toggle = await screen.findByRole('button', { name: /mark churned/i });
+  await user.click(toggle); // optimistic: flips to "churned" instantly
+
+  // after the failed request, onError restores the snapshot
+  expect(await screen.findByText(/active/i)).toBeInTheDocument();
+});
+```
+
+Điều này chứng minh hợp đồng rollback `onMutate`→`onError` đầu-cuối, đúng loại logic tinh tế vỡ âm thầm khi không có test.
+
+### Tóm tắt một dòng
+
+Ghi đè handler thành 500, kích hành động optimistic, và khẳng định UI hoàn nguyên — chứng minh rollback `onError` chạy.
+
+---
+
+## 7. Cổng chất lượng
+
+Nối một lệnh phải qua trước khi merge — type, lint, format, test:
+
+```jsonc
+// package.json
+"scripts": {
+  "typecheck": "tsc --noEmit",
+  "lint": "oxlint",
+  "format:check": "oxfmt --check",
+  "test": "vitest run",
+  "verify": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test"
+}
+```
+
+`pnpm verify` là bản sao local của CI (Phần 12). Chạy nó trước khi push; pre-commit hook từ Phần 1 bắt lint/format trên file staged, và `verify` bắt mọi thứ trước PR.
+
+### Tóm tắt một dòng
+
+Một `pnpm verify` (typecheck + lint + format + test) là cổng chất lượng, nhân bản trong CI.
+
+---
+
+## 8. Bài tập
+
+**1.** Sao mock ở tầng mạng bằng MSW thay vì mock `fetch` hay module `apiFetch`?
+
+<details>
+<summary>Lời giải</summary>
+
+MSW để code thật (gồm `apiFetch` và parse zod) chạy nguyên — chỉ response mạng là giả. Mock `fetch`/module bỏ qua logic thật, nên test có thể qua trong khi tầng dữ liệu thật hỏng.
+</details>
+
+**2.** Sao cho mỗi test một `QueryClient` mới với `retry: false`?
+
+<details>
+<summary>Lời giải</summary>
+
+Client mới ngăn cache test này rò sang test kế. `retry: false` khiến query lỗi thất bại ngay thay vì thử lại vài giây, nên test nhánh lỗi nhanh và xác định.
+</details>
+
+**3.** Sao test rollback optimistic đặc biệt giá trị?
+
+<details>
+<summary>Lời giải</summary>
+
+Rollback là logic tinh tế, async, nhánh lỗi dễ vỡ khi refactor và hiếm chạm thủ công (cần request lỗi). Test tự động ép 500 và khẳng định UI hoàn nguyên bảo vệ hợp đồng đó liên tục.
+</details>
+
+Nâng cao:thêm test gõ vào ô tìm debounce và khẳng định (bằng `waitFor`) rằng bảng refetch với `q` mới — dùng MSW để đổi response theo query param.
+
+---
+
+## Điểm chính
+
+- **Test hành vi, không hiện thực** — khẳng định thứ user thấy qua truy vấn role/label.
+- **MSW** mock ở tầng mạng để code thật (và parse zod) chạy.
+- Dùng `QueryClient` mới, tắt retry mỗi test; test form, hook, và rollback optimistic.
+- Một `pnpm verify` là cổng chất lượng, nhân bản trong CI.
+
+---
+
+## Tiếp theo
+
+**Phần 12 — Capstone: CI & deploy**: gắn cả stack vào một luồng feature customer (URL → bảng → form → mutation optimistic), set up build môi trường, pipeline GitHub Actions với cache pnpm chạy `verify`, deploy Vite SPA, và tổng kết kiến trúc.
