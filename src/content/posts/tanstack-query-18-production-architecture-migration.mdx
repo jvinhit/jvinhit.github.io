@@ -8,15 +8,45 @@ seriesOrder: 18
 draft: false
 ---
 
-Đây là **bài kết** của series. Mười bảy phần trước cho bạn từng mảnh — query, cache, mutation, SSR, offline, realtime, hiệu năng, type. Phần này lắp chúng thành một **kiến trúc** mà cả team áp dụng được, rồi cho bạn lộ trình migrate, so sánh với hàng xóm, và một checklist để tự chấm điểm dự án.
+Đây là **bài kết** của series. Mười bảy phần trước cho bạn từng mảnh — query, cache, mutation, SSR, offline, realtime, hiệu năng, type. Phần này lắp chúng thành một **kiến trúc** mà cả team áp dụng được, rồi cho bạn lộ trình migrate v4 → v5, so sánh với hàng xóm (RTK Query, SWR), và một checklist để tự chấm điểm dự án.
 
-Mục tiêu: rời series với một *bản thiết kế trong đầu* cho lớp data của bất kỳ app React nào.
+Mục tiêu: rời series với một *bản thiết kế trong đầu* cho lớp data của bất kỳ app React nào — đủ chi tiết để mở một repo trống và gõ ra cấu trúc thư mục từ trí nhớ.
+
+> **Bài này tổng hợp 17 phần trước.** Mỗi mục dưới đây dẫn ngược về phần đã đào sâu cơ chế; ở đây ta chỉ chốt *cách ghép* chúng lại thành quy ước cho cả team.
 
 ---
 
-## 1. Cấu trúc thư mục theo feature
+## 1. Vì sao cần một "query layer"
 
-Đừng gom mọi query vào một file `queries.ts` khổng lồ. Tổ chức **theo feature**, mỗi feature tự chứa key, schema, api, query/mutation options và hook:
+Khi app nhỏ, gọi `useQuery({ queryKey, queryFn })` thẳng trong component thấy gọn. Nhưng đến khi 30 component cùng đọc `customers`, bạn gặp bốn vấn đề kinh điển:
+
+| Triệu chứng | Nguyên nhân gốc | Hậu quả |
+|---|---|---|
+| Cache "không invalidate" | Mỗi nơi gõ key một kiểu (`['customers']` vs `['customer','list']`) | Mutation invalidate trượt key → UI cũ |
+| Type lệch | `queryFn` trả `any`, mỗi component tự cast | Lỗi runtime, refactor sợ hãi |
+| Đổi endpoint = sửa 30 chỗ | URL + fetch logic rải khắp component | PR khổng lồ, dễ sót |
+| Khó test | Component vừa lo UI vừa lo fetch | Mock nửa vời, test giòn |
+
+Gốc rễ: **server state là một tài nguyên dùng chung**, nhưng code lại đối xử với nó như biến cục bộ của component. Query layer kéo phần "đồng bộ server state" ra khỏi component và đặt nó sau một **biên giới rõ ràng**:
+
+```
+TRƯỚC (không có layer)              SAU (có query layer)
+
+Component ──gọi──► useQuery          Component ──gọi──► useCustomers()
+   │  key tự gõ, fn tự viết             │  chỉ biết hook, không biết key
+   │  type tự cast                       ▼
+   ▼                                  hooks.ts ─► queries.ts ─► api.ts
+fetch('/api/...')                         keys.ts  schema.ts (zod)
+(lặp lại ở 30 nơi)                     (một nguồn sự thật / feature)
+```
+
+Lợi ích đo được: đổi cách fetch sửa **một** file; key tập trung nên invalidate luôn trúng; type chảy từ zod schema ra tới component không cast tay; test mock ở tầng `api` thay vì mock `fetch` toàn cục.
+
+---
+
+## 2. Cấu trúc thư mục theo feature
+
+Đừng gom mọi query vào một `queries.ts` khổng lồ. Tổ chức **theo feature** (vertical slice), mỗi feature tự chứa key, schema, api, query/mutation options và hook:
 
 ```
 src/
@@ -32,42 +62,250 @@ src/
         ├── api.ts             # fetchCustomers, createCustomer... (throw ApiError)
         ├── queries.ts         # queryOptions: customersQuery, customerQuery
         ├── mutations.ts       # mutationOptions: createCustomerMutation...
-        └── hooks.ts           # useCustomers, useCreateCustomer (gói lại cho UI)
+        ├── hooks.ts           # useCustomers, useCreateCustomer (gói cho UI)
+        └── components/        # UI riêng của feature (tùy chọn)
 ```
 
-Quy tắc: **component chỉ import từ `hooks.ts`**, không bao giờ gọi `useQuery` với key/fn tay trong component. Điều này giữ key tập trung, type nhất quán, và đổi data layer không phải sửa component.
+Trách nhiệm từng file — hợp đồng để cả team gõ giống nhau:
+
+| File | Chịu trách nhiệm | KHÔNG được chứa | Phụ thuộc |
+|---|---|---|---|
+| `keys.ts` | Key factory phân cấp, duy nhất 1 root/feature | Fetch, React | — |
+| `schema.ts` | zod schema + `z.infer` type | Network, key | `zod` |
+| `api.ts` | Gọi mạng, parse zod, throw `ApiError` | React hook, key | `schema`, `api-client` |
+| `queries.ts` | `queryOptions({ queryKey, queryFn })` | `useQuery`, JSX | `keys`, `api` |
+| `mutations.ts` | `mutationOptions({ mutationFn })` | `useMutation`, JSX | `keys`, `api` |
+| `hooks.ts` | `useQuery`/`useMutation` gói options thành hook | Fetch tay, key tay | `queries`, `mutations` |
+
+Hướng phụ thuộc luôn **một chiều**: `keys/schema → api → queries/mutations → hooks → component`. Không có mũi tên ngược. Đó là điều giúp refactor an toàn.
+
+---
+
+## 3. Giải phẫu một feature (6 file)
+
+Một feature đầy đủ, từ ngoài vào trong. Mỗi file ngắn và một-trách-nhiệm.
+
+**`keys.ts` — nguồn sự thật cho key**
 
 ```ts
-// features/customers/hooks.ts — biên giới UI dùng
-import { useQuery } from '@tanstack/react-query';
-import { customersQuery } from './queries';
+// features/customers/keys.ts
+import type { CustomerFilters } from './schema';
 
-export function useCustomers() {
-  return useQuery(customersQuery());
+export const customerKeys = {
+  all: ['customers'] as const,
+  lists: () => [...customerKeys.all, 'list'] as const,
+  list: (filters: CustomerFilters) => [...customerKeys.lists(), filters] as const,
+  details: () => [...customerKeys.all, 'detail'] as const,
+  detail: (id: string) => [...customerKeys.details(), id] as const,
+};
+```
+
+**`schema.ts` — zod là biên kiểu**
+
+```ts
+// features/customers/schema.ts
+import { z } from 'zod';
+
+export const customerSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  email: z.string().email(),
+  createdAt: z.string().datetime(),
+});
+export const customerListSchema = z.array(customerSchema);
+
+export type Customer = z.infer<typeof customerSchema>;
+export type CustomerFilters = { q?: string; status?: 'active' | 'churned' };
+```
+
+**`api.ts` — parse ngay tại ranh giới**
+
+```ts
+// features/customers/api.ts
+import { apiFetch } from '@/lib/api-client';
+import { customerSchema, customerListSchema } from './schema';
+import type { Customer, CustomerFilters } from './schema';
+
+export async function fetchCustomers(filters: CustomerFilters): Promise<Customer[]> {
+  const data = await apiFetch('/customers', { query: filters });
+  return customerListSchema.parse(data); // sau dòng này type đã chuẩn, không cast tay
+}
+
+export async function createCustomer(
+  input: Omit<Customer, 'id' | 'createdAt'>,
+): Promise<Customer> {
+  const data = await apiFetch('/customers', { method: 'POST', body: input });
+  return customerSchema.parse(data);
+}
+```
+
+**`queries.ts` — `queryOptions` để type chảy đi khắp nơi**
+
+```ts
+// features/customers/queries.ts
+import { queryOptions } from '@tanstack/react-query';
+import { customerKeys } from './keys';
+import { fetchCustomers } from './api';
+import type { CustomerFilters } from './schema';
+
+export function customersQuery(filters: CustomerFilters = {}) {
+  return queryOptions({
+    queryKey: customerKeys.list(filters),
+    queryFn: () => fetchCustomers(filters),
+    staleTime: 30_000,
+  });
+}
+```
+
+**`mutations.ts` — `mutationOptions` (v5.80+) hoặc factory object**
+
+```ts
+// features/customers/mutations.ts
+import { mutationOptions } from '@tanstack/react-query';
+import { customerKeys } from './keys';
+import { createCustomer } from './api';
+
+export function createCustomerMutation() {
+  return mutationOptions({
+    mutationFn: createCustomer,
+    meta: { invalidates: [customerKeys.lists()] }, // MutationCache đọc meta (Phần 9)
+  });
+}
+```
+
+> Nếu bản TanStack Query của bạn chưa có `mutationOptions` (helper thêm ở v5.80+), trả về một object literal có type `UseMutationOptions` cũng đạt cùng mục tiêu — quan trọng là *factory tập trung ở `mutations.ts`*.
+
+**`hooks.ts` — biên giới duy nhất UI được chạm**
+
+```ts
+// features/customers/hooks.ts
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { customersQuery } from './queries';
+import { createCustomerMutation } from './mutations';
+import { customerKeys } from './keys';
+import type { CustomerFilters } from './schema';
+
+export function useCustomers(filters: CustomerFilters = {}) {
+  return useQuery(customersQuery(filters));
+}
+
+export function useCreateCustomer() {
+  const qc = useQueryClient();
+  return useMutation({
+    ...createCustomerMutation(),
+    onSuccess: () => qc.invalidateQueries({ queryKey: customerKeys.lists() }),
+  });
+}
+```
+
+> Component sẽ không bao giờ biết key `['customers','list',...]` tồn tại. Nó chỉ biết `useCustomers`. Đổi key, đổi `staleTime`, thêm `select` — tất cả nằm trong feature, UI không đụng tới.
+
+---
+
+## 4. Quy tắc vàng: component chỉ import `hooks.ts`
+
+Đây là quy ước quan trọng nhất của cả kiến trúc. Hướng import phải một chiều:
+
+```
+✅ ĐƯỢC                          ❌ KHÔNG ĐƯỢC
+component → hooks.ts             component → queries.ts (gọi useQuery tay)
+                                 component → api.ts     (fetch tay, mất cache)
+                                 component → keys.ts    (gõ key inline)
+```
+
+| Vi phạm | Vì sao nguy hiểm |
+|---|---|
+| `useQuery({ queryKey: ['customers'] })` trong component | Key lệch với factory → invalidate trượt |
+| Gọi `fetchCustomers()` trong `useEffect` | Mất cache, dedup, retry — quay về thời tiền-Query |
+| Import `customerKeys` vào component để `setQueryData` | Cache mutation rải khắp UI, khó truy vết |
+
+Đừng chỉ trông vào kỷ luật — **enforce bằng lint**. Chặn `features/*/api`, `features/*/keys`, `features/*/queries` khỏi tầng component:
+
+```js
+// eslint.config.js (rút gọn)
+'no-restricted-imports': ['error', {
+  patterns: [{
+    group: ['@/features/*/api', '@/features/*/keys', '@/features/*/queries'],
+    message: 'Component chỉ được import từ features/<x>/hooks',
+  }],
+}]
+```
+
+Component dùng feature giờ rất sạch — không URL, không key, không zod:
+
+```tsx
+import { useCustomers } from '@/features/customers/hooks';
+
+function CustomerList() {
+  const { data, isPending, isError } = useCustomers({ status: 'active' });
+  if (isPending) return <Spinner />;
+  if (isError) return <ErrorState />;
+  return <ul>{data.map((c) => <li key={c.id}>{c.name}</li>)}</ul>;
 }
 ```
 
 ---
 
-## 2. Quy ước loading/error nhất quán
+## 5. Quy ước loading/error: Suspense vs cờ trạng thái
 
-Mỗi team nên chốt **một** cách xử lý loading/error và áp khắp nơi. Hai lựa chọn chính (Phần 7):
+Mỗi team nên chốt **một** cách xử lý loading/error và áp khắp nơi (Phần 7). Hai trường phái:
 
-| Cách | Loading | Error | Hợp khi |
-|---|---|---|---|
-| Imperative | `if (isPending)` | `if (isError)` | Cần kiểm soát inline, granular |
-| Declarative | `<Suspense>` | `<ErrorBoundary>` | Muốn component sạch, loading/error gom ở biên |
+| Cách | Loading | Error | Component | Hợp khi |
+|---|---|---|---|---|
+| Imperative (cờ) | `if (isPending)` | `if (isError)` | Tự render mọi state | Cần kiểm soát inline, granular |
+| Declarative (Suspense) | `<Suspense>` | `<ErrorBoundary>` | Sạch, chỉ lo happy-path | Gom loading/error ở biên route |
 
-Chọn declarative cho app mới: `useSuspenseQuery` + Suspense/ErrorBoundary cho từng route, cộng một `QueryCache.onError` toàn cục (Phần 9) cho toast/log. Đừng trộn hai cách trong cùng một feature — gây khó đoán.
+Suspense vs cờ — đánh đổi cụ thể:
+
+| | `useQuery` + cờ | `useSuspenseQuery` |
+|---|---|---|
+| `data` ở happy path | `T \| undefined` (phải narrow) | `T` (đã chắc chắn) |
+| Loading | `isPending` trong component | `<Suspense fallback>` ở cha |
+| Error | `isError` trong component | `<ErrorBoundary>` ở cha |
+| `enabled`/`skipToken` | Có | Không (luôn chạy) |
+| Rủi ro waterfall | Thấp | Cao nếu xếp tuần tự → `useSuspenseQueries` |
+
+Khuyến nghị cho app mới: **declarative** — `useSuspenseQuery` + một `<Suspense>`/`<ErrorBoundary>` cho mỗi route, cộng một `QueryCache.onError` toàn cục (Phần 9) cho toast/log. Đừng trộn hai cách trong cùng một feature — gây khó đoán.
+
+```tsx
+// app/providers.tsx — loading/error gom ở biên route
+<ErrorBoundary FallbackComponent={RouteError}>
+  <Suspense fallback={<RouteSkeleton />}>
+    <CustomerList /> {/* dùng useSuspenseQuery, component sạch */}
+  </Suspense>
+</ErrorBoundary>
+```
+
+> Quy ước rõ giúp reviewer chỉ liếc qua là biết đúng/sai. "Mỗi route một boundary" dễ enforce hơn "mỗi component tự lo state".
 
 ---
 
-## 3. Devtools & logging trong production
+## 6. Sở hữu query key theo feature
 
-Devtools mặc định chỉ vào dev. Nhưng đôi khi cần debug production (bug chỉ xảy ra trên prod). Lazy-load Devtools có điều kiện:
+Mỗi feature **sở hữu** root key của mình; không feature nào gõ key của feature khác.
+
+```
+features/customers/keys.ts  ──owns──►  ['customers', ...]
+features/orders/keys.ts     ──owns──►  ['orders', ...]
+features/billing/keys.ts    ──owns──►  ['billing', ...]
+```
+
+| Quy tắc | Lý do |
+|---|---|
+| 1 root array/feature (`['customers']`) | Invalidate cả feature = `{ queryKey: customerKeys.all }` |
+| Cross-feature invalidate đi qua factory đã export | `orders` cần refresh `customers`? Dùng `customerKeys.lists()`, đừng gõ `['customers','list']` |
+| Key chỉ chứa giá trị serialize ổn định | Hash key phải nhất quán giữa các render (Phần 3) |
+
+Khi feature A cần invalidate feature B, import factory đã export của B — vẫn một nguồn sự thật, không chép chuỗi key. Muốn ranh giới chặt hơn nữa, B export sẵn một hook `useInvalidateCustomers()` để A gọi mà không cần biết cả factory.
+
+---
+
+## 7. Devtools & logging trong production
+
+Devtools mặc định chỉ vào dev (`process.env.NODE_ENV`). Nhưng đôi khi cần debug production (bug chỉ xảy ra trên prod). Lazy-load bản production có điều kiện để không thêm bytes vào bundle thường:
 
 ```tsx
-import { lazy, Suspense } from 'react';
+import { lazy, Suspense, useState, useEffect } from 'react';
 
 const ReactQueryDevtoolsProd = lazy(() =>
   import('@tanstack/react-query-devtools/production').then((d) => ({
@@ -75,8 +313,18 @@ const ReactQueryDevtoolsProd = lazy(() =>
   })),
 );
 
+function useDevtoolsToggle() {
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    // bật bằng console: window.__toggleDevtools()
+    (window as unknown as { __toggleDevtools?: () => void }).__toggleDevtools = () =>
+      setOn((v) => !v);
+  }, []);
+  return on;
+}
+
 function App() {
-  const showDevtools = useDevtoolsToggle(); // vd bật qua localStorage flag
+  const showDevtools = useDevtoolsToggle();
   return (
     <>
       {/* ...app... */}
@@ -90,89 +338,218 @@ function App() {
 }
 ```
 
-Cho logging/observability, gắn vào cache (Phần 12):
+Cho observability, gắn vào **cả hai** cache (Phần 12): `QueryCache` cho lỗi đọc, `MutationCache` cho lỗi ghi.
 
 ```ts
-queryClient.getQueryCache().subscribe((event) => {
-  if (event.type === 'updated' && event.query.state.status === 'error') {
-    logToObservability('query_error', {
-      key: event.query.queryKey,
-      error: event.query.state.error,
-    });
-  }
+// lib/query-client.ts
+import { QueryClient, QueryCache, MutationCache } from '@tanstack/react-query';
+
+export const queryClient = new QueryClient({
+  queryCache: new QueryCache({
+    onError: (error, query) =>
+      logToObservability('query_error', { key: query.queryKey, error }),
+  }),
+  mutationCache: new MutationCache({
+    onError: (error, _vars, _ctx, mutation) =>
+      logToObservability('mutation_error', { key: mutation.options.mutationKey, error }),
+  }),
 });
 ```
 
----
+Nên log gì trong production:
 
-## 4. Migrate v4 → v5 — những đổi thay phải biết
-
-Nếu kế thừa codebase v4, đây là các breaking change quan trọng nhất:
-
-| v4 | v5 | Ghi chú |
+| Sự kiện | Nguồn | Dùng để |
 |---|---|---|
-| `isLoading` | `isPending` | `isLoading` giờ = `isPending && isFetching` |
-| `cacheTime` | `gcTime` | Đổi tên, ý nghĩa giữ nguyên |
-| `useQuery(key, fn, opts)` | `useQuery({ queryKey, queryFn, ...opts })` | Chỉ còn **một** object argument |
-| `onSuccess`/`onError`/`onSettled` trên `useQuery` | **Đã bỏ** | Chuyển sang `QueryCache` global hoặc `useEffect` |
-| `keepPreviousData: true` | `placeholderData: keepPreviousData` | Import `keepPreviousData` |
-| `useQueries` trả mảng | thêm `combine` | (Phần 16) |
+| Query error | `QueryCache.onError` | Phát hiện endpoint hỏng, 5xx tăng đột biến |
+| Mutation error | `MutationCache.onError` | Theo dõi ghi thất bại (mất tiền/đơn) |
+| Slow query | `dataUpdatedAt - fetchStart` | Tìm endpoint chậm |
+| Cache size | `getQueryCache().getAll().length` | Cảnh báo rò bộ nhớ |
 
-Bỏ callback trên `useQuery` là thay đổi gây "đau" nhất. Lý do: chúng chạy không đoán được với cache chia sẻ. Thay thế: side-effect "sau khi data về" chuyển sang `useEffect` theo `data`, còn xử lý global (toast/log) lên `QueryCache.onError`.
-
-> Có codemod chính thức: `npx jscodeshift ... @tanstack/react-query/codemods/v5/...` cho phần đổi tên và gộp argument. Chạy nó trước, rồi dọn tay phần callback.
+> Đừng log dữ liệu nhạy cảm (PII) trong payload. Chỉ log key + mã lỗi, không log nguyên `data`.
 
 ---
 
-## 5. So sánh nhanh: RTK Query & SWR
+## 8. Migrate v4 → v5
 
-| | TanStack Query | RTK Query | SWR |
+Nếu kế thừa codebase v4, đây là các breaking change quan trọng nhất — đọc kỹ trước khi `npm install` v5:
+
+| v4 | v5 | Loại | Ghi chú |
+|---|---|---|---|
+| `useQuery(key, fn, opts)` | `useQuery({ queryKey, queryFn })` | Signature | Chỉ còn **một** object argument cho mọi hook |
+| `isLoading` | `isPending` | Rename | `isPending` = chưa có data; `isLoading` cũ ≈ `isPending && isFetching` |
+| `isInitialLoading` | `isLoading` (đã đổi nghĩa) | Rename | `isInitialLoading` bị deprecate; dùng `isLoading` mới |
+| `status: 'loading'` | `status: 'pending'` | Enum | Mọi chỗ so `=== 'loading'` đổi thành `'pending'` |
+| `cacheTime` | `gcTime` | Rename | "garbage collection time", ý nghĩa giữ nguyên |
+| `keepPreviousData: true` | `placeholderData: keepPreviousData` | API | Import hàm `keepPreviousData` từ package |
+| `onSuccess`/`onError`/`onSettled` trên `useQuery` | **Đã bỏ** | Removed | Chuyển sang `QueryCache` global hoặc `useEffect` |
+| `useInfiniteQuery` không cần page param | **Bắt buộc** `initialPageParam` | Required | `getNextPageParam(lastPage, pages, lastPageParam)` cũng đổi chữ ký |
+| mutation `status: 'loading'` | `status: 'pending'` | Enum | `mutation.status === 'pending'` |
+| `useQueries({ queries })` | thêm `combine` | Thêm | Gộp kết quả nhiều query (Phần 16) |
+| `Hydrate` | `HydrationBoundary` | Rename | (Phần 10) |
+| `contextSharing` prop | **Đã bỏ** | Removed | Dùng `QueryClientProvider` thường |
+
+Bỏ callback trên `useQuery` là thay đổi gây "đau" nhất. Lý do under-the-hood: với cache chia sẻ, *nhiều* observer cùng subscribe một query — `onSuccess` sẽ chạy bao nhiêu lần, ở observer nào, là không xác định. v5 loại bỏ sự mơ hồ đó. Thay thế:
+
+```tsx
+// v4 (đã bỏ)
+useQuery({ queryKey, queryFn, onSuccess: (d) => setLocal(d) });
+
+// v5 — side-effect theo data: useEffect
+const { data } = useQuery({ queryKey, queryFn });
+useEffect(() => { if (data) setLocal(data); }, [data]);
+
+// v5 — xử lý global (toast/log/logout): QueryCache.onError
+new QueryCache({ onError: (e) => toast.error(getMessage(e)) });
+```
+
+**Codemod chính thức** — chạy trước, dọn tay sau:
+
+```bash
+# Gộp argument + bỏ overload (signature đa-arg → single object)
+npx jscodeshift@latest ./src \
+  --extensions=tsx,ts --parser=tsx \
+  --transform=./node_modules/@tanstack/react-query/build/codemods/v5/remove-overloads/remove-overloads.cjs
+
+# isLoading → isPending, status 'loading' → 'pending'
+npx jscodeshift@latest ./src \
+  --extensions=tsx,ts --parser=tsx \
+  --transform=./node_modules/@tanstack/react-query/build/codemods/v5/is-loading/is-loading.cjs
+
+# keepPreviousData → placeholderData: keepPreviousData
+npx jscodeshift@latest ./src \
+  --extensions=tsx,ts --parser=tsx \
+  --transform=./node_modules/@tanstack/react-query/build/codemods/v5/keep-previous-data/keep-previous-data.cjs
+```
+
+> Codemod lo phần cơ học (đổi tên, gộp argument). Phần cần đầu óc — bỏ callback `useQuery`, thêm `initialPageParam`, kiểm tra `placeholderData` — vẫn phải làm tay. Chạy codemod trên nhánh sạch rồi review diff.
+
+---
+
+## 9. So sánh: TanStack Query vs RTK Query vs SWR
+
+| Tiêu chí | TanStack Query | RTK Query | SWR |
 |---|---|---|---|
 | Gắn với | Độc lập (mọi nguồn async) | Redux Toolkit | Next.js-friendly, nhẹ |
-| Cache | Mạnh, linh hoạt, thao tác chủ động | Tốt, theo endpoint | Đơn giản, key-based |
-| Mutation/optimistic | Đầy đủ, kiểm soát cao | Có | Cơ bản |
+| Mô hình cache | Key phân cấp, fuzzy-match, thao tác chủ động | Theo endpoint + tag | Key string, đơn giản |
+| Mutation/optimistic | Đầy đủ (`onMutate`/rollback) | Có (`onQueryStarted`) | Cơ bản (`mutate`) |
+| Invalidation | Filter key (exact/prefix/predicate) | Tag-based tự động | `mutate(key)` thủ công |
+| SSR/Hydration | Chính thức, đầy đủ (Phần 10) | Có | Có (Next.js) |
 | Offline/persist | Chính thức (Phần 13) | Hạn chế | Qua middleware |
-| Khi nào chọn | App có server state phức tạp, cần kiểm soát | Đã dùng Redux nặng, thích codegen từ OpenAPI | App nhỏ/vừa, ưu tiên đơn giản |
+| Realtime | Patch cache thủ công (Phần 14) | Streaming updates | Hạn chế |
+| Codegen | Cộng đồng (OpenAPI) | Chính thức (OpenAPI/GraphQL) | — |
+| Bundle (gzip, xấp xỉ) | ~12–13 kB | đi kèm Redux Toolkit | ~4–5 kB |
+| Khi nào chọn | Server state phức tạp, cần toàn quyền cache | Đã sống trong Redux, thích codegen | App nhỏ/vừa, ưu tiên tối giản |
 
-TanStack Query thắng khi server state là trung tâm và bạn cần toàn quyền với cache. SWR thắng khi muốn tối giản. RTK Query hợp khi team đã sống trong Redux.
+Tóm gọn:
+
+- **TanStack Query** thắng khi server state là trung tâm và bạn cần toàn quyền: thao tác cache, optimistic đa query, offline, realtime.
+- **SWR** thắng khi muốn tối giản, bundle nhỏ, app vừa phải.
+- **RTK Query** hợp team đã dùng Redux nặng và muốn codegen từ OpenAPI/GraphQL.
+
+> Cả ba giải cùng một bài toán gốc (server state). Khác biệt là *trục kiểm soát ↔ tối giản* và *có gắn Redux hay không*.
 
 ---
 
-## 6. Checklist production-ready
+## 10. Checklist production-ready
 
-Chấm dự án của bạn theo danh sách này:
+Chấm dự án của bạn theo danh sách này (mỗi mục dẫn về phần đã đào sâu):
 
-**Cấu hình**
+**Cấu hình (Phần 9)**
 - [ ] Một `QueryClient` module-scope (browser) / mới mỗi request (server)
-- [ ] `defaultOptions` có `staleTime > 0`, `retry` bỏ qua 4xx, `gcTime` hợp lý
+- [ ] `defaultOptions.queries` có `staleTime > 0`, `retry` bỏ qua 4xx, `gcTime` hợp lý
 - [ ] `QueryCache.onError`/`MutationCache.onError` toàn cục (401 → logout, toast)
+- [ ] `meta` có type (Register augmentation) cho `invalidates`/`silent`
 
-**Tổ chức**
+**Tổ chức (Phần 3, 18)**
 - [ ] Query/mutation gói trong `queryOptions`/`mutationOptions`, không key/fn tay trong component
-- [ ] Key factory phân cấp tập trung mỗi feature
-- [ ] Component chỉ import qua hook layer
+- [ ] Key factory phân cấp tập trung mỗi feature; 1 root/feature
+- [ ] Component chỉ import qua hook layer (enforce bằng ESLint)
+- [ ] Hướng phụ thuộc một chiều: keys/schema → api → queries → hooks → UI
 
-**Type & data**
-- [ ] Validate biên bằng zod; `type = z.infer<schema>`; không `any`, không `as` ngoài sau parse
-- [ ] `skipToken` cho dependent query
+**Type & data (Phần 3, 17)**
+- [ ] Validate biên bằng zod; `type = z.infer<schema>`; không `any`, `as` chỉ ngay sau parse
+- [ ] `skipToken` cho dependent query (không `enabled` + `queryFn!`)
+- [ ] `queryOptions`/`mutationOptions` để type chảy tới `setQueryData`/`getQueryData`
 
-**Hiệu năng**
-- [ ] Subscription đặt gần nơi dùng data
+**Hiệu năng (Phần 11, 16)**
+- [ ] Subscription đặt gần nơi dùng data; `select` thu hẹp re-render
 - [ ] Prefetch theo ý định / route loader cho điều hướng chính
-- [ ] Tránh waterfall (`Promise.all`, `useSuspenseQueries`)
+- [ ] Tránh waterfall (`Promise.all`, `useSuspenseQueries`, `combine`)
 
-**Bền & UX**
-- [ ] Quy ước loading/error nhất quán (Suspense+Boundary hoặc imperative)
-- [ ] Optimistic update có cancel → snapshot → patch → rollback → invalidate
-- [ ] (Nếu offline) persist + paused mutations + `buster` theo schema
+**Bền & UX (Phần 6, 7, 13)**
+- [ ] Quy ước loading/error nhất quán (Suspense+Boundary hoặc imperative — chọn một)
+- [ ] Optimistic update đủ 5 bước: cancel → snapshot → patch → rollback → invalidate
+- [ ] (Nếu offline) persist + paused mutations + `buster` theo schema version
 
-**Chất lượng**
-- [ ] Test hook với MSW (Phần 8)
-- [ ] Devtools sẵn sàng cho dev (và bật được ở prod khi cần)
+**Chất lượng (Phần 8)**
+- [ ] Test hook với MSW; test client `retry: false`, `gcTime: Infinity`
+- [ ] Devtools sẵn cho dev (và bật được ở prod khi cần)
+- [ ] Observability gắn vào cache subscribe (không log PII)
 
 ---
 
-## 7. Bài tập
+## 11. Gotchas thường gặp
+
+| Gotcha | Vì sao | Cách tránh |
+|---|---|---|
+| Component gọi `useQuery` tay → key lệch | Không qua factory | Chỉ import `hooks.ts`; enforce ESLint |
+| `mutationOptions` không tồn tại ở bản cũ | Helper thêm sau (v5.80+) | Dùng factory trả object literal nếu chưa nâng cấp |
+| Migrate v5 nhưng `status === 'loading'` còn sót | Codemod không bắt 100% | Grep `'loading'` sau khi chạy codemod |
+| `useInfiniteQuery` đỏ type sau v5 | Thiếu `initialPageParam` | Thêm `initialPageParam` + sửa chữ ký `getNextPageParam` |
+| Devtools prod làm phình bundle | Import tĩnh bản production | `lazy()` + điều kiện toggle |
+| Log `data` đầy đủ lên observability | PII rò rỉ | Chỉ log key + mã lỗi |
+| Cross-feature invalidate gõ key tay | Chép chuỗi `['orders']` | Import factory đã export của feature kia |
+| Một feature, hai quy ước loading/error | Trộn imperative + Suspense | Chốt một cách/feature |
+
+---
+
+## 12. Recipes production
+
+**Provider gốc (browser + SSR-safe)**
+
+```tsx
+// app/providers.tsx
+'use client';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
+import { getQueryClient } from '@/lib/query-client';
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  const queryClient = getQueryClient(); // singleton browser / per-request server (Phần 9)
+  return (
+    <QueryClientProvider client={queryClient}>
+      {children}
+      <ReactQueryDevtools initialIsOpen={false} />
+    </QueryClientProvider>
+  );
+}
+```
+
+**Một feature đầy đủ, gọi từ component**
+
+```tsx
+import { useCustomers, useCreateCustomer } from '@/features/customers/hooks';
+
+function Customers() {
+  const { data, isPending } = useCustomers({ status: 'active' });
+  const create = useCreateCustomer();
+  if (isPending) return <Spinner />;
+  return (
+    <>
+      <button onClick={() => create.mutate({ name: 'Acme', email: 'a@b.co' })}>
+        Thêm
+      </button>
+      <ul>{data.map((c) => <li key={c.id}>{c.name}</li>)}</ul>
+    </>
+  );
+}
+```
+
+Component không biết URL, key, hay zod schema — đúng tinh thần "chỉ chạm hook layer".
+
+---
+
+## Bài tập
 
 **1.** Vì sao nên buộc component import qua "hook layer" thay vì gọi `useQuery` trực tiếp với key/fn?
 
@@ -201,18 +578,38 @@ Khi server state phức tạp và bạn cần toàn quyền: thao tác cache ch�
 
 </details>
 
-**Nâng cao:** Lấy một feature trong dự án, tái cấu trúc theo layout mục 1 (keys/schema/api/queries/mutations/hooks), rồi chạy checklist mục 6 và sửa mọi mục chưa đạt. Đây là "capstone" thật của series.
+**4.** Một feature `orders` sau khi tạo đơn cần làm mới danh sách `customers` (để cập nhật "tổng đơn"). Làm sao invalidate đúng mà không vi phạm "sở hữu key theo feature"?
+
+<details>
+<summary>Lời giải</summary>
+
+`orders` **không** gõ `['customers','list']` tay. Thay vào đó import factory đã export của customers: `import { customerKeys } from '@/features/customers/keys'` rồi `qc.invalidateQueries({ queryKey: customerKeys.lists() })`. Vẫn một nguồn sự thật cho key — nếu customers đổi cấu trúc key, chỉ sửa trong feature customers. Muốn ranh giới chặt hơn nữa, customers export sẵn hook `useInvalidateCustomers()` để orders gọi mà không cần biết cả factory.
+
+</details>
+
+**5.** Sau khi chạy ba codemod v5, build vẫn đỏ ở vài chỗ `useInfiniteQuery`. Vì sao codemod không sửa được, và bạn phải làm gì tay?
+
+<details>
+<summary>Lời giải</summary>
+
+Codemod lo phần cơ học (gộp argument, đổi tên `isLoading`/`status`). Nhưng `useInfiniteQuery` v5 **bắt buộc** `initialPageParam` và đổi chữ ký `getNextPageParam(lastPage, allPages, lastPageParam, allPageParams)` — đây là thay đổi ngữ nghĩa, cần người quyết `initialPageParam` bằng bao nhiêu. Phải thêm tay `initialPageParam: 1` (hoặc giá trị đầu phù hợp) và cập nhật `getNextPageParam`/`getPreviousPageParam`. (Phần 4.)
+
+</details>
+
+**Nâng cao:** Lấy một feature trong dự án, tái cấu trúc theo layout mục 2–3 (keys/schema/api/queries/mutations/hooks), thêm rule ESLint mục 4, rồi chạy checklist mục 10 và sửa mọi mục chưa đạt. Đây là "capstone" thật của series.
 
 ---
 
 ## Tóm tắt
 
-- Tổ chức **theo feature**: keys/schema/api/queries/mutations/hooks; component chỉ chạm hook layer.
-- Chốt **một** quy ước loading/error; ưu tiên declarative + `QueryCache.onError` toàn cục.
-- Devtools lazy-load được ở prod; gắn observability vào cache subscribe.
-- Migrate v4→v5: chạy codemod cho đổi tên/gộp argument, dọn tay phần callback `useQuery` đã bỏ.
+- Tổ chức **theo feature** (vertical slice): keys/schema/api/queries/mutations/hooks; hướng phụ thuộc một chiều.
+- **Quy tắc vàng**: component chỉ chạm `hooks.ts` — enforce bằng ESLint để key/type không rò ra UI.
+- Mỗi feature **sở hữu** root key; cross-feature invalidate đi qua factory đã export, không gõ key tay.
+- Chốt **một** quy ước loading/error; ưu tiên declarative (`useSuspenseQuery` + boundary) + `QueryCache.onError` toàn cục.
+- Devtools lazy-load được ở prod; gắn observability vào `QueryCache`/`MutationCache` (không log PII).
+- Migrate v4→v5: chạy ba codemod (remove-overloads, is-loading, keep-previous-data), rồi dọn tay callback `useQuery` đã bỏ + `initialPageParam`.
 - Chọn TanStack Query khi server state phức tạp; SWR cho tối giản; RTK Query cho hệ Redux.
-- Dùng **checklist production-ready** để tự chấm điểm dự án.
+- Dùng **checklist production-ready** để tự chấm điểm dự án trước khi ship.
 
 ---
 
@@ -239,6 +636,33 @@ Khi server state phức tạp và bạn cần toàn quyền: thao tác cache ch�
 
 ---
 
-## Điều cốt lõi
+## Kết thúc series
 
-TanStack Query không chỉ là "fetch giúp bạn" — nó là một **lớp đồng bộ server state** có cache thông minh, mutation có kiểm soát, hỗ trợ SSR/offline/realtime, và type chặt. Dùng đúng, nó xoá hàng nghìn dòng boilerplate và biến những bài toán khó (race, optimistic, offline) thành pattern có sẵn. Giờ bạn đã có cả 18 mảnh — hãy ghép chúng vào dự án thật.
+Bạn vừa đi hết **18 phần**. Nhìn lại toàn bộ hành trình:
+
+```
+NỀN TẢNG (1–8)                      PRODUCTION (9–18)
+1  Mental model & setup             9  QueryClient & defaults sâu
+2  useQuery & vòng đời cache        10 SSR / Next.js / hydration
+3  Query keys, zod, queryOptions    11 Prefetching & router
+4  Pagination & infinite            12 QueryClient như một store
+5  Mutations & invalidation         13 Offline-first & persistence
+6  Optimistic updates               14 Realtime: WebSocket/SSE
+7  Errors, retry, suspense, perf    15 Mutation nâng cao
+8  Testing & capstone (milestone)   16 Hiệu năng render sâu
+                                     17 Type-safety đỉnh cao
+                                     18 Kiến trúc & migration (bạn ở đây)
+```
+
+- **Nền tảng (1–8)** dạy bạn *từng API*: query, cache, key, mutation, optimistic, error, test. Hết phần 8 bạn đã làm được một app CRUD chỉn chu.
+- **Production (9–18)** dạy bạn *vận hành ở quy mô thật*: defaults, SSR, prefetch, store, offline, realtime, hiệu năng, type, và cuối cùng là kiến trúc gói tất cả lại.
+
+TanStack Query không chỉ là "fetch giúp bạn" — nó là một **lớp đồng bộ server state** có cache thông minh, mutation có kiểm soát, hỗ trợ SSR/offline/realtime, và type chặt. Dùng đúng, nó xoá hàng nghìn dòng boilerplate và biến những bài toán khó (race, optimistic, offline) thành pattern có sẵn.
+
+Đi tiếp từ đây:
+
+- **Xây thứ thật.** Chọn một app nhỏ (todo + auth + danh sách phân trang), dựng query layer theo Phần 18 từ đầu. Lý thuyết chỉ đọng lại khi gõ tay.
+- **Đọc docs chính thức** khi gặp ca lạ: [tanstack.com/query/latest](https://tanstack.com/query/latest) — phần "Guides" và API reference rất sát thực tế.
+- **Bản tóm tắt một trang**: nếu cần ôn nhanh hoặc giới thiệu cho đồng đội, xem [hướng dẫn TanStack Query toàn diện](/blog/tanstack-query-react-query-guide/).
+
+Cảm ơn bạn đã đi cùng 18 phần. Giờ bạn đã có cả bộ — hãy ghép chúng vào dự án thật.

@@ -842,6 +842,15 @@ const llmSeriesTools: Tool[] = [
 
 const tailwindUiSeriesTools: Tool[] = [
   {
+    name: 'Tailwind v4 Cheatsheet',
+    description:
+      'A compact Tailwind v4 utility and @theme token reference: layout, flex/grid, spacing, sizing, typography, colors, effects, filters, transforms, SVG, and design-token namespaces in one searchable-feeling tabbed panel.',
+    href: '/tools/tailwind-v4-cheatsheet/',
+    icon: 'code',
+    tags: ['tailwind', 'cheatsheet', 'design-tokens', 'reference', 'tailwind_ui_14'],
+    app: true,
+  },
+  {
     name: 'Tailwind Utility-First Playground',
     description:
       'Compose a component by toggling utilities and watch the class="" string build up alongside the exact plain CSS Tailwind generates — the whole utility-first mental model made visible.',
@@ -1242,7 +1251,7 @@ export const toolSections: ToolSection[] = [
   { label: 'Vite Zero to Pro · vite_12', tools: viteSeriesTools },
   { label: 'Webpack Zero to Pro · webpack_12', tools: webpackSeriesTools },
   { label: 'Build Chrome Extensions · chrome_ext_12', tools: chromeExtSeriesTools },
-  { label: 'Tailwind, Radix & shadcn/ui · tailwind_ui_12', tools: tailwindUiSeriesTools },
+  { label: 'Tailwind, Radix & shadcn/ui · tailwind_ui_14', tools: tailwindUiSeriesTools },
   { label: 'JavaScript Deep Dive · js_10', tools: jsSeriesTools },
   { label: 'CSS Deep Dive · css_10', tools: cssSeriesTools },
   { label: 'CSS Animation · css_10_batch2', tools: cssAnimationSeriesTools },

@@ -8,24 +8,111 @@ seriesOrder: 7
 draft: false
 ---
 
-App thật phải xử lý lỗi tử tế và chạy nhanh. Phần này gom hai chủ đề thường bị bỏ quên cho tới khi lên production: **độ bền (errors, retry, Suspense)** và **hiệu năng (select, structural sharing, prefetch)**. Đây là những thứ biến một app "chạy được trên máy mình" thành một app "chạy mượt cho người dùng thật".
+[Phần 6](/blog/tanstack-query-06-optimistic-updates-cache/) làm UI *cảm giác* tức thì. Phần này làm UI **bền** và **mượt**: xử lý lỗi tử tế khi mạng chập chờn, retry đúng loại lỗi, dùng Suspense cho loading khai báo, và cắt re-render thừa bằng `select` + structural sharing. Đây là tầng biến một app "chạy được trên máy mình" thành một app "chạy mượt cho người dùng thật".
+
+Ta đi theo hai trục: **độ bền** (errors → retry → Suspense) và **hiệu năng** (select → structural sharing → tracked properties → prefetch). Mỗi mục đào tới cơ chế bên dưới, kèm bảng tra cứu để bạn quay lại tra nhanh.
 
 ---
 
-## 1. Retry — thử lại thông minh
+## 1. Bản đồ hai trục
 
-Mặc định, query lỗi sẽ được thử lại **3 lần** với khoảng chờ tăng dần (exponential backoff). Bạn điều chỉnh qua `retry` và `retryDelay`:
+```
+                ┌──────────────── ĐỘ BỀN ────────────────┐
+  query lỗi  →  error/isError  →  retry  →  throwOnError  →  Suspense
+                (đọc trạng thái)  (thử lại)  (Error Boundary)  (khai báo)
+
+                ┌──────────────── HIỆU NĂNG ──────────────┐
+  data đổi   →  structural    →  select   →  notifyOn   →  prefetch
+                sharing           (narrow)    ChangeProps    (mồi cache)
+                (giữ ref)         (subscribe ít)  (re-render ít)
+```
+
+Hai trục này độc lập nhưng bổ trợ: một query có thể đồng thời retry thông minh, ném lỗi lên boundary, **và** chỉ re-render khi đúng field đổi.
+
+---
+
+## 2. `error` vs `isError` — đọc trạng thái lỗi đúng cách
+
+`useQuery` phơi lỗi qua nhiều field. Hiểu rõ từng field tránh được kiểu code "lúc có lúc không":
+
+| Field | Kiểu | Ý nghĩa |
+|---|---|---|
+| `isError` | `boolean` | `true` khi `status === 'error'` (lần fetch gần nhất thất bại) |
+| `error` | `TError \| null` | Đối tượng lỗi `queryFn` ném ra; `null` khi không lỗi |
+| `isLoadingError` | `boolean` | Lỗi ở lần fetch **đầu** (chưa từng có data) |
+| `isRefetchError` | `boolean` | Lỗi khi refetch **đã** có data cũ trong cache |
+| `failureCount` | `number` | Số lần thất bại liên tiếp (reset về 0 khi thành công) |
+| `failureReason` | `TError \| null` | Lỗi của lần thử **gần nhất** — có giá trị *ngay trong lúc đang retry* |
+| `status` | `'pending' \| 'error' \| 'success'` | Trạng thái của **data** |
+| `fetchStatus` | `'fetching' \| 'paused' \| 'idle'` | Trạng thái của **đường mạng** |
+
+**Cơ chế cần nắm:** `error` chỉ được set khi query *cạn* số lần retry. Trong lúc còn đang retry, `status` vẫn là `'pending'`, nhưng `failureReason` đã có lỗi của lần thử vừa rồi — dùng nó để hiện "Đang thử lại… (lỗi mạng)" mà chưa coi là thất bại hẳn.
+
+```tsx
+function Report() {
+  const { data, isPending, isError, error, failureReason, failureCount } = useQuery({
+    queryKey: ['report'],
+    queryFn: fetchReport,
+  });
+
+  // Đang retry: chưa lỗi hẳn, nhưng cho user biết đang trục trặc.
+  if (isPending) {
+    return failureCount > 0
+      ? <Spinner note={`Đang thử lại… (${failureReason?.message})`} />
+      : <Spinner />;
+  }
+  if (isError) return <ErrorState message={error.message} />; // error: TError, không null
+  return <ReportView data={data} />;
+}
+```
+
+> **Phân biệt `isLoadingError` vs `isRefetchError`:** lỗi lần đầu (chưa có data) thường cần một màn hình lỗi toàn phần; lỗi khi refetch (đã có data cũ) chỉ nên hiện một toast nhẹ và **giữ nguyên data cũ** — đừng xoá màn hình đang dùng được.
+
+---
+
+## 3. Retry — thử lại thông minh
+
+### 3.1. `retry` và `retryDelay`
+
+Mặc định, query lỗi được thử lại **3 lần** với khoảng chờ tăng dần (exponential backoff). Mutation mặc định **không** retry. Bảng giá trị `retry`:
+
+| Giá trị `retry` | Hành vi |
+|---|---|
+| `3` (mặc định query) | Thử lại tối đa 3 lần rồi mới set `isError` |
+| `0` (mặc định mutation) | Không thử lại; lỗi là lỗi luôn |
+| `false` | Tương đương `0` |
+| `true` | Thử lại **vô hạn** (cẩn thận — chỉ hợp lý khi kèm điều kiện ngoài) |
+| `(failureCount, error) => boolean` | Quyết định theo từng lỗi — mạnh nhất |
 
 ```ts
 useQuery({
   queryKey: ['report'],
   queryFn: fetchReport,
-  retry: 2,                 // số lần thử lại (false = không thử, true = vô hạn)
+  retry: 2,                 // số lần thử lại
   retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 30_000), // backoff, trần 30s
 });
 ```
 
-Nhưng **không phải lỗi nào cũng nên retry**. Lỗi 404 (không tồn tại) hay 401/403 (không có quyền) thử lại vô ích — chỉ tổ làm chậm. Dùng `retry` dạng hàm để chỉ thử lại lỗi mạng/5xx:
+### 3.2. `retryDelay` — công thức exponential backoff
+
+Mặc định `retryDelay` là `Math.min(1000 * 2 ** attempt, 30_000)` — chờ gấp đôi sau mỗi lần, trần 30s. `attempt` đếm từ 0:
+
+```
+attempt:   0      1      2      3       4        …
+delay:   1000ms  2000ms 4000ms 8000ms  16000ms  (… cap 30000ms)
+
+  fetch ✗ ──1s──▶ retry ✗ ──2s──▶ retry ✗ ──4s──▶ retry ✗ ──▶ isError
+```
+
+Tăng theo cấp số nhân giúp **không dồn request** vào lúc server đang ngộp (nếu mọi client retry cùng lúc đều đặn, server bị "thundering herd"). Muốn thêm jitter (lệch ngẫu nhiên để tránh đồng pha), cộng một lượng nhỏ ngẫu nhiên:
+
+```ts
+retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 30_000) + Math.random() * 1000,
+```
+
+### 3.3. Không phải lỗi nào cũng nên retry
+
+Lỗi 404 (không tồn tại) hay 401/403 (không có quyền) thử lại vô ích — chỉ tổ làm chậm và spam request. Dùng `retry` dạng hàm để chỉ thử lại lỗi mạng/5xx:
 
 ```ts
 import { ApiError } from '@/lib/api-client'; // từ Phần 3
@@ -44,24 +131,61 @@ useQuery({
 });
 ```
 
-> **Mutation thì khác:** mặc định mutation **không** retry (`retry: 0`). Hợp lý — thử lại một POST có thể tạo bản ghi trùng. Chỉ bật retry cho mutation khi endpoint *idempotent* (vd PUT).
+### 3.4. `networkMode` — hành vi khi offline
+
+`networkMode` quyết định query/mutation xử sự thế nào khi **không có mạng**:
+
+| `networkMode` | Khi offline | Dùng cho |
+|---|---|---|
+| `'online'` (mặc định) | Không chạy `queryFn`; chuyển `fetchStatus: 'paused'`, tự chạy lại khi có mạng | App phụ thuộc server hoàn toàn |
+| `'always'` | Luôn chạy `queryFn` bất kể mạng | Data từ cache/AsyncStorage/local, không cần mạng |
+| `'offlineFirst'` | Chạy `queryFn` **một lần**; nếu lỗi thì pause + retry khi có mạng | Có Service Worker / HTTP cache đáp ứng được lần đầu |
+
+> **`fetchStatus: 'paused'` không phải lỗi.** Khi offline với mode `'online'`, query "đứng chờ" chứ không thất bại — UI nên hiện trạng thái "ngoại tuyến, sẽ tải lại khi có mạng" thay vì màn hình lỗi. Đây chính là lý do `fetchStatus` tách khỏi `status` (xem Phần 1).
+
+### 3.5. Retry trên mutation
+
+Mutation mặc định `retry: 0` vì rủi ro: thử lại một POST có thể tạo bản ghi trùng. Chỉ bật retry khi endpoint **idempotent** (PUT/DELETE theo id):
+
+```ts
+useMutation({
+  mutationFn: (c: Customer) => api.put(`/customers/${c.id}`, c), // idempotent
+  retry: 2,
+  retryDelay: (attempt) => 1000 * 2 ** attempt,
+});
+```
 
 ---
 
-## 2. Error Boundary với `throwOnError`
+## 4. `throwOnError` & Error Boundaries
+
+### 4.1. `throwOnError` — boolean và function
 
 Kiểm tra `isError` ở từng component lặp đi lặp lại rất mệt. Với những lỗi "nghiêm trọng" (không có data thì không render được), tiện hơn là **ném lỗi lên Error Boundary** và xử lý tập trung.
+
+`throwOnError` nhận hai dạng:
+
+| Dạng | Ý nghĩa |
+|---|---|
+| `true` | Mọi lỗi đều ném lên Error Boundary gần nhất |
+| `false` (mặc định `useQuery`) | Không ném; tự xử lý qua `isError` |
+| `(error, query) => boolean` | Chọn lọc: ném lỗi nào, giữ lỗi nào |
 
 ```tsx
 useQuery({
   queryKey: ['profile'],
   queryFn: fetchProfile,
-  // Ném lỗi cho Error Boundary gần nhất bắt, thay vì tự xử lý isError.
-  throwOnError: true,
+  // Chỉ ném 5xx lên boundary; 4xx tự xử lý inline (vd form validation).
+  throwOnError: (error) =>
+    error instanceof ApiError && error.status >= 500,
 });
 ```
 
-Bọc khu vực bằng một Error Boundary (React không có sẵn — dùng `react-error-boundary`):
+> `useSuspenseQuery` mặc định `throwOnError: true` — đó là lý do nó **luôn** cần một Error Boundary bao quanh.
+
+### 4.2. Error Boundary + `useQueryErrorResetBoundary`
+
+React không có sẵn Error Boundary — dùng `react-error-boundary`. Vấn đề: sau khi boundary bắt lỗi, query vẫn ở trạng thái `error` trong cache; bấm "Thử lại" mà không reset thì boundary lại bắt đúng lỗi cũ. `QueryErrorResetBoundary` (component) hoặc `useQueryErrorResetBoundary` (hook) giải quyết:
 
 ```tsx
 import { QueryErrorResetBoundary } from '@tanstack/react-query';
@@ -72,7 +196,7 @@ function ProfileSection() {
     <QueryErrorResetBoundary>
       {({ reset }) => (
         <ErrorBoundary
-          onReset={reset} // reset query lỗi khi user bấm "Thử lại"
+          onReset={reset} // reset trạng thái lỗi của query khi boundary reset
           fallbackRender={({ resetErrorBoundary }) => (
             <div role="alert">
               <p>Không tải được hồ sơ.</p>
@@ -88,15 +212,52 @@ function ProfileSection() {
 }
 ```
 
-`QueryErrorResetBoundary` cho phép nút "Thử lại" của boundary **reset trạng thái lỗi** của query để nó fetch lại sạch sẽ.
+Dùng hook khi cần reset từ chỗ khác (vd một nút "Tải lại tất cả" ở header):
 
-> **Lỗi toàn cục** (vd 401 → đăng xuất, hay log lỗi về Sentry) nên xử lý một chỗ qua `QueryCache`'s `onError` khi tạo `QueryClient`, thay vì lặp ở mỗi query.
+```tsx
+import { useQueryErrorResetBoundary } from '@tanstack/react-query';
+
+function Header() {
+  const { reset } = useQueryErrorResetBoundary();
+  return <button onClick={reset}>Tải lại tất cả</button>;
+}
+```
+
+### 4.3. Lỗi toàn cục: `QueryCache.onError`
+
+Lỗi cần xử lý **một chỗ** (401 → đăng xuất, log về Sentry, toast chung) nên đặt ở `QueryCache`/`MutationCache` khi tạo `QueryClient`, thay vì lặp ở mỗi query:
+
+```ts
+import { QueryClient, QueryCache, MutationCache } from '@tanstack/react-query';
+
+const queryClient = new QueryClient({
+  queryCache: new QueryCache({
+    onError: (error, query) => {
+      if (error instanceof ApiError && error.status === 401) {
+        logout(); // hết phiên → đăng xuất tập trung
+        return;
+      }
+      // Chỉ toast nếu query không tự xử lý lỗi (tránh toast trùng).
+      if (query.meta?.silent !== true) {
+        toast.error(error.message);
+      }
+    },
+  }),
+  mutationCache: new MutationCache({
+    onError: (error) => Sentry.captureException(error),
+  }),
+});
+```
+
+> `query.meta` là túi metadata tuỳ ý gắn vào từng query — ở đây dùng `meta.silent` để query nào đó *chọn không* hiện toast chung. Đây là mẫu rất gọn để tách "lỗi nền" khỏi "lỗi cần báo".
 
 ---
 
-## 3. `useSuspenseQuery` — loading khai báo
+## 5. `useSuspenseQuery` — loading khai báo
 
-React Query v5 có `useSuspenseQuery`: thay vì trả `isPending`, nó **suspend** component cho tới khi có data, để `<Suspense>` lo phần loading và Error Boundary lo phần lỗi. Code component sạch hơn vì **`data` không bao giờ `undefined`**:
+### 5.1. `data` không bao giờ `undefined`
+
+React Query v5 có `useSuspenseQuery`: thay vì trả `isPending`, nó **suspend** component cho tới khi có data, để `<Suspense>` lo loading và Error Boundary lo lỗi. Code component sạch hơn vì **`data` không bao giờ `undefined`** — TypeScript thu hẹp type giúp bạn:
 
 ```tsx
 import { useSuspenseQuery } from '@tanstack/react-query';
@@ -104,7 +265,7 @@ import { useSuspenseQuery } from '@tanstack/react-query';
 function Profile() {
   // Không có isPending/isError ở đây — Suspense & ErrorBoundary lo.
   const { data } = useSuspenseQuery(profileQuery());
-  return <h1>{data.name}</h1>; // data đã chắc chắn tồn tại
+  return <h1>{data.name}</h1>; // data: Profile (KHÔNG phải Profile | undefined)
 }
 
 function ProfilePage() {
@@ -118,55 +279,127 @@ function ProfilePage() {
 }
 ```
 
-Đánh đổi cần biết:
+### 5.2. `useSuspenseQuery` vs `useQuery`
 
-- **Ưu:** code component gọn, `data` luôn có type chuẩn, loading/error gom về biên (Suspense + Boundary).
-- **Nhược:** dễ tạo **waterfall** nếu lồng nhiều suspense query — vì component bị suspend sẽ chặn render con. Để chạy song song, hoặc gọi các suspense query *cạnh nhau* trong một component, hoặc dùng `useSuspenseQueries`.
+| Khía cạnh | `useQuery` | `useSuspenseQuery` |
+|---|---|---|
+| `data` ban đầu | `TData \| undefined` | `TData` (luôn có) |
+| Loading | `isPending` trong component | `<Suspense fallback>` ở biên |
+| Lỗi | `isError` trong component | Error Boundary ở biên (`throwOnError: true`) |
+| `enabled` | Có | **Không hỗ trợ** (luôn chạy) |
+| `placeholderData` | Có | Không |
+| Rủi ro chính | Boilerplate loading/error | **Waterfall** khi lồng nhiều suspense |
+| Hợp khi | Cần kiểm soát loading inline | Muốn loading khai báo, `data` chắc chắn |
 
-Chọn `useQuery` (có `isPending`) khi cần kiểm soát loading inline; chọn `useSuspenseQuery` khi muốn loading khai báo và `data` không-undefined.
+### 5.3. Coi chừng waterfall + ghi chú streaming
+
+Component bị suspend sẽ **chặn render con** — nếu hai `useSuspenseQuery` lồng nhau (cha suspend xong mới tới lượt con fetch), bạn vô tình tạo waterfall tuần tự. Để chạy song song, gọi các query *cạnh nhau* trong cùng một component, hoặc dùng `useSuspenseQueries`:
+
+```tsx
+import { useSuspenseQueries } from '@tanstack/react-query';
+
+function Dashboard() {
+  // Hai query fetch SONG SONG, cùng suspend một lần.
+  const [{ data: user }, { data: stats }] = useSuspenseQueries({
+    queries: [userQuery(), statsQuery()],
+  });
+  return <DashboardView user={user} stats={stats} />;
+}
+```
+
+> **Streaming SSR (Next.js App Router):** với `<Suspense>`, server có thể stream HTML phần đã sẵn sàng và "lấp" phần suspend sau, kèm hydrate data từ server (prefetch + `dehydrate`). Chi tiết để dành cho phần SSR/Hydration nâng cao trong series — ở đây chỉ cần biết `useSuspenseQuery` là viên gạch nền cho streaming.
 
 ---
 
-## 4. `select` — biến đổi & thu hẹp re-render
+## 6. `select` — biến đổi & thu hẹp re-render
 
 `select` cho phép **biến đổi** data trước khi component nhận, và quan trọng hơn: component chỉ re-render khi *phần được select* đổi, không phải khi *toàn bộ* data đổi.
 
 ```tsx
-// Chỉ lấy số lượng — component re-render khi COUNT đổi, không phải khi từng customer đổi.
+// Chỉ lấy số lượng — re-render khi COUNT đổi, không phải khi từng customer đổi.
 function CustomerCount() {
-  const count = useQuery({
+  const { data: count } = useQuery({
     ...customersQuery(),
     select: (data) => data.length,
   });
-  return <span>{count.data} khách hàng</span>;
+  return <span>{count} khách hàng</span>;
 }
 
 // Hoặc biến đổi shape
 function CustomerNames() {
-  const names = useQuery({
+  const { data: names } = useQuery({
     ...customersQuery(),
     select: (data) => data.map((c) => c.name), // chỉ tên
   });
-  // ...
+  return <ul>{names?.map((n) => <li key={n}>{n}</li>)}</ul>;
 }
 ```
 
-> **Mẹo hiệu năng:** `select` chạy mỗi lần render. Nếu phép biến đổi nặng, bọc trong `useCallback` để React Query so sánh tham chiếu và bỏ qua khi không đổi. Với data lớn, `select` + structural sharing (mục 5) cắt re-render rất hiệu quả.
+**Cơ chế:** sau mỗi lần data nguồn đổi, React Query chạy `select`, rồi **so sánh cấu trúc** kết quả với kết quả lần trước. Nếu giống hệt → trả về tham chiếu cũ → observer **không** re-render. Nghĩa là dù `customersQuery` refetch liên tục, `CustomerCount` chỉ re-render khi *con số* thực sự đổi.
+
+> **Mẹo hiệu năng:** `select` chạy mỗi lần render khi data có. Nếu phép biến đổi nặng, dùng một hàm `select` **ổn định tham chiếu** (định nghĩa ngoài component hoặc bọc `useCallback`) để React Query bỏ qua tính lại khi data không đổi. Với data lớn, `select` + structural sharing (mục 7) cắt re-render rất hiệu quả.
 
 ---
 
-## 5. Structural sharing — vì sao tham chiếu ổn định
+## 7. Structural sharing — vì sao tham chiếu ổn định
 
-React Query mặc định bật **structural sharing**: sau mỗi lần refetch, nó so sánh data mới với data cũ và **giữ nguyên tham chiếu** của những phần *không đổi*. Hệ quả: nếu refetch trả về data y hệt, `data === data` cũ (cùng tham chiếu) → component **không re-render thừa**, và các `useMemo`/`React.memo` phía dưới vẫn hiệu lực.
+React Query mặc định bật **structural sharing**: sau mỗi lần refetch, nó so sánh data mới với data cũ và **giữ nguyên tham chiếu** của những phần *không đổi*.
 
-Bạn gần như không phải làm gì — chỉ cần biết:
+```
+data cũ:  { items: [A, B, C], page: 1 }
+data mới: { items: [A, B, C'], page: 1 }   ← chỉ C đổi thành C'
+                     │  │  │
+kết quả:  items[0]=A (ref cũ), items[1]=B (ref cũ), items[2]=C' (ref mới)
+          → page giữ ref cũ, A/B giữ ref cũ; chỉ C' và mảng items là mới
+```
 
-- Đừng tự ý phá vỡ nó bằng cách map/clone data ngoài `select`.
-- `queryFn` nên trả về JSON-serializable data để so sánh cấu trúc hoạt động tốt.
+Hệ quả: nếu refetch trả về data y hệt, `data === data` cũ (cùng tham chiếu) → component **không re-render thừa**, và các `useMemo`/`React.memo`/`select` phía dưới vẫn hiệu lực vì tham chiếu phần không đổi được bảo toàn.
+
+| Tình huống | Có structural sharing |
+|---|---|
+| Refetch trả data y hệt | `data` giữ nguyên ref → **0 re-render** |
+| Refetch đổi 1 phần tử trong list | Phần tử khác giữ ref, `React.memo` con không đổi vẫn skip |
+| Tắt `structuralSharing: false` | Mọi refetch tạo object mới → re-render toàn bộ |
+| Data **không** JSON-serializable (Map, Class) | So sánh cấu trúc không áp dụng được → cân nhắc custom |
+
+Bạn gần như không phải làm gì — chỉ cần biết: đừng tự ý map/clone data **ngoài** `select`, và `queryFn` nên trả về JSON-serializable data để so sánh cấu trúc hoạt động tốt.
 
 ---
 
-## 6. Prefetching — tải trước cho cảm giác tức thì
+## 8. `notifyOnChangeProps` & tracked properties — cắt re-render
+
+`useQuery` trả về cả chục field (`data`, `isPending`, `isFetching`, `dataUpdatedAt`…). Mặc định v5 dùng **tracked properties**: nó theo dõi *bạn thực sự đọc field nào* (qua getter) và **chỉ re-render khi field đó đổi**.
+
+```tsx
+function CustomerName() {
+  // Chỉ đọc `data` → component KHÔNG re-render khi `isFetching` bật/tắt
+  // (vd lúc refetch nền), chỉ re-render khi `data` đổi.
+  const { data } = useQuery(customerQuery(id));
+  return <span>{data?.name}</span>;
+}
+```
+
+Muốn ghim cứng danh sách field cần nghe, dùng `notifyOnChangeProps`:
+
+| `notifyOnChangeProps` | Hành vi |
+|---|---|
+| `'all'` | Re-render khi **bất kỳ** field nào đổi (tắt tracked properties) |
+| `['data', 'error']` | Chỉ re-render khi `data` hoặc `error` đổi |
+| Bỏ trống (mặc định) | Tracked properties — theo field bạn destructure |
+
+```tsx
+useQuery({
+  ...customerQuery(id),
+  // Bỏ qua isFetching/isStale… chỉ quan tâm data & error.
+  notifyOnChangeProps: ['data', 'error'],
+});
+```
+
+> **Bẫy phổ biến:** destructure cả `isFetching` "cho chắc" rồi không dùng vẫn khiến component nghe field đó → re-render mỗi lần refetch nền. Chỉ destructure field bạn **thật sự render**.
+
+---
+
+## 9. Prefetching — tải trước cho cảm giác tức thì
 
 *Tài liệu: [Prefetching](https://tanstack.com/query/latest/docs/framework/react/guides/prefetching).*
 
@@ -207,11 +440,11 @@ export async function customerLoader({ params }: { params: { id: string } }) {
 
 Khi component mount và gọi `useQuery(customerQuery(id))`, data đã nằm sẵn trong cache → hiển thị tức thì, không spinner.
 
-> **Thứ tự tối ưu hiệu năng (nhớ làm theo):** bundle (code splitting + lazy route) → data (prefetch / tránh waterfall) → re-render (select / structural sharing / selector). Đo bằng React Profiler và bundle visualizer trước khi tối ưu — đừng tối ưu mò.
+> **Thứ tự tối ưu hiệu năng (nhớ làm theo):** bundle (code splitting + lazy route) → data (prefetch / tránh waterfall) → re-render (`select` / structural sharing / tracked props). Đo bằng React Profiler và bundle visualizer trước khi tối ưu — đừng tối ưu mò.
 
 ---
 
-## 7. Persistence (ghi nhớ cache qua refresh) — xem nhanh
+## 10. Persistence (ghi nhớ cache qua refresh) — xem nhanh
 
 Mặc định cache nằm trong RAM, mất khi reload trang. Nếu muốn giữ cache qua các lần load (offline-first, mở app thấy data cũ ngay), dùng persister chính thức:
 
@@ -230,11 +463,104 @@ const persister = createSyncStoragePersister({ storage: window.localStorage });
 </PersistQueryClientProvider>;
 ```
 
-Cẩn thận: đừng persist data nhạy cảm (token, thông tin cá nhân) vào localStorage. Lọc bằng `dehydrateOptions` nếu cần.
+Cẩn thận: đừng persist data nhạy cảm (token, thông tin cá nhân) vào localStorage. Lọc bằng `dehydrateOptions` nếu cần. (Phần Offline-first & Persistence sâu trong series sẽ đào kỹ chủ đề này.)
 
 ---
 
-## 8. Bài tập
+## 11. Gotchas thường gặp
+
+| Triệu chứng | Nguyên nhân | Cách xử lý |
+|---|---|---|
+| Lỗi 404 vẫn quay vòng 3 lần rồi mới hiện | `retry` mặc định `3`, không phân biệt loại lỗi | `retry` dạng hàm: `false` cho 4xx |
+| App "treo" khi offline, không báo gì | `fetchStatus: 'paused'` bị tưởng là lỗi | Hiện trạng thái ngoại tuyến; tách `status` ≠ `fetchStatus` |
+| Bấm "Thử lại" trên boundary nhưng lại lỗi ngay | Không reset trạng thái lỗi của query | Bọc `QueryErrorResetBoundary` + `onReset={reset}` |
+| `useSuspenseQuery` báo "ném ra ngoài Suspense" | Thiếu `<Suspense>` hoặc Error Boundary bao quanh | Luôn đặt cả hai ở biên |
+| Hai suspense query chạy tuần tự (chậm) | Lồng nhau gây waterfall | Đặt cạnh nhau / `useSuspenseQueries` |
+| Component re-render mỗi lần refetch nền | Destructure `isFetching` nhưng không cần | Chỉ destructure field render; hoặc `notifyOnChangeProps` |
+| `select` chạy lại liên tục, tốn CPU | Hàm `select` tạo mới mỗi render + data lớn | Định nghĩa `select` ổn định ref / `useCallback` |
+| Mutation tạo bản ghi trùng khi mạng chập | Bật `retry` cho POST không idempotent | Chỉ retry endpoint idempotent (PUT/DELETE) |
+| Toast lỗi hiện hai lần | Vừa `onError` cục bộ vừa `QueryCache.onError` | Dùng `query.meta.silent` để tắt toast chung |
+
+---
+
+## 12. Recipes thực chiến
+
+### 12.1. Error UI dựa trên boundary (tái dùng)
+
+```tsx
+import { QueryErrorResetBoundary } from '@tanstack/react-query';
+import { ErrorBoundary } from 'react-error-boundary';
+import type { ReactNode } from 'react';
+
+// Bọc bất kỳ vùng nào cần "ném lỗi → boundary" tập trung.
+export function QueryBoundary({ children }: { children: ReactNode }) {
+  return (
+    <QueryErrorResetBoundary>
+      {({ reset }) => (
+        <ErrorBoundary
+          onReset={reset}
+          fallbackRender={({ error, resetErrorBoundary }) => (
+            <div role="alert" className="error-card">
+              <p>Đã có lỗi: {error.message}</p>
+              <button onClick={resetErrorBoundary}>Thử lại</button>
+            </div>
+          )}
+        >
+          {children}
+        </ErrorBoundary>
+      )}
+    </QueryErrorResetBoundary>
+  );
+}
+```
+
+### 12.2. Backoff theo loại lỗi (defaults toàn cục)
+
+```ts
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: (failureCount, error) => {
+        if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+          return false; // 4xx: bỏ
+        }
+        return failureCount < 3; // mạng/5xx: tối đa 3
+      },
+      retryDelay: (attempt) =>
+        Math.min(1000 * 2 ** attempt, 30_000) + Math.random() * 1000, // + jitter
+    },
+  },
+});
+```
+
+### 12.3. Danh sách dùng Suspense, fetch song song
+
+```tsx
+function CustomerListPage() {
+  return (
+    <QueryBoundary>
+      <Suspense fallback={<ListSkeleton />}>
+        <CustomerList />
+      </Suspense>
+    </QueryBoundary>
+  );
+}
+
+function CustomerList() {
+  const { data } = useSuspenseQuery(customersQuery()); // data: Customer[]
+  return (
+    <ul>
+      {data.map((c) => (
+        <li key={c.id}>{c.name}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+---
+
+## 13. Bài tập
 
 **1.** Vì sao không nên retry lỗi 404 hay 401, và cấu hình `retry` thế nào để chỉ thử lại lỗi mạng/5xx?
 
@@ -249,7 +575,7 @@ Cẩn thận: đừng persist data nhạy cảm (token, thông tin cá nhân) v�
 <details>
 <summary>Lời giải</summary>
 
-`useSuspenseQuery` suspend component cho tới khi có data (loading/error đẩy lên Suspense + Error Boundary), nên `data` không bao giờ undefined. Rủi ro: lồng nhiều suspense query gây **waterfall** vì component bị suspend chặn render con. Khắc phục bằng cách đặt query cạnh nhau hoặc dùng `useSuspenseQueries`.
+`useSuspenseQuery` suspend component cho tới khi có data (loading/error đẩy lên Suspense + Error Boundary), nên `data` không bao giờ undefined và mặc định `throwOnError: true`. Nó không hỗ trợ `enabled`/`placeholderData`. Rủi ro: lồng nhiều suspense query gây **waterfall** vì component bị suspend chặn render con. Khắc phục bằng cách đặt query cạnh nhau hoặc dùng `useSuspenseQueries`.
 </details>
 
 **3.** `select` giúp giảm re-render bằng cách nào?
@@ -260,19 +586,45 @@ Cẩn thận: đừng persist data nhạy cảm (token, thông tin cá nhân) v�
 `select` thu hẹp data mà component "nghe". Component chỉ re-render khi *kết quả của select* đổi (so sánh cấu trúc), chứ không phải khi toàn bộ data query đổi. Kết hợp structural sharing, các phần không đổi giữ nguyên tham chiếu nên không kích hoạt re-render thừa.
 </details>
 
+**4.** Phân biệt `error`, `failureReason` và `failureCount`. Field nào dùng được *trong lúc* query còn đang retry?
+
+<details>
+<summary>Lời giải</summary>
+
+`error` chỉ được set khi query **cạn** số lần retry (status chuyển `'error'`). Trong lúc đang retry, `status` vẫn `'pending'` và `error` vẫn `null`, nhưng `failureReason` chứa lỗi của lần thử gần nhất và `failureCount` đếm số lần đã thất bại — dùng hai field này để hiện "Đang thử lại…" mà chưa coi là lỗi hẳn.
+</details>
+
+**5.** `networkMode` mặc định là gì, và `fetchStatus: 'paused'` nghĩa là sao? Vì sao đừng hiển thị màn hình lỗi khi gặp nó?
+
+<details>
+<summary>Lời giải</summary>
+
+Mặc định `networkMode: 'online'`. Khi offline, query không chạy `queryFn` mà chuyển `fetchStatus: 'paused'` và tự chạy lại khi có mạng — đây **không** phải lỗi (`status` vẫn `'pending'`/`'success'`). Nên hiện trạng thái "ngoại tuyến, sẽ tải lại" thay vì màn hình lỗi, và giữ nguyên data cũ nếu có.
+</details>
+
+**6 (nâng cao).** Vì sao destructure `isFetching` "cho chắc" rồi không dùng lại làm component re-render nhiều hơn? Hai cách khắc phục?
+
+<details>
+<summary>Lời giải</summary>
+
+v5 dùng tracked properties: chỉ field bạn **đọc** mới khiến component nghe thay đổi. Destructure `isFetching` đăng ký nghe field đó → mỗi lần refetch nền (isFetching bật/tắt) là một lần re-render dù bạn không render nó. Cách khắc phục: (1) chỉ destructure field thực sự render; (2) đặt `notifyOnChangeProps: ['data', 'error']` để ghim cứng danh sách field cần nghe.
+</details>
+
 **Nâng cao:** Thêm prefetch-on-hover cho danh sách, rồi thêm `ensureQueryData` vào route loader của trang chi tiết. Mở Network tab và xác nhận trang chi tiết hiển thị *không* có spinner vì data đã được mồi sẵn.
 
 ---
 
 ## Tóm tắt
 
-- **Retry** mặc định 3 lần + backoff; dùng `retry` dạng hàm để **không** thử lại lỗi 4xx. Mutation mặc định không retry.
-- Lỗi nghiêm trọng → `throwOnError` đẩy lên **Error Boundary** + `QueryErrorResetBoundary` cho nút "Thử lại"; lỗi toàn cục xử lý ở `QueryCache.onError`.
-- **`useSuspenseQuery`** cho loading khai báo (`data` không-undefined) nhưng coi chừng waterfall; chọn theo nhu cầu kiểm soát.
-- Hiệu năng: **`select`** thu hẹp re-render, **structural sharing** giữ tham chiếu ổn định, **prefetch** (hover + loader `ensureQueryData`) cho cảm giác tức thì. Tối ưu theo thứ tự bundle → data → re-render.
+- **Đọc lỗi đúng:** `isError`/`error` chỉ "chốt" khi cạn retry; trong lúc retry dùng `failureReason`/`failureCount`. Phân biệt `isLoadingError` (lần đầu) vs `isRefetchError` (giữ data cũ).
+- **Retry:** mặc định query 3 lần + exponential backoff (`Math.min(1000 * 2 ** attempt, 30_000)`); dùng `retry` dạng hàm để **không** thử lại 4xx; thêm jitter để tránh thundering herd. Mutation mặc định không retry — chỉ bật cho endpoint idempotent.
+- **`networkMode`** (`'online' \| 'always' \| 'offlineFirst'`) quyết định hành vi offline; `fetchStatus: 'paused'` **không** phải lỗi.
+- **Lỗi nghiêm trọng** → `throwOnError` (boolean hoặc function) đẩy lên **Error Boundary** + `useQueryErrorResetBoundary` cho nút "Thử lại"; lỗi toàn cục gom ở `QueryCache.onError` (dùng `meta.silent` tránh toast trùng).
+- **`useSuspenseQuery`** cho loading khai báo (`data` không-undefined, mặc định `throwOnError: true`) nhưng coi chừng waterfall → dùng `useSuspenseQueries` để chạy song song.
+- **Hiệu năng:** `select` thu hẹp subscribe, **structural sharing** giữ tham chiếu ổn định, **tracked properties / `notifyOnChangeProps`** cắt re-render thừa, **prefetch** (hover + loader `ensureQueryData`) cho cảm giác tức thì. Tối ưu theo thứ tự bundle → data → re-render.
 
 ---
 
 ## Phần tiếp theo
 
-**Phần 8 — Testing & Capstone:** test hook query/mutation bằng **Vitest + React Testing Library + MSW** (mock ở tầng network), kiểm thử cả optimistic rollback, rồi ghép tất cả 8 phần thành một **feature CRUD hoàn chỉnh** — danh sách + tìm kiếm + phân trang + tạo/sửa/xoá với optimistic update.
+**Phần 8 — Testing & Capstone (cột mốc):** test hook query/mutation bằng **Vitest + React Testing Library + MSW** (mock ở tầng network), kiểm thử cả optimistic rollback, rồi gom kiến thức **8 phần nền tảng đầu tiên** thành một **feature CRUD hoàn chỉnh** — danh sách + tìm kiếm + phân trang + tạo/sửa/xoá với optimistic update. Đây là **cột mốc khép lại nhóm 8 phần cơ bản**, *không phải* điểm kết của cả series: từ Phần 9 trở đi series bước sang các chủ đề nâng cao/production (QueryClient & defaults sâu, SSR & hydration, realtime, type-safety đỉnh cao, kiến trúc & migration). Đọc tiếp: [Phần 8 — Testing & Capstone](/blog/tanstack-query-08-testing-capstone/).

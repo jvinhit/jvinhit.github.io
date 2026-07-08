@@ -14,110 +14,270 @@ Phần này chỉ cách hợp nhất hai thế giới: giữ một query làm "n
 
 ---
 
-## 1. Hai chiến lược: invalidate vs setQueryData
+## 1. Bản đồ kiến trúc: vận chuyển vs cache
 
-Khi nhận một sự kiện realtime, bạn có hai cách phản ứng:
+Đừng nghĩ realtime là "thay thế" React Query. Hãy nghĩ theo **lớp**: WebSocket/SSE là *vận chuyển* (đẩy byte từ server xuống), React Query là *cache + phân phối* (lưu trữ chuẩn hoá, structural sharing, thông báo đúng observer). Cầu nối giữa hai lớp là một handler nhỏ gọi `setQueryData` hoặc `invalidateQueries`.
 
-| Chiến lược | Làm gì | Ưu | Nhược |
-|---|---|---|---|
-| **Invalidate** | `invalidateQueries` → query refetch | Đơn giản, luôn lấy data đúng từ server | Tốn một request mỗi sự kiện; trễ |
-| **setQueryData (patch)** | Ghi thẳng payload sự kiện vào cache | Tức thì, 0 request | Bạn chịu trách nhiệm shape; payload phải đủ |
+```text
+  Server ──push──► [ WebSocket / SSE ]        ← lớp VẬN CHUYỂN
+                          │
+                          ▼  onmessage(event)
+                  zod.safeParse(payload)        ← biên: validate
+                          │
+              setQueryData  /  invalidateQueries  ← CẦU NỐI
+                          │
+                          ▼
+                   [ QueryCache ]               ← lớp LƯU TRỮ
+              (structural sharing, gc, observers)
+                          │
+                 notify observers (chỉ key đổi)
+                          │
+                          ▼
+        useQuery(...) trong component           ← lớp PHÂN PHỐI
+```
 
-Quy tắc chọn:
+Lợi ích của ranh giới này: component **không biết** data tới từ `fetch` hay từ socket — chúng chỉ đọc `useQuery`. Bạn có thể thêm/bỏ realtime mà không sửa một dòng UI nào. Mọi logic đồng bộ sống trong cầu nối.
 
-- Payload sự kiện **chứa đủ** dữ liệu mới (vd "todo X đổi thành Y") → **patch** bằng `setQueryData`.
-- Sự kiện chỉ là **tín hiệu** "có gì đó đổi" (không kèm data, hoặc data phức tạp cần tính lại ở server) → **invalidate**.
-- Sự kiện đến **dồn dập** (giá tick mỗi 100ms) → patch (invalidate sẽ tạo bão request).
+> **Tư duy cốt lõi.** Realtime không tạo ra một "store" thứ hai. Nó chỉ là một *nguồn ghi khác* vào đúng cái cache mà `useQuery` đang đọc. Một nguồn sự thật, nhiều nguồn ghi.
 
 ---
 
-## 2. Một hook bắc cầu WebSocket → cache
+## 2. Hai chiến lược: invalidate vs setQueryData
 
-Pattern gọn nhất: một hook mở WebSocket một lần ở gốc app, rồi route từng loại message vào cache.
+Khi nhận một sự kiện realtime, bạn có đúng hai cách phản ứng. Đây là quyết định quan trọng nhất của cả phần này.
+
+| Chiến lược | Khi nào dùng | Cơ chế | Request thêm? | Rủi ro |
+|---|---|---|---|---|
+| **Invalidate on event** | Sự kiện chỉ là *tín hiệu* "có gì đó đổi", không kèm data; hoặc data cần server tính lại (tổng, quyền, join phức tạp) | `invalidateQueries` đánh dấu stale → query active refetch | Có — mỗi sự kiện tốn 1 request | Trễ một vòng round-trip; dễ tạo bão request nếu sự kiện dồn dập |
+| **Push into cache** | Payload *chứa đủ* entity mới (object đầy đủ); hoặc sự kiện đến dồn dập (giá tick) | `setQueryData` ghi thẳng payload vào cache | Không — 0 request | Bạn tự chịu trách nhiệm shape; payload thiếu field → cache sai |
+
+**Quy tắc chọn (decision tree):**
+
+```text
+Sự kiện đến
+   │
+   ├─ Payload có đủ entity mới? ──No──► invalidateQueries (để server dựng lại)
+   │            │Yes
+   │            ▼
+   ├─ Cần tính lại ở server (tổng/quyền/join)? ──Yes──► invalidateQueries
+   │            │No
+   │            ▼
+   ├─ Tần suất cao (>vài lần/giây)? ──Yes──► setQueryData (+ batch, mục 8)
+   │            │No
+   │            ▼
+   └────────────────────────────────────────► setQueryData (patch trực tiếp)
+```
+
+> **Vì sao không luôn invalidate cho "an toàn"?** Vì invalidate biến mỗi sự kiện thành một request. Một phòng chat 50 người gõ phím → 50 invalidate/giây → 50 refetch/giây. Patch (`setQueryData`) ghi thẳng, 0 request, và giữ UI mượt. Invalidate chỉ "an toàn" khi tần suất thấp.
+
+---
+
+## 3. WebSocket vs SSE (EventSource) — chọn vận chuyển
+
+Hai vận chuyển phổ biến nhất. SSE bị đánh giá thấp: nếu bạn chỉ cần *server → client* thì nó đơn giản hơn nhiều và **tự reconnect** miễn phí.
+
+| Tiêu chí | WebSocket | SSE (`EventSource`) |
+|---|---|---|
+| Chiều | Hai chiều (client gửi + nhận) | Một chiều (chỉ server → client) |
+| Reconnect | **Tự viết** (socket đóng là hết) | **Tự động**, có `Last-Event-ID` để bắt tiếp |
+| Payload | Text **hoặc** binary (`ArrayBuffer`/`Blob`) | Chỉ UTF-8 text |
+| Định dạng | Tự do (thường JSON) | Khung `event:` + `data:` chuẩn |
+| Tên sự kiện | Tự route trong `onmessage` | Native: `addEventListener('price', …)` |
+| Auth | Header bị giới hạn lúc handshake → thường nhét token vào query string hoặc subprotocol | Cookie tự gửi; header tuỳ trình duyệt; thường dùng cookie/`withCredentials` |
+| Giao thức | `ws://` / `wss://` (HTTP upgrade) | HTTP thường (`text/event-stream`) |
+| Giới hạn kết nối | Cao | ~6 kết nối/domain trên HTTP/1.1 (HTTP/2 đỡ hơn nhiều) |
+| Hợp với | Chat, game, presence, gửi lệnh lên server | Giá, thông báo, feed, log — luồng đẩy một chiều |
+
+Nguyên tắc: **cần gửi lên → WebSocket; chỉ nhận xuống → SSE.** Đừng kéo WebSocket vào chỉ để nhận thông báo — bạn sẽ tự viết lại reconnect mà SSE đã cho không.
+
+---
+
+## 4. Hook bắc cầu WebSocket → cache (typed + zod)
+
+Pattern gọn nhất: một hook mở WebSocket **một lần** ở gốc app, validate payload bằng zod, rồi route từng loại message vào cache. Không `any`, không `as` — kiểu được zod *suy ra*.
 
 ```tsx
 import { useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import { z } from 'zod';
 import { todoKeys } from '@/features/todos/keys';
+import { todoSchema } from '@/features/todos/schema';
 
-type WsEvent =
-  | { type: 'todo.updated'; todo: Todo }
-  | { type: 'todo.deleted'; id: string }
-  | { type: 'todos.changed' }; // chỉ tín hiệu
+// Discriminated union, parse tại biên → không cần `as`.
+const wsEventSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('todo.updated'), todo: todoSchema }),
+  z.object({ type: z.literal('todo.deleted'), id: z.string() }),
+  z.object({ type: z.literal('todos.changed') }), // chỉ tín hiệu
+]);
+type WsEvent = z.infer<typeof wsEventSchema>;
 
-export function useRealtimeSync() {
+export function useRealtimeSync(): void {
   const qc = useQueryClient();
 
   useEffect(() => {
     const ws = new WebSocket(import.meta.env.VITE_WS_URL);
 
-    ws.addEventListener('message', (e) => {
-      const event = JSON.parse(e.data) as WsEvent;
+    const onMessage = (e: MessageEvent<string>) => {
+      const parsed = wsEventSchema.safeParse(JSON.parse(e.data));
+      if (!parsed.success) return; // payload lạ → bỏ qua, KHÔNG làm hỏng cache
+      route(parsed.data);
+    };
 
+    const route = (event: WsEvent) => {
       switch (event.type) {
         case 'todo.updated':
-          // Patch: payload đủ data → ghi thẳng, không refetch.
+          // Patch: payload đủ data → ghi thẳng cả list lẫn detail.
           qc.setQueryData<Todo[]>(todoKeys.lists(), (old) =>
             old?.map((t) => (t.id === event.todo.id ? event.todo : t)),
           );
           qc.setQueryData(todoKeys.detail(event.todo.id), event.todo);
-          break;
-
+          return;
         case 'todo.deleted':
           qc.setQueryData<Todo[]>(todoKeys.lists(), (old) =>
             old?.filter((t) => t.id !== event.id),
           );
           qc.removeQueries({ queryKey: todoKeys.detail(event.id) });
-          break;
-
+          return;
         case 'todos.changed':
           // Tín hiệu mơ hồ → để server quyết định, refetch.
-          qc.invalidateQueries({ queryKey: todoKeys.lists() });
-          break;
+          void qc.invalidateQueries({ queryKey: todoKeys.lists() });
+          return;
       }
-    });
+    };
 
-    return () => ws.close();
+    ws.addEventListener('message', onMessage);
+    return () => {
+      ws.removeEventListener('message', onMessage);
+      ws.close(); // CLEANUP bắt buộc — nếu không, socket rò mỗi lần remount
+    };
   }, [qc]);
 }
 ```
 
-Component vẫn dùng `useQuery(todoKeys.lists())` như thường — chúng không biết data tới từ fetch hay từ WebSocket. Mọi đồng bộ gói gọn trong một hook.
+Component vẫn dùng `useQuery(todoKeys.lists())` như thường — chúng không phân biệt được data đến từ fetch hay từ WebSocket. `switch` trên discriminated union là *exhaustive*: thêm một loại event mới mà quên xử lý, TS sẽ báo lỗi tại `default` (thêm `default: { const _x: never = event; }` nếu muốn ép buộc).
 
 ---
 
-## 3. Server-Sent Events (SSE) — nhẹ hơn cho một chiều
+## 5. Hook SSE với `EventSource`
 
-Nếu chỉ cần server → client (không cần client gửi lên), SSE đơn giản và tự reconnect:
+Khi chỉ cần một chiều, SSE ngắn hơn và tự reconnect. Dùng `instanceof MessageEvent` để truy cập `.data` an toàn type — không cần `as`.
 
 ```tsx
-export function useSseSync() {
+import { z } from 'zod';
+
+const priceSchema = z.object({ symbol: z.string(), price: z.number() });
+
+export function useSseSync(): void {
   const qc = useQueryClient();
+
   useEffect(() => {
-    const es = new EventSource('/api/stream');
-    es.addEventListener('price', (e) => {
-      const { symbol, price } = JSON.parse((e as MessageEvent).data) as Price;
+    const es = new EventSource('/api/stream', { withCredentials: true });
+
+    const onPrice = (e: Event) => {
+      if (!(e instanceof MessageEvent)) return;
+      const parsed = priceSchema.safeParse(JSON.parse(e.data));
+      if (!parsed.success) return;
       // Giá tick dồn dập → luôn patch, không bao giờ invalidate.
-      qc.setQueryData(['price', symbol], price);
+      qc.setQueryData(['price', parsed.data.symbol], parsed.data.price);
+    };
+
+    es.addEventListener('price', onPrice);
+    es.addEventListener('error', () => {
+      // EventSource TỰ reconnect; chỉ log/đo, đừng tự đóng vội.
     });
-    return () => es.close();
+
+    return () => {
+      es.removeEventListener('price', onPrice);
+      es.close();
+    };
   }, [qc]);
 }
 ```
 
-`EventSource` tự kết nối lại khi rớt — đỡ phải tự viết reconnect như WebSocket.
+Server gửi khung chuẩn `text/event-stream`:
+
+```text
+event: price
+data: {"symbol":"AAPL","price":231.4}
+
+event: price
+data: {"symbol":"AAPL","price":231.7}
+```
+
+Mỗi khung kết thúc bằng một dòng trống. Trình duyệt tự gắn `Last-Event-ID` nếu server gửi `id:` — sau reconnect server có thể phát lại từ điểm đứt.
 
 ---
 
-## 4. Gom sự kiện dồn dập (batching/throttle)
+## 6. Cập nhật từng phần vào list cache & detail cache
 
-Khi sự kiện tới quá nhanh, mỗi `setQueryData` kích hoạt một lượt thông báo observer. Với hàng trăm tick/giây, gom lại rồi ghi theo nhịp:
+Một entity thường nằm trong **nhiều** query: danh sách (`todoKeys.lists()`) và chi tiết (`todoKeys.detail(id)`). Một sự kiện `todo.updated` nên ghi vào **cả hai** để mọi màn hình đồng bộ.
+
+```text
+event: todo.updated { id: 7, title: "Mua sữa ✓" }
+        │
+        ├─► setQueryData(lists())  → map: thay item id=7
+        │
+        └─► setQueryData(detail(7)) → ghi đè object chi tiết
+```
+
+Tách thành helper tái dùng để mọi nơi patch nhất quán:
+
+```ts
+function applyTodoUpsert(qc: QueryClient, todo: Todo): void {
+  // List: thay tại chỗ; nếu chưa có thì thêm vào đầu.
+  qc.setQueryData<Todo[]>(todoKeys.lists(), (old) => {
+    if (!old) return old; // list chưa nạp → bỏ qua, lần fetch sau sẽ có
+    const exists = old.some((t) => t.id === todo.id);
+    return exists
+      ? old.map((t) => (t.id === todo.id ? todo : t))
+      : [todo, ...old];
+  });
+  // Chỉ ghi detail nếu key đó đang tồn tại → tránh "tạo" cache rác.
+  if (qc.getQueryData(todoKeys.detail(todo.id)) !== undefined) {
+    qc.setQueryData(todoKeys.detail(todo.id), todo);
+  }
+}
+```
+
+> **Mẹo "không seed cache rác".** Trả `old` nguyên vẹn khi `old === undefined` nghĩa là "list chưa từng nạp" — đừng dựng list từ một sự kiện đơn lẻ (bạn sẽ có list **thiếu**). Tương tự, chỉ ghi `detail` khi nó đã tồn tại, để không giữ sống một entity mà chẳng component nào quan tâm.
+
+---
+
+## 7. Tin nhắn đến lệch thứ tự (out-of-order)
+
+WebSocket giữ thứ tự *trong một kết nối*, nhưng sau reconnect, qua nhiều socket, hoặc khi trộn với optimistic update, bạn có thể nhận một bản **cũ hơn** sau một bản **mới hơn**. Nếu patch mù, UI sẽ "nhảy lùi".
+
+Cách chữa: mỗi entity mang một dấu thứ tự (`version` tăng dần hoặc `updatedAt`), và **chỉ ghi nếu mới hơn**:
+
+```ts
+function applyIfNewer(qc: QueryClient, incoming: Todo): void {
+  qc.setQueryData<Todo>(todoKeys.detail(incoming.id), (current) => {
+    if (current && current.version >= incoming.version) {
+      return current; // đã có bản mới hơn → bỏ qua bản đến trễ
+    }
+    return incoming;
+  });
+}
+```
+
+| Dấu thứ tự | Ưu | Nhược |
+|---|---|---|
+| `version` (số nguyên tăng) | So sánh tuyệt đối, không lệ thuộc đồng hồ | Server phải cấp và tăng đều |
+| `updatedAt` (timestamp) | Sẵn có trong hầu hết schema | Lệch đồng hồ server, độ phân giải ms có thể trùng |
+
+Quy tắc: server là nơi cấp dấu thứ tự (đừng tin đồng hồ client). Với danh sách, dùng cùng guard khi map từng item.
+
+---
+
+## 8. Gom sự kiện dồn dập (batching/throttle)
+
+Khi sự kiện tới quá nhanh, mỗi `setQueryData` kích hoạt một lượt structural sharing + thông báo observer. Với hàng trăm tick/giây, gom lại rồi ghi theo nhịp:
 
 ```ts
 function createBatcher<T>(flush: (items: T[]) => void, ms = 100) {
   let buffer: T[] = [];
   let timer: ReturnType<typeof setTimeout> | null = null;
-  return (item: T) => {
+  return (item: T): void => {
     buffer.push(item);
     timer ??= setTimeout(() => {
       const items = buffer;
@@ -128,93 +288,211 @@ function createBatcher<T>(flush: (items: T[]) => void, ms = 100) {
   };
 }
 
-// Dùng: gom tick 100ms rồi ghi một lần
+// Gom tick 100ms rồi ghi một lần cho cả map giá.
 const pushTick = createBatcher<Price>((ticks) => {
   qc.setQueryData<Record<string, number>>(['prices'], (old) => {
     const next = { ...old };
-    for (const t of ticks) next[t.symbol] = t.price;
+    for (const t of ticks) next[t.symbol] = t.price; // chỉ giữ tick cuối/symbol
     return next;
   });
 }, 100);
 ```
 
-React 18+ tự batch nhiều `setState` trong cùng một tick, nhưng gom *trước khi* chạm cache vẫn giảm số lần structural sharing chạy — đáng làm cho stream tần suất cao.
+React 18+ tự batch nhiều `setState` trong một tick, nhưng gom *trước khi* chạm cache vẫn cắt số lần structural sharing — với stream tần suất cao, đây là khác biệt giữa 60fps và giật khung.
+
+| Cách điều tiết | Hành vi | Hợp với |
+|---|---|---|
+| **Throttle** (mép sau, như trên) | Ghi tối đa 1 lần / `ms`, gộp tick giữa các lần | Giá, đếm, "trạng thái mới nhất thắng" |
+| **Debounce** | Chờ im lặng `ms` rồi mới ghi | Ô "đang gõ…" lặng đi thì cập nhật |
+| **rAF coalescing** | Gộp theo khung hình (`requestAnimationFrame`) | Cập nhật gắn chặt với vẽ lại UI |
 
 ---
 
-## 5. `refetchOnReconnect` & "đồng bộ lại sau gián đoạn"
+## 9. Reconnect: đồng bộ lại nền tảng + `refetchOnReconnect`
 
-Realtime có một lỗ hổng: khi kết nối rớt rồi nối lại, bạn **bỏ lỡ** các sự kiện trong lúc mất kết nối → cache lệch. Cách chữa: khi reconnect, **invalidate một lần** để lấy lại snapshot đúng từ server, rồi tiếp tục patch theo stream.
+Realtime có một lỗ hổng cố hữu: khi kết nối rớt rồi nối lại, bạn **bỏ lỡ** các sự kiện trong lúc gián đoạn → cache trôi khỏi sự thật. Cách chữa: khi `open` (kể cả lần reconnect), **invalidate một lần** để lấy snapshot đúng, rồi tiếp tục patch theo stream.
 
 ```tsx
 ws.addEventListener('open', () => {
   // Vừa (re)connect: có thể đã lỡ sự kiện → đồng bộ lại nền tảng.
-  qc.invalidateQueries({ queryKey: todoKeys.lists() });
+  void qc.invalidateQueries({ queryKey: todoKeys.lists() });
 });
 ```
 
-Kết hợp với `refetchOnReconnect: true` (mặc định) cho query thường: khi mạng trở lại, query active tự refetch. Realtime stream chỉ cần lo phần "đẩy delta" giữa các lần đồng bộ.
+```text
+ connected  ──events──►  [rớt mạng]  ✗ lỡ 3 events ✗  ──reconnect──► open
+                                                              │
+                                                     invalidate 1 lần
+                                                              │
+                                              snapshot đúng ◄─┘  rồi patch tiếp
+```
+
+Kết hợp với `refetchOnReconnect: true` (mặc định) cho query thường: khi `navigator.onLine` trở lại, query active tự refetch. Hai cơ chế bổ trợ nhau — `refetchOnReconnect` lo query React Query quản lý, còn handler `open` lo riêng "lỗ hổng" của stream realtime.
 
 ---
 
-## 6. Một query làm "kênh subscription"
+## 10. Một socket dùng chung cho nhiều query (dedupe ngoài React)
 
-Đôi khi bạn muốn vòng đời subscription **gắn với** vòng đời query (mở khi component cần, đóng khi không ai dùng). Trick: dùng `queryFn` để lấy snapshot đầu, và một hiệu ứng phụ để subscribe — hoặc dùng `experimental_streamedQuery`/streaming nếu nguồn hỗ trợ. Cách thủ công, dễ hiểu:
+Nếu mỗi hook mở một socket, 10 component = 10 socket. Giải pháp: **một** socket singleton sống *ngoài* React, các query đăng ký nhận message từ nó. Đây cũng là cách `QueryClient` được tạo ngoài cây React (Phần 9, 12).
 
-```tsx
-function useLiveTodos() {
-  const qc = useQueryClient();
+```ts
+// realtime/socket.ts — một instance dùng chung cho cả app.
+type Listener = (event: WsEvent) => void;
 
-  // Query lo snapshot ban đầu + cache.
-  const query = useQuery(todoKeys.listsQuery());
+let socket: WebSocket | null = null;
+const listeners = new Set<Listener>();
 
-  // Subscription sống cùng component đang quan tâm tới data này.
-  useEffect(() => {
-    const sub = subscribeTodos((todo) => {
-      qc.setQueryData<Todo[]>(todoKeys.lists(), (old) =>
-        old?.map((t) => (t.id === todo.id ? todo : t)),
-      );
-    });
-    return () => sub.unsubscribe();
-  }, [qc]);
+function ensureSocket(): WebSocket {
+  if (socket && socket.readyState <= WebSocket.OPEN) return socket;
+  socket = new WebSocket(import.meta.env.VITE_WS_URL);
+  socket.addEventListener('message', (e: MessageEvent<string>) => {
+    const parsed = wsEventSchema.safeParse(JSON.parse(e.data));
+    if (parsed.success) for (const fn of listeners) fn(parsed.data);
+  });
+  return socket;
+}
 
-  return query;
+export function subscribe(fn: Listener): () => void {
+  ensureSocket();
+  listeners.add(fn);
+  return () => {
+    listeners.delete(fn);
+    if (listeners.size === 0) {
+      socket?.close(); // không còn ai nghe → đóng để khỏi rò
+      socket = null;
+    }
+  };
 }
 ```
 
-> Khi nhiều component cùng `useLiveTodos`, bạn sẽ mở nhiều subscription. Nếu muốn **một** subscription dùng chung, nâng nó lên một provider gốc (như mục 2) thay vì trong hook dùng nhiều nơi.
-
----
-
-## 7. An toàn type khi patch từng phần
-
-Payload realtime đến từ JSON — đừng tin mù. Validate biên bằng zod (như Phần 3) trước khi ghi vào cache:
-
-```ts
-import { z } from 'zod';
-import { todoSchema } from '@/features/todos/schema';
-
-const todoUpdatedSchema = z.object({ type: z.literal('todo.updated'), todo: todoSchema });
-
-ws.addEventListener('message', (e) => {
-  const parsed = todoUpdatedSchema.safeParse(JSON.parse(e.data));
-  if (!parsed.success) return; // payload lạ → bỏ qua, không làm hỏng cache
-  qc.setQueryData(todoKeys.detail(parsed.data.todo.id), parsed.data.todo);
-});
+```tsx
+// Phía React: hook mỏng chỉ đăng ký vào singleton.
+export function useRealtimeSync(): void {
+  const qc = useQueryClient();
+  useEffect(() => subscribe((event) => routeToCache(qc, event)), [qc]);
+}
 ```
 
-Validate ở biên giữ cho cache luôn đúng shape — nếu không, một payload server lỗi có thể nhét `undefined` vào field bắt buộc và làm crash mọi component đang đọc query đó.
+```text
+        ┌───────── một WebSocket singleton ─────────┐
+        │  (đếm listener; đóng khi về 0)            │
+        └───────────────────┬──────────────────────┘
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+        useRealtimeSync  Sidebar      Notifications
+        (mỗi nơi chỉ add/remove 1 listener)
+```
+
+Lợi: một kết nối, một nguồn parse, reference-count tự đóng. Đây là cách an toàn nhất để nhiều phần UI cùng "nghe" realtime mà không nhân bản socket.
 
 ---
 
-## 8. Bài tập
+## 11. Đồng bộ cross-tab với `broadcastQueryClient`
+
+Người dùng mở 3 tab — bạn không muốn 3 socket *và* 3 cache lệch nhau. `broadcastQueryClient` (gói `@tanstack/query-broadcast-client-experimental`) phát thay đổi cache qua `BroadcastChannel`, để các tab chia sẻ cùng trạng thái:
+
+```ts
+import { broadcastQueryClient } from '@tanstack/query-broadcast-client-experimental';
+
+broadcastQueryClient({ queryClient, broadcastChannel: 'app-cache' });
+```
+
+Mẫu thực dụng: chỉ **một tab "leader"** giữ socket thật; các tab khác *không* mở socket mà nhận cập nhật qua broadcast. Vừa tiết kiệm kết nối, vừa giữ mọi tab đồng bộ. (API còn experimental — ghim version và đọc changelog khi nâng cấp.)
+
+---
+
+## 12. An toàn type khi patch từng phần
+
+Payload realtime đến từ JSON — đừng tin mù. Validate biên bằng zod (như Phần 3) *trước khi* ghi vào cache. Ta đã làm điều này trong mọi ví dụ trên; đây là vì sao nó không thể bỏ:
+
+```ts
+const parsed = wsEventSchema.safeParse(JSON.parse(e.data));
+if (!parsed.success) return; // payload lạ → bỏ qua, cache vẫn nguyên vẹn
+qc.setQueryData(todoKeys.detail(parsed.data.todo.id), parsed.data.todo);
+```
+
+Validate ở biên giữ cache luôn đúng shape — nếu không, một payload server lỗi có thể nhét `undefined` vào field bắt buộc và làm **crash mọi component** đang đọc query đó. Đây cũng là lý do ta dùng `safeParse` (trả về kết quả) thay vì `parse` (ném lỗi): một message rác không nên đánh sập handler và làm rớt cả stream.
+
+> **Vì sao không `as WsEvent`?** Ép kiểu bằng `as` chỉ *nói dối* với compiler — runtime vẫn nhận object sai shape. `safeParse` kiểm tra *thật* tại runtime và *suy ra* type cho nhánh thành công. Realtime là biên không kiểm soát được → bắt buộc parse thật.
+
+---
+
+## 13. Gotchas thường gặp
+
+| Gotcha | Triệu chứng | Cách chữa |
+|---|---|---|
+| **Thiếu cleanup** | Socket rò mỗi lần remount; nhiều kết nối "ma" gửi message trùng | Luôn `return () => { removeEventListener; ws.close(); }` trong `useEffect` |
+| **Stale closure** | Handler dùng `qc`/state cũ; patch sai key | Đưa `qc` vào deps; đọc state qua updater `setQueryData((old) => …)` thay vì biến ngoài |
+| **Bão invalidate** | Sự kiện dồn dập → hàng loạt refetch, server quá tải | Đổi sang `setQueryData`; nếu phải invalidate thì throttle/gộp key |
+| **Seed cache rác** | List dựng từ một event đơn → thiếu phần tử; detail "sống" vô ích | Chỉ patch khi `old !== undefined`; chỉ ghi detail nếu key đã tồn tại |
+| **Message lệch thứ tự** | UI "nhảy lùi" về bản cũ | Guard bằng `version`/`updatedAt`, chỉ ghi nếu mới hơn (mục 7) |
+| **Token hết hạn khi reconnect** | Reconnect 401/403, stream chết im lặng | Làm mới token *trước* khi mở lại; nhét token mới vào URL/subprotocol; có backoff |
+| **Nhiều socket trùng** | N component = N kết nối, parse N lần | Một socket singleton + reference-count (mục 10) |
+| **Patch ngoài React không re-render** | `getQueryData` rồi sửa object tại chỗ | Luôn ghi qua `setQueryData` với object **mới** (immutable) để observer được báo |
+
+---
+
+## 14. Recipe thực chiến
+
+### 14.1 Live list — chat append tin nhắn mới
+
+```ts
+const messageSchema = z.object({
+  id: z.string(), roomId: z.string(), body: z.string(), version: z.number(),
+});
+
+function applyNewMessage(qc: QueryClient, msg: Message): void {
+  qc.setQueryData<Message[]>(chatKeys.list(msg.roomId), (old) => {
+    if (!old) return old;
+    if (old.some((m) => m.id === msg.id)) return old; // chống trùng
+    return [...old, msg]; // append cuối; UI tự cuộn xuống
+  });
+}
+```
+
+Chống trùng theo `id` quan trọng vì optimistic insert (Phần 6) có thể đã thêm tin nhắn này rồi — khi server echo lại, ta không nhân đôi.
+
+### 14.2 Presence / "đang gõ…" bằng `setQueryData`
+
+Trạng thái phù du như "ai đang gõ" cũng là *cache* — chỉ là không bao giờ `fetch` ban đầu, chỉ realtime ghi. Dùng một query key riêng với `staleTime: Infinity`:
+
+```ts
+function setTyping(qc: QueryClient, roomId: string, userId: string): void {
+  qc.setQueryData<string[]>(chatKeys.typing(roomId), (old = []) =>
+    old.includes(userId) ? old : [...old, userId],
+  );
+  // Tự xoá sau 3s nếu không có tín hiệu "vẫn đang gõ" mới.
+  window.setTimeout(() => {
+    qc.setQueryData<string[]>(chatKeys.typing(roomId), (old = []) =>
+      old.filter((u) => u !== userId),
+    );
+  }, 3000);
+}
+```
+
+```tsx
+function TypingIndicator({ roomId }: { roomId: string }) {
+  const { data: typing = [] } = useQuery({
+    queryKey: chatKeys.typing(roomId),
+    queryFn: () => [] as string[], // không có nguồn fetch — realtime ghi
+    staleTime: Infinity,
+  });
+  return typing.length ? <p>{typing.join(', ')} đang gõ…</p> : null;
+}
+```
+
+Component đọc presence y hệt đọc data thường — `useQuery`. Cùng một cache, cùng một API, dù nguồn ghi hoàn toàn là realtime.
+
+---
+
+## 15. Bài tập
 
 **1.** Khi nào nên patch bằng `setQueryData` và khi nào nên `invalidateQueries` để phản ứng với một sự kiện realtime?
 
 <details>
 <summary>Lời giải</summary>
 
-Patch khi payload sự kiện *đủ* để dựng giá trị mới (vd object đầy đủ sau khi đổi) hoặc khi sự kiện đến dồn dập (giá tick) — tức thì, không tốn request. Invalidate khi sự kiện chỉ là *tín hiệu* "có gì đó đổi" không kèm đủ data, hoặc data cần server tính lại — đánh đổi một request lấy tính đúng.
+Patch khi payload sự kiện *đủ* để dựng giá trị mới (vd object đầy đủ sau khi đổi) hoặc khi sự kiện đến dồn dập (giá tick) — tức thì, không tốn request. Invalidate khi sự kiện chỉ là *tín hiệu* "có gì đó đổi" không kèm đủ data, hoặc data cần server tính lại (tổng, quyền, join) — đánh đổi một request lấy tính đúng.
 
 </details>
 
@@ -227,30 +505,51 @@ Trong lúc mất kết nối, client bỏ lỡ các sự kiện realtime → cac
 
 </details>
 
-**3.** Vì sao phải validate payload realtime trước khi `setQueryData`?
+**3.** Vì sao phải validate payload realtime trước khi `setQueryData`, và vì sao dùng `safeParse` thay vì `parse`?
 
 <details>
 <summary>Lời giải</summary>
 
-Payload đến từ JSON ngoài tầm kiểm soát; một message lỗi/đổi shape có thể ghi data sai vào cache (vd thiếu field bắt buộc), làm crash mọi component đọc query đó. Validate biên bằng zod và bỏ qua payload không hợp lệ giữ cache luôn đúng type — đúng triết lý "validate tại biên" của Phần 3.
+Payload đến từ JSON ngoài tầm kiểm soát; một message lỗi/đổi shape có thể ghi data sai vào cache (vd thiếu field bắt buộc), làm crash mọi component đọc query đó. `safeParse` kiểm tra *thật* tại runtime và *suy ra* type cho nhánh thành công (không cần `as`); nó trả về kết quả thay vì ném lỗi, nên một message rác chỉ bị bỏ qua chứ không đánh sập handler/stream.
 
 </details>
 
-**Nâng cao:** Dựng một stream giá giả (setInterval phát tick), bắc cầu vào cache bằng batcher 100ms. Mở React Profiler và so sánh số lần render khi patch từng tick so với patch gom nhóm.
+**4.** Khi nào chọn SSE (`EventSource`) thay vì WebSocket?
+
+<details>
+<summary>Lời giải</summary>
+
+Khi luồng dữ liệu **một chiều** server → client (giá, thông báo, feed, log) và bạn không cần gửi lên qua cùng kênh. SSE đơn giản hơn: tự reconnect (kèm `Last-Event-ID` để bắt tiếp), khung `event:`/`data:` chuẩn, route bằng `addEventListener('tên', …)` native. WebSocket dành cho khi cần *hai chiều* (chat, game, gửi lệnh lên). Đổi lại, SSE chỉ text và bị giới hạn ~6 kết nối/domain trên HTTP/1.1.
+
+</details>
+
+**5.** Vì sao một socket singleton ngoài React tốt hơn mở socket trong mỗi hook?
+
+<details>
+<summary>Lời giải</summary>
+
+Mở trong mỗi hook → N component tạo N kết nối, parse N lần, và mỗi `setQueryData` chạy nhiều lần trùng lặp. Một singleton ngoài React giữ *một* kết nối, *một* nơi parse, rồi fan-out tới các listener; reference-count tự đóng socket khi không còn ai nghe. Đây cũng là lý do `QueryClient` được tạo ngoài cây React — vòng đời hạ tầng không nên gắn với vòng đời render của một component.
+
+</details>
+
+**Nâng cao 1:** Dựng một stream giá giả (`setInterval` phát tick), bắc cầu vào cache bằng batcher 100ms. Mở React Profiler và so sánh số lần render khi patch từng tick so với patch gom nhóm.
+
+**Nâng cao 2:** Mở app trên 2 tab, bật `broadcastQueryClient`, và cho **một** tab giữ socket thật. Kiểm chứng tab còn lại cập nhật mà không mở socket riêng; rồi đóng tab leader và quan sát ai tiếp quản.
 
 ---
 
 ## Tóm tắt
 
-- WebSocket/SSE lo **vận chuyển**, React Query lo **cache + phân phối**; component dùng `useQuery` không cần biết data tới từ đâu.
-- Phản ứng sự kiện: **patch** (`setQueryData`) khi payload đủ/đến dồn dập; **invalidate** khi chỉ là tín hiệu mơ hồ.
-- Bắc cầu trong **một hook gốc** (route message theo type); SSE tự reconnect, hợp một chiều.
-- **Gom sự kiện** tần suất cao trước khi chạm cache để giảm structural sharing/re-render.
-- Khi **(re)connect**, invalidate một lần để đồng bộ lại nền tảng đã lỡ; `refetchOnReconnect` lo phần còn lại.
-- **Validate payload bằng zod** trước khi ghi — giữ cache luôn đúng shape.
+- Realtime gồm hai **lớp**: WebSocket/SSE lo **vận chuyển**, React Query lo **cache + phân phối**. Component dùng `useQuery` không cần biết data đến từ đâu — một nguồn sự thật, nhiều nguồn ghi.
+- Phản ứng sự kiện theo decision tree: **patch** (`setQueryData`) khi payload đủ/đến dồn dập; **invalidate** khi chỉ là tín hiệu mơ hồ hoặc cần server tính lại.
+- Chọn vận chuyển: **WebSocket** khi cần hai chiều; **SSE** khi một chiều (đơn giản hơn, tự reconnect).
+- Bắc cầu trong **một hook/singleton**, validate bằng **zod tại biên** (`safeParse`, không `as`), patch vào **cả list lẫn detail**, và guard **lệch thứ tự** bằng `version`/`updatedAt`.
+- **Gom sự kiện** tần suất cao (throttle/debounce/rAF) trước khi chạm cache để giảm structural sharing/re-render.
+- Khi **(re)connect**, invalidate một lần để đồng bộ lại "lỗ hổng" đã lỡ; `refetchOnReconnect` lo phần còn lại. **`broadcastQueryClient`** đồng bộ cross-tab.
+- Cẩn thận **gotchas**: thiếu cleanup (rò socket), stale closure, bão invalidate, seed cache rác, token hết hạn khi reconnect.
 
 ---
 
 ## Phần tiếp theo
 
-**Phần 15 — Mutation nâng cao:** `mutationKey` + `setMutationDefaults`, theo dõi mutation đang chạy bằng `useMutationState`, chạy tuần tự bằng `scope`, optimistic update trải trên nhiều query cùng lúc, xử lý lỗi/thành công toàn cục ở `MutationCache`, và hàng đợi mutation offline.
+**[Phần 15 — Mutation nâng cao](/blog/tanstack-query-15-advanced-mutations/):** `mutationKey` + `setMutationDefaults`, theo dõi mutation đang chạy bằng `useMutationState`, chạy tuần tự bằng `scope`, optimistic update trải trên nhiều query cùng lúc, xử lý lỗi/thành công toàn cục ở `MutationCache`, và hàng đợi mutation offline.

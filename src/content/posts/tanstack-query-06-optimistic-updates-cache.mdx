@@ -10,170 +10,413 @@ draft: false
 
 [Phần 5](/blog/tanstack-query-05-mutations-invalidation/) dùng invalidate: ghi xong → refetch → UI cập nhật. Cách đó đáng tin nhưng có độ trễ — user phải chờ một vòng round-trip mới thấy thay đổi. Với những hành động cần phản hồi *tức thì* (like, toggle, kéo-thả, đổi tên inline), ta dùng **optimistic update**: cập nhật cache **ngay lập tức**, rồi tự **rollback** nếu server báo lỗi.
 
-Phần này cũng dạy cách thao tác cache thủ công (`setQueryData`, `getQueryData`) và query filters — công cụ nền tảng cho optimistic và nhiều mẫu nâng cao.
+Phần này mổ xẻ optimistic đến tận cơ chế: chụp ảnh cache, vá tạm, hoàn tác chính xác khi lỗi — cộng với bộ công cụ thao tác cache thủ công (`getQueryData`, `setQueryData`, `setQueriesData`, query filters) làm nền cho mọi mẫu nâng cao về sau.
 
 ---
 
-## 1. Thao tác cache thủ công
+## 1. Thao tác cache thủ công: đọc & ghi trực tiếp
 
-Trước khi làm optimistic, cần biết hai hàm trên `queryClient`:
+Optimistic xây trên hai thao tác cache cơ bản của `queryClient`. Hiểu kỹ chúng trước đã:
 
 ```ts
-// ĐỌC cache (không trigger fetch). undefined nếu chưa có.
-const customers = queryClient.getQueryData(customerKeys.lists());
+// ĐỌC cache đồng bộ, KHÔNG trigger fetch. undefined nếu key chưa có entry.
+const customers = queryClient.getQueryData<Customer[]>(customerKeys.lists());
 
-// GHI cache trực tiếp. Component đang dùng key này sẽ re-render NGAY.
-queryClient.setQueryData(customerKeys.detail('42'), (old) => ({
-  ...old,
-  name: 'Tên mới',
-}));
+// GHI thẳng vào cache. Mọi component đang subscribe key này re-render NGAY.
+queryClient.setQueryData<Customer[]>(customerKeys.detail('42'), (old) =>
+  old ? { ...old, name: 'Tên mới' } : old,
+);
 ```
 
-`setQueryData` nhận **updater function** `(old) => new`. Luôn cập nhật **bất biến (immutable)**: tạo object/array mới, đừng mutate `old` tại chỗ — nếu không React Query không phát hiện thay đổi và UI không cập nhật đúng.
+`setQueryData` đồng bộ và *không chạm tới mạng*: bạn cung cấp data, nó ghi vào cache rồi đánh thức mọi observer. Đây là khác biệt cốt lõi với `invalidateQueries` (đi hỏi lại server).
 
-> `setQueryData` cập nhật cache *mà không gọi mạng*. Đây là khác biệt then chốt với invalidate: invalidate = "đi hỏi lại server", `setQueryData` = "tôi biết kết quả rồi, ghi thẳng".
+Bảng tra cứu các API đọc/ghi cache:
+
+| API | Trả về / tác dụng | Có gọi mạng? | Dùng khi |
+|---|---|---|---|
+| `getQueryData(key)` | Data hiện tại hoặc `undefined` | Không | Chụp snapshot trước khi vá |
+| `getQueriesData(filter)` | Mảng `[key, data]` của mọi query khớp filter | Không | Đọc nhiều list cùng lúc |
+| `getQueryState(key)` | Cả `QueryState` (`status`, `dataUpdatedAt`, `error`…) | Không | Cần metadata, không chỉ data |
+| `setQueryData(key, updater)` | Ghi 1 entry, re-render observer | Không | Vá optimistic, ghi từ response |
+| `setQueriesData(filter, updater)` | Ghi MỌI entry khớp filter | Không | Cùng item nằm trong nhiều list |
+| `ensureQueryData(opts)` | Đọc cache, thiếu thì fetch rồi trả | Có thể | Prefetch đảm bảo có data |
+
+> `getQueryData` đọc một *ảnh tĩnh* tại thời điểm gọi — nó không subscribe. Đừng dùng nó trong thân render để "đọc cache"; ở component hãy dùng `useQuery`. `getQueryData` dành cho event handler, callback mutation, route loader.
 
 ---
 
-## 2. Optimistic update: ý tưởng
+## 2. `setQueryData` sâu: updater function & tính bất biến
 
-Quy trình kinh điển gồm 4 bước, đặt trong các callback của `useMutation`:
+`setQueryData` nhận hai dạng tham số thứ hai:
+
+```ts
+// Dạng 1: giá trị trực tiếp (khi đã có data hoàn chỉnh)
+qc.setQueryData(customerKeys.detail(id), updatedCustomer);
+
+// Dạng 2: updater function (prev) => next — ưu tiên dạng này
+qc.setQueryData<Customer[]>(customerKeys.lists(), (prev) =>
+  prev?.map((c) => (c.id === id ? { ...c, favorite: true } : c)),
+);
+```
+
+Ba quy tắc sống còn về updater:
+
+- **`prev` có thể là `undefined`** (cache rỗng). Luôn xử lý nhánh này — `prev?.map(...)` hoặc `if (!prev) return prev`.
+- **Trả về `undefined` = no-op**: React Query bỏ qua, cache giữ nguyên. Hữu ích khi không có gì để vá.
+- **Bắt buộc bất biến**: tạo object/array MỚI, không sửa `prev` tại chỗ.
+
+Vì sao bất biến lại bắt buộc? Dưới mui xe, React Query so sánh tham chiếu bằng `Object.is` và chạy **structural sharing**: nếu bạn mutate `prev` tại chỗ, tham chiếu mảng không đổi → observer thấy "y nguyên" → **bỏ qua re-render**. UI sẽ lệch với cache.
 
 ```text
-onMutate(vars):
-  1. cancelQueries  → huỷ refetch đang chạy (tránh nó đè lên optimistic data)
-  2. getQueryData   → chụp ảnh (snapshot) data hiện tại để rollback nếu lỗi
-  3. setQueryData   → patch cache NGAY với data lạc quan
-  4. return { snapshot }  → truyền context xuống onError/onSettled
-
-onError(err, vars, context):
-  setQueryData(snapshot)  → KHÔI PHỤC data cũ (rollback)
-
-onSettled():
-  invalidateQueries  → đồng bộ lại với server (chốt sự thật, dù thành/bại)
+setQueryData(key, updater)
+        │
+        ▼
+  prev = cache[key]              ← ảnh hiện tại
+        │
+        ▼
+  next = updater(prev)           ← BẠN phải trả ref MỚI
+        │
+        ▼
+  structuralSharing(prev, next)  ← giữ lại nhánh con không đổi (ref ổn định)
+        │
+        ▼
+  notify observers → re-render component đang dùng key
 ```
 
-Vì sao cần `cancelQueries`? Vì có thể đang có một refetch chạy nền; nếu nó về *sau* khi bạn đã patch optimistic, nó sẽ **đè** mất data lạc quan của bạn. Huỷ trước cho chắc.
+> Structural sharing là lý do bạn nên trả object mới ở *cấp thay đổi* nhưng không cần deep-clone toàn bộ: React Query tự tái dùng các nhánh con không đổi, giúp `select` và `React.memo` phía dưới vẫn thấy ref ổn định.
 
 ---
 
-## 3. Ví dụ đầy đủ: toggle trạng thái yêu thích
+## 3. Quy trình optimistic kinh điển — dòng thời gian
+
+Optimistic gói gọn trong ba callback của `useMutation`. Đây là dòng thời gian đầy đủ:
+
+```text
+user bấm ──► mutate(vars)
+                │
+   ┌────────────┴───────────── onMutate(vars) ──────────────────────┐
+   │ 1) await cancelQueries({ queryKey })   ← chặn refetch đang bay   │
+   │ 2) previous = getQueryData(key)        ← CHỤP ẢNH để rollback    │
+   │ 3) setQueryData(key, optimistic)       ← VÁ cache ngay (UI đổi)  │
+   │ 4) return { previous, key }            ← context cho bước sau    │
+   └───────────────────────────┬────────────────────────────────────┘
+                               │  (mutationFn chạy, gọi server)
+                ┌──────────────┴───────────────┐
+            THÀNH CÔNG                        LỖI
+                │                              │
+          onSuccess(data)             onError(err, vars, ctx)
+                │                     setQueryData(ctx.key, ctx.previous)
+                │                          ← ROLLBACK về ảnh đã chụp
+                └──────────────┬───────────────┘
+                               ▼
+                 onSettled(data, err, vars, ctx)
+                 invalidateQueries({ queryKey: ctx.key })
+                       ← CHỐT sự thật từ server (luôn chạy)
+```
+
+Vai trò từng bước:
+
+| Bước | Callback | Làm gì | Vì sao bắt buộc |
+|---|---|---|---|
+| 1 | `onMutate` | `await cancelQueries` | Refetch đang chạy nếu về sau sẽ **đè** mất optimistic data |
+| 2 | `onMutate` | `getQueryData` snapshot | Không có ảnh cũ thì **không thể rollback** đúng |
+| 3 | `onMutate` | `setQueryData` vá | Đây mới là phần làm UI đổi *tức thì* |
+| 4 | `onMutate` | `return context` | Đường duy nhất đưa snapshot sang `onError`/`onSettled` |
+| 5 | `onError` | rollback từ context | Lỗi mà không hoàn tác → UI kẹt ở trạng thái sai |
+| 6 | `onSettled` | `invalidateQueries` | Optimistic chỉ *đoán*; invalidate lấy số liệu thật |
+
+**Vì sao `cancelQueries` phải đứng đầu và phải `await`?** Hình dung: list đang refetch nền (do `refetchOnWindowFocus` chẳng hạn). Bạn vá optimistic lúc `t=0`. Refetch cũ về lúc `t=120ms` với data *trước khi vá* → nó ghi đè, optimistic biến mất, UI "nhấp nháy" rồi nhảy về cũ. `await cancelQueries` huỷ request đó và đợi nó dừng hẳn *trước khi* bạn chụp ảnh và vá.
+
+> `cancelQueries` chỉ huỷ refetch của React Query (nó abort qua `AbortSignal`). `queryFn` của bạn nên nhận `signal` và truyền vào `fetch` để việc huỷ thật sự dừng request mạng — xem [Phần 2](/blog/tanstack-query-02-usequery-cache-lifecycle/).
+
+---
+
+## 4. `context` object: snapshot đi qua các callback (type chặt)
+
+`onMutate` trả về một object — React Query gọi là **context** — và truyền *nguyên vẹn* xuống `onError` và `onSettled`. Đây là kênh duy nhất để chuyển snapshot. Với TS strict, hãy type nó tường minh qua generic thứ tư của `useMutation`:
+
+```ts
+// useMutation<TData, TError, TVariables, TContext>
+type ToggleContext = {
+  previous: Customer[] | undefined;
+  listKey: readonly unknown[];
+};
+
+useMutation<Customer, Error, string, ToggleContext>({
+  mutationFn: toggleFavorite,
+  onMutate: async (id): Promise<ToggleContext> => {
+    const listKey = customerKeys.lists();
+    await qc.cancelQueries({ queryKey: listKey });
+    const previous = qc.getQueryData<Customer[]>(listKey);
+    qc.setQueryData<Customer[]>(listKey, (old) =>
+      old?.map((c) => (c.id === id ? { ...c, favorite: !c.favorite } : c)),
+    );
+    return { previous, listKey };
+  },
+  onError: (_err, _id, context) => {
+    // context được suy ra kiểu ToggleContext | undefined
+    if (context) qc.setQueryData(context.listKey, context.previous);
+  },
+  onSettled: (_data, _err, _id, context) => {
+    if (context) qc.invalidateQueries({ queryKey: context.listKey });
+  },
+});
+```
+
+Vì sao `context` có thể là `undefined`? Vì `onMutate` có thể ném lỗi *trước khi* kịp `return context` (ví dụ `cancelQueries` reject). Khi đó `onError` vẫn chạy nhưng `context === undefined` → luôn `if (context)` trước khi rollback, đừng giả định nó tồn tại.
+
+---
+
+## 5. Recipe: optimistic toggle (nút Like) có rollback
+
+Ghép quy trình ở §3–4 thành một hook hoàn chỉnh, type chặt:
 
 ```tsx
 // src/features/customers/hooks.ts
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { toggleFavorite } from './api';
+import { toggleFavorite } from './api';        // (id: string) => Promise<Customer>
 import { customerKeys } from './keys';
 import type { Customer } from './schema';
+
+type ToggleContext = { previous: Customer[] | undefined; listKey: readonly unknown[] };
 
 export function useToggleFavorite() {
   const qc = useQueryClient();
 
-  return useMutation({
-    mutationFn: toggleFavorite, // (id: string) => Promise<Customer>
+  return useMutation<Customer, Error, string, ToggleContext>({
+    mutationFn: toggleFavorite,
 
-    onMutate: async (id: string) => {
+    onMutate: async (id) => {
       const listKey = customerKeys.lists();
-
-      // 1. Huỷ refetch đang bay để nó không đè optimistic data.
-      await qc.cancelQueries({ queryKey: listKey });
-
-      // 2. Chụp ảnh data hiện tại để rollback.
-      const previous = qc.getQueryData<Customer[]>(listKey);
-
-      // 3. Patch cache NGAY (immutable).
-      qc.setQueryData<Customer[]>(listKey, (old) =>
+      await qc.cancelQueries({ queryKey: listKey });           // 1. chặn refetch
+      const previous = qc.getQueryData<Customer[]>(listKey);   // 2. snapshot
+      qc.setQueryData<Customer[]>(listKey, (old) =>            // 3. vá ngay
         old?.map((c) => (c.id === id ? { ...c, favorite: !c.favorite } : c)),
       );
-
-      // 4. Trả context cho onError/onSettled.
-      return { previous, listKey };
+      return { previous, listKey };                            // 4. context
     },
 
-    onError: (_err, _id, context) => {
-      // Rollback về snapshot đã chụp.
-      if (context) qc.setQueryData(context.listKey, context.previous);
+    onError: (_err, _id, ctx) => {
+      if (ctx) qc.setQueryData(ctx.listKey, ctx.previous);     // rollback
     },
 
-    onSettled: (_data, _err, _id, context) => {
-      // Dù thành công hay lỗi, đồng bộ lại với server cho chắc.
-      if (context) qc.invalidateQueries({ queryKey: context.listKey });
+    onSettled: (_data, _err, _id, ctx) => {
+      if (ctx) qc.invalidateQueries({ queryKey: ctx.listKey }); // đồng bộ
     },
   });
 }
 ```
 
-UI gọi như mutation thường, nhưng người dùng thấy thay đổi **ngay khi bấm**:
+UI gọi y như mutation thường — khác biệt nằm ở *cảm giác*: thay đổi xuất hiện ngay khi bấm.
 
 ```tsx
 function FavoriteButton({ customer }: { customer: Customer }) {
   const toggle = useToggleFavorite();
   return (
-    <button onClick={() => toggle.mutate(customer.id)} aria-pressed={customer.favorite}>
+    <button
+      onClick={() => toggle.mutate(customer.id)}
+      aria-pressed={customer.favorite}
+    >
       {customer.favorite ? '★' : '☆'}
     </button>
   );
 }
 ```
 
-Bấm sao → đổi màu tức thì (chưa chờ server). Nếu request lỗi → tự quay về trạng thái cũ. Nếu thành công → `onSettled` refetch để chốt số liệu thật.
+Bấm sao → đổi màu tức thì (chưa chờ server). Lỗi → tự quay về trạng thái cũ. Thành công → `onSettled` refetch chốt số liệu thật.
 
-> **Patch phải khớp đúng shape của cache.** Ví dụ trên giả định cache là `Customer[]` (mảng phẳng). Nếu bạn dùng response phân trang `{ items: Customer[]; hasMore: boolean }` từ [Phần 4](/blog/tanstack-query-04-pagination-infinite-query/), updater phải patch `old.items` chứ không phải `old` trực tiếp: `{ ...old, items: old.items.map(...) }`. Sai shape ở đây là nguồn bug optimistic phổ biến nhất — luôn đối chiếu với những gì `queryFn` thật sự trả về.
-
----
-
-## 4. `useOptimistic` của React 19 — khi nào dùng cái nào?
-
-React 19 có hook `useOptimistic` cho optimistic UI *cục bộ*. Phân biệt:
-
-- **`useOptimistic` (React):** optimistic cho **state cục bộ trong một component/transition**. Tự reset khi action xong. Hợp cho UI nhỏ, không chia sẻ (vd một form gửi comment).
-- **`onMutate` + `setQueryData` (React Query):** optimistic cho **server cache dùng chung**. Khi bạn patch cache, *mọi* component đọc key đó đều cập nhật. Hợp khi thay đổi cần phản ánh khắp app.
-
-Quy tắc: thay đổi nằm trong **server cache** (danh sách, chi tiết được nhiều nơi dùng) → dùng `onMutate`/`setQueryData`. Thay đổi chỉ là **trạng thái tạm của một form/transition** → `useOptimistic` gọn hơn. Hai cái bổ trợ nhau, không thay thế.
+> **Patch phải khớp đúng shape của cache.** Ví dụ trên giả định cache là `Customer[]` (mảng phẳng). Nếu bạn dùng response phân trang `{ items: Customer[]; hasMore: boolean }` từ [Phần 4](/blog/tanstack-query-04-pagination-infinite-query/), updater phải vá `old.items`, không phải `old`: `{ ...old, items: old.items.map(...) }`. Sai shape ở đây là nguồn bug optimistic phổ biến nhất — luôn đối chiếu với những gì `queryFn` thật sự trả về.
 
 ---
 
-## 5. Query filters — nhắm đúng query để thao tác
+## 6. Recipe: optimistic thêm / xoá item trong danh sách
 
-Nhiều API của `queryClient` nhận **query filter** để chọn tập query cần tác động. Các tham số hay dùng:
+**Xoá** đơn giản nhất — chỉ `filter` bỏ item:
 
 ```ts
-// Mọi query có key bắt đầu bằng ['customers'] (mặc định khớp tiền tố)
+export function useDeleteCustomer() {
+  const qc = useQueryClient();
+  const listKey = customerKeys.lists();
+
+  return useMutation<void, Error, string, { previous: Customer[] | undefined }>({
+    mutationFn: (id) => deleteCustomer(id),
+    onMutate: async (id) => {
+      await qc.cancelQueries({ queryKey: listKey });
+      const previous = qc.getQueryData<Customer[]>(listKey);
+      qc.setQueryData<Customer[]>(listKey, (old) => old?.filter((c) => c.id !== id));
+      return { previous };
+    },
+    onError: (_e, _id, ctx) => qc.setQueryData(listKey, ctx?.previous),
+    onSettled: () => qc.invalidateQueries({ queryKey: listKey }),
+  });
+}
+```
+
+**Thêm** khó hơn một bậc: item mới *chưa có id thật* (server sinh id). Mẹo là gắn **id tạm** để render, rồi thay bằng bản thật khi `onSuccess`:
+
+```ts
+export function useAddCustomer() {
+  const qc = useQueryClient();
+  const listKey = customerKeys.lists();
+
+  return useMutation<
+    Customer,
+    Error,
+    NewCustomer,
+    { previous: Customer[] | undefined; tempId: string }
+  >({
+    mutationFn: (input) => createCustomer(input),
+    onMutate: async (input) => {
+      await qc.cancelQueries({ queryKey: listKey });
+      const previous = qc.getQueryData<Customer[]>(listKey);
+      const tempId = `temp-${crypto.randomUUID()}`;
+      const optimistic: Customer = { id: tempId, favorite: false, ...input };
+      qc.setQueryData<Customer[]>(listKey, (old) => [...(old ?? []), optimistic]);
+      return { previous, tempId };
+    },
+    onSuccess: (saved, _input, ctx) => {
+      // Thay item tạm bằng bản thật từ server (id thật, timestamps…).
+      qc.setQueryData<Customer[]>(listKey, (old) =>
+        old?.map((c) => (c.id === ctx?.tempId ? saved : c)),
+      );
+    },
+    onError: (_e, _input, ctx) => qc.setQueryData(listKey, ctx?.previous),
+    onSettled: () => qc.invalidateQueries({ queryKey: listKey }),
+  });
+}
+```
+
+> Với *thêm*, hãy đặt `onSuccess` thay item tạm bằng bản thật *trước khi* `onSettled` invalidate. Nếu chỉ dựa vào invalidate, item tạm vẫn hiển thị với id giả cho tới khi refetch xong — giữa chừng có thể nháy hoặc trùng `key` của React. Thay tại chỗ ở `onSuccess` cho mượt, invalidate ở `onSettled` để chốt.
+
+---
+
+## 7. `setQueriesData` — vá nhiều list cache cùng lúc
+
+Một khách hàng có thể nằm trong *nhiều* list cache cùng lúc: `['customers','list',{status:'all'}]`, `['customers','list',{status:'active'}]`, kết quả tìm kiếm… `setQueryData` chỉ vá *một* key. Để vá MỌI list khớp tiền tố trong một lần, dùng `setQueriesData` với **query filter**:
+
+```ts
+qc.setQueriesData<Customer[]>(
+  { queryKey: customerKeys.lists() },          // filter: mọi list của customers
+  (old) => old?.map((c) => (c.id === id ? { ...c, favorite: !c.favorite } : c)),
+);
+```
+
+`setQueriesData` chạy updater cho *từng* entry khớp filter. Vẫn nguyên tắc bất biến: mỗi updater trả về mảng mới. Để rollback nhiều list, snapshot bằng `getQueriesData`:
+
+```ts
+onMutate: async (id) => {
+  const filter = { queryKey: customerKeys.lists() };
+  await qc.cancelQueries(filter);
+  const previous = qc.getQueriesData<Customer[]>(filter); // [[key, data], ...]
+  qc.setQueriesData<Customer[]>(filter, (old) =>
+    old?.map((c) => (c.id === id ? { ...c, favorite: !c.favorite } : c)),
+  );
+  return { previous };
+},
+onError: (_e, _id, ctx) => {
+  // Khôi phục từng cặp [key, data] đã chụp.
+  ctx?.previous?.forEach(([key, data]) => qc.setQueryData(key, data));
+},
+```
+
+> Khi dùng `setQueriesData`, rollback phải lặp qua *toàn bộ* các cặp `[key, data]` mà `getQueriesData` trả về — không chỉ một key. Quên một list nghĩa là list đó kẹt ở trạng thái optimistic khi lỗi.
+
+---
+
+## 8. Hai cách làm optimistic — `setQueryData` vs `mutation.variables`
+
+Có hai trường phái optimistic, khác nhau ở *nơi* lưu trạng thái tạm:
+
+**Cách A — ghi vào cache (`setQueryData`):** vá thẳng query cache trong `onMutate`. Mọi component đọc key đều đổi. Đây là cách dùng xuyên suốt phần này.
+
+**Cách B — đọc từ `mutation` state:** không đụng cache; thay vào đó render trạng thái pending *từ chính mutation* qua `mutation.variables` + `mutation.isPending`. React Query phơi `variables` của mutation đang chạy để bạn "vẽ" item tạm ngay trong danh sách:
+
+```tsx
+function CustomerList() {
+  const { data: customers = [] } = useCustomers();
+  const add = useAddCustomer();
+
+  return (
+    <ul>
+      {customers.map((c) => <CustomerRow key={c.id} customer={c} />)}
+
+      {/* Hàng tạm cho item đang tạo — đọc thẳng từ mutation */}
+      {add.isPending && (
+        <li style={{ opacity: 0.5 }}>{add.variables.name} (đang lưu…)</li>
+      )}
+    </ul>
+  );
+}
+```
+
+So sánh để chọn:
+
+| Tiêu chí | Cách A — `setQueryData` | Cách B — `mutation.variables` |
+|---|---|---|
+| Phạm vi ảnh hưởng | Mọi component đọc key cùng đổi | Chỉ nơi đọc `mutation` state |
+| Rollback khi lỗi | Phải tự `setQueryData` snapshot | **Tự động** — hết pending là item tạm biến mất |
+| Độ phức tạp | Cao hơn (cancel + snapshot + patch) | Thấp — không chạm cache |
+| Nhiều mutation song song | Quản lý thủ công | `useMutationState` đọc được *mọi* mutation đang chạy |
+| Hợp khi | Thay đổi cần phản ánh khắp app | Thêm item cục bộ trong một list, một nơi |
+
+Cách B đặc biệt gọn cho "thêm item": không cần id tạm, không cần rollback thủ công — khi lỗi, `isPending` về `false`, hàng tạm tự mất. Với nhiều mutation đang bay, dùng `useMutationState({ filters: { status: 'pending' }, select: (m) => m.state.variables })` để render *tất cả* hàng tạm.
+
+> Kinh nghiệm: thao tác **toggle/sửa** trên data dùng chung → Cách A (cache là nguồn sự thật). Thao tác **thêm** vào một list cụ thể → cân nhắc Cách B cho gọn. Hai cách dùng chung được trong cùng app.
+
+---
+
+## 9. Query filters — nhắm đúng tập query
+
+Hầu hết API trên `queryClient` nhận **query filter** để chọn tập query cần tác động. Đây là từ vựng chung của `invalidateQueries`, `refetchQueries`, `removeQueries`, `cancelQueries`, `resetQueries`, `setQueriesData`, `getQueriesData`.
+
+```ts
+// Mọi query có key bắt đầu bằng ['customers'] (mặc định khớp TIỀN TỐ)
 qc.invalidateQueries({ queryKey: ['customers'] });
 
 // Khớp CHÍNH XÁC key này, không lan tiền tố
 qc.invalidateQueries({ queryKey: ['customers', 'list'], exact: true });
 
-// Chỉ những query đang được component dùng (active)
+// Chỉ query đang được component dùng (active observer)
 qc.invalidateQueries({ queryKey: ['customers'], type: 'active' });
 
-// Lọc theo điều kiện tuỳ ý trên từng query
+// Điều kiện tuỳ ý trên từng query
 qc.removeQueries({
   predicate: (query) => query.state.dataUpdatedAt < Date.now() - 60_000,
 });
 ```
 
-Bộ filter này dùng được cho `invalidateQueries`, `refetchQueries`, `removeQueries`, `cancelQueries`, `setQueriesData`...
+Bảng tra cứu các trường filter:
+
+| Trường | Kiểu | Ý nghĩa |
+|---|---|---|
+| `queryKey` | `QueryKey` | Khớp theo tiền tố (mặc định) — `['customers']` trúng cả `['customers','list']` |
+| `exact` | `boolean` | `true` = chỉ khớp đúng key, không lan tiền tố |
+| `type` | `'all' \| 'active' \| 'inactive'` | `active` = có observer đang mount; `inactive` = nằm cache không ai dùng |
+| `stale` | `boolean` | Lọc theo cờ stale của query |
+| `fetchStatus` | `'fetching' \| 'paused' \| 'idle'` | Lọc theo trạng thái fetch hiện tại |
+| `predicate` | `(query) => boolean` | Bộ lọc tuỳ biến mạnh nhất; nhận cả `Query` object |
+
+> `type: 'active'` quan trọng cho hiệu năng: `invalidateQueries` mặc định chỉ **refetch** query active, còn query inactive bị đánh dấu stale và refetch *khi được dùng lại*. Nhờ vậy invalidate một tiền tố rộng không gây bão refetch những list không ai đang xem.
 
 ---
 
-## 6. Bốn cách "đụng" vào cache — chọn đúng
+## 10. Năm cách "đụng" vào cache — chọn đúng
 
-| Hàm | Làm gì | Khi nào dùng |
-|---|---|---|
-| **`invalidateQueries`** | Đánh dấu stale + refetch active | Mặc định sau mutation; muốn lấy sự thật từ server |
-| **`refetchQueries`** | Refetch ngay (kể cả inactive nếu lọc) | Cần ép tải lại không qua cờ stale |
-| **`setQueryData`** | Ghi thẳng cache, không gọi mạng | Optimistic; đã có data mới từ response mutation |
-| **`removeQueries`** | Xoá hẳn cache entry | Sau logout, hoặc dọn data nhạy cảm |
-| **`resetQueries`** | Đưa query về trạng thái ban đầu | Reset hoàn toàn về initialData |
+| Hàm | Làm gì | Gọi mạng? | Khi nào dùng |
+|---|---|---|---|
+| `invalidateQueries` | Đánh dấu stale + refetch active | Có (active) | Mặc định sau mutation; muốn sự thật từ server |
+| `refetchQueries` | Refetch ngay (kể cả inactive nếu lọc) | Có | Ép tải lại không qua cờ stale |
+| `setQueryData` | Ghi thẳng cache | Không | Optimistic; đã có data từ response |
+| `removeQueries` | Xoá hẳn cache entry | Không | Sau logout; dọn data nhạy cảm |
+| `resetQueries` | Đưa query về `initialData`/loading | Có thể | Reset hoàn toàn một màn hình |
 
-Một tối ưu hay gặp: dùng *kết quả trả về của mutation* để ghi thẳng cache, khỏi tốn một request refetch:
+Một tối ưu hay gặp: dùng *kết quả trả về của mutation* ghi thẳng cache, khỏi tốn một request refetch riêng:
 
 ```ts
 useMutation({
   mutationFn: updateCustomer, // trả về customer đã cập nhật
   onSuccess: (updated) => {
-    // Ghi thẳng chi tiết từ response, khỏi refetch riêng.
+    // Ghi thẳng chi tiết từ response — khỏi refetch.
     qc.setQueryData(customerKeys.detail(updated.id), updated);
     // Danh sách vẫn nên invalidate vì thứ tự/lọc có thể đổi.
     qc.invalidateQueries({ queryKey: customerKeys.lists() });
@@ -183,24 +426,45 @@ useMutation({
 
 ---
 
-## 7. Cạm bẫy thường gặp
+## 11. `useOptimistic` (React 19) vs `onMutate`/`setQueryData`
 
-- **Quên `cancelQueries`** → refetch nền đè mất optimistic data. Luôn cancel trước khi patch.
-- **Mutate `old` tại chỗ** trong `setQueryData` → UI không cập nhật. Luôn trả object/array **mới**.
-- **Quên rollback** trong `onError` → khi lỗi, UI kẹt ở trạng thái lạc quan sai. Luôn khôi phục snapshot.
-- **Không `invalidate` ở `onSettled`** → optimistic data có thể lệch nhẹ với server (vd `updatedAt`, id thật). Chốt lại bằng invalidate.
-- **Optimistic cho mọi thứ** → phức tạp không cần thiết. Chỉ dùng cho hành động cần phản hồi tức thì; còn lại cứ invalidate cho đơn giản.
+React 19 có hook `useOptimistic` cho optimistic UI *cục bộ*. Đừng nhầm với optimistic của React Query — chúng ở hai tầng khác nhau:
+
+| | `useOptimistic` (React) | `onMutate` + `setQueryData` (RQ) |
+|---|---|---|
+| Phạm vi state | Cục bộ trong 1 component/transition | Server cache **dùng chung** |
+| Ai thấy thay đổi | Chỉ component đó | Mọi component đọc key |
+| Tự reset | Có, khi action/transition xong | Không — bạn tự rollback/invalidate |
+| Hợp cho | Form gửi comment, ô input lạc quan | List/detail dùng nhiều nơi |
+
+Quy tắc: thay đổi nằm trong **server cache** (danh sách, chi tiết được nhiều nơi dùng) → `onMutate`/`setQueryData`. Thay đổi chỉ là **trạng thái tạm của một form/transition** → `useOptimistic` gọn hơn. Hai cái bổ trợ, không thay thế nhau.
 
 ---
 
-## 8. Bài tập
+## 12. Gotchas thường gặp
 
-**1.** Vì sao bước đầu tiên của `onMutate` phải là `cancelQueries`?
+| Triệu chứng | Nguyên nhân | Cách sửa |
+|---|---|---|
+| UI nháy rồi nhảy về cũ | Quên `await cancelQueries` → refetch nền về sau đè optimistic | Luôn `await qc.cancelQueries(filter)` đầu `onMutate` |
+| Bấm nhưng UI không đổi | Mutate `prev` tại chỗ trong updater → ref không đổi | Trả về object/array **mới** (immutable) |
+| Lỗi nhưng UI kẹt trạng thái sai | Quên rollback trong `onError`, hoặc `context` `undefined` | `if (context) setQueryData(...previous)` |
+| Rollback về sai dữ liệu | Snapshot *sau* khi đã vá, hoặc nhầm key | `getQueryData` phải đứng **trước** `setQueryData` |
+| Hai click nhanh → data lộn xộn | Nhiều mutation song song cùng vá một key, rollback đè nhau | Snapshot per-mutation; hoặc dùng Cách B (`variables`) |
+| Optimistic đúng nhưng số liệu lệch nhẹ | Thiếu `invalidateQueries` ở `onSettled` (vd `updatedAt`, id thật) | Luôn invalidate ở `onSettled` để chốt |
+| Vá xong nhưng list khác không đổi | Item nằm trong nhiều list, chỉ vá một key | Dùng `setQueriesData` với filter tiền tố |
+
+> Về **nhiều mutation song song**: nếu mỗi `onMutate` đều `getQueriesData` rồi `onError` khôi phục, hai lỗi liên tiếp có thể rollback chồng lấn và đưa cache về ảnh quá cũ. Khi UX cho phép, hạn chế chồng mutation trên cùng item, hoặc chuyển sang Cách B để React Query tự quản trạng thái pending.
+
+---
+
+## 13. Bài tập
+
+**1.** Vì sao bước đầu tiên của `onMutate` phải là `await cancelQueries`?
 
 <details>
 <summary>Lời giải</summary>
 
-Vì có thể đang có refetch chạy nền cho cùng query. Nếu không huỷ, refetch đó có thể resolve *sau* khi bạn đã patch optimistic và **đè** mất data lạc quan bằng data cũ từ server. `cancelQueries` đảm bảo không có request nào ghi đè patch của bạn.
+Vì có thể đang có refetch chạy nền cho cùng query. Nếu không huỷ, refetch đó có thể resolve *sau* khi bạn đã vá optimistic và **đè** mất data lạc quan bằng data cũ từ server (UI nháy). `await` đảm bảo request đã dừng hẳn trước khi bạn chụp snapshot và vá cache.
 </details>
 
 **2.** Khác nhau giữa `setQueryData` và `invalidateQueries` là gì?
@@ -208,10 +472,10 @@ Vì có thể đang có refetch chạy nền cho cùng query. Nếu không huỷ
 <details>
 <summary>Lời giải</summary>
 
-`setQueryData` ghi thẳng vào cache *không gọi mạng* (bạn cung cấp data mới). `invalidateQueries` đánh dấu query stale và *refetch* từ server. Optimistic dùng `setQueryData` để cập nhật tức thì; invalidate dùng để lấy lại sự thật từ server.
+`setQueryData` ghi thẳng vào cache *không gọi mạng* (bạn cung cấp data mới). `invalidateQueries` đánh dấu query stale và *refetch* từ server. Optimistic dùng `setQueryData` để cập nhật tức thì; invalidate để lấy lại sự thật từ server ở `onSettled`.
 </details>
 
-**3.** Khi nào nên dùng `useOptimistic` của React 19 thay vì `onMutate`/`setQueryData`?
+**3.** Khi nào dùng `useOptimistic` của React 19 thay vì `onMutate`/`setQueryData`?
 
 <details>
 <summary>Lời giải</summary>
@@ -219,19 +483,52 @@ Vì có thể đang có refetch chạy nền cho cùng query. Nếu không huỷ
 Dùng `useOptimistic` cho optimistic *cục bộ* của một component/transition (state không chia sẻ, tự reset khi action xong). Dùng `onMutate`/`setQueryData` khi thay đổi nằm trong **server cache dùng chung** để mọi component đọc key đó cùng cập nhật.
 </details>
 
-**Nâng cao:** Viết optimistic update cho thao tác **xoá** một item khỏi danh sách (cancel → snapshot → filter bỏ item khỏi cache → rollback nếu lỗi → invalidate ở settled). So sánh cảm giác với phiên bản chỉ invalidate ở Phần 5.
+**4.** Khi nào nên dùng `setQueriesData` thay vì `setQueryData`?
+
+<details>
+<summary>Lời giải</summary>
+
+Khi cùng một item xuất hiện trong **nhiều** list cache (vd list "all", "active", kết quả tìm kiếm). `setQueryData` chỉ vá một key; `setQueriesData` chạy updater cho *mọi* query khớp filter tiền tố. Nhớ rollback bằng cách lặp qua toàn bộ cặp `[key, data]` từ `getQueriesData`.
+</details>
+
+**5.** Vì sao tham số `context` trong `onError` có kiểu `… | undefined`, và hệ quả khi viết rollback?
+
+<details>
+<summary>Lời giải</summary>
+
+Vì `onMutate` có thể ném lỗi *trước khi* kịp `return context` (ví dụ `cancelQueries` reject). Khi đó `onError` vẫn chạy nhưng `context === undefined`. Hệ quả: luôn kiểm tra `if (context)` (hoặc `context?.previous`) trước khi rollback, không giả định context tồn tại.
+</details>
+
+**6. (Nâng cao)** Viết optimistic update cho thao tác **xoá** một item khỏi danh sách: `cancelQueries` → snapshot → `filter` bỏ item khỏi cache → rollback nếu lỗi → invalidate ở `onSettled`. So sánh cảm giác với phiên bản chỉ invalidate ở [Phần 5](/blog/tanstack-query-05-mutations-invalidation/).
+
+<details>
+<summary>Gợi ý lời giải</summary>
+
+Khung giống recipe xoá ở §6: trong `onMutate`, `await qc.cancelQueries({ queryKey: listKey })`, `const previous = qc.getQueryData<Customer[]>(listKey)`, rồi `qc.setQueryData<Customer[]>(listKey, (old) => old?.filter((c) => c.id !== id))`, `return { previous }`. `onError` khôi phục `previous`, `onSettled` invalidate. Khác biệt cảm giác: bản optimistic xoá item *ngay khi bấm*; bản chỉ-invalidate ở Phần 5 phải chờ refetch xong item mới biến mất.
+</details>
+
+**7. (Nâng cao)** Viết optimistic **thêm** dùng id tạm: vá item `temp-…` vào cache ở `onMutate`, rồi thay bằng bản thật ở `onSuccess`. Vì sao bước thay ở `onSuccess` cần thiết dù đã invalidate ở `onSettled`?
+
+<details>
+<summary>Gợi ý lời giải</summary>
+
+Xem recipe "thêm" ở §6. Bước `onSuccess` thay item tạm bằng bản server (id thật, timestamps) *ngay lập tức*; nếu chỉ dựa vào invalidate ở `onSettled`, item tạm vẫn hiện với id giả tới khi refetch hoàn tất — khoảng giữa có thể nháy hoặc trùng `key` React. Thay tại chỗ ở `onSuccess` cho mượt, invalidate ở `onSettled` để chốt số liệu.
+</details>
 
 ---
 
 ## Tóm tắt
 
-- Thao tác cache thủ công: **`getQueryData`** (đọc, không fetch) và **`setQueryData`** (ghi thẳng, immutable, không gọi mạng).
-- Optimistic 4 bước trong `useMutation`: **`onMutate`** (cancel → snapshot → patch → trả context) → **`onError`** (rollback snapshot) → **`onSettled`** (invalidate đồng bộ).
-- **Query filters** (`queryKey`, `exact`, `type`, `predicate`) nhắm đúng tập query cho mọi thao tác cache.
-- Chọn đúng công cụ: invalidate (mặc định), setQueryData (optimistic / đã có data), remove/reset (logout/cleanup). Đừng optimistic mọi thứ.
+- **Thao tác cache thủ công** là nền của optimistic: `getQueryData` (đọc, không fetch), `setQueryData` (ghi 1 key), `setQueriesData` (ghi nhiều key theo filter) — tất cả **đồng bộ, immutable, không gọi mạng**.
+- Updater `(prev) => next` phải trả **ref mới**; `prev` có thể `undefined`; trả `undefined` = no-op. Bất biến là bắt buộc vì React Query so sánh bằng `Object.is` + structural sharing.
+- **Quy trình optimistic 4 bước** trong `useMutation`: `onMutate` (`await cancelQueries` → `getQueryData` snapshot → `setQueryData` vá → `return context`) → `onError` (rollback từ context) → `onSettled` (`invalidateQueries` chốt).
+- **`context`** là kênh duy nhất chuyển snapshot qua callback; type qua generic thứ tư `useMutation<TData, TError, TVars, TContext>`, luôn xử lý `context` có thể `undefined`.
+- **Hai cách optimistic**: ghi cache (`setQueryData`, ảnh hưởng toàn app) vs đọc `mutation.variables`/`useMutationState` (rollback tự động, gọn cho "thêm").
+- **Query filters** (`queryKey`, `exact`, `type`, `stale`, `predicate`) nhắm đúng tập query cho mọi thao tác cache; `type: 'active'` tránh bão refetch.
+- Chọn đúng công cụ trong **năm cách** đụng cache; đừng optimistic mọi thứ — chỉ dùng cho hành động cần phản hồi tức thì.
 
 ---
 
 ## Phần tiếp theo
 
-**Phần 7 — Error handling, retry, Suspense & performance:** cấu hình retry thông minh, ném lỗi lên **Error Boundary** với `throwOnError`, dùng `useSuspenseQuery` cho luồng loading khai báo, rồi tối ưu hiệu năng với `select`, structural sharing và **prefetching** (hover + route loader).
+**[Phần 7 — Error handling, retry, Suspense & performance](/blog/tanstack-query-07-errors-retry-suspense-performance/):** cấu hình retry thông minh, ném lỗi lên **Error Boundary** với `throwOnError`, dùng `useSuspenseQuery` cho luồng loading khai báo, rồi tối ưu hiệu năng với `select`, structural sharing và **prefetching** (hover + route loader).

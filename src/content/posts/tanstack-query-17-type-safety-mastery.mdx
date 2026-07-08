@@ -12,23 +12,49 @@ React Query có type rất tốt sẵn — nhưng để type *thực sự* chả
 
 ---
 
-## 1. `queryFn` định type, mọi thứ sau đó tự suy ra
+## 1. Luồng suy luận type: từ `queryFn` tới `data`
 
-Nguồn sự thật của type là **giá trị trả về của `queryFn`**. Định đúng đó, `data` ở component tự có type:
+Nguồn sự thật của type là **giá trị trả về của `queryFn`**. Định đúng đó, `data` ở component tự có type — không generic, không `as`:
 
 ```ts
 // fetchCustomers: () => Promise<Customer[]>
 useQuery({ queryKey: ['customers'], queryFn: fetchCustomers });
-// data: Customer[] | undefined — tự suy ra, không cần generic
+// data: Customer[] | undefined — tự suy ra
 ```
 
-> **Đừng** viết `useQuery<Customer[]>(...)` thủ công. Truyền generic tay làm hỏng suy luận cho `error`, `select`, v.v. Hãy để `queryFn` "kể" type. Nếu cần ép, ép ở `queryFn` (vd qua zod parse) chứ không ở `useQuery`.
+TanStack Query đọc `ReturnType` của `queryFn` (đã gỡ `Promise`) ra một type nội bộ gọi là `TQueryFnData`, rồi suy ra `TData` (kiểu của `data`) từ đó. Toàn bộ chuỗi như sau:
+
+```
+queryFn: () => Promise<Customer[]>
+   │
+   │  unwrap Promise → ReturnType
+   ▼
+TQueryFnData = Customer[]                  ← "raw" type từ network
+   │
+   ├── KHÔNG có select ──────► TData = Customer[]
+   │
+   └── CÓ select: (d) => d.length ─► TData = ReturnType<select> = number
+                                          │
+                                          ▼
+                              useQuery(...).data : TData | undefined
+```
+
+Bảng các generic của `useQuery` và nguồn suy luận:
+
+| Generic | Ý nghĩa | Suy ra từ đâu |
+| --- | --- | --- |
+| `TQueryFnData` | Type thô `queryFn` trả về | `ReturnType` của `queryFn` |
+| `TError` | Type của `error` | `Register['defaultError']` (mặc định `Error`) |
+| `TData` | Type của `data` | `select` nếu có, ngược lại `TQueryFnData` |
+| `TQueryKey` | Type của `queryKey` (const tuple) | Chính `queryKey` bạn truyền |
+
+> **Đừng** viết `useQuery<Customer[]>(...)` thủ công. Truyền generic tay chỉ ép `TQueryFnData`, nhưng làm hỏng suy luận cho `select`, `error`, `initialData`, và **không** kiểm chứng `queryFn` thật sự trả `Customer[]`. Hãy để `queryFn` "kể" type. Nếu cần ép kiểu, ép ở `queryFn` (qua zod `parse`) — chứ không ở hook.
 
 ---
 
-## 2. `queryOptions` — gói có type & suy luận `DataTag`
+## 2. `queryOptions` mang type đi xuyên suốt — `DataTag`
 
-`queryOptions` (Phần 3) không chỉ để tái dùng — nó gắn một **`DataTag`** vào `queryKey`, giúp `getQueryData`/`setQueryData` biết kiểu data *từ chính key*:
+`queryOptions` (Phần 3) không chỉ để tái dùng — nó gắn một **`DataTag`** (một phantom type ẩn) vào `queryKey`, giúp mọi API nhận key đó biết kiểu data *từ chính key*:
 
 ```ts
 import { queryOptions } from '@tanstack/react-query';
@@ -44,11 +70,68 @@ const cached = queryClient.getQueryData(customerQuery(id).queryKey);
 //    ^? Customer | undefined  — KHÔNG cần generic, KHÔNG cần `as`
 ```
 
-So với cách cũ `getQueryData<Customer>(['customers', 'detail', id])` (phải tự nhắc type và tự gõ key đúng), `queryOptions` cho bạn cả type lẫn key từ một nguồn — lệch key là compiler la ngay.
+Điều mạnh nhất: **một** `queryOptions` chảy type ra *mọi* điểm dùng key, end-to-end:
+
+```
+            customerQuery(id)  →  { queryKey: DataTag<Key, Customer>, queryFn }
+                   │
+   ┌───────────────┼────────────────────┬──────────────────────┐
+   ▼               ▼                    ▼                       ▼
+useQuery(...)   prefetchQuery(...)   getQueryData(key)     setQueryData(key, x)
+ data:           (void, nhưng        → Customer|undefined   x phải là
+ Customer|undef   queryFn type-check)                       Customer (hoặc updater)
+```
+
+Bảng đối chiếu — cùng một `queryOptions`, type được giữ ở đâu:
+
+| Điểm dùng | API | Type được giữ |
+| --- | --- | --- |
+| Component | `useQuery(customerQuery(id))` | `data: Customer \| undefined` |
+| Suspense | `useSuspenseQuery(customerQuery(id))` | `data: Customer` (non-undefined) |
+| Prefetch | `queryClient.prefetchQuery(customerQuery(id))` | `queryFn` được type-check |
+| Đọc cache | `getQueryData(customerQuery(id).queryKey)` | trả `Customer \| undefined` |
+| Ghi cache | `setQueryData(customerQuery(id).queryKey, x)` | `x` phải là `Customer` |
+
+So với cách cũ `getQueryData<Customer>(['customers','detail',id])` (phải tự nhắc type *và* tự gõ key đúng), `queryOptions` cho cả type lẫn key từ một nguồn — lệch key là compiler la ngay.
 
 ---
 
-## 3. Generic query factory — tái dùng có type
+## 3. Typed query keys: const tuple & key factory có type
+
+`getQueryData`/`setQueryData` chỉ suy được type khi `queryKey` là **const tuple** (literal), không phải `string[]` rộng. Khác biệt nằm ở `as const`:
+
+```ts
+const k1 = ['customers', 'detail', id];            // type: string[]  ❌ quá rộng
+const k2 = ['customers', 'detail', id] as const;   // type: readonly ['customers', 'detail', string]  ✅
+```
+
+Key factory nên trả const tuple ở **mọi** nhánh để filter (`queryKey: [...]`) khớp type:
+
+```ts
+export const customerKeys = {
+  all: ['customers'] as const,
+  lists: () => [...customerKeys.all, 'list'] as const,
+  list: (filters: CustomerFilters) => [...customerKeys.lists(), filters] as const,
+  details: () => [...customerKeys.all, 'detail'] as const,
+  detail: (id: string) => [...customerKeys.details(), id] as const,
+};
+
+// Lấy type của một key để dùng lại nơi khác:
+type DetailKey = ReturnType<typeof customerKeys.detail>;
+//   = readonly ['customers', 'detail', string]
+```
+
+| Cách viết key | Type suy ra | Hệ quả |
+| --- | --- | --- |
+| `['customers', id]` | `string[]` | `getQueryData` trả `unknown`, filter lỏng |
+| `['customers', id] as const` | `readonly ['customers', string]` | Type chuẩn, khớp `DataTag` |
+| `customerKeys.detail(id)` (factory) | const tuple | Một nguồn key, không gõ tay sai |
+
+> **Quy tắc:** factory + `as const` + `queryOptions` là bộ ba bất ly thân. Thiếu `as const`, `DataTag` không bám được vào key và bạn rơi về `unknown`/`as`.
+
+---
+
+## 4. Generic query factory — tái dùng có type
 
 Khi có nhiều resource cùng pattern (list/detail), một factory generic giảm lặp mà vẫn giữ type:
 
@@ -77,30 +160,9 @@ Mỗi resource mới chỉ cần một dòng, và type của data được giữ
 
 ---
 
-## 4. `skipToken` — `enabled` mà vẫn giữ type hẹp
+## 5. zod ở biên: `parse` cho runtime, `z.infer` cho static
 
-Pattern `enabled: !!id` (Phần 3) tắt query khi chưa có tham số, nhưng nó *không* làm hẹp type: `queryFn` vẫn thấy `id: string | undefined`, buộc bạn `id!` (non-null assertion — gần như `as`). `skipToken` giải quyết triệt để:
-
-```ts
-import { skipToken, useQuery } from '@tanstack/react-query';
-
-function useCustomer(id: string | undefined) {
-  return useQuery({
-    queryKey: ['customers', 'detail', id],
-    // Khi id undefined → skipToken: query bị tắt VÀ type của queryFn được giữ.
-    queryFn: id === undefined ? skipToken : () => fetchCustomer(id),
-    // Bên trong nhánh else, `id` đã hẹp về `string` — không cần `id!`.
-  });
-}
-```
-
-`skipToken` vừa tắt query (như `enabled: false`) vừa cho TypeScript narrow `id` về `string` trong nhánh có hàm — xoá luôn nhu cầu `!`/`as`. Đây là cách type-safe nhất để làm dependent query.
-
----
-
-## 5. Validate biên bằng zod = nơi `as` *được phép*
-
-Prohibition của dự án cho phép `as` **sau khi validate runtime**. zod là công cụ đó: nó nhận `unknown` và trả type đã chứng minh:
+Prohibition của dự án cho phép `as` **chỉ sau khi validate runtime**. zod chính là công cụ đó: nó nhận `unknown` và trả ra một type đã được *chứng minh* tại runtime — vừa khử `any`, vừa khử `as`:
 
 ```ts
 import { z } from 'zod';
@@ -109,6 +171,7 @@ export const customerSchema = z.object({
   id: z.string(),
   name: z.string(),
   orderCount: z.number(),
+  tier: z.enum(['free', 'pro', 'enterprise']),
 });
 export type Customer = z.infer<typeof customerSchema>; // type SUY RA từ schema
 
@@ -116,17 +179,26 @@ export async function fetchCustomer(id: string): Promise<Customer> {
   const res = await fetch(`/api/customers/${id}`);
   if (!res.ok) throw new ApiError(`HTTP ${res.status}`, res.status);
   const json: unknown = await res.json(); // unknown, KHÔNG any
-  return customerSchema.parse(json); // parse → Customer đã được kiểm chứng
+  return customerSchema.parse(json);      // parse → Customer đã kiểm chứng
 }
 ```
 
-`type Customer = z.infer<...>` giữ type và validator **đồng bộ**: đổi schema, type tự đổi theo. Không bao giờ định nghĩa `interface Customer` riêng song song với schema — chúng sẽ lệch.
+`type Customer = z.infer<...>` giữ type và validator **đồng bộ tuyệt đối**: đổi schema, type tự đổi theo. Không bao giờ định nghĩa `interface Customer` song song với schema — chúng sẽ trôi xa nhau.
+
+| Cách lấy data thô | Type | An toàn? |
+| --- | --- | --- |
+| `await res.json()` | `any` | ❌ `any` lây lan khắp nơi |
+| `(await res.json()) as Customer` | `Customer` | ❌ `as` mù — runtime có thể sai hình |
+| `schema.parse(await res.json())` | `Customer` | ✅ runtime + static khớp nhau |
+| `schema.safeParse(json)` | `{ success; data \| error }` | ✅ xử lý lỗi không throw |
+
+> **Mẹo:** `z.infer` cho type *output* (sau transform). Nếu schema có `.transform()` hay `.default()`, dùng `z.input<typeof schema>` cho dữ liệu vào và `z.infer`/`z.output` cho dữ liệu ra để không lẫn lộn hai đầu.
 
 ---
 
-## 6. Type cho `error` — bỏ `unknown` đúng cách
+## 6. `Register` augmentation: typed `error`, `queryMeta`, `mutationMeta`
 
-Mặc định `error` trong React Query là `Error`. Nếu `queryFn` luôn throw `ApiError`, bạn muốn `error` có type đó để đọc `error.status`. Khai báo qua module augmentation `Register`:
+Mặc định `error` trong React Query là `Error` — đủ rộng để bạn không đọc được `error.status`. Nếu `queryFn` luôn throw `ApiError`, khai báo qua module augmentation `Register` để mọi `error` toàn app có đúng type:
 
 ```ts
 // src/types/react-query.d.ts
@@ -134,7 +206,9 @@ import '@tanstack/react-query';
 
 declare module '@tanstack/react-query' {
   interface Register {
-    defaultError: ApiError; // mọi query/mutation error giờ là ApiError
+    defaultError: ApiError;                       // error: ApiError, không phải Error
+    queryMeta: { silent?: boolean; invalidates?: readonly unknown[][] };
+    mutationMeta: { successMessage?: string; invalidates?: readonly unknown[][] };
   }
 }
 ```
@@ -147,11 +221,130 @@ function Detail() {
 }
 ```
 
-Cùng cơ chế `Register` còn type được `queryMeta`/`mutationMeta` (đã dùng ở Phần 9 cho `meta.invalidates`).
+| Khoá trong `Register` | Type hoá cái gì | Trước khi khai báo |
+| --- | --- | --- |
+| `defaultError` | `error` của mọi query & mutation | `Error` |
+| `queryMeta` | `options.meta` của query | `Record<string, unknown> \| undefined` |
+| `mutationMeta` | `options.meta` của mutation | `Record<string, unknown> \| undefined` |
+
+> **Vì sao toàn cục?** `Register` là một interface "mở" mà chính thư viện đọc khi suy `TError`/`meta`. Augment nó một lần ở file `.d.ts` là cả codebase được lợi — không phải truyền `<…, ApiError>` ở từng hook. Đây là cách duy nhất biến `error` từ `Error` rộng thành type miền của bạn mà không dùng `as`.
 
 ---
 
-## 7. Type cho mutation: `mutationOptions` & biến/ngữ cảnh
+## 7. `skipToken`: disabled query type-safe (vs `enabled` narrowing)
+
+Pattern `enabled: !!id` (Phần 3) tắt query khi chưa có tham số, nhưng nó *không* làm hẹp type: `queryFn` vẫn thấy `id: string | undefined`, buộc bạn `id!` (non-null assertion — gần như `as`). `skipToken` giải quyết triệt để:
+
+```ts
+import { skipToken, useQuery } from '@tanstack/react-query';
+
+function useCustomer(id: string | undefined) {
+  return useQuery({
+    queryKey: ['customers', 'detail', id] as const,
+    // id undefined → skipToken: query bị tắt VÀ type của queryFn được giữ.
+    queryFn: id === undefined ? skipToken : () => fetchCustomer(id),
+    // Trong nhánh else, `id` đã hẹp về `string` — không cần `id!`.
+  });
+}
+```
+
+| Tiêu chí | `enabled: !!id` | `skipToken` |
+| --- | --- | --- |
+| Tắt query khi thiếu tham số | ✅ | ✅ |
+| Narrow `id` → `string` trong `queryFn` | ❌ (vẫn `string \| undefined`) | ✅ |
+| Cần `id!` / `as` | ✅ phải dùng | ❌ không cần |
+| Dùng được với `useSuspenseQuery` | ❌ (không có `enabled`) | ✅ (skipToken treo Suspense) |
+
+> **Quy tắc:** dùng `skipToken` cho *dependent query* (query phụ thuộc tham số có thể chưa có). Để dành `enabled` cho điều kiện boolean thuần (vd `enabled: isLoggedIn`) không liên quan tới narrow type.
+
+---
+
+## 8. Narrowing `data`: discriminated `status` & `initialData`
+
+`data` của `useQuery` là `TData | undefined` vì lúc đầu chưa có. Có hai cách hợp lệ để TypeScript hiểu khi nào `data` chắc chắn tồn tại.
+
+**Cách 1 — discriminated union qua `status`.** React Query thiết kế kết quả thành union phân biệt theo `status`, nên kiểm tra `status`/`isSuccess` sẽ narrow `data`:
+
+```tsx
+const query = useQuery(customerQuery(id));
+if (query.isPending) return <Spinner />;
+if (query.isError)   return <Err e={query.error} />;   // error: ApiError
+// Tới đây status === 'success' → data đã narrow:
+return <Profile customer={query.data} />;               // data: Customer (KHÔNG undefined)
+```
+
+```
+status: 'pending'  → data: undefined,  error: null
+status: 'error'    → data: undefined,  error: TError
+status: 'success'  → data: TData,      error: null   ← chỉ ở đây data chắc chắn có
+```
+
+**Cách 2 — `initialData` biến `data` thành non-undefined.** Khi truyền `initialData` (không phải hàm trả `undefined`), TanStack chọn overload `DefinedInitialDataOptions` và `data` mất nhánh `undefined` ngay từ render đầu:
+
+```ts
+useQuery({
+  ...customerQuery(id),
+  initialData: cachedCustomer,   // Customer (không undefined)
+});
+// data: Customer — đã non-undefined, không cần kiểm tra isPending
+```
+
+| Tình huống | Overload chọn | `data` |
+| --- | --- | --- |
+| Không `initialData` | `UndefinedInitialDataOptions` | `TData \| undefined` |
+| `initialData: value` | `DefinedInitialDataOptions` | `TData` |
+| `initialData: () => maybeUndef` | `UndefinedInitialDataOptions` | `TData \| undefined` |
+| `useSuspenseQuery` | — | `TData` (Suspense đảm bảo đã có) |
+
+> **Gotcha:** `initialData: () => readFromCache()` mà hàm có thể trả `undefined` thì overload "defined" **không** kích hoạt — `data` lại là `TData | undefined`. Muốn non-undefined, truyền giá trị trực tiếp hoặc đảm bảo hàm luôn trả `TData`.
+
+---
+
+## 9. Typing `select`, custom hook & `UseQueryResult`
+
+`select` đổi type của `data`: `TData` thành kiểu trả về của `select`, còn data thô (`TQueryFnData`) giữ nguyên cho cache:
+
+```ts
+const count = useQuery({
+  ...customerQuery(id),
+  select: (c) => c.orderCount,   // (c: Customer) => number
+});
+// count.data: number | undefined  — TData giờ là number
+```
+
+Khi viết **custom hook**, đừng "đóng băng" return type — hãy để nó suy ra hoặc dùng đúng type tiện ích của thư viện:
+
+```ts
+import type { UseQueryResult, UseMutationResult } from '@tanstack/react-query';
+
+// Cách A — để return type tự suy ra (gọn nhất, luôn đúng):
+export function useCustomer(id: string) {
+  return useQuery(customerQuery(id));
+}
+
+// Cách B — annotate tường minh khi cần export ổn định cho lib:
+export function useCustomerExplicit(id: string): UseQueryResult<Customer, ApiError> {
+  return useQuery(customerQuery(id));
+}
+
+// Mutation tương tự:
+export function useUpdateCustomer(): UseMutationResult<Customer, ApiError, UpdateInput> {
+  return useMutation(updateCustomerMutation());
+}
+```
+
+| Type tiện ích | Generic | Dùng khi |
+| --- | --- | --- |
+| `UseQueryResult<TData, TError>` | data + error | Annotate return của custom query hook |
+| `UseMutationResult<TData, TError, TVars, TCtx>` | 4 generic | Annotate return của mutation hook |
+| `UseSuspenseQueryResult<TData, TError>` | data non-undefined | Hook bọc `useSuspenseQuery` |
+| `QueryObserverOptions` / `DefinedInitialDataOptions` | options | Nhận options từ bên ngoài có type |
+
+> **Vì sao thường chọn Cách A?** Để TypeScript suy ra return type giữ mọi field (`isPending`, `dataUpdatedAt`, `fetchStatus`…) luôn khớp phiên bản thư viện. Chỉ annotate tường minh (Cách B) khi bạn publish một thư viện và muốn API ổn định, không phụ thuộc nội bộ React Query.
+
+---
+
+## 10. Type cho mutation: `mutationOptions`, biến & ngữ cảnh
 
 v5 có `mutationOptions` tương tự `queryOptions` để gói mutation có type:
 
@@ -160,17 +353,16 @@ import { mutationOptions } from '@tanstack/react-query';
 
 export const updateCustomerMutation = () =>
   mutationOptions({
-    mutationFn: updateCustomer, // (vars: UpdateInput) => Promise<Customer>
+    mutationFn: updateCustomer,                 // (vars: UpdateInput) => Promise<Customer>
     meta: { successMessage: 'Đã lưu' },
   });
 
-// Bốn type generic của useMutation: <TData, TError, TVariables, TContext>
-// Thường để suy ra; chỉ chỉ định TContext khi onMutate trả ngữ cảnh phức tạp:
+// 4 generic của useMutation: <TData, TError, TVariables, TContext>
 useMutation({
   mutationFn: updateCustomer,
   onMutate: async (vars): Promise<{ previous: Customer | undefined }> => {
-    const previous = queryClient.getQueryData<Customer>(customerKeys.detail(vars.id));
-    return { previous }; // TContext suy ra là { previous: Customer | undefined }
+    const previous = queryClient.getQueryData(customerKeys.detail(vars.id));
+    return { previous };                        // TContext = { previous: Customer | undefined }
   },
   onError: (_e, _vars, ctx) => {
     // ctx có type { previous: Customer | undefined } — không undefined-mù
@@ -179,18 +371,105 @@ useMutation({
 });
 ```
 
-Mẹo quan trọng: annotate **giá trị trả về của `onMutate`** (`Promise<{...}>`) để `TContext` được suy đúng, nhờ đó `ctx` trong `onError`/`onSettled` có type chuẩn thay vì `unknown`.
+| Generic | Suy ra từ | Khi nào annotate tay |
+| --- | --- | --- |
+| `TVariables` | tham số của `mutationFn` | Hiếm — để suy ra |
+| `TData` | `ReturnType` của `mutationFn` | Hiếm — để suy ra |
+| `TError` | `Register['defaultError']` | Không (đặt qua `Register`) |
+| `TContext` | return của `onMutate` | **Annotate return của `onMutate`** |
+
+> **Mẹo quan trọng:** annotate **giá trị trả về của `onMutate`** (`Promise<{...}>`) để `TContext` được suy đúng, nhờ đó `ctx` trong `onError`/`onSettled` có type chuẩn thay vì `unknown`. Đây là chỗ duy nhất mutation thật sự cần "giúp" compiler.
 
 ---
 
-## 8. Bài tập
+## 11. Gotchas thường gặp
+
+| Gotcha | Triệu chứng | Cách đúng |
+| --- | --- | --- |
+| `as Customer` lên response | runtime sai hình mà compiler im | `schema.parse(json)` ở `queryFn` |
+| `await res.json()` để `any` | `any` lây sang `data`, mất type | `const json: unknown` rồi `parse` |
+| Generic tay `useQuery<T>()` | `select`/`error` mất suy luận | Để `queryFn` định type |
+| Key không `as const` | `getQueryData` trả `unknown` | Factory + `as const` + `queryOptions` |
+| `error` để `unknown`/`Error` | không đọc được `error.status` | `Register.defaultError = ApiError` |
+| `enabled: !!id` rồi `id!` | non-null assertion trá hình `as` | `skipToken` để narrow |
+| Đọc `data` khi `isPending` | `data` là `undefined` | Narrow qua `status`/`isSuccess` |
+| `initialData: () => undefined?` | tưởng non-undefined nhưng không | truyền giá trị trực tiếp |
+| Tự định `interface` + schema riêng | type & validator trôi xa nhau | `type = z.infer<typeof schema>` |
+| Đóng băng return custom hook sai | lệch field theo version | để suy ra hoặc dùng `UseQueryResult` |
+
+---
+
+## 12. Recipe: module API feature đầy đủ type
+
+Gom tất cả vào một module feature — `any`/`as` bằng 0, type chảy từ network tới component:
+
+```ts
+// features/customers/api.ts
+import { z } from 'zod';
+import { queryOptions, mutationOptions } from '@tanstack/react-query';
+import { apiFetch } from '@/lib/api';   // (path) => Promise<unknown>
+
+// 1) Schema = nguồn type duy nhất
+export const customerSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  tier: z.enum(['free', 'pro', 'enterprise']),
+});
+export type Customer = z.infer<typeof customerSchema>;
+export const updateInputSchema = customerSchema.pick({ name: true, tier: true });
+export type UpdateInput = z.infer<typeof updateInputSchema>;
+
+// 2) Key factory — const tuple ở mọi nhánh
+export const customerKeys = {
+  all: ['customers'] as const,
+  detail: (id: string) => [...customerKeys.all, 'detail', id] as const,
+};
+
+// 3) Fetchers — unknown vào, parse ra
+export async function fetchCustomer(id: string): Promise<Customer> {
+  return customerSchema.parse(await apiFetch(`/customers/${id}`));
+}
+
+// 4) queryOptions/mutationOptions — type đi xuyên suốt
+export const customerQuery = (id: string) =>
+  queryOptions({ queryKey: customerKeys.detail(id), queryFn: () => fetchCustomer(id) });
+
+export const updateCustomerMutation = (id: string) =>
+  mutationOptions({
+    mutationFn: (vars: UpdateInput) =>
+      apiFetch(`/customers/${id}`, { method: 'PATCH', body: vars }).then((d) => customerSchema.parse(d)),
+  });
+```
+
+```tsx
+// features/customers/CustomerCard.tsx
+import { skipToken, useQuery } from '@tanstack/react-query';
+import { customerQuery } from './api';
+
+export function CustomerCard({ id }: { id: string | undefined }) {
+  const q = useQuery(
+    id === undefined
+      ? { ...customerQuery(''), queryFn: skipToken }
+      : customerQuery(id),
+  );
+  if (q.isPending) return <Spinner />;
+  if (q.isError)   return <p>Lỗi {q.error.status}</p>;   // error: ApiError nhờ Register
+  return <h2>{q.data.name}</h2>;                          // data: Customer, không undefined/as
+}
+```
+
+> Toàn bộ chuỗi — schema → `z.infer` → fetcher `parse` → `queryOptions` → `useQuery` → narrow `status` — không có một `any` hay `as` nào. Đổi schema một chỗ, compiler dẫn bạn tới mọi điểm cần sửa.
+
+---
+
+## 13. Bài tập
 
 **1.** Vì sao không nên truyền generic tay vào `useQuery<T>()` mà nên để `queryFn` định type?
 
 <details>
 <summary>Lời giải</summary>
 
-Truyền `useQuery<T>()` chỉ ép kiểu `data` nhưng phá suy luận của các phần khác (`select`, `error`, `initialData`) và không kiểm chứng `queryFn` thực sự trả `T`. Để `queryFn` "kể" type giữ một nguồn sự thật duy nhất và compiler kiểm tra toàn bộ chuỗi. Nếu cần ép, ép ở `queryFn` (qua zod) chứ không ở hook.
+Truyền `useQuery<T>()` chỉ ép kiểu `TQueryFnData`/`data` nhưng phá suy luận của `select`, `error`, `initialData`, và không kiểm chứng `queryFn` thực sự trả `T`. Để `queryFn` "kể" type giữ một nguồn sự thật duy nhất và compiler kiểm tra toàn bộ chuỗi. Nếu cần ép, ép ở `queryFn` (qua zod `parse`) chứ không ở hook.
 
 </details>
 
@@ -199,7 +478,7 @@ Truyền `useQuery<T>()` chỉ ép kiểu `data` nhưng phá suy luận của c�
 <details>
 <summary>Lời giải</summary>
 
-`enabled: !!id` tắt query nhưng không narrow type — `queryFn` vẫn thấy `id: string | undefined`, buộc `id!`. `skipToken` vừa tắt query vừa cho TypeScript narrow `id` về `string` trong nhánh có hàm, xoá nhu cầu non-null assertion/`as` — type-safe hơn cho dependent query.
+`enabled: !!id` tắt query nhưng không narrow type — `queryFn` vẫn thấy `id: string | undefined`, buộc `id!`. `skipToken` vừa tắt query vừa cho TypeScript narrow `id` về `string` trong nhánh có hàm, xoá nhu cầu non-null assertion/`as`; ngoài ra `skipToken` còn dùng được với `useSuspenseQuery` (vốn không có `enabled`).
 
 </details>
 
@@ -212,21 +491,50 @@ Truyền `useQuery<T>()` chỉ ép kiểu `data` nhưng phá suy luận của c�
 
 </details>
 
-**Nâng cao:** Refactor một resource sang generic factory (mục 3) + `queryOptions`, bật `Register.defaultError = ApiError` (mục 6), rồi xoá mọi `as`/`!` còn sót trong lớp data. Chạy `astro check`/`tsc` xác nhận không lỗi và không cần assertion.
+**4.** Cùng một `queryOptions`, hãy kể ba điểm dùng mà type được giữ tự động và type tương ứng ở mỗi điểm.
+
+<details>
+<summary>Lời giải</summary>
+
+Nhờ `DataTag` gắn trong `queryKey`: (1) `useQuery(customerQuery(id))` → `data: Customer | undefined`; (2) `getQueryData(customerQuery(id).queryKey)` → trả `Customer | undefined`; (3) `setQueryData(customerQuery(id).queryKey, x)` → ép `x` phải là `Customer` (hoặc updater `(old) => Customer`). Ngoài ra `prefetchQuery`/`useSuspenseQuery` cũng nhận type từ cùng một nguồn — `useSuspenseQuery` cho `data: Customer` non-undefined.
+
+</details>
+
+**5.** Khi nào `data` của `useQuery` mất nhánh `| undefined`? Nêu hai cách hợp lệ.
+
+<details>
+<summary>Lời giải</summary>
+
+(1) Sau khi narrow qua `status`: trong nhánh `isSuccess`/`status === 'success'`, `data` là `TData`. (2) Truyền `initialData` bằng **giá trị** (không phải hàm trả `undefined`) → overload `DefinedInitialDataOptions` kích hoạt, `data: TData` ngay từ render đầu. Ngoài ra `useSuspenseQuery` luôn cho `data: TData` vì Suspense đảm bảo đã resolve.
+
+</details>
+
+**6.** Vì sao chỉ cần annotate return của `onMutate` là đủ để toàn bộ optimistic flow có type?
+
+<details>
+<summary>Lời giải</summary>
+
+`TContext` được suy ra từ **giá trị trả về của `onMutate`**. Annotate `onMutate: async (vars): Promise<{ previous: Customer \| undefined }> => …` cố định `TContext`, nên `ctx` trong `onError`/`onSettled` có đúng type `{ previous: Customer \| undefined }` thay vì `unknown` — đọc `ctx.previous` an toàn để rollback.
+
+</details>
+
+**Nâng cao:** Refactor một resource thật sang module feature ở mục 12: schema + `z.infer`, key factory `as const`, `queryOptions`/`mutationOptions`, bật `Register.defaultError = ApiError`, thay `enabled: !!id` bằng `skipToken`, rồi xoá mọi `as`/`!` còn sót trong lớp data. Chạy `astro check`/`tsc --noEmit` xác nhận 0 lỗi và 0 assertion.
 
 ---
 
 ## Tóm tắt
 
-- Để `queryFn` định type; **đừng** truyền generic tay vào `useQuery`.
-- `queryOptions` gắn `DataTag` vào key → `getQueryData`/`setQueryData` biết type *từ key*, không cần `as`.
-- **Generic query factory** tái dùng pattern list/detail giữ type end-to-end.
-- `skipToken` thay `enabled: !!id` để vừa tắt query vừa narrow type (xoá `!`/`as`).
-- zod `parse` là nơi `as` *hợp lệ* (validate biên); `type = z.infer<schema>` giữ type & validator đồng bộ.
-- `Register` augmentation type hoá `error` (`defaultError`) và `meta`; annotate `onMutate` để `TContext` suy đúng.
+- **Luồng suy luận:** `queryFn` định `TQueryFnData` → `TData` (`select` nếu có) → `data: TData | undefined`. Đừng truyền generic tay vào `useQuery`.
+- `queryOptions` gắn `DataTag` vào key, mang type end-to-end qua `useQuery`/`prefetch`/`getQueryData`/`setQueryData` — không cần `as`.
+- **Typed key:** factory + `as const` (const tuple) là điều kiện để `DataTag` bám và `getQueryData` có type; generic factory tái dùng pattern list/detail giữ type.
+- **zod ở biên:** `unknown` → `schema.parse` → type đã kiểm chứng; `type = z.infer<schema>` giữ type & validator đồng bộ — đây là nơi `as` *hợp lệ*.
+- **`Register` augmentation:** `defaultError` type hoá `error` (đọc `error.status`), `queryMeta`/`mutationMeta` type hoá `meta` toàn cục.
+- **`skipToken`** thay `enabled: !!id` để vừa tắt query vừa narrow `id` về `string` (xoá `!`/`as`); còn dùng được với `useSuspenseQuery`.
+- **Narrow `data`:** discriminated `status`/`isSuccess` hoặc `initialData` bằng giá trị (`DefinedInitialDataOptions`) làm `data` mất nhánh `undefined`.
+- **Typing hook:** để return tự suy ra hoặc dùng `UseQueryResult`/`UseMutationResult`; `select` đổi `TData`; annotate return của `onMutate` để `TContext` chuẩn.
 
 ---
 
 ## Phần tiếp theo
 
-**Phần 18 — Kiến trúc production & migration (capstone):** gói toàn bộ 17 phần thành một kiến trúc query layer theo feature, quy ước loading/error nhất quán, devtools & logging cho production, lộ trình migrate v4 → v5, so sánh nhanh với RTK Query/SWR, và một checklist "production-ready" để tự chấm điểm dự án.
+**[Phần 18 — Kiến trúc production & Migration (Capstone)](/blog/tanstack-query-18-production-architecture-migration/):** gói toàn bộ 17 phần thành một kiến trúc query layer theo feature, quy ước loading/error nhất quán, devtools & logging cho production, lộ trình migrate v4 → v5, so sánh nhanh với RTK Query/SWR, và một checklist "production-ready" để tự chấm điểm dự án.

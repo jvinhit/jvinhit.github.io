@@ -14,9 +14,33 @@ Nguyên tắc xuyên suốt: **đo trước, tối ưu sau**. Mở React Profile
 
 ---
 
-## 1. Khi nào một `useQuery` gây re-render?
+## 1. Mô hình observer — khi nào một `useQuery` gây re-render?
 
-Mỗi `useQuery` đăng ký một **observer** vào cache entry. Khi entry đổi (data, status, fetchStatus, error...), observer cân nhắc có nên báo component re-render không. Mặc định v5 dùng **tracked queries**: nó *theo dõi bạn đọc field nào* từ kết quả, và chỉ re-render khi đúng field đó đổi.
+Để tối ưu re-render, trước hết phải hiểu **ai báo cho ai**. Mỗi lần gọi `useQuery` trong một component, React Query tạo một **`QueryObserver`** gắn vào **một** cache entry (xác định bởi `queryKey`). Observer là cầu nối: nó nghe cache entry, tính ra một *result object* (`{ data, status, fetchStatus, error, ... }`), và quyết định **có gọi `notify` để buộc component re-render hay không**.
+
+```text
+            ┌─────────────────────────────────────────────────────────┐
+            │  QueryCache  (một Query duy nhất cho mỗi queryKey)        │
+            │  state = { data, status, fetchStatus, error, dataUpdatedAt }
+            └───────────┬─────────────────────────────────────────────┘
+                        │  state thay đổi (fetch xong, setQueryData, invalidate…)
+                        ▼
+            ┌─────────────────────────────────────────────────────────┐
+            │  QueryObserver  (một cho MỖI lần gọi useQuery)            │
+            │  1. tính result mới (chạy `select` nếu có)               │
+            │  2. structural sharing: giữ tham chiếu nhánh không đổi   │
+            │  3. so result mới vs cũ — CHỈ field được "track" mới tính │
+            └───────────┬─────────────────────────────────────────────┘
+                        │  nếu có field theo dõi đổi → notify()
+                        ▼
+            ┌─────────────────────────────────────────────────────────┐
+            │  Component  →  React re-render                            │
+            └─────────────────────────────────────────────────────────┘
+```
+
+Điểm mấu chốt: **một cache entry có thể có nhiều observer** (nhiều component cùng dùng một `queryKey`). Khi entry đổi, *từng* observer tự tính xem component của mình có cần render không — chúng độc lập. Đó là lý do "chia nhỏ component" (mục 5) lại mạnh đến vậy.
+
+Mặc định v5 dùng **tracked queries**: observer *theo dõi bạn đọc field nào* từ result, và chỉ re-render khi đúng field đó đổi.
 
 ```tsx
 function Count() {
@@ -29,13 +53,15 @@ function Count() {
 
 Đây là khác biệt lớn so với các thư viện ngây thơ "đổi gì cũng báo": React Query mặc định đã thông minh về việc nào đáng re-render. Bạn thường **không cần** làm gì — nhưng cần hiểu để biết khi nào nó không đủ.
 
-> **Lưu ý:** tracked queries hoạt động nhờ Proxy trên object kết quả. Nếu bạn destructure *mọi* field (vd `const all = { ...query }`) hoặc đọc qua spread, bạn "chạm" hết field → mất lợi ích theo dõi. Chỉ đọc field bạn thật sự dùng.
+**Cơ chế dưới nắp capo:** result object của `useQuery` được bọc trong một `Proxy`. Lần đầu component render, mỗi lần bạn `query.data` / `query.isFetching` là một lần `get` trên Proxy — observer ghi tên field đó vào tập "tracked props". Lần sau cache đổi, observer chỉ `notify` nếu **một field trong tập đã track** thực sự khác giá trị cũ.
+
+> **Gotcha tracking:** Proxy chỉ ghi nhận field bạn *thật sự truy cập trong khi render*. Nếu bạn spread toàn bộ result (`const all = { ...query }`) hoặc destructure mọi field, bạn "chạm" hết → tập track = tất cả → mất lợi ích. Đọc `query.data` *bên trong* một callback chạy sau (vd `onClick`) cũng **không** được track (Proxy chỉ active lúc render). Chỉ đọc, lúc render, đúng field bạn dùng.
 
 ---
 
-## 2. `notifyOnChangeProps` — kiểm soát thủ công
+## 2. `notifyOnChangeProps` & tracked properties
 
-Khi cần kiểm soát tường minh (hoặc tắt tracking), `notifyOnChangeProps` liệt kê chính xác field nào được phép kích hoạt re-render:
+Tracked queries là *ngầm* (tự suy ra từ field bạn đọc). Khi cần **tường minh** — hoặc tắt hẳn tracking để đặt cứng danh sách — dùng `notifyOnChangeProps`:
 
 ```tsx
 const { data } = useQuery({
@@ -47,41 +73,98 @@ const { data } = useQuery({
 
 Hữu ích cho component "chỉ cần data, không quan tâm spinner": vd một cell trong bảng lớn không cần biết query đang background-refetch. Đặt `notifyOnChangeProps: ['data']` để nó *bất động* trừ khi data thực sự đổi.
 
-Giá trị đặc biệt `'all'` bắt re-render trên mọi thay đổi (hành vi cũ kiểu v3). Hiếm khi cần.
+### Bảng tra `notifyOnChangeProps`
+
+| Giá trị | Re-render khi… | Khi nào dùng |
+| --- | --- | --- |
+| (không đặt) — *mặc định* | Bất kỳ field **bạn đọc lúc render** đổi (tracked) | Gần như luôn luôn. Để v5 tự lo. |
+| `['data', 'error']` | Chỉ `data` hoặc `error` đổi | Component không cần biết spinner/`isFetching`; muốn cố định danh sách bất kể bạn đọc gì |
+| `['data']` | Chỉ `data` đổi | Cell/badge "câm" — chỉ vẽ lại khi data mới về, lờ mọi trạng thái nền |
+| `'all'` | **Mọi** thay đổi internal (kể cả `dataUpdatedAt`, `fetchStatus`) | Hành vi cũ kiểu v3; hiếm khi cần. Dùng khi debug hoặc render `dataUpdatedAt` |
+| `() => [...]` (hàm) | Trả danh sách động mỗi lần observer kiểm tra | Rất hiếm; cần logic động về việc field nào quan trọng |
+
+> **`'all'` ≠ tốt hơn.** Nó *tăng* re-render. Chỉ đặt khi bạn thật sự hiển thị một field "ồn ào" như thời điểm cập nhật. Với phần lớn app, **đừng đụng vào** `notifyOnChangeProps` — tracked queries đã đủ.
+
+**Quan hệ với tracking:** đặt `notifyOnChangeProps` thủ công sẽ **ghi đè** cơ chế tracked Proxy cho query đó. Nghĩa là bạn nhận về một mảng cứng thay vì để Proxy tự suy. Đừng đặt `'all'` "cho chắc" — đó chính là tắt tối ưu mặc định.
 
 ---
 
-## 3. `select` + tham chiếu ổn định
+## 3. `select` — đăng ký một lát cắt hẹp
 
-`select` (Phần 7) thu hẹp data component "nghe". Điểm tinh tế: `select` chạy **mỗi lần render**, và nếu nó trả về object/array mới mỗi lần, structural sharing của React Query vẫn so sánh kết quả để quyết định re-render. Nhưng để chắc chắn ổn định:
+`select` (Phần 7) là cách **thu hẹp cái component "nghe"** xuống đúng phần data cần. Observer chạy `select` *sau* khi lấy data, rồi so sánh **kết quả của `select`** (không phải data gốc) để quyết định re-render. Nhờ vậy hai component đọc cùng một query nhưng `select` khác nhau sẽ re-render theo nhịp khác nhau.
 
 ```tsx
-// ✅ select trả primitive → so sánh trị, ổn định tự nhiên
+// Component A re-render khi SỐ LƯỢNG đổi — không quan tâm nội dung từng item
 const count = useQuery({ ...customersQuery(), select: (d) => d.length });
 
-// ⚠️ select trả object/array mới → dựa vào structural sharing của Query để so sánh
+// Component B re-render khi DANH SÁCH active đổi — không quan tâm item inactive
 const active = useQuery({
   ...customersQuery(),
-  select: (d) => d.filter((c) => c.active), // mảng mới mỗi lần
+  select: (d) => d.filter((c) => c.active),
 });
 ```
 
-Với phép biến đổi **nặng**, memo hoá `select` để không chạy lại khi data không đổi:
+Nếu `customersQuery` refetch nhưng `length` không đổi, **A không render**; nếu chỉ item inactive đổi, **B không render**. Một query, nhiều "view" độc lập.
+
+### Yêu cầu sống còn: tham chiếu `select` phải ỔN ĐỊNH
+
+`select` chạy lại khi: (a) data đổi, **hoặc** (b) chính hàm `select` đổi tham chiếu. Nếu bạn viết arrow **inline**, mỗi lần component render là một hàm `select` *mới* → observer coi như "select đổi" → chạy lại `select` mỗi render (tốn CPU với phép biến đổi nặng), dù vẫn nhờ structural sharing mà thường không gây re-render thừa.
 
 ```tsx
-const selectActive = useCallback((d: Customer[]) => d.filter((c) => c.active), []);
+// ⚠️ select inline — hàm MỚI mỗi render → select chạy lại mỗi render
+const active = useQuery({
+  ...customersQuery(),
+  select: (d) => d.filter((c) => c.active), // tốn CPU nếu d to / filter nặng
+});
+
+// ✅ select ổn định — useCallback giữ một tham chiếu → chỉ chạy khi data đổi
+const selectActive = useCallback(
+  (d: Customer[]) => d.filter((c) => c.active),
+  [],
+);
 const active = useQuery({ ...customersQuery(), select: selectActive });
 ```
 
-React Query so sánh kết quả `select` bằng structural sharing, nên ngay cả `filter` trả mảng mới, nếu *nội dung* giống lần trước, component vẫn không re-render.
+> **Quy tắc:** `select` **nhẹ** (lấy `.length`, đọc một field) → để inline thoải mái, chi phí không đáng kể. `select` **nặng** (filter/sort/map mảng lớn, tính toán phái sinh) → bọc `useCallback` (hoặc đưa ra ngoài component nếu không phụ thuộc props) để không chạy lại vô ích.
+
+Nếu `select` phụ thuộc một biến (vd từ khoá lọc), đưa biến vào dependency array — nhưng nhớ: đổi dependency = `select` đổi tham chiếu = chạy lại. Đó là đúng và mong muốn.
+
+```tsx
+const selectByKeyword = useCallback(
+  (d: Customer[]) => d.filter((c) => c.name.includes(keyword)),
+  [keyword], // đổi keyword → select chạy lại; đúng ý
+);
+```
+
+Vì observer dùng structural sharing trên **đầu ra** của `select`, nên dù `filter` trả mảng mới mỗi lần, nếu *nội dung* giống hệt lần trước, component **vẫn không re-render**.
 
 ---
 
-## 4. `structuralSharing` — cơ chế bên trong & tuỳ chỉnh
+## 4. Structural sharing — giữ tham chiếu để bỏ qua re-render
 
-Sau mỗi lần data mới về (refetch, setQueryData), React Query chạy `replaceEqualDeep`: đi sâu so sánh data mới với cũ, **giữ nguyên tham chiếu** mọi nhánh không đổi. Kết quả: `data === data` cũ nếu không có gì đổi → không re-render; nếu chỉ một phần tử đổi, chỉ phần tử đó nhận tham chiếu mới.
+Sau mỗi lần data mới về (refetch, `setQueryData`), React Query chạy `replaceEqualDeep`: đi sâu so sánh data mới với data cũ, **giữ nguyên tham chiếu** mọi nhánh không đổi.
 
-Điều kiện để nó hoạt động: data phải **JSON-serializable**. Với data chứa `Date`, `Map`, hay class instance, structural sharing mặc định có thể không so sánh đúng. Khi đó cung cấp hàm tuỳ chỉnh:
+```text
+  data cũ                          data mới (sau refetch)
+  ┌───────────────┐                ┌───────────────┐
+  │ [0] Alice  ●──┼──────同一?──────┼──● [0] Alice   │  giống → GIỮ tham chiếu cũ
+  │ [1] Bob    ●──┼──────同一?──────┼──● [1] Bob     │  giống → GIỮ tham chiếu cũ
+  │ [2] Carol  ●──┼──── khác! ──────┼──○ [2] Carol*  │  đổi  → tham chiếu MỚI
+  └───────────────┘                └───────────────┘
+        │                                  │
+   mảng ngoài chứa [2] mới → mảng MỚI, nhưng [0],[1] vẫn === cũ
+```
+
+Hệ quả thực tế:
+
+- Nếu **không có gì** đổi sau refetch → `data === data` cũ → observer thấy y hệt → **không re-render** dù vừa fetch xong.
+- Nếu chỉ `Carol` đổi → chỉ phần tử `[2]` nhận tham chiếu mới. Một `<Row item={alice} />` được `React.memo` sẽ **không render lại** vì `alice` vẫn `===` cũ. Chỉ `<Row item={carol} />` render.
+
+Đây là lý do `React.memo` trên row component lại "ăn khớp" hoàn hảo với React Query: structural sharing đảm bảo các prop không đổi vẫn giữ nguyên reference.
+
+### Khi nào tắt — và rủi ro
+
+Điều kiện để `replaceEqualDeep` chạy đúng: data phải **JSON-serializable**. Với data chứa `Date`, `Map`, `Set`, hay class instance, so sánh sâu mặc định có thể không chính xác (hoặc tốn kém). Khi đó:
 
 ```ts
 useQuery({
@@ -91,7 +174,7 @@ useQuery({
   structuralSharing: false,
 });
 
-// Hoặc tuỳ chỉnh toàn cục (vd dùng thư viện so sánh khác):
+// Hoặc tuỳ chỉnh toàn cục (vd hợp nhất theo cách riêng):
 new QueryClient({
   defaultOptions: {
     queries: {
@@ -101,39 +184,19 @@ new QueryClient({
 });
 ```
 
-> Đừng tắt `structuralSharing` trừ khi có lý do (data không serialize được). Nó là một trong những tối ưu "miễn phí" giá trị nhất của thư viện.
+| `structuralSharing` | Hành vi | Đánh đổi |
+| --- | --- | --- |
+| `true` (mặc định) | `replaceEqualDeep` giữ tham chiếu nhánh không đổi | Tốt cho data JSON; tốn chút CPU so sánh sâu data **rất** lớn |
+| `false` | Luôn dùng data mới nguyên xi từ `queryFn` | Mọi prop con đổi reference → `React.memo` vô dụng → re-render nhiều hơn |
+| `(old, new) => merged` | Bạn tự quyết hợp nhất | Toàn quyền cho data có `Date`/`Map`/class; phải tự đảm bảo đúng |
+
+> Đừng tắt `structuralSharing` trừ khi có lý do rõ (data không serialize được, hoặc data khổng lồ khiến so sánh sâu thành nút thắt — hiếm). Nó là một trong những tối ưu "miễn phí" giá trị nhất của thư viện.
 
 ---
 
-## 5. `useQueries` — danh sách query động
+## 5. Cô lập component — chia nhỏ subscription
 
-Khi số lượng query **không cố định** (vd fetch chi tiết cho N item được chọn), bạn không thể gọi `useQuery` trong vòng lặp (vi phạm rules of hooks). Dùng `useQueries`:
-
-```tsx
-import { useQueries } from '@tanstack/react-query';
-
-function SelectedCustomers({ ids }: { ids: string[] }) {
-  const results = useQueries({
-    queries: ids.map((id) => customerQuery(id)),
-    // combine: gộp kết quả thành một giá trị, chỉ re-render khi giá trị gộp đổi.
-    combine: (results) => ({
-      data: results.map((r) => r.data).filter(Boolean),
-      isPending: results.some((r) => r.isPending),
-    }),
-  });
-
-  if (results.isPending) return <Spinner />;
-  return <List items={results.data} />;
-}
-```
-
-`combine` quan trọng cho hiệu năng: thay vì component nghe N kết quả riêng lẻ (re-render khi *bất kỳ* cái nào đổi), nó nghe **một** giá trị gộp. Nhớ giữ `combine` ổn định (định nghĩa ngoài render hoặc memo) để tránh chạy lại thừa.
-
----
-
-## 6. Cô lập subscription — chia nhỏ component
-
-Một sai lầm hiệu năng phổ biến: gọi `useQuery` ở component **cha to** rồi truyền data xuống. Khi query refetch, cả cây con render. Thay vào đó, đẩy `useQuery` xuống **đúng component cần data**:
+Một sai lầm hiệu năng phổ biến nhất: gọi `useQuery` ở component **cha to** rồi truyền data xuống. Khi query refetch, **cả cây con** render. Thay vào đó, đẩy `useQuery` xuống **đúng component cần data** (colocation):
 
 ```tsx
 // ❌ Page nghe query → cả page render khi refetch
@@ -158,23 +221,192 @@ function Page() {
 }
 ```
 
-Mỗi `useQuery` là một điểm subscription độc lập. Đặt subscription càng gần nơi dùng data, phạm vi re-render càng hẹp. Đây thường là tối ưu *có tác động lớn nhất* và rẻ nhất.
+Mỗi `useQuery` là một điểm subscription độc lập (mục 1: một observer riêng). Đặt subscription càng gần nơi dùng data, phạm vi re-render càng hẹp. Đây thường là tối ưu **có tác động lớn nhất** và rẻ nhất — không cần memo, không cần `select`, chỉ cần di chuyển chỗ gọi hook.
+
+> **Đừng sợ gọi cùng một query ở nhiều nơi.** Nhờ dedupe theo `queryKey`, gọi `useQuery(statsQuery())` ở `StatsBadge` *và* `StatsChart` chỉ tạo **một** network request — nhưng **hai** observer độc lập, mỗi cái render riêng. Đây là chuyện tốt: bạn được cô lập re-render mà không tốn thêm fetch.
+
+Nguyên tắc đi kèm: **đừng truyền cả `data` xuống sâu** chỉ để con cháu lôi ra một field. Mỗi tầng nhận `data` sẽ render khi `data` đổi. Hoặc để mỗi lá tự `useQuery` + `select` lát cắt của nó, hoặc dùng Context cẩn thận. Truyền nguyên `data` qua 5 tầng = 5 tầng cùng render mỗi lần data nhúc nhích.
 
 ---
 
-## 7. Thứ tự tối ưu (nhắc lại & mở rộng)
+## 6. `useQueries` + `combine` — danh sách query động
 
-Từ Phần 7, theo thứ tự tác động:
+Khi số lượng query **không cố định** (vd fetch chi tiết cho N item được chọn), bạn không thể gọi `useQuery` trong vòng lặp (vi phạm rules of hooks). Dùng `useQueries`:
+
+```tsx
+import { useQueries } from '@tanstack/react-query';
+
+function SelectedCustomers({ ids }: { ids: string[] }) {
+  const { data, isPending } = useQueries({
+    queries: ids.map((id) => customerQuery(id)),
+    // combine: gộp N kết quả thành MỘT giá trị; component chỉ nghe giá trị gộp.
+    combine: combineCustomers,
+  });
+
+  if (isPending) return <Spinner />;
+  return <List items={data} />;
+}
+
+// ✅ combine định nghĩa NGOÀI render → tham chiếu ổn định
+function combineCustomers(results: UseQueryResult<Customer>[]) {
+  return {
+    data: results.map((r) => r.data).filter((c): c is Customer => Boolean(c)),
+    isPending: results.some((r) => r.isPending),
+  };
+}
+```
+
+`combine` quan trọng cho hiệu năng: thay vì component nghe N kết quả riêng lẻ (re-render khi *bất kỳ* cái nào đổi), nó nghe **một** giá trị gộp, và chỉ render khi giá trị gộp thực sự khác (structural sharing áp lên đầu ra của `combine`).
+
+> **Caveat tham chiếu ổn định:** giống `select`, nếu bạn viết `combine` **inline** thì mỗi render là một hàm mới → `combine` chạy lại mỗi render. Với N nhỏ thì không sao; với N lớn hoặc phép gộp nặng, **đưa `combine` ra ngoài** (như trên) hoặc `useCallback`. React Query *vẫn* structural-share đầu ra nên thường không gây re-render thừa — nhưng bạn tiết kiệm CPU bằng cách không chạy lại phép gộp vô ích.
+
+`combine` cũng là nơi lý tưởng để tính **giá trị phái sinh** (tổng, trung bình, gộp lỗi) một lần, thay vì rải `.map`/`.reduce` khắp JSX con.
+
+---
+
+## 7. Danh sách lớn — memo, keys, virtualization
+
+Bảng/list dài là nơi re-render thừa "ăn" nhiều FPS nhất. Bốn đòn bẩy, theo thứ tự:
+
+1. **Đừng truyền cả `data` xuống từng row.** Truyền đúng `item` của row đó. Nhờ structural sharing (mục 4), row không đổi giữ nguyên reference.
+2. **`React.memo` row component** với prop là chính `item`. Khi list refetch nhưng chỉ vài item đổi, chỉ những row đó render.
+3. **`key` ổn định, định danh thật** (id của bản ghi), **không** dùng index. `key` index khiến React tái dùng nhầm DOM khi list sắp xếp/lọc → row "nhảy" và render sai.
+4. **Virtualization** khi list cực dài (hàng nghìn dòng): chỉ mount các row đang trong viewport. Dùng `@tanstack/react-virtual`. React Query lo *data*, virtual lo *số DOM node*.
+
+```tsx
+// Row được memo: chỉ render khi `item` của NÓ đổi reference (structural sharing lo việc đó)
+const Row = React.memo(function Row({ item }: { item: Customer }) {
+  return <li>{item.name} — {item.email}</li>;
+});
+
+function CustomerList() {
+  const { data = [] } = useQuery(customersQuery());
+  return (
+    <ul>
+      {data.map((c) => (
+        <Row key={c.id} item={c} /> // key = id thật, KHÔNG phải index
+      ))}
+    </ul>
+  );
+}
+```
+
+> **Ghép đôi quan trọng:** `React.memo` row **chỉ** phát huy khi prop giữ reference giữa các lần render — và đó chính là điều structural sharing của React Query đảm bảo. Nếu bạn `select: (d) => d.map(transform)` tạo object mới cho *mọi* row mỗi lần, bạn vô tình phá reference → `React.memo` vô dụng. Hoặc memo phép transform, hoặc transform trong chính row.
+
+---
+
+## 8. React 18/19 & React Compiler
+
+Bối cảnh React hiện đại làm nhẹ gánh tối ưu thủ công — nhưng không thay thế các nguyên tắc trên:
+
+- **Automatic batching (React 18+):** nhiều `setState`/notify trong cùng một tick (kể cả trong promise, `setTimeout`, event handler) được gộp thành **một** lần render. Khi 3 query cùng resolve gần nhau, bạn không còn ăn 3 lần render liên tiếp như React 17. React Query tận dụng điều này sẵn — bạn không phải làm gì.
+- **`useSuspenseQuery` + streaming (React 18/19):** kết hợp Suspense, data về theo dòng, tránh "loading nhấp nháy" toàn trang (đã bàn ở Phần 7 & 10).
+- **React Compiler (React 19):** tự chèn memo hoá ở mức biên dịch — nhiều `useMemo`/`useCallback`/`React.memo` thủ công trở nên thừa. Nhưng **`select`/`combine` của React Query không nằm trong phạm vi Compiler tối ưu hoàn toàn** (chúng là option truyền vào hook), nên *tham chiếu ổn định cho `select`/`combine` vẫn nên cân nhắc* khi phép biến đổi nặng. Khi bật Compiler, hãy *đo lại* trước khi gỡ memo cũ.
+
+> **Định hướng:** Coi React Compiler là "memo hoá mặc định cho component", còn `select`/`combine` reference vẫn là quyết định của bạn. Đừng vội xoá `useCallback` quanh `select` nặng chỉ vì đã bật Compiler — hãy đo bằng Profiler.
+
+---
+
+## 9. Thứ tự tối ưu (nhắc lại & mở rộng)
+
+Từ Phần 7, theo thứ tự **tác động giảm dần** — luôn làm từ trên xuống:
 
 1. **Bundle** — code splitting, lazy route. Không tải JS thừa.
 2. **Data** — prefetch, tránh waterfall (Phần 11). Data tới sớm.
-3. **Re-render** — đặt subscription gần nơi dùng (mục 6) → `select`/`notifyOnChangeProps` → `useQueries.combine` → memo component con.
+3. **Kiến trúc subscription** — đặt `useQuery` gần nơi dùng (mục 5), đừng truyền cả `data` xuống sâu (mục 7).
+4. **Thu hẹp cái component nghe** — `select` lát cắt hẹp (mục 3) → `notifyOnChangeProps` (mục 2) → `useQueries.combine` (mục 6).
+5. **Memo cấp render** — `React.memo` row + key ổn định (mục 7), virtualization nếu list khổng lồ.
 
-Làm từ trên xuống. Đừng nhảy vào micro-optimize `select` khi component cha to vẫn nghe query và kéo cả cây render — sửa kiến trúc subscription trước.
+> Đừng nhảy vào micro-optimize `select` khi component cha to vẫn nghe query và kéo cả cây render. **Sửa kiến trúc subscription (bước 3) trước** — nó thường xoá phần lớn re-render thừa chỉ bằng việc dời chỗ gọi hook.
+
+**Và trên hết: đo trước, tối ưu sau.** Mở React DevTools Profiler, ghi một lần refetch, tìm component "render mà không đổi gì", rồi mới áp đúng kỹ thuật cho đúng chỗ.
 
 ---
 
-## 8. Bài tập
+## 10. Gotchas thường gặp
+
+| Triệu chứng | Nguyên nhân | Cách sửa |
+| --- | --- | --- |
+| Component render mỗi lần background-refetch dù data y hệt | Đọc `isFetching`/`fetchStatus` lúc render (tracked) hoặc spread cả result | Chỉ đọc `data`; hoặc `notifyOnChangeProps: ['data']` |
+| `select` chạy lại mỗi render, tốn CPU | `select` viết **inline** → hàm mới mỗi render | `useCallback` (hoặc đưa ra ngoài component) cho `select` nặng |
+| `React.memo` row vô dụng, vẫn render hết | `select`/transform tạo object mới cho mọi item; hoặc truyền cả `data` xuống | Giữ reference (structural sharing); memo transform; truyền đúng `item` |
+| Mất hết lợi ích tracked queries | `const all = { ...query }` hoặc destructure mọi field | Chỉ destructure field thật dùng, lúc render |
+| `useQueries` render mỗi khi 1 query con đổi dù kết quả gộp như cũ | `combine` viết **inline** → reference đổi mỗi render | Đưa `combine` ra ngoài / `useCallback` |
+| Spinner "nhấp nháy" liên tục trên list | Hiển thị theo `isFetching` (đổi mỗi background-refetch) | Dùng `isPending`/`status` cho lần load đầu; tách indicator nền ra component riêng |
+| List sắp xếp/lọc làm row "nhảy" và render sai | `key={index}` | `key={item.id}` — id định danh thật |
+| Đặt `notifyOnChangeProps: 'all'` "cho chắc" | Hiểu nhầm `'all'` an toàn hơn | Bỏ đi — `'all'` *tăng* re-render; để mặc định tracked |
+
+---
+
+## 11. Recipes thực chiến
+
+**Hook `select` hẹp, tái dùng (tham chiếu ổn định):**
+
+```tsx
+// Tách select ra hook → mọi nơi dùng đều có select ổn định, type rõ.
+function useActiveCustomers() {
+  return useQuery({
+    ...customersQuery(),
+    select: selectActive, // hằng module-level → reference ổn định
+  });
+}
+
+function selectActive(d: Customer[]): Customer[] {
+  return d.filter((c) => c.active);
+}
+```
+
+**Row được cô lập + memo (ăn khớp structural sharing):**
+
+```tsx
+const CustomerRow = React.memo(function CustomerRow({ id }: { id: string }) {
+  // Mỗi row tự đăng ký lát cắt của riêng nó → chỉ row có item đổi mới render.
+  const { data } = useQuery({
+    ...customersQuery(),
+    select: useCallback((d: Customer[]) => d.find((c) => c.id === id), [id]),
+  });
+  if (!data) return null;
+  return <li>{data.name}</li>;
+});
+```
+
+**`combine` cho giá trị phái sinh (tính một lần):**
+
+```tsx
+function useOrderTotals(ids: string[]) {
+  return useQueries({
+    queries: ids.map((id) => orderQuery(id)),
+    combine: combineTotals, // ngoài render → ổn định
+  });
+}
+
+function combineTotals(results: UseQueryResult<Order>[]) {
+  const orders = results.map((r) => r.data).filter((o): o is Order => Boolean(o));
+  return {
+    total: orders.reduce((sum, o) => sum + o.amount, 0),
+    isPending: results.some((r) => r.isPending),
+  };
+}
+```
+
+**Tách indicator nền để hết nhấp nháy:**
+
+```tsx
+function List() {
+  const { data } = useQuery({ ...itemsQuery(), notifyOnChangeProps: ['data'] });
+  return <ul>{data?.map((i) => <Row key={i.id} item={i} />)}</ul>;
+}
+
+// Indicator nền sống ở component RIÊNG → chỉ NÓ render khi isFetching đổi.
+function BackgroundSpinner() {
+  const isFetching = useIsFetching({ queryKey: itemsQuery().queryKey });
+  return isFetching ? <span className="dot" /> : null;
+}
+```
+
+---
+
+## 12. Bài tập
 
 **1.** "Tracked queries" của v5 nghĩa là gì, và làm sao bạn vô tình *phá* nó?
 
@@ -203,21 +435,41 @@ Mỗi `useQuery` là một điểm subscription; component chứa nó (và cây 
 
 </details>
 
-**Nâng cao:** Lấy một trang gọi `useQuery` ở cha và truyền prop xuống. Mở React Profiler, ghi lại một lần refetch. Đẩy `useQuery` xuống component lá, đo lại — so sánh số component re-render trước/sau.
+**4.** Hai component cùng gọi `useQuery(customersQuery())` — một dùng `select: (d) => d.length`, một dùng `select: (d) => d.filter((c) => c.active)`. Sau một refetch chỉ thêm một customer *inactive*, component nào re-render? Vì sao?
+
+<details>
+<summary>Lời giải</summary>
+
+Observer so sánh **đầu ra của `select`**, không phải data gốc. Thêm một item inactive: `length` đổi (tăng 1) → component đếm **re-render**; còn danh sách `active` (sau structural sharing) có *nội dung y hệt* → đầu ra `select` giữ reference → component active **không re-render**. Một query, hai nhịp render độc lập — đó là sức mạnh của `select`.
+
+</details>
+
+**5.** Bạn viết `select: (d) => d.filter((c) => c.active)` **inline** và `combine` **inline** trong `useQueries`. Cả hai "chạy lại mỗi render". Điều này có gây *re-render thừa* không? Chi phí thực là gì, và khi nào phải sửa?
+
+<details>
+<summary>Lời giải</summary>
+
+Thường **không** gây re-render thừa: React Query áp structural sharing lên đầu ra của `select`/`combine`, nên dù hàm chạy lại và trả mảng mới, nếu *nội dung* giống thì component không render. Chi phí thực là **CPU**: phép `filter`/gộp chạy lại mỗi render dù data không đổi. Phải sửa (đưa hàm ra ngoài / `useCallback`) khi phép biến đổi **nặng** hoặc data **lớn** — lúc đó CPU lãng phí mới đáng kể.
+
+</details>
+
+**Nâng cao:** Lấy một trang gọi `useQuery` ở cha và truyền prop xuống. Mở React Profiler, ghi lại một lần refetch. Đẩy `useQuery` xuống component lá, đo lại — so sánh số component re-render trước/sau. Sau đó thêm `React.memo` cho row + `key={item.id}` và ghi lại lần ba: xác nhận chỉ row có item đổi mới render.
 
 ---
 
 ## Tóm tắt
 
-- v5 mặc định **tracked queries**: chỉ re-render khi field bạn *đọc* đổi. Đừng spread toàn bộ kết quả (phá tracking).
-- `notifyOnChangeProps: ['data']` cho component "chỉ cần data" bất động trước thay đổi fetchStatus.
-- `select` thu hẹp + structural sharing giữ tham chiếu; memo `select` nặng bằng `useCallback`.
-- `structuralSharing` (`replaceEqualDeep`) là tối ưu miễn phí; chỉ tắt khi data không JSON-serializable.
-- `useQueries` cho danh sách query động; `combine` gộp kết quả để giảm re-render.
-- **Đặt subscription gần nơi dùng** thường là tối ưu re-render lớn nhất. Thứ tự: bundle → data → re-render.
+- **Mô hình observer:** mỗi `useQuery` = một observer gắn vào một cache entry; một entry có thể nuôi nhiều observer độc lập. Observer tính result, structural-share, rồi mới quyết định `notify`.
+- v5 mặc định **tracked queries** (Proxy): chỉ re-render khi field bạn *đọc lúc render* đổi. Đừng spread toàn bộ result (`{ ...query }`) — phá tracking.
+- `notifyOnChangeProps` đặt cứng danh sách field (`['data']` cho component "câm"); `'all'` *tăng* re-render — hiếm khi cần.
+- `select` đăng ký một **lát cắt hẹp** → nhiều view độc lập trên cùng query. `select` **nặng** phải có **tham chiếu ổn định** (`useCallback`/hằng module) kẻo chạy lại mỗi render.
+- **Structural sharing** (`replaceEqualDeep`) giữ tham chiếu nhánh không đổi → `React.memo` row hoạt động. Chỉ tắt khi data không JSON-serializable hoặc khổng lồ.
+- **Cô lập subscription** (đặt `useQuery` gần nơi dùng, đừng truyền cả `data` xuống sâu) thường là tối ưu re-render lớn nhất.
+- `useQueries` + `combine` cho danh sách query động; giữ `combine` ổn định. Lists: `React.memo` + `key={id}` thật + virtualization nếu khổng lồ.
+- React 18 batching & React 19 Compiler giảm memo thủ công, nhưng `select`/`combine` reference vẫn do bạn — **đo trước, tối ưu sau**. Thứ tự: bundle → data → kiến trúc subscription → thu hẹp cái nghe → memo render.
 
 ---
 
 ## Phần tiếp theo
 
-**Phần 17 — Type-safety đỉnh cao:** typing toàn trình từ `queryFn` tới component, generic query factory tái dùng, dùng `skipToken` thay cho `enabled` để type hẹp đúng, suy luận type qua `DataTag`/`queryOptions`, kết hợp zod `infer`, và loại bỏ `as` khỏi lớp data.
+**[Phần 17 — Type-safety đỉnh cao](/blog/tanstack-query-17-type-safety-mastery/):** typing toàn trình từ `queryFn` tới component, generic query factory tái dùng, dùng `skipToken` thay cho `enabled` để type hẹp đúng, suy luận type qua `DataTag`/`queryOptions`, kết hợp zod `infer`, và loại bỏ `as` khỏi lớp data.

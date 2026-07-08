@@ -8,13 +8,30 @@ seriesOrder: 15
 draft: false
 ---
 
-Phần 5 và 6 đã dạy mutation cơ bản và optimistic update. Nhưng app thật đặt ra những câu hỏi khó hơn: làm sao hiện "đang lưu…" ở một chỗ *khác* nơi gọi mutation? Làm sao đảm bảo hai mutation cùng loại **không chạy đè** lên nhau? Làm sao optimistic update khi một thao tác đụng tới *nhiều* query? Phần này trả lời từng câu, biến mutation từ "gọi rồi quên" thành một hệ thống có kiểm soát.
+Phần 5 dạy mutation cơ bản, Phần 6 dạy optimistic update một query, Phần 13 dạy mutation offline. Nhưng app thật đặt ra những câu hỏi khó hơn: làm sao hiện "đang lưu…" ở một chỗ *khác* nơi gọi mutation? Làm sao đảm bảo hai mutation cùng loại **không chạy đè** lên nhau? Làm sao render một item optimistic mà **không đụng cache**? Làm sao chia sẻ một định nghĩa mutation để mutation đã xếp hàng offline (Phần 13) chạy lại được? Phần này trả lời từng câu, biến mutation từ "gọi rồi quên" thành một hệ thống có kiểm soát.
+
+> **Bản đồ tư duy.** Mutation nâng cao xoay quanh một thứ: **`mutationKey`**. Nó là cái móc để (1) *đọc* trạng thái từ xa (`useMutationState`, `useIsMutating`), (2) *cấu hình* từ xa (`setMutationDefaults`), và (3) *điều phối* chạy tuần tự (`scope`). Cộng thêm hai kỹ thuật không cần key: optimistic qua `variables` và sequential mutations.
+
+```text
+                         ┌──────────────────────────┐
+                         │       mutationKey        │
+                         │   ['customer','update']  │
+                         └────────────┬─────────────┘
+              ┌───────────────────────┼───────────────────────┐
+              ▼                       ▼                        ▼
+      ┌───────────────┐      ┌─────────────────┐      ┌────────────────┐
+      │  ĐỌC từ xa    │      │  CẤU HÌNH từ xa │      │  ĐIỀU PHỐI      │
+      │ useMutation   │      │ setMutation     │      │ scope:{id}      │
+      │   State       │      │   Defaults      │      │ → chạy tuần tự  │
+      │ useIsMutating │      │ (resume offline)│      │                 │
+      └───────────────┘      └─────────────────┘      └────────────────┘
+```
 
 ---
 
-## 1. `mutationKey` — định danh để theo dõi & cấu hình
+## 1. `mutationKey` — định danh để theo dõi, cấu hình & điều phối
 
-Khác query, mutation **không bắt buộc** có key. Nhưng đặt `mutationKey` mở ra ba năng lực: theo dõi qua `useMutationState`, cấu hình qua `setMutationDefaults` (offline — Phần 13), và `scope` để chạy tuần tự (mục 3).
+Khác query, mutation **không bắt buộc** có key — bạn vẫn `mutate()` bình thường mà không cần key. Nhưng đặt `mutationKey` mở ra một loạt năng lực mà nếu không có key thì *không thể* làm:
 
 ```ts
 useMutation({
@@ -23,13 +40,25 @@ useMutation({
 });
 ```
 
-Coi `mutationKey` như "tên loại thao tác", không phải "id một lần chạy" — nhiều lần update customer dùng *cùng* key.
+Coi `mutationKey` như **"tên loại thao tác"**, không phải "id một lần chạy" — mọi lần update customer dùng *cùng* key `['customer','update']`. Đừng nhét id bản ghi vào key trừ khi bạn thật sự muốn lọc theo bản ghi.
+
+### Bảng tra: `mutationKey` mở khoá những gì
+
+| Năng lực | API | Cần `mutationKey`? | Mục |
+|---|---|---|---|
+| Đọc trạng thái mutation từ component khác | `useMutationState({ filters })` | Có (để lọc theo loại) | 2 |
+| Đếm nhanh số mutation đang chạy | `useIsMutating({ mutationKey })` | Tuỳ (lọc theo loại) | 3 |
+| Đăng ký `mutationFn` + options dùng lại | `setMutationDefaults(key, opts)` | **Bắt buộc** | 5 |
+| Resume mutation offline sau reload | `setMutationDefaults` + `mutationKey` | **Bắt buộc** | 5 |
+| Chạy tuần tự (không liên quan key) | `scope: { id }` | Không (dùng `scope` riêng) | 4 |
+
+> **`mutationKey` vs `scope`.** Đây là hai trục độc lập. `mutationKey` = *"thao tác loại gì"* (để đọc/cấu hình). `scope.id` = *"hàng đợi nào"* (để điều phối thứ tự chạy). Hai mutation có thể cùng `mutationKey` nhưng khác `scope`, hoặc ngược lại.
 
 ---
 
 ## 2. `useMutationState` — đọc trạng thái mutation từ xa
 
-Vấn đề kinh điển: nút "Lưu" nằm trong form, nhưng bạn muốn hiện spinner "đang đồng bộ" ở **header** (component khác cây). `useMutationState` đọc trạng thái mọi mutation khớp filter, ở bất kỳ đâu:
+Vấn đề kinh điển: nút "Lưu" nằm trong form, nhưng bạn muốn hiện spinner "đang đồng bộ" ở **header** (component khác cây). Không có `useMutationState`, bạn phải nâng state lên context/Redux thủ công. Với nó, bạn đọc trạng thái mọi mutation khớp filter, ở bất kỳ đâu:
 
 ```tsx
 import { useMutationState } from '@tanstack/react-query';
@@ -38,7 +67,7 @@ function SyncIndicator() {
   // Đếm số mutation 'customer/update' đang chạy, dù chúng được gọi ở đâu.
   const pending = useMutationState({
     filters: { mutationKey: ['customer', 'update'], status: 'pending' },
-    select: (m) => m.state.variables,
+    select: (mutation) => mutation.state.variables,
   });
 
   if (pending.length === 0) return null;
@@ -46,31 +75,130 @@ function SyncIndicator() {
 }
 ```
 
-Dùng được cho: badge "đang lưu", hiển thị optimistic item *trước khi* nó vào cache (lấy `variables` của mutation pending), hoặc disable một nút toàn cục khi có thao tác nặng đang chạy.
+### Bảng tra `useMutationState(options)`
+
+| Field | Kiểu | Ý nghĩa |
+|---|---|---|
+| `filters.mutationKey` | `unknown[]` | Lọc theo loại thao tác (so khớp prefix, giống query filter). |
+| `filters.status` | `'idle' \| 'pending' \| 'success' \| 'error'` | Chỉ lấy mutation ở trạng thái này. |
+| `filters.exact` | `boolean` | `true` = khớp key chính xác thay vì prefix. |
+| `filters.predicate` | `(mutation) => boolean` | Lọc tuỳ ý (vd theo `meta`, theo `variables`). |
+| `select` | `(mutation) => T` | Trích phần cần — trả `T[]` thay vì cả đối tượng mutation. **Luôn dùng** để giảm re-render. |
+
+> **Cơ chế.** `useMutationState` subscribe vào `MutationCache`. Mỗi khi cache đổi (mutation mới chạy, đổi status…), nó chạy lại filter + `select`, rồi so sánh kết quả bằng structural sharing — chỉ re-render khi mảng kết quả thật sự đổi. Vì nó trả về **mảng** (nhiều mutation có thể khớp), luôn xử lý `length === 0`.
+
+Dùng được cho: badge "đang lưu", hiển thị optimistic item *trước khi* nó vào cache (lấy `variables` của mutation pending — xem mục 7), hoặc disable một nút toàn cục khi có thao tác nặng đang chạy.
 
 ---
 
-## 3. `scope` — chạy tuần tự thay vì song song
+## 3. `useIsMutating` — đếm nhanh số mutation đang chạy
 
-Mặc định mutation chạy **song song**. Nhưng đôi khi điều đó sai: gửi nhiều cập nhật cùng một bản ghi cùng lúc → race, thứ tự ghi không xác định. `scope.id` bắt các mutation cùng scope **xếp hàng**, chạy lần lượt:
+Khi bạn chỉ cần *một con số* (có thao tác ghi nào đang chạy không?), `useIsMutating` gọn hơn `useMutationState`. Nó trả về **số nguyên** = số mutation pending khớp filter:
+
+```tsx
+import { useIsMutating } from '@tanstack/react-query';
+
+function GlobalSpinner() {
+  const isMutating = useIsMutating(); // tổng số mutation đang chạy toàn app
+  const savingCustomer = useIsMutating({ mutationKey: ['customer'] }); // chỉ loại 'customer'
+
+  return isMutating > 0 ? <Spinner label={`${isMutating} thao tác…`} /> : null;
+}
+```
+
+### `useIsMutating` vs `useMutationState`
+
+| Tiêu chí | `useIsMutating` | `useMutationState` |
+|---|---|---|
+| Trả về | `number` (đếm pending) | `T[]` (mảng đã `select`) |
+| Dùng khi | Chỉ cần biết *có/bao nhiêu* | Cần *dữ liệu* (variables, error…) |
+| Re-render | Khi con số đổi | Khi mảng kết quả đổi |
+| Ví dụ | Global spinner, disable nút | Optimistic row, danh sách lỗi |
+
+> **Mẹo.** Có một `useIsFetching` song song cho query (Phần 16). Cặp `useIsMutating` + `useIsFetching` ở layout gốc cho bạn một "thanh trạng thái mạng" toàn cục chỉ với hai dòng.
+
+---
+
+## 4. `scope` — chạy tuần tự thay vì song song
+
+Mặc định mutation chạy **song song**. Nhưng đôi khi điều đó sai: gửi nhiều cập nhật cùng một bản ghi cùng lúc → race, thứ tự ghi không xác định, response về lộn xộn. `scope.id` bắt các mutation cùng scope **xếp hàng**, chạy lần lượt:
 
 ```ts
 useMutation({
-  mutationFn: updateDocument,
+  mutationFn: reorderItem,
   // Mọi mutation cùng scope.id chạy TUẦN TỰ, không chồng chéo.
-  scope: { id: `document-${documentId}` },
+  scope: { id: `list-${listId}` },
 });
 ```
 
-Khi user bấm "Lưu" liên tục, mutation thứ hai chờ thứ nhất xong mới chạy — giữ thứ tự ghi đúng. Hợp với: chỉnh sửa cùng tài liệu, thao tác trên cùng hàng tồn kho, hay bất cứ tài nguyên nào mà thứ tự ghi quan trọng.
+### Song song (mặc định) vs tuần tự (`scope`)
 
-> **Phân biệt với debounce:** debounce *bỏ* các lần gọi giữa chừng; `scope` *giữ tất cả* và chạy tuần tự. Dùng `scope` khi mỗi thao tác đều phải tới server, dùng debounce khi chỉ lần cuối là quan trọng.
+```text
+Bấm "Lưu" 3 lần nhanh:
+
+SONG SONG (mặc định):                 TUẦN TỰ (scope: { id }):
+  m1 ├────────────┤ (xong thứ 3?!)      m1 ├──────┤
+  m2   ├──────┤   (xong thứ 1)          m2        ├──────┤  (chờ m1)
+  m3     ├────┤   (xong thứ 2)          m3               ├──────┤ (chờ m2)
+  → thứ tự ghi server KHÔNG xác định    → server nhận đúng m1 → m2 → m3
+```
+
+Khi user bấm "Lưu" liên tục, mutation thứ hai chờ thứ nhất xong (settled) mới chạy — giữ thứ tự ghi đúng. Dưới mui xe, mỗi `scope.id` là một hàng đợi: mutation mới được đẩy vào cuối, runner lấy ra từng cái khi cái trước `settled`.
+
+### Khi nào cần `scope`
+
+| Tình huống | Cần `scope`? | Vì sao |
+|---|---|---|
+| Kéo-thả sắp xếp lại danh sách | Có | Mỗi lần thả gửi thứ tự mới; chạy song song → server lưu thứ tự sai. |
+| Nhiều lần lưu cùng một tài liệu | Có | Race ghi → mất chữ; tuần tự giữ "last write" đúng. |
+| Tăng/giảm tồn kho cùng một SKU | Có | Cộng dồn phải tuần tự, không thì mất cập nhật. |
+| Tạo nhiều order *khác nhau* | Không | Độc lập, chạy song song nhanh hơn. |
+| Mutation offline xếp hàng cùng data | Có | Khi online lại, tránh chúng đua nhau patch cache (mục 5). |
+
+> **Phân biệt với debounce:** debounce *bỏ* các lần gọi giữa chừng và chỉ gửi lần cuối; `scope` *giữ tất cả* và chạy tuần tự. Dùng `scope` khi mỗi thao tác đều phải tới server (vd log từng bước reorder); dùng debounce khi chỉ trạng thái cuối là quan trọng (vd search-as-you-type).
 
 ---
 
-## 4. Optimistic update trải nhiều query
+## 5. Chia sẻ định nghĩa mutation với `setMutationDefaults`
 
-Phần 6 optimistic một query. Thực tế một mutation thường đụng nhiều: thêm một order vừa cập nhật `orders.list`, vừa tăng `customer.detail.orderCount`, vừa đụng `stats`. Snapshot và rollback **tất cả**:
+Phần 13 đã dùng `setMutationDefaults` để mutation offline sống sót reload. Đây là cơ chế tổng quát hơn: **đăng ký `mutationFn` + options theo `mutationKey`**, để mọi `useMutation` chỉ cần khai `mutationKey` là kế thừa đầy đủ:
+
+```ts
+// Đăng ký một LẦN, gần nơi tạo QueryClient.
+queryClient.setMutationDefaults(['customer', 'update'], {
+  mutationFn: updateCustomer,
+  retry: 3, // idempotent (PUT theo id) nên retry an toàn — xem mục 8
+  onSuccess: () => queryClient.invalidateQueries({ queryKey: customerKeys.lists() }),
+});
+```
+
+```tsx
+// Bất kỳ component nào — KHÔNG lặp lại mutationFn/onSuccess.
+function EditButton({ id }: { id: string }) {
+  const mutation = useMutation({ mutationKey: ['customer', 'update'] });
+  return <button onClick={() => mutation.mutate({ id, name: 'An' })}>Lưu</button>;
+}
+```
+
+> **Vì sao cần thiết cho offline (nối Phần 13).** Sau reload, hàng đợi mutation được khôi phục từ storage dưới dạng *dữ liệu* (variables + key), nhưng **closure `mutationFn` không serialize được** nên không sống sót. `setMutationDefaults` đăng ký lại `mutationFn` theo `mutationKey`, để `resumePausedMutations()` biết gọi hàm nào cho mỗi mutation đã xếp hàng. Không có nó, mutation resume sẽ *không có hàm để chạy*.
+
+```text
+Reload khi offline:
+
+  storage ──restore──▶ hàng đợi: [{ key:['customer','update'], variables:{...} }]
+                                    │ (chỉ có DATA, không có hàm)
+   setMutationDefaults(key, { mutationFn }) ──ghép──┘
+                                    │
+   online lại ──▶ resumePausedMutations() ──▶ gọi mutationFn(variables) cho từng cái
+```
+
+Khi nhiều mutation offline xếp hàng đụng cùng data, **kết hợp `scope`** (mục 4) để chúng chạy tuần tự khi online lại — tránh chúng đua nhau patch cache.
+
+---
+
+## 6. Optimistic update trải nhiều query (cache-based)
+
+Phần 6 optimistic *một* query. Thực tế một mutation thường đụng *nhiều*: thêm một order vừa cập nhật `orders.list`, vừa tăng `customer.detail.orderCount`, vừa đụng `stats`. Snapshot và rollback **tất cả**:
 
 ```ts
 useMutation({
@@ -118,7 +246,123 @@ Khuôn mẫu bất biến: **cancel → snapshot → patch** trong `onMutate`, *
 
 ---
 
-## 5. Xử lý toàn cục ở `MutationCache`
+## 7. Optimistic qua `variables` — render pending *không đụng cache*
+
+Cách ở mục 6 ghi thẳng cache (`setQueryData`) rồi rollback nếu lỗi — mạnh nhưng nhiều bước và rủi ro nếu rollback sót. Có một cách nhẹ hơn cho trường hợp "chỉ cần hiển thị item đang gửi": **đọc `variables` của mutation pending** rồi render nó như một dòng tạm, *không hề chạm vào cache*. Khi mutation xong, cache invalidate và dòng tạm biến mất tự nhiên.
+
+```tsx
+function TodoList() {
+  const { data: todos } = useQuery({ queryKey: ['todos'], queryFn: fetchTodos });
+
+  const addTodo = useMutation({
+    mutationFn: createTodo,
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ['todos'] }),
+  });
+
+  return (
+    <ul>
+      {todos?.map((t) => <li key={t.id}>{t.title}</li>)}
+
+      {/* Dòng tạm: chỉ tồn tại khi đang gửi, KHÔNG nằm trong cache. */}
+      {addTodo.isPending && (
+        <li style={{ opacity: 0.5 }}>{addTodo.variables.title} (đang gửi…)</li>
+      )}
+    </ul>
+  );
+}
+```
+
+Muốn hiển thị optimistic item ở component *khác* nơi gọi mutation? Lấy `variables` qua `useMutationState` (mục 2):
+
+```tsx
+function PendingTodos() {
+  const pendingTitles = useMutationState({
+    filters: { mutationKey: ['todos', 'add'], status: 'pending' },
+    select: (m) => (m.state.variables as CreateTodoInput).title,
+  });
+  return pendingTitles.map((title) => <li key={title}>{title} (đang gửi…)</li>);
+}
+```
+
+### `setQueryData` (cache-based) vs `variables` (render-based)
+
+| Tiêu chí | `setQueryData` trong `onMutate` | Render từ `variables` |
+|---|---|---|
+| Chạm cache | Có (patch + rollback) | **Không** |
+| Cần snapshot/rollback | Có (`onError`) | Không — lỗi thì dòng tạm tự mất |
+| Hiển thị ở component khác | Tự nhiên (cache global) | Cần `useMutationState` |
+| Hợp với | Update field, đếm, dữ liệu phức tạp | Thêm item vào danh sách |
+| Rủi ro | Rollback sót → cache lệch | Gần như không |
+| Hiện lỗi từng item | Khó | Dễ (đọc `m.state.status === 'error'`) |
+
+> **Khi nào chọn cái nào?** Thêm một dòng vào danh sách → `variables` (đơn giản, an toàn). Tăng `orderCount`, cập nhật nhiều field, đụng nhiều query → `setQueryData` (mục 6). Nhiều đội dùng `variables` làm mặc định và chỉ rơi xuống `setQueryData` khi cần patch dữ liệu phức tạp.
+
+---
+
+## 8. Retry & idempotency cho mutation
+
+Mutation mặc định `retry: 0`, còn query là `3`. Lý do: **đọc lại an toàn (idempotent), ghi lại thì không**. Retry một POST lỗi-giữa-chừng có thể tạo **2 bản ghi**. Chỉ bật retry cho thao tác *idempotent*:
+
+| Thao tác | Idempotent? | `retry` an toàn? |
+|---|---|---|
+| `POST /orders` (tạo mới) | Không | **Không** — dễ tạo trùng |
+| `PUT /customers/:id` (ghi đè theo id) | Có | Có |
+| `DELETE /customers/:id` | Có (xoá lại = vẫn xoá) | Có |
+| `PATCH` cộng dồn (vd `count += 1`) | Không | **Không** — cộng nhiều lần |
+| `POST` có idempotency-key | Có (server khử trùng) | Có |
+
+```ts
+// An toàn: PUT theo id, server ghi đè — retry không tạo trùng.
+useMutation({ mutationFn: updateCustomer, retry: 3 });
+
+// Muốn retry POST tạo mới? Gửi kèm idempotency key để server khử trùng.
+function createOrder(input: CreateOrderInput) {
+  return apiFetch('/orders', orderSchema, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': input.clientId }, // server bỏ qua nếu đã thấy
+    body: JSON.stringify(input),
+  });
+}
+```
+
+> **Quy tắc.** Đừng bật `retry` cho mutation chỉ vì "cho chắc". Hỏi: *gửi hàm này hai lần có hại không?* Nếu có → để `retry: 0` (hoặc thêm idempotency-key trước khi bật).
+
+---
+
+## 9. `onMutate` trả context & chuỗi mutation phụ thuộc
+
+`onMutate` trả về gì thì giá trị đó thành **`context`** cho `onError`/`onSettled` — đây là kênh truyền snapshot để rollback (mục 6). Kiểu `context` được suy ra tự động, không cần `any`:
+
+```ts
+useMutation({
+  mutationFn: updateTodo,
+  onMutate: async (vars) => {
+    await queryClient.cancelQueries({ queryKey: ['todos'] });
+    const previous = queryClient.getQueryData<Todo[]>(['todos']);
+    queryClient.setQueryData<Todo[]>(['todos'], (old) => patch(old, vars));
+    return { previous }; // ← context, TS suy ra { previous: Todo[] | undefined }
+  },
+  onError: (_err, _vars, context) => {
+    if (context?.previous) queryClient.setQueryData(['todos'], context.previous);
+  },
+});
+```
+
+Với **chuỗi mutation phụ thuộc** (B cần kết quả của A), dùng `mutateAsync` và `await` tuần tự — đừng gọi song song rồi hy vọng đúng thứ tự:
+
+```ts
+async function checkout(cartId: string) {
+  const order = await createOrder.mutateAsync({ cartId });   // A
+  await capturePayment.mutateAsync({ orderId: order.id });   // B cần order.id
+  await sendReceipt.mutateAsync({ orderId: order.id });      // C
+}
+```
+
+> **Phân biệt với `scope`.** `scope` chỉ tuần-tự-hoá các mutation **cùng loại** (cùng hàng đợi) và *không* truyền dữ liệu giữa chúng. Chuỗi phụ thuộc ở đây là các mutation **khác loại** truyền kết quả cho nhau — phải dùng `await` thủ công.
+
+---
+
+## 10. Xử lý toàn cục ở `MutationCache`
 
 Lặp `onError: toast(...)` ở mọi mutation rất mệt. Đẩy lên `MutationCache` (Phần 9) và để mutation chỉ lo phần *đặc thù*:
 
@@ -145,22 +389,7 @@ Thứ tự chạy: `MutationCache.onError` chạy **trước** `useMutation`'s `
 
 ---
 
-## 6. Hàng đợi mutation offline (nối tiếp Phần 13)
-
-Gom lại pattern offline: `mutationKey` + `setMutationDefaults` cho `mutationFn` sống sót reload, `onlineManager` gọi `resumePausedMutations`:
-
-```ts
-queryClient.setMutationDefaults(['order', 'create'], {
-  mutationFn: createOrder,
-  retry: 3,
-});
-```
-
-Để xử lý đúng khi nhiều mutation offline xếp hàng đụng cùng data, kết hợp `scope` (mục 3) để chúng chạy tuần tự khi online lại — tránh chúng đua nhau patch cache.
-
----
-
-## 7. `mutateAsync` vs `mutate` — khi nào cần Promise
+## 11. `mutateAsync` vs `mutate` — khi nào cần Promise
 
 `mutate` là "bắn rồi quên" (callback `onSuccess`/`onError`). `mutateAsync` trả Promise — dùng khi bạn cần **await** kết quả để làm việc tiếp:
 
@@ -180,7 +409,79 @@ async function handleSubmit() {
 
 ---
 
-## 8. Bài tập
+## 12. Gotchas thường gặp
+
+| Triệu chứng | Nguyên nhân | Cách sửa |
+|---|---|---|
+| Nhiều lần "Lưu" ghi đè nhau, thứ tự sai | Mutation cùng bản ghi chạy **song song** | Thêm `scope: { id }` để xếp hàng tuần tự (mục 4) |
+| `useMutationState` không thấy mutation nào | Mutation **thiếu `mutationKey`** nên filter không khớp | Đặt `mutationKey` cho mutation cần theo dõi (mục 1) |
+| Retry tạo bản ghi **trùng** | Bật `retry` cho thao tác *non-idempotent* (POST tạo mới) | Để `retry: 0`, hoặc thêm `Idempotency-Key` (mục 8) |
+| Optimistic item nhân đôi khi mutation xong | Vừa render từ `variables` **vừa** `setQueryData` cùng item | Chọn *một* cách; nếu dùng `variables` thì đừng patch cache (mục 7) |
+| Mutation offline resume nhưng "không có hàm chạy" | `mutationFn` chỉ trong component, không serialize được | Đăng ký qua `setMutationDefaults(key, { mutationFn })` (mục 5) |
+| Rollback sót → cache lệch vĩnh viễn | `onMutate` patch nhiều query nhưng `onError` rollback thiếu | Snapshot & rollback **đủ bộ** từng query, hoặc dùng `variables` (mục 6, 7) |
+| `unhandledrejection` trong console | Dùng `mutateAsync` mà không `try/catch` | Bọc try/catch, hoặc đổi sang `mutate` (mục 11) |
+| Chuỗi mutation phụ thuộc chạy sai thứ tự | Gọi song song rồi mong đúng thứ tự | `await mutateAsync` tuần tự (mục 9) |
+
+---
+
+## 13. Recipes
+
+### Recipe 1 — Thanh trạng thái lưu toàn cục
+
+Một component duy nhất ở layout gốc, phản ánh *mọi* thao tác ghi đang chạy:
+
+```tsx
+function GlobalSaveStatus() {
+  const saving = useIsMutating();
+  const errored = useMutationState({
+    filters: { status: 'error' },
+    select: (m) => m.state.error,
+  });
+
+  if (saving > 0) return <Banner tone="info">Đang lưu {saving} thay đổi…</Banner>;
+  if (errored.length > 0) return <Banner tone="error">Một số thay đổi lưu lỗi</Banner>;
+  return <Banner tone="ok">Đã lưu tất cả</Banner>;
+}
+```
+
+### Recipe 2 — Reorder tuần tự (không race)
+
+Kéo-thả sắp xếp: mỗi lần thả gửi thứ tự mới, `scope` đảm bảo server nhận đúng tuần tự:
+
+```ts
+const reorder = useMutation({
+  mutationFn: (next: ItemOrder) => apiFetch(`/lists/${listId}/order`, orderSchema, {
+    method: 'PUT',
+    body: JSON.stringify(next),
+  }),
+  scope: { id: `reorder-${listId}` }, // mọi lần thả vào CÙNG hàng đợi
+  retry: 3,                            // PUT idempotent → retry an toàn
+  onSettled: () => queryClient.invalidateQueries({ queryKey: ['lists', listId] }),
+});
+```
+
+### Recipe 3 — Danh sách optimistic qua `variables`
+
+Thêm todo hiện ngay, không snapshot/rollback, lỗi thì tự biến mất:
+
+```tsx
+const addTodo = useMutation({
+  mutationKey: ['todos', 'add'],
+  mutationFn: createTodo,
+  onSettled: () => queryClient.invalidateQueries({ queryKey: ['todos'] }),
+});
+
+// Trong render: ghép data thật + (các) variables đang gửi
+const pending = useMutationState({
+  filters: { mutationKey: ['todos', 'add'], status: 'pending' },
+  select: (m) => m.state.variables as CreateTodoInput,
+});
+// <li> cho từng todos?.map(...) rồi nối thêm pending.map((v) => <li className="opacity-50">…)
+```
+
+---
+
+## 14. Bài tập
 
 **1.** `useMutationState` giải quyết vấn đề gì mà `useMutation` đơn lẻ không làm được?
 
@@ -209,18 +510,47 @@ Dùng `scope` khi thứ tự ghi quan trọng và mọi thao tác đều phải 
 
 </details>
 
-**Nâng cao:** Thêm `SyncIndicator` (mục 2) vào header, gọi một mutation update có `scope`, bấm "Lưu" 3 lần liên tiếp — xác nhận header đếm pending đúng và 3 mutation chạy *tuần tự* (xem thứ tự trong Network tab).
+**4.** Khi nào nên render optimistic item từ `variables` thay vì `setQueryData`? Đánh đổi là gì?
+
+<details>
+<summary>Lời giải</summary>
+
+Dùng `variables` khi chỉ cần *thêm một dòng đang gửi* vào danh sách: không chạm cache, không cần snapshot/rollback, lỗi thì dòng tạm tự biến mất. Đánh đổi: muốn hiển thị ở component khác phải qua `useMutationState`, và nó không hợp khi cần cập nhật nhiều field/nhiều query (vd tăng `orderCount`) — lúc đó `setQueryData` + cancel→snapshot→patch→rollback phù hợp hơn. Cảnh báo: **đừng dùng cả hai cho cùng item** → bị nhân đôi.
+
+</details>
+
+**5.** Vì sao bật `retry` cho một `POST /orders` (tạo mới) lại nguy hiểm, còn `PUT /customers/:id` thì an toàn? Làm sao retry an toàn cái POST?
+
+<details>
+<summary>Lời giải</summary>
+
+`POST` tạo mới *không idempotent*: nếu request đầu lỗi sau khi server đã ghi (vd timeout response), retry tạo **bản ghi thứ hai**. `PUT` theo id ghi đè cùng bản ghi → gửi lại nhiều lần cho cùng kết quả (idempotent), retry an toàn. Để retry POST an toàn, gửi kèm `Idempotency-Key` (vd `clientId` sinh ở client) để server khử trùng các request lặp.
+
+</details>
+
+**6.** Một paused mutation offline được khôi phục sau reload nhưng không gửi đi. Thiếu gì?
+
+<details>
+<summary>Lời giải</summary>
+
+Thiếu `setMutationDefaults(key, { mutationFn })`. Hàng đợi persist chỉ lưu *dữ liệu* (key + variables); closure `mutationFn` không serialize được nên mất sau reload. `setMutationDefaults` đăng ký lại `mutationFn` theo `mutationKey` để `resumePausedMutations()` biết gọi hàm nào. Component cũng phải `useMutation({ mutationKey })` khớp đúng key.
+
+</details>
+
+**Nâng cao:** Dựng danh sách todo với: (a) `GlobalSaveStatus` ở header (Recipe 1), (b) thêm todo optimistic qua `variables` (Recipe 3), (c) reorder có `scope` (Recipe 2). Mở DevTools → Network → Offline, thêm 2 todo (thấy dòng tạm), bật mạng lại — xác nhận chúng gửi *tuần tự* và `GlobalSaveStatus` đếm đúng.
 
 ---
 
 ## Tóm tắt
 
-- `mutationKey` mở khoá theo dõi (`useMutationState`), cấu hình (`setMutationDefaults`) và `scope`.
-- `useMutationState` đọc trạng thái mutation từ xa — badge "đang lưu", optimistic từ `variables`.
-- `scope: { id }` cho mutation cùng scope **chạy tuần tự**, tránh race; khác debounce (giữ tất cả vs bỏ giữa chừng).
-- Optimistic đa query: **cancel → snapshot → patch** (`onMutate`), **rollback** (`onError`), **invalidate** (`onSettled`) cho *từng* query.
-- `MutationCache.onError/onSuccess` + `meta` xử lý toàn cục, bớt lặp toast/log.
-- `mutateAsync` khi cần await (phải try/catch); `mutate` cho phần còn lại.
+- `mutationKey` là cái móc mở khoá: theo dõi từ xa (`useMutationState`, `useIsMutating`), cấu hình từ xa (`setMutationDefaults`), và là điều kiện để resume offline.
+- `useMutationState` trả **mảng** trạng thái mutation khớp filter (luôn `select` + xử lý rỗng); `useIsMutating` trả **số** — chọn theo nhu cầu "dữ liệu" vs "đếm".
+- `scope: { id }` cho mutation cùng scope **chạy tuần tự**, tránh race ghi (reorder, cùng tài liệu); khác debounce (giữ tất cả vs bỏ giữa chừng).
+- `setMutationDefaults(key, { mutationFn })` chia sẻ định nghĩa mutation và là điều kiện sống còn để mutation offline resume sau reload (closure không serialize được).
+- Hai kiểu optimistic: **cache-based** (`setQueryData` + cancel→snapshot→patch→rollback, hợp đa query/nhiều field) và **render-based** (`variables`, hợp thêm item, không chạm cache).
+- Mutation mặc định `retry: 0`: chỉ bật cho thao tác **idempotent** (PUT/DELETE theo id) hoặc POST có `Idempotency-Key`.
+- `onMutate` trả `context` để rollback; chuỗi mutation phụ thuộc thì `await mutateAsync` tuần tự.
+- `MutationCache.onError/onSuccess` + `meta` xử lý toàn cục; `mutateAsync` khi cần await (phải try/catch), `mutate` cho phần còn lại.
 
 ---
 

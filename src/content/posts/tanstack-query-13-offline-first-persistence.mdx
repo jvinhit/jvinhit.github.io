@@ -19,22 +19,112 @@ Phần 7 đã xem nhanh persistence. Phần này đào tới đáy: persister, b
 ```
 Khởi động app
    │
-   ├─ Đọc cache đã lưu từ storage (localStorage / IndexedDB)
-   ├─ Kiểm tra buster + maxAge → còn hợp lệ thì RESTORE vào QueryClient
-   │     (không hợp lệ → bỏ, fetch mới)
+   ├─ Đọc snapshot cache đã lưu từ storage (localStorage / IndexedDB)
+   ├─ Kiểm tra buster + maxAge
+   │     ├─ hợp lệ      → HYDRATE vào QueryClient → UI thấy data NGAY
+   │     └─ không hợp lệ → bỏ (đổi version / quá hạn) → fetch mới
    ▼
-App chạy: mỗi khi cache đổi → ghi (throttle) xuống storage
-   │
-   ├─ Online: query/mutation chạy bình thường
-   └─ Offline: mutation chuyển 'paused' → xếp hàng
-         → khi online lại → resumePausedMutations() gửi đi
+App chạy:
+   ├─ Mỗi khi cache đổi → dehydrate → ghi (throttle) xuống storage
+   ├─ Online : query/mutation chạy bình thường
+   └─ Offline (networkMode 'online'):
+         ├─ query mới  → fetchStatus 'paused' (không gọi mạng)
+         └─ mutation   → 'paused' + xếp hàng trong MutationCache
+               ▼
+         Online lại → onlineManager phát tín hiệu
+               → resumePausedMutations() gửi hàng đợi
 ```
 
-Hai mảnh ghép: **persister** (lưu/khôi phục cache) và **networkMode + paused mutations** (offline ghi).
+Hai trụ cột độc lập:
+
+- **Persistence** — `persistQueryClient` + một *persister* lưu/khôi phục snapshot cache qua reload.
+- **Offline writes** — `networkMode` + `onlineManager` đẩy mutation sang `paused`, xếp hàng, rồi tự gửi lại khi có mạng.
+
+Bạn có thể chỉ persist (giữ data qua reload) mà không lo offline-write, hoặc ngược lại. Ghép cả hai mới ra "offline-first" đầy đủ.
 
 ---
 
-## 2. Cài đặt persister
+## 2. `networkMode` — bộ điều phối online/offline
+
+`networkMode` quyết định Query *làm gì khi không có mạng*. Đặt global ở `defaultOptions` hoặc theo từng hook.
+
+| Giá trị | Khi **offline** | Khi **online** | Dùng khi |
+|---|---|---|---|
+| `'online'` (mặc định) | Không fetch; query → `fetchStatus: 'paused'`, mutation xếp hàng | Chạy bình thường | App phụ thuộc API thật (mặc định an toàn) |
+| `'always'` | **Vẫn chạy** `queryFn`/`mutationFn` | Chạy bình thường | Data không cần mạng (đọc IndexedDB cục bộ, tính toán local) |
+| `'offlineFirst'` | Chạy **một lần**; fail mới `paused` | Chạy bình thường | Có lớp cache HTTP / service worker đứng trước (PWA) |
+
+```ts
+// global
+new QueryClient({
+  defaultOptions: {
+    queries: { networkMode: 'offlineFirst' },
+    mutations: { networkMode: 'offlineFirst' },
+  },
+});
+
+// hoặc từng hook
+useQuery({ queryKey: ['local'], queryFn: readLocal, networkMode: 'always' });
+```
+
+> **`'offlineFirst'` khác `'always'` ở đâu?** `'always'` *bỏ qua* trạng thái mạng hoàn toàn — luôn chạy. `'offlineFirst'` vẫn *thử một phát* dù offline (để service worker / HTTP cache có cơ hội trả lời), nhưng nếu request thật sự fail vì mất mạng thì nó dừng và `paused`, chờ online để retry. Với PWA có Workbox, `'offlineFirst'` là lựa chọn đúng.
+
+### `onlineManager` — nguồn sự thật về trạng thái mạng
+
+Query không tự đoán online/offline; nó hỏi `onlineManager`. Mặc định manager nghe sự kiện `online`/`offline` của `window` và `navigator.onLine`.
+
+| API | Ý nghĩa |
+|---|---|
+| `onlineManager.isOnline()` | Trạng thái hiện tại (boolean) |
+| `onlineManager.setOnline(bool)` | Ép trạng thái thủ công (test, hoặc tín hiệu mạng riêng) |
+| `onlineManager.subscribe(cb)` | Lắng nghe đổi trạng thái; trả về hàm unsubscribe |
+| `onlineManager.setEventListener(fn)` | Thay nguồn sự kiện mặc định (vd `navigator.connection`) |
+
+```ts
+import { onlineManager } from '@tanstack/react-query';
+
+// Dùng tín hiệu mạng tuỳ biến (vd Capacitor / React Native NetInfo).
+onlineManager.setEventListener((setOnline) => {
+  const sub = Network.addListener('networkStatusChange', (s) => setOnline(s.connected));
+  return () => sub.remove();
+});
+```
+
+> `navigator.onLine` nổi tiếng *hay nói dối*: `true` không có nghĩa Internet thông, chỉ là có card mạng. Cần chính xác hơn thì tự ping một endpoint nhẹ rồi `onlineManager.setOnline(result)`.
+
+---
+
+## 3. `fetchStatus: 'paused'` — query & mutation khi mất mạng
+
+Nhắc lại từ Phần 1/9: `status` nói về *data* (`pending`/`error`/`success`), còn `fetchStatus` nói về *hoạt động mạng* (`fetching`/`paused`/`idle`). Offline tạo ra tổ hợp đặc trưng:
+
+```
+Mở app lần đầu, OFFLINE, networkMode 'online'
+   │
+   ▼
+status: 'pending'  +  fetchStatus: 'paused'
+   │  (chưa có data, nhưng KHÔNG quay spinner mạng — đang chờ online)
+   ▼
+Online lại → onlineManager báo → fetchStatus: 'fetching' → 'success'
+```
+
+| `status` | `fetchStatus` | Nghĩa |
+|---|---|---|
+| `pending` | `paused` | Chưa có data, đang **chờ mạng** để fetch lần đầu |
+| `success` | `paused` | Đã có data (từ persist), muốn refetch nhưng đang offline |
+| `success` | `idle` | Có data, không làm gì |
+| `pending` | `fetching` | Lần đầu, đang gọi mạng |
+
+UI nên phân biệt: `isPending && fetchStatus === 'paused'` → hiển thị "Đang chờ kết nối…" thay vì spinner vô tận.
+
+```tsx
+const { data, status, fetchStatus } = useQuery({ queryKey: ['todos'], queryFn });
+if (status === 'pending' && fetchStatus === 'paused') return <OfflineBanner />;
+```
+
+---
+
+## 4. Cài đặt `PersistQueryClientProvider`
 
 ```bash
 pnpm add @tanstack/react-query-persist-client @tanstack/query-sync-storage-persister
@@ -48,8 +138,7 @@ import { queryClient } from '@/lib/query-client';
 
 const persister = createSyncStoragePersister({
   storage: window.localStorage,
-  // Throttle ghi để không spam localStorage mỗi lần cache nhúc nhích.
-  throttleTime: 1000,
+  throttleTime: 1000, // gộp ghi: tối đa 1 lần/giây thay vì mỗi lần cache nhúc nhích
 });
 
 export function Providers({ children }: { children: React.ReactNode }) {
@@ -58,8 +147,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
       client={queryClient}
       persistOptions={{
         persister,
-        maxAge: 24 * 60 * 60 * 1000, // cache cũ hơn 24h → bỏ
-        buster: import.meta.env.VITE_APP_VERSION, // đổi version → xoá cache cũ
+        maxAge: 24 * 60 * 60 * 1000,
+        buster: import.meta.env.VITE_APP_VERSION,
       }}
     >
       {children}
@@ -68,19 +157,24 @@ export function Providers({ children }: { children: React.ReactNode }) {
 }
 ```
 
-> Lưu ý: muốn cache được persist *và* không bị xoá sớm, `gcTime` phải **≥ `maxAge`** (Phần 9). Nếu `gcTime` ngắn hơn, entry bị GC khỏi RAM trước khi kịp dùng lại sau restore. Đặt `gcTime: maxAge` cho data cần giữ.
+`PersistQueryClientProvider` làm ba việc: (1) **restore** snapshot trước khi render con, (2) **subscribe** cache để ghi tiếp khi thay đổi, (3) sau restore tự gọi `resumePausedMutations()`. Nó *chặn render* tới khi restore xong (với async persister) để tránh nháy "no data → data".
+
+> Cần chạy code *sau khi* restore xong (vd refetch có chủ đích)? Dùng prop `onSuccess` của provider — nó fire một lần khi hydrate hoàn tất.
 
 ---
 
-## 3. `localStorage` (sync) vs `IndexedDB` (async)
+## 5. Sync (`localStorage`) vs Async (`IndexedDB`)
 
-| | Sync (`localStorage`) | Async (`IndexedDB`) |
+| | Sync — `createSyncStoragePersister` | Async — `createAsyncStoragePersister` |
 |---|---|---|
-| Dung lượng | ~5MB | hàng trăm MB |
-| API | Đồng bộ (block main thread) | Bất đồng bộ |
-| Hợp với | Cache nhỏ, app đơn giản | Cache lớn, PWA nghiêm túc |
+| Backend điển hình | `window.localStorage` | IndexedDB qua `idb-keyval` |
+| Dung lượng | ~5 MB / origin | hàng trăm MB |
+| Kiểu API | Đồng bộ — **block main thread** khi serialize | Bất đồng bộ — không block |
+| Cache lớn | Dễ vượt quota, ghi giật | Mượt, hợp cache nặng |
+| Render lúc restore | Gần như tức thì | Provider chờ Promise xong mới render |
+| Hợp với | App nhỏ, vài KB cache | PWA, danh sách lớn, ảnh/blob |
 
-Với cache lớn, dùng async persister (vd `idb-keyval`):
+Async persister cho cache lớn:
 
 ```bash
 pnpm add @tanstack/query-async-storage-persister idb-keyval
@@ -96,19 +190,52 @@ const persister = createAsyncStoragePersister({
     setItem: (key, value) => set(key, value),
     removeItem: (key) => del(key),
   },
+  throttleTime: 1000,
 });
 ```
 
-`PersistQueryClientProvider` hoạt động giống hệt; nó tự chờ async restore xong rồi mới render con (tránh nháy "no data → data").
+API dùng giống hệt sync; `PersistQueryClientProvider` tự nhận ra persister async và chờ restore xong rồi mới render con (tránh nháy "no data → data").
 
 ---
 
-## 4. `buster` & `maxAge` — vô hiệu hoá cache đúng lúc
+## 6. `persistQueryClient` options đầy đủ
 
-Hai cơ chế để cache cũ không gây hại:
+Dù dùng provider hay gọi tay `persistQueryClient(...)`, các tuỳ chọn giống nhau:
 
-- **`maxAge`** — tuổi tối đa của *toàn bộ* snapshot đã lưu. Quá hạn → bỏ hết, fetch mới. Mặc định 24h.
-- **`buster`** — chuỗi định danh phiên bản. Khi `buster` đổi (vd deploy version mới làm đổi shape data), cache cũ bị **vứt ngay** bất kể tuổi. Luôn đặt `buster` theo version app/schema để tránh "data hình dạng cũ" làm crash UI mới.
+| Option | Kiểu | Ý nghĩa |
+|---|---|---|
+| `persister` | `Persister` | Bộ lưu/khôi phục (sync hoặc async) — **bắt buộc** |
+| `maxAge` | `number` | Tuổi tối đa (ms) của snapshot; quá hạn → bỏ. Mặc định `24h` |
+| `buster` | `string` | "Dấu vân tay" phiên bản; đổi → vứt cache cũ ngay |
+| `dehydrateOptions` | `object` | Lọc *cái gì được lưu* (xem §8) |
+| `hydrateOptions` | `object` | Tuỳ biến lúc khôi phục (hiếm khi cần) |
+
+Hai cách dùng:
+
+```tsx
+// Cách 1: provider (khuyên dùng cho app React)
+<PersistQueryClientProvider client={queryClient} persistOptions={{ persister, maxAge, buster }} />
+```
+
+```ts
+// Cách 2: gọi tay (ngoài React, hoặc kiểm soát thủ công)
+import { persistQueryClient } from '@tanstack/react-query-persist-client';
+
+const [unsubscribe, restorePromise] = persistQueryClient({
+  queryClient,
+  persister,
+  maxAge: 1000 * 60 * 60 * 24,
+  buster: APP_VERSION,
+});
+await restorePromise; // chờ hydrate xong rồi mới render / refetch
+```
+
+---
+
+## 7. `buster` & `maxAge` — vô hiệu hoá cache đúng lúc
+
+- **`maxAge`** — tuổi tối đa của *toàn bộ* snapshot. Quá hạn → bỏ hết, fetch mới. Mặc định 24h.
+- **`buster`** — định danh phiên bản. `buster` đổi → cache cũ bị **vứt ngay** bất kể tuổi. Dùng cho deploy đổi shape data/schema.
 
 ```ts
 persistOptions={{
@@ -118,48 +245,84 @@ persistOptions={{
 }}
 ```
 
-> Bài học xương máu: quên cập nhật `buster` khi đổi shape data → user cũ mở app thấy cache hình dạng cũ → code mới `.map` trên field không tồn tại → crash. `buster` rẻ, hãy dùng.
+> **Bài học xương máu:** quên cập nhật `buster` khi đổi shape data → user cũ restore cache hình dạng cũ → code mới `.map` field không tồn tại → crash. `buster` rẻ, hãy gắn nó vào version build.
+
+### `gcTime` phải ≥ `maxAge`
+
+`maxAge` chỉ kiểm soát snapshot *trên storage*. Nhưng entry trong RAM bị `gcTime` chi phối: nếu `gcTime` < `maxAge`, entry có thể bị GC khỏi cache *ngay trong phiên* trước khi snapshot hết hạn, khiến lần dehydrate sau ghi ra data thiếu. Quy tắc: đặt `gcTime ≥ maxAge` (thường bằng nhau) cho data cần persist.
+
+```ts
+new QueryClient({ defaultOptions: { queries: { gcTime: 1000 * 60 * 60 * 24 } } }); // = maxAge
+```
 
 ---
 
-## 5. Lọc cái gì được persist — đừng lưu data nhạy cảm
+## 8. Cái gì được persist — mặc định chỉ `success`
 
-`localStorage`/`IndexedDB` **không** an toàn cho token, PII, số dư. Lọc bằng `dehydrateOptions.shouldDehydrateQuery`:
+Khi dehydrate, mặc định Query **chỉ lưu query ở `status: 'success'`** — query `pending`/`error` bị bỏ qua (lưu lỗi vào storage là vô nghĩa và nguy hiểm). Bạn tinh chỉnh thêm bằng `dehydrateOptions`:
+
+| Option | Kiểu | Ý nghĩa |
+|---|---|---|
+| `shouldDehydrateQuery` | `(query) => boolean` | Có lưu query này không (mặc định: chỉ `success`) |
+| `shouldDehydrateMutation` | `(mutation) => boolean` | Có lưu mutation này không (cho hàng đợi offline) |
+| `serializeData` | `(data) => unknown` | Biến đổi data trước khi lưu (vd nén) |
 
 ```ts
 persistOptions={{
   persister,
   dehydrateOptions: {
     shouldDehydrateQuery: (query) => {
-      // KHÔNG persist mọi thứ liên quan auth/secret.
       const root = query.queryKey[0];
+      // KHÔNG persist data nhạy cảm.
       if (root === 'me' || root === 'auth' || root === 'payment') return false;
-      // Chỉ persist query đã thành công (đừng lưu lỗi/pending).
+      // Giữ mặc định: chỉ persist query đã thành công.
       return query.state.status === 'success';
     },
+    // Persist hàng đợi mutation đang paused để sống sót reload (xem §11).
+    shouldDehydrateMutation: (m) => m.state.isPaused,
   },
 }}
 ```
 
-Nguyên tắc: **opt-in cho data công khai, mặc định loại data nhạy cảm**. Một danh sách sản phẩm thì persist thoải mái; hồ sơ tài khoản thì không.
+Nguyên tắc: **persist data công khai, mặc định loại data nhạy cảm**. `localStorage`/`IndexedDB` không phải kho bí mật — token/PII/số dư không bao giờ được ghi xuống.
 
 ---
 
-## 6. Offline ghi: `networkMode` + paused mutations
+## 9. Khôi phục lúc reload — luồng restore
 
-Đây là phần làm nên "offline-first" thật sự. Khi `networkMode: 'online'` (mặc định) và mất mạng:
+```
+Reload trang
+   │
+   ▼
+persister.restoreClient() đọc snapshot từ storage
+   │
+   ├─ buster trong snapshot ≠ buster hiện tại? ──yes──► bỏ snapshot, removeClient()
+   │                                                     → QueryClient rỗng → fetch mới
+   ├─ (now - snapshot.timestamp) > maxAge?     ──yes──► bỏ (như trên)
+   │
+   └─ hợp lệ → hydrate(queryClient, dehydratedState)
+                  │
+                  ├─ Mỗi query khôi phục với dataUpdatedAt cũ
+                  ├─ staleTime quyết định: stale → refetch nền; fresh → dùng luôn
+                  └─ Mutation paused khôi phục vào hàng đợi
+                          │
+                          ▼
+                  Provider gọi resumePausedMutations() (nếu online)
+```
 
-- Query mới chuyển `fetchStatus: 'paused'` (đã bàn ở Phần 9).
-- Mutation cũng **paused** — không gửi, nhưng được **ghi vào hàng đợi** trong `MutationCache`.
+Điểm quan trọng: data khôi phục **vẫn tuân theo `staleTime`**. Snapshot 2 giờ trước với `staleTime: 0` → hydrate xong sẽ refetch nền ngay (UI thấy data cũ tức thì, rồi tự cập nhật). Muốn "data tin tưởng được lâu", tăng `staleTime`.
 
-Để mutation được resume tự động khi online, cần hai thứ: `setMutationDefaults` (để Query biết `mutationFn` nào chạy lại) và `onlineManager` (tự gọi `resumePausedMutations`):
+---
+
+## 10. Offline mutations: pause → queue → resume
+
+Khi `networkMode: 'online'` và mất mạng, mutation **paused** — không gửi, nhưng được ghi vào `MutationCache`. Để nó tự gửi lại sau khi online (kể cả sau reload) cần hai mảnh: `setMutationDefaults` (đăng ký `mutationFn` theo key) và `onlineManager` → `resumePausedMutations`.
 
 ```ts
-// Đăng ký mutationFn theo key để paused mutation biết cách chạy lại sau reload.
 queryClient.setMutationDefaults(['addTodo'], {
   mutationFn: addTodo,
   // Khi offline, optimistic update vào cache để UI phản hồi ngay.
-  onMutate: async (variables) => {
+  onMutate: async (variables: NewTodo) => {
     await queryClient.cancelQueries({ queryKey: ['todos'] });
     const previous = queryClient.getQueryData<Todo[]>(['todos']);
     queryClient.setQueryData<Todo[]>(['todos'], (old) => [
@@ -168,18 +331,19 @@ queryClient.setMutationDefaults(['addTodo'], {
     ]);
     return { previous };
   },
+  onError: (_err, _vars, context) => {
+    if (context?.previous) queryClient.setQueryData(['todos'], context.previous);
+  },
   retry: 3, // mạng chập khi vừa online lại → thử vài lần
 });
 ```
 
 ```tsx
-useMutation({
-  mutationKey: ['addTodo'], // KHỚP với setMutationDefaults
-  // KHÔNG cần mutationFn ở đây — đã đăng ký qua defaults để survive reload.
-});
+// Component: KHÔNG khai báo mutationFn — đã đăng ký qua defaults để survive reload.
+const mutation = useMutation<Todo, Error, NewTodo>({ mutationKey: ['addTodo'] });
 ```
 
-`PersistQueryClientProvider` (hoặc gọi tay) sẽ `resumePausedMutations()` sau khi restore + khi `onlineManager` báo online lại:
+Resume khi online (provider làm sẵn; nếu gọi tay):
 
 ```ts
 import { onlineManager } from '@tanstack/react-query';
@@ -189,13 +353,51 @@ onlineManager.subscribe((isOnline) => {
 });
 ```
 
-> **Vì sao `mutationFn` phải nằm ở `setMutationDefaults` chứ không chỉ trong component?** Vì sau reload, hàng đợi mutation được khôi phục từ storage nhưng **closure `mutationFn` thì không** (không serialize được hàm). `setMutationDefaults` đăng ký lại `mutationFn` theo `mutationKey` để Query biết cách gửi mutation đã xếp hàng.
+> **Vì sao `mutationFn` phải nằm ở `setMutationDefaults` chứ không chỉ trong component?** Vì sau reload, hàng đợi mutation được khôi phục từ storage dưới dạng *dữ liệu* (variables, key) — nhưng **closure `mutationFn` thì không** (không serialize được hàm). `setMutationDefaults` đăng ký lại `mutationFn` theo `mutationKey` để `resumePausedMutations` biết gọi gì.
 
 ---
 
-## 7. Đồng bộ cache đa tab với `broadcastQueryClient`
+## 11. Persist hàng đợi mutation + `mutationCache` retry
 
-Mở app ở hai tab: sửa data ở tab A, tab B vẫn thấy data cũ tới khi focus refetch. `broadcastQueryClient` dùng `BroadcastChannel` để đồng bộ cache giữa các tab cùng origin tức thì:
+Mặc định dehydrate **không** lưu mutation; muốn hàng đợi offline sống qua reload phải bật `shouldDehydrateMutation` (§8) để lưu các mutation `isPaused`. Sau hydrate, chúng nằm lại trong `MutationCache` và `resumePausedMutations()` sẽ gửi.
+
+```ts
+persistOptions={{
+  persister,
+  dehydrateOptions: {
+    shouldDehydrateQuery: (q) => q.state.status === 'success',
+    shouldDehydrateMutation: (m) => m.state.isPaused, // chỉ lưu cái đang chờ gửi
+  },
+}}
+```
+
+Cấu hình retry mặc định cho *mọi* mutation qua `defaultOptions` để hàng đợi không gãy khi mạng chập lúc vừa online:
+
+```ts
+new QueryClient({
+  defaultOptions: {
+    mutations: {
+      retry: 3,
+      retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 30_000), // backoff
+    },
+  },
+});
+```
+
+| Tình huống | Hành vi mong muốn |
+|---|---|
+| Offline lúc submit | `paused` + xếp hàng, không retry vô ích |
+| Online lại | `resumePausedMutations()` gửi theo thứ tự FIFO |
+| Server 500 sau khi gửi | `retry`/`retryDelay` thử lại vài lần |
+| Reload khi còn hàng đợi | Hydrate lại + resume nếu online |
+
+> Thứ tự gửi là FIFO theo thời điểm tạo. Nếu hai mutation phụ thuộc nhau (tạo rồi sửa cùng record), giữ chúng cùng `mutationKey` hoặc xử lý idempotency phía server để tránh lệch.
+
+---
+
+## 12. Đồng bộ cache đa tab — `broadcastQueryClient`
+
+Mở app ở hai tab: sửa data ở tab A, tab B vẫn thấy data cũ tới khi focus refetch. `broadcastQueryClient` dùng `BroadcastChannel` đồng bộ cache giữa các tab cùng origin tức thì:
 
 ```bash
 pnpm add @tanstack/query-broadcast-client-experimental
@@ -204,17 +406,78 @@ pnpm add @tanstack/query-broadcast-client-experimental
 ```ts
 import { broadcastQueryClient } from '@tanstack/query-broadcast-client-experimental';
 
-broadcastQueryClient({
-  queryClient,
-  broadcastChannel: 'my-app-cache',
-});
+broadcastQueryClient({ queryClient, broadcastChannel: 'my-app-cache' });
 ```
 
-Giờ `setQueryData`/invalidate ở tab A lan sang tab B ngay. Hợp với app nhiều tab (CRM, admin) để tránh data lệch giữa các tab. (Còn "experimental" — kiểm thử kỹ.)
+Giờ `setQueryData`/invalidate ở tab A lan sang tab B ngay — hợp với CRM/admin nhiều tab. (Còn "experimental" — kiểm thử kỹ trước khi tin tưởng tuyệt đối.)
 
 ---
 
-## 8. Bài tập
+## 13. Gotchas thường gặp
+
+| Gotcha | Hậu quả | Cách tránh |
+|---|---|---|
+| Persist data nhạy cảm (token/PII) | Lộ bí mật trong `localStorage` | `shouldDehydrateQuery` trả `false` cho key auth/payment |
+| Persist cả lỗi | Restore ra trạng thái `error` "đông cứng" | Giữ mặc định success-only; đừng nới `shouldDehydrateQuery` |
+| Quên đổi `buster` khi đổi schema | Code mới crash trên data hình dạng cũ | Gắn `buster` vào version/schema build |
+| `gcTime` < `maxAge` | Entry bị GC → restore thiếu data | Đặt `gcTime ≥ maxAge` |
+| `mutationFn` chỉ ở component | Hàng đợi mất `mutationFn` sau reload | Đăng ký qua `setMutationDefaults(key, ...)` |
+| Cache lớn vào `localStorage` | Vượt quota 5MB, ghi giật main thread | Dùng async IndexedDB persister |
+| Không bật `shouldDehydrateMutation` | Hàng đợi offline biến mất khi reload | Bật để lưu mutation `isPaused` |
+| Tin `navigator.onLine` tuyệt đối | "Online" giả khi có card mạng nhưng mất Internet | Tự ping + `onlineManager.setOnline` |
+
+---
+
+## 14. Recipes thực chiến
+
+### Danh sách đọc offline (persist + offlineFirst)
+
+```tsx
+function useProducts() {
+  return useQuery({
+    queryKey: ['products'],
+    queryFn: fetchProducts,
+    networkMode: 'offlineFirst', // có service worker / HTTP cache đỡ
+    staleTime: 1000 * 60 * 5,    // tin data 5 phút sau hydrate
+    gcTime: 1000 * 60 * 60 * 24, // = maxAge để persist không bị GC
+  });
+}
+```
+
+### Tạo bản ghi xếp hàng khi offline
+
+```tsx
+// lib/mutations.ts — đăng ký 1 lần lúc khởi tạo client
+queryClient.setMutationDefaults(['createProduct'], {
+  mutationFn: (input: NewProduct) => api.createProduct(input),
+  onMutate: async (input: NewProduct) => {
+    await queryClient.cancelQueries({ queryKey: ['products'] });
+    const previous = queryClient.getQueryData<Product[]>(['products']);
+    queryClient.setQueryData<Product[]>(['products'], (old) => [
+      ...(old ?? []),
+      { ...input, id: `temp-${crypto.randomUUID()}`, pending: true },
+    ]);
+    return { previous };
+  },
+  onError: (_e, _v, ctx) => {
+    if (ctx?.previous) queryClient.setQueryData(['products'], ctx.previous);
+  },
+  onSettled: () => queryClient.invalidateQueries({ queryKey: ['products'] }),
+});
+
+// component
+function NewProductForm() {
+  const create = useMutation<Product, Error, NewProduct>({ mutationKey: ['createProduct'] });
+  // offline: thêm vào UI ngay (pending) + xếp hàng; online: tự gửi.
+  return <button onClick={() => create.mutate({ name: 'Bàn phím' })}>Thêm</button>;
+}
+```
+
+Luồng đầy đủ: offline → bấm Thêm → optimistic vào cache (UI thấy item `pending`) → mutation `paused` + persist → reload (vẫn offline, item còn nhờ persist query + hàng đợi) → bật mạng → `resumePausedMutations()` gửi → `onSettled` invalidate → danh sách thật về.
+
+---
+
+## 15. Bài tập
 
 **1.** Vì sao `gcTime` phải ≥ `maxAge` khi persist?
 
@@ -243,20 +506,39 @@ Hàng đợi mutation được persist dưới dạng *dữ liệu* (variables, 
 
 </details>
 
+**4.** `networkMode: 'always'` và `'offlineFirst'` khác nhau ra sao khi offline?
+
+<details>
+<summary>Lời giải</summary>
+
+`'always'` *bỏ qua* trạng thái mạng — luôn chạy `queryFn`/`mutationFn` (hợp data thuần local, không cần API). `'offlineFirst'` vẫn *thử một lần* dù offline để lớp cache HTTP / service worker có cơ hội trả lời; nếu request fail thật vì mất mạng thì mới `paused` chờ online. Vậy `'always'` cho data không cần mạng, `'offlineFirst'` cho PWA có cache layer.
+
+</details>
+
+**5.** Vì sao dehydrate mặc định chỉ persist query `success`? Nếu cố tình nới `shouldDehydrateQuery` để lưu cả `error` thì hại gì?
+
+<details>
+<summary>Lời giải</summary>
+
+Success-only vì lưu `pending` (chưa có data) hay `error` (sự cố nhất thời) là vô nghĩa. Persist `error` → reload sẽ restore ra trạng thái lỗi "đông cứng": user mở app thấy lỗi cũ dù mạng đã ổn, và message lỗi có thể chứa thông tin nhạy cảm bị ghi xuống storage. Cứ để Query refetch tự nhiên thay vì persist lỗi.
+
+</details>
+
 **Nâng cao:** Dựng offline todo: bật DevTools → Network → Offline, thêm 2 todo (thấy chúng `pending` trong UI nhờ optimistic), reload trang (vẫn offline, todo vẫn còn nhờ persist), rồi bật mạng lại — xác nhận cả hai tự gửi đi qua `resumePausedMutations`.
 
 ---
 
 ## Tóm tắt
 
-- `PersistQueryClientProvider` + persister (sync `localStorage` cho cache nhỏ, async `IndexedDB` cho cache lớn) giữ cache qua reload.
-- `maxAge` vứt cache theo tuổi; `buster` vứt theo phiên bản — **luôn đổi `buster` khi schema đổi**. Đặt `gcTime ≥ maxAge`.
-- Lọc bằng `shouldDehydrateQuery`: persist data công khai, **không** persist token/PII/payment.
-- Offline ghi: `networkMode` đẩy mutation sang `paused` + xếp hàng; `setMutationDefaults` đăng ký lại `mutationFn` để sống sót reload; `onlineManager` → `resumePausedMutations()` khi online.
-- `broadcastQueryClient` đồng bộ cache giữa các tab cùng origin (experimental).
+- **Persistence**: `PersistQueryClientProvider` + persister (sync `localStorage` cho cache nhỏ, async `IndexedDB` cho cache lớn) giữ cache qua reload; provider chặn render tới khi restore xong để khỏi nháy data.
+- **`persistQueryClient` options**: `persister` (bắt buộc), `maxAge` (theo tuổi), `buster` (theo phiên bản), `dehydrateOptions` (lọc cái gì lưu). **Luôn đổi `buster` khi schema đổi**; đặt `gcTime ≥ maxAge`.
+- **Lọc**: mặc định chỉ persist query `success`; dùng `shouldDehydrateQuery` để **không** lưu token/PII/payment, và `shouldDehydrateMutation` để giữ hàng đợi offline.
+- **`networkMode`** (`'online'` \| `'always'` \| `'offlineFirst'`) + `onlineManager` điều phối offline: query → `fetchStatus: 'paused'`, mutation → `paused` + xếp hàng.
+- **Offline writes**: `setMutationDefaults` đăng ký lại `mutationFn` để sống sót reload; `onlineManager` → `resumePausedMutations()` gửi FIFO khi online; cấu hình `retry`/`retryDelay` để hàng đợi không gãy.
+- **`broadcastQueryClient`** đồng bộ cache giữa các tab cùng origin (experimental).
 
 ---
 
 ## Phần tiếp theo
 
-**Phần 14 — Realtime: WebSocket/SSE + cache:** đẩy cập nhật từ server vào cache bằng `setQueryData` khi có sự kiện (thay vì invalidate gây refetch), quyết định khi nào *patch* và khi nào *invalidate*, gom nhiều sự kiện, dùng một query làm "kênh subscription", và cập nhật từng phần cache an toàn về type.
+[**Phần 14 — Realtime: WebSocket, SSE & cache**](/blog/tanstack-query-14-realtime-websocket-sse/): đẩy cập nhật từ server vào cache bằng `setQueryData` khi có sự kiện (thay vì invalidate gây refetch), quyết định khi nào *patch* và khi nào *invalidate*, gom nhiều sự kiện, dùng một query làm "kênh subscription", và cập nhật từng phần cache an toàn về type.
