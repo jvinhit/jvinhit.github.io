@@ -174,6 +174,7 @@ const standaloneTools: Tool[] = [
     href: '/tools/stock-patterns-demo/',
     icon: 'trending',
     tags: ['investing', 'charts', 'demo'],
+    pinned: true
   },
   {
     name: 'iOS Video Playback Lab',

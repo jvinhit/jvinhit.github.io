@@ -80,6 +80,11 @@ export const SERIES: Record<string, SeriesMeta> = {
     blurb:
       'From your first script to production-grade automation — quoting, loops, functions, text processing, and robust error handling.',
   },
+  nvim: {
+    title: 'Neovim từ Gà mờ đến Pro',
+    blurb:
+      'Series tiếng Việt giúp bạn chuyển từ VSCode sang Neovim một cách thực dụng, theo chuẩn 2025-2026: modal editing, Lua config, lazy.nvim, native LSP mới với vim.lsp.config/vim.lsp.enable, completion, formatter/linter, Treesitter, fuzzy finder, Git, terminal, debug/test, dotfiles và một capstone cấu hình hoàn chỉnh. Mỗi phần có cheatsheet, bài tập và checklist để luyện thành phản xạ thật.',
+  },
   'ts-pattern': {
     title: 'Design Patterns in TypeScript',
     blurb:
@@ -148,7 +153,7 @@ export const SERIES: Record<string, SeriesMeta> = {
   'tailwind-ui': {
     title: 'Tailwind, Radix & shadcn/ui — từ Zero đến Pro',
     blurb:
-      'Series tiếng Việt giúp bạn thành thạo bộ công cụ styling React hiện đại — mỗi phần đều có config thật, demo tương tác, gotcha production và bài tập thực hành. Bắt đầu với tư duy nền tảng và cài đặt Tailwind CSS v4, rồi tới utility cốt lõi và layout, design token và theming, variant và kết hợp trạng thái, cách dựng component tái dùng cho đúng (clsx, tailwind-merge, cn, cva) cùng hệ sinh thái plugin. Tiếp đó đi headless và accessible với Radix UI primitives, áp dụng shadcn/ui (triết lý, CLI, components.json), theme và tùy biến nó, dựng form đã validate với react-hook-form + zod, ráp mọi thứ thành capstone dashboard production, rồi khép lại bằng hai bài reference chuyên sâu: Tailwind variants và Tailwind v4 cheatsheet/token reference để tra cứu khi làm dự án thật.',
+      'Series tiếng Việt giúp bạn thành thạo bộ công cụ styling React hiện đại — mỗi phần đều có config thật và một demo tương tác trực tiếp. Bắt đầu với tư duy nền tảng và cài đặt Tailwind CSS v4, rồi tới utility cốt lõi và layout, design token và theming, variant và kết hợp trạng thái, cách dựng component tái dùng cho đúng (clsx, tailwind-merge, cn, cva) cùng hệ sinh thái plugin. Tiếp đó đi headless và accessible với Radix UI primitives, áp dụng shadcn/ui (triết lý, CLI, components.json), theme và tùy biến nó, dựng form đã validate với react-hook-form + zod, và kết thúc bằng các mẫu chuyên nghiệp cùng capstone dashboard.',
   },
   vue: {
     title: 'Vue.js 3 — từ Zero đến Production',
