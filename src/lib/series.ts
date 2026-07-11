@@ -60,9 +60,9 @@ export const SERIES: Record<string, SeriesMeta> = {
       'Series tiếng Việt về các mẫu thiết kế (design pattern) mà frontend engineer hiện đại dùng để giữ codebase sạch và mở rộng được. Khởi đầu với mental model "pattern là gì, khi nào nên/không nên dùng" và SOLID nhìn qua lăng kính frontend, rồi đi qua Module & Singleton, Observer & Pub/Sub (nền tảng của reactivity/signals), Factory, Strategy, Command (undo/redo), Facade & Adapter (chống vendor lock-in), Decorator & Proxy (HOC, logging, reactive), các pattern composition đặc trưng React (Compound Components, Render Props, Custom Hooks), state patterns (Flux/Redux, State Machine), Container/Presentational, MVVM và dependency injection — kết bằng một capstone refactor một feature rối thành code gọn gàng. Toàn bộ có ví dụ TypeScript/React thực tế.',
   },
   stocks: {
-    title: 'Đầu tư Cổ phiếu — từ Zero đến Tự tin',
+    title: 'Đầu tư Cổ phiếu — từ Zero đến Quy trình chuyên nghiệp',
     blurb:
-      'A complete, bilingual, education-only path into stock investing — from "what even is a share?" to a written process you can actually follow. Start with the owner mindset and why markets exist, how exchanges, brokers and orders really work, then read the three financial statements and spot accounting games. Go deep on valuation (P/E, P/B, EV/EBITDA, ROE/ROIC) and the price lens (chart patterns, candlesticks, moving averages, RSI, MACD, volume). Then the parts that separate gamblers from investors: building a diversified portfolio, position sizing and risk management, the behavioral biases that wreck returns, long-term compounding with dividends and index funds/ETFs, reading macro and sector cycles, and a capstone that fuses fundamentals, technicals, risk and psychology into one repeatable checklist. Not financial advice.',
+      'Lộ trình tiếng Việt, chỉ mang tính giáo dục, đưa bạn từ "cổ phiếu là gì" đến một quy trình có thể viết ra, kiểm chứng và lặp lại. Series bắt đầu với tư duy chủ sở hữu, cơ chế thị trường, báo cáo tài chính, định giá, kỹ thuật, danh mục, rủi ro, tâm lý, lãi kép và vĩ mô; sau đó đào sâu DCF, lợi thế cạnh tranh, phong cách đầu tư, thuế, phái sinh, thị trường quốc tế, bong bóng và gian lận. Volume phòng lab tiếp theo chuyển kiến thức thành năng lực thực hành: đọc trọn bộ BCTC, viết trading playbook, kiểm định lợi thế, thực thi lệnh, quản trị rủi ro và review hiệu suất. Không phải lời khuyên đầu tư và không bảo đảm lợi nhuận.',
   },
   'package-managers': {
     title: 'Node Package Managers & the Supply Chain — Deep Dive',
@@ -79,6 +79,11 @@ export const SERIES: Record<string, SeriesMeta> = {
     title: 'Bash & Shell Scripting',
     blurb:
       'From your first script to production-grade automation — quoting, loops, functions, text processing, and robust error handling.',
+  },
+  'dev-cli': {
+    title: 'Command Line cho Developer - Commands, Bash Script & Workflow',
+    blurb:
+      'Series tiếng Việt dạng handbook/cookbook cho developer làm việc trong terminal mỗi ngày: điều hướng file, đọc log, tìm code với rg/find, pipe và redirection, Git workflow, curl+jq để debug API, process/port/network debugging, Node package manager, Docker/SSH, và cách gom tất cả thành bash script tự động hóa an toàn.',
   },
   nvim: {
     title: 'Neovim từ Gà mờ đến Pro',
@@ -103,7 +108,7 @@ export const SERIES: Record<string, SeriesMeta> = {
   docker: {
     title: 'Docker, Compose & Kubernetes',
     blurb:
-      'Containers from fundamentals to Compose and Kubernetes, ending with debugging real-world issues.',
+      'A production-minded path from first container to confident operations: container and image mental models, Dockerfile layer/cache discipline, data and networking, Compose for local multi-service systems, image hardening, systematic debugging, then Kubernetes fundamentals, probes, rollouts and real incident playbooks.',
   },
   nginx: {
     title: 'Nginx from Zero to Production',

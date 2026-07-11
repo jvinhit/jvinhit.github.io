@@ -1,0 +1,380 @@
+---
+title: 'Đầu tư Cổ phiếu · Phần 26 — Backtest không tự lừa mình'
+description: 'Thiết kế backtest point-in-time, mô phỏng tín hiệu và execution, xử lý bias, costs, out-of-sample, robustness và tiêu chí quyết định keep/revise/retire.'
+pubDate: 2026-07-11
+tags: [investing, trading, backtesting, quantitative-finance]
+series: stocks
+seriesOrder: 26
+draft: false
+---
+
+Một equity curve đẹp có thể được tạo bởi edge, may mắn, lỗi dữ liệu hoặc một trăm lần thử rồi chỉ giữ lần đẹp nhất. Backtest không phải máy chứng minh chiến lược đúng. Nó là **thí nghiệm cố gắng làm chiến lược thất bại trước khi tiền thật làm việc đó**.
+
+[Bailey và López de Prado](https://escholarship.org/uc/item/9tq3327h) mô tả backtest overfitting là nguồn của những “tối ưu” thống kê nhưng hoạt động kém ngoài đời. Vì vậy bài này ưu tiên audit trail hơn Sharpe đẹp.
+
+## 1. Research contract trước khi chạy
+
+```text
+RESEARCH ID: TPC-01-R001
+Hypothesis:
+Universe / market / period:
+Signal timestamp:
+Execution assumption:
+Risk/exit rules:
+Primary metric:
+Secondary metrics:
+Minimum sample:
+In-sample / validation / test split:
+Costs model:
+Acceptance criteria:
+Rejection criteria:
+Parameters allowed to vary:
+Number of trials budget:
+```
+
+Viết trước giúp phân biệt **confirmatory test** với exploration. Exploration được phép; chỉ cần không giả vờ kết quả sau khám phá là kiểm định độc lập.
+
+## 2. Event timeline — xương sống chống nhìn trước
+
+Với signal cuối ngày:
+
+```text
+t close:      bar hoàn thành
+t + latency:  indicator/signal được tính
+t+1 open:     thời điểm sớm nhất order có thể tới thị trường
+t+1 session:  fill/partial fill/cancel
+future bars:  stop/trail/time exit theo thứ tự sự kiện
+```
+
+Mỗi trường dữ liệu phải có hai thời điểm:
+
+- `effective_at`: nó nói về kỳ nào.
+- `known_at`: thị trường/researcher biết nó lúc nào.
+
+BCTC quý kết thúc 31/03 nhưng công bố 25/04 không được dùng ngày 31/03. Thành phần index công bố sau kỳ cũng vậy.
+
+## 3. Dữ liệu đúng
+
+### Checklist universe
+
+```text
+☐ Bao gồm mã hủy niêm yết/phá sản nếu thuộc universe lịch sử
+☐ Thành phần index theo từng ngày, không dùng membership hôm nay
+☐ IPO chỉ xuất hiện sau listing và đủ lookback
+☐ Suspended/limited trading được phản ánh
+☐ Symbol change/merger được map đúng
+```
+
+### Giá điều chỉnh
+
+Giá raw cần cho execution thực tế; giá adjusted tiện tính return qua split/dividend. Không được trộn adjusted entry với raw stop. Lưu riêng:
+
+```text
+raw OHLCV
+adjustment factor
+adjusted series
+corporate action table
+```
+
+### Dữ liệu bẩn
+
+Phát hiện high < low, volume âm, return cực đoan, missing bar, duplicated timestamp. Không tự winsorize mọi outlier: một số là crash thật. Mọi correction có log nguồn, ngày và lý do.
+
+## 4. Bias ledger
+
+| Bias             | Cách nó lọt vào                      | Kiểm soát                           |
+| ---------------- | ------------------------------------ | ----------------------------------- |
+| Look-ahead       | Entry tại close dùng để tạo signal   | Lag và event timeline               |
+| Survivorship     | Chỉ test mã còn sống                 | Point-in-time universe              |
+| Selection        | Chọn thị trường/giai đoạn đẹp        | Pre-register phạm vi; multi-market  |
+| Multiple testing | Thử nhiều biến thể, báo một biến thể | Trial ledger; holdout; correction   |
+| Data snooping    | Xem test set nhiều lần               | Test set khóa; tạo test mới nếu mở  |
+| Fill bias        | Limit chạm low là coi khớp đủ        | Queue/volume/priority assumption    |
+| Cost omission    | P&L gross                            | Fees, spread, slippage, impact, tax |
+| Delisting        | Bỏ return cuối                       | Event/delist treatment              |
+| Rebalancing      | Dùng weight chưa thể biết            | Timestamp và execution lag          |
+
+Bias ledger phải nằm cạnh report, không ở trí nhớ.
+
+## 5. Backtest engine tối thiểu
+
+```text
+for each trading_day t:
+  load only data known by decision_time(t)
+  update universe and regime
+  process exits and corporate events by declared priority
+  create signals eligible at t
+  generate orders for earliest actionable time
+  simulate fills with volume/price constraints
+  recompute cash, positions, stops, open risk, heat
+  charge all costs
+  save immutable event log and daily equity
+```
+
+### Thứ tự intrabar
+
+Daily bar có high và low nhưng không nói cái nào xảy ra trước. Nếu cả target và stop cùng nằm trong bar, không được luôn chọn target. Chọn policy:
+
+- Conservative: stop trước.
+- Dùng intraday data để tái dựng.
+- Đánh dấu ambiguous và báo khoảng kết quả.
+
+Policy phải áp dụng đều.
+
+## 6. Execution và costs
+
+P&L thật:
+
+```text
+Net P&L = Gross P&L
+          - commissions
+          - exchange/broker fees
+          - taxes/levies nếu áp dụng
+          - spread cost
+          - slippage
+          - market impact
+          - borrow/funding cost nếu có
+```
+
+SEC lưu ý limit order có execution uncertainty và adverse selection; thống kê execution cần xét effective/realized spread, time-to-execution và loại order, không chỉ giá cuối ngày ([SEC order-execution disclosure](https://www.sec.gov/rules-regulations/2001/03/disclosure-order-execution-routing-practices)).
+
+### Ba kịch bản cost
+
+| Scenario                | Spread/slippage             | Dùng để        |
+| ----------------------- | --------------------------- | -------------- |
+| Optimistic but possible | Estimate thấp có bằng chứng | Upper bound    |
+| Base                    | Median/conditional estimate | Main report    |
+| Stress                  | 2–3× base, liquidity xấu    | Fragility test |
+
+Nếu edge biến mất ở tăng chi phí nhỏ, capacity thấp hoặc execution model là phần cốt lõi của “edge”.
+
+### Participation cap
+
+```text
+shares_filled ≤ participation_rate × observed_volume
+```
+
+Không dùng volume cả ngày để giả định khớp ở open mà không có intraday profile. Với daily research, dùng cap thận trọng và capacity bands.
+
+## 7. Position accounting
+
+Mỗi fill tạo event, không chỉ một trade row:
+
+```text
+ORDER_SUBMITTED
+PARTIAL_FILL
+FILL
+STOP_UPDATED
+DIVIDEND/CORPORATE_ACTION
+EXIT_FILL
+CANCEL/REJECT
+```
+
+Kiểm tra invariant hằng ngày:
+
+```text
+ending_cash = beginning_cash + sells - buys + income - costs
+equity = cash + market_value_positions
+position_qty = prior_qty + buys - sells ± corporate_actions
+```
+
+Nếu không reconcile, performance report chưa đáng tin.
+
+## 8. Chia mẫu theo thời gian
+
+Random split phá cấu trúc thời gian. Dùng:
+
+```text
+TRAIN/RESEARCH: phát triển giả thuyết và khoảng tham số
+VALIDATION: chọn giữa số ít specification đã định
+TEST/HOLDOUT: mở một lần để đánh giá cuối
+FORWARD/PAPER: dữ liệu đến sau, gần thực tế nhất
+```
+
+Walk-forward:
+
+```text
+Train 2012–2016 → Test 2017
+Train 2013–2017 → Test 2018
+...
+```
+
+Nếu label/position overlap, cần purge/embargo phù hợp để thông tin của event sát biên không rò giữa folds.
+
+## 9. Metric pack — không có một con số thống trị
+
+### Return và risk
+
+```text
+CAGR = (ending_equity / starting_equity)^(1/years) - 1
+Drawdown_t = equity_t / running_peak_t - 1
+Max drawdown = min(drawdown_t)
+Volatility = std(period returns) × annualization factor
+Sharpe = annualized excess mean / annualized volatility
+```
+
+Sharpe giả định và độ tin cậy phụ thuộc dữ liệu; autocorrelation, skew, tails và sample nhỏ làm nó dễ bị hiểu quá mức.
+
+### Trade distribution
+
+```text
+Expectancy_R = win_rate × avg_win_R - loss_rate × avg_loss_R
+Profit factor = gross_profit / abs(gross_loss)
+Payoff ratio = avg_win / abs(avg_loss)
+```
+
+Win rate đứng một mình vô nghĩa. 80% thắng vẫn tệ nếu thắng +0,2R và thua -2R.
+
+### Operational
+
+- Turnover và trades/year.
+- Exposure/time in market.
+- Capacity theo liquidity band.
+- Slippage median/P90.
+- Rejection/partial-fill rate.
+- P&L concentration ở top 5 trades.
+
+### Uncertainty
+
+Báo confidence interval hoặc bootstrap phù hợp chuỗi thời gian, không chỉ point estimate. Với ít trade, kết luận phải yếu tương ứng.
+
+## 10. Worked example TPC-01
+
+Giả sử kết quả minh họa, không phải dữ liệu thật:
+
+|                  | In-sample | Validation | Holdout |
+| ---------------- | --------: | ---------: | ------: |
+| Trades           |       420 |        135 |     142 |
+| Expectancy gross |    +0,24R |     +0,13R |  +0,09R |
+| Costs            |    -0,07R |     -0,08R |  -0,09R |
+| Expectancy net   |    +0,17R |     +0,05R |   0,00R |
+| Max DD           |      -11R |        -8R |    -14R |
+
+Kết luận không phải “700 trades nên chắc chắn”. Edge net không tồn tại ở holdout; cần **fail/revise**, không chọn lại tham số trên holdout rồi gọi đó là test.
+
+Phân rã cho thấy:
+
+```text
+Liquid large-cap: +0,08R net
+Illiquid tail:    -0,19R net
+Risk-on:          +0,11R net
+Caution:          -0,07R net
+```
+
+Một giả thuyết v0.2 hợp lý là universe/permission khác, nhưng phải có lý do kinh tế và test trên dữ liệu mới. Không xóa nhóm thua chỉ vì nó xấu.
+
+## 11. Robustness tests
+
+### Parameter sensitivity
+
+Thay volume ratio 1,1/1,2/1,3; pullback 2–4/2–5/2–6; stop buffer 0/0,1/0,2 ATR. Tìm **plateau**, không tìm đỉnh.
+
+### Ablation
+
+Loại từng filter:
+
+```text
+Base
+- regime filter
+- volume condition
+- trend condition
+- time stop
+```
+
+Nếu một filter không đóng góp hoặc chỉ giảm sample để Sharpe đẹp, bỏ nó.
+
+### Subperiod và regime
+
+Đánh giá bull, bear, range, shock, early/late sample. Một chiến lược chỉ lời ở một năm nhờ hai trade phải mang nhãn như vậy.
+
+### Placebo
+
+Randomize entry trong cùng universe/regime hoặc shift signal. Nếu chiến lược không khác placebo đáng kể, “edge” có thể chỉ là market beta.
+
+### Cost/capacity stress
+
+Tăng spread/slippage, giảm participation cap, trì hoãn entry một bar. Edge mong manh với delay nhỏ khó triển khai.
+
+## 12. Multiple testing ledger
+
+```text
+trial_id | date | hypothesis | parameters | sample_seen | result | decision
+001      | ...  | base       | ...        | train       | ...    | keep
+002      | ...  | vol 1.1    | ...        | train       | ...    | reject
+...
+```
+
+“Tôi chỉ chạy một chiến lược” là sai nếu bạn đã thử 50 filter trong đầu/code. Ghi mọi trial đủ ảnh hưởng quyết định. Holdout đã xem trở thành validation; muốn kiểm định mới cần dữ liệu tương lai hoặc thị trường độc lập.
+
+## 13. Acceptance gate
+
+Một gate minh họa:
+
+```text
+DATA
+☐ Point-in-time universe, corporate actions, no reconciliation errors
+
+IMPLEMENTATION
+☐ Independent rule review; unit tests; ambiguous bars handled
+
+PERFORMANCE
+☐ Net expectancy > 0 ở đa số walk-forward windows
+☐ Không phụ thuộc vài outlier
+☐ Drawdown nằm trong risk mandate
+
+ROBUSTNESS
+☐ Parameter plateau
+☐ Survives stressed costs/delay
+☐ Sensible regime/subperiod behavior
+
+GOVERNANCE
+☐ Trial ledger complete
+☐ Holdout untouched until final
+☐ Reproduction from config + data version
+```
+
+Kết quả cuối chỉ có bốn nhãn:
+
+- `KEEP FOR PAPER`: qua gate, chưa phải live.
+- `REVISE`: có giả thuyết sửa cụ thể; tạo version mới.
+- `REJECT`: evidence chống lại thesis.
+- `INCONCLUSIVE`: sample/data chưa đủ.
+
+## 14. Báo cáo backtest một trang
+
+```text
+Research ID / code commit / data version
+Question and pre-registered criteria
+Universe and exact timestamps
+Signal → order → fill → exit timeline
+Costs and capacity model
+IS / validation / holdout / walk-forward table
+Equity, drawdown and monthly-return distributions
+Trade R distribution, MFE/MAE, P&L concentration
+Regime/subperiod/parameter/ablation results
+Bias ledger and known limitations
+Trial count and discarded variants
+Decision: keep/revise/reject/inconclusive
+Next evidence required
+```
+
+## 15. Bài kiểm tra
+
+1. Signal dùng closing price và backtest mua đúng closing price: **look-ahead/execution bias** trừ khi chứng minh có thể tính và gửi trước close với dữ liệu phù hợp.
+2. Universe là VN30 hiện tại cho dữ liệu 10 năm: **survivorship/membership bias**.
+3. Limit buy bằng daily low nên coi khớp: **không đủ**; thiếu path, queue và volume.
+4. Thử 200 tham số, chọn tốt nhất rồi test trên chính kỳ đó: **multiple testing/overfit**.
+5. Gross expectancy +0,08R, stressed cost -0,10R: **không triển khai** theo assumptions này.
+
+## Nguồn chuẩn và đọc thêm
+
+- [Bailey & López de Prado — How Backtest Overfitting Leads to False Discoveries](https://escholarship.org/uc/item/9tq3327h)
+- [Bailey et al. — The Probability of Backtest Overfitting](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2326253)
+- [SEC — Disclosure of Order Execution and Routing Practices](https://www.sec.gov/rules-regulations/2001/03/disclosure-order-execution-routing-practices)
+- [SEC — Trading Basics](https://www.sec.gov/file/trading101basicspdf)
+
+## Kết luận
+
+Backtest đáng tin không bắt đầu bằng code nhanh; nó bắt đầu bằng timeline đúng và kết thúc bằng bằng chứng có thể tái tạo. Equity curve là một output. Bias ledger, trial history, costs, capacity và holdout mới cho biết output đó đáng tin đến đâu.
+
+Phần 27 đi sâu vào đoạn thường bị một backtest nến ngày giấu mất: order book, spread, queue, fill, adverse selection, market impact và transaction-cost analysis.
