@@ -1,0 +1,221 @@
+---
+title: 'TypeScript Production · Phần 12 — Capstone: Typed SDK từ Contract đến Release'
+description: 'Capstone ghép toàn series: xây SDK HTTP có runtime validation, branded IDs, typed errors, cancellation, ESM exports, declaration tests, project references và release gates.'
+pubDate: 2026-07-11
+lang: vi
+tags: [typescript, sdk, capstone, architecture]
+series: typescript
+seriesOrder: 12
+draft: false
+---
+
+Capstone không chấm bạn bằng type dài. Nó chấm khả năng ship một artifact mà consumer dùng đúng dễ hơn dùng sai, production quan sát được, và team có thể nâng cấp an toàn.
+
+## Đề bài
+
+Xây `@acme/users-sdk` với hai operation:
+
+```ts
+interface UsersClient {
+  getUser(
+    id: UserId,
+    options?: RequestOptions
+  ): Promise<Result<User, UsersError>>;
+  searchUsers(
+    query: SearchQuery,
+    options?: RequestOptions
+  ): Promise<Result<SearchPage, UsersError>>;
+}
+```
+
+Yêu cầu:
+
+- browser và Node 20+ dùng native `fetch` được inject;
+- mọi response bắt đầu là `unknown`, parse trước khi map;
+- cancel/timeout qua `AbortSignal`;
+- domain errors là discriminated union;
+- package ESM với explicit exports và declaration;
+- không `any` trong public surface;
+- runtime, type và packaged-consumer tests;
+- diagnostics baseline cho compiler.
+
+## Kiến trúc đích
+
+```text
+packages/users-domain
+  ids.ts, user.ts, errors.ts
+          ↑
+packages/users-sdk
+  public.ts
+  application/create-client.ts
+  adapters/http.ts
+  adapters/schemas.ts
+          ↑
+fixtures/consumer-node
+fixtures/consumer-bundler
+```
+
+Domain không import `fetch`, schema library hoặc package metadata.
+
+## Bước 1: domain contract
+
+```ts
+declare const userIdBrand: unique symbol;
+export type UserId = string & { readonly [userIdBrand]: 'UserId' };
+
+export function parseUserId(value: unknown): UserId {
+  if (typeof value !== 'string' || !/^usr_[a-z0-9]+$/.test(value)) {
+    throw new Error('Invalid UserId');
+  }
+  return value as UserId;
+}
+
+export type UsersError =
+  | { code: 'NOT_FOUND'; userId: UserId }
+  | { code: 'UNAUTHORIZED' }
+  | { code: 'RATE_LIMITED'; retryAfterMs: number }
+  | { code: 'TIMEOUT' }
+  | { code: 'CANCELLED' }
+  | { code: 'BAD_RESPONSE'; requestId?: string };
+```
+
+Review: error nào caller xử lý được? Programming/config error nào nên throw khi tạo client thay vì trả mỗi request?
+
+## Bước 2: transport là adapter
+
+```ts
+export type FetchLike = typeof globalThis.fetch;
+
+export type ClientConfig = {
+  baseUrl: URL;
+  fetch: FetchLike;
+  defaultTimeoutMs?: number;
+  onDiagnostic?(event: DiagnosticEvent): void;
+};
+
+export function createUsersClient(config: ClientConfig): UsersClient {
+  assertHttpsOrLocalhost(config.baseUrl);
+  return {
+    getUser: (id, options) => getUser(config, id, options),
+    searchUsers: (query, options) => searchUsers(config, query, options),
+  };
+}
+```
+
+Không nhận global logger/framework type. Diagnostic callback là capability nhỏ; document rõ payload nào không chứa PII.
+
+## Bước 3: parse và normalize
+
+```ts
+async function decodeUser(response: Response): Promise<User> {
+  const contentType = response.headers.get('content-type') ?? '';
+  if (!contentType.includes('application/json')) throw new BadResponseError();
+
+  const raw: unknown = await response.json();
+  const dto = userDtoParser.parse(raw);
+  return toUser(dto);
+}
+```
+
+Thêm giới hạn response size ở layer phù hợp. Parser error được map thành `BAD_RESPONSE` và diagnostic có request ID, không log body thô.
+
+## Bước 4: concurrency contract
+
+Combine caller signal với timeout. Phân biệt cancel chủ động và timeout để UI/telemetry hành xử khác. Không retry `POST`; `GET` chỉ retry theo policy opt-in, tôn trọng `Retry-After` và total budget.
+
+## Bước 5: public package
+
+```json
+{
+  "name": "@acme/users-sdk",
+  "type": "module",
+  "files": ["dist"],
+  "types": "./dist/public.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/public.d.ts",
+      "import": "./dist/public.js"
+    }
+  }
+}
+```
+
+Không export schema, raw DTO, HTTP adapter hay internal error class. Public API là firewall, không phải barrel export toàn repo.
+
+## Test matrix bắt buộc
+
+### Runtime
+
+- success và mapping date/ID;
+- 404, 401, 429 + `Retry-After`;
+- malformed JSON/shape/content-type;
+- timeout và caller cancellation;
+- concurrent requests không dùng chung controller sai;
+- diagnostic không lộ body/authorization.
+
+### Type
+
+```ts
+const result = await client.getUser(parseUserId('usr_1'));
+
+if (!result.ok) {
+  switch (result.error.code) {
+    case 'NOT_FOUND':
+      result.error.userId satisfies UserId;
+      break;
+    case 'RATE_LIMITED':
+      result.error.retryAfterMs satisfies number;
+      break;
+    case 'UNAUTHORIZED':
+    case 'TIMEOUT':
+    case 'CANCELLED':
+    case 'BAD_RESPONSE':
+      break;
+    default:
+      assertNever(result.error);
+  }
+}
+
+// @ts-expect-error raw string chưa có bằng chứng UserId
+await client.getUser('1');
+```
+
+### Artifact
+
+- pack tarball;
+- cài vào consumer Node ESM sạch;
+- cài vào consumer bundler sạch;
+- chạy `tsc --noEmit` bằng minimum và current TS version;
+- import subpath nội bộ phải fail.
+
+## Release gate
+
+```text
+[ ] public .d.ts đã review
+[ ] runtime + negative type tests xanh
+[ ] tarball không thiếu file/dependency
+[ ] exports resolve trong consumer matrix
+[ ] API/type diff đã phân loại semver
+[ ] compiler diagnostics không regression ngoài budget
+[ ] changelog có migration note và minimum TS version
+```
+
+## Bài bảo vệ cấp staff
+
+Viết ADR tối đa hai trang giải thích:
+
+1. ranh giới compile-time/runtime nằm ở đâu;
+2. vì sao error nào dùng `Result`, error nào throw;
+3. public surface nào cam kết semver;
+4. dependency direction được enforce bằng tool nào;
+5. SDK sẽ evolve schema/version mà không khóa producer/consumer ra sao;
+6. số liệu nào chứng minh compiler và runtime health.
+
+**Bạn hoàn thành series khi:** một engineer khác dùng SDK chỉ từ declaration và README, invalid usage fail sớm, malformed production data không lọt vào domain, artifact chạy thật ngoài monorepo, và bạn bảo vệ được mọi trade-off — không chỉ làm compiler im lặng.
+
+## Hướng luyện tiếp
+
+- [TypeScript Type Challenges](/series/ts-challenges/) để luyện type mechanics có chọn lọc.
+- [Design Patterns in TypeScript](/series/ts-pattern/) để mở rộng vốn pattern.
+- [Declaration publishing](https://www.typescriptlang.org/docs/handbook/declaration-files/publishing.html)
+- [Project references](https://www.typescriptlang.org/docs/handbook/project-references.html)

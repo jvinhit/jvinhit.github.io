@@ -1,11 +1,10 @@
 ---
 title: 'Web Performance · Part 13 — RUM & Field Data Deep Dive'
-description: 'Đo người dùng thật như senior: thư viện web-vitals và bản Attribution để biết phần tử/script nào gây LCP/INP/CLS, lấy mẫu, percentile p75, gửi bằng sendBeacon, và CrUX API/BigQuery.'
+description: 'Đo người dùng thật như senior: web-vitals Attribution để phân rã LCP/INP/CLS, lấy mẫu, percentile p75, gửi bằng sendBeacon, và CrUX API/BigQuery.'
 pubDate: 2026-09-11
-tags: [performance, rum, web-vitals, crux, web_perf_12]
+tags: [performance, rum, web-vitals, crux, web_perf_22]
 series: web-perf
 seriesOrder: 13
-draft: true
 ---
 
 Phần 3 giới thiệu lab vs field data. Mười phần chuyên sâu này bắt đầu từ thứ quan trọng nhất: **đo người dùng thật** (Real User Monitoring). Lab data nói trang nhanh trên máy bạn; chỉ RUM nói nó nhanh với người dùng thật trên điện thoại 4G. Phần này dạy cách thu, *quy trách* (attribution), và phân tích field data đúng cách — nền tảng cho mọi quyết định tối ưu sau đó.
@@ -16,14 +15,14 @@ Phần 3 giới thiệu lab vs field data. Mười phần chuyên sâu này bắ
 
 ## 1. Thư viện web-vitals — cách chuẩn để thu
 
-Google duy trì thư viện `web-vitals` đo đúng cả ba Core Web Vitals (và TTFB/FCP) theo cách khớp với CrUX/Search Console.
+Google duy trì thư viện `web-vitals` để triển khai định nghĩa Core Web Vitals (cùng TTFB/FCP) trên các API mà trình duyệt cung cấp. Coverage từng metric vẫn phụ thuộc engine; dữ liệu client cũng không nhìn xuyên nội dung iframe như CrUX có thể làm.
 
 ```ts
 import { onLCP, onINP, onCLS, onTTFB, onFCP } from 'web-vitals';
 
 function sendToAnalytics(metric: { name: string; value: number; id: string; rating: string }) {
   const body = JSON.stringify(metric);
-  // sendBeacon sống sót cả khi trang đang unload — KHÔNG dùng fetch thường ở đây
+  // Ưu tiên sendBeacon khi trang hidden/unload; false nghĩa là browser không xếp hàng được.
   navigator.sendBeacon?.('/rum', body) ||
     fetch('/rum', { body, method: 'POST', keepalive: true });
 }
@@ -35,13 +34,13 @@ onTTFB(sendToAnalytics);
 onFCP(sendToAnalytics);
 ```
 
-Mấu chốt: các chỉ số như **CLS và INP tích lũy suốt vòng đời trang**, nên phải gửi vào lúc trang ẩn/đóng. Dùng `visibilitychange → hidden` + `sendBeacon`, không gửi ngay khi đo.
+Mấu chốt: ứng viên **CLS và INP có thể thay đổi suốt vòng đời trang**. `web-vitals` tự gọi callback khi giá trị sẵn sàng báo cáo, bao gồm lúc trang chuyển sang `hidden`; endpoint phải upsert theo `id` hoặc cộng `delta` vì một metric có thể được gửi nhiều lần (và có id mới sau khi khôi phục từ BFCache). Nếu tự gom beacon, flush hàng đợi ở `visibilitychange → hidden` bằng `sendBeacon`.
 
 ---
 
-## 2. Attribution build — biết CHÍNH XÁC cái gì gây chậm
+## 2. Attribution build — thu hẹp nguyên nhân gây chậm
 
-Đo được "INP = 450ms" chưa giúp gì nếu không biết *tương tác nào, phần tử nào, vì sao*. Bản **Attribution** của web-vitals trả về dữ liệu chẩn đoán đính kèm.
+Đo được "INP = 450ms" chưa giúp gì nếu không biết *tương tác nào, phần tử nào, vì sao*. Bản **Attribution** của web-vitals trả về dữ liệu chẩn đoán đính kèm; đây là manh mối để tái hiện và profile, không phải lúc nào cũng chỉ thẳng một dòng code duy nhất.
 
 ```ts
 import { onINP, onLCP, onCLS } from 'web-vitals/attribution';
@@ -55,7 +54,7 @@ onINP((metric) => {
     inputDelay: a.inputDelay,        // chờ main thread rảnh
     processingDuration: a.processingDuration, // chạy handler
     presentationDelay: a.presentationDelay,   // render khung kế
-    loafScripts: a.longAnimationFrameEntries, // script gây long frame (Part 16)
+    loafEntries: a.longAnimationFrameEntries, // LoAF entries để lần tới script (Part 16)
   });
 });
 ```
@@ -67,24 +66,26 @@ Phân rã INP thành 3 phần → biết sửa ở đâu:
   presentationDelay cao  → render/layout nặng sau handler (Part 17)
 ```
 
-Tương tự, LCP attribution cho biết `element`, thời gian TTFB/resource-load/render-delay; CLS attribution cho `largestShiftTarget` — phần tử nào nhảy. Đây là khác biệt giữa "biết trang chậm" và "biết sửa dòng nào".
+Tương tự, LCP attribution phân rã TTFB/resource-load delay/resource-load duration/element-render delay; CLS attribution cho `largestShiftTarget` — phần tử đại diện cho cụm shift lớn nhất. LoAF attribution hiện không đồng đều giữa các engine, nên luôn feature-detect và giữ đường chẩn đoán bằng Performance panel.
+
+Attribution làm payload có cardinality và rủi ro riêng tư cao hơn. Không gửi DOM text, form value hay URL/query có token; allowlist route, chuẩn hóa selector bằng tùy chọn `generateTarget`, cắt query khỏi `sourceURL`, và đặt retention/sampling riêng cho dữ liệu debug.
 
 ---
 
 ## 3. Percentile, không phải trung bình
 
-Sai lầm phân tích kinh điển: nhìn **giá trị trung bình**. Trung bình bị kéo lệch và giấu đuôi xấu. Field data dùng **percentile**, đặc biệt **p75** — Google đánh giá CWV ở mốc 75% người dùng.
+Sai lầm phân tích kinh điển: nhìn **giá trị trung bình**. Trung bình bị kéo lệch và giấu đuôi xấu. Field data dùng **percentile**, đặc biệt **p75** — Google đánh giá CWV ở phân vị 75 của các lượt xem trang đủ điều kiện.
 
 ```text
-Ví dụ INP của 5 phiên: 80, 90, 100, 120, 900 (ms)
+Ví dụ minh họa INP của 5 phiên: 80, 90, 100, 120, 900 (ms)
   Trung bình = 258ms  → trông "tệ" nhưng gây hiểu lầm
-  p75 = 120ms         → "Good" cho 75% người dùng (cái Google dùng)
+  p75 = 120ms         → ít nhất 75% lượt xem ở mức này hoặc tốt hơn (mốc Google dùng)
   p99 = ~900ms        → đuôi xấu cần điều tra riêng
 
 → Báo cáo p75 (tuân thủ) + theo dõi p95/p99 (đuôi).
 ```
 
-Đừng tính p75 trên trung bình client-side; gửi *từng* giá trị thô về backend rồi tính percentile khi tổng hợp. Trung bình của các trung bình là vô nghĩa.
+Đừng tính p75 trên trung bình client-side; gửi *từng* giá trị thô về backend rồi tính percentile khi tổng hợp. Trung bình của các trung bình làm mất phân phối. Năm mẫu ở ví dụ trên quá ít để ra quyết định thật — dashboard phải hiển thị cả sample count và khoảng thời gian.
 
 ---
 
@@ -102,7 +103,7 @@ Phân khúc đáng theo dõi:
   - new vs returning (cache nóng/lạnh)
 ```
 
-Gắn các chiều này vào payload RUM. "p75 INP toàn site = 180ms" có thể giấu một route mobile với p75 = 600ms — chính chỗ cần sửa.
+Gắn các chiều hợp lệ vào payload RUM. "p75 INP toàn site = 180ms" có thể giấu một route mobile với p75 = 600ms — chính chỗ cần sửa. Dữ liệu mạng phía client (Network Information API) không có ở mọi browser và có thể bị giảm độ chi tiết; đừng biến giá trị thiếu thành một phân khúc giả.
 
 ---
 
@@ -118,13 +119,13 @@ if (sampled) {
 }
 ```
 
-> Lưu ý: lấy mẫu theo **phiên** (quyết định một lần lúc tải), không theo từng metric, để dữ liệu một phiên nhất quán. Với traffic thấp thì đo 100%; traffic cao thì 1–10% là đủ cho percentile ổn định.
+> Lưu ý: lấy mẫu theo **page visit/phiên theo định nghĩa analytics của bạn** (quyết định một lần), không tung xúc xắc riêng cho từng metric. Tỉ lệ phù hợp phụ thuộc traffic, số route/phân khúc và độ chính xác cần có; theo dõi sample count trước khi hạ tỉ lệ, không mặc định rằng 1–10% luôn đủ.
 
 ---
 
 ## 6. CrUX — field data miễn phí của Google
 
-Nếu chưa có RUM, **Chrome UX Report (CrUX)** cho field data thật (từ người dùng Chrome thật) miễn phí — đây là nguồn Google dùng để xếp hạng.
+Nếu chưa có RUM, **Chrome UX Report (CrUX)** cho field data tổng hợp từ tập người dùng Chrome đủ điều kiện và đã bật đồng bộ lịch sử/usage statistics. Đây là nguồn field mà các công cụ Google như PageSpeed Insights và báo cáo Core Web Vitals sử dụng.
 
 ```text
 Truy cập CrUX:
@@ -141,17 +142,18 @@ curl "https://chromeuxreport.googleapis.com/v1/records:queryRecord?key=$KEY" \
   -d '{"origin":"https://example.com","metrics":["largest_contentful_paint","interaction_to_next_paint","cumulative_layout_shift"]}'
 ```
 
-Khác biệt CrUX vs RUM riêng: CrUX là dữ liệu **tổng hợp 28 ngày, chỉ Chrome, không phân khúc tùy ý**; RUM riêng cho dữ liệu **tức thời, mọi trình duyệt, phân khúc & attribution tùy ý**. Dùng CrUX để benchmark, RUM riêng để chẩn đoán sâu.
+Khác biệt CrUX vs RUM riêng: CrUX API là dữ liệu **tổng hợp rolling 28 ngày, từ tập Chrome đủ điều kiện, không phân khúc tùy ý**; BigQuery phát hành theo tháng và có các lát cắt được công bố. RUM riêng cho dữ liệu gần thời gian thực, phân khúc & attribution tùy ý trên những browser hỗ trợ API metric tương ứng. Dùng CrUX để benchmark, RUM riêng để chẩn đoán sâu.
 
 ---
 
 ## 7. Tóm tắt
 
-- Đo người dùng thật bằng thư viện **`web-vitals`**; gửi bằng **`sendBeacon`** lúc `visibilitychange → hidden` vì CLS/INP tích lũy suốt vòng đời trang.
+- Đo người dùng thật bằng thư viện **`web-vitals`**; xử lý callback có thể lặp theo `id`/`delta`, và dùng **`sendBeacon`** để flush an toàn lúc `visibilitychange → hidden`.
 - Dùng bản **Attribution** để biết *phần tử/script/giai đoạn* nào gây LCP/INP/CLS — phân rã INP thành inputDelay/processing/presentation để biết sửa ở đâu.
+- Chuẩn hóa attribution trước khi gửi: tránh PII/token và cardinality không kiểm soát; dùng `generateTarget` khi selector mặc định không phù hợp.
 - Phân tích bằng **percentile p75** (mốc Google dùng), không phải trung bình; theo dõi p95/p99 cho đuôi. Tính percentile ở backend từ giá trị thô.
 - **Phân khúc** theo thiết bị/mạng/route/quốc gia — con số toàn cục giấu vấn đề thật.
-- **Lấy mẫu theo phiên** để giảm chi phí ở site lớn.
-- **CrUX** (PSI/API/BigQuery/Search Console) cho field data Chrome miễn phí để benchmark; RUM riêng cho chẩn đoán sâu mọi trình duyệt.
+- **Lấy mẫu nhất quán** và luôn theo dõi sample count để giảm chi phí mà không làm percentile vô nghĩa.
+- **CrUX** (PSI/API/BigQuery/Search Console) cho field data Chrome tổng hợp để benchmark; RUM riêng cho chẩn đoán sâu với coverage tùy API/browser.
 
 **Phần tiếp theo:** Resource hints, priorities & Early Hints — `preload`/`preconnect`/`modulepreload`, `fetchpriority`, `103 Early Hints` và Speculation Rules để rút ngắn đường tới byte quan trọng.

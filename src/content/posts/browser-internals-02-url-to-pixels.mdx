@@ -2,15 +2,14 @@
 title: 'How Browsers Work · Part 2 — From URL to Pixels'
 description: 'A bird''s-eye walkthrough of everything that happens between pressing Enter and the first paint: URL parsing, DNS, TCP/TLS, the HTTP request, response handling, and handing bytes to the renderer.'
 pubDate: 2026-10-07
-tags: [browser, internals, navigation, networking, browser_internals_12]
+tags: [browser, internals, navigation, networking, browser_internals_22]
 series: browser-internals
 seriesOrder: 2
-draft: true
 ---
 
 Phần 1 đã cho bạn bản đồ: trình duyệt là nhiều tiến trình, và renderer biến code thành pixel. Phần này theo một lần điều hướng từ đầu đến cuối — điều gì diễn ra giữa lúc nhấn **Enter** ở address bar và lần vẽ pixel đầu tiên.
 
-Ta giữ góc nhìn tổng thể ở đây; các phần sau sẽ zoom vào phân tích HTML (Phần 3), CSS (Phần 4), và layout/paint (Phần 5). Chủ đề xuyên suốt: **tiến trình browser sở hữu điều hướng**; renderer chỉ nhận byte sau khi navigation được commit.
+Ta giữ góc nhìn tổng thể ở đây; các phần sau sẽ zoom vào phân tích HTML (Phần 3), CSS (Phần 4), và layout/paint (Phần 5). Chủ đề xuyên suốt: **tiến trình browser sở hữu điều hướng**; nó chọn renderer và bàn giao response ở bước commit, rồi renderer tiếp tục loading.
 
 ---
 
@@ -19,11 +18,11 @@ Ta giữ góc nhìn tổng thể ở đây; các phần sau sẽ zoom vào phân
 Khi bạn nhấn Enter, **luồng UI** trong tiến trình browser nhận input — không phải renderer. Việc đầu tiên là biến chuỗi đó thành thứ có thể hành động:
 
 1. **Phân tích và chuẩn hóa URL** — thêm scheme nếu thiếu (`example.com` → `https://example.com`), viết thường host, percent-encode ký tự không hợp lệ, resolve đường dẫn tương đối nếu bạn đang sửa URL hiện có.
-2. **Tìm kiếm vs URL** — nếu input không giống URL (không có dấu chấm, không có scheme), trình duyệt coi đó là truy vấn tìm kiếm và điều hướng tới công cụ tìm kiếm mặc định.
+2. **Tìm kiếm vs URL** — omnibox dùng heuristic và cấu hình công cụ tìm kiếm để phân biệt URL với query; đây không phải quy tắc đơn giản kiểu "có dấu chấm thì là URL".
 3. **Kiểm tra HSTS** — nếu host nằm trong danh sách preload HTTP Strict Transport Security, yêu cầu `http://` được nâng lên `https://` trước mọi I/O mạng.
-4. **Kiểm tra bảo mật** — chặn scheme nguy hiểm (`javascript:`, `data:` trên address bar), áp dụng Safe Browsing nếu bật, kiểm tra chính sách doanh nghiệp.
+4. **Chọn đường xử lý theo scheme và policy** — `http:`/`https:` đi qua network stack; `data:`, `file:`, URL nội bộ hay scheme tùy chỉnh có pipeline và giới hạn riêng. Safe Browsing và policy doanh nghiệp có thể chặn navigation.
 
-Chỉ sau khi URL hợp lệ, trình duyệt mới khởi động network stack.
+Nếu đây là cross-document navigation rời một trang đang mở, Chromium chạy `beforeunload` của document cũ **trước network request**; user có thể hủy điều hướng. Sau đó, URL cần mạng mới đi vào network stack. Trình tự chi tiết nằm trong [Life of a Navigation của Chromium](https://chromium.googlesource.com/chromium/src/+/main/docs/navigation.md).
 
 > Điều hướng là **theo URL, theo tab** — mỗi lần nhấn Enter (hoặc click link, hay `location.href = …`) chạy pipeline này độc lập, dù tái sử dụng kết nối có thể bỏ qua vài bước khi quay lại.
 
@@ -33,35 +32,27 @@ Chỉ sau khi URL hợp lệ, trình duyệt mới khởi động network stack.
 
 Trình duyệt biết *muốn đi đâu* (`example.com`) nhưng mạng cần địa chỉ IP. **Phân giải DNS** lấp khoảng trống đó.
 
-Phân giải là một chuỗi cache, nhanh nhất trước:
+Phân giải thường đi qua cache và resolver, nhưng đường chính xác phụ thuộc cấu hình trình duyệt/HĐH:
 
 ```text
-Browser DNS cache
+Chromium host cache
        ↓ miss
-OS resolver cache (getaddrinfo)
-       ↓ miss
-Configured recursive resolver (ISP, 8.8.8.8, 1.1.1.1, …)
+Built-in resolver / OS resolver / DNS-over-HTTPS (tùy cấu hình)
        ↓
-Authoritative nameservers for the domain
+Recursive resolver → authoritative nameservers
        ↓
 IP address(es) returned
 ```
 
-**Network service** (không phải renderer) thực hiện tra cứu này — nhớ từ Phần 1 renderer không mở socket trực tiếp. Nếu bạn vừa ghé site gần đây, cache trình duyệt hay OS có thể trả lời trong micro giây; tra cứu lạnh có thể mất hàng chục đến hàng trăm mili giây.
+**Network service** (không phải renderer) điều phối tra cứu này — nhớ từ Phần 1 renderer không mở socket trực tiếp. Cache hit tránh một round-trip DNS; cache miss phải chờ resolver và có thể thử nhiều địa chỉ IPv6/IPv4.
 
-Trình duyệt hiện đại cũng hỗ trợ **DNS-over-HTTPS (DoH)** khi cấu hình, gửi truy vấn mã hóa tới resolver thay vì UDP plaintext tới ISP. Kết quả — một hoặc nhiều địa chỉ IP — là thứ TCP sẽ kết nối tới.
-
-| Cache layer | Thời gian sống | Ai xóa |
-|-------------|----------------|----------------|
-| Browser | Vài phút đến vài giờ | Đóng tab, "Clear browsing data" |
-| OS | Theo TTL bản ghi DNS | Khởi động lại, `ipconfig /flushdns` |
-| Resolver | Khác nhau | Phụ thuộc nhà cung cấp |
+Trình duyệt hiện đại cũng hỗ trợ **DNS-over-HTTPS (DoH)** khi cấu hình. TTL, negative caching và cách cache browser tương tác với cache HĐH là chi tiết implementation; đóng một tab không đồng nghĩa xóa DNS cache dùng chung của browser.
 
 ---
 
 ## 3. TCP và TLS: mở kênh bảo mật
 
-Có IP rồi, network service mở **kết nối TCP** tới cổng 443 (HTTPS) hay 80 (HTTP). Đây là bắt tay ba bước bạn học ở lớp mạng:
+Có IP rồi, HTTP/1.1 và HTTP/2 thường mở **kết nối TCP** tới cổng 443 (HTTPS) hay 80 (HTTP). Đây là bắt tay ba bước bạn học ở lớp mạng:
 
 ```text
 Client  ── SYN ──────────────►  Server
@@ -70,14 +61,14 @@ Client  ── ACK ──────────────►  Server
         (connection established)
 ```
 
-Với **HTTPS**, **bắt tay TLS** chạy trên TCP trước khi byte HTTP chảy. Ở mức cao:
+Với HTTPS trên TCP, **bắt tay TLS** chạy trước khi HTTP chảy. Ở mức cao:
 
 1. Client gửi phiên bản TLS và bộ mật mã hỗ trợ.
 2. Server chọn mật mã, gửi chuỗi chứng chỉ.
 3. Client xác minh chứng chỉ (chuỗi tin cậy, khớp hostname, thu hồi nếu kiểm tra).
 4. Hai bên dẫn xuất khóa phiên và chuyển sang giao tiếp mã hóa.
 
-TLS thêm một đến ba vòng round-trip trên kết nối lạnh — lý do chính **tái sử dụng kết nối** quan trọng. Nếu trình duyệt đã có kết nối **HTTP/2 hay HTTP/3** ấm tới host đó (cùng IP + cổng + scheme), nó bỏ qua TCP+TLS và gửi yêu cầu trên socket hiện có.
+Một kết nối HTTPS lạnh qua TCP thường trả 1 RTT cho TCP rồi 1 RTT cho full handshake TLS 1.3; resumption có thể giảm thêm. **HTTP/3** là nhánh khác: nó chạy trên QUIC/UDP và tích hợp TLS 1.3, không có TCP handshake riêng. Nếu browser đã có kết nối HTTP/2 hoặc HTTP/3 đủ điều kiện, nó tái dùng kết nối; HTTP/2/3 còn có thể **coalesce** một kết nối cho nhiều origin khi chứng chỉ, DNS và policy cho phép.
 
 > Thẻ gợi ý **`preconnect`** và **`dns-prefetch`** cho phép trang làm ấm kết nối *trước* điều hướng — `<link rel="preconnect" href="https://cdn.example.com">` phân giải DNS và mở TCP+TLS sớm. Phần 9 đi sâu hơn về cache và HTTP.
 
@@ -88,8 +79,10 @@ TLS thêm một đến ba vòng round-trip trên kết nối lạnh — lý do c
 Khi kênh mở, trình duyệt gửi **yêu cầu HTTP**:
 
 ```http
-GET /articles/browser-internals HTTP/2
-Host: example.com
+:method: GET
+:scheme: https
+:authority: example.com
+:path: /articles/browser-internals
 Accept: text/html,application/xhtml+xml,…
 Accept-Language: en-US,en;q=0.9
 Accept-Encoding: gzip, deflate, br
@@ -104,12 +97,12 @@ Các phần chính:
 
 - **Method** — `GET` cho điều hướng; `POST` cho submit form.
 - **Headers** — `Accept` báo server trình duyệt xử lý được gì; `Cookie` gắn cookie đã lưu cho origin này; header `Sec-Fetch-*` mô tả ngữ cảnh bảo mật của yêu cầu.
-- **Credentials** — cookie và client cert được gắn tự động theo quy tắc SameSite và cài đặt người dùng.
+- **Credentials** — cookie được chọn theo host/domain, path, `Secure`, `SameSite`, partition và policy người dùng. TLS client certificate, nếu có, được thương lượng ở tầng TLS chứ không phải một header cookie.
 
 Server phản hồi bằng status, header, và body:
 
 ```http
-HTTP/2 200
+:status: 200
 Content-Type: text/html; charset=utf-8
 Content-Encoding: gzip
 Cache-Control: max-age=3600
@@ -118,27 +111,30 @@ Set-Cookie: session_id=xyz789; HttpOnly; Secure; SameSite=Lax
 <!DOCTYPE html>…
 ```
 
-Tiến trình browser đọc phản hồi và đưa ra vài quyết định trước khi giao bất cứ thứ gì cho renderer:
+Network service và tiến trình browser xử lý header phản hồi, rồi đưa ra vài quyết định trước khi bàn giao response cho renderer:
 
 | Status / signal | Hành động trình duyệt |
 |-----------------|------------------------------------------|
 | **301/302/307/308** | Theo redirect (có thể nhiều bước); mỗi bước lặp DNS/TCP/TLS nếu khác origin |
-| **401/403** | Hiện trang lỗi hay nhắc xác thực |
+| **401** | Có thể kích hoạt HTTP-auth prompt khi có `WWW-Authenticate`; nếu không, render body lỗi như response bình thường |
+| **403** | Thường vẫn commit và render body phản hồi với status lỗi |
 | **`Content-Disposition: attachment`** | Coi là tải xuống, không phải điều hướng |
 | **`Content-Type: application/pdf`** | Có thể dùng viewer tích hợp hay tải xuống |
-| **Missing/wrong `Content-Type`** | **Thiếu/sai `Content-Type`** — **sniff MIME** — xem byte để đoán loại (bị hạn chế với `text/html` từ lỗi IE cũ) |
+| **204/205** | Không tạo document mới; document hiện tại vẫn active |
+| **Thiếu `Content-Type`** | Có thể sniff một phần body nếu policy cho phép; `X-Content-Type-Options: nosniff` tắt một số đường sniff |
 
 ---
 
-## 5. Có thật sự điều hướng không? — beforeunload và kiểm tra commit
+## 5. Có thật sự tạo document mới không?
 
-Không phải mọi phản hồi HTTP thành công đều thành trang mới trong tab. Trước khi đổi tài liệu, trình duyệt chạy **kiểm tra commit điều hướng**:
+Không phải mọi navigation hay phản hồi HTTP đều tạo document mới trong tab:
 
-1. **`beforeunload`** — nếu bạn rời trang đã đăng ký handler `beforeunload`, trình duyệt có thể hỏi "Leave site?" và chờ câu trả lời.
-2. **Tải xuống vs tài liệu** — nếu phản hồi là file (`Content-Disposition: attachment`, hay MIME không render được mà người dùng chọn tải), trình duyệt lưu file và **không** điều hướng tab.
-3. **Cross-origin opener policy / hạn chế frame** — vài phản hồi mở trong ngữ cảnh duyệt mới thay vì thay tài liệu hiện tại.
+1. **Same-document navigation** — đổi fragment hay `history.pushState()` giữ nguyên `Document`, không đi qua pipeline này như một page load mới.
+2. **`204` / `205`** — response thành công nhưng không có document thay thế; trang cũ vẫn active.
+3. **Tải xuống** — `Content-Disposition: attachment` khiến browser chuyển sang download và không commit document mới.
+4. **Navigation trong frame bị chặn** — `frame-ancestors`/`X-Frame-Options` có thể từ chối nhúng response. **COOP** không tự mở URL sang tab khác; nó có thể tách document mới sang browsing-context group khác khi commit.
 
-Nếu mọi kiểm tra qua, trình duyệt sẵn sàng **commit** điều hướng — điểm không quay lại khi trang cũ bị dỡ và trang mới tiếp quản.
+Nếu không rơi vào các nhánh trên, browser chọn renderer và chuẩn bị **commit** điều hướng. Document cũ có thể bị hủy, hoặc được giữ sống trong bfcache để dùng khi Back/Forward.
 
 ---
 
@@ -159,11 +155,11 @@ Renderer process (sandboxed)
   └─ Begin receiving bytes, start HTML parsing…
 ```
 
-**Site Isolation** (Phần 1) nghĩa là điều hướng từ `bank.com` sang `evil.com` luôn vào **renderer khác** — tiến trình cũ bị hủy hay chỉ giữ cho back-forward cache. Điều hướng trong cùng site (`/about` → `/contact` cùng origin) thường **tái sử dụng** renderer, tránh chi phí tạo tiến trình.
+Với full Site Isolation trên desktop, điều hướng từ `bank.com` sang `evil.com` dùng **renderer khác**. Điều hướng cùng site thường có thể tái sử dụng process, nhưng quyết định còn phụ thuộc SiteInstance, COOP, process limit và trạng thái hiện tại — đừng coi "một tab = một process" là invariant.
 
 **Commit** là cột mốc IPC: address bar cập nhật, lịch sử phiên thêm mục mới, renderer bắt đầu tiêu thụ stream body phản hồi. Trước commit, người dùng vẫn thấy trang cũ (dù spinner tab có thể đã quay).
 
-> **Back-forward cache (bfcache)** đóng băng cả tiến trình renderer trong bộ nhớ để Back tức thì — không mạng, không parse lại. Không phải trang nào cũng đủ điều kiện (WebSocket mở, `Cache-Control: no-store`, v.v.).
+> **Back-forward cache (bfcache)** giữ sống **Document cùng state liên quan** và tạm dừng tác vụ của trang để Back/Forward gần như tức thì — không phải lúc nào cũng đóng băng cả renderer process. Eligibility thay đổi theo browser và phiên bản: Chrome hiện có thể cache một số trang `Cache-Control: no-store` an toàn, nên hãy kiểm tra **Application → Back-forward Cache** hoặc `notRestoredReasons` thay vì thuộc một blacklist cũ. Xem [thay đổi `no-store` của Chrome](https://developer.chrome.com/docs/web-platform/bfcache-ccns).
 
 ---
 
@@ -198,7 +194,7 @@ Response bytes (streaming)
     First paint (FP) / First Contentful Paint (FCP)
 ```
 
-**Lần paint đầu** xảy ra ngay khi trình duyệt có đủ DOM + CSSOM để vẽ *cái gì đó* — thường trước khi mọi tài nguyên tải xong. Đó là lý do CSS chặn render trong `<head>` trì hoãn lần paint đầu, còn ảnh dưới fold thì không.
+**Lần paint đầu** có thể xảy ra khi browser có đủ DOM tăng dần và các stylesheet đang chặn để vẽ *cái gì đó* — không cần đợi toàn bộ document hay mọi tài nguyên. Đó là lý do CSS render-blocking trì hoãn paint, còn nhiều ảnh ngoài viewport thì không.
 
 Yêu cầu tài nguyên con (`<script src="…">`, `@import`, `fetch()` từ JS) quay lại network service — cùng pool kết nối, cùng cookie jar, cùng thực thi CORS. Renderer yêu cầu; tiến trình browser (qua network service) fetch và stream byte trả về qua IPC.
 
@@ -213,20 +209,19 @@ Enter URL
   │
   ├─ [Browser] Parse URL, HSTS, security checks
   │
-  ├─ [Network] DNS lookup (cache → resolver → authoritative)
+  ├─ [Browser] beforeunload (nếu cần; có thể hủy navigation)
   │
-  ├─ [Network] TCP handshake (1 RTT)
+  ├─ [Network] DNS lookup (nếu cache miss)
   │
-  ├─ [Network] TLS handshake (1–2 RTT)
+  ├─ [Network] TCP + TLS 1.3, hoặc QUIC + TLS cho HTTP/3
   │
   ├─ [Network] HTTP request → HTTP response (headers + body stream)
   │       │
-  │       ├─ Redirect? → repeat from DNS or reuse connection
-  │       └─ Download? → save file, STOP
+  │       ├─ Redirect? → request URL kế tiếp, có thể reuse connection
+  │       ├─ 204/205? → giữ document cũ, STOP
+  │       └─ Download? → lưu file, STOP
   │
-  ├─ [Browser] beforeunload prompt, commit checks
-  │
-  ├─ [Browser] Pick/spawn renderer (Site Isolation rules)
+  ├─ [Browser] Pick/spawn renderer (Site Isolation + response policy)
   │
   ├─ [Browser → Renderer] Commit navigation, stream body
   │
@@ -235,14 +230,14 @@ Enter URL
                     └──► First paint visible on screen
 ```
 
-Mỗi bước có chi phí tính bằng mili giây — DNS và TLS chiếm ưu thế trên tải lạnh; tái sử dụng kết nối và preconnect thu nhỏ phía trái sơ đồ này khi quay lại. Panel **Network** của DevTools cho thấy tầng HTTP; panel **Performance** cho thấy khi parse và paint bắt đầu ở phía renderer.
+Chi phí thực tế phụ thuộc RTT, server think time, protocol, cache và khả năng reuse connection; không có bước nào luôn chiếm ưu thế. Panel **Network** của DevTools cho thấy timing request; panel **Performance** cho thấy parse và render phía renderer.
 
 ---
 
 ## Tóm tắt
 
 - Điều hướng thuộc **tiến trình browser**: phân tích URL, HSTS, search-vs-URL, và kiểm tra bảo mật diễn ra trước mọi I/O mạng.
-- **DNS → TCP → TLS → HTTP** là network stack cho mỗi origin; cache và tái sử dụng kết nối bỏ qua bước khi ghé ấm.
+- Với HTTP/1.1/2, đường lạnh thường là **DNS → TCP → TLS → HTTP**; HTTP/3 dùng **QUIC + TLS**. Cache và connection reuse có thể bỏ qua nhiều bước.
 - Trình duyệt xử lý redirect, sniff MIME, tải xuống vs tài liệu, và **`beforeunload`** trước khi commit.
 - **Site Isolation** quyết định renderer nào nhận trang; commit là điểm bàn giao.
 - Renderer stream byte vào pipeline **DOM → CSSOM → layout → paint → composite**; lần paint đầu đến trước khi trang tải xong.

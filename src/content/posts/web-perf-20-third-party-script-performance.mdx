@@ -2,15 +2,14 @@
 title: 'Web Performance · Part 20 — Third-Party Script Performance'
 description: 'Chế ngự analytics, ads, embed và tag manager: đo tác động bên thứ ba, facade pattern cho embed, Partytown để đẩy sang worker, lazy iframe, async/defer, và đặt budget cho third-party.'
 pubDate: 2026-09-25
-tags: [performance, third-party, partytown, scripts, web_perf_12]
+tags: [performance, third-party, partytown, scripts, web_perf_22]
 series: web-perf
 seriesOrder: 20
-draft: true
 ---
 
-Bạn có thể tối ưu hoàn hảo code của mình rồi vẫn có một trang chậm — vì **script bên thứ ba**: analytics, quảng cáo, chat widget, A/B testing, tag manager, embed (YouTube, Twitter, Maps). Chúng chạy trên *cùng main thread* với code bạn, thường nặng, và bạn ít kiểm soát. Phần này về chiến lược chế ngự chúng mà không (luôn) phải gỡ bỏ.
+Bạn có thể tối ưu code của mình rồi vẫn có một trang chậm — vì **tài nguyên bên thứ ba**: analytics, quảng cáo, chat widget, A/B testing, tag manager, embed (YouTube, social, Maps). Script được chèn vào document chính cạnh tranh trên *cùng main thread*; cross-origin iframe có execution context riêng nhưng vẫn tốn mạng, bộ nhớ, render và có thể gây layout shift. Phần này về chiến lược chế ngự chúng mà không mặc định phải gỡ bỏ.
 
-> Sự thật phũ phàng: third-party thường là nguồn INP/long task lớn nhất trên web thật. "Chỉ một đoạn snippet" có thể kéo theo hàng trăm KB JS chặn main thread.
+> "Chỉ một đoạn snippet" có thể kéo theo nhiều request và JavaScript hơn rất nhiều so với đoạn bạn nhìn thấy. Tác động khác nhau theo vendor/cấu hình, nên phải đo CPU, network và user flow của chính trang mình.
 
 ---
 
@@ -21,7 +20,7 @@ Bạn có thể tối ưu hoàn hảo code của mình rồi vẫn có một tra
 ```text
 Công cụ đo third-party:
   - DevTools Performance → group theo domain, xem CPU mỗi origin
-  - Lighthouse → "Reduce the impact of third-party code" (liệt kê kèm thời gian block)
+  - Lighthouse/DevTools → diagnostics CPU, request và main-thread work theo origin
   - WebPageTest → request map, theo domain
   - LoAF (Part 16) → script third-party nào gây khung chậm (sourceURL)
   - Attribution API (Part 13) → INP có phải do script bên thứ ba?
@@ -33,7 +32,7 @@ Lập bảng "ngân sách giá trị/chi phí": mỗi third-party tốn bao nhi�
 
 ## 2. async, defer & vị trí đặt
 
-Quy tắc cơ bản nhưng hay sai: script bên thứ ba **không bao giờ** nên là `<script>` đồng bộ trong `<head>` (chặn parse + render).
+Quy tắc mặc định: tránh `<script>` bên thứ ba đồng bộ trong `<head>` vì nó chặn parser; chỉ chấp nhận khi yêu cầu sản phẩm đã cân trade-off và đo rõ (ví dụ một số anti-flicker snippet).
 
 ```html
 <!-- defer: tải song song, chạy SAU khi HTML parse xong, theo thứ tự -->
@@ -44,12 +43,12 @@ Quy tắc cơ bản nhưng hay sai: script bên thứ ba **không bao giờ** n�
 ```
 
 ```text
-defer → dùng cho script cần DOM / cần thứ tự (phần lớn trường hợp)
-async → dùng cho script độc lập, không phụ thuộc DOM/nhau (analytics)
-KHÔNG → script đồng bộ chặn (trừ khi tuyệt đối bắt buộc, vd anti-flicker A/B)
+defer → classic external script cần DOM/thứ tự; chạy sau parse, trước DOMContentLoaded
+async → script độc lập; chạy ngay khi tải xong, thứ tự không bảo đảm
+module → mặc định có hành vi defer; thêm async nếu thật sự độc lập
 ```
 
-Tải script bên thứ ba *muộn* (sau khi nội dung chính tương tác được) thường an toàn — analytics không cần chạy trước LCP.
+Tải script bên thứ ba *muộn* hoặc theo consent/interaction thường giảm tranh chấp với LCP/INP. Nếu analytics cần ghi nhận event sớm, queue event bằng first-party code nhẹ rồi tải vendor sau; đừng mặc định toàn bộ SDK phải chạy trước LCP.
 
 ---
 
@@ -60,47 +59,58 @@ Embed như YouTube, Google Maps, chat widget kéo theo hàng trăm KB JS dù ng�
 ```html
 <!-- Facade cho YouTube: ảnh thumbnail + nút play; tải iframe thật khi click -->
 <div class="yt-facade" data-id="VIDEO_ID">
-  <img src="https://i.ytimg.com/vi/VIDEO_ID/hqdefault.jpg" alt="Tiêu đề video" loading="lazy">
+  <img src="https://i.ytimg.com/vi/VIDEO_ID/hqdefault.jpg" alt="Tiêu đề video" width="480" height="360" decoding="async">
   <button type="button" aria-label="Phát video">▶</button>
 </div>
 ```
 
 ```ts
-document.querySelector('.yt-facade button')?.addEventListener('click', () => {
-  const wrap = document.querySelector('.yt-facade')!;
-  const id = wrap.getAttribute('data-id');
-  wrap.innerHTML = `<iframe src="https://www.youtube.com/embed/${id}?autoplay=1"
-    title="Video" allow="autoplay" allowfullscreen></iframe>`;
+document.querySelectorAll<HTMLButtonElement>('.yt-facade button').forEach((button) => {
+  button.addEventListener('click', () => {
+    const wrap = button.closest<HTMLElement>('.yt-facade');
+    const id = wrap?.dataset.id;
+    if (!wrap || !id || !/^[\w-]{11}$/.test(id)) return;
+
+    const iframe = document.createElement('iframe');
+    iframe.src = `https://www.youtube-nocookie.com/embed/${id}?autoplay=1`;
+    iframe.title = 'Video';
+    iframe.allow = 'autoplay; encrypted-media; picture-in-picture';
+    iframe.allowFullscreen = true;
+    iframe.referrerPolicy = 'strict-origin-when-cross-origin';
+    wrap.replaceChildren(iframe);
+    iframe.focus();
+  });
 });
 ```
 
 ```text
-Tiết kiệm thật: một embed YouTube ~500KB+ JS → facade chỉ 1 ảnh thumbnail.
+Một embed video có thể kéo hàng trăm KB và nhiều request → facade ban đầu chỉ cần markup + thumbnail.
 Có sẵn: lite-youtube-embed, react-lite-youtube-embed... cho facade chuẩn.
 ```
 
-Facade chuyển chi phí từ "mọi lần tải trang" sang "chỉ khi người dùng thật sự dùng" — thường rất ít người click.
+Facade chuyển chi phí từ "mọi lần tải trang" sang "chỉ khi người dùng thật sự dùng". Giữ `aspect-ratio`/kích thước container giống iframe để click không gây CLS; chỉ thêm `loading="lazy"` cho thumbnail khi facade thật sự ở dưới màn hình đầu.
 
 ---
 
 ## 4. Partytown — đẩy third-party sang Web Worker
 
-**Partytown** chạy script bên thứ ba trong **Web Worker** thay vì main thread, dùng proxy để cho chúng truy cập DOM/`window` qua worker. Main thread rảnh → INP tốt hơn dù vẫn có analytics/ads.
+**Partytown** chạy script được opt-in trong **Web Worker**, rồi proxy các API main-thread như DOM/`window`. Nó có thể giảm JavaScript trực tiếp trên main thread, nhưng DOM operation vẫn phải được chuyển tiếp và có overhead; INP không tự động tốt hơn với mọi vendor.
 
 ```html
-<!-- Đánh dấu script để Partytown chạy nó trong worker -->
+<!-- Sau khi đã cài và bootstrap Partytown, opt-in script này vào worker -->
 <script type="text/partytown" src="https://analytics.com/a.js"></script>
 ```
 
 ```text
-Cơ chế: Partytown chặn truy cập DOM từ worker, chuyển tiếp về main thread
-        đồng bộ qua SharedArrayBuffer/service worker proxy.
+Cơ chế: JavaScript Proxy chuyển API call từ worker về main thread.
+        Transport có thể dùng Atomics/SharedArrayBuffer khi cross-origin isolated,
+        hoặc fallback qua service worker; DOM-heavy script có thể chậm vì bridge.
 
 Hợp với: analytics, tag manager, tracking pixel (chủ yếu gửi sự kiện, ít cần DOM realtime).
 Cẩn thận: script phụ thuộc nặng vào timing DOM/API đồng bộ có thể trục trặc — test kỹ.
 ```
 
-Partytown không phải thuốc tiên cho *mọi* third-party, nhưng cho analytics/tag manager nặng, nó dời được phần lớn chi phí khỏi main thread. Đo lại bằng RUM sau khi áp dụng.
+Partytown không phải thuốc tiên: một số script phụ thuộc DOM đồng bộ, cookie/storage của iframe hay timing tinh vi sẽ không phù hợp. Chỉ opt-in vendor đã test, kiểm tra correctness/consent trước, rồi đo lại bằng RUM.
 
 ---
 
@@ -108,16 +118,16 @@ Partytown không phải thuốc tiên cho *mọi* third-party, nhưng cho analyt
 
 ```html
 <!-- iframe tải lười khi gần viewport (như ảnh lazy) -->
-<iframe src="https://maps.example.com/embed" loading="lazy" title="Bản đồ"></iframe>
+<iframe src="https://maps.example.com/embed" loading="lazy" title="Bản đồ" width="600" height="450"></iframe>
 ```
 
 ```text
 Kỹ thuật chế ngự khác:
-  - loading="lazy" cho iframe dưới màn hình
+  - loading="lazy" cho iframe dưới màn hình; không lazy iframe/ảnh là LCP ở màn hình đầu
   - tải chat widget khi cuộn/sau X giây/khi tương tác (idle import)
   - preconnect tới origin third-party quan trọng (Part 14) để bớt latency kết nối
-  - self-host script ổn định (nếu license cho phép) → kiểm soát cache + bỏ một kết nối
-  - Subresource Integrity (SRI) cho script third-party tĩnh → an toàn
+  - self-host chỉ khi vendor + license hỗ trợ và bạn có quy trình cập nhật/security patch
+  - SRI cho URL script bất biến (kèm CORS đúng); script đổi nội dung thường xuyên sẽ làm hash fail
 ```
 
 ---
@@ -141,11 +151,11 @@ Budget third-party (ví dụ):
 
 ## 7. Tóm tắt
 
-- Third-party (analytics/ads/embed/tag manager) chạy trên **cùng main thread** và thường là nguồn INP/long task lớn nhất — **đo trước** bằng Lighthouse/LoAF/Attribution.
-- Dùng **`defer`/`async`**, không bao giờ script đồng bộ chặn; tải third-party muộn (sau nội dung chính).
+- Script third-party trong document chính cạnh tranh trên **cùng main thread**; iframe vẫn tốn network/render/memory — **đo trước** bằng DevTools, Lighthouse và field attribution khi có.
+- Dùng đúng **`defer`/`async`/module**, tránh script đồng bộ chặn theo mặc định; queue event nhẹ nếu phải tải SDK muộn.
 - **Facade pattern** thay embed nặng (YouTube/Maps/chat) bằng placeholder nhẹ, chỉ tải embed thật khi click — tiết kiệm hàng trăm KB.
-- **Partytown** đẩy script (analytics/tag manager) sang Web Worker để giải phóng main thread; test kỹ vì script phụ thuộc DOM đồng bộ có thể trục trặc.
-- **Lazy iframe**, idle-load widget, preconnect, self-host + SRI là các kỹ thuật bổ trợ.
+- **Partytown** proxy script opt-in qua Web Worker; bridge vẫn có overhead và compatibility trade-off, nên test correctness + hiệu năng từng vendor.
+- **Lazy iframe**, idle-load widget, preconnect, self-host có kiểm soát + SRI cho URL bất biến là các kỹ thuật bổ trợ.
 - Đặt **budget third-party** và **quản trị**: mỗi tag có chủ + lý do, review trước khi thêm, gỡ tag chết.
 
 **Phần tiếp theo:** Budgets, automation & culture at scale — size-limit/bundlesize, ngân sách trong CI, phân tích treemap, bisect hồi quy, scorecard và xây văn hóa hiệu năng bền vững.

@@ -1,14 +1,13 @@
 ---
 title: 'How Browsers Work · Part 22 — Capstone 2: Profiling Internals End-to-End'
-description: 'Ghép mọi tầng nội bộ lại: đọc Performance panel và Perfetto, quy một jank cụ thể về đúng process/thread/giai đoạn pipeline, và một quy trình điều tra hiệu năng có hệ thống.'
+description: 'Ghép mọi tầng nội bộ lại: đọc Performance panel và Perfetto, khoanh vùng jank theo process/thread/giai đoạn pipeline, rồi kiểm chứng bằng một quy trình có hệ thống.'
 pubDate: 2026-11-16
-tags: [browser, internals, profiling, performance, browser_internals_12]
+tags: [browser, internals, profiling, performance, browser_internals_22]
 series: browser-internals
 seriesOrder: 22
-draft: true
 ---
 
-Mười phần chuyên sâu vừa qua mở từng hộp đen: compositor, scheduling, V8, bộ nhớ, a11y, decode ảnh, threading, process model. Capstone này dạy kỹ năng buộc tất cả lại với nhau — **profiling**: nhìn một trang giật và quy trách chính xác về đúng *process*, *thread*, và *giai đoạn pipeline* gây ra nó. Đây là nơi lý thuyết biến thành chẩn đoán.
+Mười phần chuyên sâu vừa qua mở từng hộp đen: compositor, scheduling, V8, bộ nhớ, a11y, decode ảnh, threading, process model. Capstone cuối dạy kỹ năng buộc tất cả lại bằng **profiling**: khoanh một trang giật về *process*, *thread* và *giai đoạn pipeline* có bằng chứng mạnh nhất, rồi đo lại sau khi sửa.
 
 ---
 
@@ -17,39 +16,39 @@ Mười phần chuyên sâu vừa qua mở từng hộp đen: compositor, schedu
 Khi có vấn đề hiệu năng, hãy định vị nó trên kiến trúc đã học:
 
 ```text
-                ┌─ Network (Phần 9) ── tải chậm, waterfall xấu
+                ┌─ Network service (Phần 9) ── tải chậm, waterfall xấu
                 │
 Browser process ┤
-                └─ GPU process / Viz ── composite chậm, quá nhiều layer (Phần 13)
+                └─ GPU process / Viz ── raster/display composite chậm (Phần 13)
 
 Renderer process
   ├─ Main thread ── JS dài, layout/style, forced reflow (Phần 5,7,15,16)
   ├─ Compositor thread ── scroll/transform (mượt hay rớt về main? Phần 14)
-  └─ Raster/Worker threads ── raster tile, decode ảnh (Phần 13,19)
+  └─ Raster/helper threads ── raster tile, decode ảnh (Phần 13,19)
 ```
 
-Mọi triệu chứng đều rơi vào một trong các ô này. Câu hỏi của profiler luôn là: *thread nào, giai đoạn nào, trong process nào?*
+Đây là bản đồ phía client; TTFB/server, OS scheduling, driver và thiết bị vẫn có thể là gốc. Câu hỏi của profiler là: *độ trễ nằm ở process/thread/giai đoạn nào, hay ở ngoài browser client?*
 
 ---
 
 ## 2. Đọc Performance panel theo tầng
 
-DevTools → **Performance** → record. Các track tương ứng trực tiếp với kiến trúc:
+DevTools → **Performance** → record đúng interaction. Track/label đổi theo phiên bản Chrome và capture settings; bảng sau tập trung vào tín hiệu ổn định hơn tên UI:
 
 | Track | Tương ứng | Tìm gì |
 |---|---|---|
-| **Main** | luồng chính renderer | long task (>50ms), Recalculate Style, Layout, "Purple" |
-| **Compositor / Raster** | compositor & raster threads | raster lâu, quá nhiều tile |
-| **GPU** | GPU process | thời gian composite |
-| **Network** | browser process | waterfall, chờ TTFB |
-| **Frames** | khung hình | khung rớt (đỏ), thời gian mỗi khung |
+| **Main** | luồng chính renderer | long task (>50ms), function stack, style/layout/paint |
+| **Network** | request qua network service | queueing, TTFB, download và initiator |
+| **Timings / Interactions / Layout shifts** | mốc UX | LCP/INP phases, shift cluster, event timing |
+| **Frames / screenshots** | output thị giác | frame dài/rớt và hình ảnh tương ứng |
+| **Compositor/Raster/GPU** (khi trace expose) | pipeline ngoài main | tile/raster/composite; system trace cho chi tiết đầy đủ hơn |
 
-Màu trong track Main map sang pipeline (Phần 5/15):
+Trong theme mặc định, category thường có màu sau; hãy đọc **event name + stack + duration**, vì màu/UI không phải API ổn định:
 
 ```text
 Vàng   = Scripting (JS, gọi hàm)        → nghi V8 / long task
 Tím    = Rendering (style + layout)     → nghi forced reflow / layout thrash
-Xanh lá= Painting (paint + composite)   → nghi layer/paint nặng
+Xanh lá= Painting                       → nghi paint/raster input nặng
 ```
 
 ---
@@ -59,8 +58,8 @@ Xanh lá= Painting (paint + composite)   → nghi layer/paint nặng
 ```text
 ① JS long task chặn luồng chính
    Dấu hiệu: khối VÀNG dài, cờ "Long task" đỏ, INP cao.
-   Soi: Bottom-Up/Call Tree tìm hàm tốn nhất. → Phần 7,16 (deopt? megamorphic?)
-   Sửa: chia nhỏ (scheduler.yield), đẩy sang worker (Phần 20).
+   Soi: Bottom-Up/Call Tree tìm hàm tốn nhất; chỉ đào deopt/IC nếu hotspot thật sự dẫn tới đó. → Phần 7,16
+   Sửa: chia nhỏ (`await scheduler.yield()` khi hỗ trợ), đẩy compute phù hợp sang worker (Phần 20).
 
 ② Forced synchronous layout (reflow)
    Dấu hiệu: khối TÍM kèm cảnh báo "Forced reflow", thường trong vòng lặp.
@@ -68,38 +67,36 @@ Xanh lá= Painting (paint + composite)   → nghi layer/paint nặng
    Sửa: gom đọc rồi gom ghi (Phần 5,15).
 
 ③ Layer/paint nặng hoặc layer explosion
-   Dấu hiệu: XANH LÁ nhiều, "Layers" pane cho thấy quá nhiều layer/VRAM.
+   Dấu hiệu: paint/raster dài; Layers/Rendering tools cho thấy promotion hoặc vùng paint bất thường.
    Soi: bật "Layer borders" + Rendering pane "Paint flashing".
-   Sửa: giảm will-change, chỉ animate transform/opacity (Phần 13).
+   Sửa: giảm `will-change`; ưu tiên property có fast path và xác nhận lại bằng trace (Phần 13).
 
 ④ Scroll rớt về main thread
    Dấu hiệu: cuộn giật khi JS bận; "Scrolling on main thread".
    Soi: kiểm tra non-passive wheel/touch listener.
-   Sửa: { passive: true }, dùng animation-timeline (Phần 14).
+   Sửa: `{ passive: true }` khi không huỷ input; dùng scroll-driven animation cho property compositor-friendly (Phần 14).
 ```
 
 ---
 
 ## 4. Công cụ chuyên sâu hơn DevTools
 
-Khi cần nhìn *liên process* (renderer + GPU + browser cùng lúc):
+Performance panel đủ cho đa số bug web. Khi cần nhìn *liên process* (renderer + Viz/GPU + browser/network service cùng lúc), dùng Chrome system trace và mở bằng **Perfetto**:
 
 ```text
-chrome://tracing  /  Perfetto (ui.perfetto.dev)
-  → trace mọi process & thread của Chrome trên một timeline
+Chrome system trace  →  Perfetto UI
+  → trace nhiều process & thread trên cùng timeline
   → thấy commit từ main → compositor, raster threads, GPU draw
   → đo chính xác round-trip giữa các thread (vd input → composite)
 ```
 
-```bash
-# Bắt trace từ dòng lệnh rồi mở trong Perfetto
-google-chrome --trace-startup --trace-startup-file=trace.json
-```
+`chrome://tracing` vẫn hữu ích trong flow debug Chromium, còn Perfetto là viewer/phân tích hiện đại. Trace có thể chứa URL, title và dữ liệu nhạy cảm; record ngắn, đóng tab không liên quan và kiểm tra trước khi chia sẻ.
 
 Các pane bổ trợ trong DevTools:
 
-- **Rendering** pane: Paint flashing, Layer borders, Scrolling performance issues, FPS meter.
-- **Layers** pane: cây layer + lý do mỗi layer được thăng (Phần 13).
+- **Performance → Insights**: forced reflow, INP phases, LCP/CLS và các culprit trực tiếp trên timeline.
+- **Rendering** pane: Paint flashing, Layer borders, Scrolling performance issues, FPS meter (tuỳ phiên bản).
+- **Layers** tool: cây composited layer/reason ở mức Chromium; đừng quy mỗi layer thành một bitmap VRAM nguyên khối (Phần 13).
 - **Performance Monitor**: CPU/JS heap/DOM node/listener theo thời gian thực (bắt rò rỉ Phần 17).
 - **Memory**: heap snapshot (Phần 17).
 
@@ -110,7 +107,7 @@ Các pane bổ trợ trong DevTools:
 Đừng tối ưu mò. Theo vòng lặp này:
 
 ```text
-1. ĐO trước     → record Performance, ghi lại số (INP, khung rớt, long task)
+1. ĐO trước     → record Performance, ghi device/throttle/scenario + số baseline
 2. KHOANH VÙNG  → jank ở thread nào? giai đoạn nào? (mục 1–3)
 3. TÌM GỐC      → Bottom-Up/Call Tree/retainer path → hàm/dòng cụ thể
 4. SỬA 1 THỨ    → đổi đúng một biến số
@@ -118,9 +115,9 @@ Các pane bổ trợ trong DevTools:
 6. LẶP          → tới khi đạt ngân sách (budget)
 ```
 
-Gắn số đo vào **Core Web Vitals** để biết khi nào dừng: LCP (ảnh/render — Phần 19,5), INP (đáp ứng input — Phần 7,15), CLS (layout shift — Phần 5,19). Đặt ngân sách trước, đo sau.
+Gắn số đo vào **Core Web Vitals** để ưu tiên outcome: LCP (server/resource/render — Phần 9,19,5), INP (input delay + processing + presentation delay — Phần 7,15), CLS (layout shift — Phần 5,19). Lab trace giải thích cơ chế của một phiên; field/RUM cho biết user thật gặp nó bao nhiêu.
 
-> Nguyên tắc tối thượng: *đo trước khi sửa, đo lại sau khi sửa*. Trực giác về hiệu năng thường sai; profiler thì không.
+> Nguyên tắc: *đo trước khi sửa, đo lại sau khi sửa*. Profiler cũng có overhead, sampling và phần dữ liệu không expose; tái hiện nhiều lần, giữ điều kiện so sánh và đối chiếu field data.
 
 ---
 
@@ -149,11 +146,11 @@ CHUYÊN SÂU (13–22)
 
 ## 7. Tóm tắt
 
-- Mọi vấn đề hiệu năng đều quy về **thread nào, giai đoạn nào, process nào** — dùng bản đồ kiến trúc để định vị.
-- **Performance panel**: track Main/Compositor/GPU/Network/Frames; màu Vàng=Scripting, Tím=Rendering, Xanh lá=Painting.
+- Định vị độ trễ theo **process/thread/giai đoạn**, nhưng luôn chừa giả thuyết server, OS, driver và thiết bị.
+- **Performance panel**: ưu tiên event name/stack/duration và Insights; track compositor/GPU chi tiết phụ thuộc capture, system trace cho góc nhìn đầy đủ hơn.
 - Bốn loại jank kinh điển: JS long task, forced reflow, layer/paint nặng, scroll rớt về main — mỗi loại có dấu hiệu và cách sửa riêng.
-- **Perfetto/chrome://tracing** cho góc nhìn liên process; Rendering/Layers/Memory pane cho chi tiết từng tầng.
+- **Perfetto/Chrome system trace** cho góc nhìn liên process; Insights/Rendering/Layers/Memory bổ sung bằng chứng từng tầng.
 - Theo quy trình **đo → khoanh vùng → tìm gốc → sửa một thứ → đo lại**; gắn vào Core Web Vitals và đặt ngân sách trước.
 - Đây là điểm hội tụ của cả series: hiểu nội bộ trình duyệt biến profiling từ đoán mò thành chẩn đoán có cơ sở.
 
-Cảm ơn bạn đã đi hết hành trình "How Browsers Work". Giờ khi một trang chậm, bạn không còn thấy một hộp đen — bạn thấy các process, thread và giai đoạn, và biết chính xác nơi cần nhìn.
+Cảm ơn bạn đã đi hết 22 phần "How Browsers Work". Giờ khi một trang chậm, bạn không còn thấy một hộp đen — bạn có bản đồ process/thread/pipeline, biết bằng chứng nào cần thu và cũng biết khi nào phải nhìn ra ngoài browser.

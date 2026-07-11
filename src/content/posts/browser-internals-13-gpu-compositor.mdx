@@ -1,14 +1,13 @@
 ---
 title: 'How Browsers Work · Part 13 — GPU & the Compositor: Raster, Tiles & Layers'
-description: 'Đi sâu vào nửa sau pipeline render: compositor thread, layerization, chia tile và raster, GPU process & Viz, và vì sao transform/opacity mượt ở tận tầng phần cứng.'
+description: 'Đi sâu vào nửa sau pipeline render của Chromium: property trees/layers, tiling, software/GPU raster, compositor thread, Viz và fast path của transform/opacity.'
 pubDate: 2026-10-29
-tags: [browser, internals, compositing, gpu, browser_internals_12]
+tags: [browser, internals, compositing, gpu, browser_internals_22]
 series: browser-internals
 seriesOrder: 13
-draft: true
 ---
 
-Phần 5 dừng ở "composite layer". Mười phần chuyên sâu này mở từng hộp đen còn lại — bắt đầu bằng nửa sau của pipeline render, nơi lệnh paint biến thành pixel trên màn hình. Đây là lãnh địa của **compositor thread** và **GPU process**, và hiểu nó giải thích vì sao một số animation mượt 60fps còn số khác giật, dù nhìn code "giống nhau".
+Phần 5 dừng ở "composite layer". Mười phần chuyên sâu này mở từng hộp đen còn lại — bắt đầu bằng nửa sau của pipeline render, nơi lệnh paint biến thành pixel trên màn hình. Đây là lãnh địa của **compositor thread**, raster workers và **Viz/GPU process** trong Chromium; hiểu nó giải thích vì sao hai animation nhìn giống nhau có thể đi qua hai đường render khác hẳn.
 
 Sự thật cốt lõi từ Phần 1 quay lại ở đây: luồng chính ghi *lệnh paint*, nhưng việc biến chúng thành bitmap và ghép lên màn hình diễn ra **ngoài** luồng chính. Đó là lý do tồn tại của cả phần này.
 
@@ -16,16 +15,16 @@ Sự thật cốt lõi từ Phần 1 quay lại ở đây: luồng chính ghi *l
 
 ## 1. Layer — vì sao trang được chia tầng
 
-Trình duyệt không vẽ cả trang thành một ảnh phẳng. Nó chia trang thành **compositing layers** — các lớp độc lập có thể được vẽ và di chuyển riêng. Hình dung như các tấm kính trong suốt xếp chồng.
+Trình duyệt không vẽ cả trang thành một ảnh phẳng sau mỗi thay đổi. Chromium duy trì paint chunks, property trees và một danh sách layer để compositor có thể xử lý độc lập những phần phù hợp. Hình dung **compositing layer** như các tấm kính trong suốt xếp chồng — hữu ích về mặt mental model, dù cấu trúc nội bộ không ánh xạ 1–1 với DOM.
 
-Một phần tử được "thăng" thành layer riêng khi có dấu hiệu nó sẽ thay đổi độc lập:
+Engine tự quyết định layerization theo nội dung, thiết bị và chi phí. Những tín hiệu thường khiến nội dung được composited riêng gồm:
 
-- `transform` hoặc `opacity` đang animate
+- animation `transform` hoặc `opacity` đủ điều kiện
 - `will-change: transform/opacity`
-- `<video>`, `<canvas>`, phần tử 3D (`transform: translateZ(0)`)
+- video/WebGL hoặc nội dung đã có surface tăng tốc riêng
 - `position: fixed`/`sticky` trong vài trường hợp
 
-Lợi ích: nếu một layer chỉ *di chuyển* (transform) hay *mờ đi* (opacity), compositor ghép lại các layer cũ ở vị trí mới — **không cần vẽ lại** gì cả.
+Lợi ích: sau lần paint/raster ban đầu, nếu thay đổi chỉ tác động tới transform hay opacity của nội dung đã composited, compositor có thể ghép lại các tài nguyên cũ — không cần chạy lại style/layout/paint cho từng frame. Đây là khả năng tối ưu, không phải bảo đảm của CSS.
 
 ```text
 Trang  ──► layerize ──►  Layer 0 (nội dung tĩnh)
@@ -39,7 +38,7 @@ Trang  ──► layerize ──►  Layer 0 (nội dung tĩnh)
 
 ## 2. Tiling — chia layer thành ô
 
-Một layer có thể rất lớn (trang cuộn dài hàng chục nghìn px). Vẽ toàn bộ là phí. Compositor chia mỗi layer thành **tiles** (thường 256×256 hoặc 512×512px) và chỉ raster những tile **gần viewport**.
+Một layer có thể rất lớn (trang cuộn dài hàng chục nghìn px). Vẽ toàn bộ là phí. Compositor chia phần lớn nội dung thành **tiles** với kích thước do implementation chọn, ưu tiên raster tile trong hoặc sắp đi vào viewport theo ngân sách bộ nhớ.
 
 ```text
 Layer (cao 20000px)        Chỉ raster tile quanh viewport
@@ -57,15 +56,15 @@ Layer (cao 20000px)        Chỉ raster tile quanh viewport
 
 ## 3. Raster — biến lệnh paint thành bitmap
 
-**Raster** là quá trình thực thi danh sách lệnh paint (vẽ chữ nhật này, text kia, ảnh nọ) để tạo ra **bitmap** (mảng pixel) cho mỗi tile. Raster chạy trên **raster threads**, thường được tăng tốc bằng GPU.
+**Raster** là quá trình thực thi danh sách lệnh paint (vẽ chữ nhật này, text kia, ảnh nọ) để tạo tài nguyên pixel cho mỗi tile. Chromium có cả **software raster** trên worker threads lẫn **GPU raster**; chế độ thực tế phụ thuộc nền tảng, driver, nội dung và khả năng của GPU process.
 
 ```text
 Paint records (lệnh)         Raster              Bitmap (pixel)
 "fillRect #fff"      ──►   raster thread   ──►   [pixel...]
-"drawText 'Hi'"            (GPU-accelerated)     mỗi tile một ảnh
+"drawText 'Hi'"            (software hoặc GPU)   mỗi tile một tài nguyên
 ```
 
-Điểm quan trọng: **raster ≠ paint**. "Paint" (Phần 5) là *ghi lệnh* trên luồng chính; "raster" là *thực thi lệnh thành pixel* ngoài luồng chính. Tách hai bước cho phép raster song song và dùng GPU.
+Điểm quan trọng: **raster ≠ paint**. "Paint" (Phần 5) chủ yếu là *ghi display items/paint records*; "raster" là *thực thi chúng thành pixel*, thường trên worker threads hoặc qua GPU process. Tách hai bước cho phép xếp lịch và chạy song song nhiều phần việc.
 
 ---
 
@@ -73,12 +72,12 @@ Paint records (lệnh)         Raster              Bitmap (pixel)
 
 Compositor thread là ngôi sao của phần này. Nó:
 
-1. Nhận **layer tree** + paint records từ luồng chính (sau commit).
-2. Quyết định tile nào cần raster (theo viewport), giao cho raster threads.
-3. Khi có bitmap, tạo **draw quads** (lệnh "đặt tile này tại toạ độ kia") gửi cho GPU.
-4. Có thể tự xử lý **scroll** và **animation transform/opacity** mà *không* đánh thức luồng chính.
+1. Nhận state đã commit từ luồng chính: paint records, layer list và property trees.
+2. Ưu tiên tile cần raster theo viewport/ngân sách, rồi lập task cho raster workers hoặc Viz.
+3. Tạo **compositor frame** gồm render passes/draw quads và gửi tới display compositor.
+4. Có thể tự xử lý nhiều thao tác **scroll** và animation compositor-eligible mà không chờ Blink/main thread.
 
-Bước 4 là siêu năng lực: khi bạn cuộn hoặc animate transform, compositor thread di chuyển layer/tile có sẵn — luồng chính có thể đang bận chạy JS mà animation vẫn mượt.
+Bước 4 là lợi thế kiến trúc: nếu scroll/animation đi đúng fast path và tile đã sẵn sàng, compositor có thể cập nhật khung hình dù luồng chính đang bận. Raster trễ, input cần main thread hoặc áp lực GPU vẫn có thể làm rớt frame.
 
 ```text
 Main thread          Compositor thread        GPU process (Viz)
@@ -89,11 +88,11 @@ style→layout→paint ─commit─► layer tree
 
 ---
 
-## 5. GPU process & Viz — vẽ ra màn hình thật
+## 5. GPU process & Viz — tổng hợp khung hình
 
-Compositor thread không nói chuyện trực tiếp với phần cứng. Nó gửi draw quads tới **GPU process** (Phần 1), nơi component **Viz** (display compositor) gom draw quads của *mọi* renderer + UI trình duyệt thành một khung hình cuối và đẩy lên màn hình theo nhịp **VSync** (thường 60Hz).
+Renderer gửi compositor frame tới **Viz**. Surface Aggregator trong display compositor kết hợp surface từ renderer, iframe và UI trình duyệt; đường GPU hoặc software compositor sau đó đưa khung hình tới hệ thống hiển thị theo nhịp refresh/VSync.
 
-Vì sao tách GPU ra process riêng: driver GPU dễ crash và là bề mặt tấn công; cô lập nó giữ renderer (và trình duyệt) sống sót khi driver lỗi.
+Tách GPU service khỏi renderer giúp cô lập driver/API đồ hoạ — một bề mặt tấn công và nguồn crash phức tạp. Chromium còn có thể rơi về software raster/compositing khi tăng tốc GPU không khả dụng; "GPU" vì thế không phải điều kiện bắt buộc để trang được vẽ.
 
 ---
 
@@ -103,23 +102,23 @@ Giờ ta thấy lý do *thật sự*, không chỉ "compositor lo":
 
 | Thay đổi | Cần làm lại |
 |---|---|
-| Đổi `width`/`top`/`left` | **Layout** lại (Phần 5) → paint → raster → composite — đắt |
-| Đổi `color`/`background` | **Paint** lại → raster → composite — vừa |
-| Đổi `transform`/`opacity` của layer | **Chỉ composite** — compositor đổi ma trận biến đổi của layer đã raster sẵn, GPU ghép lại — rẻ |
+| Đổi `width`/`top`/`left` | Thường cần **layout** (Phần 5), rồi có thể paint/raster/composite |
+| Đổi `color`/`background` | Thường cần **paint/raster**, rồi composite |
+| Đổi `transform`/`opacity` đủ điều kiện | Có thể chỉ **composite** sau lần raster ban đầu |
 
-`transform`/`opacity` chỉ đổi *cách ghép* một bitmap đã có — không vẽ lại pixel nào. GPU làm phép biến đổi ma trận trên layer cực nhanh. Đó là nền tảng phần cứng của lời khuyên "chỉ animate transform và opacity".
+Ở fast path, `transform`/`opacity` chỉ đổi *cách ghép* tài nguyên đã raster. Nhưng clipping, filter, thay đổi nội dung, thiếu layer phù hợp hoặc giới hạn thiết bị có thể khiến engine chọn đường khác. Hãy xác nhận bằng Performance/Rendering tools thay vì suy từ tên property.
 
-> Cạm bẫy: thăng quá nhiều layer (`will-change` tràn lan) tốn bộ nhớ GPU và thời gian composite. Mỗi layer là một bitmap trong VRAM. "Layer explosion" có thể làm chậm thay vì nhanh — chỉ thăng phần tử thật sự animate.
+> Cạm bẫy: `will-change` tràn lan có thể tạo thêm layer/tile, tăng bộ nhớ, raster, overdraw và thời gian composite. Layer không nhất thiết là một bitmap nguyên khối trong VRAM, nhưng "layer explosion" vẫn có thể làm chậm — chỉ khai báo cho phần tử sắp thay đổi và bỏ khi không còn cần.
 
 ---
 
 ## 7. Tóm tắt
 
-- Trang được chia thành **compositing layers** (các "tấm kính") để di chuyển/mờ độc lập mà không vẽ lại.
-- Mỗi layer chia thành **tiles**; chỉ tile gần viewport được raster (cuộn quá nhanh → checkerboard).
-- **Raster** biến lệnh paint thành bitmap trên raster threads (GPU-accelerated) — khác với "paint" (ghi lệnh trên luồng chính).
-- **Compositor thread** điều phối tile/raster/draw quads và tự xử lý scroll + transform/opacity animation **không cần luồng chính**.
-- **GPU process/Viz** gom draw quads thành khung hình cuối, đẩy lên màn hình theo VSync.
-- `transform`/`opacity` rẻ vì chỉ đổi cách ghép bitmap có sẵn (phép ma trận GPU); nhưng đừng thăng quá nhiều layer (tốn VRAM).
+- Chromium dùng paint chunks/property trees/layer list để compositor xử lý độc lập phần nội dung phù hợp; mental model "tấm kính" không ánh xạ 1–1 với DOM.
+- Nội dung lớn được chia **tile** và ưu tiên theo viewport/ngân sách; tile chưa sẵn sàng có thể gây checkerboard.
+- **Raster** thực thi paint records bằng software worker hoặc GPU raster — khác với bước ghi lệnh paint.
+- **Compositor thread** điều phối tile và compositor frame; scroll/animation đủ điều kiện có thể tiếp tục mà không chờ main thread.
+- **Viz/display compositor** tổng hợp surface từ nhiều renderer/UI; hệ thống có cả đường GPU lẫn software fallback.
+- `transform`/`opacity` *có thể* chỉ cần composite, nhưng promotion không phải hợp đồng; tránh `will-change` tràn lan và luôn đo trace.
 
-**Phần tiếp theo:** Scrolling internals — vì sao cuộn thường chạy trên compositor thread (mượt kể cả khi JS bận), khi nào nó rớt về luồng chính, và cơ chế của passive listeners, scroll anchoring và scroll-linked effects.
+**Phần tiếp theo:** Scrolling internals — compositor fast path hoạt động khi nào, điều gì buộc input chờ luồng chính, và cơ chế của passive listeners, scroll anchoring cùng scroll-driven effects.

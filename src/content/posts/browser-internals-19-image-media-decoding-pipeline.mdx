@@ -1,46 +1,45 @@
 ---
 title: 'How Browsers Work · Part 19 — Image & Media Decoding Pipeline'
-description: 'Ảnh đi từ byte tới pixel: download, decode (đồng bộ vs async), upload GPU. Cùng decoding="async", Image.decode(), createImageBitmap, OffscreenCanvas và đường đi của video frame.'
+description: 'Ảnh đi từ byte tới pixel: fetch, decode đồng bộ/bất đồng bộ, raster/composite; cùng decoding="async", Image.decode(), createImageBitmap, OffscreenCanvas và video frames.'
 pubDate: 2026-11-10
-tags: [browser, internals, images, media, browser_internals_12]
+tags: [browser, internals, images, media, browser_internals_22]
 series: browser-internals
 seriesOrder: 19
-draft: true
 ---
 
-Ảnh thường là phần nặng nhất của một trang, và cách trình duyệt xử lý chúng ảnh hưởng trực tiếp tới mượt mà. Nhiều người nghĩ "tải ảnh xong là xong" — nhưng giữa byte tải về và pixel trên màn hình có một bước tốn kém dễ chặn luồng chính: **decode**. Phần này theo dấu một tấm ảnh từ mạng tới màn hình.
+Ảnh thường chiếm nhiều byte và bộ nhớ của một trang. Nhiều người nghĩ "tải xong là xong", nhưng giữa byte nén và pixel còn có **decode**, resize/color conversion, raster và composite. Browser hiện đại đẩy nhiều việc sang helper/raster threads, song synchronous decode hoặc lượng decode quá lớn vẫn có thể làm rớt frame.
 
 ---
 
-## 1. Ba giai đoạn: download → decode → upload
+## 1. Mental model: fetch → decode → raster/composite
 
 ```text
 Byte nén (JPEG/PNG/WebP/AVIF)
-   │  ① download (mạng — Phần 9)
+   │  ① fetch (mạng/cache — Phần 9)
    ▼
-Bitmap thô (pixel RGBA, KHÔNG nén — lớn hơn nhiều)
-   │  ② decode (giải nén → pixel; tốn CPU/bộ nhớ)
+Decoded image data (RGBA/YUV/tile tuỳ codec và engine)
+   │  ② decode + scale/color conversion (CPU/hardware, có cache)
    ▼
-GPU texture
-   │  ③ upload (đưa bitmap lên VRAM để composite)
+Raster tile / software bitmap / GPU texture
+   │  ③ composite bằng đường software hoặc GPU
    ▼
 Màn hình
 ```
 
-Điểm bất ngờ: file 200KB JPEG khi *decode* thành bitmap có thể chiếm hàng chục MB RAM (width × height × 4 byte). Decode cũng tốn CPU — và nếu chạy trên luồng chính, nó *chặn* mọi thứ khác (Phần 7).
+Điểm bất ngờ: một estimate phổ biến cho bitmap RGBA là `width × height × 4 byte`, nên file JPEG vài trăm KB có thể cần hàng chục MB khi decode. Engine có thể giữ định dạng/tile khác và evict cache, nên đây không phải công thức đo RAM chính xác. Decode vẫn tốn CPU/băng thông bộ nhớ; synchronous decode trên đường paint có thể chặn luồng chính.
 
 ---
 
 ## 2. Decode đồng bộ vs bất đồng bộ
 
-Theo mặc định, trình duyệt cố decode ảnh *trước* khi present khung chứa nó. Decode lớn trên luồng chính → "janky" lúc ảnh xuất hiện. Thuộc tính `decoding` cho phép gợi ý:
+Thuộc tính `decoding` là **hint** về cách phối hợp ảnh với nội dung khác, không phải lệnh chọn thread:
 
 ```html
-<!-- async: đừng chặn render để decode; hiện khi sẵn sàng -->
+<!-- async: ưu tiên không trì hoãn việc present nội dung khác -->
 <img src="hero.avif" decoding="async" alt="...">
 
-<!-- sync: decode trước khi present (hiếm khi cần) -->
-<img src="logo.svg" decoding="sync" alt="...">
+<!-- sync: ưu tiên present ảnh cùng nội dung khác (hiếm khi cần) -->
+<img src="icon.png" decoding="sync" alt="...">
 ```
 
 Để *chủ động* decode rồi mới chèn (tránh nhấp nháy/jank khi swap ảnh lớn):
@@ -48,50 +47,61 @@ Theo mặc định, trình duyệt cố decode ảnh *trước* khi present khun
 ```js
 const img = new Image();
 img.src = 'big.avif';
-await img.decode();     // chờ decode xong (off-main-thread khi có thể)
-container.append(img);  // chèn khi pixel đã sẵn sàng → không jank
+try {
+  await img.decode();    // resolve khi dữ liệu sẵn sàng để paint
+  container.append(img); // browser cố giữ decoded data ít nhất cho frame kế
+} catch {
+  container.textContent = 'Không thể giải mã ảnh';
+}
 ```
 
-`img.decode()` trả promise, resolve khi ảnh đã decode và sẵn sàng vẽ — lý tưởng cho chuyển ảnh trong gallery/lightbox.
+`img.decode()` trả promise và có thể reject (`EncodingError`). Nó giúp tránh chèn ảnh rồi mới gặp synchronous decode khi paint; không hứa "zero jank" nếu layout, upload/raster hay memory pressure vẫn đắt.
 
 ---
 
-## 3. createImageBitmap — decode off-main-thread
+## 3. createImageBitmap — bitmap bất đồng bộ, dùng được trong worker
 
-`createImageBitmap()` decode/resize ảnh thành một `ImageBitmap` — đối tượng bitmap đã giải mã, sẵn sàng vẽ, và có thể **transfer** sang worker. Đây là công cụ chuẩn để đẩy decode khỏi luồng chính.
+`createImageBitmap()` trả promise cho một `ImageBitmap`, hỗ trợ crop/resize và là transferable. API có trong worker; gọi pipeline từ worker giữ fetch/orchestration JS khỏi main thread, nhưng spec không bảo đảm decode vật lý luôn chạy trên một OS thread cụ thể.
 
 ```js
-// Trong worker: tải + decode hoàn toàn ngoài luồng chính
+// Trong worker: fetch + tạo bitmap mà không chạy JS orchestration trên main
 const res = await fetch(url);
 const blob = await res.blob();
 const bitmap = await createImageBitmap(blob, {
   resizeWidth: 400, resizeQuality: 'high', // resize ngay khi decode
 });
-postMessage({ bitmap }, [bitmap]); // transfer (zero-copy) về main
+postMessage({ bitmap }, [bitmap]); // chuyển ownership về main
 ```
 
-Khác `new Image()`, `ImageBitmap` không gắn DOM, decode ngay, và transfer được — phù hợp pipeline xử lý ảnh nặng.
+Khác `HTMLImageElement`, `ImageBitmap` không gắn DOM và có vòng đời tài nguyên rõ hơn. Sau khi vẽ xong ở bên nhận, gọi `bitmap.close()` để nhả backing resource sớm thay vì chờ GC.
 
 ---
 
 ## 4. OffscreenCanvas — vẽ ngoài luồng chính
 
-`OffscreenCanvas` tách canvas khỏi DOM để **render trong worker**. Kết hợp với `transferControlToOffscreen()`, toàn bộ việc vẽ (game, data-viz, xử lý ảnh) chạy trên worker, không đụng luồng chính.
+`OffscreenCanvas` cung cấp drawing context không phụ thuộc DOM và có thể transfer control từ `<canvas>` sang dedicated worker. JS dựng frame chạy ở worker; browser vẫn phải composite kết quả lên trang.
 
 ```js
-// main thread
+// main.js — gọi trước khi lấy context trên HTMLCanvasElement
+const canvas = document.querySelector('canvas');
+if (!canvas) throw new Error('Missing <canvas>');
+const worker = new Worker('./worker.js', { type: 'module' });
 const offscreen = canvas.transferControlToOffscreen();
 worker.postMessage({ canvas: offscreen }, [offscreen]);
 
-// worker.js — vẽ độc lập với luồng chính
+// worker.js
 onmessage = ({ data }) => {
   const ctx = data.canvas.getContext('2d');
-  function draw() { /* ... */ ctx.clearRect(0,0,w,h); /* ... */ requestAnimationFrame(draw); }
-  draw(); // rAF tồn tại trong worker với OffscreenCanvas
+  function draw() {
+    ctx.clearRect(0, 0, data.canvas.width, data.canvas.height);
+    // ...draw next frame...
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
 };
 ```
 
-Đây là cầu nối tới Phần 20: OffscreenCanvas + worker là cách chính để giữ canvas 60fps khi luồng chính bận.
+Dedicated-worker `requestAnimationFrame` giúp đồng bộ drawing loop với rendering của owner window. Dù vậy, worker không bảo đảm 60fps: chi phí vẽ, transfer, raster/GPU và composite vẫn phải nằm trong deadline.
 
 ---
 
@@ -104,44 +114,44 @@ Trình duyệt cũng quyết định *khi nào* và *cái nào* tải, ảnh hư
   src="photo-800.avif"
   srcset="photo-400.avif 400w, photo-800.avif 800w, photo-1600.avif 1600w"
   sizes="(max-width: 600px) 100vw, 800px"
-  loading="lazy"          
+  loading="lazy"
   decoding="async"
-  fetchpriority="low"     
-  width="800" height="600" 
+  fetchpriority="low"
+  width="800" height="600"
   alt="...">
 ```
 
-- `loading="lazy"`: hoãn tải tới khi gần viewport (như `content-visibility` nhưng cho tải).
-- `srcset`/`sizes`: chọn độ phân giải đúng → decode bitmap nhỏ hơn, ít RAM hơn.
-- `fetchpriority`: nâng ảnh LCP (`high`) hoặc hạ ảnh phụ (`low`).
+- `loading="lazy"`: cho user agent hoãn fetch ảnh ngoài màn hình theo heuristic riêng; đừng dùng cho ảnh LCP.
+- `srcset`/`sizes`: giúp browser chọn candidate theo kích thước layout, DPR và điều kiện mạng → tránh decode ảnh lớn quá nhu cầu.
+- `fetchpriority`: **hint** nâng ảnh LCP (`high`) hoặc hạ ảnh phụ (`low`), không ghi đè mọi quyết định scheduler.
 - `width`/`height`: cho trình duyệt biết tỉ lệ → tránh layout shift (CLS).
 
-> Định dạng hiện đại (AVIF/WebP) decode khác JPEG; AVIF nén tốt hơn nhưng decode có thể nặng CPU hơn trên ảnh lớn — cân nhắc theo thiết bị mục tiêu.
+> Codec đổi trade-off byte mạng, chất lượng, decode và hardware support. Đừng kết luận AVIF/WebP/JPEG chỉ từ kích thước file; đo cả LCP, decode time và memory trên thiết bị mục tiêu.
 
 ---
 
 ## 6. Video — pipeline thời gian thực
 
-Video không decode một lần mà là **dòng khung liên tục**, thường tăng tốc phần cứng:
+Video không decode một lần mà là **dòng khung liên tục**. Browser ưu tiên hardware decoder khi codec/thiết bị/driver hỗ trợ và rơi về software khi cần:
 
 ```text
 Container (mp4/webm) ─► demux ─► luồng video nén (H.264/VP9/AV1)
    │
-   ▼ hardware decoder (GPU/ASIC) — không qua luồng chính
+   ▼ media pipeline → hardware decoder hoặc software decoder
 Khung đã decode ─► đồng bộ với audio clock ─► compositor ─► màn hình
 ```
 
-API nâng cao: **WebCodecs** (`VideoDecoder`/`VideoEncoder`) cho truy cập khung ở mức thấp; `requestVideoFrameCallback` để chạy code đồng bộ từng khung video (vd vẽ overlay). Mặc định, `<video>` decode trên đường phần cứng và composite như một layer riêng (Phần 13), nên phát video không chặn luồng chính.
+API nâng cao: **WebCodecs** (`VideoDecoder`/`VideoEncoder`) cho truy cập khung ở mức thấp; `requestVideoFrameCallback` lên lịch callback khi một video frame mới được đưa tới compositor (hữu ích cho overlay/analysis). `<video>` thường tận dụng media threads và đường compositing hiệu quả, nhưng hardware decode/layer riêng không được bảo đảm; JS callback nặng vẫn chặn main thread.
 
 ---
 
 ## 7. Tóm tắt
 
-- Ảnh đi qua **download → decode → upload GPU**; decode giải nén thành bitmap RGBA *lớn hơn nhiều* file gốc và tốn CPU.
-- `decoding="async"` tránh chặn render; `img.decode()` cho phép chờ decode xong trước khi chèn (hết jank khi swap ảnh lớn).
-- **`createImageBitmap`** decode/resize off-main-thread và transfer được sang worker; `ImageBitmap` không gắn DOM.
-- **`OffscreenCanvas`** + `transferControlToOffscreen()` đưa toàn bộ việc vẽ vào worker (rAF chạy trong worker).
-- `loading="lazy"`, `srcset`/`sizes`, `fetchpriority`, `width/height` điều khiển *khi nào/cái nào* tải và tránh CLS.
-- **Video** decode bằng phần cứng theo dòng khung, composite như layer riêng; WebCodecs/`requestVideoFrameCallback` cho điều khiển mức thấp.
+- Ảnh đi qua **fetch → decode → raster/composite**; RGBA `w × h × 4` là estimate hữu ích, không phải layout bộ nhớ bắt buộc.
+- `decoding` chỉ là hint; `img.decode()` cho phép chờ decoded data trước khi chèn và phải xử lý rejection.
+- **`createImageBitmap`** tạo bitmap bất đồng bộ, hỗ trợ worker/transfer; không có bảo đảm spec về OS thread thực thi decode.
+- **`OffscreenCanvas`** chuyển drawing JS sang worker, còn raster/composite và deadline vẫn thuộc pipeline browser.
+- `loading`, `srcset`/`sizes`, `fetchpriority`, `width`/`height` là input cho scheduler/layout; phần lớn là hint, không phải mệnh lệnh tuyệt đối.
+- Video dùng media pipeline với hardware/software fallback; WebCodecs và `requestVideoFrameCallback` cho quyền điều khiển thấp hơn nhưng đòi quản lý frame/resource cẩn thận.
 
 **Phần tiếp theo:** Threading deep — Web Workers, SharedArrayBuffer + Atomics, OffscreenCanvas ở quy mô lớn, và cross-origin isolation (COOP/COEP) mở khoá bộ nhớ chia sẻ + timer độ phân giải cao.

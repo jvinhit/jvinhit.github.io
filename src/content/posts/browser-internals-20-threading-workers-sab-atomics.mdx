@@ -2,19 +2,18 @@
 title: 'How Browsers Work · Part 20 — Threading Deep: Workers, SharedArrayBuffer & Atomics'
 description: 'Đa luồng thật trên web: Web Workers, transferable vs SharedArrayBuffer, Atomics để đồng bộ, và cross-origin isolation (COOP/COEP) mở khoá bộ nhớ chia sẻ cùng timer phân giải cao.'
 pubDate: 2026-11-12
-tags: [browser, internals, workers, concurrency, browser_internals_12]
+tags: [browser, internals, workers, concurrency, browser_internals_22]
 series: browser-internals
 seriesOrder: 20
-draft: true
 ---
 
 JavaScript chạy đơn luồng trên mỗi context (Phần 7), nhưng nền tảng web *có* đa luồng thật qua **Web Workers**. Phần này đi sâu vào cách worker giao tiếp, cách chia sẻ bộ nhớ thật sự với `SharedArrayBuffer`, dùng `Atomics` để đồng bộ, và vì sao những thứ đó bị khoá sau **cross-origin isolation**.
 
 ---
 
-## 1. Worker = context JS riêng, luồng riêng
+## 1. Worker = execution context riêng, có thể chạy đồng thời
 
-Mỗi worker có **luồng riêng**, **event loop riêng**, **heap riêng** — không chia sẻ biến với luồng chính. Chúng chỉ nói chuyện qua message.
+Mỗi worker có global scope/event loop riêng và không truy cập DOM của document. Engine có thể chạy worker đồng thời với main thread trên worker thread; chi tiết ánh xạ tới OS thread thuộc implementation. JS object thông thường không chia sẻ trực tiếp giữa các context — giao tiếp qua message hoặc shared memory có kiểm soát.
 
 ```text
 Main thread (window)          Worker thread
@@ -28,8 +27,8 @@ Ba loại worker:
 | Loại | Phạm vi | Dùng cho |
 |---|---|---|
 | **Dedicated Worker** | một trang sở hữu | tính toán nặng riêng cho trang |
-| **Shared Worker** | nhiều tab cùng origin | chia sẻ trạng thái/kết nối giữa tab |
-| **Service Worker** | proxy mạng (Phần 10) | offline, cache, push |
+| **Shared Worker** | nhiều context cùng origin/storage partition | chia sẻ trạng thái/kết nối khi được hỗ trợ |
+| **Service Worker** | lifecycle/proxy mạng riêng (Phần 10) | offline, cache, push; không phải compute worker sống mãi |
 
 ```js
 const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
@@ -41,18 +40,18 @@ w.onmessage = (e) => render(e.data);
 
 ## 2. postMessage: structured clone vs transfer
 
-Mặc định, `postMessage` **sao chép** dữ liệu bằng *structured clone algorithm* (Phần khác trong blog). Object lớn → sao chép tốn kém.
+Mặc định, `postMessage` serialize/deserialize graph dữ liệu bằng **structured clone**. Với object/buffer lớn, việc tạo bản sao có thể tốn CPU và memory.
 
 ```text
 structured clone:  [data] ──copy──► [data']   (cả hai bên đều có bản)
-transfer:          [buffer] ──move──► [buffer] (bên gửi MẤT quyền, zero-copy)
+transfer:          [buffer] ──move──► [buffer] (bên gửi bị detach)
 ```
 
-**Transferable** (`ArrayBuffer`, `MessagePort`, `ImageBitmap`, `OffscreenCanvas`…) được *chuyển quyền sở hữu* — zero-copy, nhưng bên gửi không dùng được nữa:
+**Transferable** (`ArrayBuffer`, `MessagePort`, `ImageBitmap`, `OffscreenCanvas`…) có semantics *chuyển ownership*: object phía gửi bị detach/không dùng lại được, còn phía nhận có object mới trỏ tới backing resource đã chuyển. Cơ chế này tránh structured-clone toàn bộ payload đắt tiền; đừng phụ thuộc vào chi tiết "physical zero-copy" của implementation.
 
 ```js
 const buf = new ArrayBuffer(64 * 1024 * 1024);
-worker.postMessage({ buf }, [buf]); // transfer list → move, không copy
+worker.postMessage({ buf }, [buf]); // transfer list → ownership chuyển đi
 // buf.byteLength === 0 ở đây: đã mất quyền
 ```
 
@@ -68,17 +67,17 @@ Dùng transfer cho buffer lớn để tránh chi phí clone. Nhưng transfer v�
 const sab = new SharedArrayBuffer(1024);
 const view = new Int32Array(sab);
 worker.postMessage({ sab });   // KHÔNG transfer — cả hai cùng thấy cùng vùng nhớ
-// ghi ở luồng này, luồng kia thấy ngay
-view[0] = 42;
+// Dùng Atomics để publication/ordering rõ ràng giữa các agent
+Atomics.store(view, 0, 42);
 ```
 
-Sức mạnh đi kèm hiểm hoạ: nhiều luồng ghi cùng vị trí → **race condition**. Cần công cụ đồng bộ → `Atomics`.
+Các byte thực sự được chia sẻ, nhưng câu "luồng kia thấy ngay" không phải memory model. Nhiều agent đọc/ghi không phối hợp tạo race hoặc ordering khó đoán; dùng `Atomics` cho synchronization/publication.
 
 ---
 
 ## 4. Atomics — đọc/ghi nguyên tử & đồng bộ
 
-`Atomics` cung cấp thao tác **nguyên tử** (không bị ngắt giữa chừng) trên SAB, và cơ chế chờ/đánh thức kiểu mutex.
+`Atomics` cung cấp thao tác **nguyên tử** trên integer typed array được backed bởi SAB, cùng cơ chế chờ/đánh thức để xây primitive đồng bộ.
 
 ```js
 const view = new Int32Array(sab);
@@ -87,25 +86,35 @@ const view = new Int32Array(sab);
 Atomics.add(view, 0, 1);          // tăng nguyên tử
 const v = Atomics.load(view, 0);  // đọc nguyên tử
 
-// Chờ/đánh thức (chỉ trong worker — Atomics.wait chặn luồng)
-// Worker: chặn tới khi view[0] != 0
-Atomics.wait(view, 0, 0);
-// Main: đặt cờ rồi đánh thức 1 worker đang chờ
+// worker.js: luôn kiểm tra điều kiện trong vòng lặp
+while (Atomics.load(view, 0) === 0) {
+  Atomics.wait(view, 0, 0); // ngủ nếu giá trị vẫn bằng expected (0)
+}
+```
+
+Ở agent khác (ví dụ main thread), cập nhật state **trước** rồi mới notify:
+
+```js
 Atomics.store(view, 0, 1);
 Atomics.notify(view, 0, 1);
 ```
 
-> `Atomics.wait` chặn luồng — cấm dùng trên luồng chính (sẽ throw). Có `Atomics.waitAsync` không chặn cho main thread. Đây là nền của producer/consumer queue giữa các luồng.
+`Atomics.wait()` chỉ hợp lệ trên agent được phép block (web main thread sẽ throw). `Atomics.notify()` chỉ đánh thức waiter; nó không tự thay đổi dữ liệu, nên waiter phải kiểm tra lại điều kiện. Khi được hỗ trợ, `Atomics.waitAsync()` dùng được ở main thread mà không block; API trả `{ async, value }`, trong đó `value` là Promise hoặc kết quả tức thì:
+
+```js
+const result = Atomics.waitAsync(view, 0, 0);
+await result.value;
+```
 
 ---
 
 ## 5. Cross-origin isolation — vì sao SAB bị khoá
 
-Sau các lỗ hổng Spectre/Meltdown, `SharedArrayBuffer` (và timer phân giải cao) bị tắt mặc định, vì bộ nhớ chia sẻ + timer chính xác cho phép side-channel attack. Để mở lại, trang phải vào trạng thái **cross-origin isolated** bằng hai header:
+Sau Spectre, browser hạn chế `SharedArrayBuffer` và timer chính xác vì chúng làm timing side-channel mạnh hơn. Trên web, cần secure context và trạng thái **cross-origin isolated**. Cặp header phổ biến, interoperable nhất là:
 
 ```text
 Cross-Origin-Opener-Policy:   same-origin       (COOP — tách browsing context group)
-Cross-Origin-Embedder-Policy: require-corp       (COEP — mọi subresource phải opt-in)
+Cross-Origin-Embedder-Policy: require-corp       (COEP — chặn tài nguyên cross-origin chưa opt-in)
 ```
 
 ```js
@@ -115,7 +124,7 @@ if (crossOriginIsolated) {
 }
 ```
 
-Mô hình: COOP cô lập trang khỏi cửa sổ cross-origin; COEP buộc mọi tài nguyên nhúng phải đồng ý (`Cross-Origin-Resource-Policy` hoặc CORS). Cùng nhau, chúng bảo đảm process này không chứa dữ liệu cross-origin chưa được phép — an toàn để mở SAB. Đây cũng là lý do isolation gắn chặt với **Site Isolation** ở Phần 21.
+Mô hình: COOP tách top-level document sang browsing context group phù hợp; COEP chỉ cho nhúng cross-origin resource đã opt in qua CORP hoặc CORS. Một số browser còn hỗ trợ `COEP: credentialless`, nhưng support/trade-off khác nhau. Đây là **web opt-in policy**, bổ sung chứ không đồng nhất với Site Isolation nội bộ ở Phần 21. Hãy kiểm tra kết quả bằng `self.crossOriginIsolated` và audit popup/OAuth/third-party embeds trước khi deploy.
 
 ---
 
@@ -123,10 +132,10 @@ Mô hình: COOP cô lập trang khỏi cửa sổ cross-origin; COEP buộc mọ
 
 ```text
 Tính toán nặng, dữ liệu copy được      → Worker + structured clone
-Buffer lớn, gửi một chiều              → Worker + transfer (transferable)
+Buffer lớn, gửi một chiều              → Worker + transfer ownership
 Nhiều luồng cùng truy cập state nóng   → SharedArrayBuffer + Atomics (cần COOP/COEP)
-Vẽ canvas 60fps khi main bận           → OffscreenCanvas trong worker (Phần 19)
-Chia sẻ giữa nhiều tab                 → SharedWorker / BroadcastChannel
+Vẽ canvas khi main bận                  → OffscreenCanvas trong worker (Phần 19)
+Chia sẻ message giữa nhiều tab         → SharedWorker / BroadcastChannel (cùng partition)
 ```
 
 Đừng vội dùng SAB: với hầu hết ứng dụng, worker + transfer là đủ và đơn giản hơn nhiều. SAB/Atomics dành cho wasm threads, xử lý audio/video realtime, hoặc cấu trúc dữ liệu chia sẻ hiệu năng cao.
@@ -135,11 +144,11 @@ Chia sẻ giữa nhiều tab                 → SharedWorker / BroadcastChannel
 
 ## 7. Tóm tắt
 
-- **Web Workers** cho đa luồng thật: mỗi worker có luồng/event loop/heap riêng, không DOM; ba loại dedicated/shared/service.
-- `postMessage` mặc định **structured clone** (copy); **transferable** chuyển quyền sở hữu zero-copy (bên gửi mất quyền).
+- Worker cho execution context/event loop riêng có thể chạy đồng thời; dedicated/shared/service worker có lifecycle và mục đích khác nhau.
+- `postMessage` dùng **structured clone**; **transferable** chuyển ownership và detach phía gửi, tránh clone payload đắt tiền.
 - **`SharedArrayBuffer`** chia sẻ bộ nhớ thật giữa các luồng (không copy/transfer) → cần đồng bộ.
-- **`Atomics`** cho thao tác nguyên tử và wait/notify; `Atomics.wait` chặn nên cấm trên luồng chính (dùng `waitAsync`).
-- SAB + timer phân giải cao bị khoá sau **cross-origin isolation**: cần `COOP: same-origin` + `COEP: require-corp`; kiểm tra `crossOriginIsolated`.
+- **`Atomics`** cung cấp operation/ordering nguyên tử; `wait` cần vòng lặp điều kiện và không được block main thread, còn `waitAsync` phải feature-detect.
+- SAB trên web cần secure context + **cross-origin isolation**; cặp phổ biến là `COOP: same-origin` + `COEP: require-corp`, kiểm tra `self.crossOriginIsolated`.
 - Chọn công cụ theo nhu cầu: copy → clone, buffer lớn một chiều → transfer, state nóng đa luồng → SAB+Atomics.
 
 **Phần tiếp theo:** Process model deep — Site Isolation và OOPIF, Back/Forward Cache (BFCache), prerender/speculation rules, và Page Lifecycle API điều phối tài nguyên giữa các tab.

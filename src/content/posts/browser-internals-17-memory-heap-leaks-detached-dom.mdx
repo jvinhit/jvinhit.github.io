@@ -1,11 +1,10 @@
 ---
 title: 'How Browsers Work · Part 17 — Memory Deep: Heap Snapshots, Leaks & Detached DOM'
-description: 'Săn rò rỉ bộ nhớ như chuyên gia: heap snapshot và ba view, retainer path, detached DOM, Oilpan GC, cùng WeakRef/FinalizationRegistry và measureUserAgentSpecificMemory.'
+description: 'Điều tra rò rỉ bộ nhớ bằng heap snapshot, Comparison và retainer path; hiểu detached DOM, Oilpan/V8 GC, weak references và giới hạn của phép đo memory.'
 pubDate: 2026-11-06
-tags: [browser, internals, memory, debugging, browser_internals_12]
+tags: [browser, internals, memory, debugging, browser_internals_22]
 series: browser-internals
 seriesOrder: 17
-draft: true
 ---
 
 Phần 8 giới thiệu garbage collection (generational, mark-sweep). Phần này biến lý thuyết thành kỹ năng điều tra: làm sao tìm ra *cái gì* đang giữ bộ nhớ không cho giải phóng. Rò rỉ trong JS hiếm khi là "quên free" — nó là *vô tình giữ một tham chiếu* khiến GC không thể thu hồi.
@@ -27,26 +26,27 @@ Bốn nguồn rò rỉ kinh điển: biến toàn cục vô tình, **listener/ti
 
 ---
 
-## 2. Heap snapshot & ba view
+## 2. Heap snapshot & các view chính
 
-DevTools → **Memory** → *Heap snapshot* chụp toàn bộ object đang sống. Ba chế độ xem:
+DevTools → **Memory** → *Heap snapshot* chụp graph object JS/DOM còn reachable sau khi DevTools chạy GC. Snapshot không đại diện toàn bộ RAM của renderer/GPU. Bốn chế độ xem chính:
 
 | View | Trả lời câu hỏi |
 |---|---|
 | **Summary** | Có những loại (constructor) gì, bao nhiêu instance, chiếm bao nhiêu? |
 | **Comparison** | Giữa hai snapshot, cái gì *mới sinh ra* mà chưa chết? |
 | **Containment** | Cây sở hữu từ root — duyệt thủ công |
+| **Statistics** | Tỉ lệ tương đối của code, string, array, typed array và system object |
 
 Hai cột quan trọng:
 
 - **Shallow size**: bộ nhớ object tự nó chiếm.
-- **Retained size**: bộ nhớ sẽ được giải phóng nếu object này biến mất (gồm mọi thứ chỉ nó giữ). Retained size lớn = "thủ phạm" giữ nhiều thứ.
+- **Retained size**: ước lượng phần heap có thể được giải phóng nếu object này và các object chỉ reachable qua nó biến mất. Retained size lớn là điểm bắt đầu điều tra, chưa tự chứng minh object đó là leak.
 
 ---
 
 ## 3. Retainer path — vì sao object còn sống
 
-Chọn một object, DevTools hiện **Retainers** (ai đang giữ nó). Lần ngược chuỗi này tới root chính là *retainer path* — bằng chứng trực tiếp của rò rỉ.
+Chọn một object, DevTools hiện **Retainers** (ai đang giữ nó). Lần ngược chuỗi này tới root chính là *retainer path* — bằng chứng trực tiếp cho việc object còn reachable; việc đó có phải leak hay không vẫn phụ thuộc ý định ứng dụng.
 
 ```text
 Detached HTMLDivElement
@@ -55,30 +55,30 @@ Detached HTMLDivElement
             ◄── root (window)        ← đây là dây neo cần cắt
 ```
 
-Quy trình "three-snapshot" để xác nhận rò rỉ:
+Quy trình **ba snapshot** để tìm object tiếp tục sống sau khi ứng dụng trở về cùng trạng thái logic:
 
 1. Chụp snapshot 1 (baseline).
-2. Thực hiện thao tác *nhiều lần* (mở/đóng modal 10 lần) rồi về trạng thái đầu.
-3. Chụp snapshot 2 → so sánh. Object nào tăng tuyến tính theo số lần lặp = rò rỉ.
+2. Lặp thao tác N lần (mở/đóng modal), trở về trạng thái đầu, chụp snapshot 2.
+3. Lặp thêm N lần, trở về cùng trạng thái, chụp snapshot 3.
+4. So sánh 3 với 2: constructor/retainer nào tiếp tục tăng theo mỗi batch là **nghi phạm**. Cache có chủ đích cũng tăng, nên luôn đọc retainer path trước khi kết luận.
 
 ---
 
-## 4. Detached DOM — kẻ rò rỉ phổ biến nhất
+## 4. Detached DOM — một nguồn rò rỉ phổ biến
 
 Khi bạn gỡ một node khỏi cây DOM nhưng *JS vẫn giữ tham chiếu*, node đó (và toàn bộ cây con) thành **detached** — không hiển thị nhưng vẫn tốn bộ nhớ.
 
 ```js
-// ❌ rò rỉ: list bị xoá khỏi DOM nhưng biến vẫn giữ
-const cached = document.querySelector('#list');
-document.body.removeChild(cached.parentNode);
-// 'cached' (và mọi con) vẫn sống vì còn tham chiếu
+// ❌ nếu biến này sống lâu, node đã remove vẫn bị giữ
+let cached = document.querySelector('#list');
+cached?.remove();
+// 'cached' (và cây con) vẫn reachable qua biến JS
 
 // ✅ giải phóng tham chiếu khi không cần
-let cached = document.querySelector('#list');
-cleanup(() => { cached = null; });
+cached = null;
 ```
 
-Trong heap snapshot, lọc theo "Detached" để thấy ngay các node mồ côi và retainer của chúng. Listener gắn trên node detached cũng giữ cả closure của handler.
+Trong heap snapshot, lọc "Detached" hoặc dùng profile **Detached elements**, rồi đọc Retainers. Một listener nằm *trên chính node detached* không tự tạo leak nếu cả cycle đã unreachable; leak thường xuất hiện khi root sống lâu (`window`, store, timer, cache…) giữ handler/node/closure.
 
 ---
 
@@ -110,37 +110,50 @@ function mount(el) {
 
 **Oilpan** là GC của Blink cho các đối tượng C++ phía trình duyệt (DOM node...). Nó hợp tác với GC của V8 (cho JS) — nhưng một tham chiếu JS tới DOM node vẫn giữ node sống xuyên qua ranh giới này, nên detached DOM mới rò rỉ được.
 
-Công cụ JS để *không* giữ object sống:
+Công cụ JS để gắn dữ liệu mà không cố ý giữ key sống:
 
 ```js
-// WeakRef: tham chiếu KHÔNG ngăn GC thu hồi
-const ref = new WeakRef(bigObject);
-const obj = ref.deref(); // có thể undefined nếu đã bị GC
+// Lựa chọn mặc định cho metadata theo vòng đời object
+const metadata = new WeakMap();
+function attachMetadata(node) {
+  metadata.set(node, { selected: true });
+}
 
-// FinalizationRegistry: callback (không bảo đảm) khi object bị thu hồi
-const reg = new FinalizationRegistry((key) => cache.delete(key));
-reg.register(obj, 'key-123');
+// WeakRef/FinalizationRegistry: chỉ cho cache/quan sát best-effort
+const cache = new Map();
+const registry = new FinalizationRegistry((key) => cache.delete(key));
+let target = { large: new ArrayBuffer(10_000_000) };
+const ref = new WeakRef(target);
+registry.register(target, 'key-123');
+target = null;
+
+const maybeTarget = ref.deref(); // object hoặc undefined; chỉ mạnh trong scope này
 ```
 
 > Dùng `WeakMap`/`WeakSet` cho metadata gắn theo object (key không bị giữ sống). Tránh `WeakRef`/`FinalizationRegistry` cho logic chính — thời điểm GC không xác định.
 
-Đo bộ nhớ trong production (cần cross-origin isolation — Phần 20):
+Đo ước lượng memory của browsing context group hỗ trợ API (cần secure, cross-origin isolated context — Phần 20):
 
 ```js
-if (crossOriginIsolated && performance.measureUserAgentSpecificMemory) {
+if (
+  crossOriginIsolated &&
+  typeof performance.measureUserAgentSpecificMemory === 'function'
+) {
   const { bytes } = await performance.measureUserAgentSpecificMemory();
 }
 ```
+
+API này không có ở mọi browser và kết quả có nhiễu/implementation detail; dùng xu hướng qua nhiều mẫu, không coi một lần đo là "RAM chính xác của tab".
 
 ---
 
 ## 7. Tóm tắt
 
 - Rò rỉ JS = object **vẫn reachable** nhưng không còn cần; GC chỉ thấy tham chiếu, không thấy ý định.
-- **Heap snapshot** với Summary/Comparison/Containment; chú ý **retained size** (thủ phạm giữ nhiều) và **retainer path** (dây neo cần cắt).
-- Quy trình **three-snapshot**: lặp thao tác nhiều lần, object tăng tuyến tính = rò rỉ.
-- **Detached DOM** là nguồn rò rỉ phổ biến nhất; lọc "Detached" trong snapshot, giải phóng tham chiếu JS khi gỡ node.
+- Heap snapshot có Summary/Comparison/Containment/Statistics; **retained size** gợi ý vùng điều tra, còn **retainer path** mới chỉ ra dây neo.
+- Quy trình **ba snapshot** so sánh batch 3 với 2; tăng lặp lại là nghi phạm, không tự động là leak.
+- **Detached DOM** là nguồn leak phổ biến; listener-cycle chỉ leak khi còn đường từ một root sống lâu.
 - Gỡ **listener/timer** theo vòng đời, ưu tiên `AbortController` + `{ signal }`.
-- **Oilpan** GC cho DOM C++ hợp tác với V8 GC; dùng `WeakMap`/`WeakSet` cho metadata, `measureUserAgentSpecificMemory` để đo trong production.
+- **Oilpan** GC cho object Blink hợp tác với V8; ưu tiên `WeakMap`/`WeakSet`, xem `WeakRef`/finalizer là best-effort, và coi memory API là phép ước lượng.
 
-**Phần tiếp theo:** Accessibility tree internals — trình duyệt dựng cây a11y song song với DOM thế nào, name/role được tính ra sao, và screen reader truy vấn qua nền tảng (UIA/AX/AT-SPI) như thế nào.
+**Phần tiếp theo:** Accessibility tree internals — trình duyệt dẫn xuất cây a11y từ DOM thế nào, name/role được tính ra sao, và screen reader truy vấn qua API nền tảng như thế nào.

@@ -1,20 +1,19 @@
 ---
 title: 'How Browsers Work · Part 18 — Accessibility Tree Internals'
-description: 'Trình duyệt dựng cây accessibility song song với DOM thế nào: role/name/state, thuật toán tính tên, cây bị cắt tỉa, và cách screen reader truy vấn qua API nền tảng (UIA/AX/AT-SPI).'
+description: 'Accessibility tree được dẫn xuất từ DOM thế nào: role/name/state, thuật toán tính tên, ignored/inert nodes, API nền tảng và cách kiểm tra bằng DevTools/CDP.'
 pubDate: 2026-11-08
-tags: [browser, internals, accessibility, a11y, browser_internals_12]
+tags: [browser, internals, accessibility, a11y, browser_internals_22]
 series: browser-internals
 seriesOrder: 18
-draft: true
 ---
 
-Ta đã theo DOM qua render và compositing. Nhưng có một cây thứ hai trình duyệt dựng song song mà developer ít khi thấy: **accessibility tree (cây a11y)**. Đây là cách trình duyệt mô tả trang cho công nghệ hỗ trợ (screen reader, công cụ điều khiển bằng giọng nói). Hiểu nó biến accessibility từ "đoán mò ARIA" thành mô hình rõ ràng.
+Ta đã theo DOM qua render và compositing. Còn một biểu diễn ngữ nghĩa developer ít khi thấy: **accessibility tree (cây a11y)**. Đây là cách trình duyệt mô tả trang cho công nghệ hỗ trợ như screen reader và công cụ điều khiển bằng giọng nói. Hiểu nó biến accessibility từ "đoán mò ARIA" thành mô hình rõ ràng.
 
 ---
 
-## 1. Cây thứ ba của trang
+## 1. Một cây ngữ nghĩa dẫn xuất từ DOM
 
-Bạn đã biết DOM tree và (từ Phần 13) layer tree. Cây thứ ba là **accessibility tree** — dẫn xuất từ DOM nhưng phục vụ AT.
+Bạn đã biết DOM và các cấu trúc render/compositor. **Accessibility tree** là một biểu diễn khác, dẫn xuất từ DOM cùng style/semantics liên quan để phục vụ assistive technology (AT). Nó không phải bản sao DOM và cũng không có một thứ tự "cây thứ ba" cố định trong mọi engine.
 
 ```text
 HTML ─► DOM tree ──► Render tree ─► Layout ─► Paint  (cho mắt)
@@ -48,14 +47,15 @@ HTML ngữ nghĩa cho cả ba *miễn phí*: `<button>Lưu</button>` có role=bu
 
 ## 3. Thuật toán tính tên (accessible name computation)
 
-"Name" không hiển nhiên — trình duyệt chạy một thuật toán có thứ tự ưu tiên (ACCName) để quyết định đọc gì:
+"Name" không hiển nhiên — user agent chạy thuật toán **Accessible Name and Description Computation (ACCName)**. Thứ tự cụ thể phụ thuộc role và host language; mental model thực dụng cho nhiều control HTML là:
 
 ```text
 Thứ tự ưu tiên (đơn giản hoá):
 1. aria-labelledby  (trỏ tới id phần tử khác → dùng text của nó)
 2. aria-label       (chuỗi trực tiếp)
-3. nhãn gắn kết:     <label for>, alt của <img>, text bên trong <button>
-4. title            (fallback yếu)
+3. nguồn HTML theo từng element: <label>, alt, value, legend/caption…
+4. text bên trong nếu role cho phép name-from-content (như <button>)
+5. title            (fallback yếu)
 → nếu rỗng: phần tử "không có tên" (screen reader đọc chung chung)
 ```
 
@@ -70,7 +70,7 @@ Thứ tự ưu tiên (đơn giản hoá):
 <input id="email" type="email">  <!-- name = "Email" -->
 ```
 
-> Cạm bẫy: `aria-label`/`aria-labelledby` *ghi đè* nội dung hiển thị. Người dùng giọng nói nói "click Huỷ" nhưng label là "Đóng" → lệnh không khớp. Giữ accessible name khớp với text nhìn thấy.
+> Cạm bẫy: `aria-label`/`aria-labelledby` có ưu tiên cao hơn text nhìn thấy. `<button aria-label="Đóng">Huỷ</button>` có accessible name "Đóng"; người dùng điều khiển giọng nói thấy "Huỷ" nhưng lệnh theo chữ nhìn thấy có thể không khớp. Giữ visible label nằm trong accessible name.
 
 ---
 
@@ -80,8 +80,8 @@ Accessibility tree **không** ánh xạ 1–1 với DOM. Trình duyệt cắt t�
 
 - `display:none` / `visibility:hidden` → **loại khỏi** cây a11y.
 - `aria-hidden="true"` → loại bỏ node và con khỏi a11y (nhưng vẫn hiển thị cho mắt!).
-- Node thuần trình bày (div bao bọc) có thể bị gộp/bỏ.
-- `inert` → loại khỏi tương tác và a11y.
+- Node thuần trình bày (div bao bọc) có thể bị ignore; con của nó được nối lên ancestor gần nhất thay vì mất theo.
+- `inert` → subtree thường không focus, không hit-test và không được expose qua accessibility API.
 
 ```text
 DOM                         Accessibility tree
@@ -91,41 +91,45 @@ DOM                         Accessibility tree
   <span aria-hidden> ✕        (loại bỏ)
 ```
 
-Hệ quả thực tế: `aria-hidden="true"` trên phần tử *có thể focus* tạo bug nguy hiểm — AT bỏ qua nó nhưng người dùng vẫn tab tới được, gây "focus mồ côi". Dùng `inert` để vừa ẩn a11y vừa chặn focus.
+Hệ quả thực tế: không đặt `aria-hidden="true"` lên phần tử focusable hoặc ancestor của nó; hành vi phục hồi/cảnh báo khác nhau theo engine và có thể tạo "focus mồ côi". Khi vô hiệu hoá cả một vùng (ví dụ nền phía sau modal), `inert` đồng bộ focus, hit testing và a11y tốt hơn — đồng thời phải bảo đảm UI thị giác cũng thể hiện vùng đó không dùng được.
 
 ---
 
 ## 5. Screen reader truy vấn thế nào
 
-Trình duyệt không "đọc" gì — nó *xuất* accessibility tree qua **API nền tảng**, và screen reader (process riêng) truy vấn qua đó:
+Trình duyệt không tự "đọc" nội dung — nó *xuất* accessibility tree qua **API nền tảng**, rồi assistive technology truy vấn qua đó:
 
 ```text
 Renderer (a11y tree)
    │  ánh xạ sang API hệ điều hành
    ▼
- Windows: UI Automation (UIA / IAccessible2)
+ Windows: UI Automation (UIA), MSAA/IAccessible2
  macOS:   NSAccessibility (AX)
  Linux:   AT-SPI
    │
    ▼
-Screen reader (NVDA / JAWS / VoiceOver / Orca) ─► giọng nói / chữ nổi
+AT (NVDA / JAWS / VoiceOver / Orca...) ─► giọng nói / chữ nổi / điều khiển
 ```
 
-Dựng cây a11y có chi phí, nên trình duyệt thường dựng **lười** — chỉ khi phát hiện AT đang chạy hoặc khi API được truy vấn. Vì vậy bật DevTools "Accessibility" pane hay axe-core sẽ kích hoạt việc tính toán này.
+Dựng và duy trì dữ liệu a11y có chi phí. Chromium bật full accessibility support **on demand** khi phát hiện AT hoặc khi được yêu cầu (DevTools/CDP có thể là tác nhân). Sau khi bật, renderer phải đẩy update để browser-process cache luôn nhất quán; phần frontend của DevTools chỉ fetch nhánh cây khi bạn mở rộng. "Lazy" vì thế không có nghĩa thay đổi DOM bị bỏ qua cho tới lúc screen reader hỏi.
 
 ---
 
 ## 6. Kiểm tra cây a11y
 
 - DevTools → **Elements → Accessibility** pane: xem role/name computed và "Accessibility Tree" đầy đủ.
-- `axe-core` / Lighthouse: bắt lỗi tự động (thiếu name, tương phản, thứ tự heading).
-- Test thật bằng VoiceOver (macOS: ⌘F5) / NVDA — công cụ tự động chỉ bắt ~30–40% vấn đề.
+- `axe-core` / Lighthouse: bắt một lớp lỗi tự động (thiếu name, tương phản, quan hệ ARIA…).
+- Test thật bằng VoiceOver/NVDA cùng keyboard và zoom; automated checks không thể xác nhận luồng thao tác hay chất lượng nội dung.
 
 ```js
-// Lấy thông tin a11y computed qua CDP / Puppeteer
-const snapshot = await page.accessibility.snapshot();
-// → cây { role, name, children } như screen reader thấy
+// Puppeteer + Chrome DevTools Protocol (CDP)
+const cdp = await page.createCDPSession();
+await cdp.send('Accessibility.enable');
+const { nodes } = await cdp.send('Accessibility.getFullAXTree');
+await cdp.send('Accessibility.disable');
 ```
+
+`getFullAXTree` hiện được CDP đánh dấu experimental, nên pin phiên bản tool và ưu tiên assertion theo role/name cần thiết thay vì snapshot toàn cây dễ vỡ.
 
 ---
 
@@ -133,9 +137,9 @@ const snapshot = await page.accessibility.snapshot();
 
 - Trình duyệt dựng **accessibility tree** song song DOM, mô tả trang cho AT bằng **role / name / state**.
 - HTML ngữ nghĩa cho role+name+state miễn phí; ARIA chỉ dùng khi không có phần tử phù hợp.
-- **Accessible name** tính theo thứ tự: `aria-labelledby` → `aria-label` → nhãn/alt/text → `title`; giữ name khớp text hiển thị.
+- **Accessible name** phụ thuộc role/HTML mapping; thường ưu tiên `aria-labelledby` → `aria-label` → nguồn host language/name-from-content → `title`.
 - Cây a11y **bị cắt tỉa**: `display:none`/`aria-hidden`/`inert` loại node; cẩn thận `aria-hidden` trên phần tử focus được (dùng `inert`).
-- Trình duyệt xuất cây qua **API nền tảng** (UIA/AX/AT-SPI); screen reader là process riêng truy vấn qua đó; cây thường dựng lười.
-- Kiểm tra bằng Accessibility pane, axe-core/Lighthouse, và test thật với VoiceOver/NVDA.
+- Trình duyệt xuất cây qua **API nền tảng** (UIA/IA2/AX/AT-SPI); Chromium bật full support on demand nhưng phải duy trì update sau khi bật.
+- Kiểm tra bằng Accessibility pane, axe-core/Lighthouse và AT thật; CDP full-tree API còn experimental.
 
-**Phần tiếp theo:** Image & media decoding pipeline — ảnh đi từ byte tới pixel ra sao, decode đồng bộ vs bất đồng bộ, `decoding="async"`/`Image.decode()`, `createImageBitmap`, và OffscreenCanvas cho xử lý ngoài luồng chính.
+**Phần tiếp theo:** Image & media decoding pipeline — ảnh đi từ byte tới pixel ra sao, `decoding`/`Image.decode()` khác gì nhau, và worker + `ImageBitmap` + `OffscreenCanvas` chia việc ở đâu.

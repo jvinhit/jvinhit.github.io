@@ -2,13 +2,12 @@
 title: 'How Browsers Work · Part 9 — Networking & HTTP Caching'
 description: 'The network stack from the browser''s side: the resource fetch lifecycle, HTTP caching (Cache-Control, ETag, the disk/memory cache), connection reuse, HTTP/2 and HTTP/3, and request prioritization.'
 pubDate: 2026-10-21
-tags: [browser, internals, networking, http, caching, browser_internals_12]
+tags: [browser, internals, networking, http, caching, browser_internals_22]
 series: browser-internals
 seriesOrder: 9
-draft: true
 ---
 
-Khi trang gọi `fetch()` hoặc nạp `<script src="...">`, renderer **không** mở socket trực tiếp. Như Phần 1, **network service** — tiến trình riêng có đặc quyền — thực hiện mọi DNS, TCP, TLS, và HTTP I/O thay trình duyệt. Renderer gửi yêu cầu IPC; byte stream trả về qua cùng kênh đó.
+Khi trang gọi `fetch()` hoặc nạp `<script src="...">`, renderer **không** mở socket trực tiếp. Như Phần 1, **network service** do browser quản lý thực hiện DNS, connection, TLS, HTTP, cookie và HTTP cache qua interface IPC được cấp. Service thường ở utility process riêng; sandbox/capability cụ thể tùy platform.
 
 Phần này đi từ thông điệp IPC đến response vào JavaScript: **caching**, **kết nối**, **phiên bản HTTP**, và **ưu tiên**. Làm sai những thứ này khiến code nhanh chạy trên mạng chậm — hoặc code nhanh mà vẫn cảm giác chậm.
 
@@ -23,13 +22,13 @@ Renderer (main thread or worker)
   │
   │  1. Build request (URL, method, headers, body, credentials, priority)
   ▼
-Browser process / Network service
+Browser-managed fetch path
   │
-  │  2. Check memory cache → disk cache → Service Worker (Part 10)
-  │  3. If miss: DNS lookup (if needed)
-  │  4. Pick or open connection (TCP + TLS)
-  │  5. Send HTTP request on a stream
-  │  6. Receive response; update cache per Cache-Control
+  │  2. Policy checks; dispatch fetch event if a Service Worker controls it
+  │  3. SW may return Cache API response or call fetch()
+  │  4. Network fetch consults HTTP cache, then DNS/connection if needed
+  │  5. Send HTTP request on an H1/H2/H3 stream
+  │  6. Receive/filter response; update HTTP cache when allowed
   ▼
 Renderer
   │
@@ -38,24 +37,25 @@ Renderer
 Your code
 ```
 
-Network stack cũng thực thi **CORS**, **CSP**, quy tắc cookie, và chặn mixed content trước khi JS thấy byte. Chi tiết bảo mật ở Phần 11.
+Đây là mental model, không phải thứ tự tuyệt đối của mọi cache nội bộ: Chrome còn có renderer memory cache có thể short-circuit một số request. Fetch/CORS, CSP, mixed-content, cookie và response filtering được enforce ở nhiều component browser/renderer phối hợp trước khi JS được đọc response. Chi tiết bảo mật ở Phần 11.
 
 > Trong **Network** DevTools, cột **Size** cho biết byte từ đâu: `(memory cache)`, `(disk cache)`, hoặc kích thước thực truyền.
 
 ---
 
-## 2. HTTP cache: memory vs disk
+## 2. HTTP cache và các cache nội bộ
 
-Trình duyệt duy trì **hai HTTP cache** với đánh đổi khác nhau:
+HTTP định nghĩa **semantics reuse/validation**, không bắt user agent phải có đúng hai cache. Chromium có HTTP cache phía network service và Blink in-memory resource cache; browser còn có image decode cache, preload cache và Cache API — chúng không đồng nghĩa nhau.
 
-| Cache | Phạm vi | Bền vững | Tốc độ |
-|-------|-------|-------------|---------|
-| **Memory cache** | Per-renderer, in-session | Lost when tab/process closes | Nhanh nhất — không I/O đĩa |
-| **Disk cache** | Shared across sessions/tabs | Survives browser restart (until evicted) | Đọc chậm hơn, nhưng tránh hẳn mạng khi hit |
+| Nhãn/khái niệm | Ý nghĩa thực dụng |
+|-------|---------|
+| **`(memory cache)` trong DevTools** | Response lấy từ cache volatile/internal; scope và lifetime là implementation detail |
+| **`(disk cache)`** | HTTP response lấy từ persistent backend nếu profile/policy cho phép; vẫn có thể bị evict |
+| **Cache API** | Kho do app điều khiển qua `caches`, tách khỏi HTTP cache tự động |
 
-**Hit** cache nghĩa là trình duyệt phục vụ cặp `Request`/`Response` đã lưu mà không liên hệ origin. **Miss** đi ra mạng (trừ khi Service Worker chặn — Phần 10).
+**Fresh hit** thường tránh liên hệ origin. Entry stale có thể revalidate và nhận 304; Service Worker có thể trả response khác trước khi network fetch, hoặc gọi `fetch()` rồi vẫn đi qua HTTP cache. Bài [Service worker caching and HTTP caching](https://web.dev/articles/service-worker-caching-and-http-caching) minh họa các layer và cũng lưu ý memory cache khác nhau theo browser.
 
-Không phải mọi thứ đều cache được. Response có `Cache-Control: no-store` không vào cache nào; `private` không vào cache dùng chung (CDN) nhưng vẫn có thể ở disk cache trình duyệt.
+Không phải mọi thứ đều vào **HTTP cache**. Response có `Cache-Control: no-store` không được HTTP cache lưu; `private` không vào shared cache (CDN) nhưng private browser cache vẫn có thể lưu. Cache API là kho imperative riêng: code có thể `put()` response theo logic của mình, nên đừng nhầm header HTTP với policy Cache API.
 
 ---
 
@@ -65,22 +65,22 @@ Server báo trình duyệt response dùng bao lâu không cần kiểm tra lại
 
 | Chỉ thị | Ý nghĩa |
 |-----------|-------------------|
-| `max-age=3600` | Tươi trong 3600 giây kể từ lúc response |
+| `max-age=3600` | Freshness lifetime 3600 giây; current age tính cả thời gian qua cache/proxy |
 | `no-cache` | Có thể lưu, nhưng phải **revalidate** với origin trước mỗi lần dùng |
 | `no-store` | Không lưu |
-| `immutable` | Nội dung không đổi trong `max-age` — bỏ revalidation khi reload |
+| `immutable` | Nội dung không đổi trong freshness lifetime — tránh revalidation khi còn fresh |
 | `public` / `private` | OK cho CDN dùng chung vs chỉ trình duyệt |
 
 ### Tươi vs cũ
 
-Khi **tươi**, trình duyệt phục vụ bản cache không round-trip mạng. Khi **cũ**, hành vi phụ thuộc chỉ thị và heuristic — có thể phục vụ cũ ngay rồi revalidate nền (**stale-while-revalidate**) hoặc chặn chờ validation.
+Khi **tươi**, cache có thể reuse response không round-trip. Khi **stale**, nó thường phải validate trước khi reuse, trừ khi directive như `stale-while-revalidate`/`stale-if-error` hay quy tắc disconnected cho phép phục vụ stale. Nếu server không gửi freshness rõ, cache có thể dùng heuristic theo [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html).
 
 ### Revalidation với ETag và Last-Modified
 
 Khi revalidate, trình duyệt gửi header có điều kiện:
 
-- Ghép với response **`ETag: "abc123"`**.
-- Ghép với **`Last-Modified`**.
+- Response có **`ETag: "abc123"`** → request gửi `If-None-Match: "abc123"`.
+- Response có **`Last-Modified`** → request có thể gửi `If-Modified-Since`.
 
 Nếu không đổi, server trả **`304 Not Modified`** body rỗng — trình duyệt tái dùng byte cache. Tiết kiệm băng thông nhưng vẫn tốn **một RTT** (độ trễ).
 
@@ -108,23 +108,23 @@ Với asset có fingerprint (`app.a1b2c3.js`), `max-age` dài + `immutable` là 
 
 ## 4. Quản lý kết nối và chi phí handshake
 
-Mỗi kết nối origin mới trả thuế thiết lập:
+Một request lạnh có thể trả chi phí thiết lập trước byte đầu:
 
 ```text
 Cold request to https://cdn.example.com
-  DNS lookup        ~20–120 ms  (cached after first use)
-  TCP handshake     ~1 RTT
-  TLS handshake     ~1–2 RTT  (TLS 1.3 often 1 RTT)
-  HTTP request      ~1 RTT
-  ─────────────────────────────
-  Total before first byte: often 3–5 RTTs on a new connection
+  DNS lookup                 (nếu miss)
+  TCP handshake              1 RTT cho H1/H2
+  TLS 1.3 full handshake     thường 1 RTT trên TCP
+  HTTP request + server work + first response byte
+
+  Hoặc: QUIC + TLS 1.3 cho HTTP/3 (không có TCP riêng)
 ```
 
-**Keep-alive** tái dùng cùng kết nối TCP+TLS cho nhiều request. Loại bỏ handshake lặp cho tài nguyên tiếp theo cùng origin.
+Kết nối persistent tái dùng transport/TLS cho nhiều request và có thể coalesce cho origin khác khi đủ điều kiện. DNS, resumption, server think time và congestion đều ảnh hưởng TTFB; số mili giây cố định không có ý nghĩa nếu chưa biết RTT/workload.
 
 ### Hạn chế HTTP/1.1
 
-HTTP/1.1 chỉ **một request đang bay trên mỗi kết nối** (pipelining gần như bỏ). Trình duyệt mở **~6 kết nối song song mỗi origin** — nhưng mỗi kết nối vẫn **head-of-line blocking**: response lớn chậm chặn cái tiếp theo trên cùng kết nối.
+Browser phổ biến không dùng HTTP/1.1 pipelining, nên thường chỉ có một response active theo thứ tự trên mỗi connection và mở một pool nhỏ connection song song. Giới hạn (hay gặp khoảng 6) là implementation detail, không phải contract. Request/response chậm trên một connection giữ request sau của connection đó.
 
 ---
 
@@ -142,37 +142,34 @@ Conn 3: [img................]
 ...
 ```
 
-Server **push** (tính năng HTTP/2 sớm) gần như lỗi thời — link **`preload`** cho developer kiểm soát tường minh.
+Server Push vẫn có trong protocol nhưng Chrome đã bỏ HTTP/2 Push; nhiều deployment ưu tiên `preload`/103 Early Hints vì cache và ưu tiên dễ kiểm soát hơn. Đừng bật push chỉ vì HTTP/2 hỗ trợ nó.
 
 ### HTTP/3 (QUIC)
 
 HTTP/3 chạy trên **QUIC** (dựa UDP) thay TCP. Lợi ích chính:
 
-- **0-RTT resume** khi quay lại (có ràng buộc replay).
+- **0-RTT early data** có thể dùng khi resume và server chấp nhận (phải xử lý replay risk).
 - **Stream độc lập** — mất gói trên một stream không chặn stream khác (sửa **head-of-line blocking tầng transport** mà HTTP/2 vẫn có trên TCP).
 - **Migration kết nối** — sống sót đổi IP/mạng (handoff mobile).
 
-Hầu hết site hôm nay nói HTTP/2 hoặc HTTP/3 tự động khi server và CDN hỗ trợ — việc của bạn là **tránh ép HTTP/1.1** qua proxy cấu hình sai.
+HTTP/3 semantics được chuẩn hóa trong [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114.html). Browser tự negotiate protocol mà server/CDN quảng bá và có thể fallback về TCP khi QUIC/UDP không dùng được; application code không nên giả định một version cụ thể.
 
 ---
 
 ## 6. Ưu tiên request và thứ tự tài nguyên
 
-Không phải mọi byte đều gấp như nhau. Trình duyệt gán **priority** để tài nguyên quan trọng đến trước:
+Không phải mọi byte đều gấp như nhau. Browser gán **priority heuristic** từ destination, parser state, viewport, `async`/`defer`, preload và hint. Giá trị đổi theo engine/phiên bản và còn có thể được boost sau discovery:
 
-| Loại tài nguyên | Ưu tiên điển hình |
+| Tín hiệu | Hệ quả thường gặp |
 |---------------|-------------------------------------|
-| HTML document | Cao nhất — mở khóa phát hiện mọi thứ khác |
-| Render-blocking CSS | Cao |
-| Sync / `async=false` scripts | Cao đến trung bình (chặn parser) |
-| Fonts (via `@font-face`) | Cao — chữ có thể invisible đến khi nạp |
-| Images in viewport | Trung bình |
-| `async` / `defer` scripts | Thấp hơn |
-| Prefetch / low-priority hints | Thấp nhất |
+| Main document, blocking CSS/script | Ưu tiên cao vì mở khóa parsing/rendering |
+| Ảnh được xác định trong viewport/LCP candidate | Có thể được boost sau layout hoặc nhờ `fetchpriority="high"` |
+| Font | Chỉ được discover khi CSSOM biết rule được dùng; preload có thể kéo discovery sớm |
+| `prefetch`, lazy resource, `fetchpriority="low"` | Thường thấp hơn critical resource |
 
-Trong HTTP/2 và HTTP/3, tín hiệu priority (**extensible priorities**, thay cây dependency HTTP/2 cũ) báo server và CDN stream nào lên lịch trước. Ảnh khổng lồ ưu tiên sai vẫn có thể trễ CSS nếu server bỏ qua priority — lý do thêm để resize và lazy-load ảnh.
+Trong HTTP/2 và HTTP/3, browser có thể truyền tín hiệu **extensible priority** để server/CDN biết stream nào nên lên lịch trước. Server có thể bỏ qua hint; asset lớn vẫn tranh congestion window/băng thông với CSS — lý do thêm để resize và lazy-load ảnh.
 
-Thuộc tính **`fetchpriority`** cho phép đẩy heuristic trình duyệt:
+Thuộc tính **`fetchpriority`** chỉ là hint tăng/giảm so với heuristic, không ép thứ tự và không biến ảnh không cần thiết thành critical:
 
 ```html
 <img src="hero.webp" fetchpriority="high" alt="..." />
@@ -188,13 +185,13 @@ Thuộc tính **`fetchpriority`** cho phép đẩy heuristic trình duyệt:
 | Hint | Khi dùng |
 |------|---------------------|
 | **`dns-prefetch`** | Resolve DNS cho origin sắp cần (rẻ) |
-| **`preconnect`** | DNS + TCP + TLS tới origin sắp gọi (font, API, CDN) |
+| **`preconnect`** | DNS + thiết lập transport/TLS tới origin sắp gọi (font, API, CDN) |
 | **`preload`** | Fetch sớm tài nguyên **trang hiện tại** quan trọng |
 | **`prefetch`** | Fetch ưu tiên thấp tài nguyên **navigation tiếp theo có thể** |
-| **`modulepreload`** | Như preload nhưng cho ES module (graph dependency) |
+| **`modulepreload`** | Fetch/parse/compile module sớm; dependency graph có thể được fetch thêm tùy implementation |
 
 ```html
-<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link rel="preload" href="/fonts/inter.woff2" as="font" type="font/woff2" crossorigin />
 <link rel="prefetch" href="/dashboard" />
 ```
@@ -205,7 +202,7 @@ Dùng hint có chọn lọc — mỗi `preload` tranh băng thông với tài ng
 
 ## 8. Service Worker: proxy mạng lập trình được (xem trước)
 
-**Service Worker** là script nằm giữa trang và mạng, chặn sự kiện `fetch`. Nó có thể chiến lược HTTP cache không làm được: offline fallback, stale-while-revalidate tùy chỉnh, background sync.
+**Service Worker** là script nằm giữa page và network fetch, xử lý sự kiện `fetch` khi đang control client. Nó có thể thực hiện chiến lược HTTP cache tự động không biểu đạt được: offline fallback hay stale-while-revalidate tùy chỉnh. Background Sync là capability worker khác, không phải cache strategy.
 
 ```text
 fetch() in page
@@ -225,10 +222,10 @@ Service Worker cũng dùng **Cache API** (Phần 10) — kho `Request`/`Response
 ## Tóm tắt
 
 - **Network service** xử lý mọi I/O; renderer yêu cầu tài nguyên qua **IPC**.
-- **Memory cache** (nhanh, theo tab) và **disk cache** (bền) tránh hit mạng; DevTools hiện `(memory cache)` / `(disk cache)`.
+- HTTP cache có backend memory/disk và Blink còn resource cache nội bộ; scope/lifetime không được chuẩn hóa. Cache API là lớp app điều khiển riêng.
 - **`Cache-Control`**, **`ETag`**, và **`Last-Modified`** điều khiển độ tươi và revalidation **304**.
-- Tái dùng kết nối qua **keep-alive**; HTTP/2 **multiplex** stream; HTTP/3 trên **QUIC** bỏ head-of-line blocking transport.
+- Tái dùng kết nối; HTTP/2 multiplex stream nhưng cùng chịu TCP loss, còn HTTP/3 trên QUIC cô lập packet loss giữa stream.
 - Trình duyệt **ưu tiên** tài nguyên quan trọng; dùng **`fetchpriority`** và resource hint (`preconnect`, `preload`, `prefetch`) có chủ đích.
 - **Service Worker** thêm lớp lập trình trên HTTP cache — chi tiết ở Phần 10.
 
-**Phần tiếp theo:** Storage & the platform — cookie, Web Storage, IndexedDB, Cache API, và cách origin phân vùng dữ liệu phía client.
+**Phần tiếp theo:** Storage & the platform — cookie, Web Storage, IndexedDB, Cache API, cùng scope và partition key khác nhau của chúng.

@@ -2,41 +2,40 @@
 title: 'How Browsers Work · Part 14 — Scrolling Internals'
 description: 'Vì sao cuộn thường mượt kể cả khi JS bận: compositor scrolling, main-thread scrolling, passive listeners, scroll anchoring, và cơ chế của scroll-linked effects.'
 pubDate: 2026-10-31
-tags: [browser, internals, scrolling, performance, browser_internals_12]
+tags: [browser, internals, scrolling, performance, browser_internals_22]
 series: browser-internals
 seriesOrder: 14
-draft: true
 ---
 
-Cuộn là tương tác phổ biến nhất trên web, và nó là minh hoạ hoàn hảo cho kiến trúc đa luồng từ Phần 13. Câu hỏi trung tâm: vì sao trang vẫn cuộn mượt ngay cả khi luồng chính đang kẹt chạy JS? Câu trả lời nằm ở chỗ cuộn — như transform/opacity — có thể sống hoàn toàn trên **compositor thread**.
+Cuộn là tương tác phổ biến nhất trên web, và nó là minh hoạ hoàn hảo cho kiến trúc đa luồng từ Phần 13. Câu hỏi trung tâm: vì sao nhiều trang vẫn cuộn được khi luồng chính đang kẹt chạy JS? Vì engine có một **compositor scrolling fast path** — miễn là input, hit testing và nội dung không buộc nó chờ main thread.
 
 ---
 
 ## 1. Compositor scrolling (đường nhanh)
 
-Mặc định, cuộn là **fast path**: compositor thread xử lý trực tiếp, không cần luồng chính.
+Trong Chromium, nhiều thao tác cuộn đi theo **fast path**: compositor xử lý offset và tạo khung mới mà không chờ Blink/main thread ở từng frame.
 
 ```text
 Người dùng lăn chuột
       │
       ▼
-Compositor thread ── dịch chuyển layer/tile sẵn có ──► GPU composite ──► màn hình
-(luồng chính có thể đang bận chạy JS — không ảnh hưởng)
+Compositor thread ── dịch chuyển layer/tile sẵn có ──► composite ──► màn hình
+(không phải chờ luồng chính ở từng frame trên fast path)
 ```
 
-Compositor đã có sẵn các tile đã raster của trang. Cuộn chỉ là đổi **offset** rồi ghép lại — y hệt animate transform. Vì thế cuộn mượt 60/120fps độc lập với JS. Khi cuộn tới vùng chưa raster, compositor giao tile mới cho raster threads (đôi khi thấy checkerboard nếu không kịp — Phần 13).
+Nếu tile đã raster sẵn, cuộn chủ yếu là đổi **scroll offset** rồi composite lại. Luồng chính bận vì thế không nhất thiết chặn chuyển động đang đi trên fast path. Nhưng tile mới chưa sẵn sàng, event cần main thread, hay áp lực GPU vẫn có thể làm trễ/rớt frame (Phần 13).
 
 ---
 
 ## 2. Main-thread scrolling (đường chậm)
 
-Có những thứ buộc cuộn rớt về **luồng chính** — gọi là *main-thread scrolling*. Khi đó mỗi khung cuộn phải đợi luồng chính, nên JS nặng làm cuộn giật.
+Có những vùng hoặc pha input buộc browser đồng bộ với **luồng chính**. Khi đó độ trễ của JS có thể đi thẳng vào độ trễ bắt đầu cuộn hoặc cập nhật hiệu ứng.
 
 Nguyên nhân thường gặp:
 
-- **Non-passive `wheel`/`touchstart` listener**: trình duyệt phải hỏi luồng chính "bạn có gọi `preventDefault()` không?" *trước khi* cuộn → không thể cuộn trên compositor.
-- `background-attachment: fixed` (phải vẽ lại khi cuộn).
-- Một số hiệu ứng phụ thuộc vị trí cuộn cần luồng chính.
+- **Blocking `wheel`/`touchstart`/`touchmove` listener**: trình duyệt phải hỏi luồng chính "bạn có gọi `preventDefault()` không?" trước khi thực hiện default scroll.
+- Gesture tuỳ biến cần hit testing/xử lý input trên main thread.
+- Hiệu ứng JS đọc vị trí cuộn rồi cập nhật DOM mỗi frame: bản thân scroll có thể vẫn async, nhưng effect phụ thuộc main thread và dễ lệch nhịp.
 
 ```text
 wheel listener KHÔNG passive
@@ -60,7 +59,7 @@ window.addEventListener('wheel', onWheel, { passive: true });
 window.addEventListener('touchstart', onTouch, { passive: true });
 ```
 
-Trình duyệt hiện đại mặc định `passive: true` cho `wheel`/`touchstart`/`touchmove` ở cấp document để bảo vệ hiệu năng cuộn. Nếu bạn *thật sự* cần chặn (vd vẽ canvas, custom gesture), khai báo `{ passive: false }` — nhưng hiểu rằng nó đẩy cuộn về luồng chính.
+Đừng dựa vào default giữa mọi browser/target. Cụ thể, Chromium coi `wheel`/`mousewheel` trên root targets (`window`, `document`, `body`) là passive mặc định, và có intervention tương tự cho touch listeners ở root. Khai báo `{ passive: true }` vẫn làm ý định rõ ràng. Nếu thật sự cần huỷ default gesture, dùng `{ passive: false }` có chủ đích và cân nhắc `touch-action` để mô tả gesture bằng CSS.
 
 > Gọi `preventDefault()` trong một passive listener sẽ bị bỏ qua và cảnh báo trong console.
 
@@ -82,41 +81,42 @@ Tắt khi cần bằng `overflow-anchor: none`. Lưu ý: scroll anchoring giảm
 
 ## 5. Scroll-linked effects — làm đúng cách
 
-"Scroll-linked effect" là hiệu ứng chạy theo vị trí cuộn (parallax, thanh tiến trình đọc, header thu nhỏ). Làm sai (đọc `scrollY` trong listener rồi set style) gây giật vì:
+"Scroll-linked effect" là hiệu ứng chạy theo vị trí cuộn (parallax, thanh tiến trình đọc, header thu nhỏ). Cách JS truyền thống dễ giật vì:
 
-1. Listener chạy trên luồng chính (đẩy cuộn về đường chậm nếu non-passive).
-2. Đọc `scrollY` rồi ghi style → forced reflow (Phần 5).
+1. `scroll` event và code cập nhật DOM chạy trên luồng chính, trong khi scroll có thể đã tiến lên bất đồng bộ.
+2. Work nặng hoặc đọc/ghi layout xen kẽ trong handler làm effect trễ frame. Riêng đọc `scrollY` rồi ghi `transform` **không tự động** đồng nghĩa forced reflow.
 
-**Cách cũ (dễ giật):**
+**Cách JS (vẫn phụ thuộc main thread):**
 
 ```js
 window.addEventListener('scroll', () => {
   const y = window.scrollY;          // đọc
-  el.style.transform = `translateY(${y * 0.5}px)`; // ghi → có thể reflow
+  el.style.transform = `translateY(${y * 0.5}px)`; // vẫn là main-thread work
 });
 ```
 
-**Cách mới — scroll-driven animations (CSS, chạy off-main-thread):**
+**Cách khai báo — scroll-driven animations:**
 
 ```css
-/* Hiệu ứng gắn thẳng vào tiến trình cuộn, compositor lo — không cần JS */
+/* Engine gắn animation timeline trực tiếp với scroll progress */
 .progress {
   animation: grow linear;
   animation-timeline: scroll(root block);
+  transform-origin: left;
 }
 @keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
 ```
 
-`animation-timeline: scroll()` / `view()` cho phép trình duyệt chạy hiệu ứng theo cuộn ở tầng compositor, không round-trip luồng chính. Nếu buộc dùng JS, dùng `IntersectionObserver` (cho mốc xuất hiện) hoặc đọc trong `requestAnimationFrame` thay vì trong scroll listener.
+`animation-timeline: scroll()` / `view()` cho phép engine đồng bộ effect với scroll mà không cần listener JS; trong Chromium, animation của property compositor-friendly như `transform`/`opacity` có thể chạy off-main-thread. Điều này vẫn phụ thuộc property, engine và support hiện tại. Nếu buộc dùng JS, dùng `IntersectionObserver` cho mốc xuất hiện, giữ input listener passive khi có thể, và gom cập nhật vào `requestAnimationFrame`; rAF vẫn chạy trên main thread nên callback phải ngắn.
 
 ---
 
 ## 6. Tóm tắt
 
-- Cuộn mặc định là **fast path** trên compositor thread: chỉ đổi offset rồi composite, mượt độc lập với JS bận.
-- **Main-thread scrolling** (đường chậm) bị kích hoạt bởi non-passive `wheel`/`touch` listener, `background-attachment: fixed`,… → cuộn phụ thuộc luồng chính.
-- **Passive listeners** (`{ passive: true }`) hứa không `preventDefault()`, mở khoá cuộn off-main-thread; trình duyệt mặc định passive cho touch/wheel ở document.
+- Nhiều thao tác cuộn đi theo **compositor fast path**: đổi offset và composite mà không chờ main thread ở từng frame; không có bảo đảm tuyệt đối về FPS.
+- Blocking `wheel`/`touch` listener làm browser phải hỏi main thread trước default scroll; effect JS vẫn có thể giật dù bản thân scroll là async.
+- **Passive listeners** (`{ passive: true }`) hứa không `preventDefault()`; default passive chỉ áp dụng cho một số event/target/engine, nên khai báo rõ ý định.
 - **Scroll anchoring** giữ vị trí đọc khi nội dung phía trên đổi chiều cao; tắt bằng `overflow-anchor: none`.
-- **Scroll-linked effects** nên dùng CSS `animation-timeline: scroll()/view()` để chạy off-main-thread; tránh đọc `scrollY` + ghi style trong scroll listener (forced reflow + giật).
+- **Scroll-driven animations** loại bỏ listener JS; `transform`/`opacity` có thể chạy off-main-thread. Với JS fallback, gom cập nhật vào rAF, giữ input listener passive khi phù hợp và tránh đọc/ghi layout xen kẽ.
 
-**Phần tiếp theo:** Rendering scheduling & frame lifecycle — chính xác điều gì xảy ra trong một khung 16.6ms, thứ tự `requestAnimationFrame`/style/layout/paint, và cách `content-visibility` cùng `requestIdleCallback` xếp việc vào đúng khe thời gian.
+**Phần tiếp theo:** Rendering scheduling & frame lifecycle — cơ hội update rendering phối hợp `requestAnimationFrame`, style/layout, observers và paint ra sao; `content-visibility` cùng Scheduler API giúp giảm việc thế nào.

@@ -1,39 +1,39 @@
 ---
 title: 'How Browsers Work · Part 16 — V8 Deep: Optimization Tiers & Deopt'
-description: 'Bên trong máy ảo JS: Ignition, Sparkplug, Maglev, TurboFan, hidden class, inline cache (mono/poly/megamorphic), và vì sao code "ổn định kiểu" chạy nhanh hơn nhiều.'
+description: 'Bên trong máy ảo JS: Ignition, Sparkplug, Maglev, TurboFan, hidden class, inline cache, elements kind và deoptimization — cùng cách đọc chúng mà không tối ưu mò.'
 pubDate: 2026-11-04
-tags: [browser, internals, v8, javascript, browser_internals_12]
+tags: [browser, internals, v8, javascript, browser_internals_22]
 series: browser-internals
 seriesOrder: 16
-draft: true
 ---
 
 Phần 6 cho ta bức tranh tổng thể V8: parse → bytecode → JIT. Phần này mở nắp động cơ. JavaScript là ngôn ngữ động — không khai báo kiểu — nhưng V8 chạy nó gần tốc độ máy bằng cách *suy đoán* kiểu rồi biên dịch tối ưu, và *huỷ* tối ưu khi suy đoán sai. Hiểu cơ chế này giải thích nhiều "mẹo hiệu năng" tưởng huyền bí.
 
 ---
 
-## 1. Bốn tầng thực thi
+## 1. Các tầng thực thi
 
-V8 không biên dịch tối ưu ngay — vì hầu hết code chỉ chạy một lần. Nó dùng kiến trúc **tiered**: bắt đầu nhanh-để-khởi-động, rồi tối ưu dần code "nóng".
+V8 không biên dịch tối ưu mọi code ngay. Nó dùng kiến trúc **tiered**: bắt đầu với chi phí khởi động thấp, thu thập feedback, rồi chọn tier phù hợp cho code "nóng". Sơ đồ dưới là đường đi phổ biến, không phải state machine mà mọi hàm bắt buộc đi qua đủ bốn tầng.
 
 ```text
 Source ─► Parse ─► Bytecode
-                     │
-        ┌────────────┴───────────────────────────────┐
-        ▼                                             │ "nóng" dần
-  Ignition (interpreter)   ─► chạy bytecode, thu thập type feedback
-        │ chạy nhiều lần
+                     │ feedback + tiering decisions
+                     ▼
+  Ignition (interpreter)   ─► chạy bytecode, thu thập feedback
+        │ có thể tier-up / OSR khi đủ nóng
         ▼
-  Sparkplug (baseline JIT)  ─► máy mã không tối ưu, biên dịch siêu nhanh
+  Sparkplug (baseline JIT)  ─► mã máy chưa tối ưu, biên dịch nhanh
         │ nóng hơn
         ▼
   Maglev (mid-tier JIT)     ─► tối ưu vừa, biên dịch nhanh
         │ rất nóng
         ▼
-  TurboFan (optimizing JIT) ─► tối ưu tối đa, biên dịch chậm
+  TurboFan (optimizing JIT) ─► hướng tới peak performance, compile đắt hơn
 ```
 
-Mỗi tầng đánh đổi *thời gian biên dịch* lấy *tốc độ chạy*. Hàm chạy một lần ở Ignition là đủ; vòng lặp triệu lần leo tới TurboFan. Triết lý: chỉ trả giá tối ưu cho code thật sự đáng.
+Mỗi tầng đánh đổi *thời gian biên dịch* lấy *tốc độ chạy*. Hàm chạy ít có thể ở Ignition/Sparkplug; code đủ nóng và tối ưu được có thể tới Maglev hoặc TurboFan, kể cả **OSR** (thay code khi vòng lặp đang chạy). Ngưỡng tiering và quyết định bỏ qua tier là chi tiết implementation thay đổi theo phiên bản/nền tảng.
+
+Tên tier cũng che một pipeline đang tiến hoá: V8 cho biết toàn bộ JavaScript backend của top-tier TurboFan hiện dùng IR/compiler backend **Turboshaft**, còn các phần frontend tiếp tục được thay đổi. Với developer, "TurboFan" vẫn là nhãn top tier hữu ích; đừng coi sơ đồ thành danh sách component bất biến.
 
 ---
 
@@ -51,39 +51,39 @@ Object cùng "hình dạng" chia sẻ hidden class → V8 truy cập thuộc tí
 
 ```js
 const a = {}; a.x = 1; a.y = 2; // shape {x,y}
-const b = {}; b.y = 2; b.x = 1; // shape {y,x} — KHÁC a!  ✗ làm chậm
+const b = {}; b.y = 2; b.x = 1; // shape {y,x} — khác a
 ```
 
-> Quy tắc: khởi tạo object với cùng tập thuộc tính, cùng thứ tự (lý tưởng là trong constructor/literal). Tránh `delete` thuộc tính (chuyển object sang chế độ "dictionary" chậm).
+> Trong code nóng, khởi tạo object cùng tập thuộc tính/cùng thứ tự giúp chia sẻ Map. Thêm/xoá nhiều property có thể làm V8 chọn dictionary properties, vốn ít cơ hội tối ưu hơn. Đây là gợi ý để kiểm chứng bằng benchmark/profile, không phải lý do bẻ API sạch thành code khó đọc.
 
 ---
 
 ## 3. Inline cache — mono, poly, megamorphic
 
-Khi code đọc `obj.x`, V8 ghi nhớ tại điểm gọi đó nó đã gặp hidden class nào — gọi là **inline cache (IC)**. Lần sau cùng shape → truy cập tức thì.
+Khi code đọc `obj.x`, V8 lưu feedback tại access site về những Map đã gặp — nền của **inline cache (IC)**. Lần sau cùng shape, engine có thể đi qua fast path chuyên biệt.
 
 ```text
 Site đọc obj.x từng gặp:
-  1 shape   → MONOMORPHIC   ⚡ nhanh nhất (đoán chắc chắn)
-  2–4 shapes → POLYMORPHIC   🙂 vẫn ổn (kiểm tra vài shape)
-  >4 shapes  → MEGAMORPHIC   🐢 bỏ IC, tra cứu chung — chậm
+  1 shape          → MONOMORPHIC   (một fast path chuyên biệt)
+  một tập nhỏ      → POLYMORPHIC   (kiểm tra vài shape)
+  rất nhiều shape  → MEGAMORPHIC   (stub/cache tổng quát hơn)
 ```
 
-Hàm xử lý nhiều shape khác nhau qua cùng một điểm gọi trở nên *megamorphic* và mất tối ưu. Đây là lý do thật sự đằng sau lời khuyên "giữ kiểu ổn định": code đơn hình (monomorphic) cho phép IC + JIT inline mạnh nhất.
+Ngưỡng chính xác là chi tiết nội bộ và còn khác theo loại IC. Khi một access site gặp quá nhiều shape, V8 dùng đường megamorphic tổng quát hơn; nó không đơn giản "tắt cache". Shape ổn định thường mở thêm cơ hội inline, nhưng chi phí thực tế phải được đo ở đúng workload.
 
 ---
 
 ## 4. Speculation & deopt — khi suy đoán sai
 
-TurboFan biên dịch dựa trên *giả định* từ type feedback ("`x` luôn là số nhỏ - Smi"). Nếu sau đó giả định sai (truyền vào một object), code tối ưu không còn đúng → V8 **deoptimize**: vứt mã đã tối ưu, nhảy về Ignition/Sparkplug, chạy lại từ trạng thái hiện tại.
+Maglev/TurboFan biên dịch dựa trên *giả định* từ feedback (ví dụ "`x` thường là Smi"). Nếu guard thất bại, V8 **deoptimize**: tái dựng frame/state tương ứng trong tier ít tối ưu hơn rồi tiếp tục với đúng semantics JavaScript. Mã tối ưu có thể được thay thế hoặc tối ưu lại sau đó, tuỳ feedback mới.
 
 ```js
 function add(a, b) { return a + b; }
-for (let i = 0; i < 1e6; i++) add(i, i);  // TurboFan: giả định number
-add('x', 'y');  // ✗ vi phạm giả định → DEOPT
+for (let i = 0; i < 1e6; i++) add(i, i); // feedback chủ yếu là number
+add('x', 'y'); // có thể phá specialization đã tạo; semantics vẫn là "xy"
 ```
 
-Deopt thỉnh thoảng thì ổn. Nhưng **deopt loop** — tối ưu rồi deopt liên tục — là sát thủ hiệu năng. Nguyên nhân thường gặp: hàm nhận lúc number lúc string/object, mảng "lỗ hổng" (holey), đổi shape giữa chừng.
+Deopt thỉnh thoảng là cơ chế bình thường. Việc tối ưu/deopt lặp lại trong hot path mới đáng điều tra; nguyên nhân có thể là input đổi kiểu/shape, assumption về elements kind hoặc guard khác bị phá. V8 cũng có thể ngừng tối ưu một function thay vì lặp vô hạn, nên sơ đồ sau chỉ là failure mode khái niệm.
 
 ```text
 optimize → deopt → optimize → deopt ...   ← lãng phí, chậm hơn cả không tối ưu
@@ -93,45 +93,38 @@ optimize → deopt → optimize → deopt ...   ← lãng phí, chậm hơn cả
 
 ## 5. Elements kind — mảng cũng có "kiểu"
 
-V8 chuyên hoá cả mảng theo nội dung, từ nhanh đến chậm:
+V8 chuyên hoá phần lưu trữ indexed elements. Bản đồ đơn giản hoá:
 
 ```text
-PACKED_SMI    [1, 2, 3]              ⚡ nhanh nhất (số nguyên nhỏ, liền)
-PACKED_DOUBLE [1.5, 2.5]             ⚡
-PACKED_ELEMENTS[1, 'a', {}]          🙂 (kiểu hỗn hợp)
-HOLEY_*       [1, , 3] / a[100]=1    🐢 (có "lỗ" → kiểm tra từng phần tử)
+PACKED_SMI      [1, 2, 3]            (số nguyên nhỏ, liền; chuyên biệt)
+PACKED_DOUBLE   [1.5, 2.5]           (double, liền)
+PACKED_ELEMENTS [1, 'a', {}]         (giá trị tổng quát, liền)
+HOLEY_*         [1, , 3] / a[100]=1  (có "lỗ" → cần thêm kiểm tra)
 ```
 
-Mảng chỉ leo *xuống* (general hơn), không leo lại lên. Vì vậy: đừng tạo lỗ (`arr[100] = x` khi `arr.length` là 5), đừng trộn kiểu trong mảng số nóng, ưu tiên `push` thay vì gán index thưa.
+Elements kind thường chuyển theo hướng tổng quát hơn; từ 2025, V8 có ngoại lệ cho `Array.prototype.fill`, nên câu "không bao giờ đi ngược" không còn tuyệt đối. Quy tắc thực dụng vẫn là tránh vô tình tạo mảng thưa (`arr[100] = x` khi length là 5) trong hot path, và đừng tối ưu loại phần tử nếu profiler chưa cho thấy nó đáng kể.
 
 ---
 
 ## 6. Đọc tín hiệu tối ưu (khi cần)
 
-Bạn hiếm khi cần, nhưng khi điều tra có thể bật cờ V8 (qua Node hoặc Chrome) để xem trạng thái tối ưu:
+Bạn hiếm khi cần, nhưng benchmark Node cô lập có thể bật cờ V8 để xem tiering/deopt:
 
 ```bash
-node --trace-opt --trace-deopt app.js   # in mỗi lần optimize / deopt
-node --allow-natives-syntax app.js       # mở các hàm %... nội bộ
+node --trace-opt --trace-deopt benchmark.js
+node --trace-deopt-verbose benchmark.js
 ```
 
-```js
-// với --allow-natives-syntax (chỉ để debug, không bao giờ dùng trong production)
-%OptimizeFunctionOnNextCall(add);
-console.log(%GetOptimizationStatus(add));
-```
-
-Trong DevTools, tab **Performance** cho thấy thời gian "Compile" / "Optimize"; gai deopt liên tục thường lộ ra ở hàm nóng.
+Output và tên reason là chi tiết phiên bản. Tránh `%OptimizeFunctionOnNextCall`/`--allow-natives-syntax` trong code ứng dụng: intrinsics không phải API ổn định và có thể làm benchmark xa production. DevTools **Performance** vẫn giúp tìm function thật sự tốn CPU, nhưng các bản Chrome mới đã giảm/ẩn nhiều compile events; đừng suy ra deopt chỉ từ màu flame chart.
 
 ---
 
 ## 7. Tóm tắt
 
-- V8 dùng kiến trúc **tiered**: Ignition (interpreter) → Sparkplug → Maglev → TurboFan, đánh đổi thời gian biên dịch lấy tốc độ chạy cho code nóng.
-- **Hidden class (Map/Shape)** cho phép truy cập thuộc tính bằng offset; giữ object cùng tập thuộc tính, cùng thứ tự, tránh `delete`.
-- **Inline cache**: monomorphic (1 shape) nhanh nhất, megamorphic (>4 shapes) mất tối ưu — đây là lý do thật của "giữ kiểu ổn định".
-- **Deopt** xảy ra khi suy đoán sai; deopt thỉnh thoảng thì ổn, **deopt loop** thì rất chậm.
-- Mảng có **elements kind** (PACKED_SMI nhanh → HOLEY chậm); tránh tạo lỗ và trộn kiểu trong mảng nóng.
-- Debug bằng `--trace-opt/--trace-deopt` hoặc tab Performance khi thật cần — đừng tối ưu mò.
+- V8 có các tier Ignition, Sparkplug, Maglev và TurboFan; đường đi/ngưỡng không cố định và OSR có thể thay code khi đang chạy.
+- **Hidden class (Map/Shape)** và inline cache giúp chuyên hoá property access; dictionary/megamorphic path tổng quát hơn nhưng không đồng nghĩa "mất cache hoàn toàn".
+- **Deopt** tái dựng state đúng khi giả định speculative sai; nó bình thường trừ khi profile cho thấy churn trong hot path.
+- Mảng có **elements kind**; packed thường dễ tối ưu hơn holey, nhưng lattice có ngoại lệ hiện đại như `Array.prototype.fill`.
+- Tìm hotspot bằng profiler trước; dùng `--trace-opt/--trace-deopt` trong benchmark cô lập khi thật cần, không xây production quanh V8 intrinsics.
 
-**Phần tiếp theo:** Memory deep — heap snapshot, ba loại view, săn rò rỉ với detached DOM, Oilpan GC, và `WeakRef`/`FinalizationRegistry`/`measureUserAgentSpecificMemory`.
+**Phần tiếp theo:** Memory deep — heap snapshot/Comparison, retainer path, detached DOM, Oilpan GC và giới hạn của weak references cùng memory measurement API.

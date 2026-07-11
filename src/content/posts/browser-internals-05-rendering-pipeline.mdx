@@ -1,23 +1,22 @@
 ---
 title: 'How Browsers Work · Part 5 — Layout, Paint & Compositing'
-description: 'The pixel pipeline: how the render tree becomes geometry (layout/reflow), then paint instructions, then GPU-composited layers — and exactly which CSS changes trigger layout, paint, or only compositing.'
+description: 'The pixel pipeline: how styled DOM becomes layout geometry, paint records, raster tiles and compositor frames — why invalidation and animation cost depend on context.'
 pubDate: 2026-10-13
-tags: [browser, internals, rendering, layout, compositing, browser_internals_12]
+tags: [browser, internals, rendering, layout, compositing, browser_internals_22]
 series: browser-internals
 seriesOrder: 5
-draft: true
 ---
 
-Phần 1–4 đã dựng đầu vào: DOM, CSSOM, và **render tree** gộp chúng lại. Phần này là lúc các cây đó trở thành **pixel trên màn hình** — pipeline render mà mọi thay đổi CSS và mọi animation đi qua.
+Phần 1–4 đã dựng đầu vào: DOM, stylesheet, computed style và **layout tree**. Phần này là lúc chúng trở thành **pixel trên màn hình**. Không phải mọi update đi qua mọi stage: engine giữ kết quả cũ và chỉ chạy lại phần đã bị invalidate.
 
-Nếu bạn nhớ một điều từ Phần 1: **luồng chính** làm phần lớn việc này, còn **luồng compositor** có thể di chuyển layer đã raster hóa độc lập. Sự tách đó là lý do một số thuộc tính CSS animate rẻ còn số khác làm trang giật.
+Nếu bạn nhớ một điều từ Phần 1: **main thread** làm style/layout và ghi paint record, còn compositor/raster thread có thể chuẩn bị frame từ nội dung đã ghi. Sự tách đó cho phép một số animation đủ điều kiện tiếp tục khi main thread bận — nhưng không bảo đảm frame sẽ luôn rẻ hay mượt.
 
 ```text
-Render tree (from Parts 3–4)
+DOM + stylesheets (from Parts 3–4)
         │
         ▼
    ┌─────────┐
-   │  Style  │  recalc computed values (CSS cascade + inheritance)
+   │  Style  │  recalc affected computed values
    └────┬────┘
         ▼
    ┌─────────┐
@@ -25,23 +24,33 @@ Render tree (from Parts 3–4)
    └────┬────┘
         ▼
    ┌─────────┐
-   │  Paint  │  record draw ops into display lists / paint layers
+   │Pre-paint│  property trees, clipping, invalidation
+   └────┬────┘
+        ▼
+   ┌─────────┐
+   │  Paint  │  record draw ops / paint chunks
+   └────┬────┘
+        ▼
+   ┌─────────┐
+   │ Raster  │  paint records → tiles/pixels
    └────┬────┘
         ▼
    ┌─────────────┐
-   │ Compositing │  GPU assembles layers → screen
+   │ Compositing │  assemble compositor frame → display
    └─────────────┘
 ```
+
+Đây là bản rút gọn của [RenderingNG pipeline](https://developer.chrome.com/docs/chromium/renderingng); Phần 13 sẽ tách sâu raster, tile, Viz và GPU process.
 
 ---
 
 ## 1. Tính lại style
 
-Trước khi tính hình học, trình duyệt phải resolve **computed style** cho mọi node hiển thị trong render tree. Đây là giai đoạn **style**: duyệt render tree, áp cascade, kế thừa giá trị, và tạo tập thuộc tính cuối cùng mỗi box sẽ dùng.
+Trước khi tính hình học, browser resolve **computed style** cho node bị ảnh hưởng: áp cascade, inheritance/defaulting và cập nhật layout object nếu `display` hay cấu trúc box thay đổi.
 
 Style recalc được kích hoạt khi:
 
-- Quy tắc CSS thay đổi (toggle class, inline style, nạp stylesheet).
+- Rule/style input thay đổi (toggle class, đổi attribute/style, nạp stylesheet).
 - Cấu trúc DOM thay đổi theo cách ảnh hưởng selector (node mới, đổi attribute khớp selector).
 - Thuộc tính kế thừa thay đổi trên tổ tiên.
 
@@ -51,9 +60,9 @@ Style recalc một mình **không** luôn kéo theo layout — đổi `color` ha
 
 ## 2. Layout (reflow): tính hình học
 
-**Layout** — còn gọi **reflow** — là giai đoạn trình duyệt biến box đã styled thành hình học cụ thể: width, height, vị trí, ngắt dòng, phạm vi scroll. Với block có `width: 50%`, layout resolve phần trăm đó theo content width của cha; với chữ, nó ngắt dòng và đo glyph.
+**Layout** — còn gọi **reflow** trong nhiều tài liệu — biến box đã style thành fragment/hình học cụ thể: width, height, vị trí, ngắt dòng, scroll extent. Với block có `width: 50%`, layout resolve phần trăm theo containing block; với chữ, nó shape text và tạo line box.
 
-Layout **gần như toàn cục** và **tốn kém**. Đổi width một phần tử có thể buộc trình duyệt layout lại anh em, tổ tiên, và đôi khi hậu duệ — hiệu ứng "layout lan truyền" kinh điển. Đó là lý do layout là giai đoạn bạn muốn tránh trên đường nóng như scroll handler hay khung animation.
+Layout hiện đại là **incremental**, nhưng dependency hình học có thể làm thay đổi lan sang ancestor, sibling hay descendant. Một lượt layout nhỏ không nhất thiết đắt; vấn đề là phạm vi lớn hoặc lặp đồng bộ nhiều lần trong cùng task. Containment có thể thu hẹp dependency trong use case phù hợp.
 
 Các thuộc tính thường kích hoạt layout gồm:
 
@@ -62,7 +71,7 @@ Các thuộc tính thường kích hoạt layout gồm:
 - **Luồng**: `display`, `float`, `clear`, thuộc tính con `flex`/`grid` ảnh hưởng kích thước.
 - **Typography**: `font-size`, `font-family`, `line-height`, `text-align` (ảnh hưởng line box).
 
-> Layout đọc render tree và ghi **kết quả layout** — cây hình học được cache mà giai đoạn paint dùng. Nếu bạn đọc thuộc tính layout từ JS (`offsetWidth`, `getBoundingClientRect`) sau khi ghi style, bạn buộc trình duyệt flush việc layout đang chờ đồng bộ.
+> Layout đọc layout tree và ghi **fragment/hình học** được cache cho pre-paint/paint. Nếu bạn đọc geometry từ JS (`offsetWidth`, `getBoundingClientRect`) sau khi ghi làm layout invalid, browser có thể phải flush style/layout đồng bộ để trả kết quả mới nhất.
 
 ---
 
@@ -70,67 +79,67 @@ Các thuộc tính thường kích hoạt layout gồm:
 
 Khi hình học đã rõ, **paint** (đôi khi gọi **repaint**) ghi **cách** mỗi vùng trông ra sao — chưa phải pixel, mà là chuỗi thao tác vẽ: tô hình chữ nhật, vẽ chữ, đổ bóng, clip theo border-radius.
 
-Paint rẻ hơn layout nhưng vẫn tốn CPU, đặc biệt trên subtree lớn hoặc phức tạp. Thuộc tính kích hoạt paint **không** kéo layout gồm:
+Các thay đổi thường không đổi geometry nhưng cần paint record/raster mới gồm:
 
 - `color`, `background`, `background-image`, `background-position`.
 - `box-shadow`, `outline`, `border-color` (khi border width không đổi).
 - `visibility` (nhiều trường hợp chỉ paint; `display: none` bỏ qua cả layout lẫn paint).
 
-Đầu ra paint được lưu trong **display list** gắn với **paint layer** — hãy coi như băng lệnh mà luồng raster sau này biến thành bitmap.
+Không có luật "paint luôn rẻ hơn layout": shadow/blur lớn, text hoặc vùng invalidation rộng có thể tốn đáng kể. Đầu ra là display item/paint chunk cùng property tree — hãy coi như băng lệnh mà raster sau này biến thành tile/pixel.
 
 ---
 
 ## 4. Compositing: layer và GPU
 
-**Compositing** là bước lắp ráp cuối: **luồng compositor** lấy **layer** đã raster hóa (bitmap + metadata) và vẽ theo thứ tự, áp transform và opacity, rồi giao cho tiến trình GPU để hiển thị.
+**Compositing** lắp các quad/surface từ nội dung đã raster thành compositor frame, áp transform, clip, opacity/effect cần thiết rồi gửi qua Viz/display compositor để hiển thị. GPU thường tham gia, nhưng raster/composite có cả đường phần mềm tùy thiết bị và fallback.
 
-Đây là giai đoạn gắn với mô hình luồng ở Phần 1: **thay đổi `transform` và `opacity` thường xử lý hoàn toàn trên luồng compositor**, không cần chạy lại layout hay paint trên luồng chính. Đó là lý do animation `transform: translateX(...)` vẫn mượt khi luồng chính bận — compositor chỉ di chuyển bitmap layer có sẵn.
+Animation `transform`/`opacity` **có thể** cập nhật compositor-only khi nội dung nằm trong composited layer và effect đủ điều kiện. Lần chuẩn bị đầu vẫn có style, paint/raster và layerization; scale lớn, filter, thay nội dung hay thiếu texture có thể gây raster/GPU work. Vì vậy "dùng transform" là điều kiện tốt, không phải giấy bảo hành 60 fps.
 
 ### Khi trình duyệt promote layer
 
-Không phải mọi phần tử đều có compositor layer riêng mặc định. Chromium promote phần tử lên layer riêng khi dự đoán sẽ di chuyển độc lập hoặc cần cô lập, ví dụ:
+Không phải mọi element đều có compositor layer riêng. Chromium layerize paint chunk/surface theo compositing reason và cost model có thể đổi giữa phiên bản, ví dụ:
 
 - `will-change: transform` hoặc `will-change: opacity` (gợi ý; dùng tiết kiệm).
-- Phần tử có transform 3D hoặc animation `opacity`.
-- `<video>`, `<canvas>`, plugin, và một số UI overlay.
+- Animation `transform`/`opacity` đang chạy và đủ điều kiện.
+- `<video>`, canvas tăng tốc, iframe/surface nhúng và một số UI overlay.
 - Phần tử `position: fixed` hoặc `position: sticky` trong một số trường hợp.
-- Anh em chồng lên nhau với stacking context khác nhau.
+- Effect/clip/scrolling cần surface độc lập theo quyết định engine.
 
 ### Bùng nổ layer
 
-Mỗi compositor layer tốn bộ nhớ GPU và thêm chi phí compositing. Promote hàng chục phần tử "phòng hờ" gây **bùng nổ layer** — animation từng cái mượt nhưng tốn RAM hơn và đôi khi hiệu năng tổng thể *tệ hơn*. Ưu tiên thuộc tính thân compositor trên ít phần tử animate thay vì rải `will-change` khắp nơi.
+Layer/surface và tile backing tốn bộ nhớ, upload/raster và chi phí aggregate. Promote hàng loạt phần tử "phòng hờ" có thể làm hiệu năng tổng thể *tệ hơn*. Dùng `will-change` gần thời điểm animation, bỏ khi xong, và xác nhận bằng DevTools thay vì dùng như hack cố định.
 
 ---
 
-## 5. Cái gì kích hoạt cái gì: bảng tra nhanh
+## 5. Cái gì kích hoạt cái gì: heuristic, không phải luật
 
-Mô hình kinh điển (phổ biến từ [csstriggers.com](https://csstriggers.com/)) ánh xạ thuộc tính CSS sang giai đoạn pipeline:
+Không có bảng thuộc tính CSS nào chính xác cho mọi engine, element và frame. Bảng dưới là đường **thường gặp** khi thay đổi giá trị; engine vẫn có thể mở rộng/thu hẹp invalidation hoặc cần layer preparation:
 
 | Thay đổi | Style | Layout | Paint | Composite |
 |--------|:-----:|:------:|:-----:|:---------:|
 | `color`, `background-color` | ✓ | | ✓ | |
 | `width`, `height`, `padding`, `margin` | ✓ | ✓ | ✓ | |
-| `transform` | ✓ | | | ✓ |
-| `opacity` | ✓ | | | ✓ |
+| `transform` | ✓ | | có thể lúc chuẩn bị/raster lại | ✓ |
+| `opacity` | ✓ | | có thể lúc chuẩn bị layer | ✓ |
 | `box-shadow` | ✓ | | ✓ | |
 | `display: none` → block | ✓ | ✓ | ✓ | |
 
-Ba mức chi phí, từ tốn nhất tới rẻ nhất trên luồng chính:
+Quy tắc ra quyết định hữu ích hơn:
 
-1. **Kích hoạt layout** — thay đổi hình học; tránh trong vòng lặp và scroll handler.
-2. **Kích hoạt paint** — thay đổi hình ảnh không đổi hình học; gom khi có thể.
-3. **Chỉ composite** — `transform` và `opacity`; lý tưởng cho animation 60fps.
+1. Thay đổi geometry *có thể* kéo style → layout → pre-paint → paint/raster.
+2. Thay đổi visual không đổi geometry thường bỏ qua layout nhưng vẫn có paint/raster.
+3. Update compositor-only tránh main-thread layout/paint, nhưng vẫn trả chi phí composite/GPU và chỉ xảy ra khi đủ điều kiện.
 
-> Engine hiện đại thông minh hơn bảng tĩnh — containment (`contain: layout paint`), `content-visibility`, và cô lập subtree có thể thu hẹp invalidation. Coi bảng là mặc định đáng tin, không phải luật tuyệt đối.
+> Dùng Performance trace, Paint flashing và Layers/Compositing Reasons để kiểm chứng đường thực tế. Containment (`contain`) và `content-visibility` có thể thu hẹp công việc, nhưng cũng đổi semantics layout/paint nên cần test.
 
 ---
 
 ## 6. Layout thrashing: xen kẽ đọc/ghi
 
-**Layout thrashing** (forced synchronous layout) xảy ra khi JavaScript xen kẽ **ghi** làm layout invalid với **đọc** cần hình học mới nhất. Mỗi lần đọc buộc trình duyệt flush mọi style và layout đang chờ trước khi trả giá trị.
+**Layout thrashing** xảy ra khi JavaScript xen kẽ **ghi** làm layout invalid với **đọc** cần geometry mới nhất. Khi relevant style/layout đang pending, lần đọc có thể buộc browser flush đồng bộ; lặp pattern này tạo nhiều layout nhỏ thay vì một batch.
 
 ```js
-// ❌ BAD — N forced layouts (one per iteration)
+// ❌ BAD — repeated read/write cycles can force repeated layouts
 for (const el of elements) {
   el.style.width = `${container.offsetWidth / elements.length}px`; // read then write, every loop
 }
@@ -142,15 +151,15 @@ for (const el of elements) {
 }
 ```
 
-Mẫu luôn giống nhau: **gom đọc, rồi gom ghi**. Thư viện như FastDOM mã hóa rõ ràng; trong code của bạn, cấu trúc vòng lặp nóng cùng cách.
+Mẫu luôn giống nhau: **gom đọc, rồi gom ghi**. Bạn có thể mã hóa nó bằng queue read/write riêng, nhưng thường chỉ cần tổ chức lại vòng lặp nóng như ví dụ.
 
-Thuộc tính buộc layout khi đọc gồm `offsetWidth`, `offsetHeight`, `clientWidth`, `scrollTop`, `getBoundingClientRect()`, và `getComputedStyle()` (một số trường hợp). Ghi `element.style.*` hoặc toggle class giữa các lần đọc đó là công thức thrashing.
+Các API geometry như `offsetWidth`, `offsetHeight`, `clientWidth` và `getBoundingClientRect()` có thể force style/layout nếu kết quả đang stale; `getComputedStyle()` chỉ force layout trong một số điều kiện/property. Bản thân một read không xấu — chuỗi **write → read → write → read** trong đường nóng mới là thứ cần tìm trong trace.
 
 ---
 
 ## 7. `requestAnimationFrame` và nhịp khung hình
 
-Trình duyệt nhắm ~**60 khung/giây** (một khung ~16,7 ms trên màn 60 Hz). **`requestAnimationFrame`** lên lịch callback chạy **trước lần paint kế tiếp**, khớp nhịp refresh màn hình.
+**`requestAnimationFrame`** lên lịch callback cho rendering opportunity tiếp theo và dùng timestamp cùng nhịp refresh. Trên màn 60 Hz, khoảng giữa hai refresh là ~16,7 ms; màn 120 Hz chỉ còn ~8,3 ms, và browser còn phải chia ngân sách cho input, style/layout, raster và composite.
 
 Một khung điển hình trên luồng chính trông như:
 
@@ -164,16 +173,16 @@ JS (including rAF callbacks)
 
 Dùng `requestAnimationFrame` cho cập nhật visual chạm DOM — không phải `setTimeout(fn, 16)`. `setTimeout` không khớp vsync và có thể bắn giữa các khung, gây việc thừa hoặc bỏ lỡ paint. Với hiệu ứng gắn scroll, ưu tiên CSS (`position: sticky`, scroll-driven animations) hoặc đọc scroll position trong rAF để bám lịch render.
 
-Panel **Performance** của Chrome DevTools hiện Layout, Recalculate Style, và Paint thành track có tên; bật **Rendering → Paint flashing** để xem vùng repaint trực tiếp. Panel **Layers** liệt kê compositor layer và lý do promote từng cái.
+Panel **Performance** của Chrome DevTools hiện Layout, Recalculate Style, Paint và raster/compositor work; bật **Rendering → Paint flashing** để xem vùng repaint. Panel **Layers** và thông tin compositing reason giúp kiểm tra layer, nhưng tên/placement UI có thể đổi giữa phiên bản DevTools.
 
 ---
 
 ## Tóm tắt
 
-- Pipeline pixel là **Style → Layout → Paint → Compositing**; mỗi giai đoạn thường bỏ qua được nếu thay đổi không invalid nó.
-- **Layout (reflow)** tính hình học và là giai đoạn tốn nhất trên luồng chính; thuộc tính CSS hình học kích hoạt nó.
-- **Paint** ghi lệnh vẽ cho thay đổi visual không đổi hình học; **compositing** lắp layer GPU.
-- **`transform` và `opacity`** thân compositor; promote layer giúp animation nhưng **bùng nổ layer** lãng phí RAM GPU.
+- Pipeline rút gọn là **Style → Layout → Pre-paint → Paint → Raster → Compositing**; stage không bị invalidate có thể được bỏ qua.
+- Layout tính geometry theo dependency; nó không luôn toàn cục hay luôn đắt nhất, nhưng repeated forced layout là pattern nguy hiểm.
+- Paint ghi lệnh, raster biến chúng thành tile/pixel, compositing lắp frame; GPU không biến mọi công việc thành "miễn phí".
+- `transform` và `opacity` có thể compositor-only khi đủ điều kiện; layer quá nhiều lại tốn memory/raster/composite.
 - Tránh **layout thrashing** bằng cách gom đọc DOM trước khi ghi; dùng **`requestAnimationFrame`** cho cập nhật visual bằng JS.
 
 **Phần tiếp theo:** JavaScript engine (V8) — parsing, bytecode, JIT tối ưu, hidden class, và vì sao JS theo idiom lại nhanh.

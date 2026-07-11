@@ -1,0 +1,119 @@
+---
+title: 'TypeScript Production · Phần 6 — Errors, Async & Concurrency Contracts'
+description: 'Thiết kế lỗi và async flow có kiểu: unknown catch, Result, AbortSignal, timeout, retry, Promise concurrency và idempotency thay vì Promise<any>.'
+pubDate: 2026-06-29
+lang: vi
+tags: [typescript, async, error-handling, resilience]
+series: typescript
+seriesOrder: 6
+draft: false
+---
+
+`Promise<User>` chỉ nói happy path. Production contract còn phải nói về cancel, timeout, retry, partial failure và side effect lặp lại.
+
+## Catch variable phải là `unknown`
+
+JavaScript cho phép `throw 'nope'`, `throw 42`, hoặc reject bất kỳ giá trị nào.
+
+```ts
+function toError(value: unknown): Error {
+  if (value instanceof Error) return value;
+  return new Error(typeof value === 'string' ? value : 'Unknown failure', {
+    cause: value,
+  });
+}
+```
+
+Normalize ở adapter. Domain không nên có mười cách biểu diễn cùng một failure.
+
+## Exception hay Result?
+
+```ts
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+type CheckoutError =
+  | { code: 'OUT_OF_STOCK'; sku: string }
+  | { code: 'PAYMENT_DECLINED'; retryable: false }
+  | { code: 'TIMEOUT'; retryable: true };
+```
+
+Dùng `Result` khi failure là nhánh domain caller phải xử lý. Dùng exception cho invariant bị phá, programming error hoặc failure xuyên nhiều layer mà local caller không thể giải quyết. Đừng biến mọi function thành monad chỉ vì “type-safe”.
+
+TypeScript không có checked exceptions; `throws` trong JSDoc là documentation, không được compiler enforce. Nếu caller bắt buộc branch theo loại lỗi, encode vào return.
+
+## Cancellation là một phần function signature
+
+```ts
+type RequestOptions = {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
+
+async function loadUser(
+  id: UserId,
+  options: RequestOptions = {}
+): Promise<User> {
+  const timeout = AbortSignal.timeout(options.timeoutMs ?? 5_000);
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, timeout])
+    : timeout;
+
+  const response = await fetch(`/api/users/${id}`, { signal });
+  return parseUser(await response.json());
+}
+```
+
+Không swallow `AbortError` rồi retry. Cancellation thường thể hiện caller không còn cần kết quả.
+
+## Concurrency semantics phải có chủ đích
+
+```ts
+const [user, permissions] = await Promise.all([
+  loadUser(id),
+  loadPermissions(id),
+]);
+```
+
+`Promise.all` fail-fast nhưng không tự hủy work còn lại. Nếu cần all-or-cancel, chia sẻ `AbortController`. Nếu partial result hợp lệ, dùng `Promise.allSettled` rồi normalize thành domain result; đừng để `PromiseSettledResult` rò lên UI.
+
+## Retry chỉ dành cho operation phù hợp
+
+Retry cần trả lời:
+
+- lỗi có transient không?
+- operation có idempotent không?
+- server có idempotency key không?
+- backoff có jitter và budget tổng không?
+- cancellation có dừng retry loop không?
+
+```ts
+type RetryPolicy = {
+  maxAttempts: number;
+  shouldRetry(error: unknown, attempt: number): boolean;
+  delayMs(attempt: number): number;
+};
+```
+
+Tách policy khỏi loop để test deterministic. Inject sleep/clock thay vì chờ thời gian thật.
+
+## Tránh floating promise
+
+```ts
+void sendAnalytics(event).catch(reportAnalyticsFailure);
+```
+
+`void` chỉ hợp lý khi chủ ý fire-and-forget và có error sink. Bật lint rule cho floating promise; compiler thuần không luôn bắt được.
+
+## Lab
+
+1. Model error của một use case bằng discriminated union; UI exhaustively xử lý.
+2. Thêm `AbortSignal` xuyên từ UI tới transport và test cancel.
+3. Viết retry loop có injected clock, jitter strategy và retry budget.
+4. Audit `Promise.all`: flow nào cần fail-fast, partial success, hay cancellation?
+
+**Done khi:** mọi async operation quan trọng có ownership, timeout/cancel policy và error contract rõ; không có rejected promise vô chủ.
+
+## Đọc tiếp
+
+- [Typing functions](https://www.typescriptlang.org/docs/handbook/2/functions.html)
+- [Narrowing](https://www.typescriptlang.org/docs/handbook/2/narrowing.html)

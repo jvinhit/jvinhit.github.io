@@ -14,8 +14,17 @@ export interface SeriesMeta {
   title: string;
   /** Mô tả ngắn cho trang /series và landing */
   blurb: string;
+  /** Mô tả SEO ngắn; fallback về blurb nếu bỏ trống. */
+  description?: string;
   /** Ngôn ngữ của landing page; fallback về ngôn ngữ mặc định của site. */
   lang?: 'en' | 'vi';
+  /** Chia một series dài thành các chặng học trên landing page. */
+  sections?: Array<{
+    title: string;
+    description: string;
+    from: number;
+    to: number;
+  }>;
   /**
    * Pin series lên đầu listing (/series, /blog). Số lớn hơn = ưu tiên cao hơn.
    * Bỏ trống = không pin, xếp theo hoạt động gần nhất (`latest`) như mặc định.
@@ -39,7 +48,7 @@ export const SERIES: Record<string, SeriesMeta> = {
   'browser-internals': {
     title: 'How Browsers Work — Internals Deep Dive',
     blurb:
-      'A bilingual (English-first) journey under the hood of the browser, the runtime every frontend engineer ships to but few truly understand. Start with the multi-process architecture (browser, renderer, GPU, network processes, sandboxing and site isolation), then follow a navigation from URL to pixels. Go deep on the rendering pipeline: HTML parsing and the DOM, CSS and the CSSOM, the render tree, layout/reflow, paint, layers and compositing — and exactly what triggers each. Then the JavaScript engine (V8): parsing, bytecode, the JIT, hidden classes and inline caches; the event loop, tasks, microtasks and the rendering steps; memory management and garbage collection. Finish with the platform layers — networking and HTTP caching, storage (cookies, localStorage, IndexedDB, Cache API, service workers), and the browser security model (same-origin policy, CORS, CSP, site isolation) — capped by a capstone that turns this mental model into sharper performance debugging in DevTools. Every part connects internals to code you actually write.',
+      'Series tiếng Việt đi dưới lớp vỏ của browser — runtime mà frontend engineer ship code vào mỗi ngày nhưng hiếm khi hiểu trọn. Chặng nền tảng 1–12 bắt đầu từ kiến trúc đa process (browser, renderer, GPU, network, sandbox và site isolation), lần theo navigation từ URL tới pixel, rồi đào sâu HTML parser/DOM, CSSOM, render tree, layout, paint, compositing, V8, event loop, memory/GC, networking, storage và security model. Chặng chuyên sâu 13–22 nối mental model đó với GPU/Viz và layer promotion, scrolling, frame scheduling, các tier tối ưu/deopt của V8, heap leak và detached DOM, accessibility tree, pipeline decode ảnh/video, worker + SharedArrayBuffer/Atomics, process model + BFCache — kết bằng capstone profiling có hệ thống trong DevTools. Mỗi phần nối internals với code và triệu chứng bạn thật sự gặp.',
   },
   'web-a11y': {
     title: 'Web Accessibility (a11y) — From Zero to Inclusive',
@@ -49,7 +58,7 @@ export const SERIES: Record<string, SeriesMeta> = {
   'web-perf': {
     title: 'Web Performance & Core Web Vitals',
     blurb:
-      'Series tiếng Việt đưa bạn từ "trang chậm mà không biết tại sao" đến làm chủ hiệu năng web một cách có hệ thống. Bắt đầu với mental model và RAIL, rồi hiểu sâu ba chỉ số Core Web Vitals (LCP, INP, CLS) — định nghĩa, ngưỡng, và khác biệt giữa đo lab và đo field. Tiếp đó là bộ công cụ đo (Lighthouse, tab Performance, WebPageTest, CrUX, RUM), critical rendering path và cách tài nguyên chặn render, rồi đi tối ưu từng chỉ số: LCP (ảnh, font, phản hồi server, resource hints), INP (long task, chia nhỏ việc, web worker), CLS (đặt chỗ trước, font swap). Phần sau đào vào hiệu năng JavaScript (bundle, code splitting, tree shaking), tối ưu ảnh/media (AVIF/WebP, responsive, lazy), chiến lược nạp font, mạng và caching (HTTP cache, CDN, nén, HTTP/2-3, service worker) — kết bằng capstone audit một trang thật, đặt performance budget và giám sát trong CI. Mỗi phần có code và ví dụ đo được.',
+      'Series tiếng Việt đưa bạn từ "trang chậm mà không biết tại sao" đến làm chủ hiệu năng web một cách có hệ thống. Chặng nền tảng 1–12 đi từ RAIL và Core Web Vitals (LCP, INP, CLS), lab vs field, Lighthouse/Performance/WebPageTest/CrUX/RUM và critical rendering path tới tối ưu LCP, INP, CLS, JavaScript bundle, ảnh/media, font, network/cache — rồi gom lại bằng capstone audit, performance budget và Lighthouse CI. Chặng chuyên sâu 13–22 tiếp tục với RUM attribution và sampling, resource hints/Fetch Priority/Early Hints/Speculation Rules, kiến trúc CSR–SSR–SSG–streaming, LoAF và main-thread scheduling, CSS rendering/containment, memory của phiên dài, HTTP/2–3 + compression/cache policy, third-party governance, guardrail ở quy mô tổ chức — kết bằng capstone điều tra triệu chứng tới nguyên nhân gốc. Mỗi phần có code, giới hạn hỗ trợ và cách đo lại.',
   },
   'fe-algorithms': {
     title: 'Thuật toán hay áp dụng trong Frontend',
@@ -73,8 +82,55 @@ export const SERIES: Record<string, SeriesMeta> = {
   },
   ai: {
     title: 'AI for Developers — LLMs, Agents & Coding',
+    description:
+      'Lộ trình AI cho developer gồm 42 bài: nền tảng LLM, RAG và eval, kiến trúc agent, coding workflow, Cursor, MCP và multi-agent.',
     blurb:
-      'The complete AI path for developers in one series: from the history of AI and how LLMs work (tokens, sampling, embeddings, prompting) to choosing models, RAG and fine-tuning, building agents (tool use, architecture, patterns, MCP), and finally coding day-to-day with AI agents and Cursor — hands-on and hype-free.',
+      'Lộ trình 42 bài dành cho developer muốn hiểu AI từ gốc và dùng được trong công việc thật. Bắt đầu từ lịch sử AI, token, sampling, prompting và embeddings; tiếp tục với cách chọn model, RAG, fine-tuning, eval, safety và tối ưu chi phí; sau đó tự thiết kế agent với context, memory, tool use, patterns, orchestration và MCP; cuối cùng áp dụng vào coding hằng ngày — đọc codebase, build feature, debug, review, viết rules/skills, dùng sub-agent và bàn giao context. Nội dung ưu tiên mental model, trade-off, workflow có thể lặp lại và kiểm chứng, không chạy theo hype hay một model cụ thể.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Nền tảng LLM',
+        description:
+          'Hiểu model nhận, biến đổi và sinh thông tin như thế nào trước khi dùng API hay agent framework.',
+        from: 1,
+        to: 9,
+      },
+      {
+        title: 'Đưa LLM vào sản phẩm',
+        description:
+          'Chọn model theo eval, quản lý rủi ro, dữ liệu, chất lượng và chi phí thay vì theo leaderboard.',
+        from: 10,
+        to: 20,
+      },
+      {
+        title: 'Agent engineering',
+        description:
+          'Từ context và tool calling đến agent loop, planning, orchestration và giao thức MCP.',
+        from: 21,
+        to: 26,
+      },
+      {
+        title: 'Workflow coding với AI',
+        description:
+          'Dùng coding agent để onboard codebase, ship feature, debug, review và test mà vẫn giữ quyền kiểm soát.',
+        from: 27,
+        to: 34,
+      },
+      {
+        title: 'Tùy biến agent & capstone',
+        description:
+          'Đóng gói cách làm việc bằng config, rules, skills, sub-agent và handoff; sau đó ghép thành một workflow end-to-end.',
+        from: 35,
+        to: 41,
+      },
+      {
+        title: 'Sự nghiệp trong kỷ nguyên AI',
+        description:
+          'Chuyển từ tối ưu tốc độ gõ code sang tối ưu khả năng phán đoán, thiết kế hệ thống và xác minh output.',
+        from: 42,
+        to: 42,
+      },
+    ],
     pin: 1,
   },
   bash: {
@@ -91,6 +147,38 @@ export const SERIES: Record<string, SeriesMeta> = {
     title: 'Neovim từ Gà mờ đến Pro',
     blurb:
       'Series tiếng Việt giúp bạn chuyển từ VSCode sang Neovim một cách thực dụng, theo chuẩn 2025-2026: modal editing, Lua config, lazy.nvim, native LSP mới với vim.lsp.config/vim.lsp.enable, completion, formatter/linter, Treesitter, fuzzy finder, Git, terminal, debug/test, dotfiles và một capstone cấu hình hoàn chỉnh. Mỗi phần có cheatsheet, bài tập và checklist để luyện thành phản xạ thật.',
+  },
+  typescript: {
+    title: 'TypeScript Production Engineering — từ Senior đến Staff',
+    description:
+      'Lộ trình TypeScript 12 phần về type system, strict config, API design, runtime boundary, ESM, package authoring, kiến trúc, monorepo, hiệu năng và migration.',
+    blurb:
+      'Core series tiếng Việt 12 phần dành cho developer đã biết cú pháp TypeScript nhưng muốn dùng type system như một công cụ thiết kế hệ thống. Lộ trình đi từ structural typing, soundness, variance và control-flow analysis tới strict tsconfig theo TypeScript 6, generic API dễ suy luận, runtime validation và domain modeling. Nửa sau tập trung vào async/error contract, ESM và module resolution, viết và kiểm thử declaration cho package, kiến trúc theo boundary, project references và hiệu năng compiler, chiến lược test/migration ở codebase lớn, rồi kết bằng capstone xây một typed SDK production. Hai series Type Challenges và Design Patterns là phòng lab bổ trợ, không phải điều kiện tiên quyết. Mỗi bài có failure mode, decision rule, code TypeScript chạy được, bài tập và tiêu chí tự review.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Hiểu và điều khiển type system',
+        description:
+          'Nắm giới hạn soundness, narrowing và inference để đọc được điều compiler đang chứng minh — và điều nó không thể chứng minh.',
+        from: 1,
+        to: 4,
+      },
+      {
+        title: 'Thiết kế contract production',
+        description:
+          'Đưa dữ liệu runtime, lỗi, bất đồng bộ và module boundary vào các contract có thể kiểm tra.',
+        from: 5,
+        to: 8,
+      },
+      {
+        title: 'Scale codebase và tổ chức',
+        description:
+          'Thiết kế boundary, package, build graph, type performance, migration và quality gate cho hệ thống lớn.',
+        from: 9,
+        to: 12,
+      },
+    ],
+    pin: 6,
   },
   'ts-pattern': {
     title: 'Design Patterns in TypeScript',
@@ -119,6 +207,8 @@ export const SERIES: Record<string, SeriesMeta> = {
   },
   'hosting-dns': {
     title: 'Domain, DNS & Hosting — từ Zero đến Production',
+    description:
+      'Series 10 phần về domain, DNS và hosting: Cloudflare, Hostinger, GitHub Pages, VPS, TLS, email DNS và migration không downtime.',
     blurb:
       'Series tiếng Việt 10 phần giúp bạn nối một domain thật tới đúng hạ tầng mà không làm gián đoạn website hay email. Lộ trình bắt đầu bằng mental model tách registrar, authoritative DNS, hosting, CDN và origin; sau đó làm chủ delegation, record A/AAAA/CNAME/MX/TXT/CAA, TTL và cách kiểm tra bằng dig. Phần thực hành đi qua đổi nameserver từ Hostinger sang Cloudflare đúng thứ tự DNSSEC, giữ Cloudflare DNS nhưng host website ở Hostinger, gắn custom domain cho GitHub Pages và Cloudflare Pages, trỏ domain vào VPS qua Nginx, rồi cấu hình Cloudflare proxy với Full (strict). Cuối series là email DNS với SPF/DKIM/DMARC và runbook migration không downtime, có acceptance test, rollback cùng quy trình debug từ NS/DS tới TLS, HTTP và application.',
     lang: 'vi',

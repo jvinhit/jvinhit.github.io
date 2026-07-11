@@ -1,37 +1,36 @@
 ---
 title: 'How Browsers Work · Part 10 — Storage & the Platform'
-description: 'Where the web stores data: cookies, Web Storage (localStorage/sessionStorage), IndexedDB, the Cache API and service workers — their limits, sync vs async behavior, and the origin-scoped storage model.'
+description: 'Where the web stores data: cookie scope, Web Storage, IndexedDB, Cache API and service workers — sync/async trade-offs, quotas, partitioning and lifecycle.'
 pubDate: 2026-10-23
-tags: [browser, internals, storage, indexeddb, service-worker, browser_internals_12]
+tags: [browser, internals, storage, indexeddb, service-worker, browser_internals_22]
 series: browser-internals
 seriesOrder: 10
-draft: true
 ---
 
-Phần 8–9 đã đi qua bộ nhớ trong renderer và byte trên dây. Phần này về **lưu trữ client bền vững** — API app dùng để nhớ state qua reload, offline, và cache response lập trình được.
+Phần 8–9 đã đi qua bộ nhớ trong renderer và byte trên dây. Phần này về **client storage** — API app dùng để nhớ state qua reload/page session, hỗ trợ offline, và cache response lập trình được.
 
-Mọi cơ chế lưu trữ chia sẻ một quy tắc cứng: dữ liệu theo **origin** (`scheme + host + port`). `https://app.example.com` không đọc được dữ liệu `https://other.example.com` — và ngày càng nhiều, **ngữ cảnh third-party** bị partition thêm vì privacy. Chọn sai API có nghĩa chặn luồng chính, vượt quota, hoặc rò dữ liệu trên mọi HTTP request.
+Web Storage, IndexedDB và Cache API chủ yếu dùng **storage key dựa trên origin** (`scheme + host + port`), và browser có thể partition thêm theo top-level site trong third-party context. **Cookie là ngoại lệ quan trọng**: matching dựa host/domain + path cùng cờ `Secure`/`SameSite`/partition; port không phải ranh giới cookie. Chọn sai API có thể chặn main thread, vượt quota, hoặc gửi dữ liệu thừa trên request.
 
 ---
 
 ## 1. Mô hình lưu trữ theo origin
 
-**Origin** là bộ `(protocol, hostname, port)`. Mọi API lưu trữ chính phân vùng theo origin — không theo tab, không theo path.
+**Origin** là bộ `(scheme, hostname, port)`. `localStorage`, IndexedDB và Cache API mặc định theo origin; `sessionStorage` còn được partition theo **top-level browsing context/page session**. Storage Standard gọi primitive này là storage key/bucket và để quota là implementation-defined: [WHATWG Storage](https://storage.spec.whatwg.org/).
 
 ```text
 https://shop.example.com:443   ← origin A
   ├─ localStorage (A)
   ├─ IndexedDB database "orders" (A)
   ├─ Cache API "v1-static" (A)
-  └─ Cookies with Domain=shop.example.com (A)
+  └─ (cookies shown separately: host/domain + path, not origin/port)
 
 https://cdn.example.com:443    ← origin B (separate bucket)
   └─ its own isolated storage
 ```
 
-Trình duyệt hiện đại cũng **partition storage** (CHIPS, loại bỏ cookie third-party): iframe từ `tracker.example` nhúng trên `shop.example` có thể có cookie jar **partitioned** theo site top-level, không phải bucket third-party dùng chung. Phần 11 gắn với mô hình bảo mật.
+Trình duyệt còn **partition state** trong third-party context để giảm tracking, nhưng policy khác nhau. Với **CHIPS**, cookie có attribute `Partitioned; Secure` được double-key bởi cookie host và top-level site, nên widget nhúng trên `shop.example` không tự dùng cùng partition với widget trên `news.example`. Đây là opt-in cookie partitioning, không đồng nghĩa mọi browser đã xóa mọi third-party cookie. Xem [CHIPS guide](https://developer.mozilla.org/en-US/docs/Web/Privacy/Guides/Third-party_cookies/Partitioned_cookies).
 
-> Hai trang cùng origin thì dùng chung storage — kể cả giữa các tab. Dùng sự kiện `storage` (cho `localStorage`) hoặc `BroadcastChannel` để đồng bộ giữa tab.
+> Hai tab cùng origin có thể chia sẻ `localStorage`, IndexedDB và Cache API. **`sessionStorage` không chia sẻ như vậy**: mỗi top-level browsing context có page session riêng (tab mới từ opener có thể được clone ban đầu rồi tách). Dùng sự kiện `storage` hoặc `BroadcastChannel` khi thật sự cần đồng bộ.
 
 ---
 
@@ -39,11 +38,11 @@ Trình duyệt hiện đại cũng **partition storage** (CHIPS, loại bỏ coo
 
 | Cơ chế | Gửi kèm HTTP? | Giới hạn | Kiểu API | Kiểu dữ liệu |
 |-----------|--------------------------|------------|-----------|--------------------------------------------------|
-| **Cookies** | Yes — every matching request | ~4 KB per cookie | Sync (`document.cookie`) | Chuỗi |
-| **sessionStorage** | No | ~5–10 MB per origin | Sync | Chuỗi |
-| **localStorage** | No | ~5–10 MB per origin | Sync | Chuỗi |
-| **IndexedDB** | No | Large (disk quota) | Async (transactions) | Có cấu trúc |
-| **Cache API** | No | Shares quota with IDB | Async | `Request` / `Response` pairs |
+| **Cookies** | Yes — every matching request | ~4 KB per cookie | `Set-Cookie`; `document.cookie` sync cho cookie JS-visible | Chuỗi |
+| **sessionStorage** | No | Browser quota; page session riêng | Sync | Chuỗi |
+| **localStorage** | No | Thường ~5 MiB/origin; phải bắt `QuotaExceededError` | Sync | Chuỗi |
+| **IndexedDB** | No | Quota implementation-defined | Async (transactions) | Structured-clone values |
+| **Cache API** | No | Thường chung storage quota với IDB | Async | `Request` / `Response` pairs |
 
 Bảng là cây quyết định trong một nhìn: cần token session server đọc được → cookie; pref UI nhỏ → `localStorage`; dataset offline lớn → IndexedDB; chặn fetch offline → Cache API + Service Worker.
 
@@ -51,7 +50,7 @@ Bảng là cây quyết định trong một nhìn: cần token session server đ
 
 ## 3. Cookie: nhỏ, tự động, server thấy được
 
-**HTTP cookie** là cặp tên-giá trị server đặt qua `Set-Cookie` và trình duyệt gắn vào request sau qua header `Cookie`. Chúng là lưu trữ client gốc của web — và cạm bẫy lớn nhất là **gửi tự động**.
+**HTTP cookie** là cặp tên-giá trị thường được server đặt qua `Set-Cookie` (cookie không-`HttpOnly` cũng có thể do JS đặt). Browser tự gắn cookie phù hợp vào request qua header `Cookie`; cạm bẫy lớn nhất chính là **gửi tự động** theo scope/policy.
 
 ```http
 Set-Cookie: session=abc123; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=604800
@@ -65,9 +64,10 @@ Thuộc tính quan trọng:
 | **`Secure`** | Chỉ gửi qua HTTPS |
 | **`SameSite=Lax/Strict/None`** | Kiểm soát gửi cross-site (giảm CSRF) |
 | **`Max-Age` / `Expires`** | Thời hạn |
-| **`Domain` / `Path`** | Phạm vi gắn vào request |
+| **`Domain` / `Path`** | Phạm vi matching request; `Path` không phải security boundary |
+| **`Partitioned`** | Double-key cookie theo top-level site; bắt buộc `Secure` |
 
-Cookie **nhỏ** (~4 KB mỗi cái, số lượng giới hạn mỗi domain) và **đồng bộ** từ JS qua `document.cookie` — vụng về cho việc hơn flag đơn giản. Ưu tiên cookie session **`HttpOnly`** cho auth; không bao giờ lưu payload lớn trong cookie (phình mọi request).
+Cookie **nhỏ** (browser phải hỗ trợ tối thiểu cỡ ~4 KiB/cookie, nhưng limit/count cụ thể khác nhau) và `document.cookie` là API chuỗi đồng bộ. Với session auth browser-based, cookie `HttpOnly; Secure; SameSite` thường giảm khả năng token bị đọc bởi XSS, nhưng vẫn cần CSRF/authz phù hợp. Tránh payload lớn vì cookie matching sẽ phình request.
 
 ---
 
@@ -75,14 +75,14 @@ Cookie **nhỏ** (~4 KB mỗi cái, số lượng giới hạn mỗi domain) và
 
 **Web Storage API** có hai kho cùng origin:
 
-- **`localStorage`** — bền đến khi xóa tường minh; sống sót restart trình duyệt.
-- **`sessionStorage`** — theo **ngữ cảnh duyệt top-level** (tab/cửa sổ); xóa khi đóng tab.
+- **`localStorage`** — thường sống qua browser restart cho đến khi user/site/policy xóa; private browsing dùng lifetime tạm.
+- **`sessionStorage`** — theo origin **và** top-level browsing context/page session; sống qua reload, thường kết thúc khi tab/window session đóng (session restore có thể phục hồi).
 
 Cả hai **đồng bộ** và **chỉ chuỗi**:
 
 ```js
 localStorage.setItem('theme', 'dark');
-const theme = localStorage.getItem('theme'); // blocks main thread while disk I/O runs
+const theme = localStorage.getItem('theme'); // synchronous API; main thread waits for the operation
 
 // Objects must be serialized manually
 localStorage.setItem('prefs', JSON.stringify({ density: 'compact' }));
@@ -90,7 +90,7 @@ localStorage.setItem('prefs', JSON.stringify({ density: 'compact' }));
 
 ### Vì sao storage đồng bộ nguy hiểm trên luồng chính
 
-Đọc/ghi `localStorage` có thể chặn luồng chính khi trình duyệt chạm đĩa — đặc biệt lần truy cập đầu hoặc giá trị lớn. Trên trang đang layout và JS (Phần 7), đọc storage chậm góp vào jank **INP**. Giữ giá trị nhỏ; hoãn đọc không gấp; không dùng Web Storage như database.
+Đọc/ghi `localStorage` chặn main thread ở API boundary; browser có thể dùng memory cache/IPC nên không phải mỗi call đều là disk I/O, nhưng serialization, cross-process coordination hay cold access vẫn có cost. Giữ giá trị nhỏ, không dùng Web Storage như database. Web Storage **không có `HttpOnly`**: script cùng origin — kể cả XSS — đọc được các value đó.
 
 > **`localStorage`** không chia sẻ với worker. Dữ liệu có cấu trúc lớn hơn dùng **IndexedDB**.
 
@@ -98,11 +98,13 @@ localStorage.setItem('prefs', JSON.stringify({ density: 'compact' }));
 
 ## 5. IndexedDB: database client-side thật sự
 
-**IndexedDB** là object store giao dịch, async, cho dữ liệu có cấu trúc quy mô lớn. Khác Web Storage, nó chạy ngoài đường đồng bộ quan trọng và hỗ trợ **index**, **cursor**, lưu **Blob**/`File`, và **migration schema có version**.
+**IndexedDB** là object store giao dịch, request async, cho dữ liệu có cấu trúc quy mô lớn. Nó không giữ main thread chờ I/O theo API đồng bộ như Web Storage, nhưng callback, structured clone và xử lý result vẫn có thể tốn main-thread CPU. IDB hỗ trợ **index**, **cursor**, `Blob`/`File`, và **schema migration theo version**.
 
 ```js
+let dbPromise;
+
 function openDb() {
-  return new Promise((resolve, reject) => {
+  dbPromise ??= new Promise((resolve, reject) => {
     const req = indexedDB.open('app-db', 1);
 
     req.onupgradeneeded = () => {
@@ -111,9 +113,14 @@ function openDb() {
       store.createIndex('byUpdated', 'updatedAt');
     };
 
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => db.close();
+      resolve(db);
+    };
     req.onerror = () => reject(req.error);
   });
+  return dbPromise;
 }
 
 async function saveNote(note) {
@@ -130,16 +137,16 @@ async function saveNote(note) {
 Khái niệm cần nắm:
 
 - **Database** → **object store** (như bảng) → record key theo key path hoặc out-of-line key.
-- **Transaction** là đơn vị công việc — tự commit khi thành công, abort khi lỗi; không chia sẻ qua khoảng async bừa bãi.
+- **Transaction** là đơn vị công việc — tự commit khi request hoàn tất và event loop không còn giữ transaction active; `await` công việc không liên quan ở giữa có thể khiến transaction đóng trước khi bạn enqueue request tiếp.
 - **Version** — tăng `version` trong `open()` và migrate trong `onupgradeneeded`.
 
-Thư viện như **`idb`** bọc API dài dòng; app React, **`Dexie.js`** thêm lớp thân thiện. IndexedDB là default đúng cho app offline-first, cache lớn, và nội dung user tạo.
+Thư viện như **`idb`** hoặc **Dexie** có thể bọc API event-based. IndexedDB phù hợp cho structured client data/offline dataset lớn hơn Web Storage; dữ liệu user không thể thay thế vẫn cần sync/export/backup, vì client storage không phải durable database tuyệt đối.
 
 ---
 
 ## 6. Cache API và Service Worker
 
-**Cache API** lưu cặp **`Request`/`Response`** — cùng hình dạng pipeline fetch dùng (Phần 9). Thiết kế để dùng với **Service Worker**, proxy mạng lập trình được trên luồng nền.
+**Cache API** lưu cặp **`Request`/`Response`** — cùng hình dạng pipeline fetch dùng (Phần 9). Nó dùng được từ window và worker, thường kết hợp với **Service Worker**: worker global event-driven có thể bị terminate khi idle rồi khởi động lại cho event sau, không phải daemon sống mãi.
 
 ### Lifecycle Service Worker
 
@@ -158,7 +165,8 @@ fetch    → intercept network requests (event.respondWith)
 
 ```js
 // sw.js (simplified)
-const CACHE = 'v1-shell';
+const CACHE_PREFIX = 'my-app-shell-';
+const CACHE = `${CACHE_PREFIX}v1`;
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -169,19 +177,26 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))
+      Promise.all(
+        keys
+          .filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE)
+          .map((key) => caches.delete(key))
+      )
     )
   );
 });
 
 self.addEventListener('fetch', (event) => {
   event.respondWith(
-    caches.match(event.request).then((cached) => cached ?? fetch(event.request))
+    caches
+      .open(CACHE)
+      .then((cache) => cache.match(event.request))
+      .then((cached) => cached ?? fetch(event.request))
   );
 });
 ```
 
-Trang bị **controlled** bởi Service Worker chỉ sau đăng ký **và** navigation kích hoạt — lần visit đầu có thể vẫn chỉ mạng.
+Đăng ký thành công chưa có nghĩa page hiện tại được control. Worker mới install rồi activate; theo lifecycle mặc định, page thường chỉ có controller sau navigation/reload kế tiếp. `clients.claim()` có thể nhận control sớm hơn, nhưng app phải sẵn sàng cho việc page đang chạy chuyển controller.
 
 ### Chiến lược cache phổ biến
 
@@ -190,15 +205,15 @@ Trang bị **controlled** bởi Service Worker chỉ sau đăng ký **và** navi
 | **Cache-first** | Cache → network on miss | Asset tĩnh, app shell |
 | **Network-first** | Network → cache fallback | Dữ liệu API cần tươi |
 | **Stale-while-revalidate** | Return cache immediately, update in background | Nội dung bán tĩnh |
-| **Network-only** | Never cache | Endpoint nhạy cảm auth |
+| **Network-only** | Bỏ qua Cache API; `fetch()` vẫn theo HTTP-cache semantics | Request cần network policy/server freshness |
 
-Cạm bẫy: cache HTML hung hăng phục vụ phiên bản cũ; `cache.put()` không giới hạn cạn quota; quên `skipWaiting()` / `clients.claim()` trễ control. Luôn version tên cache và xóa bucket cũ khi activate.
+Cạm bẫy: cache HTML hung hăng phục vụ phiên bản cũ; `cache.put()` tăng không giới hạn làm cạn quota; update worker mới ở trạng thái `waiting` trong khi tab cũ còn mở. `skipWaiting()`/`clients.claim()` không phải "luôn bật" — activate code mới ngay có thể trộn HTML/runtime cũ với asset mới. Version cache, chỉ xóa cache **thuộc app của mình**, và thiết kế update UX/atomic asset strategy rõ.
 
 ---
 
 ## 7. Quota, eviction, và persistence
 
-Storage không vô hạn. Trình duyệt cấp mỗi origin một **quota** — phần đĩa khả dụng — dùng chung IndexedDB, Cache API, và (một số trình duyệt) API khác.
+Storage không vô hạn. Browser đặt **quota implementation-defined** cho storage bucket/origin; IndexedDB, Cache API và API khác thường tính vào cùng usage. `estimate()` cố ý là ước lượng, có thể gồm padding để giảm fingerprinting:
 
 ```js
 const { usage, quota } = await navigator.storage.estimate();
@@ -207,8 +222,8 @@ console.log(`Using ${usage} of ${quota} bytes`);
 
 Hai chế độ persistence quan trọng:
 
-- **Best-effort (mặc định)** — trình duyệt **có thể evict** dữ liệu khi áp lực storage (LRU giữa origin).
-- **Persistent** — yêu cầu qua `navigator.storage.persist()`; được cấp nếu site đã cài, có quyền, hoặc user tương tác đáng kể.
+- **Best-effort (mặc định)** — browser có thể evict theo policy khi storage pressure; thuật toán khác nhau theo engine.
+- **Persistent** — yêu cầu qua `navigator.storage.persist()`; Promise trả boolean, còn prompt/auto-grant/heuristic là policy của browser.
 
 Chế độ duyệt riêng dùng profile tạm — giả định dữ liệu có thể mất. Không bao giờ coi client là nguồn sự thật duy nhất cho dữ liệu không thay thế được.
 
@@ -216,11 +231,12 @@ Chế độ duyệt riêng dùng profile tạm — giả định dữ liệu có
 
 ## 8. Privacy: partitioning và storage third-party
 
-Cookie third-party — đặt bởi tracker, quảng cáo, widget nhúng — cho phép theo dõi cross-site hàng thập kỷ. Trình duyệt đang **loại bỏ dần** và **partition** storage theo site top-level:
+Unpartitioned third-party state cho phép theo dõi cross-site. Browser hiện áp dụng mức blocking/partition khác nhau theo engine và lựa chọn user:
 
 - **Storage Partitioning** — `tracker.com` trong iframe trên `shop.com` có bucket riêng với `tracker.com` trên `news.com`.
-- **CHIPS** — cookie third-party nhỏ theo site top-level.
-- **First-party sets** — ngoại lệ hạn chế cho domain sở hữu (chính sách khác nhau theo trình duyệt).
+- **CHIPS** — cookie có `Partitioned` được double-key theo top-level site.
+- **Storage Access API** — embed có thể xin quyền truy cập unpartitioned cookie/state trong use case user-facing.
+- **Related Website Sets** — cơ chế Chromium hỗ trợ một số flow liên-site liên quan qua Storage Access API; không phải ngoại lệ web-wide hay tên cũ "First-Party Sets".
 
 Với kỹ sư: auth và cá nhân hóa nên ở **origin first-party**; embed cross-site không nên dựa storage third-party dùng chung. Dùng cookie **`SameSite`**, redirect OAuth trên domain riêng, và **`postMessage`** cho giao tiếp cross-frame.
 
@@ -243,7 +259,7 @@ Nền tảng cho nhiều lớp — HTTP cache (tự động, Phần 9), Cache AP
 
 ## Tóm tắt
 
-- Mọi storage **theo origin**; trình duyệt hiện đại **partition** ngữ cảnh third-party vì privacy.
+- Web Storage/IndexedDB/Cache API chủ yếu theo origin (có thể partition thêm); cookie theo host/domain + path và có thể double-key bằng `Partitioned`.
 - **Cookie** nhỏ, tự gửi, server đọc được — dùng auth session với `HttpOnly`/`Secure`/`SameSite`.
 - **localStorage/sessionStorage** đồng bộ và chỉ chuỗi — ổn pref nhỏ, nguy hiểm dữ liệu lớn hoặc đường nóng.
 - **IndexedDB** async, lớn, có cấu trúc — database client cho app offline-first.

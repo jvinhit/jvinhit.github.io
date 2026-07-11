@@ -2,29 +2,28 @@
 title: 'Web Performance · Part 6 — Optimizing INP'
 description: 'Janky clicks mean the main thread is blocked. Chunk long tasks, yield with scheduler.yield/setTimeout, split urgent from non-urgent updates, and offload heavy computation to Web Workers.'
 pubDate: 2026-08-28
-tags: [performance, inp, long-tasks, web-worker, web_perf_12]
+tags: [performance, inp, long-tasks, web-worker, web_perf_22]
 series: web-perf
 seriesOrder: 6
-draft: true
 ---
 
-INP (≤ 200ms) đo độ trễ từ khi người dùng tương tác tới khi màn hình cập nhật. Vì JavaScript chạy đơn luồng (như đã bàn ở series thuật toán), thủ phạm gần như luôn là **main thread bị chặn**: một tác vụ JS chạy quá lâu một mạch khiến trình duyệt không kịp xử lý input và vẽ lại.
+INP (≤ 200ms) đo độ trễ từ khi người dùng tương tác tới khung hình kế tiếp. Yếu tố chi phối thường là **main thread bị chặn hoặc render quá nặng**: input phải chờ task hiện tại, handler chạy, rồi trình duyệt còn phải style/layout/paint trước khi phản hồi xuất hiện.
 
 ---
 
 ## 1. Long task — kẻ thù số một của INP
 
-**Long task** là tác vụ chiếm main thread > 50ms. Trong lúc đó, mọi click/gõ phím bị xếp hàng chờ — đó chính là "input delay" trong INP. Phát hiện long task:
+**Long task** là tác vụ chiếm main thread trên 50ms. Trong lúc đó, click/gõ phím mới phải xếp hàng chờ — đó chính là "input delay" trong INP. Phát hiện long task:
 
 ```ts
-// Observe long tasks to see what's blocking the main thread
-new PerformanceObserver((list) => {
-  for (const entry of list.getEntries()) {
-    if (entry.duration > 50) {
+// Long Tasks API is useful but not available in every browser.
+if (PerformanceObserver.supportedEntryTypes.includes('longtask')) {
+  new PerformanceObserver((list) => {
+    for (const entry of list.getEntries()) {
       console.warn(`Long task ${entry.duration.toFixed(0)}ms`, entry);
     }
-  }
-}).observe({ type: 'longtask', buffered: true });
+  }).observe({ type: 'longtask', buffered: true });
+}
 ```
 
 Ba nguồn long task phổ biến: bundle JS lớn chạy lúc khởi động (Phần 8), event handler nặng, và re-render lớn (render hàng nghìn node — dùng ảo hóa, series thuật toán Phần 4).
@@ -33,45 +32,63 @@ Ba nguồn long task phổ biến: bundle JS lớn chạy lúc khởi động (P
 
 ## 2. Phản hồi ngay, làm việc nặng sau (RAIL: Response)
 
-Nguyên tắc RAIL: phản hồi tương tác trong < 100ms. Nếu việc thật cần lâu, hãy **cập nhật UI ngay** (cho người dùng thấy phản hồi) rồi làm phần nặng sau khi trình duyệt đã kịp vẽ:
+Nguyên tắc RAIL: phản hồi tương tác trong < 100ms. Nếu việc thật cần lâu, hãy **cập nhật UI ngay** (cho người dùng thấy phản hồi), kết thúc task hiện tại, rồi làm phần nặng ở task sau:
 
 ```ts
+type SchedulerWithYield = { yield?: () => Promise<void> };
+
+function yieldToMain(): Promise<void> {
+  const scheduler = (
+    globalThis as typeof globalThis & { scheduler?: SchedulerWithYield }
+  ).scheduler;
+
+  return scheduler?.yield
+    ? scheduler.yield()
+    : new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 button.addEventListener('click', async () => {
-  setButtonLoading(true); // instant feedback → low INP
-  // let the browser paint the loading state BEFORE heavy work runs
-  await new Promise((r) => requestAnimationFrame(() => r(null)));
-  await doHeavyWork(); // heavy work is no longer on the path to "next paint"
-  setButtonLoading(false);
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Đang xử lý…';
+
+  // End the interaction task and give input/rendering a chance to run.
+  await yieldToMain();
+
+  try {
+    await doHeavyWork();
+  } finally {
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
 });
 ```
 
-Điểm mấu chốt: INP đo tới *next paint*, nên việc đặt phần nặng *sau* khi đã vẽ phản hồi sẽ kéo INP xuống ngay cả khi tổng thời gian không đổi.
+Điểm mấu chốt: INP đo tới *next paint*, nên tách phần nặng sang task sau tạo cơ hội để trạng thái phản hồi được render trước. `requestAnimationFrame` đơn lẻ không đủ cho mẹo này: callback của nó chạy **trước paint**, và microtask tiếp tục sau `await` vẫn có thể chặn chính frame đó.
 
 ---
 
 ## 3. Chia nhỏ long task bằng "yield"
 
-Khi phải làm nhiều việc trên main thread, hãy chia thành khối và **trả luồng (yield)** giữa các khối để trình duyệt xử lý input + vẽ. API mới `scheduler.yield()` là cách chuẩn:
+Khi phải làm nhiều việc trên main thread, hãy chia thành khối và **trả luồng (yield)** giữa các khối để trình duyệt xử lý input + vẽ. `scheduler.yield()` giữ continuation ở mức ưu tiên phù hợp, nhưng chưa có trên mọi trình duyệt nên dùng helper fallback ở trên:
 
 ```ts
 async function processLargeList(items: Item[]) {
+  let lastYield = performance.now();
+
   for (let i = 0; i < items.length; i++) {
     processItem(items[i]);
-    // yield every 50 items so input/paint can interleave
-    if (i % 50 === 0 && 'scheduler' in window) {
-      await (window as unknown as { scheduler: { yield: () => Promise<void> } }).scheduler.yield();
+
+    // Item cost varies, so yield by elapsed time rather than item count.
+    if (performance.now() - lastYield >= 40) {
+      await yieldToMain();
+      lastYield = performance.now();
     }
   }
 }
 ```
 
-`scheduler.yield()` có ưu điểm: việc tiếp tục được *ưu tiên* trở lại sau khi nhường (khác `setTimeout` đẩy xuống cuối hàng). Với trình duyệt chưa hỗ trợ, fallback:
-
-```ts
-function yieldToMain(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 0)); // yield via macrotask
-}
-```
+`scheduler.yield()` có ưu điểm: continuation được ưu tiên hơn task cùng loại đang chờ; fallback `setTimeout` vẫn nhường main thread nhưng continuation đi về cuối task queue. Mốc 40ms chỉ là điểm bắt đầu — điều chỉnh theo workload và trace thực tế.
 
 > Đây chính là **time-slicing** ở series thuật toán (Phần 8) áp dụng cho INP: chia việc + nhường luồng để giữ trang phản hồi.
 
@@ -79,12 +96,15 @@ function yieldToMain(): Promise<void> {
 
 ## 4. Tách cập nhật khẩn và không khẩn (React)
 
-Không phải cập nhật nào cũng cần ngay. Khi gõ vào ô lọc, việc *hiện ký tự vừa gõ* là khẩn, còn *lọc lại 10.000 dòng* thì không. React 18+ cho `useTransition`/`useDeferredValue` để đánh dấu cập nhật "không khẩn", cho phép trình duyệt phản hồi gõ phím trước:
+Không phải cập nhật nào cũng cần ngay. Khi gõ vào ô lọc, việc *hiện ký tự vừa gõ* là khẩn, còn *render kết quả* thì có thể trễ một nhịp. React cho `useTransition`/`useDeferredValue` để đánh dấu cập nhật không khẩn, giữ input phản hồi trước:
 
 ```tsx
+import { useDeferredValue, useMemo, useState } from 'react';
+
 function SearchableList({ items }: { items: Item[] }) {
   const [query, setQuery] = useState('');
   const deferredQuery = useDeferredValue(query); // "delayed" version for heavy work
+  const isStale = query !== deferredQuery;
 
   // filter uses the deferred value → doesn't block showing the typed character
   const filtered = useMemo(
@@ -95,34 +115,46 @@ function SearchableList({ items }: { items: Item[] }) {
   return (
     <>
       <input value={query} onChange={(e) => setQuery(e.target.value)} /> {/* urgent: update immediately */}
-      <List items={filtered} /> {/* non-urgent: may lag one beat */}
+      <div style={{ opacity: isStale ? 0.7 : 1 }}>
+        <List items={filtered} /> {/* non-urgent: may lag one beat */}
+      </div>
     </>
   );
 }
 ```
 
+Concurrent rendering không biến một phép tính đồng bộ khổng lồ thành miễn phí. Nếu riêng `filter()` đã chiếm hàng trăm mili-giây, hãy chunk/worker/index dữ liệu; `useDeferredValue` chủ yếu giúp React ưu tiên và có thể ngắt phần render không khẩn.
+
 ---
 
 ## 5. Đẩy tính toán nặng sang Web Worker
 
-Time-slicing giúp việc *phải* ở main thread (đụng DOM). Nhưng tính toán thuần (parse dữ liệu lớn, xử lý ảnh, tìm kiếm phức tạp) nên rời hẳn main thread bằng **Web Worker** — chạy ở luồng khác, không bao giờ chặn UI.
+Time-slicing giúp việc *phải* ở main thread (đụng DOM). Nhưng tính toán thuần (parse dữ liệu lớn, xử lý ảnh, tìm kiếm phức tạp) nên rời main thread bằng **Web Worker** — phép tính không chạy trong task UI, dù CPU contention và chi phí truyền dữ liệu vẫn cần đo.
 
 ```ts
-// worker.ts — runs on a separate thread
-self.onmessage = (e: MessageEvent<number[]>) => {
-  const result = heavyCompute(e.data); // however heavy, it won't block UI
-  self.postMessage(result);
+// worker.ts — include an id so concurrent calls don't overwrite each other
+self.onmessage = (e: MessageEvent<{ id: number; data: number[] }>) => {
+  const { id, data } = e.data;
+  self.postMessage({ id, result: heavyCompute(data) });
 };
 ```
 
 ```ts
 // main thread — only send data and receive results
 const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+const pending = new Map<number, (result: number[]) => void>();
+let nextId = 0;
+
+worker.onmessage = (e: MessageEvent<{ id: number; result: number[] }>) => {
+  pending.get(e.data.id)?.(e.data.result);
+  pending.delete(e.data.id);
+};
 
 function compute(data: number[]): Promise<number[]> {
   return new Promise((resolve) => {
-    worker.onmessage = (e: MessageEvent<number[]>) => resolve(e.data);
-    worker.postMessage(data);
+    const id = nextId++;
+    pending.set(id, resolve);
+    worker.postMessage({ id, data });
   });
 }
 ```
@@ -133,19 +165,21 @@ function compute(data: number[]): Promise<number[]> {
 
 ## 6. Giảm chi phí của chính event handler
 
-- **Debounce/throttle** handler chạy thường xuyên (input, scroll) — series thuật toán Phần 2.
+- **Debounce/throttle phần việc không khẩn** phát sinh từ input/scroll; đừng debounce việc hiển thị chính ký tự người dùng vừa gõ.
 - **Tránh layout thrashing** trong handler (đọc/ghi layout xen kẽ) — đọc gom, ghi gom.
 - **Giảm phạm vi re-render**: memo hóa, key ổn định, ảo hóa danh sách lớn.
-- **Hoãn việc phụ** (analytics, log) ra khỏi đường tương tác — phát sự kiện, xử lý lúc rảnh (`requestIdleCallback`).
+- **Hoãn việc phụ** (analytics, log) ra khỏi đường tương tác; dùng task sau, beacon hoặc background priority phù hợp thay vì giữ handler mở.
 
 ---
 
 ## Tóm tắt
 
-- INP tệ ≈ **main thread bị chặn**; phát hiện bằng quan sát **long task** (> 50ms).
+- INP tệ thường do **main thread bị chặn hoặc render nặng**; long task trên 50ms là tín hiệu chẩn đoán quan trọng.
 - **Phản hồi ngay, làm nặng sau** (vẽ trạng thái trước khi chạy việc nặng) kéo INP xuống.
-- **Chia nhỏ + yield** (`scheduler.yield()` / `setTimeout`) để input/paint chen vào — time-slicing.
+- **Chia nhỏ + yield** (`scheduler.yield()` với fallback `setTimeout`) để input/paint chen vào — time-slicing.
 - React: **`useDeferredValue`/`useTransition`** tách cập nhật khẩn và không khẩn.
 - Tính toán CPU-bound → **Web Worker** (dùng `Transferable` cho dữ liệu lớn).
 
 **Phần tiếp theo:** Tối ưu CLS — đặt chỗ trước cho ảnh/quảng cáo/font để bố cục không nhảy.
+
+**Đọc sâu hơn ở Phần 16:** phân rã INP, Long Animation Frames, `scheduler.postTask()` và chiến lược scheduling production.
