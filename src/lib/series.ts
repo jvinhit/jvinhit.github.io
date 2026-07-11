@@ -14,6 +14,8 @@ export interface SeriesMeta {
   title: string;
   /** Mô tả ngắn cho trang /series và landing */
   blurb: string;
+  /** Ngôn ngữ của landing page; fallback về ngôn ngữ mặc định của site. */
+  lang?: 'en' | 'vi';
   /**
    * Pin series lên đầu listing (/series, /blog). Số lớn hơn = ưu tiên cao hơn.
    * Bỏ trống = không pin, xếp theo hoạt động gần nhất (`latest`) như mặc định.
@@ -108,12 +110,19 @@ export const SERIES: Record<string, SeriesMeta> = {
   docker: {
     title: 'Docker, Compose & Kubernetes',
     blurb:
-      'A production-minded path from first container to confident operations: container and image mental models, Dockerfile layer/cache discipline, data and networking, Compose for local multi-service systems, image hardening, systematic debugging, then Kubernetes fundamentals, probes, rollouts and real incident playbooks.',
+      'Lộ trình tiếng Việt theo hai chặng: 10 phần nền tảng giúp bạn làm chủ container, image, Dockerfile, storage, networking, Compose, hardening và debug; nhánh chuyên sâu đi xuống OCI runtime, namespace/cgroup, BuildKit và supply chain, Compose cho team/CI, rồi vào Kubernetes networking, scheduling, autoscaling, stateful storage, security, observability và incident response. Mỗi phần ưu tiên mental model, trade-off, failure mode, lab có thể tự phá–sửa và tài liệu chính thức để biến kiến thức thành năng lực vận hành production.',
   },
   nginx: {
     title: 'Nginx from Zero to Production',
     blurb:
       'Master Nginx hands-on: install locally, understand the config model, build a reverse proxy and load balancer, add TLS, caching and rate limiting, then ship and debug a production setup.',
+  },
+  'hosting-dns': {
+    title: 'Domain, DNS & Hosting — từ Zero đến Production',
+    blurb:
+      'Series tiếng Việt 10 phần giúp bạn nối một domain thật tới đúng hạ tầng mà không làm gián đoạn website hay email. Lộ trình bắt đầu bằng mental model tách registrar, authoritative DNS, hosting, CDN và origin; sau đó làm chủ delegation, record A/AAAA/CNAME/MX/TXT/CAA, TTL và cách kiểm tra bằng dig. Phần thực hành đi qua đổi nameserver từ Hostinger sang Cloudflare đúng thứ tự DNSSEC, giữ Cloudflare DNS nhưng host website ở Hostinger, gắn custom domain cho GitHub Pages và Cloudflare Pages, trỏ domain vào VPS qua Nginx, rồi cấu hình Cloudflare proxy với Full (strict). Cuối series là email DNS với SPF/DKIM/DMARC và runbook migration không downtime, có acceptance test, rollback cùng quy trình debug từ NS/DS tới TLS, HTTP và application.',
+    lang: 'vi',
+    pin: 4,
   },
   nextjs: {
     title: 'Next.js 16 from Zero to Senior',
@@ -121,9 +130,10 @@ export const SERIES: Record<string, SeriesMeta> = {
       'Go from zero to senior on the latest Next.js (16): the App Router mental model, Server Components and data fetching, the new Cache Components & "use cache" model, Server Actions, route handlers and proxy, rendering, SEO, auth, then shipping and debugging production — hands-on, with exercises.',
   },
   nodejs: {
-    title: 'Node.js Super Senior — 10 Phases + Deep Dives',
+    title: 'Node.js Production Engineering — Từ Runtime đến Hệ thống phân tán',
     blurb:
-      'A production-ready, enterprise-grade path from "gà mờ" to Super Senior Node.js backend developer: ten core phases — core fundamentals, HTTP, Express, databases, auth & security, advanced patterns, DevOps, performance, testing, and enterprise architecture — then bonus deep dives into PostgreSQL, Prisma, and NestJS. Hands-on in TypeScript, with projects.',
+      'Lộ trình tiếng Việt gồm 20 phần dành cho kỹ sư muốn hiểu Node.js như một nền tảng production, không chỉ như công cụ dựng API. Series đi từ V8, libuv, event loop, HTTP và Express 5 đến data layer, authentication, testing, performance, delivery và kiến trúc modular monolith; sau đó đào sâu PostgreSQL, Prisma, Redis, NestJS, message queue, GraphQL, gRPC, realtime và observability với OpenTelemetry. Mỗi phần dùng TypeScript, giải thích mental model trước API, phân tích trade-off và failure mode, kèm tiêu chí vận hành, bài tập và tài liệu chính thức để người đọc có thể biến kiến thức thành quyết định kỹ thuật.',
+    pin: 5,
   },
   eng: {
     title: 'Practical English for Work',
@@ -168,7 +178,7 @@ export const SERIES: Record<string, SeriesMeta> = {
   'react-stack': {
     title: 'Build a Real React App — The Production Stack',
     blurb:
-      "The hands-on sequel to the Tailwind/Radix/shadcn series: build one real app — \"Pulse\", a small CRM/SaaS dashboard — end-to-end with the modern React production stack. Start by scaffolding with pnpm, Vite and TypeScript strict, plus oxlint + oxfmt for fast linting and formatting, then lay the Tailwind v4 + shadcn/ui foundation and an app shell. Wire routing and architecture with React Router v7 (data mode), then master server state with TanStack Query — typed query keys, caching, mutations and optimistic updates with rollback. Build validated forms with react-hook-form + zod, manage genuine client state with Zustand, and ship a real feature: a data table with filters and URL-as-state. Add an auth + API layer, then tune performance (code splitting, prefetching, bundle analysis) and lock in quality with Vitest, React Testing Library and MSW. Finish with a capstone that assembles a full feature flow and a pnpm + oxlint GitHub Actions CI pipeline.",
+      'The hands-on sequel to the Tailwind/Radix/shadcn series: build one real app — "Pulse", a small CRM/SaaS dashboard — end-to-end with the modern React production stack. Start by scaffolding with pnpm, Vite and TypeScript strict, plus oxlint + oxfmt for fast linting and formatting, then lay the Tailwind v4 + shadcn/ui foundation and an app shell. Wire routing and architecture with React Router v7 (data mode), then master server state with TanStack Query — typed query keys, caching, mutations and optimistic updates with rollback. Build validated forms with react-hook-form + zod, manage genuine client state with Zustand, and ship a real feature: a data table with filters and URL-as-state. Add an auth + API layer, then tune performance (code splitting, prefetching, bundle analysis) and lock in quality with Vitest, React Testing Library and MSW. Finish with a capstone that assembles a full feature flow and a pnpm + oxlint GitHub Actions CI pipeline.',
   },
   threejs: {
     title: 'Three.js from Zero to Senior',
@@ -208,13 +218,19 @@ export function sortByPriority(posts: Post[]): Post[] {
 
 export function isSeriesPost(post: Post): boolean {
   const { series, seriesOrder } = post.data;
-  return typeof series === 'string' && series in SERIES && typeof seriesOrder === 'number';
+  return (
+    typeof series === 'string' &&
+    series in SERIES &&
+    typeof seriesOrder === 'number'
+  );
 }
 
 /** All posts of a series, ordered by `seriesOrder` ascending (Part 1 first). */
 export function seriesParts(posts: Post[], id: string): Post[] {
   return posts
-    .filter((p) => p.data.series === id && typeof p.data.seriesOrder === 'number')
+    .filter(
+      (p) => p.data.series === id && typeof p.data.seriesOrder === 'number'
+    )
     .sort((a, b) => (a.data.seriesOrder ?? 0) - (b.data.seriesOrder ?? 0));
 }
 
@@ -230,7 +246,10 @@ export interface SeriesContext {
 }
 
 /** Context for rendering in-post navigation; null if the post is not in a series. */
-export function getSeriesContext(posts: Post[], post: Post): SeriesContext | null {
+export function getSeriesContext(
+  posts: Post[],
+  post: Post
+): SeriesContext | null {
   if (!isSeriesPost(post)) return null;
   const id = post.data.series as string;
   const meta = SERIES[id];

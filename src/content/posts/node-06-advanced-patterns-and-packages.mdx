@@ -1,292 +1,468 @@
 ---
-title: 'Node.js Super Senior · Phase 6 — Advanced Patterns & Packages'
-description: 'Phase 6: patterns that scale a codebase — dependency injection and IoC, repository + service + unit of work, caching strategies and invalidation, BullMQ job queues, structured logging, config validation, and resilience patterns.'
+title: 'Node.js Production Engineering 06 — Patterns cho Codebase lớn'
+description: 'Thiết kế ranh giới module, dependency injection, transaction, cache, queue và resilience để codebase Node.js tiếp tục thay đổi an toàn khi sản phẩm và đội ngũ cùng lớn lên.'
 pubDate: 2026-06-09
-tags: [nodejs, design-patterns, redis, queues, node_10]
+updatedDate: 2026-07-11
+tags:
+  [
+    nodejs,
+    design-patterns,
+    architecture,
+    resilience,
+    observability,
+    production-engineering,
+  ]
 series: nodejs
 seriesOrder: 6
 draft: false
 ---
 
-Đây là **Phase 6 của lộ trình Super Senior 10 phase**. Bạn dựng được API an toàn, có lưu trữ. Giờ ta tập trung vào các mẫu giữ codebase **bảo trì được khi lớn lên hàng trăm file và nhiều kỹ sư**. Các mẫu này là từ vựng của kỹ thuật senior.
+Một service thường không trở nên khó bảo trì vì thiếu pattern. Nó trở nên khó bảo trì khi **một thay đổi nhỏ lan qua quá nhiều nơi**: đổi nhà cung cấp email nhưng phải sửa controller, test và database; thêm field vào đơn hàng nhưng làm hỏng ba worker; một dependency chậm kéo sập toàn bộ request path.
 
----
-
-## Tiêm phụ thuộc & đảo ngược điều khiển
-
-Vấn đề: khi một class tự tạo phụ thuộc, nó **gắn chặt** — không thể thay hay mock, test thành cực hình. **Nguyên lý đảo ngược phụ thuộc**: phụ thuộc vào **trừu tượng**, không phải cụ thể.
-
-```ts
-// ❌ Tightly coupled — welded to a specific Database
-class UserService { private db = new Database(); }
-
-// ✅ Injected — receives anything that satisfies the interface (mock it in tests)
-class UserService {
-  constructor(private readonly db: DatabasePort) {}
-}
-```
-
-Một container nhỏ lắp cả đồ thị đối tượng ở một chỗ, với **scope**:
-
-```ts
-type Factory<T> = (c: Container) => T;
-
-class Container {
-  private factories = new Map<string, Factory<unknown>>();
-  private singletons = new Map<string, unknown>();
-
-  register<T>(name: string, factory: Factory<T>, opts: { singleton?: boolean } = {}): void {
-    this.factories.set(name, opts.singleton
-      ? (c) => { if (!this.singletons.has(name)) this.singletons.set(name, factory(c)); return this.singletons.get(name); }
-      : factory);
-  }
-  get<T>(name: string): T {
-    const f = this.factories.get(name);
-    if (!f) throw new Error(`Service not registered: ${name}`);
-    return f(this) as T;
-  }
-}
-
-const c = new Container();
-c.register('db', () => new Database(), { singleton: true });   // one shared instance
-c.register('userService', (c) => new UserService(c.get('db'))); // new per resolve
-```
-
-Ba scope phải phân biệt: **singleton** (một cho app), **transient** (mới mỗi lần), **request-scoped** (một mỗi request).
-
-> Ghi chú senior: cho app thật dùng **awilix** hoặc **inversify**/**tsyringe**. NestJS (Phase 13) tích hợp DI làm lõi.
-
----
-
-## Repository, service & unit of work
-
-Phân tầng truy cập dữ liệu để logic nghiệp vụ không chạm thẳng ORM.
-
-```ts
-// Generic base repository — the only layer that talks to the ORM
-class BaseRepository<T extends object> {
-  constructor(protected readonly model: ModelStatic<T>) {}
-  findById = (id: string) => this.model.findByPk(id);
-  create = (data: Partial<T>) => this.model.create(data);
-}
-
-class UserRepository extends BaseRepository<User> {
-  findByEmail = (email: string) => this.model.findOne({ where: { email } });
-}
-
-// Service holds business rules — no ORM, no HTTP
-class UserService {
-  constructor(private readonly repo: UserRepository) {}
-  async registerUser(email: string, password: string) {
-    if (await this.repo.findByEmail(email)) throw new AppError('Email already exists', 409);
-    return this.repo.create({ email, password: await bcrypt.hash(password, 12) });
-  }
-}
-```
-
-Khi một hành động nghiệp vụ trải nhiều **repository** phải commit cùng nhau, bọc chúng trong một **Unit of Work** (một transaction truyền cho mỗi repository):
-
-```ts
-await uow.run(async (tx) => {
-  await orderRepo.create(order, tx);
-  await inventoryRepo.decrement(itemId, qty, tx);   // both commit or both roll back
-});
-```
-
----
-
-## Chiến lược caching & invalidation
-
-Caching là đòn bẩy hiệu năng lớn nhất của senior — và bài toán đúng-đắn khó nhất. Biết bốn chiến lược:
-
-| Chiến lược | Cách |
-| ----------------------- | -------------------------------------------------------- |
-| **Cache-aside**         | app checks cache → miss → read DB → fill cache (most common) |
-| **Read-through**        | the cache library reads the DB for you on a miss          |
-| **Write-through**       | write to cache + DB together (consistent, slower writes)  |
-| **Write-behind**        | write to cache now, flush to DB async (fast, riskier)     |
-
-```ts
-// Cache-aside with a generic helper
-async function cached<T>(key: string, ttl: number, load: () => Promise<T>): Promise<T> {
-  const hit = await redis.get(key);
-  if (hit) return JSON.parse(hit) as T;
-  const value = await load();
-  await redis.set(key, JSON.stringify(value), 'EX', ttl);
-  return value;
-}
-const user = await cached(`user:${id}`, 3600, () => userRepo.findById(id));
-```
-
-Hai phần khó:
-
-- **invalidation** — mỗi lần write, xóa key liên quan; thiết kế key để bạn *có thể*.
-- **stampede** — khi key nóng hết hạn, hàng nghìn request miss cùng lúc. Giảm bằng **lock** ngắn hoặc **stale-while-revalidate**.
-
----
-
-## Hàng đợi job nền (BullMQ)
-
-Việc chậm hoặc kém tin cậy **không được** chặn HTTP response. Đẩy vào **queue** và xử lý trong worker riêng.
+Mục tiêu của pattern trong production không phải làm sơ đồ đẹp. Mục tiêu là kiểm soát ba đại lượng:
 
 ```text
-HTTP request ─▶ add job to queue ─▶ respond 202 immediately
-                       │
-                       ▼ (separate worker process, scales independently)
-                  process job ──fail──▶ retry w/ backoff ──exhausted──▶ dead-letter
+change amplification  — một yêu cầu nghiệp vụ buộc sửa bao nhiêu module?
+blast radius          — một lỗi dependency ảnh hưởng bao nhiêu request?
+feedback time         — mất bao lâu để chứng minh thay đổi vẫn đúng?
 ```
 
-```ts
-import { Queue, Worker } from 'bullmq';
-const connection = { host: 'localhost', port: 6379 };
+Bài này dùng một service đặt hàng làm ví dụ xuyên suốt. Ta sẽ thêm cấu trúc vừa đủ để thay đổi an toàn, đồng thời chỉ rõ lúc nào một abstraction chưa đáng giá.
 
-const emailQueue = new Queue('email', { connection });
+## Sau bài này, bạn sẽ làm được gì?
 
-// Producer — enqueue and return fast. jobId makes it idempotent (dedupe).
-await emailQueue.add('welcome', { to: 'a@b.com' }, {
-  jobId: `welcome:${userId}`,
-  attempts: 3,
-  backoff: { type: 'exponential', delay: 5000 },
-  removeOnComplete: 1000,
-});
-
-// Repeatable (cron-like) job — e.g. nightly cleanup
-await emailQueue.add('digest', {}, { repeat: { pattern: '0 2 * * *' } });
-
-// Consumer — a separate worker file/process
-const worker = new Worker('email', async (job) => {
-  await sendEmail(job.data.to); // throwing triggers a retry
-}, { connection, concurrency: 5 });
-
-worker.on('failed', (job, err) => logger.error({ jobId: job?.id, err }, 'job failed'));
-process.on('SIGTERM', () => worker.close()); // finish active jobs, stop pulling new ones
-```
-
-Lập luận senior: thiết kế job **idempotent**, có **dead-letter** cho job độc, và tắt worker êm.
+- Chia code theo capability và xác định API công khai của từng module.
+- Đặt dependency injection ở **composition root**, không biến container thành service locator.
+- Chọn đúng ranh giới transaction; tránh generic repository che mất năng lực database.
+- Dùng cache và queue với tiêu chí nhất quán, idempotency và khả năng quan sát rõ ràng.
+- Thiết kế timeout, retry, bulkhead và circuit breaker từ failure mode thực tế.
+- Đo coupling bằng chỉ số và test kiến trúc thay vì dựa vào cảm giác.
 
 ---
 
-## Log có cấu trúc (pino/Winston)
+## Mental model: policy ở trong, mechanism ở ngoài
 
-`console.log` ổn cho script, sai cho service. Log production phải là **JSON có cấu trúc** để công cụ tìm và tổng hợp.
+Một codebase bền thường tách hai loại quyết định:
 
-```ts
-import pino from 'pino';
+- **Policy**: luật nghiệp vụ — đơn hàng nào được xác nhận, giá nào hợp lệ, khi nào hoàn tiền.
+- **Mechanism**: cách thực thi — Express nhận HTTP, PostgreSQL lưu dữ liệu, Redis cache, BullMQ chạy job.
 
-export const logger = pino({
-  level: process.env.LOG_LEVEL ?? 'info',
-  redact: ['req.headers.authorization', 'password', '*.password'], // never log secrets
-  base: { service: 'user-api' },
-});
+Policy thay đổi theo sản phẩm. Mechanism thay đổi theo hạ tầng. Trộn chúng làm cả hai cùng khó đổi.
 
-// A child logger binds context (request id) to every line it emits
-app.use((req, _res, next) => {
-  req.log = logger.child({ requestId: req.requestId });
-  next();
-});
-
-// Log structured objects, not interpolated strings — fields become searchable
-req.log.info({ userId: 123 }, 'user registered');
-req.log.error({ err }, 'db connection failed'); // pass the Error → captures stack
+```text
+HTTP adapter ─┐
+CLI adapter  ─┼──▶ application use case ─▶ domain policy
+queue worker ─┘              │
+                              ├──▶ repository port ─▶ PostgreSQL adapter
+                              ├──▶ mail port       ─▶ provider adapter
+                              └──▶ clock port      ─▶ system clock
 ```
 
-Thói quen senior: **log object + correlation id**, chọn **level** có chủ đích, và **che** secret. pino nhanh hơn; Winston linh hoạt hơn.
+Không cần framework kiến trúc để bắt đầu. Chỉ cần dependency luôn đi từ adapter vào policy và có một nơi duy nhất lắp ráp chúng.
+
+## Module trước, class sau
+
+Folder theo tầng kỹ thuật (`controllers/`, `services/`, `repositories/`) nhìn gọn lúc đầu nhưng làm một capability bị rải khắp cây thư mục. Khi sản phẩm lớn, ưu tiên **vertical module**:
+
+```text
+src/
+├── modules/
+│   ├── ordering/
+│   │   ├── domain/
+│   │   ├── application/
+│   │   ├── infrastructure/
+│   │   └── index.ts          # public API của module
+│   ├── inventory/
+│   └── notifications/
+├── platform/                 # config, logger, database, telemetry
+└── main.ts                   # composition root
+```
+
+Quy tắc biên:
+
+1. Module khác chỉ import từ `modules/ordering/index.ts`, không chui vào `infrastructure/`.
+2. Domain không import Express, ORM, Redis hay logger.
+3. Giao tiếp đồng bộ qua public API; giao tiếp bất đồng bộ qua event có schema và version.
+4. `shared/` không phải nơi đẩy mọi thứ khó đặt tên. Chỉ đặt primitive thật sự ổn định và không thuộc capability nào.
+
+**Decision criteria:** tách module khi nhóm code có từ vựng nghiệp vụ, vòng đời thay đổi hoặc owner riêng. Không tách chỉ vì file đã dài 300 dòng.
 
 ---
 
-## Cấu hình & secret — validate khi khởi động
+## Dependency injection và composition root
 
-App 12-factor đọc config từ env. Senior **validate một lần khi khởi động** để process crash ngay khi cấu hình sai thay vì lỗi bí ẩn về sau:
-
-```ts
-import { z } from 'zod';
-
-const Env = z.object({
-  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
-  PORT: z.coerce.number().default(3000),
-  DATABASE_URL: z.string().url(),
-  JWT_SECRET: z.string().min(32),
-});
-
-// Parse once; export typed, validated config. Fails fast with a clear message.
-export const env = Env.parse(process.env);
-```
-
----
-
-## Chiến lược validation — một nguồn sự thật
-
-cho project TypeScript-first, **Zod** là mặc định vì nó *suy ra* type tĩnh từ schema — một định nghĩa cho cả validation runtime **và** type compile-time:
+Dependency injection chỉ có một lời hứa: object nhận dependency từ bên ngoài thay vì tự tạo nó.
 
 ```ts
-import { z } from 'zod';
+export interface OrderRepository {
+  findById(id: string): Promise<Order | null>;
+  save(order: Order): Promise<void>;
+}
 
-const CreateUser = z.object({
-  email: z.string().email(),
-  password: z.string().min(8),
-});
-type CreateUser = z.infer<typeof CreateUser>; // the TS type, derived from the schema
-```
+export interface PaymentGateway {
+  authorize(input: {
+    orderId: string;
+    amount: number;
+  }): Promise<{ paymentId: string }>;
+}
 
-Joi cũng trưởng thành và mạnh; chọn một và nhất quán.
+export class ConfirmOrder {
+  constructor(
+    private readonly orders: OrderRepository,
+    private readonly payments: PaymentGateway
+  ) {}
 
----
+  async execute(orderId: string): Promise<void> {
+    const order = await this.orders.findById(orderId);
+    if (!order) throw new Error('ORDER_NOT_FOUND');
 
-## Mẫu chống chịu
+    const payment = await this.payments.authorize({
+      orderId,
+      amount: order.total,
+    });
 
-Lời gọi production sẽ hỏng; senior lên kế hoạch cho điều đó.
-
-- **retry với backoff mũ + jitter** — cho lỗi tạm thời.
-- **timeout mọi thứ** — mỗi lời gọi outbound có `AbortSignal.timeout`.
-- **circuit breaker** — sau N lỗi liên tiếp, "mở" mạch và fail nhanh một lúc.
-- **bulkhead** — giới hạn concurrency mỗi dependency.
-- **outbox** — ghi sự kiện vào bảng `outbox` trong cùng transaction rồi chuyển tiếp.
-
-```ts
-async function retry<T>(fn: () => Promise<T>, tries = 3, base = 200): Promise<T> {
-  for (let i = 0; ; i++) {
-    try { return await fn(); }
-    catch (err) {
-      if (i >= tries - 1) throw err;
-      const delay = base * 2 ** i + Math.random() * 100; // backoff + jitter
-      await new Promise((r) => setTimeout(r, delay));
-    }
+    order.confirm(payment.paymentId);
+    await this.orders.save(order);
   }
 }
 ```
 
+Lắp object graph ở entry point:
+
+```ts
+// main.ts — composition root
+const pool = createPostgresPool(env.DATABASE_URL);
+const logger = createLogger(env.LOG_LEVEL);
+
+const orders = new PostgresOrderRepository(pool);
+const payments = new RetryingPaymentGateway(
+  new StripePaymentGateway(env.STRIPE_KEY),
+  logger
+);
+
+const confirmOrder = new ConfirmOrder(orders, payments);
+const app = createHttpApp({ confirmOrder, logger });
+```
+
+Container như Awilix, tsyringe hoặc DI của NestJS hữu ích khi object graph lớn, nhưng có hai failure mode:
+
+- **Service locator:** code gọi `container.resolve()` ở mọi nơi, làm dependency bị ẩn và test khó hiểu.
+- **Sai scope:** object giữ state theo request lại được đăng ký singleton, gây rò dữ liệu giữa người dùng.
+
+Giữ container trong composition root. Constructor vẫn phải nói rõ class cần gì. Scope mặc định nên là singleton cho stateless adapter, transient cho object có state ngắn; request scope chỉ dùng khi thật sự cần vì nó tăng allocation và làm lifecycle phức tạp.
+
 ---
 
-## Các mẫu GoF hữu ích trong Node
+## Repository và transaction boundary
 
-- tập trung tạo đối tượng.
-- đổi thuật toán lúc chạy.
-- bọc SDK bên thứ ba sau một port.
-- `EventEmitter` cho pub/sub trong tiến trình.
-- bọc hàm để thêm cache/log/đo mà không sửa nó.
+Repository là port theo ngôn ngữ nghiệp vụ, không phải bản sao generic của ORM.
 
-> Đừng áp mẫu cho có: một mẫu chỉ chính đáng khi nó loại trùng lặp hay coupling thật. Trừu tượng sớm tốn kém như không có.
+```ts
+// Có ý nghĩa với use case
+interface OrderRepository {
+  findPendingForCustomer(customerId: string): Promise<Order[]>;
+  reserveOrderNumber(): Promise<string>;
+  save(order: Order, tx?: Transaction): Promise<void>;
+}
+
+// Thường quá chung, làm mất query semantics và type
+interface GenericRepository<T> {
+  find(filter: Record<string, unknown>): Promise<T[]>;
+  update(id: string, patch: Partial<T>): Promise<T>;
+}
+```
+
+Một transaction nên bao quanh **một invariant cần commit nguyên tử**, không bao quanh toàn request nếu request còn gọi mạng.
+
+```ts
+await unitOfWork.run(async (tx) => {
+  const order = await orders.lockById(command.orderId, tx);
+  order.reserve(command.quantity);
+
+  await orders.save(order, tx);
+  await inventory.decrement(order.sku, command.quantity, tx);
+});
+```
+
+Không gọi payment API trong transaction trên. Network có thể chậm hoặc timeout, giữ lock lâu và làm throughput database sụt. Nếu workflow phải đi qua nhiều hệ thống, mô hình hóa trạng thái trung gian và idempotency; phần 10 sẽ đặt transactional outbox và saga vào đúng ranh giới.
+
+**Observability:** ghi `transaction_duration_ms`, số lần deadlock/serialization retry và thời gian chờ pool. Một transaction đúng về code nhưng chờ lock 8 giây vẫn là vấn đề production.
 
 ---
 
-## 7. Dự án thực hành
+## Validation theo từng trust boundary
 
-1. DI container có scope: cài `Container`; đổi `db` sang fake và chứng minh không gì khác đổi.
+TypeScript chỉ bảo vệ code đã type-check; JSON từ HTTP, queue hay env vẫn là dữ liệu không tin cậy. Validate ở biên rồi chuyển thành type nội bộ.
 
-2. Repository + service + unit of work: tái cấu trúc thành controller→service→repository, thêm hành động order+inventory trong một transaction.
+```ts
+import { z } from 'zod';
 
-3. Cache có invalidation & chống stampede: thêm cache-aside, invalidate khi write, và lock để hết hạn không stampede.
+const ConfirmOrderInput = z.object({
+  orderId: z.string().uuid(),
+  expectedVersion: z.number().int().nonnegative(),
+});
 
-4. Queue BullMQ: enqueue job idempotent, xử lý concurrency 5, ép lỗi xác nhận retry, thêm job lặp lại, đóng worker khi `SIGTERM`.
+type ConfirmOrderInput = z.infer<typeof ConfirmOrderInput>;
 
-5. Log có cấu trúc: thêm pino có redaction và child logger mỗi request; xác nhận secret bị che và mỗi dòng có request id.
+app.post('/orders/:id/confirm', async (req, res) => {
+  const input = ConfirmOrderInput.parse({
+    orderId: req.params.id,
+    expectedVersion: req.body.expectedVersion,
+  });
 
-6. Config + chống chịu: validate env bằng Zod khi boot; bọc lời gọi yếu trong retry + timeout + circuit breaker.
+  await confirmOrder.execute(input);
+  res.status(204).end();
+});
+```
+
+Không truyền thẳng DTO vào domain. DTO mô tả contract bên ngoài; domain type mô tả invariant bên trong. Hai thứ có thể giống hình dạng hôm nay nhưng có lý do thay đổi khác nhau.
+
+Config cũng là input:
+
+```ts
+const Env = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']),
+  DATABASE_URL: z.string().url(),
+  PAYMENT_TIMEOUT_MS: z.coerce.number().int().positive().max(30_000),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+});
+
+export const env = Env.parse(process.env); // fail fast trước khi nhận traffic
+```
+
+---
+
+## Resilience: budget trước, pattern sau
+
+Mỗi request có một latency budget. Nếu API cam kết p99 dưới 800 ms, không thể cho ba dependency mỗi cái retry ba lần với timeout 2 giây.
+
+```text
+request budget 800 ms
+├── parse/auth        40 ms
+├── database         180 ms
+├── payment          350 ms (gồm tối đa một retry)
+├── serialize/network 80 ms
+└── reserve          150 ms
+```
+
+### Timeout và retry có phân loại
+
+Chỉ retry operation **idempotent** và lỗi tạm thời. Không retry lỗi validation, authentication hay phần lớn `4xx`.
+
+```ts
+const retryable = new Set([408, 429, 502, 503, 504]);
+
+async function fetchJson(url: string, init: RequestInit, attempts = 2) {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const response = await fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(350),
+      });
+
+      if (!response.ok && !retryable.has(response.status)) {
+        throw new Error(`PERMANENT_HTTP_${response.status}`);
+      }
+      if (!response.ok) throw new Error(`TRANSIENT_HTTP_${response.status}`);
+
+      return response.json();
+    } catch (error) {
+      lastError = error;
+      if (attempt === attempts || String(error).includes('PERMANENT_HTTP'))
+        throw error;
+
+      const backoff = 50 * 2 ** (attempt - 1);
+      const jitter = Math.random() * backoff;
+      await new Promise((resolve) => setTimeout(resolve, backoff + jitter));
+    }
+  }
+
+  throw lastError;
+}
+```
+
+Retry làm tăng tải đúng lúc dependency đang yếu. Luôn giới hạn attempt, thêm jitter, log `attempt` và đo `retry_total{dependency,reason}`.
+
+### Bulkhead và circuit breaker
+
+- **Bulkhead** giới hạn concurrency riêng cho từng dependency để payment chậm không chiếm toàn bộ socket/promise của process.
+- **Circuit breaker** fail nhanh khi tỷ lệ lỗi vượt ngưỡng, sau đó cho một lượng request nhỏ thăm dò phục hồi.
+
+Không dùng circuit breaker như phép màu. Cần định nghĩa trạng thái fallback: trả dữ liệu cũ, đưa job vào queue, hay trả `503` có `Retry-After`. Nếu không có fallback hợp lệ, breaker vẫn hữu ích để bảo vệ tài nguyên nhưng không tạo ra availability từ hư không.
+
+---
+
+## Cache và queue: hai loại bất đồng bộ khác nhau
+
+### Cache
+
+Cache đổi **độ mới dữ liệu** lấy latency và tải thấp hơn. Trước khi thêm cache, viết ra:
+
+| Câu hỏi               | Ví dụ quyết định                                 |
+| --------------------- | ------------------------------------------------ |
+| Chấp nhận cũ bao lâu? | Product catalog: 60 giây; số dư: không chấp nhận |
+| Ai invalidate?        | Use case ghi dữ liệu xóa key liên quan           |
+| Khi Redis lỗi?        | Bỏ qua cache và đọc DB với concurrency limit     |
+| Làm gì khi stampede?  | TTL jitter + single-flight cho key nóng          |
+| Đo gì?                | hit ratio, load latency, stale serve, eviction   |
+
+```ts
+async function cached<T>(
+  key: string,
+  ttlSeconds: number,
+  load: () => Promise<T>
+): Promise<T> {
+  const hit = await redis.get(key);
+  if (hit !== null) return JSON.parse(hit) as T;
+
+  const value = await load();
+  const ttlWithJitter =
+    ttlSeconds + Math.floor(Math.random() * ttlSeconds * 0.1);
+  await redis.set(key, JSON.stringify(value), 'EX', ttlWithJitter);
+  return value;
+}
+```
+
+Cache-aside có race giữa write và invalidate. Nếu tính đúng đắn quan trọng, cân nhắc version trong key, write-through hoặc bỏ cache ở path đó.
+
+### Queue
+
+Queue tách thời điểm **chấp nhận công việc** khỏi thời điểm **hoàn tất công việc**. HTTP `202 Accepted` chỉ đúng khi API có cách cho client biết trạng thái sau đó.
+
+```ts
+await emailQueue.add(
+  'send-order-confirmation',
+  { orderId, customerId },
+  {
+    jobId: `order-confirmation:${orderId}`,
+    attempts: 5,
+    backoff: { type: 'exponential', delay: 1_000 },
+    removeOnComplete: 1_000,
+  }
+);
+```
+
+`jobId` hỗ trợ dedup trong queue nhưng không thay thế idempotency ở side effect. Worker vẫn cần khóa nghiệp vụ hoặc bảng `processed_jobs`, vì job có thể chạy lại sau crash ở thời điểm khó xác định.
+
+```ts
+const worker = new Worker('email', handleEmailJob, {
+  connection,
+  concurrency: 10,
+});
+
+worker.on('completed', (job) =>
+  metrics.jobsCompleted.add(1, { name: job.name })
+);
+worker.on('failed', (job, error) => {
+  logger.error({ jobId: job?.id, error }, 'background job failed');
+});
+
+process.once('SIGTERM', async () => {
+  await worker.close(); // ngừng nhận job mới và chờ job đang chạy
+});
+```
+
+Theo dõi queue depth, tuổi job lâu nhất, processing latency, retry và failed jobs. Queue còn trống không có nghĩa hệ thống khỏe nếu producer đã ngừng enqueue.
+
+---
+
+## Structured logging và context theo request
+
+Log là event có schema, không phải câu văn tự do. Mỗi dòng nên trả lời được: chuyện gì, ở service nào, request/job nào, entity nào, kết quả và duration.
+
+```ts
+import { AsyncLocalStorage } from 'node:async_hooks';
+import pino from 'pino';
+
+type RequestContext = { requestId: string; traceId?: string };
+const context = new AsyncLocalStorage<RequestContext>();
+
+const logger = pino({
+  level: env.LOG_LEVEL,
+  base: { service: 'ordering-api' },
+  redact: ['req.headers.authorization', '*.password', '*.token'],
+});
+
+app.use((req, _res, next) => {
+  context.run(
+    { requestId: req.header('x-request-id') ?? crypto.randomUUID() },
+    next
+  );
+});
+
+function logInfo(fields: Record<string, unknown>, message: string) {
+  logger.info({ ...context.getStore(), ...fields }, message);
+}
+```
+
+Không log payload tùy tiện: PII và secret có thể đi vào hệ thống log lâu hơn database. Đặt redaction test trong CI và sampling cho event volume cao.
+
+---
+
+## Decision table: pattern nào đáng trả chi phí?
+
+| Pattern         | Dùng khi                                                 | Tránh khi                                              |
+| --------------- | -------------------------------------------------------- | ------------------------------------------------------ |
+| Port/adapter    | Có dependency bên ngoài hoặc nhiều cách triển khai       | Hàm nội bộ thuần, không có boundary                    |
+| Repository      | Cần ngôn ngữ query theo domain và tách persistence       | Chỉ bọc từng method ORM 1:1                            |
+| Unit of Work    | Một invariant cần nhiều write nguyên tử                  | Workflow có network call dài                           |
+| Cache           | Đọc lặp, staleness định lượng được                       | Dữ liệu phải strong-consistent                         |
+| Queue           | Công việc có thể hoàn tất sau response, cần retry/buffer | Client cần kết quả ngay trong cùng request             |
+| Retry           | Lỗi tạm thời, operation idempotent                       | Lỗi vĩnh viễn hoặc side effect không dedup             |
+| Circuit breaker | Dependency lỗi kéo dài và cần bảo vệ tài nguyên          | Traffic thấp, không đủ tín hiệu hoặc không có fallback |
+
+Pattern được chấp nhận khi có **constraint**, **failure mode** và **metric** đi cùng. Nếu không viết được ba thứ đó, abstraction có thể đang đến quá sớm.
+
+## Checklist review codebase
+
+- [ ] Capability có public API và không bị import xuyên tầng.
+- [ ] Domain/application không import framework hoặc SDK hạ tầng.
+- [ ] Object graph được lắp ở composition root; dependency hiện rõ trên constructor.
+- [ ] Transaction bao quanh invariant, không giữ lock qua network call.
+- [ ] Input HTTP, event và env được validate tại boundary.
+- [ ] Mỗi outbound call có timeout; retry được phân loại và có budget.
+- [ ] Cache có staleness budget, invalidation owner và metric hit/miss.
+- [ ] Job có idempotency key, retry policy, failed-job handling và graceful shutdown.
+- [ ] Log có request/trace/job id, redaction và retention phù hợp.
+- [ ] Dashboard thể hiện latency, error, saturation và dependency health.
+
+## Lab: làm cho module Ordering thay đổi được
+
+Xây một module `ordering` có endpoint xác nhận đơn, PostgreSQL, Redis và BullMQ.
+
+### Yêu cầu
+
+1. Tạo public API cho module; cấm import trực tiếp vào `infrastructure/`.
+2. Cài `ConfirmOrder` với `OrderRepository` và `PaymentGateway` port; lắp adapter ở `main.ts`.
+3. Validate input và env bằng Zod.
+4. Thêm timeout, tối đa một retry có jitter cho payment; giới hạn concurrency dependency.
+5. Cache order summary với TTL jitter và invalidation sau write.
+6. Enqueue email xác nhận bằng idempotency key; worker đóng êm khi nhận `SIGTERM`.
+7. Gắn structured log và metric cho request, payment, cache và queue.
+
+### Acceptance criteria
+
+- Đổi payment adapter sang fake mà không sửa use case hoặc HTTP handler.
+- Test kiến trúc fail nếu module khác import `ordering/infrastructure/*`.
+- Payment trả `400` không bị retry; `503` chỉ retry trong latency budget.
+- Hai lần enqueue cùng order không gửi hai email.
+- Redis down không làm request treo; fallback và metric được ghi rõ.
+- `SIGTERM` không nhận job mới, job đang chạy hoàn tất trong grace period.
+- Dashboard phân biệt được lỗi app, lỗi payment, cache miss và queue backlog.
+
+## Tài liệu chính thức
+
+- [Node.js — AsyncLocalStorage](https://nodejs.org/api/async_context.html)
+- [Node.js — AbortSignal.timeout](https://nodejs.org/api/globals.html#static-method-abortsignaltimeoutdelay)
+- [Zod — Basic usage](https://zod.dev/basics)
+- [Pino — API và redaction](https://getpino.io/#/docs/api?id=redact)
+- [BullMQ — Idempotent jobs](https://docs.bullmq.io/patterns/idempotent-jobs)
+- [BullMQ — Graceful shutdown](https://docs.bullmq.io/guide/workers/graceful-shutdown)
 
 ---
 
 ## Phần tiếp theo
 
-Bạn đã thêm bộ công cụ senior: DI/IoC có scope, repository + service + unit of work, chiến lược caching với invalidation an toàn, queue BullMQ, log có cấu trúc, validate config khi khởi động, và mẫu chống chịu.
-
-Ở **Phase 7**, ta ship nó: **DevOps & triển khai** — quản lý env/config, Docker và Compose, PM2 cluster, health check, và pipeline CI/CD đầy đủ với GitHub Actions.
+Codebase đã có ranh giới, nhưng ranh giới chỉ có giá trị khi artifact chạy giống nhau ở mọi môi trường và có quy trình phát hành an toàn. **Phần 7** chuyển từ cấu trúc trong source code sang contract vận hành: image bất biến, probe, graceful shutdown, migration, rollout, rollback và quan sát deployment.

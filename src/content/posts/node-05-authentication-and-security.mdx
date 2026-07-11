@@ -1,14 +1,33 @@
 ---
-title: 'Node.js Super Senior · Phase 5 — Authentication & Security'
-description: 'Phase 5: lock down your API — password hashing with bcrypt/argon2, sessions vs JWT (anatomy, refresh tokens, rotation), secure cookies, OAuth2/OIDC, RBAC and ownership checks, and defenses against XSS, CSRF and injection.'
+title: 'Node.js Production Engineering 05 — Authentication và API Security'
+description: 'Thiết kế authentication và API security theo threat model: password hashing, session/JWT, cookie, OAuth/OIDC, authorization và defense-in-depth.'
 pubDate: 2026-06-09
-tags: [nodejs, authentication, security, jwt, node_10]
+updatedDate: 2026-07-11
+tags:
+  [
+    nodejs,
+    authentication,
+    api-security,
+    identity-architecture,
+    production-engineering,
+  ]
 series: nodejs
 seriesOrder: 5
 draft: false
 ---
 
-Đây là **Phase 5 của lộ trình Super Senior 10 phase**. API của bạn chạy và lưu dữ liệu. Giờ ta làm nó an toàn trên internet mở, nơi mọi endpoint bị dò chỉ vài phút sau khi lên. Bảo mật là nơi đi tắt gây rò rỉ — senior coi nó là mặc định, không phải tính năng.
+Một access token có chữ ký hợp lệ không chứng minh người gọi được xóa resource. Nó chỉ chứng minh token thỏa điều kiện xác minh; authorization vẫn phải xét tenant, ownership, trạng thái tài khoản và policy hiện tại. Nhiều sự cố auth bắt đầu từ việc gộp tất cả các câu hỏi đó thành một middleware `isLoggedIn`.
+
+Bài này dùng **Node.js 24 LTS** và Express 5 để xây baseline security theo threat model. Sau khi đọc, bạn có thể:
+
+- tách authentication, session management và authorization thành các boundary độc lập;
+- chọn password hashing parameters bằng benchmark trên hạ tầng thật;
+- chọn server-side session hoặc token theo revocation, topology và client;
+- thiết kế cookie, CSRF, refresh rotation và logout như protocol, không chỉ helper;
+- kiểm tra role/permission/ownership ở đúng data boundary;
+- trả auth error cho frontend mà không tạo vòng refresh hoặc lộ thông tin tài khoản.
+
+**Phạm vi:** đây là nền tảng cho web/API thông thường. Hệ identity đa tenant, JWKS rotation và authorization sâu được mở rộng ở [Phần 15](/blog/node-15-auth-jwt-oauth-rbac/). Với rủi ro cao, hãy dùng identity provider/thư viện trưởng thành và security review độc lập.
 
 Trước hết, hai từ người ta hay nhập nhằng:
 
@@ -21,46 +40,83 @@ prove identity (login)          check permissions (role / ownership)
   issue a session/token          gate the route / the row
 ```
 
-Nhầm chúng là nguồn lỗi kiểm soát truy cập số 1.
+Authentication tạo principal; authorization quyết định principal đó được làm gì trên resource cụ thể. Session management nối principal với các request sau. Ba lớp liên quan nhưng không thay thế nhau.
+
+---
+
+## Threat model trước thư viện
+
+```text
+credentials ─▶ login ─▶ session/token ─▶ request principal ─▶ policy ─▶ resource
+     │            │            │                 │               │
+ credential    enumeration  theft/replay     forged context   IDOR/tenant leak
+ stuffing      brute force  fixation/CSRF    stale privilege  missing ownership
+```
+
+Tài sản cần bảo vệ gồm password hash, session/refresh token, signing key, dữ liệu cá nhân và audit trail. Attacker có thể kiểm soát browser input, đánh cắp database, chèn script qua XSS, gửi cross-site request, replay token hoặc gọi thẳng API bỏ qua UI. Mỗi lớp phòng thủ nên giảm một rủi ro cụ thể và vẫn hữu ích khi lớp khác thất bại.
+
+Các invariant tối thiểu:
+
+- credential không xuất hiện trong log, URL, analytics hoặc error response;
+- đổi privilege, khóa tài khoản hoặc logout có revocation semantics đã công bố;
+- mọi resource query bị giới hạn bởi tenant/ownership phía server;
+- auth endpoint có abuse control, audit event và response không giúp enumeration;
+- secret/signing key có owner, rotation và rollback plan.
 
 ---
 
 ## Bản đồ thư viện auth của Node
 
-Bạn không tự viết crypto — bạn lắp ráp các thư viện đã kiểm chứng. Biết mỗi cái *dùng để làm gì*:
+Không tự thiết kế password hash, token format hay OAuth protocol. Chọn primitive/implementation được review, pin version, theo dõi advisory và hiểu boundary của nó:
 
-| Thư viện | Việc |
-| -------------------------- | ----------------------------------------------------- |
-| `bcrypt` / `argon2`        | hash mật khẩu |
-| `jsonwebtoken`             | ký + xác minh JWT |
-| `passport` (+ strategies)  | middleware auth cắm được |
-| `express-session`          | session phía server |
-| `connect-redis`            | lưu session trong Redis |
-| `cookie-parser`            | đọc/ký cookie |
-| `helmet`                   | đặt ~15 header bảo mật |
-| `express-rate-limit`       | kìm lạm dụng |
-| `csrf-csrf` / `csrf-sync`  | token CSRF |
-| `zod`                      | validate + type input |
+| Thư viện                  | Việc                                    |
+| ------------------------- | --------------------------------------- |
+| `bcrypt` / `argon2`       | hash mật khẩu                           |
+| `jose` / `jsonwebtoken`   | ký, mã hóa khi cần và xác minh JOSE/JWT |
+| `passport` (+ strategies) | middleware auth cắm được                |
+| `express-session`         | session phía server                     |
+| `connect-redis`           | lưu session trong Redis                 |
+| `cookie-parser`           | đọc/ký cookie                           |
+| `helmet`                  | đặt baseline security header            |
+| `express-rate-limit`      | kìm lạm dụng                            |
+| `csrf-csrf` / `csrf-sync` | token CSRF                              |
+| `zod`                     | validate + type input                   |
 
-Phân chia tư duy: **bcrypt/argon2 bảo vệ mật khẩu khi lưu; jsonwebtoken/express-session mang danh tính giữa các request; helmet/rate-limit/zod/csrf phòng thủ vành đai**.
+Phân chia trách nhiệm: **Argon2id/bcrypt bảo vệ verifier khi database bị lộ; session/JWT mang bằng chứng danh tính giữa request; Helmet/rate limit/validation/CSRF là các lớp phòng thủ khác nhau**. Thư viện không chọn policy, TTL, key rotation hoặc authorization thay hệ thống.
 
 ---
 
 ## Hash mật khẩu — phải đúng chính xác
 
-Bạn **không bao giờ** lưu mật khẩu, kể cả mã hóa (mã hóa đảo ngược được) — bạn lưu một **hash** một chiều. Và không phải hash *nhanh* như `sha256` — nhanh là dở, vì kẻ trộm DB có thể thử hàng tỷ lần đoán mỗi giây. Dùng thuật toán **chậm, có salt, dành riêng cho mật khẩu**: **bcrypt** hoặc **argon2**.
+Không lưu plaintext password hoặc encryption có thể đảo ngược. Lưu verifier bằng password hashing function chậm và có salt. Với hệ thống mới, OWASP ưu tiên **Argon2id**; bcrypt phù hợp cho hệ legacy nhưng có giới hạn input 72 byte.
+
+```ts
+import argon2 from 'argon2';
+
+const ARGON2_OPTIONS = {
+  type: argon2.argon2id,
+  memoryCost: 19_456, // KiB
+  timeCost: 2,
+  parallelism: 1,
+} as const;
+
+const hash = await argon2.hash(plainPassword, ARGON2_OPTIONS);
+const ok = await argon2.verify(user.passwordHash, attempt);
+```
+
+Các giá trị trên là baseline tối thiểu tham khảo, không phải con số capacity cuối. Benchmark trên instance production nhỏ nhất, đặt latency budget cho login và kiểm tra memory/concurrency để endpoint auth không tự làm cạn worker pool. Khi tăng parameter, dùng `argon2.needsRehash()` và rehash sau lần login thành công.
+
+Bcrypt vẫn cần được hiểu khi migrate hệ thống cũ:
 
 ```ts
 import bcrypt from 'bcrypt';
 
-// On register: cost factor 12 ≈ ~250ms per hash (tune to your hardware)
+// Đo trên hardware thật; OWASP khuyến nghị work factor tối thiểu 10 cho bcrypt.
 const hash = await bcrypt.hash(plainPassword, 12);
-
-// On login: compare is constant-time and reads the salt+cost FROM the hash string
 const ok = await bcrypt.compare(attempt, user.passwordHash);
 ```
 
-Một hash bcrypt thực chất chứa gì — salt và cost đi *bên trong* nó:
+Một hash bcrypt thực chất chứa gì — salt và cost đi _bên trong_ nó:
 
 ```text
 $2b$12$eImiTXuWVxfM37uY4JANjQ.gT1f...   ← stored in the DB
@@ -69,20 +125,22 @@ $2b$12$eImiTXuWVxfM37uY4JANjQ.gT1f...   ← stored in the DB
  └ algorithm version (bcrypt)
 ```
 
-Chi tiết senior tách bạn khỏi tutorial:
+Các chi tiết ảnh hưởng trực tiếp tới thiết kế:
 
 - **salt đánh bại rainbow table** — salt ngẫu nhiên riêng mỗi user; bcrypt/argon2 tự sinh và nhúng.
-- **cost factor là núm vặn** — tăng khi phần cứng nhanh hơn.
-- **bcrypt cắt ở 72 byte** — pre-hash bằng SHA-256 nếu cho phép passphrase rất dài.
-- **argon2id tốt nhất hiện nay** — khó về bộ nhớ, kháng GPU; ưu tiên cho hệ thống mới.
+- **cost factor là núm vặn** — tăng dần khi hardware nhanh hơn và rehash có kiểm soát.
+- **bcrypt chỉ dùng 72 byte đầu trong phần lớn implementation** — enforce limit theo **byte**, hoặc migrate sang Argon2id; không tự pre-hash nếu chưa đánh giá password-shucking/null-byte risk.
+- **pepper** có thể thêm defense-in-depth nếu nằm trong secret manager/HSM tách khỏi database, nhưng phải có rotation/recovery plan.
 
 ```ts
-import argon2 from 'argon2';
-const hash = await argon2.hash(plainPassword, { type: argon2.argon2id });
-const ok = await argon2.verify(user.passwordHash, attempt);
+const stored = user?.passwordHash ?? process.env.DUMMY_PASSWORD_HASH!;
+const passwordMatches = await argon2.verify(stored, attempt);
+if (!user || !passwordMatches) {
+  throw new InvalidCredentialsError(); // cùng status/code/message cho cả hai trường hợp
+}
 ```
 
-> Chống dò tài khoản: trả **cùng một lỗi chung** cho "không có user" và "sai mật khẩu", và lý tưởng là cùng thời gian — nếu không kẻ tấn công biết email nào tồn tại.
+> Dùng dummy hash cùng parameter khi user không tồn tại để giảm timing difference, trả cùng error contract, rồi rate-limit theo cả account key đã normalize và nguồn request. Timing hoàn toàn giống nhau qua mạng là mục tiêu khó; defense-in-depth còn gồm MFA, breached-password check và monitoring credential stuffing.
 
 ---
 
@@ -95,27 +153,30 @@ Set-Cookie: sid=abc123; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400
                          │         │       │             │       │
    JS can't read it ◄────┘         │       │             │       └ lifetime (seconds)
    (blunts XSS theft)              │       │             └ which paths send it
-   HTTPS only ◄───────────────────┘       └ not sent on cross-site requests
-   (no plaintext leak)                       (blunts CSRF)
+   HTTPS only ◄───────────────────┘       └ controls selected cross-site sends
+   (no plaintext transport)                  (reduces, not eliminates, CSRF)
 ```
 
-| Thuộc tính | Chống |
-| ------------------------ | --------------------------------------------------- |
-| `HttpOnly`               | XSS reading the token via `document.cookie`          |
-| `Secure`                 | rò qua HTTP thường |
-| `SameSite=Lax/Strict`    | CSRF |
-| `__Host-` name prefix    | giả mạo |
+| Thuộc tính            | Chống                                                         |
+| --------------------- | ------------------------------------------------------------- |
+| `HttpOnly`            | XSS reading the token via `document.cookie`                   |
+| `Secure`              | rò qua HTTP thường                                            |
+| `SameSite=Lax/Strict` | giảm cross-site cookie attachment theo navigation context     |
+| `__Host-` name prefix | buộc Secure, Path=/ và không có Domain; giảm cookie shadowing |
 
 ```ts
-res.cookie('sid', id, {
+res.cookie('__Host-sid', id, {
   httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'lax',         // 'strict' for max safety; 'none' (with Secure) only for cross-site
-  maxAge: 86_400_000,      // ms in Express
+  secure: true,
+  sameSite: 'lax', // chọn theo flow; 'none' bắt buộc đi cùng Secure
+  path: '/', // __Host- yêu cầu Path=/ và không có Domain
+  maxAge: 86_400_000, // ms in Express
 });
 ```
 
-> Quy tắc vàng: **đừng bao giờ lưu token auth trong `localStorage`** — XSS nào cũng đọc được. Cookie `HttpOnly` vô hình với JS.
+`HttpOnly` ngăn JavaScript đọc cookie nhưng XSS vẫn có thể gửi request dưới phiên của nạn nhân. `SameSite=Lax` vẫn gửi cookie trong một số top-level navigation an toàn; endpoint thay đổi state không được dùng `GET`. Với cookie-authenticated mutation, dùng SameSite phù hợp **và** CSRF token/origin checks theo threat model.
+
+Không lưu session id, refresh token hoặc bearer credential dài hạn trong `localStorage`/`sessionStorage`: JavaScript cùng origin đọc được chúng khi có XSS. Với browser app, ưu tiên cookie `HttpOnly; Secure` hoặc BFF; response chứa session/token cần `Cache-Control: no-store`.
 
 ---
 
@@ -136,16 +197,27 @@ import session from 'express-session';
 import { RedisStore } from 'connect-redis';
 import { Redis } from 'ioredis';
 
-app.use(session({
-  store: new RedisStore({ client: new Redis(process.env.REDIS_URL) }), // shared across servers
-  secret: process.env.SESSION_SECRET!,   // signs the cookie so it can't be forged
-  resave: false,
-  saveUninitialized: false,
-  cookie: { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 86_400_000 },
-}));
+app.use(
+  session({
+    store: new RedisStore({ client: new Redis(process.env.REDIS_URL) }), // shared across servers
+    name: '__Host-sid',
+    secret: process.env.SESSION_SECRET!, // ký cookie id; không mã hóa session data
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 86_400_000,
+    },
+  })
+);
 ```
 
-Siêu năng lực của session: **thu hồi tức thì** — xóa session trong Redis là user đăng xuất mọi nơi ngay lập tức. Cái giá: một lần tra store mỗi request và một store dùng chung.
+Sau login hoặc privilege change, gọi `req.session.regenerate()` rồi mới gắn principal để chống session fixation. Logout phải destroy server-side session và clear cookie với cùng `name/path/sameSite/secure` attributes. Nếu Redis unavailable, policy thường là fail closed cho endpoint cần auth; đừng âm thầm tạo session memory cục bộ trên từng replica.
+
+Session cho phép thu hồi bằng cách xóa record server-side và dễ quản lý "logout all devices" nếu lưu index theo user. Đổi lại, mỗi request cần store lookup, TTL touch policy và một shared store có capacity/availability rõ. `SESSION_SECRET` cần đủ entropy và rotation; một số middleware nhận mảng secret để verify bằng key cũ trong lúc ký bằng key mới.
 
 ---
 
@@ -154,7 +226,7 @@ Siêu năng lực của session: **thu hồi tức thì** — xóa session trong
 JWT là **ba phần Base64URL nối bằng dấu chấm**: `header.payload.signature`.
 
 ```text
-eyJhbGciOiJIUzI1NiJ9 . eyJzdWIiOiIxMjMiLCJleHAiOjE3...} . 3Txs9...K2
+eyJhbGciOiJIUzI1NiJ9 . eyJzdWIiOiIxMjMiLCJleHAiOjE3... . 3Txs9...K2
 └──── HEADER ────────┘ └──────── PAYLOAD ───────────┘   └─ SIGNATURE ─┘
  { "alg":"HS256",        { "sub":"123",                   HMAC_SHA256(
    "typ":"JWT" }           "role":"admin",                  header.payload,
@@ -164,69 +236,102 @@ eyJhbGciOiJIUzI1NiJ9 . eyJzdWIiOiIxMjMiLCJleHAiOjE3...} . 3Txs9...K2
 
 Hai sự thật ngăn mọi lỗi JWT:
 
-1. **payload được *ký*, không *mã hóa*** — ai cũng decode đọc được. Đừng để bí mật trong JWT.
+1. **payload được _ký_, không _mã hóa_** — ai cũng decode đọc được. Đừng để bí mật trong JWT.
 2. **chữ ký chứng minh toàn vẹn** — đổi một ký tự payload là chữ ký không khớp secret nữa, server từ chối.
 
-Các **claim** chuẩn: `sub` ....
+Các claim cần validate theo contract: `iss` (issuer), `aud` (đúng API nhận token), `sub` (subject ổn định), `exp`/`nbf` (cửa sổ thời gian), `iat` và `jti` khi cần định danh token. Decode payload không phải verify.
 
 ```ts
 import jwt from 'jsonwebtoken';
+import { randomUUID } from 'node:crypto';
 
 const accessToken = jwt.sign(
-  { sub: user.id, role: user.role },     // payload (claims)
-  process.env.JWT_SECRET!,               // secret (HS256) — or a private key (RS256)
-  { expiresIn: '15m', issuer: 'api.example.com' },
+  { sub: user.id, scope: ['posts:read'] },
+  process.env.JWT_SECRET!,
+  {
+    algorithm: 'HS256',
+    expiresIn: '15m',
+    issuer: 'https://auth.example.com',
+    audience: 'https://api.example.com',
+    jwtid: randomUUID(),
+  }
 );
 
-// Verifying throws on bad signature OR expiry — always wrap in try/catch
+// Pin algorithm, issuer và audience; không lấy policy verify từ header của token.
 try {
-  const payload = jwt.verify(token, process.env.JWT_SECRET!, { issuer: 'api.example.com' });
+  const payload = jwt.verify(token, process.env.JWT_SECRET!, {
+    algorithms: ['HS256'],
+    issuer: 'https://auth.example.com',
+    audience: 'https://api.example.com',
+    clockTolerance: 5,
+  });
 } catch (err) {
-  // TokenExpiredError | JsonWebTokenError → respond 401
+  // map lỗi verify thành 401 chung; log reason nội bộ, không echo raw token
 }
 ```
 
-HS256 vs RS256: HS256 dùng một **secret** chung. RS256 dùng **private key để ký** và **public key để xác minh** — nhiều service xác minh mà không giữ khóa ký (mô hình OAuth/OIDC).
+HS256 dùng shared secret: mọi verifier giữ secret cũng có khả năng ký. Thuật toán bất đối xứng như RS256/ES256/EdDSA tách private signing key khỏi public verification key, phù hợp khi nhiều resource server verify qua JWKS. Dù chọn gì, cần `kid`, rotation overlap, cache policy và xử lý unknown key; đừng hard-code một key vĩnh viễn.
 
 ### Access + refresh token — mẫu production
 
 Access token ngắn hạn giới hạn thiệt hại khi rò; refresh token dài hạn (trong cookie `HttpOnly`) lấy token mới âm thầm.
 
 ```text
-access token  : 15 min   ── used on every API call (Authorization: Bearer ...)
-refresh token : 7 days   ── HttpOnly cookie, used ONLY at /auth/refresh
-                            └ stored server-side (Redis) so it can be revoked
+access token  : ngắn hạn ── dùng cho resource API; scope/audience hẹp
+refresh token : dài hơn  ── cookie HttpOnly, chỉ gửi tới refresh endpoint
+                             └ lưu hash + family state server-side để rotate/revoke
 ```
 
 ```ts
-// /auth/refresh — rotate: issue a new pair AND invalidate the old refresh token
-app.post('/auth/refresh', async (req, res) => {
-  const token = req.cookies.refreshToken;
-  const payload = jwt.verify(token, process.env.REFRESH_SECRET!) as { sub: string; jti: string };
+import { createHash, randomBytes } from 'node:crypto';
 
-  // Rotation + reuse-detection: the jti must still be the "current" one in Redis
-  const current = await redis.get(`refresh:${payload.sub}`);
-  if (current !== payload.jti) {
-    await redis.del(`refresh:${payload.sub}`); // reuse detected → revoke the whole family
-    return res.status(401).json({ error: 'Token reuse detected' });
+const digest = (token: string) =>
+  createHash('sha256').update(token).digest('base64url');
+
+// refreshRepo.rotate phải atomic: lock record/family, mark token cũ used,
+// tạo token mới; nếu token cũ đã used thì revoke cả family.
+app.post('/auth/refresh', async (req, res) => {
+  const presented = req.cookies['__Secure-refresh'];
+  if (typeof presented !== 'string') throw new InvalidCredentialsError();
+
+  const nextToken = randomBytes(32).toString('base64url');
+  const result = await refreshRepo.rotate({
+    presentedHash: digest(presented),
+    nextHash: digest(nextToken),
+    expiresAt: new Date(Date.now() + 7 * 86_400_000),
+  });
+
+  if (result.kind !== 'rotated') {
+    // `reused` đã revoke family trong cùng transaction; client chỉ nhận 401 chung.
+    throw new InvalidCredentialsError();
   }
-  // ...issue new access + new refresh, store new jti, set the cookie...
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.cookie('__Secure-refresh', nextToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'strict',
+    path: '/auth/refresh',
+  });
+  res.json({ accessToken: await issueAccessToken(result.userId) });
 });
 ```
 
-Đánh đổi thật: JWT thuần **không thu hồi được trước hạn**. Khi bạn thêm denylist để đăng xuất tức thì là đã tái lập state — ổn thôi, chỉ cần thành thật rằng "stateless" đã thành "gần như stateless".
+Một record "current jti theo user" chỉ cho một device và dễ race khi hai refresh tới cùng lúc. Dùng token family/session riêng cho mỗi device, hash token at rest, rotate atomic, giữ trạng thái đủ lâu để phát hiện replay, và có policy xử lý concurrent tab. Refresh endpoint dùng cookie nên vẫn cần CSRF/origin defense phù hợp.
+
+JWT access token tự chứa claim thường không thu hồi được trước `exp`. Khi thêm denylist/introspection để logout hoặc privilege change có hiệu lực tức thì, hệ thống đã tái lập state — đó có thể là trade-off đúng, nhưng phải đưa store availability và lookup latency vào thiết kế.
 
 ### Session vs JWT — chọn có cân nhắc
 
-| | Sessions (stateful) | JWT (stateless) |
-|---|---|---|
-| State ở | server (Redis) | inside the token |
-| Thu hồi ngay | ✅ delete session | ❌ valid until expiry |
-| Chi phí/request | store lookup | just verify signature |
-| Đa server | needs shared store | ✅ none needed |
-| Hợp cho | web apps | APIs, mobile, microservices |
+|                       | Server-side session                          | Self-contained access JWT                                               |
+| --------------------- | -------------------------------------------- | ----------------------------------------------------------------------- |
+| State quyết định auth | session store                                | claim trong token tới khi hết hạn; key/revocation vẫn có state vận hành |
+| Thu hồi               | xóa/đổi session record                       | ngắn `exp`, denylist hoặc introspection                                 |
+| Chi phí/request       | network/store lookup + deserialize           | verify chữ ký + kích thước token/key distribution                       |
+| Scale nhiều instance  | shared store/partition strategy              | mọi verifier cần key, issuer/audience và clock policy nhất quán         |
+| Phù hợp khi           | first-party web cần revoke/control tập trung | nhiều resource server cần verify cục bộ và chấp nhận staleness ngắn     |
 
-Lầm tưởng nguy hiểm: JWT không "an toàn hơn" — chúng khó *thu hồi* hơn.
+JWT không mặc định an toàn hơn session. Chọn theo revocation latency, client type, trust boundary, key ownership và outage mode. Với first-party browser app, session hoặc BFF thường đơn giản hơn việc phơi access token cho JavaScript.
 
 ---
 
@@ -239,60 +344,84 @@ import passport from 'passport';
 import { Strategy as LocalStrategy } from 'passport-local';
 import bcrypt from 'bcrypt';
 
-passport.use(new LocalStrategy(
-  { usernameField: 'email' },
-  async (email, password, done) => {
-    const user = await User.findOne({ where: { email } });
-    // Same generic failure for "no user" and "wrong password" → no enumeration.
-    if (!user || !(await bcrypt.compare(password, user.passwordHash))) return done(null, false);
-    return done(null, user);
-  },
-));
+const normalizeEmail = (value: string) => value.trim().toLowerCase(); // cùng policy lúc register
+
+passport.use(
+  new LocalStrategy(
+    { usernameField: 'email' },
+    async (email, password, done) => {
+      const user = await User.findOne({
+        where: { email: normalizeEmail(email) },
+      });
+      const stored = user?.passwordHash ?? process.env.DUMMY_BCRYPT_HASH!;
+      const matches = await bcrypt.compare(password, stored);
+      if (!user || !matches) return done(null, false); // cùng failure contract
+      return done(null, user);
+    }
+  )
+);
 ```
 
 ```ts
 import { Strategy as JwtStrategy, ExtractJwt } from 'passport-jwt';
 
-passport.use(new JwtStrategy({
-  jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
-  secretOrKey: process.env.JWT_SECRET!,
-}, async (payload: { sub: string }, done) => {
-  const user = await User.findByPk(payload.sub);
-  return user ? done(null, user) : done(null, false);
-}));
+passport.use(
+  new JwtStrategy(
+    {
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      secretOrKey: process.env.JWT_SECRET!,
+      algorithms: ['HS256'],
+      issuer: 'https://auth.example.com',
+      audience: 'https://api.example.com',
+    },
+    async (payload: { sub: string }, done) => {
+      const user = await User.findByPk(payload.sub);
+      return user ? done(null, user) : done(null, false);
+    }
+  )
+);
 ```
 
 ---
 
 ## OAuth2 / OIDC — "Đăng nhập với Google"
 
-OAuth2 cho user đăng nhập qua provider mà không đưa bạn mật khẩu. Luồng hiện đại là **Authorization Code + PKCE**:
+OAuth 2.0 là delegated authorization; **OpenID Connect (OIDC)** thêm identity layer để login. Với browser/native client, dùng **Authorization Code + PKCE (`S256`)**, transaction-specific `state`, và `nonce` khi OIDC flow yêu cầu:
 
 ```text
 1. your app ──redirect──▶ Google consent screen
 2. user approves
 3. Google ──redirect to callbackURL?code=XYZ──▶ your app
-4. your server ──exchange code (+ secret/PKCE) for tokens──▶ Google
-5. you get an id_token (OIDC) → find-or-create a local user → issue YOUR session/JWT
+4. your server ──exchange code + code_verifier (và client auth nếu confidential)──▶ provider
+5. verify issuer/audience/signature/exp/nonce của id_token → map (iss, sub) → local account
+6. issue YOUR session/access token; provider token không mặc định là token cho API của bạn
 ```
 
 ```ts
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 
-passport.use(new GoogleStrategy({
-  clientID: process.env.GOOGLE_CLIENT_ID!,
-  clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-  callbackURL: '/auth/google/callback',
-}, async (_at, _rt, profile, done) => {
-  const [user] = await User.findOrCreate({
-    where: { googleId: profile.id },
-    defaults: { email: profile.emails?.[0]?.value, name: profile.displayName },
-  });
-  return done(null, user);
-}));
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      callbackURL: '/auth/google/callback',
+      state: true, // cần session/state store; callback phải validate state
+    },
+    async (_at, _rt, profile, done) => {
+      const user = await identityRepo.findOrCreate({
+        issuer: 'https://accounts.google.com',
+        subject: profile.id, // stable provider id; không dùng email làm identity key
+        email: profile.emails?.[0]?.value,
+        displayName: profile.displayName,
+      });
+      return done(null, user);
+    }
+  )
+);
 ```
 
-> **OIDC** là tầng danh tính mỏng trên OAuth2, thêm `id_token` (một JWT mô tả user). "Đăng nhập với X" là OIDC.
+Snippet Passport minh họa account mapping, không tự chứng minh full OIDC/PKCE compliance. Ưu tiên OIDC client hỗ trợ discovery/JWKS và validate toàn bộ ID Token. Không auto-link account chỉ vì email trùng nếu chưa có `email_verified` và policy chống account takeover; thay đổi/link identity nên yêu cầu re-authentication.
 
 ---
 
@@ -301,27 +430,39 @@ passport.use(new GoogleStrategy({
 **Phân quyền theo vai trò** chặn route theo role:
 
 ```ts
-const authorize = (...roles: string[]): RequestHandler => (req, res, next) => {
-  if (!req.user || !roles.includes(req.user.role)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
-  next();
-};
+const authorize =
+  (...roles: string[]): RequestHandler =>
+  (req, _res, next) => {
+    if (!req.user) return next(new UnauthorizedError());
+    if (!roles.includes(req.user.role)) return next(new ForbiddenError());
+    next();
+  };
 
 app.delete('/users/:id', requireAuth, authorize('admin'), deleteUser);
 ```
 
-Mịn hơn thì dùng **theo permission** (role *có* permission như `user:delete`). Và quy tắc hay sót nhất: **kiểm tra quyền sở hữu (IDOR), không chỉ đăng nhập**:
+Mịn hơn thì dùng **theo permission** (role _có_ permission như `user:delete`). Và quy tắc hay sót nhất: **kiểm tra quyền sở hữu (IDOR), không chỉ đăng nhập**:
 
 ```ts
-// ❌ Authenticated, but user A can pass user B's id and delete B's post
-// ✅ Enforce ownership at the data layer
-const post = await Post.findByPk(req.params.id);
+// User thường: scope query bằng principal + tenant ngay tại data boundary.
+const post =
+  req.user.role === 'admin'
+    ? await Post.findOne({
+        where: { id: req.params.id, tenantId: req.user.tenantId },
+      })
+    : await Post.findOne({
+        where: {
+          id: req.params.id,
+          tenantId: req.user.tenantId,
+          userId: req.user.id,
+        },
+      });
+
+// 404 tránh tiết lộ resource có tồn tại ở tenant/user khác hay không.
 if (!post) throw new NotFoundError();
-if (post.userId !== req.user.id && req.user.role !== 'admin') throw new ForbiddenError();
 ```
 
-> **IDOR** là một trong những rò rỉ phổ biến nhất thực tế — luôn giới hạn query theo user hiện tại.
+RBAC chỉ là coarse gate. Quyền cuối cùng thường phụ thuộc action, resource, tenant, ownership và state hiện tại. Scope query theo principal giúp giảm nguy cơ quên check sau khi fetch; database row-level security có thể là lớp bổ sung, nhưng application vẫn phải truyền tenant/principal context đúng và test fail-closed.
 
 ---
 
@@ -332,31 +473,71 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import cors from 'cors';
 
-app.use(helmet());                                   // ~15 headers: CSP, HSTS, X-Frame-Options...
-app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true })); // never '*' WITH credentials
+app.use(helmet());
+app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
+app.use(express.json({ limit: '1mb', strict: true }));
 app.use('/api/', rateLimit({ windowMs: 15 * 60_000, limit: 100 }));
-app.use('/auth/login', rateLimit({ windowMs: 15 * 60_000, limit: 10 })); // strict on login
-app.use(express.json({ limit: '1mb' }));             // body-size guard
+app.use(
+  '/auth/login',
+  rateLimit({
+    windowMs: 15 * 60_000,
+    limit: 10,
+    standardHeaders: 'draft-7',
+  })
+);
 ```
 
-Các mối đe dọa và cách sửa trong Node:
+Rate-limit cần shared/external store khi có nhiều replica và `trust proxy` chính xác. Chỉ khóa cứng theo account có thể bị lợi dụng để DoS nạn nhân; phối hợp IP/device/account signal, progressive delay, MFA và alert theo risk.
 
-- không render dữ liệu chưa tin; đặt CSP; token trong cookie HttpOnly.
-- cookie `SameSite` + token CSRF.
-- query parameterized; validate bằng Zod.
-- allowlist host outbound; chặn IP nội bộ/metadata.
-- rate limit chặt + khóa tài khoản/giãn thời gian.
-- không viết cứng; nạp từ env; `.env` gitignore; `npm audit`.
+Các mối đe dọa và lớp phòng thủ:
+
+- **XSS:** encode/sanitize theo output context, tránh dangerous sink, triển khai CSP/Trusted Types khi phù hợp. HttpOnly giảm token exfiltration nhưng không vô hiệu XSS.
+- **CSRF:** SameSite phù hợp, CSRF token gắn session hoặc kiểm Origin/Fetch Metadata; không đổi state bằng GET.
+- **Injection:** parameterized query, schema validation và allowlist cho identifier/command.
+- **SSRF:** allowlist scheme/host/port, resolve và chặn private/link-local/metadata IP, kiểm redirect và egress network policy.
+- **Credential stuffing:** generic response, rate/risk signal, breached-password check, MFA và audit.
+- **Secret exposure:** secret manager/KMS, least privilege, rotation; env chỉ là delivery mechanism, không phải secret store hoàn chỉnh.
+- **Supply chain:** lockfile, review lifecycle script, dependency scanning và phản ứng advisory; `npm audit` chỉ là một tín hiệu.
 
 ```ts
 import { z } from 'zod';
-const Register = z.object({ email: z.string().email(), password: z.string().min(8) });
+const Register = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+});
 // validate at the edge → trust inward (Phase 3)
 ```
 
 ---
 
-## Checklist bảo mật senior
+## Failure modes cần diễn tập
+
+| Failure mode            | Tác động                           | Control chính                                              | Bằng chứng cần có                                     |
+| ----------------------- | ---------------------------------- | ---------------------------------------------------------- | ----------------------------------------------------- |
+| Account enumeration     | lộ danh sách user                  | generic response + dummy hash + rate signal                | status/body gần như nhau; timing distribution được đo |
+| Session fixation        | attacker biết session id sau login | regenerate id khi auth/privilege đổi                       | integration test id trước/sau khác nhau               |
+| Refresh token replay    | chiếm phiên dài hạn                | atomic rotation + family revoke + audit                    | dùng lại token cũ làm cả family mất hiệu lực          |
+| Role/tenant claim stale | user giữ quyền đã bị thu hồi       | access TTL ngắn, version/introspection cho action nhạy cảm | đổi role rồi đo revocation latency                    |
+| IDOR/BOLA               | đọc/sửa resource người khác        | query scope theo tenant/owner + policy                     | negative authorization matrix                         |
+| CSRF trên cookie auth   | mutation dưới phiên nạn nhân       | SameSite + token/origin policy                             | request cross-site thiếu proof bị chặn                |
+| Key rotation lỗi        | outage hoặc token cũ sống quá lâu  | `kid`, overlap, JWKS cache/rollback                        | test key mới/cũ/unknown trong rollout                 |
+| Session store outage    | fail-open hoặc login loop          | explicit fail-closed/degraded policy                       | fault injection Redis timeout                         |
+
+Không log raw password, session id, access/refresh token, OAuth authorization code hoặc `Authorization` header trong bất kỳ failure drill nào. Audit event nên chứa actor, action, target, outcome, request id và risk metadata tối thiểu; tránh biến audit log thành kho PII mới.
+
+## Hợp đồng với frontend
+
+- `401` nghĩa là credential thiếu/hết hạn/không hợp lệ. Client chỉ thử refresh theo một **single-flight** dùng chung giữa request đồng thời; refresh thất bại thì dừng và chuyển login.
+- `403` nghĩa là principal hiện tại không có quyền; không refresh lặp để "sửa" authorization.
+- `429` tôn trọng `Retry-After`; UI không tự brute-force login.
+- Response login/refresh/logout dùng `Cache-Control: no-store`. Logout nên idempotent và clear client state kể cả session đã hết hạn.
+- Browser dùng cookie cross-origin phải đặt `credentials: 'include'`, server allowlist exact origin và CSRF policy tương ứng. Không dùng `*` với credentials.
+- Frontend map machine-readable code như `AUTHENTICATION_REQUIRED`, `FORBIDDEN`, `MFA_REQUIRED`; không parse message hoặc biết user có tồn tại.
+- Nhiều tab có thể refresh cùng lúc. Rotation protocol phải định nghĩa grace/concurrency behavior thay vì coi mọi reuse là attacker một cách mù quáng.
+
+---
+
+## Checklist bảo mật trước khi ship
 
 - Hash mạnh; lỗi+thời gian giống nhau.
 - Token trong cookie an toàn.
@@ -364,7 +545,11 @@ const Register = z.object({ email: z.string().email(), password: z.string().min(
 - Phân quyền kiểm sở hữu ở tầng data.
 - helmet, CORS khóa origin, rate limit.
 - Input validate; query parameterized; giới hạn body.
-- Secret trong env; lỗi chung cho client.
+- Secret qua cơ chế có rotation/audit; lỗi chung cho client.
+- Session id regenerate sau login; logout/revoke đã test trên nhiều device.
+- Token verify pin algorithm, issuer, audience và key lifecycle.
+- Negative authorization test bao phủ tenant, owner, role và trạng thái resource.
+- Auth response `no-store`; log/redaction và audit event đã kiểm tra.
 
 ---
 
@@ -382,10 +567,32 @@ const Register = z.object({ email: z.string().email(), password: z.string().min(
 
 6. Gia cố vành đai: thêm helmet, CORS khóa, rate-limit (chứng minh `429`), Zod, và token CSRF.
 
+**Tiêu chí hoàn thành:** test phải chứng minh password plaintext/token không xuất hiện trong DB hoặc log; login user-không-tồn-tại và sai-password cùng contract; session id đổi sau login; refresh token chỉ dùng được một lần theo policy; token sai `iss`/`aud`/`alg` bị từ chối; user A không truy cập resource user B/tenant B; CSRF request bị chặn; logout all devices có revocation latency đo được.
+
+## Nếu chỉ nhớ năm điều
+
+- Authentication, session management và authorization là ba boundary khác nhau.
+- Password hashing parameter là capacity/security decision phải benchmark và rehash theo thời gian.
+- Cookie HttpOnly giảm token theft nhưng không loại XSS hoặc CSRF.
+- JWT chỉ đáng tin sau khi verify algorithm, key, issuer, audience và thời gian; claim vẫn có thể stale.
+- Authorization phải scope resource theo tenant/owner phía server và được kiểm bằng negative test.
+
 ---
 
 ## Phần tiếp theo
 
-API của bạn giờ an toàn để mở ra: mật khẩu hash đúng, cookie an toàn, quyết định session-vs-JWT rõ ràng kèm xoay vòng refresh, strategy Passport, đăng nhập OAuth2/OIDC, RBAC + permission kèm kiểm sở hữu, và bộ gia cố OWASP đầy đủ.
+API giờ có threat model và control có thể kiểm chứng, nhưng các dependency vẫn đang được khởi tạo và gọi trực tiếp. Ở **Phần 6**, ta tổ chức dependency, repository, resilience và background work thành boundary rõ ràng.
 
-Ở **Phase 6**, ta nâng chất lượng code với **mẫu & package nâng cao** — DI, repository + service, cache Redis, hàng đợi job nền với BullMQ, log có cấu trúc, và chiến lược validation.
+Đọc tiếp: [Advanced Patterns & Packages](/blog/node-06-advanced-patterns-and-packages/).
+
+## Tài liệu chính thức và chuẩn ngành
+
+- [OWASP: Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)
+- [OWASP: Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
+- [OWASP: Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
+- [OWASP: Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html)
+- [OWASP: CSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)
+- [RFC 9700: Best Current Practice for OAuth 2.0 Security](https://www.rfc-editor.org/rfc/rfc9700.html)
+- [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html)
+- [RFC 7519: JSON Web Token](https://www.rfc-editor.org/rfc/rfc7519.html)
+- [Express: Security best practices](https://expressjs.com/en/advanced/best-practice-security.html)

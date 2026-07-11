@@ -1,16 +1,25 @@
 ---
-title: 'Node.js Super Senior · Phase 3 — Express.js Mastery'
-description: 'Phase 3: master Express 5 — the request lifecycle, the middleware pipeline, routing and routers, a layered architecture, a typed error strategy with async handling, Zod validation, the production security stack, and graceful shutdown.'
+title: 'Node.js Production Engineering 03 — Express 5 và Request Pipeline'
+description: 'Thiết kế Express 5 như một request pipeline có thứ tự, validation boundary, error contract, proxy trust và graceful shutdown kiểm chứng được.'
 pubDate: 2026-06-09
-tags: [nodejs, express, middleware, routing, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, express, middleware, api-architecture, production-engineering]
 series: nodejs
 seriesOrder: 3
 draft: false
 ---
 
-Đây là **Phase 3 của lộ trình Super Senior 10 phase**. Ở Phase 2 bạn dựng server thô và cảm nhận mọi khoảng trống. Giờ **Express** lấp chúng — và vì bạn biết bên dưới là gì, bạn sẽ thành thạo nhanh, và cấu trúc nó như senior thay vì nhồi tất cả vào một file.
+Một endpoint có thể validate đúng, authenticate đúng và vẫn rò dữ liệu nếu middleware authorization được đăng ký sau handler. Trong Express, kiến trúc không bắt đầu từ folder; nó bắt đầu từ **thứ tự request đi qua pipeline** và contract của từng middleware.
 
-Ta dùng **Express 5** (bản production hiện hành).
+Bài này dùng **Node.js 24 LTS**, TypeScript và **Express 5**. Sau khi đọc, bạn có thể:
+
+- lần theo request qua app middleware, router, handler và error middleware;
+- đặt validation, authentication, authorization và rate limit đúng boundary;
+- tách HTTP translation khỏi business logic mà không tạo abstraction hình thức;
+- chuẩn hóa error response cho frontend và giữ nguyên cause cho observability;
+- cấu hình proxy trust, request id, body limit và graceful shutdown theo topology thật.
+
+**Kiến thức cần có:** HTTP semantics, stream, timeout và error contract ở [Phần 2](/blog/node-02-http-and-web-fundamentals/). Express giảm boilerplate nhưng không thay các invariant đó.
 
 ---
 
@@ -51,7 +60,7 @@ res.json() / res.send() ── response sent ◄──────────�
 error-handling middleware (4 args), registered LAST
 ```
 
-Giữ bức tranh này trong đầu — mọi bug Express là "một middleware chạy sai thứ tự, không gọi `next()`, hoặc kết thúc response hai lần".
+Mental model quan trọng: middleware là một chuỗi có thứ tự, nhưng mỗi phần tử có thể kết thúc response, chuyển tiếp hoặc chuyển sang error pipeline. Bug phổ biến xuất hiện khi contract đó bị phá: middleware đứng sai vị trí, không gọi `next()`, gọi `next()` sau khi đã gửi response, hoặc giữ công việc async ngoài Promise mà Express không quan sát được.
 
 ---
 
@@ -60,15 +69,21 @@ Giữ bức tranh này trong đầu — mọi bug Express là "một middleware 
 Một middleware là `(req, res, next) => …` — đúng mẫu `compose`/`next` bạn dựng ở Phase 2, giờ là hạng nhất.
 
 ```ts
-app.use(express.json());                          // JSON bodies
-app.use(express.urlencoded({ extended: true }));  // HTML form posts
-app.use(express.static('public'));                // serve files from ./public
+app.use(express.json()); // JSON bodies
+app.use(express.urlencoded({ extended: true })); // HTML form posts
+app.use(express.static('public')); // serve files from ./public
 
 // Custom middleware — runs on every request, in registration order
 app.use((req, res, next) => {
   const start = performance.now();
   res.on('finish', () => {
-    console.log(`${req.method} ${req.path} ${res.statusCode} ${(performance.now() - start).toFixed(1)}ms`);
+    console.log(
+      `${req.method} ${req.path} ${res.statusCode} ${(performance.now() - start).toFixed(1)}ms`
+    );
+  });
+  res.on('close', () => {
+    if (!res.writableFinished)
+      console.warn(`${req.method} ${req.path} client disconnected`);
   });
   next(); // forget this → the request hangs forever
 });
@@ -76,19 +91,22 @@ app.use((req, res, next) => {
 
 Năm điều cần thấm:
 
-- **Thứ tự quan trọng** — chạy trên xuống; đăng ký body parser và auth *trước* route cần chúng.
+- **Thứ tự quan trọng** — chạy trên xuống; đăng ký body parser và auth _trước_ route cần chúng.
 - **Phạm vi** — toàn cục / theo tiền tố path / theo route.
-- **Cắt mạch** — có thể *kết thúc* request mà không gọi `next()`.
+- **Cắt mạch** — có thể _kết thúc_ request mà không gọi `next()`.
 - `next('route')` bỏ phần còn lại của stack route; `next(err)` nhảy thẳng tới error handler.
 - **Gắn dữ liệu suy ra vào `req`**, không tạo global mới — nó theo request và chết cùng request.
 
-> Gõ type cho prop tùy biến: mở rộng `Request` thay vì cast:
+Khi nhiều middleware cùng cần request context, mở rộng type một lần thay vì cast rải rác. Chỉ đặt dữ liệu đã được server xác minh; không sao chép nguyên header client vào `req.user` hay `requestId`.
 
 ```ts
 // types/express.d.ts
 declare global {
   namespace Express {
-    interface Request { user?: { id: string; role: string }; requestId?: string }
+    interface Request {
+      user?: { id: string; role: string };
+      requestId?: string;
+    }
   }
 }
 export {};
@@ -99,19 +117,17 @@ export {};
 ## Mẫu routing
 
 ```ts
-app.get('/users', listUsers);              // collection
+app.get('/users', listUsers); // collection
 app.post('/users', createUser);
-app.get('/users/:id', getUser);            // req.params.id
+app.get('/users/:id', getUser); // req.params.id
 app.put('/users/:id', updateUser);
 app.delete('/users/:id', deleteUser);
 
 // Chain handlers for one path with app.route to avoid repeating it
-app.route('/posts')
-  .get(listPosts)
-  .post(createPost);
+app.route('/posts').get(listPosts).post(createPost);
 ```
 
-biết rõ cái nào là cái nào. Giá trị query luôn là chuỗi; tự ép kiểu và validate.
+`req.params`, `req.query` và `req.body` đến từ ba nguồn khác nhau nhưng đều là input không tin cậy. Giá trị query có thể là chuỗi, mảng hoặc object tùy parser; schema phải parse và validate trước khi service sử dụng.
 
 ### Router — tổ chức app đang lớn
 
@@ -122,7 +138,7 @@ biết rõ cái nào là cái nào. Giá trị query luôn là chuỗi; tự ép
 import { Router } from 'express';
 const router = Router();
 
-router.use(requireAuth);          // applies to every route in THIS router only
+router.use(requireAuth); // applies to every route in THIS router only
 router.get('/', listUsers);
 router.post('/', createUser);
 router.get('/:id', getUser);
@@ -140,9 +156,9 @@ app.use('/api/users', usersRouter); // every route is prefixed with /api/users
 
 ---
 
-## Kiến trúc phân tầng — đừng để controller phình
+## Kiến trúc phân tầng — giữ HTTP ở biên
 
-Hình dạng senior: **route → controller → service → repository**. Controller chỉ dịch HTTP qua lại domain; service giữ business logic; repository giữ truy cập dữ liệu.
+Một hình dạng hữu ích là **route → controller → use case/service → repository**. Controller dịch HTTP sang input của use case; service giữ policy nghiệp vụ; repository che chi tiết truy cập dữ liệu khi sự trừu tượng đó thực sự có giá trị.
 
 ```ts
 // controller — thin: parse input, call service, shape the HTTP response
@@ -161,25 +177,42 @@ export const userService = {
 };
 ```
 
-Vì sao? Service **test được không cần HTTP** và **dùng lại** từ CLI, queue worker, hay route khác. Ta chính thức hóa ở Phase 6 và Phase 10.
+Service **test được không cần HTTP** và có thể được gọi từ CLI, queue worker hoặc transport khác. Tuy nhiên không cần tạo một class cho mỗi hàm CRUD: thêm layer khi nó tạo boundary, policy hoặc test seam rõ ràng; abstraction không có trách nhiệm chỉ làm tăng navigation cost.
 
 ---
 
-## Chiến lược xử lý lỗi
+## Chiến lược xử lý lỗi và API contract
 
-Senior tập trung lỗi bằng một cây lỗi có type và một handler toàn cục:
+Tập trung lỗi dự kiến bằng type có machine-readable code; giữ lỗi bất ngờ cùng `cause` để log, nhưng không phơi implementation detail cho client:
 
 ```ts
 export class AppError extends Error {
-  constructor(message: string, public readonly statusCode: number) {
-    super(message);
+  constructor(
+    message: string,
+    public readonly statusCode: number,
+    public readonly code: string,
+    options?: ErrorOptions
+  ) {
+    super(message, options);
     this.name = this.constructor.name;
     Error.captureStackTrace?.(this, this.constructor); // clean stack, omits this ctor
   }
 }
-export class NotFoundError extends AppError { constructor(m = 'Not Found') { super(m, 404); } }
-export class ValidationError extends AppError { constructor(m = 'Invalid input') { super(m, 422); } }
-export class UnauthorizedError extends AppError { constructor(m = 'Unauthorized') { super(m, 401); } }
+export class NotFoundError extends AppError {
+  constructor(message = 'Resource not found') {
+    super(message, 404, 'RESOURCE_NOT_FOUND');
+  }
+}
+export class ValidationError extends AppError {
+  constructor(message = 'Invalid input', options?: ErrorOptions) {
+    super(message, 422, 'VALIDATION_ERROR', options);
+  }
+}
+export class UnauthorizedError extends AppError {
+  constructor(message = 'Authentication required') {
+    super(message, 401, 'AUTHENTICATION_REQUIRED');
+  }
+}
 ```
 
 Error handler được nhận diện qua **bốn** tham số và đăng ký **cuối cùng**:
@@ -192,28 +225,34 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
   next(new NotFoundError(`Cannot ${req.method} ${req.path}`));
 });
 
-app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+  // Header/body đã bắt đầu (ví dụ stream lỗi giữa chừng): giao cho default handler đóng connection.
+  if (res.headersSent) return next(err);
+
   const isApp = err instanceof AppError;
   const status = isApp ? err.statusCode : 500;
-  if (!isApp || status >= 500) console.error(`[${req.requestId}]`, err); // log real causes
-  res.status(status).json({
-    error: {
-      message: isApp ? err.message : 'Internal Server Error',
+  if (!isApp || status >= 500) console.error({ requestId: req.requestId, err });
+
+  res
+    .status(status)
+    .type('application/problem+json')
+    .json({
+      type: `https://api.example.com/problems/${isApp ? isApp.code.toLowerCase() : 'internal-error'}`,
+      title: isApp ? isApp.message : 'Internal Server Error',
       status,
-      // never leak stack traces in production
-      ...(process.env.NODE_ENV !== 'production' && err instanceof Error ? { stack: err.stack } : {}),
-    },
-  });
+      code: isApp ? isApp.code : 'INTERNAL_ERROR',
+      requestId: req.requestId,
+    });
 });
 ```
 
-Nguyên tắc senior: **lỗi dự kiến thì có type và rõ ràng; lỗi bất ngờ thì log lại và giấu sau 500 chung** — đừng để lộ stack trace cho client.
+Lỗi dự kiến cần status/code ổn định; lỗi bất ngờ cần log object lỗi thật, gồm stack và cause, rồi map thành `500` chung. Nếu response streaming đã gửi header, không thể đổi sang JSON error nữa; chuyển tiếp để Express đóng connection và ghi nhận failure.
 
 ---
 
 ## Xử lý lỗi async
 
-**Express 5 tự bắt promise bị reject** trong async handler và chuyển tới error handler — cải tiến lớn so với Express 4:
+**Express 5 tự chuyển rejected Promise** từ handler/middleware sang `next(error)`:
 
 ```ts
 // Express 5: just throw or let it reject — the framework forwards it.
@@ -224,44 +263,52 @@ app.get('/users/:id', async (req, res) => {
 });
 ```
 
-Để rõ ý định và hành vi đồng nhất, bọc async handler bằng một helper nhỏ:
+Vì vậy project thuần Express 5 không cần `catchAsync` cho handler trả Promise. Helper dưới chỉ hữu ích trong giai đoạn cùng codebase còn chạy Express 4; giữ nó sau migration tạo thêm một abstraction không cần thiết:
 
 ```ts
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 
 const catchAsync =
-  (fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>): RequestHandler =>
-  (req, res, next) => { fn(req, res, next).catch(next); };
+  (
+    fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>
+  ): RequestHandler =>
+  (req, res, next) => {
+    fn(req, res, next).catch(next);
+  };
 ```
 
 ---
 
 ## Validation
 
-Đừng bao giờ tin input. Hai cách vững.
+Validation là boundary giữa representation không tin cậy và input đã có type của use case. Hai cách phổ biến:
 
-cho chuỗi nội tuyến trên route:
+Validator dạng chuỗi phù hợp với rule ngắn ngay trên route:
 
 ```ts
 import { body, validationResult } from 'express-validator';
 
-app.post('/register',
+app.post(
+  '/register',
   body('email').isEmail().normalizeEmail(),
-  body('password').isLength({ min: 8 }).matches(/^(?=.*[A-Za-z])(?=.*\d)/),
+  body('password')
+    .isLength({ min: 8 })
+    .matches(/^(?=.*[A-Za-z])(?=.*\d)/),
   (req, res, next) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(422).json({ errors: errors.array() });
+    if (!errors.isEmpty())
+      return res.status(422).json({ errors: errors.array() });
     next();
   },
-  registerHandler,
+  registerHandler
 );
 ```
 
-cho validation schema-first còn cho bạn giá trị **đã parse, có type** — lựa chọn của tôi cho code mới:
+Schema-first phù hợp khi cùng schema phục vụ runtime validation, type inference và API documentation. Thay vì mutate `req.body` rồi tuyên bố nó đã có type, wrapper dưới chuyển giá trị đã parse trực tiếp vào handler:
 
 ```ts
 import { z } from 'zod';
-import type { RequestHandler } from 'express';
+import type { Request, RequestHandler, Response } from 'express';
 
 const RegisterSchema = z.object({
   email: z.string().email(),
@@ -269,20 +316,37 @@ const RegisterSchema = z.object({
   age: z.coerce.number().int().positive().optional(), // coerce query strings → number
 });
 
-// Reusable validator factory — replaces req.body with the typed, parsed result
-const validate =
-  (schema: z.ZodType): RequestHandler =>
-  (req, _res, next) => {
-    const result = schema.safeParse(req.body);
-    if (!result.success) return next(new ValidationError(result.error.issues[0].message));
-    req.body = result.data; // now strongly typed downstream
-    next();
-  };
+type ValidatedHandler<T> = (
+  input: T,
+  req: Request,
+  res: Response
+) => void | Promise<void>;
 
-app.post('/register', validate(RegisterSchema), registerHandler);
+function withBody<S extends z.ZodTypeAny>(
+  schema: S,
+  handler: ValidatedHandler<z.infer<S>>
+): RequestHandler {
+  return async (req, res, next) => {
+    const result = schema.safeParse(req.body);
+    if (!result.success) {
+      return next(
+        new ValidationError('Request body is invalid', { cause: result.error })
+      );
+    }
+    await handler(result.data, req, res);
+  };
+}
+
+app.post(
+  '/register',
+  withBody(RegisterSchema, async (input, _req, res) => {
+    const user = await userService.register(input); // input is z.infer<typeof RegisterSchema>
+    res.status(201).json(user);
+  })
+);
 ```
 
-> Validate ở **biên** (route), rồi tin dữ liệu khi đi **vào trong**. Đừng validate lại cùng hình dạng ở mọi service.
+> Parse và validate representation ở **biên transport**. Domain vẫn phải bảo vệ invariant của chính nó, vì use case có thể được gọi từ queue, CLI hoặc code nội bộ không đi qua route Express.
 
 ---
 
@@ -299,36 +363,50 @@ import helmet from 'helmet';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 
-app.disable('x-powered-by');                         // don't advertise Express
-app.set('trust proxy', 1);                           // correct req.ip behind a proxy/LB
-app.use(helmet());                                   // ~15 security headers (Phase 5)
-app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
-app.use(compression());                              // gzip/br responses
-app.use(express.json({ limit: '1mb' }));             // body-size guard (the Phase 2 lesson)
+app.disable('x-powered-by');
+// Chỉ dùng 1 khi mọi đường vào production đi qua đúng một trusted proxy.
+app.set('trust proxy', 1);
+app.use(helmet());
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL,
+    credentials: true,
+  })
+);
+app.use(compression()); // gzip/br responses
+app.use(express.json({ limit: '1mb', strict: true }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
-// Blunt brute-force / abuse at the edge
-app.use('/api/', rateLimit({ windowMs: 60_000, limit: 100, standardHeaders: 'draft-7' }));
+// Baseline abuse control; distributed deployment needs a shared/external store.
+app.use(
+  '/api/',
+  rateLimit({ windowMs: 60_000, limit: 100, standardHeaders: 'draft-7' })
+);
 ```
 
-> `trust proxy` quan trọng: sau Nginx/load balancer, `req.ip` là IP của proxy trừ khi bạn tin header `X-Forwarded-For` — rate-limit theo sai IP sẽ thả hết hoặc chặn hết.
+> `trust proxy` là quyết định security dựa trên topology, không phải dòng cấu hình mặc định. Nếu client có đường kết nối trực tiếp hoặc số proxy thay đổi, cấu hình `1` có thể khiến Express tin header do client giả. Dùng subnet/function trust cụ thể và test `req.ip`, `req.protocol`, `req.hostname` qua mọi ingress path. Rate limiter trong memory cũng không tạo một quota chung khi chạy nhiều replica.
 
 ---
 
 ## Context request & log có cấu trúc
 
-Gắn request id ở biên và xuyên nó qua log bằng `AsyncLocalStorage` — vô giá để truy vết một request qua nhiều dòng log:
+Gắn request id ở biên và truyền context bằng `AsyncLocalStorage` để truy vết một request qua nhiều dòng log:
 
 ```ts
 import { randomUUID } from 'node:crypto';
 
-app.use((req, _res, next) => {
-  req.requestId = (req.headers['x-request-id'] as string) ?? randomUUID();
+const REQUEST_ID = /^[A-Za-z0-9_-]{8,128}$/;
+
+app.use((req, res, next) => {
+  const incoming = req.get('x-request-id');
+  req.requestId =
+    incoming && REQUEST_ID.test(incoming) ? incoming : randomUUID();
+  res.setHeader('X-Request-Id', req.requestId);
   next();
 });
 ```
 
-Ta đổi `console` sang log JSON có cấu trúc (pino/Winston) ở Phase 6.
+Header correlation id vẫn là input: giới hạn format/độ dài trước khi đưa vào log. Ở production, dùng `AsyncLocalStorage` và logger JSON để mọi log con tự mang `requestId`; không log token, cookie hoặc body nhạy cảm.
 
 ---
 
@@ -341,8 +419,12 @@ const server = app.listen(3000);
 
 function shutdown(signal: string): void {
   console.log(`${signal} — draining`);
-  server.close(() => process.exit(0));   // stop accepting, finish in-flight
-  setTimeout(() => process.exit(1), 10_000).unref(); // hard cap
+  server.close(() => process.exit(0));
+  server.closeIdleConnections();
+  setTimeout(() => {
+    server.closeAllConnections();
+    process.exit(1);
+  }, 10_000).unref();
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
@@ -350,7 +432,56 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 ---
 
-## 4. Dự án thực hành
+## Failure modes và quyết định kiến trúc
+
+### Thứ tự pipeline đề xuất
+
+Một API điển hình có thể dùng thứ tự sau; route cụ thể vẫn phải đặt authorization sát use case thay vì chỉ ở global middleware:
+
+```text
+request id / context
+  → access log
+  → security headers + CORS
+  → body parser có limit
+  → router
+      → authentication
+      → validation
+      → authorization theo resource
+      → handler/use case
+  → 404
+  → error mapper
+```
+
+| Failure mode            | Triệu chứng                               | Nguyên nhân thường gặp                                                 | Cách xác nhận                              |
+| ----------------------- | ----------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------ |
+| Request treo            | client timeout, không có status           | middleware quên `next()` và chưa gửi response                          | integration test với deadline ngắn         |
+| `ERR_HTTP_HEADERS_SENT` | log 500 sau khi client đã nhận body       | gọi `next(err)` hoặc gửi lần hai sau `res.json()`                      | test từng branch và kiểm `return`          |
+| Mất error async         | unhandled rejection hoặc response treo    | callback async không được return/await, EventEmitter lỗi ngoài Promise | fault injection đúng boundary              |
+| Rate limit sai user     | mọi user chung quota hoặc attacker bypass | `trust proxy` sai, store riêng từng replica                            | test qua ingress thật với nhiều IP/replica |
+| Error contract lệch     | frontend phải parse message               | route tự trả lỗi thay vì qua mapper                                    | contract test trên toàn bộ 4xx/5xx         |
+| Shutdown cắt request    | deploy sinh socket reset                  | grace period ngắn hơn request/dependency deadline                      | gửi `SIGTERM` khi request đang chạy        |
+
+### Express hay abstraction khác?
+
+| Lựa chọn               | Phù hợp khi                                                 | Chi phí cần chấp nhận                                 |
+| ---------------------- | ----------------------------------------------------------- | ----------------------------------------------------- |
+| `node:http` trực tiếp  | protocol server nhỏ, proxy/stream chuyên biệt               | tự sở hữu routing, validation, error pipeline         |
+| Express 5              | cần ecosystem middleware và control trực tiếp trên pipeline | ít convention; team phải thống nhất architecture      |
+| Framework có module/DI | nhiều team cần convention, lifecycle và tooling thống nhất  | abstraction, learning curve và migration cost cao hơn |
+
+Quyết định không nên dựa trên benchmark hello-world đơn lẻ. Đo workload thật, nhưng ưu tiên correctness, ecosystem, năng lực team và chi phí vận hành trước khi throughput framework trở thành bottleneck đã chứng minh.
+
+## Hợp đồng với frontend
+
+- Một error envelope thống nhất theo `application/problem+json`, có `code`, `status`, `requestId` và field errors có path ổn định.
+- `401` cho phép client bắt đầu login/refresh flow; `403` không được tự động refresh vô hạn.
+- Validation code không phụ thuộc câu tiếng Anh hiển thị. Frontend map `code` sang bản dịch và UI phù hợp.
+- CORS allowlist và cookie credentials phải được test cùng origin deploy thật, không chỉ Postman.
+- Request id được trả lại để UI/support cung cấp mã tra cứu, nhưng không lộ stack hay internal identifier nhạy cảm.
+
+---
+
+## Dự án thực hành
 
 1. REST API đầy đủ (CRUD): dựng lại API `tasks` bằng Express 5, tách `route → controller → service`. Để ý nó ngắn và rõ hơn.
 
@@ -360,11 +491,13 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 4. Tầng validation Zod: dựng factory `validate(schema)` dùng lại; validate body và query trên route tạo; chứng minh `req.body` có type khi đi tiếp.
 
-Bài tập thêm: viết route `*splat`; bảo vệ router bằng `requireAuth`; thêm tắt êm và xác nhận request đang chạy hoàn tất khi `SIGTERM`.
+Bài tập thêm: viết route `/{*splat}` theo cú pháp Express 5; bảo vệ router bằng `requireAuth`; thêm tắt êm và xác nhận request đang chạy hoàn tất khi `SIGTERM`.
+
+**Tiêu chí hoàn thành:** Supertest hoặc client tương đương phải chứng minh middleware chạy đúng thứ tự, malformed body không vào use case, rejected Promise tới error mapper, stream lỗi sau khi gửi header không tạo response thứ hai, `401/403/422/500` cùng schema, và hai request đồng thời không dùng nhầm `requestId`.
 
 ---
 
-## 5. Checklist senior
+## Checklist trước khi ship
 
 - Controller mỏng; logic ở service.
 - Thứ tự middleware đúng; mỗi nhánh hoặc `next()` hoặc kết thúc response một lần.
@@ -372,11 +505,31 @@ Bài tập thêm: viết route `*splat`; bảo vệ router bằng `requireAuth`;
 - Mọi input validate ở biên.
 - Đủ bộ bảo mật/giới hạn.
 - App tắt êm.
+- `trust proxy` khớp mọi ingress path và rate-limit dùng shared store khi có nhiều replica.
+- Không có middleware async "fire-and-forget" trong request lifecycle.
+
+## Nếu chỉ nhớ năm điều
+
+- Express là pipeline có thứ tự; thứ tự middleware chính là một phần kiến trúc.
+- Express 5 chuyển rejected Promise được return từ handler sang error middleware.
+- Validation transport không thay invariant ở domain.
+- Error mapper phải giữ chi tiết trong log nhưng chỉ trả contract an toàn cho client.
+- Proxy trust, rate limit và graceful shutdown phải được test qua topology production thật.
 
 ---
 
 ## Phần tiếp theo
 
-Bạn đã thành thạo Express 5 từ vòng đời request tới tắt êm.
+Request pipeline đã có boundary rõ, nhưng dữ liệu vẫn nằm trong bộ nhớ và biến mất khi restart. Ở **Phần 4**, ta thiết kế data layer với transaction, pool, query shape và failure contract thay vì chỉ thay một object bằng ORM.
 
-Nhưng dữ liệu vẫn nằm trong bộ nhớ và biến mất khi restart. Ở **Phase 4**, ta thêm **database thật** — SQL với ORM và NoSQL với Mongoose — gồm thiết kế schema, quan hệ, migration, index, connection pooling, transaction, vấn đề N+1, và tầng cache Redis.
+Đọc tiếp: [Thiết kế Data Layer](/blog/node-04-database-integration/).
+
+## Tài liệu chính thức
+
+- [Express 5: Writing middleware](https://expressjs.com/en/5x/guide/writing-middleware.html)
+- [Express 5: Error handling](https://expressjs.com/en/5x/guide/error-handling.html)
+- [Express 5: Routing](https://expressjs.com/en/5x/guide/routing.html)
+- [Express: Moving to Express 5](https://expressjs.com/en/guide/migrating-5.html)
+- [Express: Behind proxies](https://expressjs.com/en/guide/behind-proxies.html)
+- [Express: Production security best practices](https://expressjs.com/en/advanced/best-practice-security.html)
+- [Express: Production performance and reliability](https://expressjs.com/en/advanced/best-practice-performance.html)

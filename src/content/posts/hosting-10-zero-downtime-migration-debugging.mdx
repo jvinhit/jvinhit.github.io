@@ -1,0 +1,313 @@
+---
+title: 'Domain, DNS & Hosting · Phần 10 — Zero-downtime migration và debug theo tầng'
+description: 'Capstone chuyển hosting/DNS không downtime: hạ TTL đúng lúc, dual-run và đồng bộ dữ liệu, acceptance matrix, rollback threshold, rồi debug NS/DS/A/TLS/HTTP/app.'
+pubDate: 2026-07-11
+tags:
+  [
+    hosting,
+    domain,
+    dns,
+    migration,
+    debugging,
+    cloudflare,
+    github-pages,
+    vps,
+    devops,
+    hosting_dns_10,
+  ]
+series: hosting-dns
+seriesOrder: 10
+lang: vi
+draft: false
+---
+
+import HostingDiagram from '../../components/blog/HostingDiagram.astro';
+
+“Đổi DNS xong chờ propagation” không phải kế hoạch migration. Trong lúc resolver còn cache, user có thể đi vào origin cũ hoặc mới. Nếu hai nơi chạy khác version, ghi vào hai database, giữ session khác nhau hoặc chỉ một nơi có upload mới, downtime có thể không hiện thành trang lỗi — nó hiện thành **mất dữ liệu**.
+
+Capstone này ghép toàn bộ series thành một runbook có thể review trước change:
+
+- hạ TTL trước một chu kỳ TTL cũ;
+- dựng song song origin/zone mới;
+- chọn chiến lược data và single-writer;
+- test đích bằng `curl --resolve` trước cutover;
+- thay record hoặc nameserver theo từng change riêng;
+- quan sát bằng acceptance matrix định lượng;
+- rollback theo threshold, không theo cảm giác;
+- debug từ NS/DS xuống application thay vì click dashboard ngẫu nhiên.
+
+Ta dùng `example.com` và API origin `203.0.113.20` thuộc TEST-NET-3. Mọi IP/hostname placeholder phải được thay bằng giá trị thật.
+
+## 1. Capstone architecture
+
+| Hostname/service   | Nền tảng                    | DNS intent                                                   |
+| ------------------ | --------------------------- | ------------------------------------------------------------ |
+| `example.com`      | GitHub Pages                | Apex A/ALIAS/ANAME theo tài liệu GitHub, DNS-only baseline   |
+| `www.example.com`  | GitHub Pages                | CNAME trực tiếp tới `<account>.github.io`, DNS-only baseline |
+| `api.example.com`  | VPS + Nginx                 | A → `203.0.113.20`, có thể Cloudflare Proxied                |
+| `user@example.com` | Hostinger Email trong ví dụ | MX + SPF/DKIM/DMARC từ provider, DNS-only                    |
+| TLS issuance       | GitHub/ACME/provider        | CAA phải cho phép các CA thực sự dùng                        |
+
+Trước khi tạo GitHub Pages DNS, verify custom domain và thêm domain trong repository settings. GitHub cảnh báo cấu hình DNS trước khi gắn domain với site có thể tạo cơ hội takeover. Bài [GitHub Pages + Actions](/blog/github-pages-actions-deep-dive/) giải thích pipeline deploy; capstone chỉ tập trung cutover domain.
+
+> DNS định tuyến **hostname**, không đọc URL path. Bạn có thể đưa `api.example.com` tới VPS, nhưng không thể dùng A/CNAME để đưa `example.com/api` sang VPS trong khi `/` ở GitHub Pages. Muốn route theo path phải có HTTP reverse proxy/edge worker đứng trước cả hai, hoặc dùng subdomain.
+
+Record inventory minh họa:
+
+| Type          | Name                    | Content                                           | Proxy                                     |
+| ------------- | ----------------------- | ------------------------------------------------- | ----------------------------------------- |
+| A/ALIAS/ANAME | `@`                     | Giá trị GitHub Pages hiện hành từ docs chính thức | DNS-only baseline                         |
+| CNAME         | `www`                   | `<account>.github.io`                             | DNS-only baseline                         |
+| A             | `api`                   | `203.0.113.20`                                    | Proxied sau khi origin pass Full (strict) |
+| MX            | `@`                     | Provider MX set                                   | DNS-only                                  |
+| TXT           | `@`                     | Một SPF chính thức đã gộp                         | DNS-only                                  |
+| TXT/CNAME     | `<selector>._domainkey` | Giá trị provider                                  | DNS-only                                  |
+| TXT           | `_dmarc`                | Policy đã rollout                                 | DNS-only                                  |
+| CAA           | `@`                     | CA set đã inventory                               | DNS-only                                  |
+
+Không copy IP GitHub từ một bài cũ. Dùng giá trị hiện tại trong GitHub Docs tại thời điểm change và lưu snapshot trong ticket/runbook.
+
+## 2. Mental model migration: thay traffic, không chỉ thay record
+
+<HostingDiagram
+  kind="migration-flow"
+  caption="Inventory, dựng song song, test trực tiếp, cutover có quan sát và giữ nguyên hệ thống cũ để rollback"
+/>
+
+Hai change thường bị trộn:
+
+1. **Hosting cutover:** authoritative DNS giữ nguyên; đổi A/AAAA/CNAME từ origin cũ sang mới.
+2. **DNS provider migration:** đổi NS delegation ở registrar; toàn bộ zone và DNSSEC trust chain chuyển nơi.
+
+Đừng đồng thời đổi nameserver, origin, SSL mode và application release nếu có thể tách. Khi lỗi, mỗi dimension thêm một nhánh điều tra và làm rollback DNSSEC nguy hiểm hơn.
+
+## 3. T-7 ngày: inventory, baseline và change contract
+
+Export toàn zone, không chỉ web records:
+
+```bash
+dig example.com NS +noall +answer
+dig example.com DS +noall +answer
+dig example.com A +noall +answer
+dig example.com AAAA +noall +answer
+dig www.example.com CNAME +noall +answer
+dig example.com MX +noall +answer
+dig example.com TXT +noall +answer
+dig _dmarc.example.com TXT +noall +answer
+dig example.com CAA +noall +answer
+```
+
+Lưu zone export cùng:
+
+- TTL từng record và TTL NS/DS nhìn từ parent;
+- custom-domain settings ở GitHub/hosting/SaaS;
+- redirect canonical, CORS allowlist, cookie domain và callback URL;
+- certificate issuer/SAN/expiry/renewal;
+- health endpoints, baseline 4xx/5xx/p95 và traffic;
+- database schema/version, uploads, session store, queue và cron ownership;
+- mailboxes/aliases/forwarders cùng email authentication records;
+- exact rollback values và người có quyền thực thi.
+
+Change contract phải trả lời: ai ra quyết định go/no-go, thời gian observe tối thiểu, metric nào rollback, hệ thống cũ giữ bao lâu, ai reconcile data nếu đã nhận write ở đích mới.
+
+## 4. Hạ TTL đúng thời điểm
+
+Giả sử A record đang TTL 14.400 giây. Đổi nó xuống 300 giây lúc 09:00 không khiến cache cũ hết hạn lúc 09:05; resolver đã cache lúc 08:59 vẫn có thể giữ tới gần 13:00.
+
+Quy tắc:
+
+1. hạ TTL;
+2. chờ **ít nhất một chu kỳ TTL cũ**;
+3. xác nhận authoritative answer đã mang TTL mới;
+4. mới cutover.
+
+```bash
+dig example.com A @<authoritative-nameserver> +noall +answer
+dig example.com A @1.1.1.1 +noall +answer
+dig example.com A @8.8.8.8 +noall +answer
+```
+
+TTL thấp giảm cửa sổ cache cho lần đổi tiếp theo nhưng tăng query load; nâng lại khi migration ổn định. Với NS migration, TTL delegation ở parent thường không phải ô TTL bạn sửa trong zone, nên phải đo bằng `dig +trace`/query parent và lên lịch riêng.
+
+## 5. Dual-run nhưng giữ một nguồn sự thật
+
+Hai origin cùng trả `200` chưa đủ. Chọn strategy cho từng state:
+
+| State                        | Strategy an toàn                                                            |
+| ---------------------------- | --------------------------------------------------------------------------- |
+| Static build                 | Deploy cùng commit/hash ở cả hai                                            |
+| Database read/write          | Dùng chung DB có đường private phù hợp, hoặc replication/failover đã test   |
+| Write khi không thể share DB | Chỉ một writer; freeze ngắn ở final sync/cutover                            |
+| Upload/media                 | Shared object storage hoặc continuous sync + final delta                    |
+| Session                      | Shared session store, stateless token, hoặc chấp nhận re-login có thông báo |
+| Queue/cron                   | Chỉ một active consumer/scheduler nếu job không idempotent                  |
+| Schema migration             | Backward-compatible với cả release cũ và mới                                |
+
+DNS không đảm bảo tất cả user chuyển cùng lúc. Nếu origin cũ và mới đều nhận write vào database riêng, rollback A record không gộp dữ liệu giúp bạn. Khi data divergence xuất hiện, freeze write, xác định source of truth, reconcile và audit trước khi mở lại traffic.
+
+## 6. Preflight origin/hosting mới không cần đổi DNS
+
+Với VPS API:
+
+```bash
+curl --resolve api.example.com:80:203.0.113.20 \
+  -sS -o /dev/null -D - http://api.example.com/health/ready
+
+curl --resolve api.example.com:443:203.0.113.20 \
+  -sS -o /tmp/api-health.json -D /tmp/api-headers.txt \
+  https://api.example.com/health/ready
+
+cat /tmp/api-headers.txt
+cat /tmp/api-health.json
+```
+
+`--resolve` override DNS cho curl nhưng giữ hostname/SNI. Nó test đúng Nginx virtual host và certificate. Gọi `https://203.0.113.20` không tương đương.
+
+Với GitHub Pages, deploy site và cấu hình custom domain ở GitHub trước. Test default Pages URL, asset paths, 404 và canonical; sau đó mới tạo apex/`www` records. Với email, tạo mailbox và gửi canary bằng provider mới trước MX cutover như Phần 9.
+
+## 7. Exact acceptance matrix
+
+Điền expected result trước khi change; người thực thi chỉ đánh pass/fail:
+
+| Flow           | Probe                                                              | Expected                                    |
+| -------------- | ------------------------------------------------------------------ | ------------------------------------------- |
+| Apex HTTP      | `curl -I http://example.com/`                                      | 301/308 một bước tới `https://example.com/` |
+| Apex HTTPS     | `curl -fsS https://example.com/`                                   | 200; chứa build marker/commit mong muốn     |
+| `www`          | `curl -I https://www.example.com/`                                 | Một redirect tới canonical apex             |
+| Static asset   | `curl -I https://example.com/assets/<hash>.js`                     | 200, correct content-type/cache header      |
+| Not found      | `curl -o /dev/null -w '%{http_code}' https://example.com/not-real` | 404, không 200 soft-404                     |
+| API ready      | `curl -fsS https://api.example.com/health/ready`                   | 200 + exact version/commit                  |
+| API auth       | Request không token tới protected route                            | 401/403, không 200/500                      |
+| API write/read | Tạo fixture có idempotency key rồi đọc lại                         | Một record, dữ liệu nhất quán               |
+| TLS            | `openssl s_client -servername ...`                                 | SAN/chain/expiry hợp lệ                     |
+| IPv4/IPv6      | `curl -4`, `curl -6` nếu publish AAAA                              | Cùng behavior; không AAAA stale             |
+| Inbound mail   | Hai external senders → mailbox                                     | Nhận đủ, đúng timestamp                     |
+| Outbound mail  | Mailbox + transactional canary                                     | SPF/DKIM/DMARC aligned pass                 |
+
+Build marker có thể là `<meta name="app-version" content="...">` hoặc `/version.json`. Không dùng “trông có vẻ đúng”; một CDN cache có thể trả homepage cũ với status 200.
+
+## 8. Cutover và observation window
+
+### Nếu chỉ đổi hosting
+
+1. Freeze deploy/config ngoài change.
+2. Chạy final data sync hoặc chuyển single writer.
+3. Cập nhật A/AAAA/CNAME.
+4. Query authoritative nameserver ngay.
+5. Query `1.1.1.1`, `8.8.8.8` và resolver nội bộ.
+6. Chạy acceptance matrix qua public DNS.
+7. Theo dõi log cả origin cũ lẫn mới; traffic ở cũ trong TTL window là bình thường.
+
+### Nếu đổi DNS provider/nameserver
+
+1. Dựng zone mới đầy đủ ở trạng thái chưa active; mặc định DNS-only nếu muốn giảm biến số.
+2. Query trực tiếp từng nameserver mới: `dig @<new-ns> example.com A/MX/TXT`.
+3. Với DNSSEC, gỡ DS cũ ở registrar và chờ **DS TTL tại parent hết** trước khi đổi NS, trừ khi bạn dùng quy trình DNSSEC transfer nâng cao được cả hai provider hỗ trợ.
+4. Đổi NS delegation ở registrar.
+5. Khi NS mới ổn, enable DNSSEC ở provider mới và publish DS mới.
+6. Chỉ bật proxy/rules bổ sung sau khi zone baseline pass.
+
+Cloudflare cảnh báo đổi NS trong khi DS cũ còn cache có thể khiến validating resolver trả `SERVFAIL` vì key không khớp.
+
+## 9. Rollback thresholds và data-aware rollback
+
+Threshold dưới đây là **mẫu**, phải điều chỉnh theo SLO/baseline của hệ thống:
+
+- TLS invalid, wrong tenant hoặc redirect loop: rollback ngay;
+- data divergence/lost write: freeze write và rollback traffic ngay;
+- core login/payment/write probe fail hai lần liên tiếp trong 5 phút;
+- 5xx cao hơn gấp đôi baseline hoặc vượt 1% liên tục 5 phút;
+- p95 cao hơn hai lần baseline trong 10 phút và ảnh hưởng core flow;
+- inbound/outbound canary critical fail quá cửa sổ SMTP đã định.
+
+Rollback hosting:
+
+1. Nếu đích mới đã nhận write, dừng/freeze write trước; reconcile về source of truth.
+2. Khôi phục exact A/AAAA/CNAME cũ.
+3. Giữ cả hai origin, logs và database snapshot.
+4. Theo dõi qua TTL cũ + buffer; user vẫn có thể đi hai nơi.
+5. Chỉ nâng TTL/xóa origin mới sau post-incident review.
+
+Rollback nameserver phức tạp hơn: NS và DS phải là một cặp trust chain phù hợp. Không trỏ NS về provider cũ trong khi parent còn DS của provider mới. Giữ zone cũ phục vụ cùng dữ liệu và key/signing state đủ lâu để rollback có thể thực hiện theo runbook DNSSEC, không ứng biến giữa incident.
+
+## 10. Debug theo tầng, dừng ở lớp hỏng đầu tiên
+
+<HostingDiagram
+  kind="debug-tree"
+  caption="Bắt đầu từ delegation và DNSSEC, rồi mới đi xuống record, network/TLS, HTTP và application"
+/>
+
+| Lớp                  | Lệnh                                                        | Diễn giải                                              |
+| -------------------- | ----------------------------------------------------------- | ------------------------------------------------------ |
+| NS delegation        | `dig example.com NS +trace`                                 | Parent đang chỉ tới nameserver nào                     |
+| DS/DNSSEC            | `dig example.com DS +dnssec`; so sánh query thường và `+cd` | `SERVFAIL` nhưng `+cd` có answer gợi ý validation hỏng |
+| Authoritative A/AAAA | `dig @<ns> example.com A`; `AAAA`                           | Nguồn sự thật có record đúng không                     |
+| Recursive cache      | `dig @1.1.1.1`; `dig @8.8.8.8`                              | Resolver đang cache answer/TTL nào                     |
+| TCP/origin           | `curl --resolve ...`; `ss -ltnp`                            | Port/firewall/service có tới được không                |
+| TLS/SNI              | `openssl s_client -connect IP:443 -servername host`         | Cert/SAN/chain/handshake                               |
+| HTTP                 | `curl -IL --max-redirs 5 URL`                               | Status, redirect, Host, proxy/cache                    |
+| App/data             | health, logs, version, synthetic write/read                 | Release/config/dependency/data                         |
+
+Quy tắc: nếu `dig @authoritative` sai, đừng xóa browser cache. Nếu DNS đúng nhưng `openssl` fail, đừng sửa MX. Nếu TLS pass nhưng API 500, xuống application logs. Debug theo dependency graph tiết kiệm thời gian vì mỗi lớp dưới chỉ có ý nghĩa khi lớp trên đã pass.
+
+### Failure modes hay bị gọi nhầm là “propagation”
+
+- **Stale AAAA:** IPv4 đúng, IPv6 vẫn về origin cũ.
+- **DNSSEC stale DS:** resolver validating trả `SERVFAIL`; `+cd` lại có answer.
+- **Nginx default site:** A đúng nhưng `server_name`/SNI sai.
+- **Cloudflare 521/522/525/526:** proxy tới origin lỗi theo network/TLS, không phải NS.
+- **GitHub Pages 404/takeover risk:** DNS đã trỏ nhưng custom domain chưa được attach/verify.
+- **Assets 404:** custom domain dùng base `/` nhưng build vẫn dùng project subpath.
+- **Mail chết:** zone mới thiếu MX/SPF/DKIM/DMARC hoặc proxy nhầm mail CNAME.
+- **Split-brain data:** cả hai origin nhận write vào store riêng.
+- **Path routing fantasy:** A record không thể route `/api` sang VPS.
+
+## Checklist go/no-go
+
+- [ ] Zone export gồm A/AAAA/CNAME/MX/TXT/CAA/SRV và NS/DS.
+- [ ] TTL đã hạ và đã chờ một chu kỳ TTL cũ.
+- [ ] Zone/origin mới được query/test trực tiếp trước cutover.
+- [ ] Cùng release/config và có build marker.
+- [ ] Có strategy cho DB, upload, session, queue và cron.
+- [ ] Schema backward-compatible; single-writer/freeze được định nghĩa.
+- [ ] GitHub custom domain được verify/attach trước DNS.
+- [ ] API VPS pass `curl --resolve` HTTP/TLS.
+- [ ] Email mailbox/auth records/canary đã sẵn sàng.
+- [ ] Acceptance matrix có exact status/content/owner.
+- [ ] Threshold và người ra quyết định rollback đã ghi trước.
+- [ ] Rollback data khác rollback DNS và cả hai đã diễn tập.
+- [ ] Với NS migration, DS TTL/trust chain có runbook riêng.
+- [ ] Origin/zone cũ chưa bị xóa và còn quan sát được.
+
+## Bài tập capstone
+
+1. A record TTL cũ là 4 giờ, vừa hạ xuống 5 phút. Sớm nhất khi nào nên dựa vào TTL mới cho cutover?
+2. Thiết kế migration cho app có local uploads và cron gửi invoice không idempotent.
+3. `dig` thường trả `SERVFAIL`, còn `dig +cd` trả đúng A record. Lớp nào hỏng và kiểm tiếp gì?
+4. Viết rollback order khi origin mới đã nhận 20 phút write vào database riêng.
+
+<details>
+<summary>Gợi ý đáp án</summary>
+
+1. Sau ít nhất một chu kỳ TTL cũ — 4 giờ kể từ lúc authoritative publish TTL mới — rồi xác minh bằng query.
+2. Chuyển upload sang shared object storage hoặc sync + final freeze; chỉ một scheduler active, dùng idempotency key trước khi failover.
+3. Nghi DNSSEC trust chain/DS/DNSKEY; kiểm `dig DS`, `DNSKEY`, authoritative signatures và DS ở registrar/parent.
+4. Freeze write, xác định/reconcile 20 phút delta về source of truth, kiểm consistency, rồi restore DNS; không đổi A trước khi xử lý data.
+
+</details>
+
+## Nguồn chính thức
+
+- [Cloudflare DNS — Change nameservers (full setup)](https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/)
+- [Cloudflare DNS — DNSSEC](https://developers.cloudflare.com/dns/dnssec/)
+- [Cloudflare DNS — Troubleshooting DNSSEC](https://developers.cloudflare.com/dns/dnssec/troubleshooting/)
+- [Cloudflare DNS — Proxy status](https://developers.cloudflare.com/dns/proxy-status/)
+- [GitHub Pages — Managing a custom domain](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/managing-a-custom-domain-for-your-github-pages-site)
+- [GitHub Pages — Verifying a custom domain](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/verifying-your-custom-domain-for-github-pages)
+- [Hostinger — Migrate email services to Hostinger Email](https://support.hostinger.com/en/articles/5240867-how-to-migrate-email-services-to-hostinger-email)
+- [curl — Command line manual (`--resolve`)](https://curl.se/docs/manpage.html#--resolve)
+- [NGINX — How nginx processes a request](https://nginx.org/en/docs/http/request_processing.html)
+
+---
+
+**Điều cốt lõi:** zero-downtime không đến từ TTL thấp mà từ việc origin cũ và mới cùng hợp lệ trong cửa sổ cache, state có một nguồn sự thật, acceptance test đo đúng business flow và rollback xử lý cả traffic lẫn dữ liệu. Khi có lỗi, đi từ NS/DS xuống A/AAAA, TLS, HTTP rồi app — lớp hỏng đầu tiên mới là nơi cần sửa.

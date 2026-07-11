@@ -17,6 +17,8 @@ const posts = defineCollection({
       description: z.string().min(1).max(240),
       pubDate: z.coerce.date(),
       updatedDate: z.coerce.date().optional(),
+      /** Ngôn ngữ nội dung — layout dùng cho html[lang], OG locale và JSON-LD. */
+      lang: z.enum(['en', 'vi']).optional(),
       tags: z.array(z.string()).default([]),
       /**
        * Series membership — first-class, không phụ thuộc pubDate.

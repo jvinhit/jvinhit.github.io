@@ -1,0 +1,492 @@
+---
+title: 'Domain, DNS & Hosting · Phần 6 — Cloudflare Pages Custom Domain'
+description: 'Deploy Astro lên Cloudflare Pages bằng Git integration, tách production/preview, gắn apex hoặc subdomain, kiểm chứng và rollback deployment.'
+pubDate: 2026-07-11
+lang: vi
+tags:
+  [hosting, domain, dns, cloudflare-pages, astro, deployment, hosting_dns_10]
+series: hosting-dns
+seriesOrder: 6
+draft: false
+---
+
+import HostingDiagram from '../../components/blog/HostingDiagram.astro';
+
+Kết thúc bài này, bạn sẽ đưa một Astro static site lên **Cloudflare Pages** với
+Git integration, preview deployment, custom domain và rollback deployment mà
+không nhầm nó với một Workers project.
+
+Đích cuối:
+
+```text
+push/PR → Pages build → immutable deployment → Cloudflare edge
+                                      ├─ production: example.com
+                                      └─ preview: <hash>.<project>.pages.dev
+```
+
+> Scope rất cụ thể: đây là **Cloudflare Pages project** và workflow Pages Git
+> integration. Tài liệu Astro hiện tại ghi rằng Cloudflare khuyến nghị Workers
+> cho project mới; Workers Builds + Static Assets dùng `wrangler deploy` và
+> cấu hình khác. Đừng trộn deploy command hoặc routing của hai sản phẩm trong
+> cùng một runbook.
+
+---
+
+## Prerequisites và current-state inventory
+
+Flow chính giả định Astro xuất static HTML:
+
+- `npm run build` chạy thành công ở local;
+- output nằm trong `dist/`;
+- source đã ở GitHub hoặc GitLab;
+- lockfile được commit;
+- bạn biết production branch, ví dụ `main`;
+- domain còn quyền quản lý DNS và chưa có record xung đột;
+- email records đã được export trước khi đổi nameserver cho apex.
+
+Ghi lại bảng này:
+
+| Hạng mục            | Ví dụ                          | Vì sao cần                                   |
+| ------------------- | ------------------------------ | -------------------------------------------- |
+| Repo/root directory | root hoặc `apps/blog`          | Pages phải chạy build đúng thư mục           |
+| Package manager     | npm/pnpm/yarn                  | lockfile quyết định dependency graph         |
+| Build command       | `npm run build`                | phải giống local/CI                          |
+| Output directory    | `dist`                         | sai path tạo deployment rỗng                 |
+| Production branch   | `main`                         | chỉ branch này cập nhật custom domain        |
+| Existing DNS        | A/CNAME/MX/TXT/CAA             | tránh xóa nhầm mail hoặc policy CA           |
+| Canonical URL       | `https://example.com`          | dùng cho Astro `site` và redirect            |
+| Runtime model       | static hay SSR/Functions       | quyết định adapter và header handling        |
+| Rollback target     | production deployment gần nhất | preview không rollback thành production được |
+
+Nếu project dùng on-demand rendering, Pages Functions hoặc
+`@astrojs/cloudflare`, đừng áp nguyên xi static recipe. Pages vẫn có tài liệu
+SSR, nhưng response runtime, bindings, secrets và `_headers`/`_redirects` có
+ranh giới khác; bài này sẽ chỉ rõ các ranh giới đó.
+
+<HostingDiagram
+  kind="cloudflare-pages"
+  caption="Pages Git integration tạo deployment mới từ mỗi commit; production branch cập nhật custom domain, còn branch và pull request tạo preview URL riêng"
+/>
+
+DNS không đổi sau mỗi commit. Custom domain tiếp tục trỏ tới Pages platform;
+Pages chỉ đổi deployment nào đang được production alias phục vụ.
+
+---
+
+## Bước 1 — chuẩn hóa Astro trước khi kết nối Pages
+
+Một Astro static site không cần Cloudflare adapter. Default build output là
+`dist/`. Đặt production URL để sitemap, canonical và URL tuyệt đối được sinh
+đúng:
+
+```js
+import { defineConfig } from 'astro/config';
+
+export default defineConfig({
+  site: 'https://example.com',
+});
+```
+
+Custom apex phục vụ ở root nên không cần `base`. Chỉ cấu hình `base` khi site
+thực sự sống dưới một path như `https://example.com/docs/`.
+
+Chạy quality gate tại local:
+
+```bash
+npm ci
+npm run build
+test -f dist/index.html
+npx astro preview
+```
+
+Commit lockfile và pin Node bằng `.node-version` hoặc `.nvmrc` để build không
+phụ thuộc platform default thay đổi theo thời gian:
+
+```text
+22
+```
+
+`22` ở đây là ví dụ LTS phù hợp với project; hãy dùng version project đã test
+và còn được Pages build image hỗ trợ. Nếu không dùng file, Pages cũng cho phép
+đặt `NODE_VERSION` trong build environment.
+
+---
+
+## Bước 2 — tạo đúng Cloudflare Pages project
+
+Trong dashboard:
+
+1. Workers & Pages → Create application.
+2. Chọn **Pages/Git integration**, kết nối GitHub hoặc GitLab repository.
+3. Chọn production branch rõ ràng, ví dụ `main`.
+4. Dùng build settings:
+
+| Setting                | Giá trị cho Astro static                                        |
+| ---------------------- | --------------------------------------------------------------- |
+| Framework preset       | Astro                                                           |
+| Build command          | `npm run build`                                                 |
+| Build output directory | `dist`                                                          |
+| Root directory         | để trống nếu Astro ở repo root; nếu monorepo, chọn package path |
+
+5. Save and Deploy.
+
+Đừng thêm deploy command `npx wrangler deploy`: đó là Workers flow. Với Pages
+Git integration, Pages tự lấy `dist` sau build và tạo deployment.
+
+Nếu monorepo dùng workspace command riêng, hãy chứng minh cùng command từ đúng
+root ở local trước. “Build succeeded” chỉ có nghĩa command exit 0; output
+directory sai vẫn có thể tạo một site thiếu file.
+
+Khi deployment đầu tiên hoàn tất:
+
+```bash
+curl -I https://PROJECT.pages.dev
+```
+
+Kỳ vọng `2xx`/`3xx` hợp lý và có header `cf-ray`. Mở ít nhất trang chủ, một
+route sâu, CSS/JS và `404` trước khi gắn domain thật.
+
+---
+
+## Production và preview không phải hai domain trỏ tay
+
+Với Git integration:
+
+- commit vào production branch cập nhật `PROJECT.pages.dev` và mọi custom
+  domain;
+- branch khác tạo deployment dạng
+  `HASH.PROJECT.pages.dev`;
+- Pages còn tạo branch alias như `development.PROJECT.pages.dev`, alias này
+  di chuyển theo deployment mới nhất của branch;
+- hash URL là deployment cụ thể và vẫn có thể truy cập sau lần push tiếp theo;
+- pull request từ chính repository tạo preview URL; PR từ nguồn ngoài không
+  có cùng guarantee.
+
+Preview public mặc định. Có thể bật Cloudflare Access policy để giới hạn người
+xem. Pages mặc định gửi:
+
+```http
+X-Robots-Tag: noindex
+```
+
+cho preview deployment, giảm duplicate-content indexing. Xác minh:
+
+```bash
+curl -I https://HASH.PROJECT.pages.dev |
+  tr -d '\r' |
+  rg -i 'x-robots-tag|cf-ray|location'
+```
+
+Custom domain production không tự chuyển sang preview khi mở PR.
+
+---
+
+## Bước 3 — gắn custom apex khi zone ở Cloudflare
+
+Cloudflare Pages yêu cầu apex `example.com` là một Cloudflare zone trong cùng
+account với Pages project và nameserver đã trỏ Cloudflare.
+
+Thứ tự:
+
+1. xác nhận `dig NS example.com` trả đúng cặp Cloudflare;
+2. Pages project → **Custom domains** → **Set up a domain**;
+3. nhập `example.com`;
+4. để Pages kiểm tra ownership và tạo DNS record;
+5. chờ custom domain chuyển sang `Active`;
+6. sau đó mới thêm `www.example.com` như custom domain thứ hai nếu cần.
+
+Expected state do Pages quản lý:
+
+| Type  | Name  | Content             | Trạng thái                          |
+| ----- | ----- | ------------------- | ----------------------------------- |
+| CNAME | `@`   | `PROJECT.pages.dev` | Pages/Cloudflare tạo và quản lý     |
+| CNAME | `www` | `PROJECT.pages.dev` | thêm sau khi bind `www` vào project |
+
+Ở apex, Cloudflare flatten CNAME khi trả lời resolver. Vì vậy:
+
+```bash
+dig CNAME example.com +short
+```
+
+có thể rỗng, còn:
+
+```bash
+dig A example.com +short
+curl -I https://example.com
+```
+
+vẫn hoạt động. Dashboard và trạng thái Custom domains mới là nơi xác nhận
+binding.
+
+Không tạo CNAME thủ công rồi mới thêm domain vào Pages. Cloudflare cảnh báo
+hostname chưa được associate trong Pages dashboard có thể trả `522` dù DNS
+trông hợp lý.
+
+### CAA có thể chặn certificate
+
+Nếu zone có CAA hạn chế, Cloudflare Pages phải được phép dùng CA hiện tại của
+nền tảng. Tài liệu custom-domain của Pages liệt kê các giá trị cần cho
+`letsencrypt.org`, `pki.goog` và `ssl.com`. Đừng tự thêm một policy rút gọn từ
+bài cũ; đối chiếu danh sách hiện hành và policy bảo mật của tổ chức trước khi
+sửa CAA.
+
+---
+
+## Bước 4 — subdomain khi DNS vẫn ở provider khác
+
+Một subdomain như `docs.example.com` không bắt buộc chuyển toàn bộ apex zone
+sang Cloudflare.
+
+Thứ tự vẫn là **bind trước, DNS sau**:
+
+1. Pages → Custom domains → thêm `docs.example.com`;
+2. tại authoritative DNS hiện tại, tạo:
+
+| Type  | Name   | Content             |
+| ----- | ------ | ------------------- |
+| CNAME | `docs` | `PROJECT.pages.dev` |
+
+3. chờ Pages verify và cấp certificate;
+4. kiểm tra:
+
+```bash
+dig CNAME docs.example.com +short
+curl -I https://docs.example.com
+```
+
+Kỳ vọng CNAME trả `PROJECT.pages.dev.` và HTTPS pass. Với external DNS, không
+có nút orange/gray cloud của Cloudflare DNS; provider đó chỉ trả CNAME.
+
+Apex là trường hợp khác: theo Pages docs, muốn dùng apex custom domain thì zone
+phải được onboard vào Cloudflare và nameserver trỏ Cloudflare.
+
+---
+
+## Canonical redirect: không dùng `_redirects` sai tầng
+
+Nếu attach cả `example.com` và `www.example.com`, chọn một canonical hostname.
+Đảm bảo **cả hai đều đã được Pages bind và có certificate**, sau đó dùng
+Cloudflare Bulk Redirect hoặc Redirect Rule để redirect hostname còn lại.
+
+Tương tự, nếu không muốn `PROJECT.pages.dev` xuất hiện như một bản production
+song song, Cloudflare docs đề xuất account-level Bulk Redirect tới custom
+domain.
+
+`public/_redirects` chỉ dành cho path/static asset routing trong Pages:
+
+```text
+/old-article  /new-article  301
+/docs/*       /guide/:splat 301
+```
+
+Domain-level redirect không được `_redirects` hỗ trợ. Đưa `www → apex` vào file
+này sẽ không thay thế Redirect Rule/Bulk Redirect ở edge.
+
+---
+
+## `_headers` và `_redirects` có boundary rõ ràng
+
+Với Astro, đặt hai file trong `public/` để chúng được copy vào `dist/`:
+
+```text
+public/
+├── _headers
+└── _redirects
+```
+
+Ví dụ `public/_headers`:
+
+```text
+/_astro/*
+  Cache-Control: public, max-age=31536000, immutable
+
+https://PROJECT.pages.dev/*
+  X-Robots-Tag: noindex
+```
+
+Astro asset trong `/_astro/` thường có content hash nên phù hợp immutable
+cache. Không áp một năm cho HTML không fingerprint.
+
+Hai caveat:
+
+- redirect được xử lý trước header; request đã redirect không nhận block header
+  của response static cũ;
+- `_headers` và `_redirects` không áp vào response do Pages Functions/SSR tạo.
+  Với Function, header/redirect phải được trả từ Function code hoặc routing
+  của Function.
+
+Đừng copy một CSP “cứng” vào production nếu chưa inventory script, font, image
+và analytics; CSP sai có thể làm site trắng trong khi deployment vẫn healthy.
+
+---
+
+## Environment variables và secrets
+
+Pages inject các biến build như `CF_PAGES`, `CF_PAGES_BRANCH`,
+`CF_PAGES_COMMIT_SHA` và `CF_PAGES_URL`. Custom variable được cấu hình tại
+project Settings và nên có giá trị riêng cho Production/Preview.
+
+Ba quy tắc:
+
+1. Với Astro, biến `PUBLIC_*` có thể đi vào client bundle; không đặt secret ở
+   đó.
+2. Static build có thể serialize bất kỳ giá trị nào bạn dùng để sinh HTML/JS.
+   Nút “Encrypt” trong dashboard không cứu được secret nếu code build cố tình
+   in nó vào output.
+3. Muốn giữ API key ở server, cần Pages Function/Worker. Secret được đọc tại
+   runtime qua `context.env`, không gửi xuống browser.
+
+Cloudflare Pages cho phép Variables and Secrets riêng cho production và
+preview. Thay binding/secret cần redeploy để deployment mới dùng cấu hình đó.
+Local secret để trong `.dev.vars` hoặc `.env` và phải gitignore.
+
+---
+
+## Verification runbook và cách đọc kết quả
+
+```bash
+# Delegation và DNS
+dig NS example.com +short
+dig A example.com +short
+dig CNAME www.example.com +short
+
+# HTTP/TLS
+curl -I http://example.com
+curl -I https://example.com
+curl -I https://www.example.com
+
+# Pages/edge signal
+curl -I https://example.com |
+  tr -d '\r' |
+  rg -i 'cf-ray|server|location|cache-control|x-robots-tag'
+
+# Certificate
+openssl s_client \
+  -connect example.com:443 \
+  -servername example.com </dev/null 2>/dev/null |
+  openssl x509 -noout -subject -issuer -dates
+```
+
+Diễn giải:
+
+- NS sai: bạn đang sửa sai zone hoặc apex chưa onboard Cloudflare;
+- DNS đúng, `522`: custom domain chưa associate/active hoặc có route khác chặn;
+- homepage `200` nhưng route sâu `404`: build output/link/trailing slash, không
+  phải propagation;
+- `cf-ray` xác nhận request qua Cloudflare edge;
+- production không nên có `X-Robots-Tag: noindex` nếu bạn không chủ động đặt;
+- preview nên có `noindex` theo default Pages.
+
+---
+
+## Failure modes thường gặp
+
+### Build xanh nhưng site trống
+
+Kiểm tra root directory và `dist`. Với monorepo, Pages có thể chạy đúng command
+ở sai package hoặc lấy output của package khác.
+
+### Asset 404 sau custom domain
+
+Astro `site` hoặc `base` vẫn theo hostname/path cũ. Custom apex thường dùng
+`site: 'https://example.com'` và không có `base`.
+
+### Custom domain `Verifying` quá lâu
+
+Kiểm tra CAA, duplicate DNS, Access policy, Worker route hoặc redirect đang
+chặn HTTP validation. Với external subdomain, kiểm tra CNAME public.
+
+### CNAME thủ công trả `522`
+
+Thêm hostname qua Pages → Custom domains trước. DNS record một mình không tạo
+binding/certificate.
+
+### Preview dùng nhầm dữ liệu production
+
+Tách environment variables, secrets và bindings cho Preview/Production. Preview
+URL public mặc định; không dùng production credential nếu reviewer không cần.
+
+### `_headers` không áp vào API
+
+API đang chạy qua Pages Function, nên file static không can thiệp response.
+Gắn CORS/security header trong Function, kể cả `OPTIONS`.
+
+### Trỏ DNS đi chỗ khác rồi trỏ lại
+
+Cloudflare ghi nhận custom domain có thể chuyển `Inactive`; khi trỏ lại, traffic
+có thể lỗi cho tới khi domain active lại. Theo dõi trạng thái trong Pages, đừng
+chỉ nhìn `dig`.
+
+---
+
+## Rollback: ưu tiên deployment, không rung DNS
+
+Nếu release mới lỗi nhưng domain và Pages platform vẫn khỏe:
+
+1. Pages project → Deployments → All deployments.
+2. Chọn một **production deployment đã build thành công**.
+3. Menu ba chấm → **Rollback to this deployment**.
+4. Kiểm tra custom domain, route sâu và asset.
+5. Revert/fix commit trong Git; rollback không đổi source, nên push production
+   tiếp theo có thể đưa bug trở lại.
+
+Preview deployment không phải rollback target cho production.
+
+Chỉ rollback DNS khi lỗi thuộc domain binding/platform:
+
+1. khôi phục record cũ tại authoritative DNS;
+2. xác minh origin cũ đã phục vụ HTTPS;
+3. theo dõi resolver và `curl`;
+4. nếu tháo custom domain khỏi Pages, làm theo thứ tự chính thức: xóa Pages DNS
+   record, rồi remove domain trong Pages dashboard;
+5. giữ Pages project và deployment cho tới khi traffic cũ ổn định.
+
+Đừng xóa project trước khi xóa CNAME/custom domain; dangling record sẽ trỏ tới
+một project không còn tồn tại.
+
+---
+
+## Checklist
+
+- [ ] Đã xác định đây là Pages project, không phải Workers Static Assets.
+- [ ] `npm ci && npm run build` pass và `dist/index.html` tồn tại.
+- [ ] Lockfile và Node version được pin.
+- [ ] Git integration dùng đúng root, production branch, command và `dist`.
+- [ ] `PROJECT.pages.dev`, route sâu, asset và 404 đã test trước custom domain.
+- [ ] Apex được thêm qua Pages Custom domains, không tạo CNAME tay trước.
+- [ ] External subdomain được bind trước rồi mới CNAME tới `PROJECT.pages.dev`.
+- [ ] CAA hiện tại không chặn certificate.
+- [ ] Production và Preview có variables/secrets tách biệt.
+- [ ] `_headers`/`_redirects` chỉ được kỳ vọng trên static responses.
+- [ ] Canonical hostname dùng Bulk Redirect/Redirect Rule, không dùng domain
+      redirect trong `_redirects`.
+- [ ] Đã test rollback một production deployment và biết preview không dùng
+      làm rollback target.
+
+## Bài tập
+
+1. Tạo branch `lab-preview`, push một thay đổi và so sánh hash URL với branch
+   alias. Push lần hai và ghi URL nào đổi, URL nào giữ nguyên.
+2. Đặt `X-Robots-Tag: noindex` riêng cho `PROJECT.pages.dev` trong
+   `public/_headers`, nhưng xác nhận custom domain production không nhận nó.
+3. Tạo path redirect `/old → /new` bằng `public/_redirects`, rồi giải thích vì
+   sao cùng file không phải chỗ làm `www → apex`.
+4. Rollback về production deployment trước trong dashboard, sau đó mô tả commit
+   Git nào cần revert để rollback trở thành trạng thái bền vững.
+
+---
+
+## Nguồn chính thức, kiểm tra tháng 07/2026
+
+- [Cloudflare Pages — Deploy Astro](https://developers.cloudflare.com/pages/framework-guides/deploy-an-astro-site/)
+- [Cloudflare Pages — Build configuration](https://developers.cloudflare.com/pages/configuration/build-configuration/)
+- [Cloudflare Pages — GitHub integration](https://developers.cloudflare.com/pages/configuration/git-integration/github-integration/)
+- [Cloudflare Pages — Branch build controls](https://developers.cloudflare.com/pages/configuration/branch-build-controls/)
+- [Cloudflare Pages — Preview deployments](https://developers.cloudflare.com/pages/configuration/preview-deployments/)
+- [Cloudflare Pages — Custom domains](https://developers.cloudflare.com/pages/configuration/custom-domains/)
+- [Cloudflare Pages — Rollbacks](https://developers.cloudflare.com/pages/configuration/rollbacks/)
+- [Cloudflare Pages — Redirects](https://developers.cloudflare.com/pages/configuration/redirects/)
+- [Cloudflare Pages — Headers](https://developers.cloudflare.com/pages/configuration/headers/)
+- [Cloudflare Pages — Variables, bindings và secrets](https://developers.cloudflare.com/pages/functions/bindings/)
+- [Astro — Deploy guide và Cloudflare product distinction](https://docs.astro.build/en/guides/deploy/cloudflare/)
+- [Astro — `site`, `base` và deployment URL](https://docs.astro.build/en/guides/configuring-astro/)

@@ -1,276 +1,486 @@
 ---
-title: 'Node.js Super Senior · Phase 7 — DevOps & Deployment'
-description: 'Phase 7: take it to production — 12-factor config, multi-stage Docker images and PID 1 signals, Docker Compose, PM2 vs Kubernetes, health checks and zero-downtime deploys, a CI/CD pipeline with GitHub Actions, and nginx + TLS.'
+title: 'Node.js Production Engineering 07 — Đưa Service lên Production'
+description: 'Biến source code thành một service vận hành được: image bất biến, config và secret, probe, graceful shutdown, migration, rollout, rollback, CI/CD và quan sát deployment.'
 pubDate: 2026-06-09
-tags: [nodejs, devops, docker, ci-cd, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, devops, docker, ci-cd, reliability, production-engineering]
 series: nodejs
 seriesOrder: 7
 draft: false
 ---
 
-Đây là **Phase 7 của lộ trình Super Senior 10 phase**. ""Chạy trên máy tôi" là nơi junior dừng và senior bắt đầu. Giờ ta đóng gói app để nó chạy **y hệt mọi nơi**, ship **tự động**, và **sống sót** qua restart, deploy, và sự cố.
+Deploy thành công không có nghĩa process đã khởi động. Một release chỉ thành công khi phiên bản mới **nhận traffic đúng**, không làm mất request đang chạy, tương thích với dữ liệu hiện tại, phát ra tín hiệu quan sát được và có đường rollback đã kiểm chứng.
+
+Production vì thế là một contract giữa application và platform:
+
+```text
+application hứa: artifact xác định, probe đúng nghĩa, shutdown có giới hạn,
+                 migration tương thích, telemetry đủ để quyết định
+
+platform hứa:    config/secret đúng lúc, resource limit, routing, restart,
+                 rollout có kiểm soát, lưu log/metric/trace
+```
+
+Thiếu một vế, lỗi dễ bị quy cho “Docker”, “Kubernetes” hoặc “network” dù nguyên nhân thật nằm ở lifecycle chưa được thiết kế.
+
+## Sau bài này, bạn sẽ làm được gì?
+
+- Tạo một image Node.js nhỏ, bất biến, non-root và tái lập được.
+- Phân biệt config với secret; validate trước khi nhận traffic.
+- Thiết kế startup, liveness và readiness probe không gây cascading failure.
+- Drain HTTP, database pool và worker trong một shutdown budget rõ ràng.
+- Tách build, release và runtime; triển khai migration theo expand–contract.
+- Chọn rolling, blue-green hoặc canary theo rủi ro thay đổi.
+- Dùng deployment metric và SLO để tự động dừng hoặc rollback release.
 
 ---
 
-## Quản lý env & config
+## Mental model: build một lần, promote cùng artifact
 
-Quy tắc **Twelve-Factor**: config khác nhau giữa môi trường nằm trong **environment**, không bao giờ trong code.
+Pipeline production có ba pha khác nhau:
 
-```bash
-# .env  (gitignored — NEVER commit secrets)
-NODE_ENV=production
-PORT=3000
-DATABASE_URL=postgresql://user:pass@localhost/dbname
-JWT_SECRET=your_secret_key
-REDIS_URL=redis://localhost:6379
+```text
+BUILD
+source + lockfile ─▶ test ─▶ image@sha256 ─▶ SBOM/provenance
+
+RELEASE
+image digest + config version + migration plan ─▶ staging ─▶ production
+
+RUNTIME
+replica + resource limits + probes + telemetry + shutdown contract
 ```
 
-Tập trung và **xác thực** config khi khởi động — fail nhanh nếu thiếu hoặc yếu:
+Không rebuild cho từng môi trường. Nếu staging chạy image A nhưng production được build lại thành image B, staging không còn là bằng chứng cho production. Hãy promote **cùng digest**, chỉ thay config được quản trị bên ngoài artifact.
+
+## Config và secret: fail trước traffic
+
+Config là giá trị thay đổi giữa môi trường. Secret là config cần cơ chế lưu trữ, phân quyền, audit và rotation riêng.
 
 ```ts
 import { z } from 'zod';
 
-const envSchema = z.object({
-  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
-  PORT: z.coerce.number().default(3000),
+const RuntimeConfig = z.object({
+  NODE_ENV: z.literal('production'),
+  PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
   DATABASE_URL: z.string().url(),
-  JWT_SECRET: z.string().min(32), // refuse to start with a weak secret
+  REDIS_URL: z.string().url(),
+  REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().max(30_000),
+  RELEASE_SHA: z.string().min(7),
 });
-export const config = envSchema.parse(process.env); // crash loudly at startup, not at 3am
+
+export type RuntimeConfig = z.infer<typeof RuntimeConfig>;
+export const config = RuntimeConfig.parse(process.env);
 ```
 
-> Node 24 đọc `.env` sẵn — không cần `dotenv`. Với secret thật, ưu tiên secrets manager tiêm vào env lúc deploy.
+Nguyên tắc vận hành:
+
+- Validate một lần ở startup và dừng với lỗi rõ ràng nếu sai.
+- Không log toàn bộ `process.env`; redaction sau khi log đã rời process là quá muộn.
+- Secret được inject ở runtime từ secret manager, không bake vào image hoặc commit trong `.env`.
+- Rotation cần hỗ trợ giai đoạn hai credential cùng hợp lệ; đổi secret một bước có thể tự khóa service.
+- `/config` debug endpoint, nếu có, chỉ hiển thị giá trị không nhạy cảm và phải được bảo vệ.
+
+Node hỗ trợ `--env-file` cho local workflow, nhưng production vẫn cần secret manager và audit thay vì chuyển file bí mật quanh hệ thống.
 
 ---
 
-## Docker — build nhỏ, chạy an toàn
+## Dockerfile: tối ưu tính xác định trước kích thước
 
-Image Docker dựng theo **layer**; mỗi lệnh là một layer được cache. Dùng **multi-stage build** để công cụ build không lọt vào image cuối:
+Multi-stage build tách compiler/dev dependency khỏi runtime. Ví dụ dưới dùng cùng họ base image giữa build và runtime để giảm rủi ro native module không tương thích:
 
 ```dockerfile
-# ---- build stage ----
-FROM node:24-alpine AS build
+# syntax=docker/dockerfile:1
+FROM node:24-bookworm-slim AS dependencies
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci                      # cached until package*.json changes
-COPY . .
-RUN npm run build               # compile TypeScript → dist/
+COPY package.json package-lock.json ./
+RUN npm ci
 
-# ---- runtime stage ----
-FROM node:24-alpine
-WORKDIR /app
+FROM dependencies AS build
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build \
+ && npm prune --omit=dev
+
+FROM node:24-bookworm-slim AS runtime
 ENV NODE_ENV=production
-RUN apk add --no-cache tini     # a real PID 1 that forwards signals (see 7.5)
-COPY package*.json ./
-RUN npm ci --omit=dev           # production deps only
-COPY --from=build /app/dist ./dist
-USER node                       # never run as root
+WORKDIR /app
+
+COPY --from=build --chown=node:node /app/package.json ./package.json
+COPY --from=build --chown=node:node /app/package-lock.json ./package-lock.json
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/dist ./dist
+
+USER node
 EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=3s \
-  CMD node -e "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["node", "dist/index.js"]
+CMD ["node", "dist/server.js"]
 ```
 
-Phản xạ senior:
+Thêm `.dockerignore` để credential, `.git`, test output và local `node_modules` không vào build context.
 
-- nhỏ, nhanh, an toàn hơn.
-- cache `npm ci` đến khi deps đổi.
-- ghim digest, chạy non-root, quét image.
-- Alpine hoặc distroless cho bề mặt tấn công nhỏ.
-
-### Docker Compose — cả stack
-
-Compose chạy app *cùng* phụ thuộc trong một lệnh:
-
-```yaml
-services:
-  app:
-    build: .
-    ports: ['3000:3000']
-    environment:
-      DATABASE_URL: postgresql://user:pass@postgres:5432/mydb
-      REDIS_URL: redis://redis:6379
-    depends_on:
-      postgres: { condition: service_healthy }   # wait until DB is actually ready
-      redis: { condition: service_started }
-
-  postgres:
-    image: postgres:17-alpine
-    environment: { POSTGRES_USER: user, POSTGRES_PASSWORD: pass, POSTGRES_DB: mydb }
-    volumes: ['pgdata:/var/lib/postgresql/data'] # persist data across restarts
-    healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U user']
-      interval: 10s
-      retries: 5
-
-  redis: { image: redis:7-alpine }
-
-volumes:
-  pgdata:
+```text
+.git
+.env*
+node_modules
+coverage
+dist
+npm-debug.log*
 ```
 
-**Tên service thành hostname**; **named volume** giữ dữ liệu DB.
+### Các quyết định cần ghi rõ
+
+| Quyết định                 | Lợi ích                     | Chi phí/rủi ro                                    |
+| -------------------------- | --------------------------- | ------------------------------------------------- |
+| Pin base image bằng digest | Build tái lập, audit rõ     | Phải có bot/quy trình cập nhật security patch     |
+| Image slim                 | Ít package và CVE hơn       | Debug tại chỗ khó hơn                             |
+| Distroless/hardened        | Bề mặt tấn công nhỏ         | Không có shell; native dependency cần kiểm tra kỹ |
+| Chạy non-root              | Giảm quyền khi bị khai thác | Phải chuẩn hóa quyền file/volume                  |
+| Một process/container      | Lifecycle và resource rõ    | Scale qua replica, không qua PM2 trong container  |
+
+Kích thước nhỏ không tự động đồng nghĩa an toàn. Một image 50 MB với dependency lỗi thời vẫn rủi ro hơn image lớn hơn nhưng được cập nhật, ký và quét đều đặn.
+
+### Supply-chain gate
+
+Pipeline nên tạo và lưu:
+
+- image digest thay vì chỉ tag `latest`;
+- SBOM cho dependency OS và Node;
+- provenance/attestation cho biết ai build từ commit nào;
+- kết quả scan có policy severity và exception có hạn sử dụng;
+- chữ ký hoặc cơ chế admission chỉ cho artifact được tin cậy.
+
+Tag thuận tiện cho con người; digest mới là identity bất biến của artifact.
 
 ---
 
-## Health check & tắt êm
+## Probe phải trả lời một câu hỏi duy nhất
 
-Orchestrator quyết định gửi traffic hay restart dựa trên **probe** — nên hãy phơi chúng:
+Ba probe có mục đích khác nhau:
 
-- **liveness** — nếu fail, orchestrator **restart**.
-- **readiness** — nếu fail, **ngưng gửi traffic** nhưng **không** giết container.
+| Probe     | Câu hỏi                                    | Hành động khi fail                              |
+| --------- | ------------------------------------------ | ----------------------------------------------- |
+| Startup   | App đã khởi động xong chưa?                | Cho thêm thời gian hoặc restart nếu vượt ngưỡng |
+| Liveness  | Process còn có khả năng tiến triển không?  | Restart container                               |
+| Readiness | Replica này có nên nhận traffic mới không? | Bỏ khỏi load balancer, không nhất thiết restart |
+
+Liveness không nên gọi database. Nếu database chung bị lỗi, mọi replica cùng fail liveness và bị restart liên tục, làm sự cố nặng hơn. Readiness có thể xét dependency **bắt buộc**, nhưng phải có timeout ngắn và không biến probe thành load generator.
 
 ```ts
-app.get('/health', (_req, res) => res.json({ status: 'ok' }));         // liveness: cheap
-app.get('/ready', async (_req, res) => {                              // readiness: deps
-  try { await pool.query('SELECT 1'); res.json({ ready: true }); }
-  catch { res.status(503).json({ ready: false }); }
+let shuttingDown = false;
+
+app.get('/livez', (_req, res) => {
+  res.status(200).json({ status: 'alive' });
+});
+
+app.get('/readyz', async (_req, res) => {
+  if (shuttingDown) {
+    return res.status(503).json({ status: 'draining' });
+  }
+
+  try {
+    await Promise.race([
+      pool.query('SELECT 1'),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('readiness timeout')), 150)
+      ),
+    ]);
+    return res.status(200).json({ status: 'ready' });
+  } catch {
+    return res.status(503).json({ status: 'not_ready' });
+  }
 });
 ```
 
-Khi deploy, orchestrator gửi **`SIGTERM`** — xả việc đang chạy rồi thoát. Trình tự đầy đủ để không downtime:
+Nếu service có degraded mode hợp lệ — ví dụ Redis down nhưng có thể đọc database — Redis không nên làm readiness fail. Đưa dependency vào readiness theo **khả năng phục vụ contract**, không theo danh sách kết nối.
+
+Kubernetes dùng startup probe để trì hoãn liveness/readiness cho app khởi động chậm:
+
+```yaml
+startupProbe:
+  httpGet: { path: /livez, port: 3000 }
+  periodSeconds: 2
+  failureThreshold: 30
+
+livenessProbe:
+  httpGet: { path: /livez, port: 3000 }
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet: { path: /readyz, port: 3000 }
+  periodSeconds: 5
+  timeoutSeconds: 1
+  failureThreshold: 2
+```
+
+---
+
+## Graceful shutdown là một deadline
+
+Khi platform thay replica, process nhận signal và có một khoảng grace period. Trình tự cần xác định:
 
 ```text
-SIGTERM ─▶ stop readiness (drop from LB) ─▶ server.close() (finish in-flight)
-        ─▶ close DB pool / queue workers ─▶ exit 0   (force-exit after a grace timeout)
+SIGTERM
+  1. readiness=false, ngừng traffic mới
+  2. ngừng nhận job/consumer message mới
+  3. đóng HTTP listener, chờ request đang chạy
+  4. flush telemetry cần thiết
+  5. đóng DB/Redis/broker connection
+  6. exit 0 trước deadline; quá hạn thì exit 1 có log
 ```
 
----
+```ts
+import type { Server } from 'node:http';
 
-## PM2 vs điều phối container
+export function installShutdown(server: Server) {
+  let started = false;
 
-`node app.js` trần chết khi crash và chỉ dùng một lõi CPU. Có hai thế giới.
+  async function shutdown(signal: string) {
+    if (started) return;
+    started = true;
+    shuttingDown = true;
 
-**Trên VPS cổ điển — PM2** giữ sống và chạy **cluster** trên mọi lõi:
+    logger.info({ signal }, 'shutdown started');
 
-```js
-// ecosystem.config.js
-module.exports = {
-  apps: [{
-    name: 'api', script: './dist/index.js',
-    instances: 'max', exec_mode: 'cluster',   // one worker per core, load-balanced
-    max_memory_restart: '500M',
-    env_production: { NODE_ENV: 'production', PORT: 3000 },
-  }],
-};
-```
+    const deadline = AbortSignal.timeout(25_000);
+    const forceExit = () => {
+      logger.error('shutdown deadline exceeded');
+      process.exit(1);
+    };
+    deadline.addEventListener('abort', forceExit, { once: true });
 
-```bash
-pm2 start ecosystem.config.js --env production
-pm2 reload api      # zero-downtime: workers cycle one at a time
-```
+    try {
+      await emailWorker.close();
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+      await Promise.allSettled([
+        pool.end(),
+        redis.quit(),
+        telemetry.shutdown(),
+      ]);
 
-**Trong container — orchestrator** lo restart, scale, cân bằng tải, nên chạy **một** tiến trình Node mỗi container, bỏ PM2 cluster. Từ vựng Kubernetes cần nhận ra:
-
-```yaml
-# A Deployment runs N replicas; probes use the endpoints from 7.3
-livenessProbe:  { httpGet: { path: /health, port: 3000 }, periodSeconds: 10 }
-readinessProbe: { httpGet: { path: /ready,  port: 3000 }, periodSeconds: 5 }
-# A HorizontalPodAutoscaler adds replicas when CPU/RPS rises.
-```
-
-> Mở rộng bằng thêm replica **stateless** (ngang), không phải máy to hơn (dọc) — vì thế session/cache nằm ở Redis, không trong bộ nhớ tiến trình.
-
----
-
-## PID 1 & tín hiệu — bug container thầm lặng
-
-Trong container tiến trình chạy là **PID 1**, có quy tắc tín hiệu đặc biệt: nếu Node là PID 1 mà không gắn handler đúng, `SIGTERM` có thể bị **bỏ qua**, nên deploy chờ hết grace rồi **giết cứng** giữa request. Hai cách sửa: dùng init như **`tini`** làm PID 1, và luôn tự xử lý `SIGTERM`/`SIGINT`.
-
----
-
-## Pipeline CI/CD (GitHub Actions)
-
-CI/CD tự động hóa đường từ `git push` tới production: lint → test → build → **migrate** → deploy.
-
-```yaml
-# .github/workflows/deploy.yml
-name: Deploy
-on: { push: { branches: [main] } }
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env: { POSTGRES_PASSWORD: postgres }
-        options: >-
-          --health-cmd pg_isready --health-interval 10s
-          --health-timeout 5s --health-retries 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '24', cache: 'npm' }
-      - run: npm ci
-      - run: npm run lint && npm test && npm run build
-
-  build-image:
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/build-push-action@v6     # BuildKit + layer cache
-        with:
-          push: true
-          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
-```
-
-Chiến lược deploy senior gọi tên được: **rolling**, **blue-green**, **canary**. Chạy **migration** như bước riêng, tương thích ngược, *trước* khi code mới lên.
-
-Nguyên tắc senior: **pipeline là cổng** — code fail không bao giờ tới production; deploy lặp lại được, có log, đảo ngược được.
-
----
-
-## nginx & TLS
-
-Ở production, đặt **nginx** trước Node làm reverse proxy — kết thúc TLS, phục vụ file tĩnh, cân bằng tải, che chắn Node:
-
-```nginx
-server {
-  listen 443 ssl;
-  server_name api.example.com;
-  ssl_certificate     /etc/letsencrypt/live/api.example.com/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
-
-  location / {
-    proxy_pass http://localhost:3000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; # for trust proxy (Phase 3)
+      deadline.removeEventListener('abort', forceExit);
+      logger.info('shutdown completed');
+      process.exit(0);
+    } catch (error) {
+      logger.error({ error }, 'shutdown failed');
+      process.exit(1);
+    }
   }
+
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
+  process.once('SIGINT', () => void shutdown('SIGINT'));
 }
 ```
 
-Lấy chứng chỉ miễn phí, tự gia hạn bằng **Certbot**.
+Shutdown handler phải idempotent vì nhiều signal có thể đến. Grace period của platform phải lớn hơn deadline nội bộ. Với request streaming/WebSocket, cần policy riêng: gửi close signal, đặt max connection age hoặc chuyển client sang replica khác.
+
+**Acceptance signal:** metric `shutdown_duration_seconds`, số request bị ngắt và số job bị trả lại queue. Chỉ log “received SIGTERM” chưa chứng minh drain thành công.
 
 ---
 
-## Khả năng quan sát — bộ ba vận hành
+## Resource request, limit và backpressure
 
-Không sửa được cái không thấy. Production cần ba tín hiệu: **log** (có cấu trúc), **metric** (RPS, p95, lỗi, event-loop lag), và **trace** (đường đi của request qua các service).
+Container không có tài nguyên vô hạn. Định nghĩa resource dựa trên profile dưới tải:
+
+```yaml
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: '1'
+    memory: 512Mi
+```
+
+- CPU limit quá thấp làm event-loop latency tăng dù host còn CPU.
+- Memory limit quá sát RSS bình thường gây OOM kill trước khi heap alert kịp phản ứng.
+- Pool DB, HTTP agent và worker concurrency phải tính theo **toàn bộ replica**, không theo một process.
+
+Ví dụ 20 replica × pool 20 = 400 connection. Nếu Postgres chỉ chịu 200, autoscale API có thể làm database sập. HPA cũng cần metric phản ánh saturation; scale theo CPU không giúp khi bottleneck là DB connection hoặc downstream quota.
+
+Backpressure phải xuất hiện trước giới hạn cứng: queue hữu hạn, concurrency cap, `429/503` có `Retry-After`, và load shedding cho request ít quan trọng.
 
 ---
 
-## 8. Dự án thực hành
+## Migration: expand–migrate–contract
 
-1. Đóng gói Docker đúng cách: multi-stage + .dockerignore + tini + non-root + HEALTHCHECK; xác nhận image nhỏ và quét sạch.
+Code cũ và code mới thường chạy đồng thời trong rolling deployment. Migration phá tương thích là nguồn lỗi phổ biến nhất.
 
-2. Dựng stack bằng Compose: app + Postgres + Redis, hostname theo service, depends_on chờ healthcheck, volume bền.
+Ví dụ đổi `users.name` thành `display_name`:
 
-3. Health + tắt êm: thêm `/health` và `/ready`; khi `SIGTERM` xả rồi thoát — chứng minh không rớt request.
+```text
+EXPAND   thêm display_name nullable; code mới đọc fallback name
+MIGRATE  backfill theo batch; đo remaining rows và replication lag
+SWITCH   code mới ghi/read display_name; vẫn giữ compatibility
+CONTRACT xóa name ở release sau khi không còn reader cũ
+```
 
-4. PM2 cluster: viết `ecosystem.config.js`, chứng minh `pm2 reload` không downtime.
+Không gộp drop column và deploy code mới trong một bước. Rollback code không rollback được dữ liệu đã bị xóa.
 
-5. Pipeline CI/CD: lint + test + build + push image gắn SHA; chạy bước migration.
+Migration production cần:
 
-6. Deploy có TLS: ship lên VPS sau nginx + Certbot; push `main` tự deploy.
+- lock/statement timeout;
+- ước lượng số dòng, tốc độ backfill và ảnh hưởng I/O;
+- khả năng resume theo checkpoint;
+- dashboard tiến độ và error;
+- runbook pause/rollback;
+- owner và cửa sổ thực thi.
+
+Schema migration là một release artifact độc lập, không phải side effect bí mật khi application boot. Nhiều replica cùng chạy migration khi startup có thể tranh lock và làm outage.
+
+---
+
+## Chọn chiến lược rollout
+
+| Chiến lược | Hợp khi                                   | Cần chuẩn bị                                           |
+| ---------- | ----------------------------------------- | ------------------------------------------------------ |
+| Rolling    | Thay đổi thường, backward-compatible      | Probe đúng, đủ capacity khi một số replica unavailable |
+| Blue-green | Muốn switch/rollback nhanh toàn phiên bản | Hai environment, data/schema vẫn phải tương thích      |
+| Canary     | Rủi ro cao, có metric phân biệt cohort    | Traffic splitting, sample đủ lớn, auto-analysis        |
+
+Canary không có metric và threshold chỉ là rolling deployment chậm. Trước rollout, định nghĩa guardrail:
+
+```text
+5xx rate       không tăng quá 0,5 điểm % so với baseline
+p99 latency    không tăng quá 20%
+readiness fail = 0 sau warm-up
+event-loop lag p99 < 50 ms
+business KPI   checkout success không giảm quá 1%
+```
+
+So sánh canary với control cùng thời gian để tránh kết luận sai vì traffic theo giờ. Tự động pause khi guardrail fail; rollback chỉ an toàn nếu schema, event và cache key vẫn tương thích.
+
+---
+
+## CI/CD là chuỗi bằng chứng
+
+Một pipeline tối thiểu:
+
+```yaml
+name: delivery
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy previously built image digest
+        run: ./scripts/deploy-image.sh "$IMAGE_DIGEST"
+```
+
+Trong hệ thống thật, job build image xuất digest/SBOM/provenance thành artifact; job deploy chỉ nhận digest đó. GitHub Environment có thể giới hạn branch, secret và approval. Ưu tiên OIDC với cloud provider thay cho access key sống lâu.
+
+Các gate nên phản ánh rủi ro:
+
+- unit/lint/typecheck chạy nhanh trên mọi PR;
+- integration và migration compatibility trước merge;
+- image scan, policy và signature trước registry promotion;
+- smoke test sau deploy;
+- canary analysis trước mở 100% traffic;
+- synthetic check và rollback drill định kỳ.
+
+---
+
+## Observability cho deployment
+
+Mọi log/metric/trace cần có `service.version`, `deployment.environment` và release SHA. Nếu không, dashboard không phân biệt lỗi của bản mới với nhiễu nền.
+
+Dashboard release nên trả lời:
+
+1. Replica mới có ready ổn định không?
+2. Error, latency và saturation đổi thế nào so với control?
+3. Dependency nào xuất hiện retry/timeout mới?
+4. Business flow chính có suy giảm không?
+5. Rollback mất bao lâu và có để lại data incompatibility không?
+
+Theo dõi cả delivery performance: deployment frequency, lead time, change failure rate và time to restore. Chỉ tối ưu số lần deploy mà bỏ change failure rate sẽ tạo tốc độ giả.
+
+## Failure modes và runbook
+
+| Triệu chứng                  | Khả năng                               | Hành động đầu tiên                          |
+| ---------------------------- | -------------------------------------- | ------------------------------------------- |
+| Replica restart vòng lặp     | Liveness quá nhạy, config sai, OOM     | Xem exit reason/event; dừng rollout         |
+| Ready nhưng 5xx cao          | Probe quá nông, dependency/config lỗi  | Giảm traffic canary; so trace theo version  |
+| Deploy treo ở terminating    | Connection/job không drain             | Kiểm active handles, shutdown duration      |
+| DB latency tăng khi deploy   | Migration lock/backfill quá mạnh       | Pause migration, kiểm lock/replication      |
+| Chỉ bản mới lỗi              | Contract/event/cache không tương thích | Rollback image nếu data vẫn compatible      |
+| Toàn hệ thống chậm khi scale | Pool/quota tính sai theo replica       | Giảm concurrency/replica, bảo vệ dependency |
+
+Runbook phải chứa lệnh và owner cụ thể, không chỉ “kiểm tra log”. Thực hành rollback trong giờ bình thường; outage không phải lúc đầu tiên thử quy trình.
+
+## Checklist trước khi mở traffic
+
+- [ ] Image được build một lần, pin bằng digest và chạy non-root.
+- [ ] Lockfile, SBOM, provenance và scan result được lưu cùng release.
+- [ ] Config được validate; secret không nằm trong image/log.
+- [ ] Startup/liveness/readiness probe có semantics và timeout đúng.
+- [ ] Graceful shutdown đã được test với request/job đang chạy.
+- [ ] Resource request/limit và pool size được tính theo tổng replica.
+- [ ] Migration theo expand–contract, có lock timeout và kế hoạch resume.
+- [ ] Rollout có guardrail, auto-pause và rollback path.
+- [ ] Telemetry gắn release SHA; dashboard so sánh canary/control.
+- [ ] Runbook và owner trực ca đã rõ.
+
+## Lab: phát hành Ordering Service không mất request
+
+### Yêu cầu
+
+1. Viết multi-stage Dockerfile, `.dockerignore`, chạy non-root.
+2. Thêm `/livez`, `/readyz`, startup probe và readiness semantics khi Redis down.
+3. Cài graceful shutdown cho HTTP, BullMQ, Postgres và telemetry.
+4. Tạo migration expand–contract cho một cột được đổi tên.
+5. Pipeline build image, xuất digest/SBOM, deploy canary và kiểm guardrail.
+6. Gắn release SHA vào log, metric và trace.
+
+### Acceptance criteria
+
+- Cùng một image digest chạy ở staging và production.
+- Secret scan không tìm thấy credential trong layer hoặc build log.
+- Gửi `SIGTERM` giữa request 10 giây: request hoàn tất, replica ngừng nhận traffic mới và thoát trước 25 giây.
+- Database down làm readiness fail nhưng liveness vẫn pass; không có restart storm.
+- Redis down vẫn ready nếu contract cho phép fallback; metric degraded mode tăng.
+- Code cũ và mới cùng chạy được trong mọi bước migration.
+- Canary tự pause khi 5xx hoặc p99 vượt threshold; rollback phục hồi trong mục tiêu RTO.
+
+## Tài liệu chính thức
+
+- [Docker — Multi-stage builds](https://docs.docker.com/build/building/multi-stage/)
+- [Docker — Building best practices](https://docs.docker.com/build/building/best-practices/)
+- [Docker Scout — SBOM và provenance policy](https://docs.docker.com/scout/policy/)
+- [Kubernetes — Liveness, readiness và startup probes](https://kubernetes.io/docs/concepts/workloads/pods/probes/)
+- [Kubernetes — Pod lifecycle và termination flow](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+- [GitHub Actions — Deployment environments](https://docs.github.com/en/actions/concepts/workflows-and-actions/deployment-environments)
+- [GitHub Actions — Security](https://docs.github.com/en/actions/how-tos/secure-your-work)
 
 ---
 
 ## Phần tiếp theo
 
-App của bạn đạt chuẩn production về vận hành: config đã xác thực, image multi-stage nhỏ và an toàn với tín hiệu PID 1 đúng, cả stack qua Compose, probe và tắt êm, PM2 *hoặc* orchestrator, pipeline CI/CD, nginx + TLS, và bộ ba quan sát.
-
-Ở **Phase 8**, ta làm nó **nhanh**: profiling, tìm event-loop lag, sửa query chậm, chiến lược caching, clustering, và tối ưu response — đo bằng load test thật.
+Service đã deploy lặp lại được và có guardrail vận hành. **Phần 8** dùng chính telemetry và môi trường tải đó để trả lời câu hỏi khó hơn: latency đến từ đâu, capacity thật là bao nhiêu và thay đổi nào cải thiện hiệu năng mà không làm tính đúng đắn hoặc chi phí xấu đi.

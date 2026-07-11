@@ -1,0 +1,349 @@
+---
+title: 'Domain, DNS & Hosting · Phần 9 — Email DNS: MX, SPF, DKIM, DMARC và CAA'
+description: 'Bảo toàn email khi đổi DNS/hosting: inventory MX, gộp đúng một SPF, lấy DKIM từ provider, rollout DMARC theo RFC 9989, kiểm CAA và rollback không mất mail.'
+pubDate: 2026-07-11
+tags:
+  [hosting, domain, dns, email, spf, dkim, dmarc, caa, security, hosting_dns_10]
+series: hosting-dns
+seriesOrder: 9
+lang: vi
+draft: false
+---
+
+import HostingDiagram from '../../components/blog/HostingDiagram.astro';
+
+Website vẫn mở sau khi đổi nameserver không có nghĩa migration thành công. Bỏ sót MX, SPF, DKIM hoặc DMARC có thể làm mất mail, đẩy invoice vào spam hoặc mở đường spoof domain.
+
+Bài này xây một runbook **email-safe** cho `example.com`: biết record nào điều khiển nhận mail, record nào xác thực gửi mail, cách chuyển provider mà không tạo hai SPF, cách tăng DMARC từ monitoring tới enforcement, và vì sao CAA cũng phải nằm trong DNS inventory dù không phải record email.
+
+> `example.com`, `example.net` và các hostname dưới chúng chỉ dùng cho tài liệu. Mọi MX/SPF/DKIM production phải lấy từ dashboard chính thức của email provider; không suy ra từ ví dụ trong blog.
+
+## Kết quả mục tiêu
+
+Sau change, hệ thống phải thỏa cả bốn hướng:
+
+1. Người ngoài gửi tới `user@example.com` được giao vào mailbox mới.
+2. Mail hợp lệ do các nguồn đã inventory gửi ra pass SPF hoặc DKIM **và** pass DMARC alignment.
+3. Mail giả mạo domain bị quan sát rồi xử lý theo policy đã rollout có kiểm soát.
+4. Việc cấp TLS cho web không bị CAA cũ chặn ngoài ý muốn.
+
+<HostingDiagram
+  kind="email-dns"
+  caption="MX định tuyến mail vào; SPF và DKIM cung cấp tín hiệu xác thực; DMARC kiểm alignment với From; CAA kiểm soát CA cấp TLS cho domain"
+/>
+
+## 1. Mental model: bốn record, bốn nhiệm vụ
+
+### MX — nhận mail ở đâu
+
+MX của `example.com` liệt kê mail exchanger và priority. Số nhỏ hơn được ưu tiên trước. MX không nói server nào được phép **gửi** mail; nó chỉ định tuyến SMTP vào domain.
+
+```text
+example.com. MX 10 mx1.mail.example.net.
+example.com. MX 20 mx2.mail.example.net.
+```
+
+Đây là ví dụ minh họa, không phải provider thật.
+
+### SPF — IP/provider nào được dùng envelope identity
+
+SPF là TXT record tại domain cần xác thực, bắt đầu bằng `v=spf1`. Nó authorize host cho SMTP `HELO`/`MAIL FROM` identity; nó không trực tiếp ký nội dung và không tự đảm bảo domain trong header `From:` người dùng nhìn thấy.
+
+Một owner name chỉ được có **một SPF record**. RFC 7208 quy định nhiều record được chọn cùng lúc tạo `permerror`. Nếu dùng email provider, CRM và transactional sender, gộp các `include` chính thức vào cùng record và kiểm giới hạn DNS lookup.
+
+```text
+# Hình thức minh họa — thay từng <provider...> bằng giá trị chính thức
+v=spf1 include:<mail-provider> include:<transactional-provider> -all
+```
+
+Không copy dòng này vào production. Dấu `-all` hay `~all`, tên `include` và thứ tự rollout phải theo provider và trạng thái migration của bạn.
+
+### DKIM — mail có chữ ký của signing domain nào
+
+Mail server ký header/body bằng private key. Receiver đọc selector `s=` và signing domain `d=` trong `DKIM-Signature`, rồi lookup public key tại:
+
+```text
+<selector>._domainkey.<signing-domain>
+```
+
+Ví dụ nếu header có `s=selector2026; d=example.com`, lookup là:
+
+```bash
+dig selector2026._domainkey.example.com TXT +short
+```
+
+**Không tự đặt selector hoặc public key.** Copy chính xác type/name/value từ dashboard; provider có thể dùng TXT hoặc CNAME. Khi rotate, publish selector mới, chuyển signer, giữ selector cũ cho mail đang truyền rồi mới xóa.
+
+### DMARC — SPF/DKIM có aligned với visible From không
+
+DMARC dùng Author Domain trong header `From:` và pass nếu ít nhất một identity aligned:
+
+- SPF pass và domain được SPF xác thực aligned với Author Domain; hoặc
+- DKIM pass và `d=` aligned với Author Domain.
+
+Vì vậy “SPF pass nhưng DMARC fail” hoàn toàn có thể xảy ra: mail provider dùng envelope domain của họ, không aligned với `From: example.com`, trong khi DKIM cũng không ký bằng domain aligned.
+
+DMARC policy được publish tại `_dmarc.example.com`:
+
+```text
+v=DMARC1; p=none; rua=mailto:dmarc-reports@example.com
+```
+
+Mailbox `rua` phải tồn tại, xử lý được aggregate reports và có access/retention phù hợp vì report chứa metadata nguồn gửi.
+
+### CAA — ai được cấp public TLS certificate
+
+CAA không xác thực email; nó giới hạn CA được cấp certificate. Vẫn phải inventory vì thiếu/sai CAA khi đổi DNS có thể làm GitHub Pages, Certbot hoặc hosting provider không renew HTTPS.
+
+```text
+# Chỉ dùng nếu bạn chủ động muốn Let’s Encrypt là CA được phép
+example.com. CAA 0 issue "letsencrypt.org"
+```
+
+Nếu dùng nhiều platform/CA, inventory requirement từng nơi trước khi siết. CA phải tuân CAA policy gần nhất trong DNS tree.
+
+## 2. Inventory trước migration
+
+Chụp trạng thái từ authoritative DNS hiện tại và ít nhất hai recursive resolver:
+
+```bash
+dig example.com NS +short
+dig example.com MX +noall +answer
+dig example.com TXT +noall +answer
+dig _dmarc.example.com TXT +noall +answer
+dig example.com CAA +noall +answer
+
+dig example.com MX @1.1.1.1 +noall +answer
+dig example.com MX @8.8.8.8 +noall +answer
+```
+
+Không thể khám phá mọi DKIM selector bằng một query chung. Lấy danh sách từ:
+
+- dashboard từng email/marketing/transactional provider;
+- header của mail gần đây: tìm `DKIM-Signature: ... d=...; s=...`;
+- IaC/zone export;
+- owner của CRM, helpdesk, newsletter, invoice và authentication email.
+
+Tạo bảng inventory:
+
+| Luồng gửi/nhận    | Provider   | From domain        | Envelope domain | DKIM `d=`/selector | Owner     |
+| ----------------- | ---------- | ------------------ | --------------- | ------------------ | --------- |
+| Mailbox nhân viên | Provider A | `example.com`      | Ghi từ header   | Ghi từ header      | IT        |
+| Transactional     | Provider B | `example.com`      | Ghi từ header   | Ghi từ header      | Backend   |
+| Newsletter        | Provider C | `news.example.com` | Ghi từ header   | Ghi từ header      | Marketing |
+| Inbound           | Provider A | —                  | MX targets      | —                  | IT        |
+
+Không cutover khi “Provider” hoặc “Owner” còn mơ hồ.
+
+## 3. Hostinger Email: ví dụ provider-specific đã xác minh
+
+Theo tài liệu Hostinger Email cập nhật và được kiểm tra ngày **2026-07-11**, MX cho dịch vụ Hostinger Email là:
+
+| Type | Name | Priority | Target              |
+| ---- | ---- | -------- | ------------------- |
+| MX   | `@`  | 5        | `mx1.hostinger.com` |
+| MX   | `@`  | 10       | `mx2.hostinger.com` |
+
+Đây là giá trị **provider-specific**, chỉ dùng khi mailbox thực sự ở Hostinger Email. Nếu nameserver ở Cloudflare, tạo hai MX tại đó; MX luôn DNS-only. Không giữ MX provider cũ như “backup” ngẫu nhiên.
+
+Với SPF và DKIM Hostinger, mở **hPanel → Emails → Manage → Connect Domain** và copy “Expected records” cho đúng plan/domain. Hostinger có thể cung cấp DKIM dưới dạng CNAME và giá trị cụ thể theo service. Bài này cố ý không in một public key/selector giả, và dashboard provider luôn là nguồn chuẩn hơn một blog đã cache.
+
+## 4. DMARC rollout hiện đại: RFC 9989, không còn `pct`
+
+Tính đến 2026-07-11, DMARC được chuẩn hóa trong **RFC 9989**, thay thế RFC 7489 và RFC 9091; aggregate reporting nằm trong RFC 9990. Một thay đổi dễ bỏ sót: tag `pct` của phiên bản cũ đã bị loại bỏ. Đừng viết `p=reject; pct=10` rồi tin rằng chính xác 10% mail fail sẽ bị reject.
+
+RFC 9989 thêm `t=y`, nhưng receiver không nâng cấp đồng loạt; migration vẫn cần dữ liệu và phase gate, không dựa duy nhất vào một tag.
+
+### Phase 1 — Monitoring
+
+```text
+v=DMARC1; p=none; rua=mailto:dmarc-reports@example.com
+```
+
+`p=none` giữ mail handling hiện có và cung cấp aggregate reports. Chờ qua một chu kỳ kinh doanh đủ để invoice, password reset, ticketing, newsletter và job hiếm đều xuất hiện.
+
+Không hạ domain đang `p=reject` về `none` chỉ vì đổi hosting. Hãy pre-authorize provider mới, publish DKIM và test alignment trước.
+
+### Phase 2 — Quarantine
+
+Chỉ chuyển khi:
+
+- mọi nguồn hợp lệ có owner và canary pass DMARC;
+- report không còn nguồn hợp lệ chưa xử lý;
+- forwarding/mailing list quan trọng đã test; support biết lấy full headers.
+
+```text
+v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@example.com
+```
+
+`p=reject` không phải “đích cuối mặc định”. RFC 9989 nói domain email dùng cho
+người dùng thông thường — đặc biệt khi họ có thể gửi vào mailing list —
+**SHOULD NOT** publish `p=reject` vì các luồng chuyển tiếp gián tiếp có thể làm
+mail hợp lệ bị loại. Nếu tổ chức vẫn chấp nhận trade-off đó, RFC khuyên quan
+sát `p=none` ít nhất một tháng rồi `p=quarantine` một khoảng tương đương, đồng
+thời không được dựa riêng vào SPF: DKIM aligned phải hoạt động.
+
+### Phase 3 — Reject
+
+```text
+v=DMARC1; p=reject; rua=mailto:dmarc-reports@example.com
+```
+
+Chỉ cân nhắc cho domain có luồng gửi được kiểm soát, khi fail còn lại là
+unauthorized/spoof và rủi ro interoperability đã được chấp nhận. Tiếp tục đọc
+report sau enforcement vì nguồn gửi mới vẫn có thể xuất hiện.
+
+## 5. Production runbook chuyển email provider
+
+### T-7 ngày hoặc sớm hơn — chuẩn bị đích
+
+1. Tạo mailbox, alias, forwarder, filter và quyền truy cập ở provider mới.
+2. Import/IMAP sync lịch sử; đối soát dung lượng và message count.
+3. Publish DKIM record mới từ dashboard provider, nhưng giữ selector cũ.
+4. Gộp authorization của provider mới vào **SPF record hiện có** trong giai đoạn dual-send; không tạo TXT SPF thứ hai.
+5. Gửi canary ra ngoài và đọc `Authentication-Results`.
+6. Hạ TTL đủ sớm để một TTL cũ đã hết trước cutover.
+
+### T-0 — cutover nhận mail
+
+Thay toàn bộ MX set cũ bằng set chính thức mới. Không trộn hai provider trừ khi họ hỗ trợ rõ ràng: SMTP priority là thứ tự thử delivery, không đồng bộ mailbox.
+
+Giữ provider cũ hoạt động cho sender còn cache MX và chạy incremental sync trong overlap.
+
+### T+0 đến TTL + buffer — quan sát
+
+- gửi inbound từ hai hệ thống ngoài domain và reply outbound;
+- test transactional, reset password, CRM/newsletter;
+- kiểm inbox/spam và full headers, không chỉ dashboard “verified”;
+- theo dõi mailbox cũ, sync mail đến muộn và DMARC reports.
+
+### Kết thúc overlap
+
+Chỉ gỡ authorization/selector cũ khi:
+
+- MX ổn qua nhiều resolver quá TTL cũ;
+- mailbox/app không còn nhận/gửi qua provider cũ;
+- header/report xác nhận nguồn mới aligned pass;
+- final sync hoàn tất và được đối soát.
+
+## 6. Verification commands và cách đọc
+
+```bash
+# Inbound routing: lower priority number is preferred
+dig example.com MX @1.1.1.1 +noall +answer
+
+# SPF: output may contain many TXT records, but exactly one starts v=spf1
+dig example.com TXT @1.1.1.1 +short
+
+# DKIM: use the REAL selector from provider/message header
+dig <selector>._domainkey.example.com TXT @1.1.1.1 +short
+dig <selector>._domainkey.example.com CNAME @1.1.1.1 +short
+
+# DMARC
+dig _dmarc.example.com TXT @1.1.1.1 +short
+
+# Certificate issuance policy
+dig example.com CAA @1.1.1.1 +noall +answer
+```
+
+| Check | Pass                                              | Dấu hiệu lỗi                             |
+| ----- | ------------------------------------------------- | ---------------------------------------- |
+| MX    | Đúng target/priority provider mới                 | Target typo, còn provider không chủ đích |
+| SPF   | Đúng một `v=spf1`                                 | Hai SPF → `permerror`; include thiếu/sai |
+| DKIM  | Query selector thật trả đúng TXT/CNAME            | NXDOMAIN, selector sai, target bị proxy  |
+| DMARC | Một policy tại `_dmarc`                           | Syntax lỗi, report mailbox không tồn tại |
+| CAA   | Cho phép đúng CA cần dùng hoặc chủ đích không đặt | HTTPS issuance/renewal fail              |
+
+DNS lookup chưa chứng minh mail thực sự được ký. Gửi một canary rồi đọc header:
+
+```text
+Authentication-Results: ...
+  spf=pass ...;
+  dkim=pass header.d=example.com ...;
+  dmarc=pass header.from=example.com ...
+```
+
+Kiểm **alignment**, không chỉ ba chữ `pass`. `dkim=pass header.d=vendor.example.net` có thể vẫn khiến DMARC fail nếu không aligned với `header.from=example.com`.
+
+## Failure modes thường gặp
+
+| Triệu chứng               | Nguyên nhân khả dĩ                                       | Hành động đầu tiên                               |
+| ------------------------- | -------------------------------------------------------- | ------------------------------------------------ |
+| Không nhận mail           | MX sai/thiếu, mailbox chưa tạo, cached MX cũ             | `dig MX` nhiều resolver; kiểm cả mailbox cũ      |
+| SPF `permerror`           | Hai SPF hoặc vượt lookup/syntax                          | Đếm record `v=spf1`, dùng validator provider     |
+| DKIM `fail`               | Sai selector/key, signer dùng `d=` khác, nội dung bị sửa | Đọc `DKIM-Signature` và full header              |
+| SPF pass nhưng DMARC fail | Envelope domain không aligned                            | Kiểm Return-Path và Author Domain                |
+| Forwarded mail fail SPF   | Forwarder không phải sender được authorize               | Dựa vào DKIM aligned còn nguyên; phân tích flow  |
+| Mail hợp lệ bị quarantine | DMARC tăng quá sớm/nguồn gửi bị quên                     | Tạm rollback policy, sửa nguồn, không xóa report |
+| DKIM CNAME không resolve  | CNAME bị proxy hoặc target typo                          | Để DNS-only, query CNAME/TXT theo provider       |
+| Website cert không renew  | CAA không cho phép CA hiện dùng                          | `dig CAA`; đối chiếu docs platform/CA            |
+
+## Rollback email-safe
+
+Nếu inbound delivery lỗi vượt threshold:
+
+1. Khôi phục **toàn bộ MX set cũ** từ inventory, không chỉ một target.
+2. Giữ provider mới và mailbox mới; sender cache khác nhau có thể giao về cả hai.
+3. Chạy sync hai phía theo một hướng đã định để tránh duplicate/lost mail.
+4. Giữ SPF authorization và DKIM selectors của cả nguồn đang còn gửi trong overlap.
+5. Không xóa dữ liệu/mailbox provider nào cho tới khi đối soát message count và TTL + buffer kết thúc.
+
+Nếu outbound bị quarantine/reject do change, khôi phục policy trước change hoặc `p=none` có thời hạn rồi sửa alignment. Ghi rõ deadline quay lại enforcement.
+
+Ngưỡng rollback mẫu:
+
+- hai probe độc lập không giao được inbound trong 10 phút;
+- canary từ một nguồn business-critical DMARC fail;
+- queue/bounce tăng vượt baseline đã thống nhất;
+- mailbox cũ tiếp tục nhận tỷ lệ đáng kể sau cửa sổ dự kiến;
+- support xác nhận mất mail, không chỉ chậm UI.
+
+## Checklist hoàn thành
+
+- [ ] Inventory đủ MX, SPF, mọi DKIM selector, DMARC và CAA.
+- [ ] Có owner cho mailbox, transactional, CRM và newsletter.
+- [ ] Mailbox/alias/forwarder/filter được dựng ở provider mới.
+- [ ] Chỉ có một SPF record tại mỗi owner name.
+- [ ] DKIM value được copy từ provider dashboard, không tự chế.
+- [ ] Selector cũ được giữ qua overlap/rotation.
+- [ ] DMARC rollout dựa trên reports; không dùng `pct` cũ.
+- [ ] Report mailbox tồn tại và có access/retention phù hợp.
+- [ ] Hostinger MX chỉ dùng nếu thật sự dùng Hostinger Email.
+- [ ] Mail/DKIM/verification records không bị Cloudflare proxy.
+- [ ] CAA cho phép CA của các web platform hiện dùng.
+- [ ] Inbound, outbound và từng nguồn gửi đã có canary pass.
+- [ ] Old provider còn hoạt động qua TTL + buffer và final sync.
+- [ ] Có ngưỡng rollback, MX snapshot và policy trước change.
+
+## Bài tập
+
+1. Domain có hai TXT: `v=spf1 include:a.example.net -all` và `v=spf1 include:b.example.net -all`. Cách sửa đúng là gì?
+2. Mail có `spf=pass`, `dkim=pass header.d=vendor.example.net`, `header.from=example.com`, nhưng `dmarc=fail`. Giải thích.
+3. Vì sao không nên để MX cũ priority 20 như “backup” cho provider mới priority 10?
+4. Lập phase gate từ `p=none` tới `p=reject` cho domain gửi invoice hàng tháng.
+
+<details>
+<summary>Gợi ý đáp án</summary>
+
+1. Gộp authorization A và B vào một SPF record theo tài liệu hai provider, kiểm lookup limit rồi xóa record thứ hai.
+2. SPF authenticated domain có thể không aligned; DKIM signing domain `vendor.example.net` cũng không aligned với `example.com`, nên DMARC không có aligned pass.
+3. Khi primary không tới được hoặc bị cache khác nhau, mail có thể vào mailbox cũ; MX không đồng bộ mailbox và dễ chia dữ liệu.
+4. Chạy `p=none` đủ qua invoice cycle, inventory/fix mọi source, canary và đọc report; sau đó quarantine với cửa sổ quan sát tương đương, rồi reject khi fail còn lại là unauthorized và rollback/support đã sẵn sàng.
+
+</details>
+
+## Nguồn chính thức
+
+- [IETF RFC 7208 — Sender Policy Framework (SPF)](https://www.rfc-editor.org/rfc/rfc7208)
+- [IETF RFC 6376 — DKIM Signatures](https://www.rfc-editor.org/rfc/rfc6376)
+- [IETF RFC 9989 — DMARC](https://www.rfc-editor.org/rfc/rfc9989)
+- [IETF RFC 9990 — DMARC Aggregate Reporting](https://www.rfc-editor.org/rfc/rfc9990)
+- [IETF RFC 8659 — DNS CAA Resource Record](https://www.rfc-editor.org/rfc/rfc8659)
+- [Let’s Encrypt — Certificate Authority Authorization](https://letsencrypt.org/docs/caa/)
+- [Hostinger — Hostinger Email MX Records](https://support.hostinger.com/en/articles/4407237-hostinger-email-mx-records)
+- [Hostinger — Set up a domain for Hostinger Email manually](https://support.hostinger.com/en/articles/8671319-set-up-a-domain-for-hostinger-email-manually)
+- [Cloudflare DNS — Proxy status use cases](https://developers.cloudflare.com/dns/proxy-status/use-cases/)
+
+---
+
+**Điều cốt lõi:** MX giữ đường nhận mail; SPF và DKIM cung cấp authenticated identities; DMARC chỉ pass khi một identity aligned với domain trong `From:`. Migration an toàn không phải copy vài TXT record — nó là inventory mọi nguồn gửi, dual-run có kiểm soát, canary bằng mail thật, đọc reports và giữ rollback đủ lâu cho cache lẫn dữ liệu mailbox.

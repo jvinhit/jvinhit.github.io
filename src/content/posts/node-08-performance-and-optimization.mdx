@@ -1,205 +1,447 @@
 ---
-title: 'Node.js Super Senior · Phase 8 — Performance & Optimization'
-description: 'Phase 8: make it fast and prove it — measuring percentiles, profiling with perf_hooks and clinic.js, event-loop lag, query optimization, multi-layer caching, clustering and worker threads, response optimization, and hunting memory leaks.'
+title: 'Node.js Production Engineering 08 — Đo và Tối ưu Hiệu năng'
+description: 'Xây quy trình tối ưu Node.js dựa trên SLO, workload, percentile, profiling, event-loop health, query plan, worker pool, cache, memory và capacity thay vì phỏng đoán.'
 pubDate: 2026-06-09
-tags: [nodejs, performance, profiling, caching, node_10]
+updatedDate: 2026-07-11
+tags:
+  [
+    nodejs,
+    performance,
+    profiling,
+    capacity-planning,
+    observability,
+    production-engineering,
+  ]
 series: nodejs
 seriesOrder: 8
 draft: false
 ---
 
-Đây là **Phase 8 của lộ trình Super Senior 10 phase**. Đặc điểm senior cốt yếu ở đây là **đo trước**. Junior đoán và "tối ưu" code ngẫu nhiên; senior profile, tìm bottleneck thật, sửa, và chứng minh bằng số.
+Một endpoint từ 80 ms tăng lên 250 ms chưa chắc là regression. Có thể dataset lớn hơn, traffic mix khác, cache lạnh hoặc bài đo chỉ chạy một request. Ngược lại, latency trung bình vẫn đẹp không chứng minh hệ thống khỏe nếu p99 tăng gấp mười và error rate bị bỏ khỏi báo cáo.
 
-> "Tối ưu sớm là gốc rễ mọi tai họa." Profile, rồi tối ưu.
-
----
-
-## Đo đúng thứ
-
-Hai con số người ta hay nhầm: **latency** và **throughput** liên quan nhưng tối ưu khác nhau.
-
-**đừng bao giờ báo latency trung bình** — nó giấu nỗi đau. Báo **percentile**:
+Tối ưu production là một quy trình nhân quả:
 
 ```text
-p50 = 20ms   ← half of requests are faster than this (the "typical" user)
-p95 = 80ms   ← the slow 5%
-p99 = 400ms  ← the painful 1% — often where timeouts and rage-quits live
+SLO + workload đại diện
+        ↓
+baseline có thể lặp lại
+        ↓
+profile để tìm resource đang bão hòa
+        ↓
+thay đổi nhỏ nhất tác động đúng bottleneck
+        ↓
+đo lại latency + throughput + error + cost
+        ↓
+giữ guardrail để regression không quay lại
 ```
 
-Senior theo dõi **p99**, cộng tỷ lệ lỗi và độ bão hòa. Khung hữu ích: **RED** cho service, **USE** cho tài nguyên.
+Nếu thiếu một bước, “nhanh hơn” thường chỉ là cảm giác hoặc benchmark không so sánh được.
+
+## Sau bài này, bạn sẽ làm được gì?
+
+- Chuyển yêu cầu hiệu năng thành SLI, SLO và performance budget đo được.
+- Thiết kế load test có workload, dữ liệu, warm-up và concurrency thực tế.
+- Phân biệt latency, throughput, concurrency, utilization và saturation.
+- Dùng `perf_hooks`, CPU profile, query plan và heap snapshot để định vị bottleneck.
+- Chọn worker thread, cache, scale ngang hoặc tối ưu database theo bằng chứng.
+- Lập capacity envelope và tự động phát hiện regression trong CI/canary.
+
+---
+
+## Bắt đầu bằng user journey và SLO
+
+Không có một mục tiêu “API phải nhanh” chung cho mọi endpoint. Hãy bắt đầu từ hành trình người dùng:
+
+| Journey                | SLI                | SLO ví dụ                  | Failure budget                     |
+| ---------------------- | ------------------ | -------------------------- | ---------------------------------- |
+| Xem danh sách sản phẩm | server latency     | p95 < 180 ms, p99 < 400 ms | < 0,5% 5xx                         |
+| Xác nhận đơn hàng      | end-to-end latency | p95 < 700 ms               | < 0,1% lỗi nghiệp vụ ngoài dự kiến |
+| Export báo cáo         | job completion     | 99% xong trong 5 phút      | backlog age < 2 phút               |
+
+SLO cần kèm điều kiện đo: region, payload, cache state, dataset và thời gian. “p95 < 200 ms” không có traffic profile là một con số trống.
+
+### Bốn đại lượng thường bị trộn
+
+- **Latency:** thời gian hoàn thành một operation.
+- **Throughput:** số operation hoàn thành mỗi đơn vị thời gian.
+- **Concurrency:** số operation đang in-flight.
+- **Utilization/saturation:** tài nguyên bận bao nhiêu và hàng chờ đã hình thành chưa.
+
+Quan hệ trực giác theo Little’s Law trong trạng thái ổn định:
+
+```text
+concurrency ≈ throughput × latency
+
+1.000 request/s × 0,2 s ≈ 200 request đang in-flight
+```
+
+Nếu latency tăng nhưng throughput giữ nguyên, concurrency và memory/socket cần thiết cũng tăng. Vì vậy timeout của dependency là một quyết định capacity, không chỉ UX.
+
+---
+
+## Percentile, error và coordinated omission
+
+Trung bình che đuôi phân phối:
+
+```text
+9 request × 20 ms + 1 request × 2.000 ms
+average = 218 ms
+p50 ≈ 20 ms, p90/p99 phản ánh request 2 giây
+```
+
+Báo p50 để hiểu điển hình, p95/p99 để thấy tail. Nhưng percentile chỉ đáng tin khi sample đủ lớn: với 100 request, p99 gần như là một điểm dữ liệu.
+
+Luôn đọc latency cùng:
+
+- request count và traffic mix;
+- error/timeout rate — loại request lỗi khỏi latency làm biểu đồ đẹp giả;
+- queue time và service time;
+- CPU, memory, event-loop, connection pool và downstream saturation.
+
+Một load generator kiểu closed-loop thường chờ response rồi mới gửi request tiếp. Khi service đứng 2 giây, generator cũng ngừng tạo tải và bỏ lỡ đúng khoảng tệ nhất; đây là **coordinated omission**. Với SLO quan trọng, dùng workload giữ arrival rate độc lập hoặc công cụ có cơ chế hiệu chỉnh, rồi báo rõ mô hình tải.
+
+---
+
+## Thiết kế baseline có thể lặp lại
+
+Một benchmark có giá trị cần khóa các biến:
+
+1. **Environment:** cùng CPU/memory limit, Node flags, network path và dependency version.
+2. **Dataset:** cardinality, phân bố hot/cold key và kích thước row/payload gần production.
+3. **Workload mix:** tỷ lệ read/write, endpoint, authenticated user và think time.
+4. **Cache state:** cold, warm hay steady-state được ghi rõ.
+5. **Warm-up:** JIT, connection pool và cache đã ổn định trước khi lấy mẫu.
+6. **Repetition:** chạy nhiều lần, giữ raw result và confidence/range.
 
 ```bash
-# Load test so numbers reflect concurrency, not a single curl
-npx autocannon -c 100 -d 20 http://localhost:3000/api/posts   # 100 conns, 20s
-# k6 / artillery are great for scripted, multi-step scenarios
+# Smoke benchmark cục bộ; không thay thế workload script nhiều bước.
+npx autocannon \
+  --connections 100 \
+  --pipelining 1 \
+  --duration 60 \
+  http://127.0.0.1:3000/api/orders
 ```
 
-Vòng lặp senior: **load test → profile → sửa bottleneck lớn nhất → test lại**.
+Ghi lại commit SHA, image digest và config cạnh kết quả. Không so laptop hôm nay với CI runner tuần trước rồi kết luận 15% cải thiện.
+
+### Tăng tải theo bậc để tìm “knee”
+
+Chạy 50 → 100 → 200 → 400 request/s. Ở mỗi bậc, quan sát:
+
+```text
+throughput tăng tuyến tính, latency ổn     → còn headroom
+throughput phẳng, latency/queue tăng mạnh → saturation point
+error tăng trước CPU                       → pool/quota/downstream giới hạn
+CPU cao, event-loop lag cao                → main thread bận
+CPU thấp, latency cao                      → chờ I/O, lock hoặc queue
+```
+
+Capacity target nên nằm dưới knee đủ xa để hấp thụ burst và mất replica, không chạy sát điểm bão hòa trong steady state.
 
 ---
 
-## Profiling — tìm bottleneck thật
+## Đo event loop bằng API của Node.js
 
-Bắt đầu trong tiến trình với `perf_hooks` để đo thao tác thật:
+`monitorEventLoopDelay()` cho histogram độ trễ của event loop, đơn vị nanosecond. `eventLoopUtilization()` cho biết tỷ lệ thời gian loop active so với idle.
 
 ```ts
-import { performance, PerformanceObserver, monitorEventLoopDelay } from 'node:perf_hooks';
+import {
+  monitorEventLoopDelay,
+  performance,
+  PerformanceObserver,
+} from 'node:perf_hooks';
 
-new PerformanceObserver((items) => {
-  for (const e of items.getEntries()) console.log(`${e.name}: ${e.duration.toFixed(1)}ms`);
-}).observe({ entryTypes: ['measure'] });
+const loopDelay = monitorEventLoopDelay({ resolution: 20 });
+loopDelay.enable();
 
-performance.mark('q-start');
-await db.heavyQuery();
-performance.measure('heavyQuery', 'q-start', performance.mark('q-end').name);
+let previousElu = performance.eventLoopUtilization();
 
-// Event-loop lag is THE Node health metric — rising lag means you're blocking
-const h = monitorEventLoopDelay({ resolution: 20 });
-h.enable();
-setInterval(() => console.log(`loop p99 lag: ${(h.percentile(99) / 1e6).toFixed(1)}ms`), 5000);
+const timer = setInterval(() => {
+  const currentElu = performance.eventLoopUtilization();
+  const deltaElu = performance.eventLoopUtilization(currentElu, previousElu);
+  previousElu = currentElu;
+
+  metrics.eventLoopDelay.record(loopDelay.percentile(99) / 1e6); // ms
+  metrics.eventLoopUtilization.record(deltaElu.utilization);
+  loopDelay.reset();
+}, 10_000);
+
+timer.unref();
 ```
 
-Để có bức tranh đầy đủ, dùng profiler:
+Event-loop delay cao có thể do CPU sync, GC pause, serialize payload lớn hoặc quá nhiều callback. ELU cao nhưng delay thấp có thể chỉ là tải tốt; cần đối chiếu throughput và CPU. Một metric đơn lẻ không đủ chẩn đoán.
 
-- chẩn đoán; flame graph; luồng async.
-- profile CPU.
-- flame graph nhanh; heap snapshot cho bộ nhớ.
+Đo operation cụ thể bằng mark/measure:
 
-Đọc flame graph đơn giản: **bề rộng = tổng thời gian trong hàm đó**. Cao nguyên rộng nhất là bottleneck — không phải hàm bạn *tưởng* là chậm.
+```ts
+const observer = new PerformanceObserver((list) => {
+  for (const entry of list.getEntries()) {
+    metrics.operationDuration.record(entry.duration, { name: entry.name });
+  }
+});
+observer.observe({ entryTypes: ['measure'] });
+
+performance.mark('order-query:start');
+const order = await orderRepository.findById(orderId);
+performance.mark('order-query:end');
+performance.measure('order-query', 'order-query:start', 'order-query:end');
+```
+
+Trong production, trace span thường tiện hơn mark thủ công vì giữ context xuyên service. Mark phù hợp cho đoạn code nóng cần đo chi tiết.
 
 ---
 
-## Đừng chặn event loop
+## Quy trình profiling: symptom → resource → code path
 
-Bug hiệu năng tai hại nhất không phải query chậm — mà là **việc CPU trên luồng chính**. Vòng đồng bộ, `JSON.parse` khổng lồ, crypto đồng bộ, hay regex thảm họa đóng băng *mọi* request đồng thời.
+Đừng mở CPU profiler trước khi biết symptom. Chọn công cụ theo tín hiệu:
+
+| Tín hiệu                          | Bằng chứng tiếp theo                     |
+| --------------------------------- | ---------------------------------------- |
+| CPU + ELU + loop delay cao        | CPU profile/flame graph                  |
+| CPU thấp, DB duration cao         | slow query, `EXPLAIN (ANALYZE, BUFFERS)` |
+| RSS/heap tăng qua nhiều chu kỳ GC | heap snapshot/allocation profile         |
+| Active handles tăng               | socket/timer/listener inventory          |
+| Async operation chờ bất thường    | trace hoặc Clinic Bubbleprof             |
+| Throughput phẳng, pool wait tăng  | pool metrics và dependency capacity      |
+
+Clinic.js có Doctor để định hướng, Flame cho CPU, Bubbleprof cho async flow và Heap Profiler cho allocation. Chạy profiler tạo overhead; profile trên replica canary hoặc môi trường tái hiện, không bật vô thời hạn cho toàn fleet.
+
+### Đọc flame graph
+
+- Chiều rộng thể hiện tổng sample/time trong stack.
+- Tìm plateau rộng thuộc code của mình hoặc dependency có thể thay đổi.
+- Phân biệt self time và cumulative time.
+- Tái hiện với workload gây symptom; flame graph của health check không giải thích checkout chậm.
+
+Sau mỗi thay đổi, chạy lại cùng benchmark. Nếu CPU giảm nhưng p99/error/cost xấu hơn, thay đổi chưa thành công.
+
+---
+
+## Event loop: CPU work phải có queue hữu hạn
+
+Worker thread hữu ích cho JavaScript CPU-intensive; nó không làm I/O nhanh hơn. Khởi tạo một worker mỗi request còn có thể chậm hơn vì startup và clone dữ liệu. Dùng pool có concurrency và queue limit.
 
 ```ts
-// ❌ Blocks the loop for everyone while it runs
-const result = expensiveSyncComputation(hugeInput);
-
-// ✅ Offload genuine CPU work to a worker thread (use a pool: piscina)
 import Piscina from 'piscina';
-const pool = new Piscina({ filename: new URL('./worker.js', import.meta.url).href });
-const result = await pool.run(hugeInput);   // main loop stays responsive
-```
 
-Quy tắc: I/O → event loop; **CPU → worker thread**; lag event loop tăng là chuông báo.
+const cpuPool = new Piscina({
+  filename: new URL('./workers/render-report.js', import.meta.url).href,
+  minThreads: 1,
+  maxThreads: 4,
+  maxQueue: 100,
+});
 
----
+app.post('/reports', async (req, res) => {
+  if (cpuPool.queueSize >= 100) {
+    return res.status(503).set('Retry-After', '5').json({
+      code: 'REPORT_CAPACITY_EXHAUSTED',
+    });
+  }
 
-## Tối ưu database
-
-Database là bottleneck số 1 trong đa số API. Sổ tay senior:
-
-1. diệt N+1 bằng eager loading; gộp bằng DataLoader.
-2. index; xác minh bằng `EXPLAIN ANALYZE`.
-3. chỉ chọn cột cần — `SELECT *` chuyển và giải mã dữ liệu bạn bỏ.
-4. chỉnh pool — nhỏ quá đói, lớn quá ngợp DB.
-
-```ts
-// ✅ Eager loading + projection — one query, only the fields you use
-const users = await User.findAll({
-  attributes: ['id', 'email'],
-  include: [{ model: Post, as: 'posts', attributes: ['id', 'title'] }],
+  const report = await cpuPool.run(req.body, { name: 'renderReport' });
+  return res.json(report);
 });
 ```
 
+Decision criteria:
+
+- Chuyển sang worker khi profile chứng minh CPU sync chiếm loop và task đủ lớn để bù overhead message passing.
+- Chuyển sang background queue khi client không cần kết quả trong request.
+- Scale replica khi workload song song được và bottleneck không phải dependency chung.
+- Viết native/WASM chỉ sau khi algorithm, data structure và worker pool vẫn chưa đạt budget.
+
+Theo dõi pool queue size, wait time, task duration, reject và worker crash. Worker không có backpressure chỉ chuyển OOM từ request handler sang queue trong memory.
+
 ---
 
-## Caching — mọi tầng
+## Database: query plan trước index
 
-Caching là đòn bẩy lớn nhất cho API đọc nhiều. Nghĩ theo tầng, rẻ nhất trước:
+Database chậm thường đến từ số query, plan, lock hoặc pool — không chỉ thiếu index.
+
+Checklist điều tra:
+
+1. Trace cho biết endpoint gọi bao nhiêu query? Có N+1 không?
+2. Pool wait bao lâu so với query execution?
+3. Query đang chờ lock hay I/O?
+4. Estimated rows lệch actual rows bao nhiêu?
+5. Index có phục vụ filter **và** sort không?
+6. Payload trả về có lớn hơn nhu cầu không?
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+SELECT id, customer_id, total, created_at
+FROM orders
+WHERE customer_id = $1
+  AND status = 'pending'
+ORDER BY created_at DESC
+LIMIT 50;
+```
+
+`ANALYZE` thực thi query thật; với câu lệnh ghi, dùng transaction rồi rollback trong môi trường an toàn. Đừng thêm index chỉ vì thấy sequential scan: scan tuần tự có thể đúng cho bảng nhỏ hoặc query đọc phần lớn bảng. Index tăng chi phí write, storage và vacuum.
+
+### Pool không phải càng lớn càng tốt
+
+Pool tổng = `pool_per_replica × replica_count`. Nếu mỗi replica mở 20 connection và autoscale lên 30, database nhận 600 connection. Đo pool acquisition wait, active/idle connection và database CPU trước khi tăng.
+
+---
+
+## Cache: tối ưu cả latency lẫn correctness
+
+Cache hợp khi dữ liệu được đọc lặp, cost load đáng kể và có staleness budget. Mỗi tầng cache thêm một bản sao trạng thái cần invalidation.
 
 ```text
-client/CDN cache ─▶ HTTP cache (ETag/Cache-Control) ─▶ app memory (LRU)
-      ─▶ Redis (shared) ─▶ database
-   each layer you hit saves the cost of every layer below it
+browser/CDN ─▶ HTTP conditional cache ─▶ process LRU ─▶ Redis ─▶ database
 ```
 
-**Cache-aside** (mặc định) và **write-through** lo phần lớn:
+Đo riêng:
 
-```ts
-async function getUserProfile(userId: string) {
-  const key = `user:${userId}`;
-  const cached = await redis.get(key);
-  if (cached) return JSON.parse(cached);                       // hit
-  const user = await User.findByPk(userId);                    // miss → DB
-  await redis.set(key, JSON.stringify(user), 'EX', 3600);
-  return user;
-}
-```
+- hit ratio theo endpoint/key class;
+- latency hit và miss;
+- load amplification khi miss;
+- eviction và memory;
+- tuổi dữ liệu khi serve;
+- lỗi invalidation.
 
-Thêm **LRU trong tiến trình** trước Redis cho key cực nóng, và **HTTP caching** để client/CDN bỏ qua server. Hai bài toán khó vẫn là **invalidation** và **stampede**.
+Hit ratio 95% vẫn có thể không đủ nếu 5% miss cùng rơi vào key nóng và đánh database. TTL jitter, request coalescing/single-flight và stale-while-revalidate giúp chống stampede.
+
+Không cache để che query chưa được hiểu. Cache có thể làm benchmark warm rất đẹp nhưng outage lớn hơn khi Redis hoặc key nóng hết hạn.
 
 ---
 
-## Mở rộng theo lõi — clustering & worker
+## Payload, stream và backpressure
 
-Node mặc định chạy một lõi. Module `cluster` fork một worker mỗi lõi, chung cổng lắng nghe:
+Response optimization bắt đầu bằng gửi ít dữ liệu hơn:
+
+- projection thay `SELECT *`;
+- keyset pagination với limit cứng;
+- không serialize object graph thừa;
+- nén payload đủ lớn, nhưng đo CPU compression;
+- stream export lớn thay vì buffer toàn bộ.
 
 ```ts
-import cluster from 'node:cluster';
-import { availableParallelism } from 'node:os';
+import { pipeline } from 'node:stream/promises';
 
-if (cluster.isPrimary) {
-  for (let i = 0; i < availableParallelism(); i++) cluster.fork();
-  cluster.on('exit', (w) => { console.log(`worker ${w.process.pid} died`); cluster.fork(); });
-} else {
-  app.listen(3000);
-}
+app.get('/exports/:id', async (req, res, next) => {
+  try {
+    res.type('text/csv');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${req.params.id}.csv"`
+    );
+    await pipeline(createOrderCsvStream(req.params.id), res);
+  } catch (error) {
+    next(error);
+  }
+});
 ```
 
-Cái này nhân **throughput** xấp xỉ số lõi; PM2/orchestrator làm hộ ở prod. Phân biệt rõ: **cluster** = nhiều tiến trình cho throughput I/O; **worker thread** = đẩy CPU trong một tiến trình. Clustering **không** làm nhanh một request chậm.
+`pipeline` truyền backpressure và dọn lỗi tốt hơn ghép `.pipe()` rời. Nhưng sau khi header đã gửi, không thể trả JSON error; cần log/trace và client retry/resume strategy.
 
 ---
 
-## Tối ưu response & mạng
+## Memory và GC: phân biệt heap với RSS
 
 ```ts
-import compression from 'compression';
-app.use(compression());                  // gzip/brotli — shrinks JSON dramatically
+const memory = process.memoryUsage();
+
+metrics.memory.set(memory.rss, { kind: 'rss' });
+metrics.memory.set(memory.heapUsed, { kind: 'heap_used' });
+metrics.memory.set(memory.heapTotal, { kind: 'heap_total' });
+metrics.memory.set(memory.external, { kind: 'external' });
 ```
 
-- **phân trang mọi thứ** — chốt limit; ưu tiên keyset.
-- **định hình payload** — chỉ field cần.
-- **stream response lớn** thay vì buffer.
-- **tái dùng kết nối outbound** bằng keep-alive agent.
+- `heapUsed` là object JavaScript đang dùng.
+- `external` gồm memory do object C++/Buffer liên kết.
+- `rss` là resident memory của process, gồm heap, code, stack và native allocation.
+
+Rò rỉ đáng nghi khi baseline sau major GC tiếp tục tăng qua thời gian. Thủ phạm phổ biến: cache không giới hạn, listener/timer không dọn, closure giữ graph lớn, promise/job không bao giờ kết thúc.
+
+Heap snapshot có thể tạm thời làm heap tăng mạnh và pause process. Không chụp tùy tiện trên replica đang sát memory limit; dùng canary, traffic drain hoặc diagnostic report phù hợp. So sánh ít nhất hai snapshot sau workload tương đương và tìm retained size/path đến GC root.
+
+Tăng `--max-old-space-size` chỉ mua thời gian. Nếu live set tiếp tục tăng, process vẫn sẽ OOM muộn hơn.
 
 ---
 
-## Bộ nhớ & GC — săn rò rỉ
+## Capacity envelope và performance budget
 
-V8 chia heap thành young (rẻ, thường) và old (đắt, hiếm). **Rò rỉ** là bộ nhớ vẫn được tham chiếu và trôi sang old mãi.
+Kết quả cuối của performance work không chỉ là một PR. Nó là một envelope:
 
-```ts
-const m = process.memoryUsage();
-console.log(`heapUsed ${(m.heapUsed / 1048576).toFixed(1)}MB rss ${(m.rss / 1048576).toFixed(1)}MB`);
+```text
+Với 1 replica: 1 vCPU, 512 MiB
+workload: 70% read / 20% write / 10% checkout
+dataset: 10M orders, cache steady-state 85% hit
+
+safe operating point:
+  220 req/s
+  p95 160 ms, p99 360 ms
+  error < 0,2%
+  ELU < 0,75, loop-delay p99 < 40 ms
+  RSS < 380 MiB, DB pool wait p95 < 20 ms
+
+hard knee: khoảng 310 req/s
 ```
 
-Săn rò rỉ bằng **hai heap snapshot dưới tải**, rồi **diff** — vật thể lớn dần là rò rỉ. Thủ phạm thường gặp: cache/mảng không giới hạn, `setInterval`/listener bị quên, closure giữ vật thể lớn, `Map` khóa-object không dùng `WeakMap`.
+Từ đó mới tính replica, headroom và autoscaling. Re-run khi Node version, schema, dependency hoặc traffic mix thay đổi.
 
-> Mẹo V8 nhanh: giữ hình dạng object **đơn hình**; tránh `delete` trên object nóng; chốt `--max-old-space-size`.
+Performance budget trong CI không nên fail vì nhiễu 3%. Dùng môi trường ổn định, nhiều lần chạy và threshold đủ lớn để bắt regression có ý nghĩa. Regression nhỏ hơn có thể theo dõi trend hoặc canary production.
 
----
+## Failure modes khi tối ưu
 
-## 9. Dự án thực hành
+- Tối ưu average trong khi p99/error xấu hơn.
+- Benchmark cache warm nhưng production phần lớn cold sau deploy.
+- Tăng concurrency làm throughput ngắn hạn tăng rồi database saturation.
+- Thêm retry làm dependency outage nặng hơn.
+- Thêm cache nhưng không định nghĩa staleness/invalidation.
+- Offload worker nhưng queue không giới hạn và gây OOM.
+- Giảm payload bằng nhiều round-trip, tổng journey chậm hơn.
+- Tune V8 flag trước khi profile application/data path.
+- Chụp heap snapshot làm replica production crash.
 
-1. Baseline + profile: load test, ghi p50/p99, rồi clinic và tìm cao nguyên rộng nhất.
+## Checklist review hiệu năng
 
-2. Sửa bottleneck DB: tái hiện N+1, sửa + thêm index, xác nhận.
+- [ ] SLO và workload được định nghĩa theo user journey.
+- [ ] Baseline lưu raw result, commit/image/config và error rate.
+- [ ] Báo percentile với sample count, không chỉ average.
+- [ ] Load test tăng theo bậc và xác định saturation point.
+- [ ] Event-loop delay/ELU, CPU, memory và pool wait có dashboard.
+- [ ] Mỗi optimization liên kết với profile hoặc query plan.
+- [ ] Worker/cache/retry có queue/budget và failure behavior.
+- [ ] Capacity tính theo toàn fleet và dependency quota.
+- [ ] Canary/CI có guardrail cho latency, error và resource cost.
+- [ ] Kết quả sau thay đổi được so bằng cùng phương pháp.
 
-3. Cache nhiều tầng: thêm cache-aside + LRU + ETag; đo p99 từng tầng và invalidation.
+## Lab: capacity report cho Ordering Service
 
-4. Đẩy CPU: chuyển endpoint nặng CPU sang piscina; chứng minh lag giảm.
+### Yêu cầu
 
-5. Cluster & so sánh: chạy đơn vs cluster dưới tải và vẽ chênh lệch throughput.
+1. Định nghĩa SLO cho list order, confirm order và export report.
+2. Viết workload script có traffic mix, dataset và arrival rate theo bậc.
+3. Gắn metric event-loop delay/ELU, request, DB pool và worker pool.
+4. Tạo ba bottleneck có kiểm soát: N+1, CPU sync và cache stampede.
+5. Profile từng bottleneck; sửa lần lượt bằng query/index, worker pool và single-flight/TTL jitter.
+6. Viết capacity envelope trước/sau và performance guardrail.
 
-6. Săn rò rỉ: tạo cache lớn dần, diff hai snapshot, rồi sửa.
+### Acceptance criteria
+
+- Mỗi kết luận có raw result và profile/query plan đi kèm.
+- Load test báo p50/p95/p99, throughput, timeout và error count.
+- Query fix giảm số query và plan mới được giải thích; không chỉ thêm index.
+- CPU task chuyển sang pool làm loop-delay p99 giảm mà queue không vượt giới hạn.
+- Cache stampede test không tạo burst query vượt budget khi key hết hạn.
+- Memory đạt steady-state sau nhiều chu kỳ GC; snapshot được chụp an toàn.
+- Báo cáo xác định safe operating point, knee và headroom khi mất một replica.
+
+## Tài liệu chính thức
+
+- [Node.js — Performance measurement APIs](https://nodejs.org/api/perf_hooks.html)
+- [Node.js — Worker threads](https://nodejs.org/api/worker_threads.html)
+- [Node.js — Using heap snapshot](https://nodejs.org/en/learn/diagnostics/memory/using-heap-snapshot)
+- [Clinic.js — Documentation](https://clinicjs.org/documentation/)
+- [PostgreSQL — Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html)
+- [Autocannon — README](https://github.com/mcollina/autocannon)
 
 ---
 
 ## Phần tiếp theo
 
-Giờ bạn làm service Node nhanh và *chứng minh* được: đo percentile, profiling, theo dõi lag, diệt N+1 và chỉnh query, cache nhiều tầng, clustering và worker, tối ưu response, và săn rò rỉ — xác thực bằng load test.
-
-Ở **Phase 9**, ta khóa tính đúng đắn với **kiểm thử toàn diện** — kim tự tháp test, unit, integration với supertest và Testcontainers, mocking, fixture/factory, coverage có nghĩa, và test async/lỗi — để refactor và ship không sợ.
+Đo lường cho biết hệ thống đang làm gì; kiểm thử cho biết thay đổi nào được phép làm mà vẫn giữ contract. **Phần 9** xây một test portfolio theo rủi ro: domain, database, HTTP, contract, dependency failure, concurrency và migration — đồng thời kiểm soát flakiness để pipeline vẫn đáng tin.

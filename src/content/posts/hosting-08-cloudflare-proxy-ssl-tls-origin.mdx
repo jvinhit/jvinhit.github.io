@@ -1,0 +1,373 @@
+---
+title: 'Domain, DNS & Hosting · Phần 8 — Cloudflare Proxy, SSL/TLS và bảo vệ origin'
+description: 'Hiểu DNS-only và Proxied, triển khai Full (strict), chọn public cert hay Origin CA, khóa origin, giữ client IP đúng và debug lỗi Cloudflare 521–526.'
+pubDate: 2026-07-11
+tags:
+  [hosting, domain, dns, cloudflare, cdn, ssl, tls, security, hosting_dns_10]
+series: hosting-dns
+seriesOrder: 8
+lang: vi
+draft: false
+---
+
+import HostingDiagram from '../../components/blog/HostingDiagram.astro';
+
+Khi bấm biểu tượng đám mây từ xám sang cam, bạn không chỉ đổi một tùy chọn DNS. Bạn chèn một **reverse proxy toàn cầu** vào giữa người dùng và origin:
+
+```text
+Browser ⇄ Cloudflare edge ⇄ VPS / shared hosting
+```
+
+Từ đó có hai kết nối TLS, hai nơi có thể redirect, một lớp cache mới và một trust boundary mới. Làm đúng, Cloudflare che origin, hấp thụ DDoS và áp dụng WAF/CDN. Làm nửa vời, bạn gặp redirect loop, 52x, log toàn IP Cloudflare hoặc vẫn bị gọi thẳng vào origin.
+
+Sau bài này, bạn sẽ đưa một web origin ở `203.0.113.10` qua Cloudflare với mục tiêu **Full (strict)**, biết khi nào phải để DNS-only, và có runbook rollback không tự phá TLS.
+
+> `203.0.113.10` là TEST-NET-3 dành cho tài liệu. Hãy thay bằng origin IP thật trong môi trường của bạn.
+
+## 1. Inventory và điều kiện tiên quyết
+
+Trước khi bật proxy, ghi lại:
+
+| Câu hỏi                               | Bằng chứng cần lưu                                      |
+| ------------------------------------- | ------------------------------------------------------- |
+| Hostname web nào sẽ proxy?            | Danh sách A/AAAA/CNAME phục vụ HTTP/HTTPS               |
+| Origin hiện ở đâu?                    | IPv4/IPv6, port 80/443, provider firewall               |
+| Origin cert loại gì?                  | Issuer, SAN, chain, expiry, cách renew                  |
+| SSL mode hiện tại?                    | Screenshot/API output của Cloudflare                    |
+| Redirect do ai sở hữu?                | Nginx/app hay Cloudflare rule                           |
+| Record nào là mail/verify?            | MX, mail A/AAAA, DKIM CNAME/TXT, verification CNAME     |
+| Có cache rule/WAF không?              | Export hoặc mô tả rule và thứ tự                        |
+| Rollback direct-origin có chạy không? | Public cert và firewall có chấp nhận browser trực tiếp? |
+
+Origin phải trả đúng nội dung qua HTTPS **trước** khi Cloudflare đứng giữa:
+
+```bash
+curl --resolve example.com:443:203.0.113.10 \
+  -sS -o /dev/null -D - https://example.com/healthz
+
+openssl s_client \
+  -connect 203.0.113.10:443 \
+  -servername example.com \
+  -verify_return_error </dev/null
+```
+
+Nếu origin chưa pass, quay lại [Phần 7 — VPS và Nginx reverse proxy](/blog/hosting-07-vps-domain-nginx-reverse-proxy/). Proxy không sửa một upstream hỏng; nó chỉ thêm một lớp báo lỗi khác.
+
+## 2. DNS-only và Proxied khác nhau ở data plane
+
+<HostingDiagram
+  kind="cloudflare-proxy"
+  caption="DNS-only trả origin IP cho client; Proxied trả Cloudflare anycast IP và đưa HTTP/HTTPS qua edge trước khi tới origin"
+/>
+
+### DNS-only — cloud xám
+
+Cloudflare là authoritative DNS nhưng không đứng trên đường HTTP:
+
+```text
+dig example.com → 203.0.113.10
+Browser ───────────────────────► origin
+```
+
+TLS certificate browser thấy là certificate của origin. WAF, cache và HTTP analytics của Cloudflare không tham gia. Origin IP lộ trong câu trả lời DNS.
+
+### Proxied — cloud cam
+
+Cloudflare trả anycast IP của edge thay vì IP bạn nhập trong record:
+
+```text
+dig example.com → Cloudflare anycast IP
+Browser → Cloudflare → 203.0.113.10
+```
+
+Certificate browser thấy được phục vụ ở edge; Cloudflare tạo kết nối riêng tới origin theo SSL/TLS mode.
+
+Cloudflare chỉ proxy các record **A, AAAA và CNAME dùng cho HTTP/HTTPS**. Các record khác như MX/TXT luôn DNS-only. Ngay cả CNAME cũng phải để xám nếu nó dùng để verify domain hoặc DKIM, không phục vụ web.
+
+| Record                                        | Proxy?                                | Lý do                        |
+| --------------------------------------------- | ------------------------------------- | ---------------------------- |
+| `A @ → 203.0.113.10`                          | Proxied                               | Website HTTPS                |
+| `CNAME www → example.com`                     | Proxied                               | Website HTTPS                |
+| `A api → 203.0.113.20`                        | Proxied nếu API là HTTP/HTTPS phù hợp | WAF/rate limit/CDN path      |
+| `MX @ → mx1.mail-provider.test`               | Không                                 | SMTP không đi qua HTTP proxy |
+| `A mail → 203.0.113.30`                       | DNS-only                              | Mail transport               |
+| `CNAME selector._domainkey → provider target` | DNS-only                              | DKIM lookup/verification     |
+| `TXT _dmarc → ...`                            | DNS-only                              | DNS policy                   |
+| `CNAME verify → vendor target`                | DNS-only                              | Vendor cần thấy target thật  |
+
+Đừng “orange-cloud tất cả cho an toàn”. Proxy sai record có thể làm email/verification thất bại mà website vẫn bình thường.
+
+## 3. Hai kết nối TLS, bốn mode
+
+<HostingDiagram
+  kind="tls-modes"
+  caption="SSL/TLS mode quyết định Cloudflare kết nối tới origin bằng HTTP hay HTTPS và có xác minh certificate hay không"
+/>
+
+| Mode              | Visitor → Cloudflare | Cloudflare → origin   | Đánh giá                                          |
+| ----------------- | -------------------- | --------------------- | ------------------------------------------------- |
+| Off               | HTTP                 | HTTP                  | Không dùng cho production                         |
+| Flexible          | HTTPS                | HTTP                  | Origin leg plaintext; dễ loop nếu origin ép HTTPS |
+| Full              | HTTPS                | HTTPS                 | Có mã hóa nhưng không xác minh origin cert đầy đủ |
+| **Full (strict)** | HTTPS                | HTTPS + validate cert | Mục tiêu production                               |
+
+Với Full (strict), origin phải mở 443 và trình certificate:
+
+- chưa hết hạn;
+- SAN/CN khớp hostname Cloudflare yêu cầu;
+- chain hợp lệ;
+- do public CA được tin cậy hoặc Cloudflare Origin CA cấp.
+
+Đừng dùng “tạm Flexible rồi tính sau” cho một origin đã hỗ trợ TLS. Flexible làm connection edge→origin không mã hóa và tạo loop kinh điển:
+
+```text
+Browser requests HTTPS
+Cloudflare Flexible calls origin over HTTP
+Origin redirects HTTP → HTTPS
+Cloudflare again calls origin over HTTP
+... ERR_TOO_MANY_REDIRECTS
+```
+
+Runbook đúng là làm origin TLS pass trước, chuyển **Full (strict)**, sau đó mới proxy record.
+
+## 4. Public certificate hay Cloudflare Origin CA?
+
+Hai lựa chọn đều dùng được với Full (strict), nhưng khả năng break-glass khác nhau.
+
+### Publicly trusted certificate
+
+Ví dụ certificate ACME từ Let’s Encrypt:
+
+- Browser tin certificate khi truy cập origin trực tiếp bằng hostname.
+- Có thể tắt proxy tạm thời mà TLS vẫn hợp lệ, miễn firewall cho direct traffic.
+- Cần quản lý challenge/renewal; HTTP-01 có thể bị ảnh hưởng bởi redirect/firewall, DNS-01 cần quyền DNS phù hợp.
+
+Đây là lựa chọn linh hoạt nếu bạn muốn đường rollback DNS-only rõ ràng.
+
+### Cloudflare Origin CA
+
+Origin CA được thiết kế cho connection **Cloudflare → origin**:
+
+- tương thích Full (strict);
+- không cần browser công khai tin CA đó;
+- phù hợp khi origin chỉ nhận traffic từ Cloudflare;
+- phải lưu private key an toàn và tự theo dõi expiration.
+
+Nếu pause Cloudflare hoặc đổi record sang DNS-only, browser có thể báo certificate không tin cậy. Vì vậy Origin CA đi cùng thiết kế “origin luôn nằm sau Cloudflare”, firewall/AOP và một break-glass plan đã thử trước. Đừng coi nút cloud xám là rollback nếu certificate direct-origin không được browser tin.
+
+## 5. Production runbook: từ origin khỏe tới cloud cam
+
+### Bước 1 — Giữ record DNS-only và test origin
+
+```bash
+dig example.com A @1.1.1.1 +short
+curl -fsS https://example.com/healthz
+curl --resolve example.com:443:203.0.113.10 \
+  -sS -o /dev/null -D - https://example.com/healthz
+```
+
+Ở trạng thái xám, `dig` nên trả origin IP. Nếu dùng Origin CA, câu `curl` direct có thể không verify được bằng public trust store; khi đó kiểm Nginx/certificate chain bằng công cụ và CA root tương ứng, đồng thời chỉ bật proxy sau khi Cloudflare Strict xác minh thành công.
+
+### Bước 2 — Chọn Full (strict)
+
+Trong Cloudflare: **SSL/TLS → Overview → Full (strict)**. Không bật HSTS ở bước đầu; HSTS khiến browser nhớ HTTPS lâu dài và làm rollback TLS khó hơn. Chỉ bật sau khi cả apex/subdomain cần thiết đã ổn định.
+
+### Bước 3 — Bật Proxied cho đúng web hostnames
+
+Chuyển A/AAAA/CNAME của `example.com` và `www` sang cloud cam. Giữ mail và verification DNS-only.
+
+```bash
+dig example.com A @1.1.1.1 +short
+dig example.com A @8.8.8.8 +short
+```
+
+Sau khi proxied, kết quả là Cloudflare anycast IP, **không còn là `203.0.113.10`**. Đây là expected behavior, không phải Cloudflare “đổi mất IP”.
+
+### Bước 4 — Xác minh edge và origin cùng lúc
+
+```bash
+# Edge path
+curl -sS -o /dev/null -D - https://example.com/healthz
+
+# Origin path, bỏ qua DNS public nhưng vẫn giữ Host/SNI
+curl --resolve example.com:443:203.0.113.10 \
+  -sS -o /dev/null -D - https://example.com/healthz
+```
+
+Ở edge path, tìm `cf-ray`; `cf-cache-status` có thể là `DYNAMIC`, `MISS`, `HIT`, `BYPASS` tùy tài nguyên và cache policy. Đừng yêu cầu health/API phải `HIT`. Với nội dung có session, `Cache-Control: private, no-store` hoặc rule phù hợp thường quan trọng hơn cache hit.
+
+### Bước 5 — Quy định một nơi sở hữu redirect
+
+Chọn một thiết kế:
+
+- edge sở hữu HTTP→HTTPS và apex↔www; origin chỉ phục vụ request hợp lệ; hoặc
+- Nginx sở hữu redirect, Cloudflare chỉ proxy Full (strict).
+
+Hai lớp cùng redirect không nhất thiết luôn loop, nhưng làm debug khó và dễ sinh xung đột. Kiểm redirect chain:
+
+```bash
+curl -sS -o /dev/null -D - http://example.com/
+curl -sS -o /dev/null -D - https://www.example.com/
+curl -sS -L --max-redirs 5 -o /dev/null \
+  -w '%{http_code} %{url_effective} redirects=%{num_redirects}\n' \
+  http://www.example.com/
+```
+
+Mục tiêu là một canonical URL, redirect hữu hạn và không đổi qua lại giữa HTTP/HTTPS hoặc apex/`www`.
+
+## 6. Bảo vệ origin: “ẩn IP” chưa phải access control
+
+Cloud cam làm DNS public trả Cloudflare IP, nhưng origin IP có thể lộ qua lịch sử DNS, email cùng máy, log hoặc dịch vụ khác. Nếu ai biết IP, họ có thể gọi origin trực tiếp và bỏ qua WAF.
+
+Các lớp phòng thủ tăng dần:
+
+1. **Allowlist Cloudflare IP ranges** cho 80/443 ở firewall; block nguồn khác.
+2. Tách mail/SSH/service khác khỏi IP web origin nếu cần giảm rò rỉ.
+3. Dùng **Authenticated Origin Pulls (AOP)** để origin yêu cầu client certificate từ Cloudflare.
+4. Với threat model cao hơn, dùng zone/per-hostname AOP certificate riêng thay vì chỉ global certificate dùng chung.
+
+Cloudflare cập nhật danh sách IP chính thức; không copy một danh sách cũ từ blog. Tự động đồng bộ, validate rồi mới thay firewall atomically. Giữ SSH/VPN management rule tách biệt khỏi web allowlist.
+
+### Thứ tự triển khai AOP
+
+1. Cài CA/client-auth config trên origin nhưng chưa enforce.
+2. `nginx -t`, reload, xác minh origin vẫn hoạt động.
+3. Bật AOP tại Cloudflare.
+4. Xác minh edge traffic tới origin.
+5. Cuối cùng mới enforce client certificate trên origin.
+
+Rollback theo thứ tự ngược: bỏ enforce ở origin trước, sau đó mới disable AOP tại edge. Làm ngược có thể khóa mọi request.
+
+## 7. Client IP: chỉ tin header từ proxy đáng tin
+
+Khi proxied, Nginx nhìn thấy source IP của Cloudflare. Cloudflare gửi IP visitor trong `CF-Connecting-IP`. Nhưng bất kỳ client nào gọi trực tiếp origin cũng có thể tự đặt header này.
+
+Vì vậy:
+
+- chỉ dùng `real_ip_header CF-Connecting-IP` khi `set_real_ip_from` chứa **đầy đủ Cloudflare IP ranges chính thức**;
+- hoặc khóa origin chỉ nhận Cloudflare trước khi dùng header cho rate limit/audit;
+- không để app tin `X-Forwarded-For` từ mọi nguồn;
+- lưu cả visitor IP đã chuẩn hóa và source proxy khi điều tra sự cố;
+- nếu bật Pseudo IPv4 ở chế độ overwrite, hiểu rằng header IPv4/IPv6 có thể được biến đổi.
+
+Sai trust boundary ở đây cho phép attacker giả IP, bypass rate limit theo IP hoặc làm bẩn audit log.
+
+## 8. Đọc 521, 522, 525 và 526 theo đúng lớp
+
+| Mã      | Ý nghĩa                                       | Kiểm tra ưu tiên                                       |
+| ------- | --------------------------------------------- | ------------------------------------------------------ |
+| **521** | Origin từ chối kết nối từ Cloudflare          | Nginx down, sai port, firewall block Cloudflare ranges |
+| **522** | Cloudflare timeout khi kết nối/đợi origin     | Sai origin IP, firewall drop, overload, network path   |
+| **525** | TLS handshake edge→origin thất bại            | Port 443, SNI, cipher/protocol, certificate/TLS config |
+| **526** | Full (strict) không validate được origin cert | Expiry, SAN mismatch, issuer/chain không tin cậy       |
+
+Runbook ngắn:
+
+```bash
+# 1. Backend local
+curl -fsS http://127.0.0.1:3000/healthz
+
+# 2. Nginx/origin direct
+curl --resolve example.com:443:203.0.113.10 -v https://example.com/healthz
+
+# 3. Certificate/SNI
+openssl s_client -connect 203.0.113.10:443 \
+  -servername example.com -showcerts </dev/null
+
+# 4. Service và logs
+sudo ss -ltnp
+sudo nginx -t
+sudo tail -n 100 /var/log/nginx/error.log
+```
+
+Nếu direct-origin pass nhưng edge vẫn 521/522, kiểm firewall có cho **toàn bộ** Cloudflare ranges và Cloudflare DNS record có đúng origin IP. Nếu 526, đừng chữa bằng Flexible; sửa certificate/chain/SAN. Trong incident khẩn cấp, quay về mode trước có thể khôi phục traffic nhưng phải được time-box vì `Full` không xác minh origin cert như Strict.
+
+## 9. Cache mà không làm lộ dữ liệu người dùng
+
+Cloudflare proxy không đồng nghĩa mọi response đều được cache. Mặc định Cloudflare không cache HTML/JSON chỉ vì chúng đi qua edge; behavior còn phụ thuộc extension, status, cache headers và Cache Rules.
+
+Baseline an toàn:
+
+```http
+# Fingerprinted static asset
+Cache-Control: public, max-age=31536000, immutable
+
+# HTML cần revalidate
+Cache-Control: public, max-age=0, must-revalidate
+
+# Account/API cá nhân
+Cache-Control: private, no-store
+```
+
+Không tạo “Cache Everything” toàn site trước khi xác minh cookie, `Authorization`, query string và logout. Test ít nhất hai user riêng biệt; cache poisoning hoặc cross-user response là sự cố bảo mật, không phải chỉ lỗi performance.
+
+## Rollback không tự phá TLS
+
+Trước change, chọn một trong hai đường:
+
+### Rollback vẫn qua Cloudflare
+
+- Khôi phục SSL mode/rule/certificate config trước.
+- Nếu 526 sau rotate cert, cài lại certificate/chain cũ ở origin.
+- Nếu AOP lỗi, bỏ enforce origin trước rồi disable AOP.
+- Nếu cache rule lỗi, disable rule và purge đúng scope.
+
+### Rollback về DNS-only
+
+Chỉ dùng khi **cả hai** điều kiện đã được test:
+
+1. origin có publicly trusted certificate hợp lệ cho hostname;
+2. firewall cho phép visitor direct traffic.
+
+Nếu đang dùng Origin CA-only hoặc đã block mọi non-Cloudflare IP, cloud xám sẽ biến incident Cloudflare thành incident TLS/firewall. Mở firewall và cài public cert trước, verify bằng `curl --resolve`, rồi mới chuyển DNS-only.
+
+Ngưỡng rollback nên gồm: core route fail, 52x vượt baseline, redirect loop, certificate error, login/session trả dữ liệu sai, hoặc origin không nhận traffic từ một phần Cloudflare locations.
+
+## Checklist hoàn thành
+
+- [ ] Origin HTTPS pass trước khi bật proxy.
+- [ ] Chỉ A/AAAA/CNAME web được proxied.
+- [ ] MX, mail host, DKIM và verification record là DNS-only.
+- [ ] SSL/TLS mode là Full (strict).
+- [ ] Origin certificate đúng SAN, chain, expiry và có renewal/monitoring.
+- [ ] Biết rõ public cert hay Origin CA quyết định break-glass thế nào.
+- [ ] Redirect chỉ có một owner và chain đã test.
+- [ ] Edge path có `cf-ray`; origin path vẫn pass theo cách phù hợp.
+- [ ] Cache policy không cache response cá nhân.
+- [ ] Origin firewall/AOP được triển khai theo đúng thứ tự.
+- [ ] Chỉ tin client-IP header từ Cloudflare ranges.
+- [ ] Runbook 521/522/525/526 và rollback đã được diễn tập.
+
+## Bài tập
+
+1. `dig example.com` sau khi bật proxy không còn trả origin IP. Đây là lỗi hay expected behavior?
+2. Một site dùng Origin CA, block mọi IP ngoài Cloudflare. Vì sao chuyển cloud xám không phải rollback hợp lệ?
+3. Phân biệt 525 và 526 bằng một câu, rồi chọn lệnh đầu tiên cho mỗi lỗi.
+4. Thiết kế cache policy cho `/assets/app.abc123.js`, `/`, `/api/me`.
+
+<details>
+<summary>Gợi ý đáp án</summary>
+
+1. Expected: proxied record trả Cloudflare anycast IP.
+2. Browser không tin Origin CA và firewall chặn direct traffic; phải chuẩn bị public cert + firewall trước.
+3. 525 là handshake không hoàn tất; 526 là certificate không pass validation của Full (strict). Cả hai bắt đầu bằng `openssl s_client`/`curl --resolve`, nhưng 526 tập trung SAN/expiry/issuer/chain.
+4. Asset fingerprint: cache dài + immutable; HTML: revalidate; `/api/me`: private/no-store và không Cache Everything.
+
+</details>
+
+## Nguồn chính thức
+
+- [Cloudflare DNS — Proxy status](https://developers.cloudflare.com/dns/proxy-status/)
+- [Cloudflare SSL/TLS — Encryption modes](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/)
+- [Cloudflare SSL/TLS — Full (strict)](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/full-strict/)
+- [Cloudflare SSL/TLS — Origin CA](https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/)
+- [Cloudflare — Authenticated Origin Pulls](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/)
+- [Cloudflare — Restoring original visitor IPs](https://developers.cloudflare.com/support/troubleshooting/restoring-visitor-ips/restoring-original-visitor-ips/)
+- [Cloudflare — Protect your origin server](https://developers.cloudflare.com/fundamentals/security/protect-your-origin-server/)
+- [Cloudflare — ERR_TOO_MANY_REDIRECTS](https://developers.cloudflare.com/ssl/troubleshooting/too-many-redirects/)
+- [Cloudflare — 5xx errors](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/)
+- [Cloudflare Cache — Default cache behavior](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/)
+
+---
+
+**Điều cốt lõi:** cloud cam thay đổi cả đường request, không chỉ câu trả lời DNS. Chuẩn production là origin HTTPS khỏe, Full (strict), record web mới proxied, mail/verify để DNS-only, client IP chỉ được tin từ proxy đáng tin, và origin được khóa theo một runbook có rollback đã kiểm thử.

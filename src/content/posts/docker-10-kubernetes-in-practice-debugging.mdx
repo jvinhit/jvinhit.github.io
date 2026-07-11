@@ -1,7 +1,8 @@
 ---
 title: 'Docker for Developers · Part 10 — Kubernetes in Practice & Debugging'
-description: 'Make a k8s app production-shaped and learn to debug it: ConfigMaps & Secrets, liveness/readiness probes, resource limits, rolling updates and scaling, then a kubectl debugging playbook for CrashLoopBackOff, ImagePullBackOff and more.'
+description: 'Đưa workload Kubernetes tới mức production-shaped với config, probes, resources, rollout và playbook debug sự cố bằng kubectl.'
 pubDate: 2025-11-03
+updatedDate: 2026-07-11
 tags: [kubernetes, k8s, debugging, devops, docker_k8s_10]
 series: docker
 seriesOrder: 10
@@ -10,13 +11,13 @@ draft: false
 
 import DockerDiagram from '../../components/blog/DockerDiagram.astro';
 
-Đây là **Phần 10 — chương cuối** của series 10 bài đưa bạn từ "mới nghe Docker" đến tự tin build, chạy và *debug* ứng dụng container trên Docker, Compose và Kubernetes. Mỗi phần kết thúc bằng **bài tập**; hãy làm, đừng chỉ đọc.
+Đây là **Phần 10 — bài chốt chặng nền tảng** của lộ trình đưa bạn từ "mới nghe Docker" đến tự tin build, chạy và *debug* ứng dụng container trên Docker, Compose và Kubernetes. Mỗi phần kết thúc bằng **bài tập**; hãy làm, đừng chỉ đọc.
 
-Ở [Phần 9](/blog/docker-09-kubernetes-fundamentals/) bạn đã deploy app tối thiểu bằng **Deployment** và **Service** trên cluster local (`kind` hoặc `minikube`). Điều đó chứng minh control plane schedule được pod — nhưng manifest demo chưa phải cách chạy production. **Phần 10** biến cùng app đó thành **cấu hình được, quan sát được và phục hồi được**: config bên ngoài, health probe, giới hạn tài nguyên, rolling update — rồi dạy **debug** khi có sự cố.
+Ở [Phần 9](/blog/docker-09-kubernetes-fundamentals/) bạn đã deploy app tối thiểu bằng **Deployment** và **Service** trên cluster local (`kind` hoặc `minikube`). Điều đó chứng minh control plane schedule được pod — nhưng manifest demo chưa phải cách chạy production. **Phần 10** dùng một workload `web` nhất quán để thêm config bên ngoài, health probe, resource policy, rolling update — rồi dạy **debug** khi có sự cố.
 
 > **Điều kiện:** `kubectl` trỏ đúng cluster; bạn đã quen debug theo [Phần 8](/blog/docker-08-debugging-troubleshooting-docker/); và hiểu healthcheck Compose từ [Phần 6](/blog/docker-06-compose-in-depth-profiles-healthchecks/).
 
-Gọi đây là "production-shaped", không phải "production-complete": production thật còn cần Ingress, TLS, RBAC, NetworkPolicy, secret manager, backup, observability và CI/CD. Bài này tập trung vào xương sống mà developer phải hiểu trước khi nhờ platform team hay cloud managed service gánh phần còn lại.
+Gọi đây là "production-shaped", không phải "production-complete": production thật còn cần Gateway/TLS, RBAC, NetworkPolicy, secret manager, backup, observability và delivery pipeline. Các phần 14–18 sẽ đi sâu từng lớp còn thiếu.
 
 ---
 
@@ -46,7 +47,7 @@ stringData:
 
 Senior rule: **Secret Kubernetes là cơ chế phân phối secret cho Pod, không phải secret manager hoàn chỉnh**. Với production, thường kết hợp cloud secret manager/Vault/External Secrets, RBAC chặt và encryption at rest.
 
-Tham chiếu trong Deployment — **biến môi trường** hoặc **file mount**:
+Ghép ConfigMap + Secret phía trên với Deployment và Service dưới đây thành `part10.yaml`. Workload dùng nginx public để lab chạy được ngay, nhưng vẫn minh họa cả **biến môi trường** và **file mount**:
 
 ```yaml
 apiVersion: apps/v1
@@ -63,7 +64,9 @@ spec:
     spec:
       containers:
         - name: web
-          image: myapp:1.0.0
+          image: nginx:1.28-alpine
+          ports:
+            - { name: http, containerPort: 80 }
           envFrom:
             - configMapRef: { name: web-config }
           env:
@@ -80,10 +83,20 @@ spec:
         - name: config-vol
           configMap:
             name: web-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector: { app: web }
+  ports:
+    - { name: http, port: 80, targetPort: http }
 ```
 
 ```bash
-kubectl apply -f configmap.yaml -f secret.yaml -f deployment.yaml
+kubectl apply -f part10.yaml
+kubectl rollout status deployment/web
 kubectl get configmap,secret
 kubectl describe configmap web-config
 ```
@@ -98,19 +111,19 @@ kubectl describe configmap web-config
 |---|---|---|
 | **liveness** | Tiến trình còn sống? | **Restart** container |
 | **readiness** | Pod có nhận traffic? | Gỡ khỏi **endpoint Service** (không traffic) |
-| **startup** | Khởi động chậm xong chưa? | Chặn liveness đến khi OK (app nặng) |
+| **startup** | Khởi động chậm xong chưa? | Tạm hoãn liveness/readiness; fail quá ngưỡng thì restart container |
 
 ```yaml
           livenessProbe:
             httpGet:
-              path: /healthz
-              port: 3000
+              path: /
+              port: http
             initialDelaySeconds: 10
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /ready
-              port: 3000
+              path: /
+              port: http
             periodSeconds: 5
             failureThreshold: 3
 ```
@@ -131,13 +144,13 @@ Probe `exec` chạy lệnh trong container (giống Compose `CMD-SHELL`):
   caption="Readiness gates Service traffic (a failing pod is pulled from endpoints, no traffic); liveness restarts the container when it stops responding"
 />
 
-**Liveness** cấu hình sai trên endpoint chậm gây **vòng restart** khi app vẫn đang khởi động. Quy tắc: liveness = "còn sống không?" rẻ; readiness = "phục vụ được chưa?"; startupProbe = "đừng giết tôi khi tôi còn warm up".
+**Liveness** cấu hình sai trên endpoint chậm gây **vòng restart** khi app vẫn đang khởi động. Quy tắc: liveness = "còn sống không?" rẻ; readiness = "phục vụ được chưa?"; startupProbe = ngân sách khởi động trước khi liveness/readiness bắt đầu có hiệu lực.
 
 ---
 
 ## Request & limit tài nguyên
 
-Không limit, một pod có thể chiếm hết node; scheduler không đặt pod hợp lý. **Request** = tối thiểu đảm bảo để schedule; **limit** = trần cứng.
+Không khai báo resource, scheduler thiếu dữ liệu để đặt pod và một workload có thể gây pressure cho cả node. **Request** là lượng scheduler dùng khi xếp Pod; khi tranh chấp, CPU request còn ảnh hưởng trọng số và memory request ảnh hưởng nguy cơ eviction. **Limit** là biên thực thi: CPU bị throttle, memory có thể bị OOM kill.
 
 ```yaml
           resources:
@@ -164,10 +177,10 @@ kubectl describe pod web-xxx | grep -A5 "Last State"
 
 ## Rolling update & scale
 
-Đổi image không downtime bằng cách cập nhật Deployment:
+Deployment rolling update giúp thay image dần; để tiến gần zero downtime vẫn cần readiness đúng, đủ capacity, graceful termination và phiên bản ứng dụng tương thích:
 
 ```bash
-kubectl set image deployment/web web=myapp:1.1.0
+kubectl set image deployment/web web=nginx:1.29-alpine
 # or: kubectl edit deployment web
 
 kubectl rollout status deployment/web
@@ -287,7 +300,7 @@ kubectl exec -it <pod> -c <container> -- sh
 # config & rollout
 kubectl apply -f .
 kubectl get cm,secret
-kubectl set image deployment/web web=myapp:1.1.0
+kubectl set image deployment/web web=nginx:1.29-alpine
 kubectl rollout status deployment/web
 kubectl rollout undo deployment/web
 kubectl scale deployment/web --replicas=3
@@ -300,7 +313,7 @@ kind load docker-image myapp:tag --name kind
 
 ## Bài tập / Exercises
 
-Dùng cluster `kind` (hoặc `minikube`) và Deployment `web` từ Phần 9 làm nền. Cố tình làm hỏng — đó là cách debug in vào đầu.
+Dùng cluster `kind` (hoặc `minikube`) và file `part10.yaml` ở đầu bài làm nền. Cố tình làm hỏng — đó là cách debug in vào đầu.
 
 **1.** Deploy pod image `nginx:does-not-exist`. Sửa **ImagePullBackOff** bằng tag đúng.
 
@@ -311,37 +324,41 @@ Dùng cluster `kind` (hoặc `minikube`) và Deployment `web` từ Phần 9 làm
 kubectl run broken --image=nginx:does-not-exist
 kubectl get pods                    # ImagePullBackOff / ErrImagePull
 kubectl describe pod broken | tail -20
-kubectl set image pod/broken broken=nginx:alpine
-# or delete and recreate with a valid tag
 kubectl delete pod broken
-kubectl run broken --image=nginx:alpine
+kubectl run broken --image=nginx:1.28-alpine
 ```
 </details>
 
-**2.** Chạy container thoát ngay (`alpine` + `false`). Chẩn đoán **CrashLoopBackOff** bằng `describe` và `logs --previous`.
+**2.** Chạy container ghi lỗi rồi thoát. Chẩn đoán **CrashLoopBackOff** bằng `describe` và `logs --previous`.
 
 <details>
 <summary>Lời giải</summary>
 
 ```bash
-kubectl run crasher --image=alpine --restart=Always -- false
+kubectl run crasher --image=busybox:1.37 --restart=Always \
+  -- sh -c 'echo "boom: missing configuration" >&2; exit 1'
 kubectl get pods
 kubectl describe pod crasher | tail -15
-kubectl logs crasher --previous    # shows the failed command output
+kubectl logs crasher --previous    # boom: missing configuration
 kubectl delete pod crasher
 ```
 </details>
 
-**3.** Tạo **ConfigMap** `web-config` với `LOG_LEVEL=debug`, inject `envFrom`, kiểm tra trong pod.
+**3.** Đổi **ConfigMap** `web-config` thành `LOG_LEVEL=debug`. Chứng minh env của Pod cũ không tự đổi, sau đó restart rollout và kiểm tra Pod mới.
 
 <details>
 <summary>Lời giải</summary>
 
 ```bash
-kubectl create configmap web-config --from-literal=LOG_LEVEL=debug
-# patch deployment or add envFrom in YAML, then:
-kubectl apply -f deployment.yaml
-kubectl exec -it deploy/web -- printenv LOG_LEVEL
+kubectl create configmap web-config \
+  --from-literal=APP_ENV=production \
+  --from-literal=LOG_LEVEL=debug \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl exec deploy/web -- printenv LOG_LEVEL  # Pod cũ vẫn có giá trị lúc start
+kubectl rollout restart deployment/web
+kubectl rollout status deployment/web
+kubectl exec deploy/web -- printenv LOG_LEVEL  # debug
 ```
 </details>
 
@@ -356,21 +373,22 @@ readinessProbe:
 ```
 
 ```bash
-kubectl apply -f deployment.yaml
+kubectl apply -f part10.yaml
 kubectl get pods                    # 0/1 Ready
 kubectl get endpointslices -l kubernetes.io/service-name=web
-kubectl run tmp --rm -it --image=curlimages/curl -- curl -s -m2 http://web:80/ || true
-# fix port to 80, re-apply — endpoints repopulate
+kubectl run tmp --rm -i --restart=Never --image=busybox:1.37 \
+  -- wget -qO- -T 2 http://web:80/ || true
+# fix port to `http` (or 80), re-apply — EndpointSlice becomes ready again
 ```
 </details>
 
-**5.** Rollout `myapp:1.0.0` → `myapp:1.1.0` bằng `kubectl set image`, theo dõi `rollout status`, rồi **undo**.
+**5.** Rollout nginx stable `1.28` → mainline `1.29` bằng `kubectl set image`, theo dõi `rollout status`, rồi **undo**.
 
 <details>
 <summary>Lời giải</summary>
 
 ```bash
-kubectl set image deployment/web web=myapp:1.1.0
+kubectl set image deployment/web web=nginx:1.29-alpine
 kubectl rollout status deployment/web
 kubectl rollout history deployment/web
 kubectl rollout undo deployment/web
@@ -378,39 +396,78 @@ kubectl rollout status deployment/web
 ```
 </details>
 
-**6.** Đặt `memory.limits` `16Mi` trên app ăn RAM; gây **OOMKilled**, xác nhận trong `describe`, rồi sửa limit.
+**6.** Deploy một workload chủ đích cấp phát 128 MiB nhưng limit 32 MiB; xác nhận **OOMKilled**, rồi nâng limit và chứng minh Pod ổn định.
 
 <details>
 <summary>Lời giải</summary>
 
+```yaml
+# memory-hog.yaml — workload chỉ dùng để học OOM, không phải app production
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-hog
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: memory-hog }
+  template:
+    metadata:
+      labels: { app: memory-hog }
+    spec:
+      containers:
+        - name: hog
+          image: python:3.13-alpine
+          command: ["python", "-c"]
+          args: ["x=bytearray(128*1024*1024); import time; time.sleep(3600)"]
+          resources:
+            requests: { memory: 16Mi }
+            limits: { memory: 32Mi }
+```
+
 ```bash
-kubectl set resources deployment/web -c=web --limits=memory=16Mi
-kubectl get pods -w
-kubectl describe pod <pod> | grep -E 'OOM|Last State|Exit Code'
-# raise to 256Mi or fix the leak
-kubectl set resources deployment/web -c=web --limits=memory=256Mi
+kubectl apply -f memory-hog.yaml
+kubectl get pods -l app=memory-hog -w
+kubectl describe pod -l app=memory-hog | grep -E 'OOM|Last State|Exit Code'
+
+# change limits.memory to 256Mi, then:
+kubectl apply -f memory-hog.yaml
+kubectl rollout status deployment/memory-hog
+kubectl delete deployment memory-hog
 ```
 </details>
 
-**Đỉnh series - CAPSTONE:** Đưa stack **web + db + redis** từ [Phần 5](/blog/docker-05-compose-fundamentals/) lên `kind`: Deployment + Service + ConfigMap + Secret + probe cho `web` và `db`. Load image bằng `kind load`. Cố tình làm hỏng (image sai, thiếu Secret, readiness fail), rồi debug về healthy bằng sổ tay.
+**Capstone chặng nền tảng:** hoàn thiện `part10.yaml` với ba probe và resources cho `web`; sau đó inject hai sự cố — image sai và ConfigMap mất — rồi thu evidence, rollback/re-apply về healthy.
 
 <details>
 <summary>Lời giải</summary>
 
 ```bash
-# build & load
-docker build -t myapp:1.0.0 ./web
-kind load docker-image myapp:1.0.0 --name kind
+kubectl apply -f part10.yaml
+kubectl rollout status deployment/web
+kubectl get deploy,pod,svc,cm,secret
+kubectl get endpointslices -l kubernetes.io/service-name=web
 
-kubectl apply -f k8s/   # namespace, cm, secret, db, redis, web deployments + services
-kubectl get pods -w
-kubectl get svc
+# Incident 1: bad image → evidence → rollback
+kubectl set image deployment/web web=nginx:does-not-exist
+kubectl rollout status deployment/web --timeout=30s || true
+kubectl get pods
+kubectl describe pod -l app=web | tail -30
+kubectl rollout undo deployment/web
+kubectl rollout status deployment/web
 
-# break → fix drill
-kubectl set image deployment/web web=myapp:typo          # ImagePullBackOff → fix tag
-kubectl delete secret web-secret                         # CreateContainerConfigError → re-apply
-kubectl logs deploy/web --previous                       # CrashLoop → read stack trace
-kubectl describe pod -l app=web | tail -20               # Events tell the story
+# Incident 2: dependency config disappears during a restart
+kubectl delete configmap web-config
+kubectl rollout restart deployment/web
+kubectl get pods
+kubectl describe pod -l app=web | tail -30
+kubectl apply -f part10.yaml
+kubectl rollout status deployment/web
+
+# Final evidence
+kubectl get pods -l app=web
+kubectl get endpointslices -l kubernetes.io/service-name=web
+kubectl get events --sort-by='.lastTimestamp' | tail -30
 ```
 </details>
 
@@ -426,9 +483,9 @@ kubectl describe pod -l app=web | tail -20               # Events tell the story
 
 ---
 
-## Tổng kết series
+## Kết thúc chặng nền tảng
 
-Bạn đã hoàn thành — **10 phần**, một hành trình từ một container đến deployment Kubernetes debug được. Dùng checklist này để ôn lại từng chủ đề:
+Bạn đã hoàn thành **10 phần nền tảng**, một hành trình từ một container đến Deployment Kubernetes debug được. Dùng checklist này để ôn lại từng chủ đề:
 
 1. [Part 1 — Containers, Images & the Mental Model](/blog/docker-01-fundamentals-containers-images/)
 2. [Part 2 — Images & the Dockerfile](/blog/docker-02-images-and-dockerfile/)
@@ -441,4 +498,20 @@ Bạn đã hoàn thành — **10 phần**, một hành trình từ một contain
 9. [Part 9 — Kubernetes Fundamentals](/blog/docker-09-kubernetes-fundamentals/)
 10. [Part 10 — Kubernetes in Practice & Debugging](/blog/docker-10-kubernetes-in-practice-debugging/) *(you are here)*
 
-Giờ bạn có thể **build** image, **điều phối** stack bằng Compose, **cứng hóa** cho production, **debug** lỗi Docker và Kubernetes có hệ thống, và **vận hành** cluster với config, probe, limit và rollout. Hãy ship thứ nhỏ, cố làm hỏng, sửa bằng `describe` và `logs --previous` — đó là nghề.
+Giờ bạn có thể **build** image, **điều phối** stack bằng Compose, **cứng hóa** runtime, **debug** Docker/Kubernetes có hệ thống và vận hành workload với config, probe, resources, rollout. Đây là nền; nhánh chuyên sâu tiếp theo sẽ giải thích điều gì thật sự xảy ra bên dưới và cách vận hành các lớp production còn thiếu.
+
+---
+
+## Tài liệu chính thức
+
+- [ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/)
+- [Secrets và các lưu ý bảo mật](https://kubernetes.io/docs/concepts/security/secrets-good-practices/)
+- [Liveness, readiness và startup probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/)
+- [Resource management cho Pod và container](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
+- [Debug một Pod đang chạy](https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/)
+
+---
+
+## Tiếp theo
+
+**[Phần 11 — Container Internals](/blog/docker-11-container-internals/)** — theo `docker run` xuống OCI runtime, namespace, cgroup v2, copy-on-write và bài toán PID 1/signal.

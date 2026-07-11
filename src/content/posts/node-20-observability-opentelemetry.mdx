@@ -1,163 +1,550 @@
 ---
-title: 'Node.js Super Senior · Phase 20 — Observability với OpenTelemetry'
-description: 'Bonus Phase 20 — finale: thấy bên trong hệ thống production. Ba trụ cột logs/metrics/traces, structured logging theo request, metrics RED/USE với Prometheus, và distributed tracing với OpenTelemetry.'
+title: 'Node.js Production Engineering 20 — Observability, SLO và OpenTelemetry'
+description: 'Xây observability từ user journey: SLI/SLO, error budget, structured logs, metrics cardinality, distributed traces, sampling, Collector topology và incident workflow.'
 pubDate: 2026-06-22
-tags: [nodejs, observability, opentelemetry, monitoring, node_10]
+updatedDate: 2026-07-11
+tags:
+  [
+    nodejs,
+    observability,
+    opentelemetry,
+    slo,
+    monitoring,
+    production-engineering,
+  ]
 series: nodejs
 seriesOrder: 20
 draft: false
 ---
 
-Đây là **Bonus Phase 20**, phần đỉnh của nhánh vận hành. Bạn đã dựng API (Phase 3, 17), hệ phân tán (Phase 18), realtime (Phase 19), nền tảng dữ liệu (Phase 11–13). Câu hỏi cuối cùng phân biệt một engineer vận hành được production: **khi 2 giờ sáng có sự cố, bạn có thấy được chuyện gì đang xảy ra không?** Observability là kỹ năng đó.
+02:07 sáng, alert “CPU 92%” đánh thức on-call. CPU cao ở một pod, nhưng checkout vẫn bình thường. Hai ngày sau, payment p99 tăng gấp mười vì một query lock; CPU không cao nên không có alert. Team có rất nhiều metric nhưng chưa đo **điều người dùng thực sự cần**.
+
+Observability không bắt đầu bằng việc cài dashboard. Nó bắt đầu bằng câu hỏi: _hệ thống hứa điều gì với người dùng, tín hiệu nào chứng minh lời hứa đang được giữ, và khi lời hứa bị đe dọa thì kỹ sư có lần được từ triệu chứng tới nguyên nhân không?_
+
+Sau bài này, bạn sẽ có thể:
+
+- định nghĩa SLI, SLO và error budget theo user journey;
+- chọn logs, metrics, traces và profiles cho đúng loại câu hỏi;
+- instrument Node.js bằng OpenTelemetry mà không tạo cardinality/overhead mất kiểm soát;
+- truyền trace context qua HTTP, gRPC và message queue;
+- thiết kế head/tail sampling và Collector topology;
+- biến alert thành một incident workflow có evidence và action rõ.
+
+> Baseline: Node.js 24 LTS và OpenTelemetry JavaScript hiện đại. Theo tài liệu OpenTelemetry JS tại thời điểm cập nhật, traces và metrics ổn định; logs SDK vẫn đang ở trạng thái development. Kiểm release/status trước khi chuẩn hóa pipeline log thuần OTel.
 
 ---
 
-## Monitoring vs Observability
+## 1. Monitoring và observability là một vòng phản hồi
 
-**Monitoring** trả lời câu hỏi bạn *biết trước* (CPU có cao không?). **Observability** cho bạn hỏi câu *chưa lường trước* mà không deploy lại ("vì sao đúng request này của đúng user này chậm 8 giây?"). Ba trụ cột làm nên nó:
+Monitoring theo dõi những điều ta đã biết cần quan sát: error rate, queue age, CPU. Observability là khả năng suy luận trạng thái bên trong từ output của hệ thống để trả lời cả câu hỏi chưa được dự đoán trước.
+
+Không nên biến chúng thành hai phe. Một hệ vận hành tốt cần vòng lặp:
 
 ```text
-Logs    — sự kiện rời rạc, giàu ngữ cảnh   ("user 42 thanh toán thất bại: card_declined")
-Metrics — số liệu tổng hợp theo thời gian   (p99 latency, req/s, error rate)
-Traces  — hành trình một request xuyên các service  (đâu là chặng tốn 8s?)
+SLO/alert phát hiện user impact
+        │
+        ▼
+metric khoanh vùng thời gian + service
+        │
+        ▼
+trace tìm dependency/span bất thường
+        │
+        ▼
+structured log + profile xác nhận nguyên nhân
+        │
+        ▼
+mitigate → verify SLI hồi phục → postmortem → cải thiện signal/runbook
 ```
 
----
+Telemetry chỉ có giá trị khi rút ngắn thời gian phát hiện, chẩn đoán hoặc xác minh. Một dashboard không ai dùng khi incident là chi phí lưu trữ, không phải observability.
 
-## Trụ cột 1 — Structured logging
+## 2. Đi từ user journey đến SLI/SLO
 
-`console.log` không scale. Production cần **log JSON có cấu trúc** để máy truy vấn được. Dùng **pino** (nhanh nhất cho Node):
+### SLI: cách đo một outcome tốt
 
-```ts
-import pino from 'pino';
-const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
+Service Level Indicator thường là tỷ lệ event tốt trên event hợp lệ:
 
-logger.info({ userId: 42, orderId: 'o_1' }, 'order created');
-// → {"level":30,"time":...,"userId":42,"orderId":"o_1","msg":"order created"}
+```text
+availability SLI = successful eligible requests / all eligible requests
+latency SLI      = requests hoàn tất dưới 300 ms / successful requests
+freshness SLI    = updates tới client dưới 5 s / all expected updates
 ```
 
-Chìa khóa là **correlation id**: gắn một `requestId` (và `traceId`) vào mọi log của cùng một request để ghép lại được. Dùng `AsyncLocalStorage` để truyền ngầm qua call stack mà không phải chuyền tham số khắp nơi:
+“Eligible” phải được định nghĩa. Request bị client cancel có tính không? `400` do input sai có tính lỗi service không? Nếu không ghi, hai dashboard có thể cho hai availability khác nhau.
+
+Ví dụ cho các phần trước:
+
+| User journey           | SLI khả dụng                                                   |
+| ---------------------- | -------------------------------------------------------------- |
+| Checkout               | tỷ lệ order hợp lệ được confirm không duplicate                |
+| Background email       | tỷ lệ email giao dịch hoàn tất trong 5 phút                    |
+| GraphQL article screen | tỷ lệ operation có dữ liệu bắt buộc dưới 500 ms                |
+| Realtime order status  | tỷ lệ client thấy trạng thái mới trong 5 giây, kể cả reconnect |
+
+### SLO: mục tiêu trong một cửa sổ
+
+`99,9% availability trong 30 ngày` cho phép 0,1% event không tốt. Với service liên tục, 0,1% của 30 ngày tương đương khoảng 43 phút 12 giây — nhưng event-based SLO nên tính theo request/event thực, không chỉ đổi ra downtime.
+
+SLO không phải lời hứa marketing. Nó là ngưỡng ra quyết định: tốc độ release, ưu tiên reliability work, capacity và on-call.
+
+### Error budget và burn rate
+
+Error budget là phần lỗi SLO cho phép. Nếu SLO là 99,9%, budget là 0,1%. **Burn rate** cho biết đang tiêu budget nhanh gấp bao nhiêu tốc độ bền vững.
+
+```text
+burn rate = observed bad-event ratio / allowed bad-event ratio
+```
+
+Burn rate 10 nghĩa là nếu giữ tốc độ hiện tại, budget sẽ cạn nhanh gấp 10. Multi-window burn-rate alert kết hợp cửa sổ nhanh và chậm để vừa bắt sự cố lớn sớm, vừa tránh đánh thức vì spike ngắn vô hại.
+
+## 3. Bốn loại tín hiệu, bốn loại câu hỏi
+
+| Signal   | Tối ưu cho                                   | Không tối ưu cho                            |
+| -------- | -------------------------------------------- | ------------------------------------------- |
+| Metrics  | xu hướng, aggregate, alert rẻ                | chi tiết một request cụ thể                 |
+| Logs     | event rời rạc, audit, ngữ cảnh lỗi           | percentile/aggregate lớn nếu phải scan text |
+| Traces   | hành trình và causal path một request        | đếm chính xác toàn traffic khi sampling     |
+| Profiles | code path tiêu CPU/allocation theo thời gian | business outcome                            |
+
+“Ba trụ cột” là mental model hữu ích, không phải giới hạn. Continuous profiling và domain events cũng có thể là bằng chứng quan trọng.
+
+Kiến trúc telemetry production thường là:
+
+```text
+Node process
+  ├─ structured logs ───────────────┐
+  ├─ OTel metrics/traces ── OTLP ───┼─▶ Collector agent/gateway ─▶ backends
+  └─ runtime/profile signal ────────┘          │
+                                               ├─ batch/retry
+                                               ├─ filter/redact
+                                               ├─ sample/route
+                                               └─ queue + export
+```
+
+Ứng dụng không nên block business request chờ telemetry backend. SDK/Collector cần batch, queue hữu hạn và fail-open có kiểm soát: observability backend lỗi không được kéo sập checkout.
+
+## 4. Structured logs: event có schema, không phải câu văn ngẫu nhiên
 
 ```ts
 import { AsyncLocalStorage } from 'node:async_hooks';
-const als = new AsyncLocalStorage<{ requestId: string }>();
+import { randomUUID } from 'node:crypto';
+import { trace } from '@opentelemetry/api';
+import pino from 'pino';
 
-app.use((req, _res, next) => {
-  als.run({ requestId: req.headers['x-request-id'] ?? crypto.randomUUID() }, next);
+type RequestContext = { requestId: string };
+const requestContext = new AsyncLocalStorage<RequestContext>();
+
+const baseLogger = pino({
+  level: process.env.LOG_LEVEL ?? 'info',
+  redact: {
+    paths: [
+      'req.headers.authorization',
+      'password',
+      'accessToken',
+      'refreshToken',
+    ],
+    censor: '[REDACTED]',
+  },
 });
 
-// child logger tự đính requestId
-const log = () => logger.child({ requestId: als.getStore()?.requestId });
-```
-
-Quy tắc: **không bao giờ log secret/PII** (mật khẩu, token, thẻ — Phase 5/15). Redact chúng.
-
----
-
-## Trụ cột 2 — Metrics (RED & USE)
-
-Metrics là số tổng hợp rẻ để lưu và vẽ dashboard/alert. Hai khung tư duy chuẩn:
-
-- **RED** (cho service/request): **R**ate (req/s), **E**rrors (tỉ lệ lỗi), **D**uration (latency p50/p95/p99).
-- **USE** (cho tài nguyên): **U**tilization, **S**aturation, **E**rrors.
-
-Phơi metrics cho **Prometheus** scrape bằng `prom-client`:
-
-```ts
-import client from 'prom-client';
-client.collectDefaultMetrics(); // CPU, memory, event loop lag...
-
-const httpDuration = new client.Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'Thời lượng request HTTP',
-  labelNames: ['method', 'route', 'status'],
-  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],
-});
+export function logger() {
+  const spanContext = trace.getActiveSpan()?.spanContext();
+  return baseLogger.child({
+    requestId: requestContext.getStore()?.requestId,
+    traceId: spanContext?.traceId,
+    spanId: spanContext?.spanId,
+  });
+}
 
 app.use((req, res, next) => {
-  const end = httpDuration.startTimer();
-  res.on('finish', () => end({ method: req.method, route: req.route?.path ?? 'unknown', status: res.statusCode }));
-  next();
+  const requestId = req.get('x-request-id') || randomUUID();
+  res.setHeader('x-request-id', requestId);
+  requestContext.run({ requestId }, next);
 });
-
-app.get('/metrics', async (_req, res) => res.send(await client.register.metrics()));
 ```
 
-Đo **event loop lag** đặc biệt quan trọng với Node — nó là tín hiệu sớm của việc chặn main thread (Phase 8). Alert trên **p99 latency** và **error rate**, không phải trung bình (trung bình giấu đuôi chậm).
-
----
-
-## Trụ cột 3 — Distributed tracing với OpenTelemetry
-
-Đây là vũ khí mạnh nhất cho hệ phân tán (Phase 18). Một trace theo *một* request qua mọi service, mỗi chặng là một **span**, nối nhau bằng `traceId` truyền qua header.
-
-```text
-trace abc123
-├─ span: API Gateway        2ms
-│  └─ span: order-svc        120ms
-│     ├─ span: gRPC user-svc  15ms
-│     └─ span: DB query       95ms   ← thủ phạm: query chậm!
-```
-
-**OpenTelemetry** là chuẩn trung lập (không khóa nhà cung cấp). Auto-instrumentation cài rất ít code:
+Log business event bằng field ổn định:
 
 ```ts
-// tracing.ts — nạp TRƯỚC mọi thứ khác (node --require ./tracing.js)
+logger().info(
+  {
+    event: 'order.confirmed',
+    orderId: order.id,
+    actorType: 'user',
+    durationMs,
+  },
+  'order confirmed'
+);
+```
+
+### Log level là contract vận hành
+
+- `debug`: điều tra tạm thời, thường tắt ở production;
+- `info`: state transition đáng quan tâm, không phải mọi dòng code;
+- `warn`: bất thường hệ thống tự hồi phục hoặc gần ngưỡng;
+- `error`: operation thất bại cần điều tra/hành động.
+
+Không log cùng exception ở controller, service và global handler ba lần. Log một lần ở boundary có đủ context. Sampling/rate-limit repeated logs để dependency lỗi không tạo log storm và hóa đơn telemetry lớn.
+
+PII/secret policy phải có allowlist, retention và access control. Redaction theo vài key phổ biến không bắt được token nằm trong URL hoặc nested payload; tốt nhất không đưa raw request body vào log từ đầu.
+
+## 5. Metrics: label hữu hạn quan trọng hơn số lượng metric
+
+Khung RED cho request/service:
+
+- **Rate**: request/job/message mỗi giây;
+- **Errors**: tỷ lệ outcome xấu theo contract;
+- **Duration**: histogram latency.
+
+USE cho resource:
+
+- **Utilization**: CPU, connection đang dùng;
+- **Saturation**: queue, event-loop delay, pool wait;
+- **Errors**: OOM, connection reset, disk error.
+
+Node-specific signals đáng có: event-loop delay/utilization, heap/RSS, GC pause, active handles, libuv/thread-pool symptom, connection-pool wait và worker queue age.
+
+### Cardinality budget
+
+Metric label tạo một time series cho mỗi tổ hợp giá trị. `userId`, `requestId`, raw URL, SQL text hoặc error message tạo cardinality gần vô hạn.
+
+```ts
+// ❌ /users/123, /users/456... tạo series mới
+httpDuration.record(seconds, { path: req.originalUrl, userId: actor.id });
+
+// ✅ route template + tập giá trị hữu hạn
+httpDuration.record(seconds, {
+  method: req.method,
+  route: '/users/:id',
+  statusCode: String(res.statusCode),
+});
+```
+
+ID chi tiết thuộc trace/log. Metric dành cho aggregate. Mỗi label mới cần owner, use case và ước lượng cardinality trước khi ship.
+
+Histogram bucket phải bám SLO: nếu mục tiêu 300 ms nhưng bucket chỉ có 100 ms và 1 giây, bạn không tính được tỷ lệ dưới ngưỡng chính xác. Dùng seconds thống nhất với semantic convention/backend.
+
+## 6. OpenTelemetry Node.js: khởi tạo trước application code
+
+Auto-instrumentation patch/wrap module khi chúng được load. Nếu Express/database được import trước SDK, span tự động có thể thiếu.
+
+```bash
+npm install @opentelemetry/api @opentelemetry/sdk-node \
+  @opentelemetry/auto-instrumentations-node \
+  @opentelemetry/sdk-metrics \
+  @opentelemetry/exporter-trace-otlp-proto \
+  @opentelemetry/exporter-metrics-otlp-proto
+```
+
+```ts
+// instrumentation.ts — phải chạy trước server.ts
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-proto';
+import { PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
 
-const sdk = new NodeSDK({
-  traceExporter: new OTLPTraceExporter({ url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT }),
-  instrumentations: [getNodeAutoInstrumentations()], // tự trace http, express, prisma, redis, grpc...
+export const telemetrySdk = new NodeSDK({
+  traceExporter: new OTLPTraceExporter(),
+  metricReader: new PeriodicExportingMetricReader({
+    exporter: new OTLPMetricExporter(),
+    exportIntervalMillis: 30_000,
+  }),
+  instrumentations: [
+    getNodeAutoInstrumentations({
+      // fs spans thường rất ồn; chỉ bật khi có use case.
+      '@opentelemetry/instrumentation-fs': { enabled: false },
+    }),
+  ],
 });
-sdk.start();
+
+telemetrySdk.start();
 ```
 
-Auto-instrumentation tự tạo span cho Express, Prisma (Phase 12), Redis (Phase 13), gRPC (Phase 18) — và **truyền context** qua các service. Thêm span thủ công cho logic nghiệp vụ quan trọng:
+Cấu hình resource/exporter qua environment để cùng image chạy nhiều môi trường:
+
+```bash
+OTEL_SERVICE_NAME=order-service
+OTEL_RESOURCE_ATTRIBUTES=service.version=2026.07.11,deployment.environment.name=production
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-agent:4318
+```
+
+Boot command phụ thuộc CJS/ESM và cách build. Tài liệu OTel hiện dùng preload (`--import`) và lưu ý ESM có thể cần instrumentation loader hook. Invariant cần kiểm bằng integration test: instrumentation chạy trước app và một request thật tạo đủ HTTP/framework/dependency spans. Đừng copy `--require` CJS vào dự án ESM rồi giả định auto-instrumentation hoạt động.
+
+## 7. Manual span: instrument business boundary, không trace mọi function
+
+Auto-instrumentation thấy HTTP/DB; nó không hiểu “reserve inventory” hay “calculate risk”. Tạo manual span cho bước có ý nghĩa chẩn đoán:
 
 ```ts
-import { trace } from '@opentelemetry/api';
-const tracer = trace.getTracer('order-svc');
+import { SpanStatusCode, trace } from '@opentelemetry/api';
 
-await tracer.startActiveSpan('charge-card', async (span) => {
-  try { await chargeCard(order); }
-  catch (e) { span.recordException(e as Error); throw e; }
-  finally { span.end(); }
-});
+const tracer = trace.getTracer('checkout-application');
+
+async function reserveInventory(order: Order): Promise<Reservation> {
+  return tracer.startActiveSpan('inventory.reserve', async (span) => {
+    span.setAttributes({
+      'app.order.item_count': order.items.length,
+      'app.inventory.strategy': 'hold',
+    });
+
+    try {
+      return await inventory.reserve(order.items, {
+        signal: AbortSignal.timeout(800),
+      });
+    } catch (error) {
+      if (error instanceof Error) span.recordException(error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw error;
+    } finally {
+      span.end();
+    }
+  });
+}
 ```
 
-Xuất sang **Jaeger**, **Tempo**, hay **Grafana** để xem waterfall. Khi log, metric và trace cùng mang `traceId`, bạn nhảy từ một alert latency → đúng trace → đúng span chậm → đúng log của request đó. Đó là observability trọn vòng.
+Không đặt email, token, full SQL hay payload vào attribute. Span name phải có cardinality thấp (`GET /users/:id`, không `GET /users/42`).
 
----
+## 8. Context propagation qua message queue
 
-## Ghép ba trụ cột & alerting
+HTTP/gRPC instrumentation thường tự inject/extract W3C Trace Context. Queue/job payload tự thiết kế cần truyền carrier rõ:
 
-Sức mạnh đến từ **tương quan**: một `traceId` xuyên cả ba.
+```ts
+import { context, propagation, ROOT_CONTEXT, trace } from '@opentelemetry/api';
+
+// Producer
+const traceContext: Record<string, string> = {};
+propagation.inject(context.active(), traceContext);
+
+await emailQueue.add('order-receipt.v1', {
+  orderId,
+  traceContext,
+});
+
+// Consumer
+const parent = propagation.extract(
+  ROOT_CONTEXT,
+  job.data.traceContext as Record<string, string>
+);
+
+await context.with(parent, () =>
+  tracer.startActiveSpan('email.order_receipt process', async (span) => {
+    try {
+      await sendReceipt(job.data.orderId);
+    } finally {
+      span.end();
+    }
+  })
+);
+```
+
+Với job có thể chờ hàng giờ, nối parent-child trực tiếp có thể tạo trace kéo dài khó đọc. Một số hệ dùng **span link** từ consumer tới producer context để biểu diễn causal relationship mà không giả định cùng một synchronous trace. Ghi rõ convention và test propagation qua retry/replay.
+
+Không dùng trace như audit log bền: sampling/retention có thể bỏ trace. Business audit cần storage riêng.
+
+## 9. Sampling là quyết định chi phí và bằng chứng
+
+Trace toàn bộ traffic có thể quá đắt. Hai nhóm:
+
+- **Head sampling** quyết định sớm từ trace bắt đầu: rẻ, nhất quán, nhưng chưa biết trace sẽ lỗi/chậm.
+- **Tail sampling** đợi thấy nhiều/toàn trace: giữ lỗi/latency đặc biệt tốt hơn, đổi lại Collector cần buffer, routing và memory đáng kể.
+
+Một policy có thể giữ:
+
+- 100% trace lỗi hoặc latency vượt ngưỡng;
+- tỷ lệ cao cho canary/operation quan trọng;
+- 1–5% traffic bình thường tùy volume/cost;
+- parent-based decision để không tạo trace thủng.
+
+Tỷ lệ trên chỉ minh họa; capacity và compliance quyết định giá trị thật. Tail sampling cần các span cùng trace về đúng sampling tier; deployment topology phải hỗ trợ điều đó.
+
+Metrics SLI không được suy ra từ trace đã sampling nếu cần tỷ lệ chính xác. Metrics đếm toàn traffic; trace giải thích mẫu cụ thể.
+
+## 10. Collector là reliability boundary của telemetry
+
+Gửi trực tiếp từ từng service tới vendor nhanh cho local, nhưng production thường dùng Collector để batch, retry, filter/redact, sample và tách credential backend khỏi application.
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+  batch: {}
+
+exporters:
+  otlphttp/backend:
+    endpoint: ${env:OBSERVABILITY_ENDPOINT}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/backend]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/backend]
+```
+
+Đây là skeleton, không phải config production hoàn chỉnh. Component stability/config thay đổi theo distribution; validate bằng `otelcol validate`/công cụ của distribution.
+
+Deployment pattern:
+
+- **agent/sidecar/DaemonSet** gần app: network hop ngắn, offload nhanh;
+- **gateway** tập trung: routing, credential, tail sampling, policy;
+- **agent + gateway**: nhiều moving part hơn nhưng tách local collection và central processing.
+
+Collector cũng cần SLO, memory limit, queue, backpressure và alert. Nếu exporter down, quyết định drop/block phải bảo vệ application trước, đồng thời làm rõ telemetry loss trên dashboard.
+
+## 11. Alert theo triệu chứng, dashboard theo nguyên nhân
+
+Page on-call khi có user impact hoặc error budget bị đe dọa:
+
+- checkout bad-event ratio/burn rate;
+- p99 vượt SLO đủ lâu;
+- oldest critical job age vượt deadline;
+- realtime recovery SLI giảm.
+
+CPU, heap, replica count thường là diagnostic/capacity signals; chỉ page khi chúng gắn với action khẩn cấp rõ. Alert phải có owner, severity, runbook, dashboard link, recent deploy và điều kiện tự resolve.
+
+Một alert tốt trả lời:
 
 ```text
-Alert (metric p99 tăng) → mở trace mẫu (chậm ở DB span) → đọc log của traceId đó (query thiếu index)
+What: checkout availability burn rate 14× trong 10 phút
+Impact: khoảng 8% order hợp lệ thất bại ở region ap-southeast
+Since: 02:03 UTC, bắt đầu 4 phút sau deploy 2026.07.11-3
+Action: mở runbook checkout-availability; cân nhắc rollback nếu 5m window > 10×
+Evidence: dashboard + exemplar trace + change link
 ```
 
-Alert dựa trên **triệu chứng người dùng cảm nhận** (error rate, latency — SLO) chứ không phải nguyên nhân (CPU). Health check (Phase 7) `/healthz` + `/readyz` để orchestrator (K8s) biết khi nào restart/định tuyến.
+## 12. Từ alert đến nguyên nhân: một incident walkthrough
 
----
+Giả sử p99 checkout tăng:
 
-## Thực hành — capstone observability
+1. SLO dashboard xác nhận latency bad-event ratio và region bị ảnh hưởng.
+2. Deploy marker cho thấy không có release mới; loại bớt hypothesis.
+3. Service dependency metric cho thấy Postgres pool wait tăng, CPU bình thường.
+4. Exemplar trace chậm có span `UPDATE inventory` 8 giây.
+5. Log cùng `traceId` cho thấy retry transaction ba lần với `40001`.
+6. DB view/lock analysis xác nhận một batch job giữ lock theo thứ tự ngược.
+7. Mitigate: pause batch worker; SLI hồi phục trong hai window.
+8. Follow-up: thống nhất lock order, concurrency test, alert pool wait và runbook.
 
-Gắn quan sát vào hệ phân tán Phase 18:
+Telemetry không thay tư duy điều tra. Nó làm hypothesis rẻ hơn và bằng chứng liên kết được.
 
-1. Thêm **pino** + `AsyncLocalStorage` đính `requestId` vào mọi log; redact secret.
-2. Phơi `/metrics` với `prom-client`; histogram latency theo route + default metrics (event loop lag).
-3. Bật **OpenTelemetry** auto-instrumentation trên cả `user-svc` và `order-svc`; xuất sang Jaeger.
-4. Thêm span thủ công quanh lời gọi gRPC và DB; cố ý làm chậm một query và tìm nó trong trace.
-5. Dựng dashboard Grafana RED + event loop lag; đặt alert p99 latency và error rate.
-6. Tái hiện một sự cố (tắt Redis) và dùng cả ba trụ cột để chẩn đoán.
+## 13. Failure modes của chính observability
 
----
+| Anti-pattern                       | Hậu quả                                 | Thiết kế lại                                    |
+| ---------------------------------- | --------------------------------------- | ----------------------------------------------- |
+| synchronous exporter trong request | telemetry backend kéo tăng latency      | batch async + Collector                         |
+| `userId`/raw URL làm metric label  | cardinality/cost bùng nổ                | route template, id vào trace/log                |
+| log toàn request body              | lộ PII/secret                           | allowlist field + redaction                     |
+| span mọi function/resolver         | overhead và noise                       | business/dependency boundary                    |
+| trace 100% không budget            | hóa đơn hoặc drop hỗn loạn              | sampling policy + capacity                      |
+| chỉ dashboard CPU                  | bỏ lỡ user impact                       | SLI/SLO trước resource                          |
+| health endpoint luôn 200           | orchestrator route traffic vào app hỏng | readiness kiểm critical local state có giới hạn |
+| không flush lúc shutdown           | mất tail telemetry deploy/incident      | drain app rồi shutdown SDK/logger               |
+
+Observability code cũng là production code: dependency version, security, load test và rollback plan đều áp dụng.
+
+## 14. Graceful shutdown giữ lại telemetry cuối
+
+Thứ tự quan trọng: ngừng nhận traffic, drain request/worker, rồi flush telemetry. Nếu shutdown SDK trước, spans của request đang drain bị mất.
+
+```ts
+function closeHttpServer(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    httpServer.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
+function flushLogger(): Promise<void> {
+  return new Promise((resolve) => baseLogger.flush(resolve));
+}
+
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
+  logger().info({ signal }, 'service shutting down');
+
+  readiness.set(false);
+  await closeHttpServer();
+  await workers.close();
+  await telemetrySdk.shutdown();
+  await flushLogger();
+}
+```
+
+Đoạn code là skeleton: thêm deadline/force exit và bảo vệ gọi hai lần như phần deployment. Test bằng `SIGTERM` dưới tải và kiểm span cuối xuất hiện.
+
+## 15. Kiểm thử observability như một contract
+
+- Unit test redaction: token/password không xuất hiện trong serialized log.
+- Integration test: một request tạo trace với service/route/status attributes cần thiết.
+- Propagation test: HTTP → queue → worker giữ trace context/link.
+- Metric test: route động không tạo label động; histogram boundary bám SLO.
+- Failure test: Collector down không làm request fail hoặc memory tăng vô hạn.
+- Shutdown test: drain và flush trong termination budget.
+- Alert test: phát synthetic bad-event series, xác nhận burn-rate alert và runbook link.
+
+Không assert exact auto-instrumentation payload quá chi tiết; upgrade package sẽ làm test giòn. Assert semantic contract mà dashboard/alert phụ thuộc.
+
+## 16. Checklist trước khi ship
+
+- [ ] SLI đo user outcome, denominator/exclusion được ghi rõ.
+- [ ] SLO có window, owner và error-budget policy.
+- [ ] Alert dựa trên symptom/burn rate, có runbook và action.
+- [ ] Log có schema, correlation và redaction; không trùng lặp exception.
+- [ ] Metric label có cardinality budget; histogram bám ngưỡng SLO.
+- [ ] OTel khởi tạo trước app; auto-instrumentation được integration-test.
+- [ ] Manual span chỉ ở business/dependency boundary, không chứa PII.
+- [ ] Context truyền qua RPC/queue; retry/replay semantics được định nghĩa.
+- [ ] Sampling và Collector topology có capacity/failure plan.
+- [ ] Shutdown drain rồi flush; Collector down không kéo sập service.
+
+## 17. Capstone: vận hành một incident từ đầu tới cuối
+
+Dùng hệ thống Order/Notification từ Phần 16–19:
+
+1. Định nghĩa ba SLI: checkout availability, receipt dưới 5 phút, realtime status dưới 5 giây.
+2. Instrument HTTP, Postgres, BullMQ và WebSocket; propagate/link context qua outbox/job.
+3. Dashboard RED + queue age + realtime recovery; label cardinality có test.
+4. Collector nhận OTLP, batch và export; mô phỏng backend telemetry mất 10 phút.
+5. Cố ý đảo lock order tạo contention. Alert bằng burn rate, lần trace tới DB span, dùng log xác nhận retry.
+6. Mitigate, xác minh SLI hồi phục, viết postmortem gồm timeline, contributing factors và action có owner.
+7. Gửi `SIGTERM` trong lúc incident drill; xác nhận request drain và spans cuối không mất.
+
+Capstone đạt khi một người không viết feature vẫn có thể đi từ alert tới nguyên nhân và phục hồi bằng dashboard/runbook — không cần SSH vào pod rồi đoán.
+
+## Nếu chỉ nhớ 5 điều
+
+1. Bắt đầu bằng user journey và SLO, không bằng danh sách dashboard.
+2. Metrics phát hiện, traces liên kết, logs xác nhận, profiles chỉ ra code path.
+3. Cardinality, sampling và retention là quyết định kiến trúc/cost.
+4. Context propagation phải đi qua cả message queue và reconnect boundary.
+5. Telemetry chỉ có giá trị khi dẫn tới một quyết định hoặc hành động nhanh hơn.
+
+## Tài liệu chính thức
+
+- [OpenTelemetry JavaScript](https://opentelemetry.io/docs/languages/js/)
+- [OpenTelemetry Node.js getting started](https://opentelemetry.io/docs/languages/js/getting-started/nodejs/)
+- [OpenTelemetry exporters và OTLP](https://opentelemetry.io/docs/languages/js/exporters/)
+- [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/)
+- [OpenTelemetry Collector deployment patterns](https://opentelemetry.io/docs/collector/deploy/)
+- [Google SRE Workbook: Implementing SLOs](https://sre.google/workbook/implementing-slos/)
+- [Google SRE Workbook: Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/)
 
 ## Kết thúc series
 
-Đây là phase cuối của **Node.js Super Senior** — và là tầng làm bạn *vận hành được* mọi thứ đã xây. Nhìn lại toàn cảnh: từ event loop (Phase 1) và HTTP (Phase 2), qua Express (Phase 3), dữ liệu (Phase 4, 11–13), auth (Phase 5, 15), patterns và kiến trúc (Phase 6, 10, 14), DevOps và hiệu năng (Phase 7–8), testing (Phase 9), rồi quy mô production: hàng đợi (Phase 16), GraphQL (Phase 17), microservices (Phase 18), realtime (Phase 19), và observability (Phase 20).
+Hai mươi phần đi từ runtime tới vận hành hệ phân tán. Giá trị của lộ trình không nằm ở việc ghi nhớ nhiều API, mà ở một chuỗi phản xạ kỹ thuật:
 
-Một super senior backend không chỉ viết code chạy — họ thiết kế hệ thống *chịu lỗi, scale được, và quan sát được*, đồng thời giải thích được vì sao mỗi quyết định là đúng. Bạn giờ có bản đồ đầy đủ. Việc còn lại là build, vận hành, và học từ production thật.
+```text
+hiểu cơ chế → xác định invariant → thiết kế boundary → dự đoán failure
+→ đo production outcome → thay đổi có migration/rollback → học từ incident
+```
+
+Bạn không cần dùng mọi công nghệ trong series. Năng lực quan trọng hơn là biết constraint nào khiến một công nghệ đáng có, chi phí nào nó thêm vào, và bằng chứng nào cho thấy quyết định vẫn đúng sau khi hệ thống thay đổi.

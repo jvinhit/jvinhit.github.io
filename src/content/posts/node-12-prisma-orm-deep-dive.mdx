@@ -1,285 +1,593 @@
 ---
-title: 'Node.js Super Senior · Phase 12 — Prisma ORM Deep Dive'
-description: 'Bonus Phase 12: master Prisma — the schema and relations, migrations, the type-safe Client (CRUD, select/include, nested writes, aggregations), transactions, connection pooling, safe raw SQL, extensions, and error handling.'
+title: 'Node.js Production Engineering 12 — Prisma 7 trong Production'
+description: 'Prisma ORM 7 từ cấu hình ESM, generated client và driver adapter tới migration an toàn, query có kiểm soát, transaction giữ invariant, pooling, observability và test production.'
 pubDate: 2026-06-09
-tags: [nodejs, prisma, orm, postgresql, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, prisma, orm, postgresql, production-engineering]
 series: nodejs
 seriesOrder: 12
 draft: false
 ---
 
-Đây là **Bonus Phase 12**. Phase 11 cho bạn làm chủ PostgreSQL thô — nền tảng. Giờ ta thêm **Prisma**, ORM mà đa số team TypeScript hiện đại chọn. Điểm bán hàng của nó là **type safety đầu-cuối**: schema database sinh ra một client có type đầy đủ, nên field hay type sai là *lỗi compile*, không phải sự cố production lúc 2 giờ sáng.
+Prisma giúp một truy vấn sai tên field thất bại ở compile time. Nó không thể tự biết “số dư không được âm”, một email gửi sau `COMMIT` có cần atomic với write hay không, hoặc query relation vừa tạo ra bao nhiêu round-trip.
 
-Mọi thứ bạn học ở Phase 11 vẫn áp dụng — Prisma sinh SQL; bạn vẫn phải hiểu index, transaction, và N+1.
+Đó là ranh giới quan trọng của ORM: **type-safe query builder không phải consistency model**. Bài này cấu hình đúng Prisma ORM 7 và giữ nguyên các invariant PostgreSQL ở phần trước thay vì giấu chúng sau API đẹp.
+
+Kết thúc bài, bạn có thể:
+
+- khởi tạo Prisma 7 đúng với ESM, `prisma.config.ts`, generator mới và driver adapter;
+- thiết kế migration expand-contract, kể cả constraint chưa biểu diễn được trong Prisma Schema;
+- kiểm soát projection, relation loading, N+1 và keyset pagination;
+- cài transfer serializable có idempotency, database constraint và retry `P2034`;
+- dùng raw SQL an toàn khi ORM không diễn đạt đủ;
+- sizing pool, shutdown, quan sát query và test concurrency.
+
+> Baseline: Prisma ORM 7, PostgreSQL 18, Node.js 24 LTS. Prisma 6 dùng cấu hình khác; không trộn snippet giữa hai major version.
 
 ---
 
-## Prisma là gì
+## Prisma 7 thay đổi mental model kết nối
 
-Prisma có ba phần: Cộng **Studio**, một GUI cho dữ liệu.
-
-```bash
-npm install prisma --save-dev
-npm install @prisma/client
-npx prisma init --datasource-provider postgresql   # creates prisma/schema.prisma + .env
-```
+Đường đi của Prisma 7:
 
 ```text
-schema.prisma  ──prisma migrate──▶  database (SQL DDL)
+schema.prisma ── generate ──▶ generated TypeScript client
       │
-      └──prisma generate──▶  @prisma/client  (typed query API)
+      └── migrate ──────────▶ PostgreSQL schema
+
+application ── PrismaClient ── driver adapter ── pg pool ── PostgreSQL
 ```
+
+Ba thay đổi dễ làm tutorial cũ không chạy:
+
+1. generator mới là `prisma-client` và **bắt buộc** khai báo `output`;
+2. connection URL cho CLI/migration nằm trong `prisma.config.ts`;
+3. runtime client cần driver adapter, ví dụ `@prisma/adapter-pg`.
+
+Prisma 7 dùng ESM. Bật rõ trong `package.json`:
+
+```json
+{
+  "type": "module"
+}
+```
+
+### Cài package
+
+```bash
+npm install @prisma/client @prisma/adapter-pg pg dotenv
+npm install --save-dev prisma @types/pg
+npx prisma init --datasource-provider postgresql
+```
+
+Prisma 7 không tự động nạp environment variable theo cách các tutorial cũ giả định. Import `dotenv/config` cho CLI local; production nên inject biến môi trường từ platform/secret manager.
 
 ---
 
-## Schema — nguồn sự thật duy nhất
+## Cấu hình đúng Prisma 7
+
+### `prisma.config.ts`
+
+CLI dùng direct connection cho migration và introspection. Nếu runtime đi qua PgBouncer, tách hai URL:
+
+```ts
+import 'dotenv/config';
+import { defineConfig, env } from 'prisma/config';
+
+export default defineConfig({
+  schema: 'prisma/schema.prisma',
+  migrations: {
+    path: 'prisma/migrations',
+    seed: 'tsx prisma/seed.ts',
+  },
+  datasource: {
+    url: env('DIRECT_DATABASE_URL'),
+  },
+});
+```
+
+```bash
+# Runtime URL: có thể là endpoint của pooler.
+DATABASE_URL=postgresql://app:secret@pooler:6432/app
+
+# CLI URL: direct database endpoint cho migrate/introspection.
+DIRECT_DATABASE_URL=postgresql://migrator:secret@postgres:5432/app
+```
+
+Không đưa `prisma://` hoặc `prisma+postgres://` vào `PrismaPg`; adapter này cần PostgreSQL connection string trực tiếp. Prisma Accelerate có cách khởi tạo riêng.
+
+### `prisma/schema.prisma`
 
 ```prisma
 generator client {
-  provider = "prisma-client-js"
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 model User {
-  id        String   @id @default(uuid())
-  email     String   @unique
-  name      String?
-  role      Role     @default(USER)
-  posts     Post[]                            // 1-to-many: a user has many posts
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id        BigInt   @id @default(autoincrement())
+  email     String   @unique @db.Citext
+  posts     Post[]
+  accounts  Account[]
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  @@map("users")                              // actual table name
+  @@map("users")
 }
 
 model Post {
-  id        String   @id @default(uuid())
-  title     String
-  body      String
-  published Boolean  @default(false)
-  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
-  authorId  String
-  tags      Tag[]                             // implicit many-to-many
+  id          BigInt    @id @default(autoincrement())
+  authorId    BigInt    @map("author_id")
+  author      User      @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  title       String
+  body        String
+  status      PostStatus @default(DRAFT)
+  meta        Json      @default("{}")
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  @@index([authorId, published])              // composite index (Phase 11 rules apply)
+  @@index([authorId, publishedAt(sort: Desc), id(sort: Desc)], map: "idx_posts_author_feed")
   @@map("posts")
 }
 
-model Tag {
-  id    String @id @default(uuid())
-  name  String @unique
-  posts Post[]
+model Account {
+  id           BigInt     @id @default(autoincrement())
+  ownerId      BigInt     @map("owner_id")
+  owner        User       @relation(fields: [ownerId], references: [id])
+  balanceCents BigInt     @default(0) @map("balance_cents")
+  sent         Transfer[] @relation("transfer_from")
+  received     Transfer[] @relation("transfer_to")
+
+  @@map("accounts")
 }
 
-enum Role { USER ADMIN }
+model Transfer {
+  id              String         @id @db.Uuid
+  idempotencyKey  String         @unique @map("idempotency_key")
+  fromAccountId   BigInt         @map("from_account_id")
+  toAccountId     BigInt         @map("to_account_id")
+  fromAccount     Account        @relation("transfer_from", fields: [fromAccountId], references: [id])
+  toAccount       Account        @relation("transfer_to", fields: [toAccountId], references: [id])
+  amountCents     BigInt         @map("amount_cents")
+  status          TransferStatus @default(PENDING)
+  createdAt       DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("transfers")
+}
+
+model OutboxEvent {
+  id            String    @id @db.Uuid
+  aggregateType String    @map("aggregate_type")
+  aggregateId   String    @map("aggregate_id")
+  eventType     String    @map("event_type")
+  payload       Json
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  publishedAt   DateTime? @map("published_at") @db.Timestamptz(6)
+
+  @@index([publishedAt, createdAt])
+  @@map("outbox_events")
+}
+
+enum PostStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum TransferStatus {
+  PENDING
+  COMPLETED
+}
 ```
 
-Đọc cái này như DDL ở Phase 11: `@id`/`@default`/`@unique` `@id`/`@default`/`@unique` là constraint cột, `@relation` định nghĩa khóa ngoại kèm hành động tham chiếu, `@@index` là index ghép, `@@map` tách tên model khỏi tên bảng.
-
-### Quan hệ
-
-- FK vô hướng một bên + danh sách bên kia.
-- *ngầm* hoặc *tường minh* khi bảng nối có field thêm.
-- một FK `@unique`.
-
----
-
-## Migration
+Prisma Schema không biểu diễn mọi PostgreSQL constraint. Tạo migration rồi chỉnh SQL trước khi apply:
 
 ```bash
-npx prisma migrate dev --name add_posts   # dev: creates + applies a migration, regenerates client
-npx prisma migrate deploy                  # prod/CI: applies pending migrations only
-npx prisma migrate reset                   # wipe + replay (dev only)
-npx prisma db push                         # prototype: sync schema WITHOUT a migration file
+npx prisma migrate dev --create-only --name init_money_invariants
 ```
 
-Phân biệt senior: `migrate dev` tạo migration SQL có version, commit (dùng mọi nơi thật); `db push` cho prototype nhanh và bỏ lịch sử. Trong CI/CD, chạy `migrate deploy` như **bước riêng, tương thích ngược, trước** khi code mới lên.
+```sql
+-- Thêm vào migration.sql đã sinh.
+CREATE EXTENSION IF NOT EXISTS citext;
+
+ALTER TABLE accounts
+  ADD CONSTRAINT accounts_balance_non_negative
+  CHECK (balance_cents >= 0);
+
+ALTER TABLE transfers
+  ADD CONSTRAINT transfers_amount_positive CHECK (amount_cents > 0),
+  ADD CONSTRAINT transfers_accounts_differ CHECK (from_account_id <> to_account_id);
+
+CREATE INDEX idx_posts_meta_gin
+  ON posts USING gin (meta jsonb_path_ops);
+```
+
+Database constraint mới là nguồn thực thi invariant cuối cùng; generated type chỉ bảo vệ shape của lời gọi từ TypeScript.
 
 ---
 
-## Client — CRUD có type
+## Khởi tạo client và pool có giới hạn
 
 ```ts
-import { PrismaClient, Prisma } from '@prisma/client';
-export const prisma = new PrismaClient();
+// src/db/client.ts
+import { PrismaPg } from '@prisma/adapter-pg';
+import { PrismaClient } from '../generated/prisma/client.js';
 
-// CREATE — input type is generated; a typo or wrong type won't compile
-const user = await prisma.user.create({ data: { email: 'a@b.com', name: 'Ann' } });
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) throw new Error('DATABASE_URL is required');
 
-// READ — findUnique by a unique field; select trims the payload (and its type!)
-const u = await prisma.user.findUnique({
-  where: { email: 'a@b.com' },
-  select: { id: true, email: true },   // returned type is { id: string; email: string }
+const adapter = new PrismaPg({
+  connectionString,
+  max: 10,
+  connectionTimeoutMillis: 5_000,
+  idleTimeoutMillis: 30_000,
+  application_name: 'content-api',
 });
 
-// READ many — filter, sort, paginate
-const posts = await prisma.post.findMany({
-  where: { published: true, author: { role: 'ADMIN' } },  // filter across the relation
-  orderBy: { createdAt: 'desc' },
-  take: 20,
-  skip: 0,
-});
-
-// UPDATE / DELETE
-await prisma.post.update({ where: { id }, data: { published: true } });
-await prisma.post.delete({ where: { id } });
-```
-
-### include vs select — và thoát N+1
-
-`include` kéo quan hệ; `select` chọn field chính xác. **Prisma gộp việc tải quan hệ thành vài query**, nên tải post *kèm* author **không** bắn một query mỗi post:
-
-```ts
-// ✅ One query for posts + one batched query for all authors — not N+1
-const feed = await prisma.post.findMany({
-  include: { author: { select: { id: true, name: true } }, tags: true },
+export const prisma = new PrismaClient({
+  adapter,
+  log: [
+    { emit: 'event', level: 'error' },
+    { emit: 'event', level: 'warn' },
+  ],
 });
 ```
 
-Nhưng bạn vẫn tạo N+1 nếu **await quan hệ trong vòng lặp** — đừng làm vậy.
+Tạo một client/pool cho mỗi process lâu sống, không tạo theo request. Prisma 7 lấy pool semantics từ driver adapter; các query parameter kiểu `connection_limit` của Prisma 6 không còn là cách cấu hình chính.
 
-### Ghi lồng, upsert, tổng hợp
+Ngân sách connection vẫn là:
 
-```ts
-// Nested write — create a user AND their first post in one atomic call
-await prisma.user.create({
-  data: { email: 'c@d.com', posts: { create: [{ title: 'Hello', body: '...' }] } },
-});
-
-// Upsert — insert or update (maps to ON CONFLICT, Phase 11)
-await prisma.tag.upsert({ where: { name: 'node' }, create: { name: 'node' }, update: {} });
-
-// Aggregation + groupBy
-const stats = await prisma.post.groupBy({
-  by: ['authorId'],
-  _count: { _all: true },
-  having: { authorId: { _count: { gt: 5 } } },
-});
+```text
+replica tối đa × adapter.max + worker/migration/admin headroom
+  ≤ database connection budget
 ```
+
+`connectionTimeoutMillis` mặc định của `pg` là `0` — chờ không giới hạn. Production nên có timeout và metric cho pool wait thay vì để request treo đến deadline bên ngoài.
 
 ---
 
-## Type safety nâng cao
+## Query có type không đồng nghĩa query rẻ
 
-Prisma suy ra type chính xác từ query, nên bạn không tự viết DTO lệch khỏi schema:
-
-```ts
-// The exact return type of a specific include/select — reusable across layers
-type PostWithAuthor = Prisma.PostGetPayload<{ include: { author: true } }>;
-
-// Validate-and-type an input object without executing it
-const data = Prisma.validator<Prisma.UserCreateInput>()({ email: 'x@y.com' });
-```
-
----
-
-## Transaction
-
-Hai kiểu. Dạng **mảng** chạy các thao tác độc lập nguyên tử; dạng **tương tác** cho bạn một client `tx` cho logic đọc-sửa-ghi, có điều khiển cô lập:
+Projection làm giảm dữ liệu truyền và thu hẹp type trả về:
 
 ```ts
-// Array: all-or-nothing, no logic between
-await prisma.$transaction([
-  prisma.account.update({ where: { id: from }, data: { balance: { decrement: amount } } }),
-  prisma.account.update({ where: { id: to },   data: { balance: { increment: amount } } }),
-]);
-
-// Interactive: logic + the isolation levels from Phase 11
-await prisma.$transaction(async (tx) => {
-  const acct = await tx.account.findUniqueOrThrow({ where: { id: from } });
-  if (acct.balance < amount) throw new Error('Insufficient funds'); // throwing rolls back
-  await tx.account.update({ where: { id: from }, data: { balance: { decrement: amount } } });
-  await tx.account.update({ where: { id: to },   data: { balance: { increment: amount } } });
-}, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
-```
-
-> Mọi thứ ở Phase 11 vẫn đúng: dưới `Serializable`, sẵn sàng **retry** khi serialization failure.
-
----
-
-## Connection pooling & SQL thô
-
-`PrismaClient` pool kết nối; chỉnh `connection_limit` trong `DATABASE_URL`, và tôn trọng công thức Phase 4. Trong serverless, đặt **PgBouncer** phía trước hoặc dùng **Prisma Accelerate**; với runtime khác dùng **driver adapter**.
-
-Khi API Prisma không diễn đạt được, hạ xuống **SQL thô parameterized** — dạng tagged-template an toàn injection:
-
-```ts
-// ✅ Safe: ${userInput} is sent as a parameter, never interpolated into SQL
-const rows = await prisma.$queryRaw<{ id: string }[]>`
-  SELECT id FROM posts WHERE title ILIKE ${'%' + term + '%'} LIMIT 20
-`;
-await prisma.$executeRaw`UPDATE posts SET views = views + 1 WHERE id = ${id}`;
-```
-
-> Đừng dùng `$queryRawUnsafe` với input nối chuỗi — đó là cái bẫy đưa SQL injection trở lại.
-
----
-
-## Mở rộng client & xử lý lỗi
-
-`$extends` cho bạn thêm hành vi tái dùng — field tính toán, log query, hay **soft delete** — mà không bọc mọi lời gọi:
-
-```ts
-const xprisma = prisma.$extends({
-  query: {
-    post: {
-      // Turn every delete into an update (soft delete)
-      async delete({ args, query }) {
-        return query({ ...args, data: { deletedAt: new Date() } } as never);
-      },
+const user = await prisma.user.findUnique({
+  where: { email: 'ann@example.com' },
+  select: {
+    id: true,
+    email: true,
+    posts: {
+      where: { status: 'PUBLISHED' },
+      orderBy: [{ publishedAt: 'desc' }, { id: 'desc' }],
+      take: 5,
+      select: { id: true, title: true, publishedAt: true },
     },
   },
 });
 ```
 
-Xử lý lỗi có type của Prisma theo **mã**, không theo message:
+Không khẳng định `include` luôn là một query hay luôn là hai query. Relation loading phụ thuộc connector, option và phiên bản. Bật query tracing trong môi trường kiểm thử, đo số round-trip và xem plan của SQL thật.
+
+Failure mode N+1 vẫn xuất hiện khi gọi query trong loop:
 
 ```ts
-import { Prisma } from '@prisma/client';
-
-try {
-  await prisma.user.create({ data });
-} catch (err) {
-  if (err instanceof Prisma.PrismaClientKnownRequestError) {
-    if (err.code === 'P2002') throw new AppError('Email already exists', 409); // unique violation
-    if (err.code === 'P2025') throw new NotFoundError();                       // record not found
-  }
-  throw err;
+// Không làm thế này trên một collection lớn.
+for (const post of posts) {
+  await prisma.user.findUnique({ where: { id: post.authorId } });
 }
 ```
 
-> Quy tắc senior: tạo **một** `PrismaClient` cho cả app; ngắt khi tắt.
+Giải pháp có thể là nested `select`, query batch `in`, DataLoader theo request hoặc TypedSQL. Chọn dựa trên cardinality và plan, không dựa trên tên pattern.
 
 ---
 
-## Prisma vs SQL thô vs ORM khác
+## Keyset pagination với composite cursor
 
-| | Raw SQL / `pg` | Prisma | TypeORM / Sequelize |
-|---|---|---|---|
-| An toàn type | manual | **generated, end-to-end** | partial |
-| Migration | hand-written | declarative + generated | decorator/CLI |
-| Kiểm soát | total | high (+ raw escape hatch) | high |
-| Đường học | SQL | low | medium |
+Order gồm hai field thì predicate cursor cũng phải gồm hai field:
 
-Quan điểm senior: DX và type safety của Prisma khiến nó là mặc định tốt; giữ SQL thô cho query nó không diễn đạt được.
+```ts
+interface PostCursor {
+  publishedAt: Date;
+  id: bigint;
+}
+
+async function listPublished(authorId: bigint, cursor?: PostCursor) {
+  return prisma.post.findMany({
+    where: {
+      authorId,
+      status: 'PUBLISHED',
+      ...(cursor
+        ? {
+            OR: [
+              { publishedAt: { lt: cursor.publishedAt } },
+              { publishedAt: cursor.publishedAt, id: { lt: cursor.id } },
+            ],
+          }
+        : {}),
+    },
+    orderBy: [{ publishedAt: 'desc' }, { id: 'desc' }],
+    take: 21,
+    select: { id: true, title: true, publishedAt: true },
+  });
+}
+```
+
+Lấy `pageSize + 1` để biết còn trang sau, trả tối đa `pageSize`, encode `{ version, publishedAt, id }` thành cursor opaque. Không đi qua JSON trực tiếp với `bigint`; serialize id thành string.
 
 ---
 
-## Thực hành
+## Transaction giữ invariant, không chỉ “all or nothing”
 
-1. mô hình blog trong `schema.prisma` với quan hệ, enum, index ghép; chạy `migrate dev`.
-2. dựng repository có type: CRUD + `findMany` lọc/phân trang + ghi lồng; chứng minh type trả được suy ra.
-3. cài transaction chuyển tiền tương tác ở `Serializable` kèm retry.
-4. thêm extension soft-delete và ánh xạ `P2002`/`P2025` sang `AppError`.
+Ba API có vai trò khác nhau:
+
+- nested write cho dữ liệu phụ thuộc trong một aggregate;
+- `$transaction([])` cho chuỗi operation độc lập không có branch ở giữa;
+- interactive transaction cho read-check-write, luôn giữ ngắn.
+
+Transfer dưới đây dùng:
+
+- unique idempotency key;
+- row lock theo thứ tự xác định;
+- conditional debit + database check constraint;
+- `Serializable` và bounded retry `P2034`;
+- outbox row trong cùng transaction.
+
+```ts
+import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { Prisma } from '../generated/prisma/client.js';
+import { prisma } from './client.js';
+
+interface TransferCommand {
+  id: string;
+  idempotencyKey: string;
+  fromAccountId: bigint;
+  toAccountId: bigint;
+  amountCents: bigint;
+}
+
+function isPrismaCode(error: unknown, code: string): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError && error.code === code
+  );
+}
+
+async function executeTransfer(cmd: TransferCommand) {
+  if (cmd.amountCents <= 0n || cmd.fromAccountId === cmd.toAccountId) {
+    throw new Error('invalid transfer');
+  }
+
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await prisma.$transaction(
+        async (tx) => {
+          await tx.transfer.create({
+            data: {
+              id: cmd.id,
+              idempotencyKey: cmd.idempotencyKey,
+              fromAccountId: cmd.fromAccountId,
+              toAccountId: cmd.toAccountId,
+              amountCents: cmd.amountCents,
+            },
+          });
+
+          const ids = [cmd.fromAccountId, cmd.toAccountId].sort((a, b) =>
+            a < b ? -1 : a > b ? 1 : 0
+          );
+
+          await tx.$queryRaw`
+            SELECT id
+            FROM accounts
+            WHERE id IN (${Prisma.join(ids)})
+            ORDER BY id
+            FOR UPDATE
+          `;
+
+          const accounts = await tx.account.findMany({
+            where: { id: { in: ids } },
+            select: { id: true },
+          });
+          if (accounts.length !== 2) throw new Error('account not found');
+
+          const debit = await tx.account.updateMany({
+            where: {
+              id: cmd.fromAccountId,
+              balanceCents: { gte: cmd.amountCents },
+            },
+            data: { balanceCents: { decrement: cmd.amountCents } },
+          });
+          if (debit.count !== 1) throw new Error('insufficient funds');
+
+          await tx.account.update({
+            where: { id: cmd.toAccountId },
+            data: { balanceCents: { increment: cmd.amountCents } },
+          });
+
+          const transfer = await tx.transfer.update({
+            where: { id: cmd.id },
+            data: { status: 'COMPLETED' },
+          });
+
+          await tx.outboxEvent.create({
+            data: {
+              id: randomUUID(),
+              aggregateType: 'transfer',
+              aggregateId: transfer.id,
+              eventType: 'transfer.completed',
+              payload: {
+                transferId: transfer.id,
+                amountCents: transfer.amountCents.toString(),
+              },
+            },
+          });
+
+          return { transfer, replayed: false };
+        },
+        {
+          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+          maxWait: 3_000,
+          timeout: 5_000,
+        }
+      );
+    } catch (error) {
+      if (isPrismaCode(error, 'P2034') && attempt < 4) {
+        await sleep(25 * 2 ** (attempt - 1) + Math.random() * 50);
+        continue;
+      }
+
+      if (isPrismaCode(error, 'P2002')) {
+        const existing = await prisma.transfer.findUnique({
+          where: { idempotencyKey: cmd.idempotencyKey },
+        });
+        if (
+          existing &&
+          existing.fromAccountId === cmd.fromAccountId &&
+          existing.toAccountId === cmd.toAccountId &&
+          existing.amountCents === cmd.amountCents &&
+          existing.status === 'COMPLETED'
+        ) {
+          return { transfer: existing, replayed: true };
+        }
+        throw new Error('idempotency conflict');
+      }
+
+      throw error;
+    }
+  }
+}
+```
+
+Không gọi payment gateway, email hoặc broker trong interactive transaction. Network call kéo dài lock và không rollback cùng database. Outbox worker đọc `outbox_events`, publish idempotently rồi đánh dấu `published_at`.
 
 ---
 
-## Phần tiếp theo
+## Raw SQL: escape hatch có kỷ luật
 
-Giờ bạn dùng Prisma như senior: schema có type và quan hệ, migration có version, API query đầy đủ không N+1, type suy ra chính xác, transaction có cô lập, pooling hợp lý, SQL thô an toàn, extension, và xử lý lỗi theo mã.
+Tagged template parameterize value:
 
-Nút cổ chai kế tiếp trong mọi backend nghiêm túc là làm *cùng việc tốn kém* lặp đi lặp lại — nên ở **Phase 13** ta thêm cache và hàng đợi job với **Redis**: pattern cache và TTL, pub/sub và stream, rate limit, khóa phân tán, session, và job nền BullMQ.
+```ts
+const rows = await prisma.$queryRaw<Array<{ id: bigint; title: string }>>`
+  SELECT id, title
+  FROM posts
+  WHERE author_id = ${authorId}
+    AND meta @> ${JSON.stringify({ featured: true })}::jsonb
+`;
+```
+
+Không ghép user input vào `$queryRawUnsafe`. Identifier động như table/column không thể được parameterize theo cách value được parameterize; map từ allowlist cố định hoặc dùng TypedSQL đã review.
+
+TypedSQL phù hợp cho query phức tạp cần type generated từ file SQL. Nó không loại bỏ nhu cầu xem plan, constraint và migration ownership.
+
+---
+
+## Migration production: expand, migrate, contract
+
+```bash
+npx prisma migrate dev --name add_optional_slug   # chỉ development
+npx prisma migrate deploy                          # CI/release job
+npx prisma migrate status
+```
+
+Quy trình đổi `name` thành `display_name` mà không downtime:
+
+1. **expand**: thêm `display_name` nullable, code ghi cả hai;
+2. backfill theo batch có checkpoint và rate limit;
+3. code đọc field mới, quan sát null/error;
+4. thêm `NOT NULL`/index bằng kỹ thuật tránh lock dài phù hợp;
+5. **contract**: ngừng ghi và sau đó xóa field cũ.
+
+`prisma db push` chỉ hợp prototype/database disposable. Nó không thay migration history có review. Down migration không được mặc định là an toàn; data loss thường cần forward fix.
+
+---
+
+## Error contract và observability
+
+Map error Prisma sang error domain tại adapter boundary:
+
+| Prisma code | Ý nghĩa thường gặp            | HTTP/domain gợi ý                                 |
+| ----------- | ----------------------------- | ------------------------------------------------- |
+| `P2002`     | unique constraint             | conflict có field/code ổn định                    |
+| `P2003`     | foreign key                   | referenced resource/relationship invalid          |
+| `P2025`     | record required không tồn tại | not found hoặc concurrent change                  |
+| `P2034`     | write conflict/deadlock       | retry nội bộ, sau budget trả unavailable/conflict |
+
+Không trả raw Prisma message, SQL hay stack cho client.
+
+Quan sát tối thiểu:
+
+- query duration histogram theo operation/model, không label bằng raw SQL/user id;
+- pool wait/acquire timeout;
+- transaction duration, retry count và abort reason;
+- slow query sample đã redact parameter;
+- trace span nối HTTP → use case → Prisma → PostgreSQL;
+- outbox lag và publish retry.
+
+Query logging đầy đủ có thể chứa PII/secret và tạo volume lớn. Chỉ bật có sampling/redaction trong môi trường phù hợp.
+
+Shutdown theo thứ tự: readiness off → HTTP drain → worker drain → `await prisma.$disconnect()`.
+
+---
+
+## Failure modes và trade-off
+
+| Failure mode                        | Nguyên nhân                       | Phòng vệ                                        |
+| ----------------------------------- | --------------------------------- | ----------------------------------------------- |
+| client tạo theo request             | nhiều pool, hết connection        | một client/process                              |
+| type-safe nhưng N+1                 | query đặt trong loop              | projection/batch/DataLoader + query count test  |
+| long interactive transaction        | network/CPU trong callback        | transaction ngắn, outbox                        |
+| migration và code không tương thích | deploy không theo expand-contract | compatibility window                            |
+| retry vô hạn                        | contention hoặc outage kéo dài    | retry budget + jitter + metric                  |
+| raw SQL injection                   | ghép input/identifier             | tagged template, allowlist, TypedSQL            |
+| serverless connection storm         | mỗi instance có pool              | cap concurrency, external pooler/managed option |
+
+Prisma phù hợp khi team coi schema/migration/type generated là lợi thế. Với query-heavy analytics, PostgreSQL feature đặc thù hoặc SQL là ngôn ngữ chính của team, driver/query builder/TypedSQL có thể rõ ràng hơn. ORM là lựa chọn kiến trúc, không phải cấp độ trưởng thành.
+
+---
+
+## Lab và acceptance criteria
+
+Nâng payment service ở phần 11 sang Prisma 7.
+
+1. Client được generate bằng `prisma-client` vào `src/generated/prisma`; không còn `prisma-client-js`.
+2. CLI dùng `prisma.config.ts`; runtime dùng `PrismaPg` với pool/timeouts rõ ràng.
+3. Migration có check constraint số dư, amount và hai account khác nhau.
+4. 100 transfer đồng thời không tạo số dư âm; tổng tiền không đổi.
+5. replay cùng idempotency key trả cùng transfer; key trùng payload khác bị từ chối.
+6. test ép `P2034` chứng minh bounded retry; metric retry tăng đúng.
+7. outbox row commit atomic với transfer; worker publish hai lần không tạo side effect trùng.
+8. query feed đi hết dữ liệu có timestamp trùng mà không thiếu/trùng.
+9. test đo query count bắt được phiên bản cố ý tạo N+1.
+10. shutdown test không còn connection/open handle.
+
+---
+
+## Checklist production
+
+- [ ] Generator `prisma-client` có `output`; import từ generated path.
+- [ ] `prisma.config.ts` giữ CLI URL; runtime client có đúng driver adapter.
+- [ ] Một PrismaClient/process; pool có budget và timeout.
+- [ ] Constraint quan trọng tồn tại trong migration SQL.
+- [ ] Transaction có isolation, timeout, idempotency và bounded retry.
+- [ ] External side effect đi qua outbox hoặc cơ chế idempotent tương đương.
+- [ ] Query relation được đo round-trip/plan, không giả định từ API shape.
+- [ ] Raw SQL parameterized; identifier động đi qua allowlist.
+- [ ] Migration dùng expand-contract và được test với dữ liệu thực tế hóa.
+- [ ] Metric/trace không lộ SQL parameter hoặc tạo cardinality vô hạn.
+
+---
+
+## Tài liệu chính thức
+
+- [Prisma ORM 7 — Upgrade guide](https://www.prisma.io/docs/guides/upgrade-prisma-orm/v7)
+- [Prisma 7 — Generating Prisma Client](https://www.prisma.io/docs/orm/prisma-client/setup-and-configuration/generating-prisma-client)
+- [Prisma Config reference](https://www.prisma.io/docs/orm/reference/prisma-config-reference)
+- [Prisma 7 — Database drivers](https://www.prisma.io/docs/orm/core-concepts/supported-databases/database-drivers)
+- [Prisma — Connection pool](https://www.prisma.io/docs/orm/prisma-client/setup-and-configuration/databases-connections/connection-pool)
+- [Prisma — Transactions and P2034 retry](https://www.prisma.io/docs/orm/prisma-client/queries/transactions)
+- [Prisma — Raw queries](https://www.prisma.io/docs/orm/prisma-client/using-raw-sql/raw-queries)
+- [Prisma — TypedSQL](https://www.prisma.io/docs/orm/prisma-client/using-raw-sql/typedsql)
+
+Phần tiếp theo chuyển sang Redis. Câu hỏi không còn là “cache thế nào”, mà là mỗi primitive Redis cung cấp guarantee gì khi process crash, key hết hạn, replica failover hoặc consumer xử lý message hai lần.

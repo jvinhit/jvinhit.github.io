@@ -1,160 +1,531 @@
 ---
-title: 'Node.js Super Senior · Phase 15 — Auth & Security Capstone: JWT, OAuth2 & RBAC'
-description: 'The bonus-arc finale: master modern auth. JWT anatomy and signing, access/refresh rotation, cookie vs header storage and the XSS/CSRF trade-off, token revocation with Redis, OAuth2/OIDC with PKCE, and role/permission RBAC as NestJS guards.'
+title: 'Node.js Production Engineering 15 — Identity Architecture với JWT và OIDC'
+description: 'Thiết kế identity cho Node.js production: threat model, JWT validation, access/refresh token, atomic token-family rotation đa thiết bị, cookie/BFF, OIDC Authorization Code với state, nonce, PKCE và authorization theo resource.'
 pubDate: 2026-06-10
-tags: [nodejs, authentication, security, jwt, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, authentication, security, jwt, oidc, production-engineering]
 series: nodejs
 seriesOrder: 15
 draft: false
 ---
 
-Đây là **Bonus Phase 15**, phần đỉnh của nhánh bonus. Phase 5 giới thiệu auth; giờ ta đi sâu vào chủ đề biến một API chạy được thành một API *an toàn*. Token là nơi đa số rò rỉ thực tế bắt đầu. Junior làm login chạy; senior giải thích được đúng đòn tấn công nào mỗi quyết định thiết kế ngăn chặn.
+Một refresh token bị đánh cắp thường không gây tín hiệu ở lần dùng đầu tiên: attacker nhận access token hợp lệ, còn người dùng vẫn đăng nhập bình thường. Tín hiệu chỉ xuất hiện khi token cũ được dùng lại sau rotation. Nếu hệ thống đã xóa record cũ, hoặc chỉ lưu một `jti` cho cả user, bạn vừa mất khả năng phát hiện replay hoặc vô tình đăng xuất mọi thiết bị.
+
+Identity vì vậy là một **state machine bảo mật**, không phải hai endpoint `/login` và `/refresh`.
+
+Sau bài này, bạn có thể:
+
+- phân biệt session, access token, refresh token và ID token;
+- chọn browser session/BFF hay bearer token từ threat model;
+- verify JWT với allowlist thuật toán, `iss`, `aud`, lifetime và token type;
+- rotate refresh-token family atomic, phát hiện reuse và hỗ trợ nhiều thiết bị;
+- triển khai OIDC Authorization Code với `state`, `nonce`, PKCE S256 và exact redirect URI;
+- đặt authentication, permission, tenant và ownership đúng boundary;
+- quan sát security event mà không log credential/PII.
+
+> Ví dụ dùng Node.js 24, PostgreSQL và package `jose`. Với identity production, ưu tiên một Authorization Server/Identity Provider đã được kiểm chứng thay vì tự viết toàn bộ protocol.
 
 ---
 
-## JWT thực chất là gì
+## Threat model trước, token sau
 
-JWT là ba phần Base64URL nối bằng dấu chấm. Header nêu thuật toán, payload chứa **claim**, signature chứng minh không bị giả mạo.
+| Mối đe dọa                | Ví dụ                                     | Kiểm soát chính                                    |
+| ------------------------- | ----------------------------------------- | -------------------------------------------------- |
+| bearer theft              | token trong log, local storage, extension | TLS, cookie HttpOnly/BFF, redaction, lifetime ngắn |
+| replay                    | refresh token cũ được dùng lại            | rotation + family state + reuse detection          |
+| CSRF                      | browser tự gửi cookie tới request giả     | SameSite, CSRF token, Origin/Fetch Metadata check  |
+| XSS                       | script độc chạy cùng origin               | CSP, output encoding; HttpOnly chỉ chặn đọc token  |
+| algorithm/key confusion   | verifier chấp nhận `alg` ngoài policy     | allowlist thuật toán, tách key/token type          |
+| confused deputy           | token của API A được gửi sang API B       | verify `aud`, scope/resource restriction           |
+| login CSRF/code injection | callback nhận code của attacker           | state/nonce/PKCE, issuer validation                |
+| IDOR/cross-tenant         | user đổi resource id trên URL             | scoped query + resource authorization              |
+| key compromise            | signing private key bị lộ                 | KMS/HSM, rotation, JWKS overlap, incident plan     |
+
+`HttpOnly` không sửa XSS: script độc vẫn có thể gọi API thay user trong lúc chạy. Nó chỉ làm việc **trích xuất token** khó hơn. `SameSite` giảm nhiều CSRF path nhưng không thay mọi defense khi kiến trúc cross-site hoặc browser behavior thay đổi.
+
+---
+
+## Bốn artifact thường bị gọi chung là “token”
+
+| Artifact       | Consumer             | Mục đích                                   | Không được dùng làm           |
+| -------------- | -------------------- | ------------------------------------------ | ----------------------------- |
+| session cookie | web application      | trỏ tới session server-side                | access token cho service khác |
+| access token   | resource server/API  | cấp quyền ngắn hạn cho `aud` cụ thể        | bằng chứng login cho client   |
+| refresh token  | authorization server | đổi lấy access token mới                   | gửi tới mọi API               |
+| ID token       | OIDC client          | mô tả authentication event/user cho client | bearer token gọi API          |
+
+OAuth 2.x là framework **authorization**. OpenID Connect thêm identity layer và ID token để client xác thực authentication event. “Login bằng Google” là OIDC, không chỉ là OAuth.
+
+Mental model:
 
 ```text
-eyJhbGciOiJIUzI1NiJ9 . eyJzdWIiOiIxMjMiLCJyb2xlIjoiYWRtaW4ifQ . <signature>
-   header (alg)              payload (claims: sub, role, exp)         HMAC/RSA signature
+user/browser ── authenticate ──▶ Authorization Server / OIDC Provider
+       │                                  │
+       │             ID token ────────────┘  client kiểm login event
+       │         access token ────────────▶  API kiểm aud/scope
+       └──────── refresh/session ─────────▶  chỉ auth boundary xử lý
 ```
-
-Signature **không** phải mã hóa — ai cũng đọc được payload. **Đừng bao giờ để bí mật trong JWT**. Nó đảm bảo *tính toàn vẹn*, không phải *tính bí mật*.
-
-```ts
-import jwt from 'jsonwebtoken';
-const token = jwt.sign({ sub: user.id, role: user.role }, process.env.JWT_SECRET!,
-  { expiresIn: '15m', issuer: 'api', audience: 'web' });
-const claims = jwt.verify(token, process.env.JWT_SECRET!, { issuer: 'api', audience: 'web' });
-```
-
-**HS256** dùng một secret chung; **RS256** ký bằng private key và verify bằng public key.
 
 ---
 
-## Access token + refresh token
+## JWT: decode không phải verify
 
-Một token sống lâu duy nhất là rủi ro — nếu bị trộm, kẻ tấn công có quyền lâu và bạn không thu hồi được. Pattern senior là **hai token**:
+JWT signed thường có `header.payload.signature`. Payload Base64URL đọc được; chữ ký bảo vệ integrity, không mã hóa claim.
 
-- sống ngắn, gửi mỗi request, không trạng thái.
-- sống lâu, lưu phía server/thu hồi được, chỉ để cấp access token mới.
+Một resource server phải khóa validation policy, không lấy thuật toán/key URL tùy ý từ token:
 
 ```ts
-function issueTokens(user: User) {
-  const accessToken  = jwt.sign({ sub: user.id, role: user.role }, ACCESS_SECRET, { expiresIn: '15m' });
-  const refreshToken = jwt.sign({ sub: user.id, jti: randomUUID() }, REFRESH_SECRET, { expiresIn: '7d' });
-  return { accessToken, refreshToken };
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+
+const issuer = 'https://id.example.com';
+const audience = 'https://api.example.com/orders';
+const jwks = createRemoteJWKSet(
+  new URL('https://id.example.com/.well-known/jwks.json')
+);
+
+export async function verifyAccessToken(token: string): Promise<Principal> {
+  const { payload } = await jwtVerify(token, jwks, {
+    algorithms: ['RS256'], // policy allowlist; không tin `alg` từ token
+    issuer,
+    audience,
+    typ: 'at+jwt', // nếu issuer phát access token theo profile này
+    requiredClaims: ['sub', 'iat', 'exp', 'jti'],
+    maxTokenAge: '20m',
+    clockTolerance: 5,
+  });
+
+  if (
+    typeof payload.sub !== 'string' ||
+    typeof payload.tenant_id !== 'string'
+  ) {
+    throw new Error('invalid access-token claims');
+  }
+
+  const scopes =
+    typeof payload.scope === 'string'
+      ? new Set(payload.scope.split(' ').filter(Boolean))
+      : new Set<string>();
+
+  return {
+    subject: payload.sub,
+    tenantId: payload.tenant_id,
+    scopes,
+  };
 }
 ```
 
-### Xoay refresh token
+Nếu issuer không dùng `typ: at+jwt`, chốt một token-type contract khác và verify nó; đừng bỏ kiểm tra mà không phân biệt ID token/access token. Mỗi token type nên có key, audience và validation rule riêng để tránh cross-JWT confusion.
 
-Mỗi lần dùng refresh token, cấp một cái **mới** và vô hiệu `jti` cũ. Nếu một token cũ (đã xoay) bị phát lại, đó là dấu hiệu trộm — thu hồi cả họ token và bắt đăng nhập lại.
+Các invariant của access token:
+
+- signature hợp lệ bằng key tin cậy và thuật toán allowlist;
+- `iss` đúng chính xác issuer đã cấu hình;
+- `aud` chứa resource server hiện tại;
+- `exp`/`nbf`/`iat` hợp lệ trong clock skew nhỏ;
+- scope/tenant/token type đúng contract;
+- token ngắn hạn; logout thường không hủy nó tức thì nếu API verify offline.
+
+Revocation tức thì cần online lookup/introspection/denylist hoặc session model, đổi lại latency và dependency runtime. Đừng quảng cáo JWT là “stateless” rồi âm thầm thêm lookup ở mọi request mà không ghi nhận trade-off.
+
+### Key rotation
+
+Asymmetric signing cho phép resource server chỉ giữ public key. Header `kid` chọn key trong JWKS nhưng verifier chỉ tải từ `jwks_uri` đã cấu hình/discover an toàn.
+
+Rotation an toàn cần:
+
+1. publish key mới trước;
+2. bắt đầu ký bằng key mới;
+3. giữ public key cũ ít nhất tới khi token cũ hết hạn + clock skew;
+4. thu hồi khẩn cấp có runbook riêng;
+5. private key nằm trong KMS/HSM/secret system, không commit/env file dài hạn.
 
 ---
 
-## Thu hồi với Redis
+## Browser architecture: session/BFF thường đơn giản hơn
 
-JWT không trạng thái không thể bị hủy phát — nên cho logout và "thu hồi mọi nơi" bạn cần trạng thái server. Theo dõi `jti` của refresh token trong Redis với TTL bằng tuổi token:
+| Mô hình                                    | Lợi ích                              | Chi phí/rủi ro                                |
+| ------------------------------------------ | ------------------------------------ | --------------------------------------------- |
+| server session/BFF + HttpOnly cookie       | token không lộ cho JS; revocation rõ | state/store, CSRF defense                     |
+| access token trong memory + refresh cookie | gọi API trực tiếp, access ngắn       | refresh flow/CSRF/XSS action phức tạp         |
+| bearer dài hạn trong local storage         | triển khai nhanh                     | mọi XSS/extension có thể trích token lâu sống |
 
-```ts
-// on login: allowlist this refresh token
-await redis.set(`rt:${jti}`, user.id, 'EX', 7 * 24 * 3600);
-// on refresh: must still exist, then rotate
-if (!(await redis.get(`rt:${jti}`))) throw new UnauthorizedException('revoked');
-await redis.del(`rt:${jti}`);                 // invalidate old
-// on logout / breach: del the jti (or all of a user's) → instant revocation
-```
+Với web cùng tổ chức, session/BFF thường là mặc định dễ kiểm soát hơn. Mobile/native client dùng secure OS storage và Authorization Code + PKCE; không nhúng client secret vào app public.
 
-Access token để ngắn nên hiếm khi cần chặn; cho khẩn cấp giữ một **denylist** nhỏ.
-
----
-
-## Lưu token ở đâu — quyết định bảo mật thật sự
-
-Đây là câu hỏi tách biệt senior:
-
-| Lưu | Lộ với | Ghi chú |
-| --- | --- | --- |
-| `localStorage` + `Authorization` header | **XSS** (any injected script can read it) | easy CORS/mobile; one XSS = stolen token |
-| `httpOnly` cookie | **CSRF** (sent automatically) | JS can't read it → XSS-safe; needs CSRF defense |
-
-Đồng thuận senior: **refresh token trong cookie `httpOnly`, `Secure`, `SameSite`**; access token trong bộ nhớ.
+Cookie refresh giới hạn path:
 
 ```ts
-res.cookie('refresh', refreshToken, {
-  httpOnly: true,            // JS can't read it → mitigates XSS token theft
-  secure: true,              // HTTPS only
-  sameSite: 'strict',        // mitigates CSRF
-  path: '/auth/refresh',     // sent only to the refresh endpoint
-  maxAge: 7 * 24 * 3600_000,
+res.cookie('__Secure-refresh', refreshToken, {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'lax',
+  path: '/auth/refresh',
+  maxAge: 30 * 24 * 60 * 60_000,
 });
 ```
 
-`httpOnly` chặn đọc XSS; `SameSite` chặn phần lớn CSRF.
+Không đặt `Domain` nếu muốn host-only cookie. Prefix `__Host-` bắt buộc `Path=/`, nên không dùng nó với cookie giới hạn `/auth/refresh`; dùng `__Secure-` và giữ host-only. Endpoint cookie-authenticated vẫn cần CSRF/Origin policy phù hợp.
 
 ---
 
-## OAuth2 & OIDC — đăng nhập ủy quyền
+## Refresh token nên là opaque credential có hash
 
-"Sign in with Google" là **OAuth2** cộng **OpenID Connect**. Dùng **Authorization Code flow với PKCE**:
+Không cần JWT cho refresh token. Một opaque random secret giúp server kiểm soát state/revocation và chỉ lưu hash.
 
-1. App chuyển hướng tới provider kèm `code_challenge`.
-2. User xác thực; provider chuyển về kèm **code** ngắn hạn.
-3. App đổi code + `code_verifier` phía server lấy token.
+Mỗi login/device tạo một **auth session/token family** riêng:
 
-PKCE buộc code với bên yêu cầu gốc, đánh bại tấn công chặn code. **Đừng tự cài crypto** — dùng strategy Passport hoặc client OIDC đã kiểm chứng, và luôn validate `state`, `nonce`, issuer, audience.
+```sql
+CREATE TABLE auth_sessions (
+  id           uuid PRIMARY KEY,
+  family_id    uuid NOT NULL UNIQUE,
+  user_id      bigint NOT NULL REFERENCES users(id),
+  device_label text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  last_seen_at timestamptz NOT NULL DEFAULT now(),
+  expires_at   timestamptz NOT NULL,
+  revoked_at   timestamptz
+);
 
----
+CREATE TABLE refresh_tokens (
+  id             uuid PRIMARY KEY,
+  session_id     uuid NOT NULL REFERENCES auth_sessions(id) ON DELETE CASCADE,
+  secret_hash    bytea NOT NULL,
+  status         text NOT NULL CHECK (status IN ('active', 'used', 'revoked')),
+  expires_at     timestamptz NOT NULL,
+  used_at        timestamptz,
+  replaced_by_id uuid REFERENCES refresh_tokens(id),
+  created_at     timestamptz NOT NULL DEFAULT now()
+);
 
-## RBAC làm guard NestJS
+CREATE UNIQUE INDEX one_active_refresh_per_session
+  ON refresh_tokens (session_id)
+  WHERE status = 'active';
 
-Xác thực là "bạn là ai"; **phân quyền** là "bạn được làm gì". Với vòng đời Phase 14, kiểm vai trò là một decorator + guard tùy biến:
-
-```ts
-export const Roles = (...roles: string[]) => SetMetadata('roles', roles);
-
-@Injectable()
-export class RolesGuard implements CanActivate {
-  constructor(private reflector: Reflector) {}
-  canActivate(ctx: ExecutionContext): boolean {
-    const required = this.reflector.get<string[]>('roles', ctx.getHandler());
-    if (!required) return true;
-    const { user } = ctx.switchToHttp().getRequest();        // set by the JWT auth guard
-    return required.includes(user?.role);
-  }
-}
-
-@Roles('admin')
-@UseGuards(JwtAuthGuard, RolesGuard)
-@Delete(':id')
-remove(@Param('id', ParseIntPipe) id: number) { return this.posts.remove(id); }
+CREATE INDEX auth_sessions_user ON auth_sessions (user_id);
 ```
 
-Cho kiểm soát mịn hơn, lưu **permission** thay vì vai trò rộng.
+Giữ record `used` tới khi family hết hạn để phát hiện replay; xóa ngay token cũ sẽ xóa luôn bằng chứng.
+
+Token public có dạng `tokenId.secret`. `tokenId` dùng lookup; secret 256-bit mới là credential:
+
+```ts
+import {
+  createHmac,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from 'node:crypto';
+
+function newRefreshMaterial() {
+  const id = randomUUID();
+  const secret = randomBytes(32).toString('base64url');
+  return {
+    id,
+    token: `${id}.${secret}`,
+    hash: createHmac('sha256', process.env.REFRESH_HASH_KEY!)
+      .update(secret)
+      .digest(),
+  };
+}
+
+function sameSecret(presented: Buffer, stored: Buffer): boolean {
+  return (
+    presented.length === stored.length && timingSafeEqual(presented, stored)
+  );
+}
+```
+
+Hash key cần rotation/version policy. Không log raw token, hash đầy đủ hoặc callback URL chứa code.
 
 ---
 
-## Các đòn tấn công mọi senior phòng vệ
+## Atomic token-family rotation và reuse detection
 
-- kẻ tấn công đặt header `none` hoặc tráo thuật toán. Ghim thuật toán mong đợi trong `verify`.
-- luôn đặt `expiresIn`.
-- secret HS256 phải dài và ngẫu nhiên, không commit.
-- trộm token qua XSS — cookie `httpOnly` + CSP mạnh.
-- validate `aud`/`iss`.
+Rotation phải là một database transaction khóa token + session. Pseudocode dưới đây cố ý thể hiện state transition quan trọng:
+
+```ts
+type RotationResult =
+  | { kind: 'rotated'; userId: string; refreshToken: string }
+  | { kind: 'replay'; sessionId: string }
+  | { kind: 'invalid' };
+
+async function rotateRefreshToken(rawToken: string): Promise<RotationResult> {
+  const parsed = parseRefreshToken(rawToken); // { id, secret } hoặc null
+  if (!parsed) return { kind: 'invalid' };
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `SELECT t.id, t.session_id, t.secret_hash, t.status,
+              t.expires_at AS token_expires_at,
+              s.user_id, s.revoked_at, s.expires_at AS session_expires_at
+       FROM refresh_tokens t
+       JOIN auth_sessions s ON s.id = t.session_id
+       WHERE t.id = $1
+       FOR UPDATE OF t, s`,
+      [parsed.id]
+    );
+    const row = result.rows[0];
+    if (!row) {
+      await client.query('ROLLBACK');
+      return { kind: 'invalid' };
+    }
+
+    const presentedHash = createHmac('sha256', process.env.REFRESH_HASH_KEY!)
+      .update(parsed.secret)
+      .digest();
+    if (!sameSecret(presentedHash, row.secret_hash)) {
+      await client.query('ROLLBACK');
+      return { kind: 'invalid' };
+    }
+
+    const expired =
+      new Date(row.token_expires_at) <= new Date() ||
+      new Date(row.session_expires_at) <= new Date();
+    if (expired || row.revoked_at) {
+      await client.query('ROLLBACK');
+      return { kind: 'invalid' };
+    }
+
+    if (row.status !== 'active') {
+      // Token đã dùng quay lại: revoke đúng family/device, gồm token mới nhất.
+      await client.query(
+        `UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, now()) WHERE id = $1`,
+        [row.session_id]
+      );
+      await client.query(
+        `UPDATE refresh_tokens SET status = 'revoked'
+         WHERE session_id = $1 AND status = 'active'`,
+        [row.session_id]
+      );
+      await client.query('COMMIT');
+      return { kind: 'replay', sessionId: row.session_id };
+    }
+
+    const next = newRefreshMaterial();
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60_000);
+
+    await client.query(
+      `UPDATE refresh_tokens
+       SET status = 'used', used_at = now()
+       WHERE id = $1`,
+      [row.id]
+    );
+    await client.query(
+      `INSERT INTO refresh_tokens (id, session_id, secret_hash, status, expires_at)
+       VALUES ($1, $2, $3, 'active', $4)`,
+      [next.id, row.session_id, next.hash, expiresAt]
+    );
+    await client.query(
+      `UPDATE refresh_tokens SET replaced_by_id = $1 WHERE id = $2`,
+      [next.id, row.id]
+    );
+    await client.query(
+      `UPDATE auth_sessions SET last_seen_at = now() WHERE id = $1`,
+      [row.session_id]
+    );
+
+    await client.query('COMMIT');
+    return { kind: 'rotated', userId: row.user_id, refreshToken: next.token };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+```
+
+Hai refresh đồng thời: request đầu rotate; request thứ hai chờ lock, sau đó thấy token `used` và revoke family. Đây là reuse detection nghiêm ngặt, nhưng client hợp lệ có thể tự revoke nếu gửi refresh song song. Client nên single-flight refresh. Grace window chỉ thêm khi có threat analysis và binding đủ mạnh, vì nó mở lại replay window.
+
+Multi-device không dùng một `currentJti` cho cả user:
+
+- mỗi device/login là một `auth_sessions` + family;
+- logout device revoke một session;
+- “logout all” hoặc đổi password revoke mọi session của user;
+- UI liệt kê device, `last_seen_at`, thời điểm tạo và cho phép revoke;
+- access token đã phát vẫn sống tới `exp` trừ khi có online revocation.
+
+Nếu lưu family state trong Redis, rotation phải là một Lua/function atomic và mọi key liên quan phải cùng hash slot trong Redis Cluster. Hãy quyết định rõ hậu quả khi eviction/failover làm mất security state; PostgreSQL thường dễ audit hơn cho credential state bền.
 
 ---
 
-## Thực hành
+## OIDC Authorization Code: state, nonce và PKCE không thay nhau
 
-1. Cài cấp access+refresh có xoay, lưu `jti` trong Redis, và "đăng xuất mọi nơi".
-2. Dựng `JwtAuthGuard` + `RolesGuard` và bảo vệ route chỉ admin.
-3. Thêm "Sign in with Google" qua Passport OIDC với PKCE.
+```text
+browser → client /login
+  client tạo state + nonce + code_verifier
+  lưu transaction ngắn hạn server-side, single-use
+  redirect authorize với code_challenge=S256(verifier)
+
+provider → client /callback?code=...&state=...
+  kiểm state + issuer trước
+  đổi code bằng code_verifier qua back channel
+  verify ID token: signature, iss, aud/azp, exp/iat, nonce
+  map identity bằng (issuer, subject)
+  tạo local session/token family
+```
+
+Vai trò:
+
+- `state`: bind callback vào browser transaction và mang return target đã validate;
+- `nonce`: bind ID token vào authentication request, chống replay/code injection trong OIDC;
+- PKCE: bind authorization code vào client instance có `code_verifier`; dùng `S256`;
+- exact redirect URI: chặn code bị chuyển sang endpoint attacker;
+- issuer validation: chặn mix-up/discovery injection.
+
+Flow store phải TTL ngắn và consume atomic. Không nhét arbitrary `returnTo` vào `state` rồi redirect không allowlist.
+
+Callback checklist:
+
+1. reject lỗi/provider response bất thường;
+2. lấy và xóa flow transaction theo state đúng một lần;
+3. xác nhận callback issuer khi protocol/provider hỗ trợ;
+4. exchange code server-to-server với exact redirect URI + verifier;
+5. dùng thư viện OIDC để verify signature qua discovered JWKS;
+6. verify exact `iss`, client id trong `aud`, `azp` khi cần, time và `nonce`;
+7. dùng cặp `(iss, sub)` làm external identity key — email có thể đổi/tái sử dụng;
+8. chỉ tin `email_verified` theo semantics provider; email không tự là permission;
+9. tạo local session sau khi mọi validation hoàn tất.
+
+Không dùng Implicit Grant hay Resource Owner Password Credentials cho thiết kế mới; OAuth Security BCP khuyến nghị Authorization Code + PKCE và loại bỏ các flow làm lộ credential/token không cần thiết.
 
 ---
 
-## Kết thúc nhánh bonus
+## Authorization: token claim chỉ là input của policy
 
-Sau năm bonus phase, lộ trình Super Senior hoàn chỉnh từ một góc mới. Bạn mô hình và vận hành **PostgreSQL**, bọc type-safe bằng **Prisma**, tăng tốc bằng **Redis**, cấu trúc trong **NestJS**, và khóa chặt bằng bảo mật **JWT/OAuth2/RBAC** hiện đại. Kết hợp với mười phase cốt lõi, giờ bạn có bộ công cụ backend hoàn chỉnh, đạt chuẩn production. Dấu hiệu senior vẫn vậy: không phải API thuộc lòng, mà là **phán đoán** — và tư duy bảo mật để bảo vệ mọi lựa chọn. Giờ hãy đi dựng thứ gì đó thật, và bảo mật nó.
+Authentication trả principal; authorization đánh giá action trên resource:
+
+```ts
+interface Principal {
+  subject: string;
+  tenantId: string;
+  scopes: ReadonlySet<string>;
+}
+
+async function deletePost(principal: Principal, postId: string): Promise<void> {
+  if (!principal.scopes.has('posts:delete')) throw new ForbiddenError();
+
+  const deleted = await prisma.post.deleteMany({
+    where: {
+      id: postId,
+      tenantId: principal.tenantId,
+      OR: [{ authorId: principal.subject }, { deletableByAdmin: true }],
+    },
+  });
+  if (deleted.count !== 1) throw new NotFoundError();
+}
+```
+
+Scope query theo tenant/owner thu hẹp cả data access, giảm IDOR và tránh check-then-use race. `role` trong JWT có thể stale tới hết token; quyền nhạy cảm cần access token ngắn, policy version/online check hoặc session model.
+
+Default deny. Guard ở gateway không thay authorization trong service sở hữu resource. Internal network không tự là trust boundary.
+
+---
+
+## Password và account recovery vẫn là identity boundary
+
+Nếu hệ thống giữ password:
+
+- dùng Argon2id với cost benchmark trên hardware và concurrency thật;
+- password dài, cho phép password manager; kiểm leaked password theo policy;
+- lỗi login chung và đường code có timing tương đương cho user tồn tại/không tồn tại;
+- rate limit theo account + IP/device signal, tránh lockout thành DoS;
+- reset token random, single-use, short TTL, lưu hash;
+- đổi/reset password revoke session theo policy và phát security event;
+- MFA/passkey cần recovery flow có mức bảo vệ tương đương.
+
+Không tự “pre-hash bcrypt bằng SHA-256” từ một snippet ngắn. Bcrypt có giới hạn 72 byte và pre-hash sai encoding/composition tạo rủi ro mới; hệ thống mới nên chọn password hasher hiện đại và theo hướng dẫn thư viện/OWASP.
+
+---
+
+## Observability không được biến thành credential leak
+
+Không log:
+
+- `Authorization`, Cookie, refresh/access/ID token;
+- authorization code, verifier, secret, raw password;
+- full callback URL/query;
+- token hash dùng làm credential lookup.
+
+Nên đo:
+
+- login/refresh success-failure theo reason code có cardinality thấp;
+- refresh reuse/family revocation;
+- JWT failure: expired, issuer, audience, signature, type;
+- OIDC state/nonce/PKCE mismatch;
+- key/JWKS refresh error;
+- permission deny và cross-tenant attempt;
+- active/revoked session theo tenant tổng hợp;
+- auth latency và dependency error.
+
+Security event cần correlation id, session id nội bộ và timestamp, nhưng PII tối thiểu, retention/access control rõ. Alert reuse hoặc signing-key anomaly; đừng alert mọi sai password như incident riêng.
+
+---
+
+## Failure modes cần diễn tập
+
+| Failure mode             | Hậu quả                            | Phòng vệ                                 |
+| ------------------------ | ---------------------------------- | ---------------------------------------- |
+| chỉ verify signature     | token sai API/issuer vẫn được nhận | `alg` + `iss` + `aud` + type + time      |
+| xóa refresh token cũ     | không phát hiện replay             | giữ tombstone tới family expiry          |
+| một token family/user    | thiết bị ảnh hưởng lẫn nhau        | family/session theo device               |
+| rotation GET rồi DEL     | hai refresh cùng thành công        | row lock/transaction hoặc Lua atomic     |
+| ID token gọi API         | confused token semantics           | access token riêng cho resource server   |
+| tin email làm identity   | account link sai                   | `(issuer, sub)`, verify linking explicit |
+| cookie không CSRF policy | request giả dùng credential        | SameSite + token/origin policy           |
+| role-only guard          | IDOR/cross-tenant                  | resource/scoped query authorization      |
+| log callback/token       | credential leak                    | structured redaction + allowlist fields  |
+
+---
+
+## Lab và acceptance criteria
+
+Xây identity boundary cho web app và orders API.
+
+1. Access-token verifier allowlist thuật toán và bắt buộc `iss`, `aud`, `exp`, `iat`, `sub`, token type.
+2. ID token bị từ chối tại orders API; access token sai audience bị từ chối.
+3. Refresh token là opaque 256-bit secret, database chỉ lưu keyed hash.
+4. Mỗi device có session/family riêng; logout một device không logout device khác.
+5. Hai refresh tuần tự bằng token cũ phát hiện reuse và revoke đúng family.
+6. Hai refresh đồng thời được integration test; behavior strict-revoke được tài liệu hóa và client dùng single-flight.
+7. OIDC callback reject state, nonce, issuer, audience hoặc PKCE sai; flow transaction single-use.
+8. External identity key là `(issuer, sub)`; email change không tạo account mới ngoài ý muốn.
+9. Cross-tenant resource access trả theo disclosure policy và không query ra row tenant khác.
+10. Log scan không chứa token/code/verifier/cookie; dashboard có reuse/JWT/OIDC failure metrics.
+11. Key rotation test giữ token ký bởi key cũ hợp lệ trong overlap rồi hết hiệu lực đúng hạn.
+12. Password reset/change test revoke session theo policy.
+
+---
+
+## Checklist production
+
+- [ ] Threat model và browser/mobile/service flow được ghi thành ADR.
+- [ ] Access, refresh và ID token có consumer/purpose riêng.
+- [ ] JWT verify khóa thuật toán, issuer, audience, type và lifetime.
+- [ ] Private key có rotation/runbook; JWKS overlap đủ lifetime token.
+- [ ] Refresh rotation atomic, giữ used-token tombstone và revoke family khi reuse.
+- [ ] Multi-device dùng family/session độc lập; có logout-one/logout-all.
+- [ ] Cookie có HttpOnly/Secure/SameSite/path và CSRF policy phù hợp.
+- [ ] OIDC dùng Authorization Code + PKCE S256; state/nonce single-use được verify.
+- [ ] Identity mapping dùng `(iss, sub)`, không dùng email đơn lẻ.
+- [ ] Authorization scope theo tenant/resource và default deny.
+- [ ] Credential không xuất hiện trong log/trace/metric label.
+- [ ] Có integration test concurrency, replay, key rotation và cross-tenant access.
+
+---
+
+## Tài liệu chính thức và chuẩn
+
+- [RFC 7519 — JSON Web Token](https://www.rfc-editor.org/rfc/rfc7519)
+- [RFC 8725 — JWT Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725)
+- [RFC 9068 — JWT Profile for OAuth 2.0 Access Tokens](https://www.rfc-editor.org/rfc/rfc9068)
+- [RFC 9700 — OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700)
+- [RFC 7636 — Proof Key for Code Exchange](https://www.rfc-editor.org/rfc/rfc7636)
+- [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html)
+- [OpenID Connect Discovery 1.0](https://openid.net/specs/openid-connect-discovery-1_0.html)
+- [jose documentation](https://github.com/panva/jose)
+- [OWASP Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)
+- [OWASP OAuth 2.0 Protocol Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/OAuth2_Cheat_Sheet.html)
+
+Identity architecture tốt không được đo bằng số loại token. Nó được đo bằng việc mỗi credential có purpose rõ, mỗi validation có invariant kiểm chứng được, replay tạo security signal, và authorization vẫn đúng khi request đồng thời, key rotate hoặc một thiết bị bị xâm phạm.

@@ -1,0 +1,499 @@
+---
+title: 'Docker chuyên sâu · Part 11 — Container Internals: OCI, Namespaces, Cgroups & PID 1'
+description: 'Đi từ docker run xuống OCI, containerd, runc, namespaces, cgroups v2, copy-on-write, PID 1 và rootless bằng các lab quan sát trực tiếp.'
+pubDate: 2026-05-23
+tags: [docker, containers, oci, linux, internals]
+series: docker
+seriesOrder: 11
+draft: false
+---
+
+Mười phần đầu đã đưa bạn từ container đầu tiên tới một Deployment Kubernetes có probe, resource limit và quy trình debug. Nếu cần ôn lại lớp vận hành đó, xem [Phần 10 — Kubernetes thực hành & Debug](/blog/docker-10-kubernetes-in-practice-debugging/). Từ phần này, series chuyển sang **nhánh chuyên sâu**: không chỉ biết lệnh nào chạy được, mà còn hiểu kernel và các chuẩn bên dưới thực hiện lệnh ấy như thế nào.
+
+Mục tiêu của bài không phải biến bạn thành kernel engineer. Mục tiêu là xây một mental model đủ chính xác để trả lời các câu hỏi production: container có thật sự là một “máy” không, CPU limit được áp ở đâu, vì sao PID 1 xử lý signal khác, một file sửa trong container nằm ở đâu, và “root trong container” nguy hiểm đến mức nào.
+
+> Các lab dùng Linux container và `ubuntu:24.04`, một bản LTS còn được hỗ trợ. Trên macOS/Windows, Docker Desktop chạy kernel Linux trong VM; bạn vẫn quan sát được namespace và cgroup của VM đó, nhưng PID/path không ánh xạ thẳng sang host macOS/Windows.
+
+---
+
+## Mental model: container là cấu hình cho một nhóm process
+
+Container không phải một primitive duy nhất của Linux. Kernel không có syscall tên `create_container()`. Một runtime ghép nhiều primitive lại:
+
+- **namespaces** quyết định process _nhìn thấy gì_;
+- **cgroups** quyết định process _được dùng bao nhiêu_ và gom accounting ở đâu;
+- **mount + image layers** tạo root filesystem mà process nhìn thấy;
+- **capabilities, seccomp, LSM** giới hạn quyền gọi kernel;
+- **PID 1 + signal + exit code** tạo hợp đồng vòng đời với Docker.
+
+```text
+  docker run
+      │
+      ▼
+  Docker API / dockerd
+      │  lifecycle, network, volume, policy
+      ▼
+  containerd ──► containerd-shim ──► runc
+                                      │
+                                      ├─ namespaces
+                                      ├─ cgroups
+                                      ├─ mounts / rootfs
+                                      ├─ capabilities / seccomp
+                                      └─ exec application as PID 1
+```
+
+Đây là lý do container nhẹ hơn VM: process container dùng **cùng kernel Linux của host**. Isolation là ranh giới do kernel áp lên process, không phải một guest kernel riêng. Vì vậy kernel, runtime và cấu hình hardening vẫn là một phần của security boundary.
+
+---
+
+## Hai chuẩn OCI: image để phân phối, runtime bundle để chạy
+
+Open Container Initiative tách bài toán thành hai hợp đồng quan trọng.
+
+### OCI Image Specification
+
+Một OCI image không chỉ là tarball root filesystem. Nó là đồ thị content-addressed gồm:
+
+| Thành phần         | Vai trò                                                                      |
+| ------------------ | ---------------------------------------------------------------------------- |
+| **Layer blobs**    | Các filesystem diff nén; mỗi blob có digest.                                 |
+| **Image config**   | `Entrypoint`, `Cmd`, env, user, history và `diff_ids` của layer đã giải nén. |
+| **Image manifest** | Trỏ tới một config và danh sách layer cho **một platform**.                  |
+| **Image index**    | Trỏ tới nhiều manifest, thường là `linux/amd64`, `linux/arm64`…              |
+| **Descriptor**     | `mediaType`, digest và size để tham chiếu object khác.                       |
+
+Digest là hash nội dung. Đổi một byte trong layer hoặc manifest tạo digest khác. Tag như `app:1.4` chỉ là tên registry có thể được trỏ lại; digest mới là identity bất biến của object.
+
+### OCI Runtime Specification
+
+OCI runtime nhận một **runtime bundle** gồm tối thiểu:
+
+- thư mục `rootfs/` đã unpack;
+- `config.json` mô tả process, env, mount, namespace, Linux resources và security settings.
+
+Low-level runtime như `runc` đọc bundle, yêu cầu kernel dựng isolation, rồi start process. Docker không bắt bạn tự tạo bundle; nó chuyển image + flags của `docker run` thành cấu hình tương đương.
+
+Tách hai spec giúp hệ sinh thái thay thế từng mảnh: cùng OCI image có thể đi qua nhiều registry, builder, runtime hoặc orchestrator mà không khóa vào một CLI duy nhất.
+
+---
+
+## Từ `docker run` tới `runc`: ai chịu trách nhiệm gì?
+
+Khi chạy:
+
+```bash
+docker run --rm --memory 128m --network appnet myapp:1.4
+```
+
+luồng trách nhiệm rút gọn là:
+
+1. **Docker CLI** gửi request tới Docker Engine API.
+2. **`dockerd`** resolve image, network, mount, policy và yêu cầu lifecycle container.
+3. **`containerd`** quản lý image/snapshot và lifecycle task.
+4. **containerd shim** đứng giữa daemon và process container, giữ I/O/lifecycle tách khỏi vòng đời daemon và gọi runtime engine.
+5. **`runc`** mặc định hiện thực OCI Runtime Spec: tạo namespaces, gắn cgroup/mount/security rồi `exec` process.
+6. Process ứng dụng tiếp tục chạy; `runc` không phải daemon nằm mãi bên trong container.
+
+Docker Engine dùng containerd để quản lý lifecycle và mặc định containerd dùng runc. Đây là **implementation chain**, không phải API mà app bên trong cần biết. Khi debug, hãy chọn đúng tầng:
+
+| Triệu chứng                          | Tầng nên quan sát trước                  |
+| ------------------------------------ | ---------------------------------------- |
+| Image pull/digest/manifest           | Registry, image store, containerd        |
+| Container tạo được nhưng không start | shim/runtime, OCI config, mount/security |
+| App start rồi crash                  | PID 1, env, filesystem, dependency       |
+| CPU/RAM/PID vượt dự kiến             | cgroup configuration và host pressure    |
+
+---
+
+## Linux namespaces: nhiều góc nhìn trên cùng một kernel
+
+Namespace không “chặn mọi thứ”; mỗi loại cô lập một loại global resource.
+
+| Namespace   | Cô lập góc nhìn                         | Bug thường gặp                                                     |
+| ----------- | --------------------------------------- | ------------------------------------------------------------------ |
+| **PID**     | Cây process và PID                      | PID 1, signal, zombie; không thấy process container khác.          |
+| **mount**   | Mount table/root filesystem             | Bind mount che file trong image; mount propagation.                |
+| **network** | Interface, route, port, firewall state  | `localhost` là container hiện tại.                                 |
+| **UTS**     | Hostname/domain name                    | Hostname container khác host.                                      |
+| **IPC**     | Shared memory, semaphore, message queue | `/dev/shm` quá nhỏ hoặc IPC không chia sẻ.                         |
+| **user**    | Ánh xạ UID/GID và capability            | UID 0 bên trong có thể ánh xạ thành UID không đặc quyền bên ngoài. |
+| **cgroup**  | Góc nhìn cây cgroup                     | Tool trong container thấy hierarchy khác host.                     |
+| **time**    | Một số clock offsets                    | Không phải namespace Docker cô lập phổ biến mặc định.              |
+
+Mỗi process lộ các namespace đang tham gia dưới `/proc/<pid>/ns/`. Hai symlink có cùng inode nghĩa là hai process cùng namespace loại đó.
+
+```bash
+docker run --rm ubuntu:24.04 sh -c '
+  for ns in pid mnt net uts ipc cgroup user; do
+    printf "%-7s " "$ns"
+    readlink "/proc/1/ns/$ns"
+  done
+'
+```
+
+Đừng biến “có namespace” thành “an toàn tuyệt đối”. `--network host`, `--pid host`, bind mount Docker socket hay `--privileged` chủ động mở những ranh giới quan trọng. Isolation là tổng của mọi namespace, mount và policy, không phải checkbox đơn lẻ.
+
+---
+
+## Cgroups v2: accounting và control, không phải visibility
+
+Nếu namespace trả lời “process thấy gì?”, **control group** trả lời “nhóm process này được dùng bao nhiêu?” Linux hiện đại thường dùng cgroups v2 với một unified hierarchy.
+
+Ba file bạn sẽ gặp liên tục:
+
+| Docker flag       | cgroup v2 control | Ý nghĩa                                           |
+| ----------------- | ----------------- | ------------------------------------------------- |
+| `--memory 128m`   | `memory.max`      | Hard ceiling cho memory; vượt có thể OOM kill.    |
+| `--cpus 0.5`      | `cpu.max`         | Quota/period; hết quota thì throttle, không kill. |
+| `--pids-limit 64` | `pids.max`        | Chặn fork/process mới khi đạt trần.               |
+
+```bash
+docker info --format 'cgroup={{.CgroupVersion}} driver={{.CgroupDriver}}'
+
+docker run -d --name limited \
+  --memory 128m --cpus 0.5 --pids-limit 64 \
+  ubuntu:24.04 sleep infinity
+
+docker exec limited sh -c '
+  for f in memory.max cpu.max pids.max; do
+    printf "%-12s " "$f"
+    cat "/sys/fs/cgroup/$f"
+  done
+'
+```
+
+Trên cgroups v2, kết quả điển hình là `134217728`, `50000 100000`, `64`. Giá trị thực tế có thể khác theo daemon/host. `docker stats` là view tiện cho vận hành; file cgroup là bằng chứng kernel đang enforce gì.
+
+Hai failure mode quan trọng:
+
+- **Không đặt limit**: container không “tự có quota”; nó cạnh tranh tài nguyên theo policy của host.
+- **Đặt limit mù**: memory quá thấp tạo OOM loop; CPU quá thấp tạo latency nhưng process vẫn sống. Limit cần đi cùng đo đạc workload.
+
+Rootless Docker chỉ hỗ trợ đầy đủ các flag cgroup khi host dùng cgroups v2 và systemd. Nếu `docker info` cảnh báo controller thiếu, đừng tin rằng flag đã được enforce chỉ vì CLI chấp nhận.
+
+---
+
+## Image layers và copy-on-write: đọc chung, ghi riêng
+
+OCI layer là filesystem diff. Runtime xếp các layer image thành view chỉ-đọc rồi thêm writable snapshot/layer cho container.
+
+```text
+  writable container layer   ← create / modify / whiteout
+  ────────────────────────
+  app layer                  ← read-only
+  dependency layer           ← read-only
+  base layer                 ← read-only
+```
+
+Khi app chỉ **đọc** file ở lower layer, storage backend dùng file đó trực tiếp. Lần đầu app **sửa** file, backend thực hiện copy-up vào writable layer rồi sửa bản copy. Xóa file lower layer tạo marker/whiteout để view hợp nhất coi file đã biến mất; byte cũ vẫn tồn tại trong layer cũ.
+
+Hệ quả vận hành:
+
+- sửa file lớn lần đầu có thể tốn I/O vì copy-up;
+- xóa secret ở layer sau không xóa secret khỏi layer trước;
+- writable layer chết cùng container, nên database/upload cần volume;
+- nhiều container cùng image chia sẻ layer chỉ-đọc nhưng có writable state riêng.
+
+### Caveat Docker Engine 29: đừng mặc định mọi host dùng `overlay2`
+
+Từ Docker Engine 29, **fresh installation** mặc định dùng **containerd image store** và snapshotter; host upgrade từ bản cũ vẫn giữ classic graph driver như `overlay2` cho tới khi chủ động chuyển.
+
+```bash
+docker info --format 'storage={{.Driver}} status={{json .DriverStatus}}'
+```
+
+Với containerd image store, `DriverStatus` chứa `io.containerd.snapshotter.v1`; snapshotter mặc định trên Linux là `overlayfs`. Khái niệm layer/CoW vẫn đúng, nhưng path và lệnh nội bộ của tutorial `overlay2` cũ không còn mô tả mọi máy.
+
+Các caveat migration đáng nhớ:
+
+- bật store mới làm image/container của backend cũ **tạm bị ẩn**, không tự mất;
+- containerd giữ cả blob nén và snapshot đã giải nén nên có thể dùng nhiều disk hơn;
+- data path containerd cần được capacity-plan riêng;
+- containerd image store hiện không dùng được cùng daemon `userns-remap`;
+- không đổi backend trên host quan trọng trước khi backup/export và thử restore.
+
+---
+
+## PID 1: signal, shutdown và zombie reaping
+
+Process đầu tiên trong PID namespace có PID 1. Với Docker, đây là process từ `ENTRYPOINT`/`CMD` sau khi runtime start container.
+
+PID 1 có hai trách nhiệm dễ bị bỏ qua:
+
+1. **Nhận và xử lý signal** từ lifecycle bên ngoài.
+2. **Reap child process** đã thoát để chúng không tích lũy thành zombie.
+
+`docker stop` gửi stop signal (mặc định `SIGTERM`), chờ timeout, rồi mới `SIGKILL`. Nếu PID 1 là shell wrapper không `exec` app và không forward signal, app có thể không nhận thời gian graceful shutdown.
+
+```dockerfile
+# Shell form: /bin/sh -c trở thành PID 1; signal forwarding phụ thuộc shell
+CMD node server.js
+
+# Exec form: node trực tiếp là PID 1
+CMD ["node", "server.js"]
+```
+
+Exec form giải quyết lớp shell thừa, nhưng app vẫn phải đăng ký handler, ngừng nhận request, hoàn thành việc đang xử lý và thoát trước deadline. Nếu app sinh child process mà không reap đúng, dùng `--init` để chèn init nhỏ làm PID 1:
+
+```bash
+docker run --init myapp:1.4
+```
+
+`--init` hữu ích, nhưng không thay thế logic graceful shutdown của ứng dụng.
+
+---
+
+## `USER`, user namespace và rootless là ba trục khác nhau
+
+Ba khái niệm thường bị gom thành “non-root”, nhưng threat model khác nhau:
+
+| Cơ chế                | Daemon trên host                          | UID app thấy bên trong          | Điều nó giảm thiểu                                               |
+| --------------------- | ----------------------------------------- | ------------------------------- | ---------------------------------------------------------------- |
+| Dockerfile `USER app` | Thường vẫn root                           | UID app, không phải 0           | App compromise có ít quyền trong container hơn.                  |
+| `userns-remap`        | `dockerd` vẫn root                        | Có thể là 0                     | UID 0 container ánh xạ thành UID cao, không đặc quyền trên host. |
+| Rootless mode         | Daemon và container chạy dưới user thường | Có thể vẫn là 0 trong namespace | Giảm đặc quyền của cả daemon/runtime trên host.                  |
+
+`USER app` vẫn là baseline nên có, kể cả khi chạy rootless. User namespace không sửa mọi rủi ro: bind mount phải phối hợp ownership, kernel vẫn được chia sẻ, và Docker socket vẫn là quyền điều khiển daemon tương ứng.
+
+Kiểm tra host hiện tại:
+
+```bash
+docker info --format '{{range .SecurityOptions}}{{println .}}{{end}}'
+docker context show
+docker run --rm ubuntu:24.04 sh -c 'id; readlink /proc/self/ns/user'
+```
+
+Nếu output security options có `name=rootless`, client đang nói chuyện với rootless daemon. Đừng suy luận chỉ từ `id` bên trong: UID 0 trong user namespace có thể ánh xạ thành user thường ở host.
+
+---
+
+## Failure modes và checklist review
+
+| Triệu chứng                            | Giả thuyết tốt hơn “Docker lỗi”  | Bằng chứng cần lấy                                      |
+| -------------------------------------- | -------------------------------- | ------------------------------------------------------- |
+| Container bị kill                      | Memory cgroup/OOM hoặc signal    | `docker inspect` State, `memory.events`, exit code.     |
+| CPU thấp, app vẫn Running              | Bị throttle do `cpu.max`         | `docker stats`, `cpu.stat`.                             |
+| File “mất” sau recreate                | Ghi vào writable layer           | `docker diff`, mount/volume config.                     |
+| Stop luôn hết timeout                  | PID 1 không nhận/xử lý TERM      | PID 1 cmdline, app logs, stop duration.                 |
+| Permission denied khi mount            | UID mapping/ownership không khớp | `id` trong container, owner host, rootless/userns mode. |
+| Image/container biến mất sau đổi store | Backend cũ bị ẩn                 | `docker info`, daemon config, data paths.               |
+
+Checklist trước production:
+
+- process chính dùng exec form và có shutdown budget đo được;
+- app non-root, volume ownership được kiểm chứng;
+- memory/CPU/PID limit dựa trên load test;
+- writable data được phân loại: scratch hay persistent;
+- security options/rootless/userns được ghi nhận theo từng môi trường;
+- không phụ thuộc path nội bộ `overlay2` nếu fleet có Engine 29/containerd store.
+
+---
+
+## Bảng tra nhanh
+
+```bash
+# Runtime và storage backend
+docker version
+docker info --format 'storage={{.Driver}} cgroup={{.CgroupVersion}}'
+docker info --format '{{json .DriverStatus}}'
+docker info --format '{{range .SecurityOptions}}{{println .}}{{end}}'
+
+# Process, namespace, signal
+docker top <container>
+docker exec <container> readlink /proc/1/ns/pid
+docker exec <container> sh -c 'tr "\000" " " < /proc/1/cmdline; echo'
+docker stop --signal TERM --timeout 10 <container>
+
+# Cgroup và writable layer
+docker stats --no-stream <container>
+docker exec <container> cat /sys/fs/cgroup/memory.max
+docker diff <container>
+docker inspect <container> --format '{{json .State}}'
+```
+
+---
+
+## Bài tập / Exercises
+
+Các bài dưới đây không cần source app. Chúng biến `/proc`, cgroup và writable layer thành “kính hiển vi” cho runtime.
+
+### 1. So sánh namespace của hai container
+
+Chạy hai container, in inode của PID/mount/network/UTS/IPC namespace và xác định namespace nào khác nhau, namespace nào có thể giống nhau theo cấu hình daemon.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+docker run -d --name ns-a ubuntu:24.04 sleep infinity
+docker run -d --name ns-b ubuntu:24.04 sleep infinity
+
+for c in ns-a ns-b; do
+  echo "== $c =="
+  docker exec "$c" sh -c '
+    printf "pid1: "
+    tr "\000" " " < /proc/1/cmdline
+    echo
+    for ns in pid mnt net uts ipc cgroup user; do
+      printf "%-7s " "$ns"
+      readlink "/proc/1/ns/$ns"
+    done
+  '
+done
+
+docker rm -f ns-a ns-b
+```
+
+`pid`, `mnt`, `net`, `uts`, `ipc` thường có inode khác nhau. `user` thường giống nhau trên rootful daemon không bật user namespace; kết quả khác khi dùng rootless/userns. Bài học là **quan sát cấu hình thật**, không đoán từ tên “container”.
+
+</details>
+
+### 2. Đối chiếu Docker flags với cgroups v2
+
+Giới hạn container ở 128 MiB, nửa CPU và 64 PID; đọc control files để xác nhận kernel nhận cấu hình.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+docker info --format 'cgroup={{.CgroupVersion}} driver={{.CgroupDriver}}'
+
+docker run -d --name cg-lab \
+  --memory 128m \
+  --cpus 0.5 \
+  --pids-limit 64 \
+  ubuntu:24.04 sleep infinity
+
+docker exec cg-lab sh -c '
+  test -f /sys/fs/cgroup/cgroup.controllers || {
+    echo "Lab này cần cgroups v2" >&2
+    exit 1
+  }
+  printf "memory.max = "; cat /sys/fs/cgroup/memory.max
+  printf "cpu.max    = "; cat /sys/fs/cgroup/cpu.max
+  printf "pids.max   = "; cat /sys/fs/cgroup/pids.max
+'
+
+docker stats --no-stream cg-lab
+docker rm -f cg-lab
+```
+
+Kỳ vọng điển hình: `memory.max=134217728`, `cpu.max=50000 100000`, `pids.max=64`. Nếu khác, kiểm tra cgroup version, rootless support và daemon warnings trước khi kết luận limit hoạt động.
+
+</details>
+
+### 3. Quan sát copy-on-write bằng `docker diff`
+
+Sửa một file có sẵn, tạo file mới và xóa một file lower-layer. Sau đó xóa container và chứng minh image gốc không đổi.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+docker run -d --name cow-lab ubuntu:24.04 sleep infinity
+
+docker exec cow-lab sh -c '
+  printf "changed in writable layer\n" > /etc/motd
+  mkdir -p /work
+  touch /work/new-file
+  rm -f /etc/debian_version
+'
+
+docker diff cow-lab
+# C = changed, A = added, D = deleted in the container view
+
+docker rm -f cow-lab
+docker run --rm ubuntu:24.04 sh -c '
+  test -e /etc/debian_version && echo "base image is intact"
+'
+```
+
+`docker diff` có thể in thêm metadata path tùy backend, nhưng phải thể hiện thay đổi dưới `/etc` và `/work`. Xóa container xóa writable state; lower layer của image chưa từng bị sửa.
+
+</details>
+
+### 4. Kiểm tra signal tới PID 1 và vai trò của `--init`
+
+Chạy một PID 1 có handler `SIGTERM`, stop graceful, rồi chạy container với init nhỏ và xem cmdline PID 1.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+docker run -d --name signal-lab ubuntu:24.04 \
+  sh -c 'trap "echo TERM-received; exit 0" TERM; while :; do sleep 1; done'
+
+docker exec signal-lab sh -c 'tr "\000" " " < /proc/1/cmdline; echo'
+docker stop --signal TERM --timeout 5 signal-lab
+docker logs signal-lab
+# TERM-received
+docker rm signal-lab
+
+docker run -d --name init-lab --init ubuntu:24.04 sh -c 'sleep 300'
+docker exec init-lab sh -c 'tr "\000" " " < /proc/1/cmdline; echo'
+# PID 1 là docker-init; shell/app là child
+docker rm -f init-lab
+```
+
+Nếu handler không log trước timeout, kiểm tra quoting và process tree. Trong app thật, đo thời gian drain request/job thay vì chỉ chứng minh signal đã tới.
+
+</details>
+
+### 5. Phân biệt UID trong container và UID trên Linux host
+
+Kiểm tra security mode, chạy process UID 0 trong container rồi xem owner của host PID. Phần host-side chỉ áp dụng cho Docker Engine chạy trực tiếp trên Linux.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+docker info --format '{{range .SecurityOptions}}{{println .}}{{end}}'
+
+docker run -d --name uid-lab ubuntu:24.04 sleep infinity
+docker exec uid-lab id
+
+HOST_PID=$(docker inspect --format '{{.State.Pid}}' uid-lab)
+echo "container init host PID: $HOST_PID"
+
+# Linux host only; Docker Desktop giữ PID này bên trong Linux VM
+ps -o pid,user,uid,cmd -p "$HOST_PID"
+
+docker rm -f uid-lab
+```
+
+Rootful daemon không userns thường hiện host UID 0. `userns-remap` thường hiện UID cao trong subordinate range. Rootless mode ánh xạ container UID 0 tới user chạy rootless daemon. Dù mode nào, vẫn nên đặt `USER` non-root cho app.
+
+</details>
+
+---
+
+## Điểm chính
+
+- OCI Image Spec mô tả artifact phân phối; OCI Runtime Spec mô tả bundle và lifecycle để chạy.
+- Docker Engine điều phối containerd; containerd shim gọi runtime OCI, mặc định là runc.
+- Namespace cô lập **góc nhìn**; cgroup accounting và giới hạn **tài nguyên** — hai cơ chế khác nhau.
+- Layer image đọc chung, writable layer ghi riêng; copy-up và whiteout giải thích cả performance lẫn việc secret “đã xóa” vẫn còn trong history.
+- Fresh install Docker Engine 29 dùng containerd image store; host upgrade có thể vẫn dùng `overlay2`. Luôn kiểm tra, đừng đoán path nội bộ.
+- PID 1 phải nhận signal và reap child; exec form, graceful handler và `--init` giải quyết các lớp khác nhau.
+- Dockerfile `USER`, `userns-remap` và rootless bổ sung cho nhau, không phải ba tên của cùng một tính năng.
+
+---
+
+## Tiếp theo
+
+**[Phần 12 — BuildKit, Multi-platform & Software Supply Chain](/blog/docker-12-buildkit-multi-platform-supply-chain/)**: chuyển từ runtime xuống build graph — cache/bind/secret mounts, cache CI, image đa kiến trúc, digest, SBOM và provenance attestations.
+
+---
+
+## Tài liệu chính thức
+
+- [OCI Image Format Specification](https://github.com/opencontainers/image-spec)
+- [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec)
+- [Docker Engine — Alternative container runtimes](https://docs.docker.com/engine/daemon/alternative-runtimes/)
+- [Docker Engine — Storage drivers, layers and copy-on-write](https://docs.docker.com/engine/storage/drivers/)
+- [Docker Engine — containerd image store](https://docs.docker.com/engine/storage/containerd/)
+- [Docker Engine — Resource constraints](https://docs.docker.com/engine/containers/resource_constraints/)
+- [Linux kernel — Control Group v2](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
+- [Linux man-pages — Namespaces](https://man7.org/linux/man-pages/man7/namespaces.7.html)
+- [Docker Engine — Rootless mode](https://docs.docker.com/engine/security/rootless/)
+- [Docker Engine — User namespace remapping](https://docs.docker.com/engine/security/userns-remap/)

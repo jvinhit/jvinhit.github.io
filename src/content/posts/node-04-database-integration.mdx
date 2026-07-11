@@ -1,22 +1,32 @@
 ---
-title: 'Node.js Super Senior · Phase 4 — Database Integration'
-description: 'Phase 4: give your API a real database — drivers vs ORMs, indexes, pooling, transactions and isolation levels, the N+1 problem and DataLoader, repositories, keyset pagination, MongoDB modeling, and a Redis cache layer.'
+title: 'Node.js Production Engineering 04 — Thiết kế Data Layer'
+description: 'Thiết kế data layer đúng khi có concurrency: query shape, index, pool, transaction, pagination, repository, MongoDB và cache contract cho API.'
 pubDate: 2026-06-09
-tags: [nodejs, database, sql, mongodb, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, database, data-architecture, sql, production-engineering]
 series: nodejs
 seriesOrder: 4
 draft: false
 ---
 
-Đây là **Phase 4 của lộ trình Super Senior 10 phase**. Database là nơi junior và senior rẽ hướng rõ rệt nhất. Junior làm cho nó chạy; senior làm cho nó **đúng khi đồng thời, nhanh khi tải, và an toàn trước injection**.
+Hai request cùng đọc tồn kho là `1`, cả hai cùng trừ và đều trả thành công. Test tuần tự vẫn xanh; production vừa bán một món hàng hai lần. Data layer không chỉ là nơi đặt câu query: nó sở hữu consistency boundary, connection budget, query shape và cách lỗi dữ liệu trở thành API contract.
 
-Phase này là *bề rộng* SQL và NoSQL; Phase 11 là *chiều sâu* riêng PostgreSQL.
+Bài này dùng **Node.js 24 LTS**, PostgreSQL, MongoDB và Redis để xây bức tranh toàn cảnh. Sau khi đọc, bạn có thể:
+
+- chọn driver, query builder hoặc ORM theo constraint thay vì theo xu hướng;
+- thiết kế index từ query shape và xác nhận bằng execution plan;
+- tính connection budget cho nhiều replica và nhận diện pool exhaustion;
+- dùng transaction, isolation và locking để bảo vệ invariant đồng thời;
+- tránh N+1, cursor lỗi, cache stale và abstraction repository bị rò semantics;
+- map conflict/not-found/unavailable thành contract ổn định cho frontend.
+
+**Kiến thức cần có:** request pipeline và error contract ở [Phần 3](/blog/node-03-express-mastery/). Đây là bài bề rộng; [Phần 11](/blog/node-11-postgresql-deep-dive/) đi sâu riêng PostgreSQL.
 
 ---
 
 ## Chạy database local bằng Docker
 
-Đừng cài server database lên máy — dùng container vứt đi được:
+Dùng container giúp môi trường local tái tạo được và dọn dễ. Password dưới đây chỉ dành cho máy phát triển; không commit hoặc tái sử dụng trong môi trường dùng chung:
 
 ```bash
 docker run --name pg -e POSTGRES_PASSWORD=secret -p 5432:5432 -d postgres:17
@@ -26,26 +36,52 @@ docker run --name redis -p 6379:6379 -d redis:7
 
 ---
 
+## Mental model: nguồn sự thật, transaction và dữ liệu dẫn xuất
+
+```text
+HTTP / queue / CLI
+       │
+       ▼
+use case ── xác lập invariant + transaction boundary
+       │
+       ▼
+repository / query service
+       │
+       ▼
+connection pool ── connection budget dùng chung
+       │
+       ▼
+database (source of truth)
+       │
+       └──── cache / search index / event projection (derived data)
+```
+
+Database là source of truth cho invariant mà nó sở hữu. Cache và read model là dữ liệu dẫn xuất: có thể rebuild và có staleness contract rõ. Repository không được âm thầm mở transaction riêng cho từng method nếu một use case cần atomicity xuyên nhiều write; transaction boundary thuộc use case/unit of work.
+
+---
+
 ## Ba tầng: driver, query builder, ORM
 
-Biết mỗi tầng cho gì để chọn có chủ đích, không theo thói quen:
+Mỗi tầng đổi một phần control lấy productivity:
 
-- giao thức thô + parameterized query. Tối đa kiểm soát, tối đa lặp.
-- soạn SQL theo lập trình có type, không phép thuật.
-- ánh xạ hàng/document sang object; quan hệ, migration, hook.
+- **Driver** — protocol client + parameterized query; kiểm soát query rõ nhưng tự sở hữu mapping và migration workflow.
+- **Query builder** — tạo SQL bằng API có type; vẫn nhìn thấy query shape và ít mapping thủ công hơn.
+- **ORM/ODM** — ánh xạ row/document sang model, quan hệ và lifecycle; nhanh cho CRUD nhưng có thể che query đắt hoặc semantics riêng của database.
 
-Dù dùng ORM, bạn phải biết driver `pg` thô — mọi tầng đứng trên nó, và cách *duy nhất* an toàn để viết SQL thô là parameterized:
+Dù dùng ORM, bạn phải biết driver `pg` thô — mọi tầng đứng trên nó, và cách _duy nhất_ an toàn để viết SQL thô là parameterized:
 
 ```ts
 import { Pool } from 'pg';
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
 
-// $1/$2 are placeholders — values are sent separately, so input can NEVER become SQL
+// $1/$2 là placeholder cho VALUE; driver gửi value tách khỏi SQL text.
 const { rows } = await pool.query(
   'SELECT id, email FROM users WHERE email = $1 AND active = $2',
-  [userInput, true],
+  [userInput, true]
 );
 ```
+
+Placeholder bảo vệ **value**, không thay được table/column/order direction. Identifier động phải map qua allowlist do server sở hữu; không ghép thẳng query param vào SQL dù đang dùng driver.
 
 ---
 
@@ -58,17 +94,28 @@ import { Sequelize, DataTypes } from 'sequelize';
 
 const sequelize = new Sequelize(process.env.DATABASE_URL!, {
   dialect: 'postgres',
-  pool: { max: 10, min: 2, idle: 10_000 },          // connection pooling (see 4.4)
+  pool: { max: 10, min: 2, idle: 10_000 }, // connection pooling (see 4.4)
   logging: process.env.NODE_ENV !== 'production' ? console.log : false,
 });
 
-const User = sequelize.define('User', {
-  id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
-  email: { type: DataTypes.STRING, unique: true, allowNull: false },
-  password: { type: DataTypes.STRING, allowNull: false },
-}, { timestamps: true, paranoid: true });           // paranoid = soft delete (deletedAt)
+const User = sequelize.define(
+  'User',
+  {
+    id: {
+      type: DataTypes.UUID,
+      defaultValue: DataTypes.UUIDV4,
+      primaryKey: true,
+    },
+    email: { type: DataTypes.STRING, unique: true, allowNull: false },
+    passwordHash: { type: DataTypes.STRING, allowNull: false },
+  },
+  { timestamps: true, paranoid: true }
+); // paranoid = soft delete (deletedAt)
 
-const Post = sequelize.define('Post', { title: DataTypes.STRING, content: DataTypes.TEXT });
+const Post = sequelize.define('Post', {
+  title: DataTypes.STRING,
+  content: DataTypes.TEXT,
+});
 
 User.hasMany(Post, { foreignKey: 'userId', as: 'posts' });
 Post.belongsTo(User, { foreignKey: 'userId', as: 'author' });
@@ -77,16 +124,24 @@ Post.belongsTo(User, { foreignKey: 'userId', as: 'author' });
 ### TypeORM (dựa decorator, TypeScript-first)
 
 ```ts
-import { Entity, PrimaryGeneratedColumn, Column, OneToMany, Index, CreateDateColumn } from 'typeorm';
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  OneToMany,
+  Index,
+  CreateDateColumn,
+} from 'typeorm';
 
 @Entity()
 export class User {
   @PrimaryGeneratedColumn('uuid') id!: string;
 
   @Index({ unique: true })
-  @Column() email!: string;
+  @Column()
+  email!: string;
 
-  @Column() password!: string;
+  @Column() passwordHash!: string;
 
   @OneToMany(() => Post, (post) => post.user) posts!: Post[];
 
@@ -94,16 +149,19 @@ export class User {
 }
 
 const userRepo = AppDataSource.getRepository(User);
-const user = await userRepo.findOne({ where: { id: userId }, relations: { posts: true } });
+const user = await userRepo.findOne({
+  where: { id: userId },
+  relations: { posts: true },
+});
 ```
 
-> Ghi chú senior (2026): cho project **mới** nhiều senior nay chọn **Drizzle** hoặc **Prisma** (Phase 12). Học *khái niệm*; chúng chuyển sang ORM nào cũng được.
+> Không có ORM mặc định cho mọi team. Hãy so sánh migration control, type model, escape hatch sang SQL, observability, transaction API và mức độ phù hợp với query thật. [Phần 12](/blog/node-12-prisma-orm-deep-dive/) dùng Prisma làm một deep dive, không phải tuyên bố mọi project phải chọn nó.
 
 ---
 
 ## Index — đòn bẩy lớn nhất
 
-Index là cấu trúc dữ liệu đã sắp xếp (thường B-tree) biến quét toàn bảng thành tra cứu gần như tức thì. Thêm trên **mọi cột bạn lọc, join, hoặc sort**.
+Index là cấu trúc truy cập phụ; B-tree là mặc định phổ biến cho equality/range/order. Thiết kế index từ **query shape thường xuyên và quan trọng**, không phải thêm riêng lẻ vào mọi cột từng xuất hiện trong `WHERE`.
 
 ```sql
 CREATE INDEX idx_posts_user_id ON posts (user_id);          -- speeds up the join/filter
@@ -112,17 +170,17 @@ CREATE UNIQUE INDEX idx_users_email ON users (email);
 CREATE INDEX idx_active_users ON users (email) WHERE active; -- partial: smaller, faster
 ```
 
-Sắc thái senior:
+Các trade-off cần kiểm tra:
 
 - thứ tự cột quan trọng — index `(user_id, created_at)` giúp lọc theo `user_id`, nhưng **không** giúp lọc chỉ theo `created_at` (quy tắc prefix trái nhất).
-- index tốn write — đừng index cột không bao giờ query.
-- xác minh bằng `EXPLAIN ANALYZE` — đừng đoán.
+- index tốn write, disk và memory; index thừa cũng làm planner/vacuum thêm việc.
+- xác minh bằng `EXPLAIN (ANALYZE, BUFFERS)` trên dữ liệu có phân bố gần production; câu lệnh thực thi query thật nên tránh trên write nguy hiểm.
 
 ---
 
-## Connection pooling — thứ junior hay quên
+## Connection pooling — budget dùng chung
 
-Mở kết nối DB **tốn kém**. Mở một cái *mỗi request* đè bẹp database khi tải. Một **pool** giữ tập kết nối tái dùng cố định mà request mượn rồi trả.
+Mở kết nối DB **tốn kém**. Mở một cái _mỗi request_ đè bẹp database khi tải. Một **pool** giữ tập kết nối tái dùng cố định mà request mượn rồi trả.
 
 ```text
 Req A ─┐
@@ -132,45 +190,57 @@ Req D ─┘    │ borrow ↔ return  │
             └──────────────────┘
 ```
 
-Lập luận senior về `max`: **không** phải "càng lớn càng tốt". Quy tắc: `số_instance × pool.max ≤ giới_hạn_kết_nối_DB` (chừa chỗ cho migration và admin). Bốn instance ở `max: 25` = 100 kết nối — vượt nhiều mặc định Postgres.
+`max` không phải "càng lớn càng tốt". Capacity budget tối thiểu phải thỏa `số instance tối đa × pool.max + migration/admin/worker reserve ≤ giới hạn kết nối DB`. Autoscaling từ 4 lên 20 replica có thể nhân pool năm lần mà không đổi một dòng application code.
 
-Hai kiểu hỏng cần nhận ra: **cạn pool** và **idle-in-transaction**; serverless cần **PgBouncer**.
+Đặt timeout khi chờ pool, đo số connection active/idle/waiting, và luôn release client trong `finally`. **Pool exhaustion** và **idle in transaction** có triệu chứng giống API chậm nhưng cách sửa khác nhau. Môi trường serverless hoặc số replica lớn thường cần connection proxy/pooler như PgBouncer; mode transaction pooling cũng có giới hạn với session state và prepared statement nên phải kiểm thử driver/ORM tương ứng.
 
 ---
 
 ## Transaction & mức cô lập
 
-Một số write phải thành công *cùng nhau* hoặc *không cái nào* (chuyển tiền).
+Một số write phải thành công _cùng nhau_ hoặc _không cái nào_ (chuyển tiền).
 
 ```ts
 // Sequelize managed transaction — auto commit on success, rollback on throw
 await sequelize.transaction(async (t) => {
-  const from = await Account.findByPk(fromId, { transaction: t, lock: t.LOCK.UPDATE });
-  if (!from || from.get('balance') < amount) throw new AppError('Insufficient funds', 400);
-  await Account.decrement('balance', { by: amount, where: { id: fromId }, transaction: t });
-  await Account.increment('balance', { by: amount, where: { id: toId }, transaction: t });
+  const from = await Account.findByPk(fromId, {
+    transaction: t,
+    lock: t.LOCK.UPDATE,
+  });
+  if (!from || from.get('balance') < amount)
+    throw new AppError('Insufficient funds', 400);
+  await Account.decrement('balance', {
+    by: amount,
+    where: { id: fromId },
+    transaction: t,
+  });
+  await Account.increment('balance', {
+    by: amount,
+    where: { id: toId },
+    transaction: t,
+  });
 }); // throwing anywhere rolls everything back
 ```
 
-Mô hình tư duy: **trong một transaction, hoặc mọi thứ xảy ra hoặc không gì cả**.
+Mental model: transaction tạo một ranh giới atomicity trong **cùng database**. Nó không tự làm email, cache hoặc API bên thứ ba rollback; side effect vượt ranh giới đó cần outbox/idempotency và được đào sâu ở Phần 16.
 
-### Mức cô lập — phần của senior
+### Mức cô lập và anomaly
 
 Mức cô lập điều khiển các transaction đồng thời thấy gì của nhau:
 
-| Mức | Ngăn |
-| ---------------------- | -------------------------------------------------- |
-| Read Committed (default)| đọc bẩn |
-| Repeatable Read        | + + đọc không lặp lại được |
-| Serializable           | + + phantom |
+| Mức PostgreSQL            | Snapshot nhìn thấy                                      | Điều vẫn phải xử lý                                                 |
+| ------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------- |
+| Read Committed (mặc định) | mỗi statement thấy dữ liệu đã commit trước statement đó | non-repeatable read, lost update nếu read-modify-write sai          |
+| Repeatable Read           | transaction dùng snapshot ổn định                       | serialization anomaly có thể làm transaction bị abort; cần retry    |
+| Serializable              | hành vi tương đương một thứ tự chạy tuần tự hợp lệ      | transaction có thể bị serialization failure; retry toàn transaction |
 
-Bug đồng thời kinh điển là **read-modify-write**. Sửa bằng **khóa bi quan** (`SELECT ... FOR UPDATE`) hoặc **khóa lạc quan** (cột `version` phải khớp khi update). Sẵn sàng **retry khi deadlock/serialization failure**.
+Bug đồng thời kinh điển là **read-modify-write**. Có thể sửa bằng một atomic `UPDATE ... WHERE`, **khóa bi quan** (`SELECT ... FOR UPDATE`), hoặc **optimistic concurrency** (cột `version` phải khớp). Deadlock và serialization failure là kết quả hợp lệ của concurrency control; retry **toàn transaction** với giới hạn và jitter, không retry riêng statement cuối.
 
 ---
 
-## Vấn đề N+1 & DataLoader
+## Vấn đề N+1 và batching theo request
 
-Bug hiệu năng kinh điển — nhận ra nó là dấu hiệu senior:
+N+1 là query amplification: một query lấy danh sách kéo theo một query cho mỗi phần tử.
 
 ```ts
 // ❌ N+1: 1 query for users + N queries for each user's posts = N+1 round-trips
@@ -188,22 +258,26 @@ Khi không eager load được (vd resolver GraphQL gọi từng item), **DataLo
 ```ts
 import DataLoader from 'dataloader';
 
-const userLoader = new DataLoader(async (ids: readonly string[]) => {
-  const users = await User.findAll({ where: { id: ids as string[] } });
-  const byId = new Map(users.map((u) => [u.id, u]));
-  return ids.map((id) => byId.get(id) ?? null); // MUST return in the same order as ids
-});
+function createUserLoader() {
+  return new DataLoader(async (ids: readonly string[]) => {
+    const users = await User.findAll({ where: { id: ids as string[] } });
+    const byId = new Map(users.map((u) => [u.id, u]));
+    return ids.map((id) => byId.get(id) ?? null); // phải cùng length/thứ tự với ids
+  });
+}
 
-const [a, b] = await Promise.all([userLoader.load('1'), userLoader.load('2')]); // 1 query
+// Tạo loader trong request context, không dùng singleton xuyên user/request.
+const userLoader = createUserLoader();
+const [a, b] = await Promise.all([userLoader.load('1'), userLoader.load('2')]);
 ```
 
-Cách bắt N+1: nếu *cùng* một query nổ trong vòng lặp, bạn có N+1.
+Cách bắt N+1: đếm query theo request/trace và kiểm query shape lặp theo số item. DataLoader cache mặc định nằm trong lifetime của loader; singleton có thể giữ dữ liệu stale hoặc làm rò dữ liệu theo authorization context, nên thường tạo một instance cho mỗi request.
 
 ---
 
 ## Mẫu repository — tách khỏi ORM
 
-Đừng rải lời gọi ORM khắp controller và service. Giấu truy cập dữ liệu sau một interface repository:
+Không rải lời gọi ORM vào controller. Repository hữu ích khi nó diễn đạt operation theo domain, cô lập transaction/query policy hoặc tạo test seam có giá trị:
 
 ```ts
 export interface UserRepository {
@@ -212,15 +286,21 @@ export interface UserRepository {
   create(data: NewUser): Promise<User>;
 }
 
-// One implementation today (Sequelize); swap to Prisma later without touching services.
+// Adapter hiện tại dùng Sequelize; interface không để lộ model Sequelize.
 export class SequelizeUserRepository implements UserRepository {
-  findById(id: string) { return UserModel.findByPk(id); }
-  findByEmail(email: string) { return UserModel.findOne({ where: { email } }); }
-  create(data: NewUser) { return UserModel.create(data); }
+  findById(id: string) {
+    return UserModel.findByPk(id);
+  }
+  findByEmail(email: string) {
+    return UserModel.findOne({ where: { email } });
+  }
+  create(data: NewUser) {
+    return UserModel.create(data);
+  }
 }
 ```
 
-Đây là thứ làm tầng service và clean architecture test được.
+Repository không bảo đảm đổi PostgreSQL sang MongoDB "chỉ thay adapter": transaction, consistency, pagination và query capability khác nhau có thể làm đổi use case. Đừng tạo generic repository `findAll/create/update` chỉ để bọc lại ORM; interface nên phản ánh nhu cầu domain như `reserveInventory` hoặc `findActiveUserByEmail`.
 
 ---
 
@@ -229,13 +309,27 @@ export class SequelizeUserRepository implements UserRepository {
 `OFFSET ... LIMIT` khiến DB quét rồi bỏ rất nhiều hàng — càng vào sâu càng chậm. **Phân trang keyset (cursor)** dùng khóa sắp xếp cuối cùng đã thấy, nhanh ở mọi độ sâu:
 
 ```ts
+import { Op } from 'sequelize';
+
 // page 1: no cursor; later pages pass the last item's (created_at, id)
 const rows = await Post.findAll({
-  where: cursor ? { createdAt: { [Op.lt]: cursor.createdAt } } : {},
-  order: [['createdAt', 'DESC'], ['id', 'DESC']],
+  where: cursor
+    ? {
+        [Op.or]: [
+          { createdAt: { [Op.lt]: cursor.createdAt } },
+          { createdAt: cursor.createdAt, id: { [Op.lt]: cursor.id } },
+        ],
+      }
+    : {},
+  order: [
+    ['createdAt', 'DESC'],
+    ['id', 'DESC'],
+  ],
   limit: 20,
 });
 ```
+
+Cursor phải chứa **đủ tuple sort** (`createdAt`, `id`), được encode/validate phía server và query phải dùng cùng ordering. Chỉ so `createdAt` sẽ bỏ sót hoặc lặp row khi nhiều bản ghi có cùng timestamp. Keyset ổn định cho next/previous navigation; offset vẫn hữu ích khi UI cần nhảy tới page số cụ thể và dataset nhỏ.
 
 ---
 
@@ -245,26 +339,35 @@ Mongoose là ODM chuẩn cho MongoDB — validation schema trên database vốn 
 
 ```ts
 import mongoose, { Schema, model } from 'mongoose';
-import bcrypt from 'bcrypt';
 
-interface IUser { email: string; password: string; profile?: { firstName?: string } }
+interface IUser {
+  email: string;
+  passwordHash: string;
+  profile?: { firstName?: string };
+}
 
-const userSchema = new Schema<IUser>({
-  email: { type: String, unique: true, required: true, index: true },
-  password: { type: String, required: true },
-  profile: { firstName: String },
-}, { timestamps: true });
-
-userSchema.pre('save', async function (next) {            // hook: hash before save
-  if (this.isModified('password')) this.password = await bcrypt.hash(this.password, 10);
-  next();
-});
+const userSchema = new Schema<IUser>(
+  {
+    email: {
+      type: String,
+      unique: true,
+      required: true,
+      lowercase: true,
+      trim: true,
+    },
+    passwordHash: { type: String, required: true, select: false },
+    profile: { firstName: String },
+  },
+  { timestamps: true }
+);
 
 export const User = model<IUser>('User', userSchema);
 await mongoose.connect(process.env.MONGO_URL!);
 ```
 
-Quyết định mô hình cốt lõi là **nhúng vs tham chiếu**: **nhúng** dữ liệu đọc cùng nhau và có giới hạn; **tham chiếu** dữ liệu dùng chung, lớn, hoặc vô hạn. **aggregation pipeline** là engine truy vấn/biến đổi nhiều giai đoạn; MongoDB hiện đại hỗ trợ **transaction** đa document.
+Hash password ở authentication use case trước khi truyền `passwordHash` vào repository; persistence hook dễ bị bỏ qua bởi `updateOne`/bulk operation và che một security side effect quan trọng. `unique: true` yêu cầu MongoDB tạo unique index, nhưng duplicate vẫn phải được bắt từ database error vì validation trước write luôn có race.
+
+Quyết định mô hình cốt lõi là **nhúng hay tham chiếu**: nhúng dữ liệu được đọc/cập nhật cùng nhau và có kích thước hữu hạn; tham chiếu khi lifecycle độc lập, được chia sẻ hoặc collection con tăng không giới hạn. Single-document write là atomic. Multi-document transaction tồn tại trên replica set/sharded cluster nhưng có chi phí; nó không thay thế schema design tốt.
 
 ---
 
@@ -279,7 +382,7 @@ await pool.query('SELECT * FROM users WHERE email = $1', [userInput]);
 // await pool.query(`SELECT * FROM users WHERE email = '${userInput}'`);
 ```
 
-Quy tắc senior, không ngoại lệ: **đừng bao giờ nối input người dùng vào query**.
+Invariant: không nối input người dùng vào SQL text. Với identifier hoặc sort direction không parameterize được, map từ enum/allowlist nội bộ sang fragment cố định.
 
 ---
 
@@ -291,41 +394,91 @@ Cho dữ liệu nóng, đọc nhiều, cache trong Redis (cache-aside; đầy đ
 import { Redis } from 'ioredis';
 const redis = new Redis(process.env.REDIS_URL);
 
-async function getUser(id: string) {
+interface UserDTO {
+  id: string;
+  email: string;
+  updatedAt: string;
+}
+
+async function getUser(id: string): Promise<UserDTO | null> {
   const cached = await redis.get(`user:${id}`);
-  if (cached) return JSON.parse(cached);                          // cache hit
-  const user = await User.findByPk(id);                          // miss → DB
-  await redis.set(`user:${id}`, JSON.stringify(user), 'EX', 3600); // TTL 1h
+  if (cached) return JSON.parse(cached) as UserDTO;
+
+  const model = await User.findByPk(id);
+  if (!model) return null;
+  const user: UserDTO = {
+    id: model.id,
+    email: model.email,
+    updatedAt: model.updatedAt.toISOString(),
+  };
+  await redis.set(`user:${id}`, JSON.stringify(user), 'EX', 300);
   return user;
 }
 
-// CRITICAL: invalidate on write, or you serve stale data
-async function updateUser(id: string, data: Partial<NewUser>) {
-  const user = await User.update(data, { where: { id } });
+async function updateUser(
+  id: string,
+  data: Partial<NewUser>
+): Promise<UserDTO | null> {
+  await User.update(data, { where: { id } });
   await redis.del(`user:${id}`);
-  return user;
+  // Đọc trực tiếp DB nếu response sau write cần read-your-writes.
+  const model = await User.findByPk(id);
+  return model
+    ? {
+        id: model.id,
+        email: model.email,
+        updatedAt: model.updatedAt.toISOString(),
+      }
+    : null;
 }
 ```
 
-Hai bẫy senior: luôn đặt **TTL**; phòng **cache stampede** khi key nóng hết hạn.
+TTL giới hạn thời gian stale nhưng không giải consistency. Pattern "write DB rồi delete cache" vẫn có race: một reader có thể đọc dữ liệu cũ trước commit và ghi lại cache sau lần delete. Với dữ liệu yêu cầu correctness mạnh, cân nhắc versioned key, write-through có transaction/outbox phù hợp, hoặc không cache. Với key nóng, coalesce request/lock ngắn để tránh cache stampede; luôn theo dõi hit rate, latency và eviction thay vì coi cache là mặc định.
 
 ---
 
 ## SQL vs NoSQL — chọn có cân nhắc
 
-| Aspect | PostgreSQL (SQL) | MongoDB (NoSQL) |
-|---|---|---|
-| Model | Relational | Document |
-| Best for | Structured data, strong consistency | Flexible/evolving schema |
-| Transactions | Full ACID | Multi-document (newer) |
-| Relationships | Foreign keys, joins | Embedding / references |
-| Schema | Rigid (a strength) | Flexible (a tradeoff) |
+| Khía cạnh          | PostgreSQL                             | MongoDB                                                                              |
+| ------------------ | -------------------------------------- | ------------------------------------------------------------------------------------ |
+| Mô hình            | quan hệ, constraint và join            | document, embedding và reference                                                     |
+| Atomicity tự nhiên | transaction trên nhiều row/table       | một document; multi-document transaction khi cần                                     |
+| Integrity          | foreign key, unique/check constraint   | schema validation + unique/index; integrity liên collection thường ở app/transaction |
+| Query evolution    | SQL và planner mạnh cho quan hệ/ad-hoc | aggregation mạnh, nhưng schema nên bám access pattern                                |
+| Trade-off          | migration và normalization cần kỷ luật | duplication/staleness và document growth cần quản lý                                 |
 
-Kinh nghiệm senior: **mặc định PostgreSQL** cho đa số app nghiệp vụ; dùng MongoDB khi schema thật sự linh hoạt hoặc dạng document.
+Khuyến nghị mặc định có điều kiện: PostgreSQL thường phù hợp khi domain có quan hệ, invariant và báo cáo chưa biết hết từ đầu. Chọn MongoDB khi aggregate document và access pattern rõ ràng đem lại lợi ích cụ thể. "Schema linh hoạt" không có nghĩa là không cần schema; cả hai lựa chọn đều cần migration và validation strategy.
 
 ---
 
-## 5. Dự án thực hành
+## Failure modes và contract với API
+
+| Failure mode             | Triệu chứng                             | Boundary chịu trách nhiệm           | Cách kiểm chứng                                                |
+| ------------------------ | --------------------------------------- | ----------------------------------- | -------------------------------------------------------------- |
+| Pool exhaustion          | API chậm dù query riêng nhanh           | deployment + pool config            | metric waiting count, acquire timeout, load test nhiều replica |
+| Lost update/oversell     | hai response thành công nhưng state sai | use case + database constraint/lock | concurrent integration test bằng barrier                       |
+| N+1                      | latency/query count tăng theo số item   | query service/resolver              | query counter theo request và dataset tăng dần                 |
+| Cursor thiếu tie-breaker | item lặp hoặc biến mất giữa page        | API pagination contract             | nhiều row cùng timestamp, insert xen giữa hai lần đọc          |
+| Cache stale              | GET sau update trả dữ liệu cũ           | cache policy                        | race test reader/writer và TTL metric                          |
+| Migration khóa bảng      | deploy timeout hàng loạt                | migration/release process           | chạy trên bản sao dữ liệu gần production, quan sát lock        |
+
+### Map lỗi database thành HTTP
+
+- Unique constraint/domain conflict → `409 Conflict` với code ổn định như `EMAIL_ALREADY_EXISTS`.
+- Optimistic version mismatch → `409` hoặc `412 Precondition Failed` nếu dùng `If-Match`/ETag.
+- Validation representation → `422`; database constraint vẫn là lưới an toàn cuối, không thay input validation.
+- Pool acquire timeout/database unavailable → `503 Service Unavailable`; không trả raw driver error.
+- Query deadline vượt quá → `504` chỉ khi service này đóng vai gateway tới upstream; với DB nội bộ thường trả `503`/`500` theo contract và ghi cause chính xác.
+
+Frontend cần biết pagination là snapshot ổn định hay eventual; cursor có hết hạn không; mutation có hỗ trợ retry/idempotency không; và optimistic UI rollback theo error code nào. Không để UI suy luận consistency từ việc "request trả 200".
+
+### Migration như một thay đổi phân tán
+
+App cũ và app mới có thể chạy đồng thời trong rolling deploy. Dùng **expand → migrate/backfill → contract**: thêm schema tương thích ngược, deploy code đọc/ghi được cả hai, backfill có checkpoint, chuyển traffic/đo, rồi mới xóa cột cũ ở release sau. Migration destructive trong cùng deploy làm rollback application trở nên vô nghĩa.
+
+---
+
+## Dự án thực hành
 
 1. Thiết kế & cài schema SQL: mô hình `User`, `Post`, `Comment` với quan hệ và index đúng, trên Postgres Docker.
 
@@ -339,23 +492,47 @@ Kinh nghiệm senior: **mặc định PostgreSQL** cho đa số app nghiệp v�
 
 6. Chiến lược caching: thêm cache-aside, đo độ trễ, invalidate khi update; thêm TTL và lập luận về stampede.
 
-Bài tập thêm: đổi offset sang keyset và benchmark; demo SQL injection rồi sửa; mô hình `orders` nhúng line item trong MongoDB.
+Bài tập thêm: đổi offset sang keyset tuple và benchmark; demo SQL injection trong môi trường local cô lập rồi sửa bằng parameter; mô hình `orders` nhúng line item trong MongoDB và giải thích giới hạn kích thước/lifecycle.
+
+**Tiêu chí hoàn thành:** test chạy ít nhất 20 transfer đồng thời và chứng minh tổng balance được bảo toàn; query list không vượt query budget cố định; cursor không mất item có cùng timestamp; pool acquire có timeout; migration có đường rollback/forward-fix; cache test ghi rõ mức staleness chấp nhận được.
 
 ---
 
-## 6. Checklist senior
+## Checklist trước khi ship
 
 - Mọi cột lọc/join/sort có index; composite đúng thứ tự.
 - Cỡ pool hợp lý; không rò kết nối.
 - Write nhiều bước có transaction; read-modify-write có khóa.
 - Không N+1 ở hot path.
-- Truy cập dữ liệu sau repository.
+- HTTP không gọi ORM trực tiếp; transaction/query boundary được đặt theo use case.
 - Input parameterized; cache có TTL và invalidate khi write.
+- Constraint quan trọng tồn tại ở database, không chỉ trong validation code.
+- Migration tương thích rolling deploy và đã thử trên dataset gần production.
+
+## Nếu chỉ nhớ năm điều
+
+- Data model bắt đầu từ invariant và access pattern, không bắt đầu từ tên ORM.
+- Index phải phục vụ query shape đã đo và luôn có write/storage cost.
+- Pool là budget nhân với số replica; queue trong pool cũng là latency.
+- Transaction chỉ atomic trong boundary của database và vẫn có thể cần retry.
+- Cache, cursor và error mapping đều là một phần API contract với frontend.
 
 ---
 
 ## Phần tiếp theo
 
-API của bạn giờ lưu dữ liệu đúng và nhanh.
+Data layer giờ có boundary để bảo vệ concurrency, capacity và contract. Ở **Phần 5**, ta đặt authentication và authorization lên trên boundary đó mà không biến token thành nguồn sự thật duy nhất.
 
-Ở **Phase 5**, ta làm cho nó **an toàn để mở ra**: xác thực, phân quyền, hash mật khẩu, và các thực hành bảo mật.
+Đọc tiếp: [Authentication và API Security](/blog/node-05-authentication-and-security/).
+
+## Tài liệu chính thức
+
+- [PostgreSQL: Transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html)
+- [PostgreSQL: Indexes](https://www.postgresql.org/docs/current/indexes.html)
+- [PostgreSQL: Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html)
+- [node-postgres: Pooling](https://node-postgres.com/features/pooling)
+- [node-postgres: Transactions](https://node-postgres.com/features/transactions)
+- [Sequelize: Transactions](https://sequelize.org/docs/v6/other-topics/transactions/)
+- [MongoDB: Data modeling best practices](https://www.mongodb.com/docs/manual/data-modeling/best-practices/)
+- [MongoDB: Transactions](https://www.mongodb.com/docs/manual/core/transactions/)
+- [Redis: Client-side caching and caching patterns](https://redis.io/docs/latest/develop/use/client-side-caching/)

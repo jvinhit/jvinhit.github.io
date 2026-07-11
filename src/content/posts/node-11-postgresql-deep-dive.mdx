@@ -1,261 +1,496 @@
 ---
-title: 'Node.js Super Senior · Phase 11 — PostgreSQL Deep Dive'
-description: 'Bonus Phase 11: go deep on PostgreSQL from Node — data modeling, the right index per query, EXPLAIN ANALYZE, transactions and isolation levels, JSONB, connection pooling with pg, and the concurrency bugs that bite seniors.'
+title: 'Node.js Production Engineering 11 — PostgreSQL Chuyên sâu'
+description: 'Thiết kế PostgreSQL 18 cho production: invariant trong schema, index theo workload, đọc EXPLAIN, transaction đúng khi đồng thời, keyset pagination, pooling, MVCC và vận hành từ Node.js.'
 pubDate: 2026-06-09
-tags: [nodejs, postgresql, database, sql, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, postgresql, database, sql, production-engineering]
 series: nodejs
 seriesOrder: 11
 draft: false
 ---
 
-Đây là **Bonus Phase 11**, phần đầu trong ba deep dive nối tiếp mười phase cốt lõi — PostgreSQL, Prisma, rồi NestJS. Phase 4 cho bạn bề rộng về database SQL và NoSQL. Giờ ta đi sâu vào database mà đa số backend Node senior thực sự chạy: **PostgreSQL**. Junior viết query trả đúng dòng; senior viết query vẫn đúng khi đồng thời và nhanh khi bảng lớn tới hàng triệu dòng.
+Một API chuyển tiền có thể vượt toàn bộ unit test nhưng vẫn tạo số dư âm khi hai request đến cùng lúc. Một query có index vẫn có thể chậm hơn `Seq Scan`. Một transaction đã `COMMIT` vẫn có thể để hệ thống thiếu sự kiện nếu ứng dụng gửi message sau đó rồi crash.
+
+Ba tình huống này có chung một bài học: **database không chỉ là nơi lưu object; nó là nơi thực thi invariant dưới concurrency**. Bài này dùng PostgreSQL 18 và `node-postgres` để xây mental model đó từ schema tới vận hành.
+
+Sau khi hoàn thành, bạn có thể:
+
+- đặt invariant quan trọng vào constraint thay vì chỉ tin application code;
+- thiết kế index từ query và kiểm chứng bằng `EXPLAIN (ANALYZE, BUFFERS)`;
+- chọn isolation level, lock và retry theo failure mode cụ thể;
+- cài transfer idempotent, không âm tiền và chịu được request đồng thời;
+- phân trang ổn định bằng cursor ghép;
+- sizing pool, quan sát lock/bloat và kiểm thử concurrency có chủ đích.
+
+> Baseline của bài: PostgreSQL 18.x, Node.js 24 LTS và `pg`. Khi dùng bản khác, đối chiếu release note trước khi áp dụng option vận hành.
 
 ---
 
-## Vì sao PostgreSQL
+## Mental model: bốn lớp bảo vệ dữ liệu
 
-Postgres là lựa chọn senior mặc định cho dữ liệu quan hệ: mã nguồn mở, tuân chuẩn, và gói đủ tính năng như một danh sách ước — transaction ACID thật, kiểu phong phú, đánh index mạnh, full-text search, window function, và `LISTEN/NOTIFY` cho pub/sub.
+Hãy đọc một đường ghi theo bốn lớp:
 
-```bash
-docker run --name pg -e POSTGRES_PASSWORD=secret -p 5432:5432 -d postgres:17
+```text
+HTTP validation
+    ↓  hình dạng input hợp lệ
+application policy
+    ↓  use case được phép
+database constraint + transaction
+    ↓  invariant vẫn đúng khi có concurrency/crash
+durable side effect
+       outbox → broker/email/search index
 ```
 
-> Ghi chú senior: mặc định chọn Postgres; chỉ chọn cái khác khi bạn nêu được đúng tính chất nó thiếu.
+Validation ở HTTP không thay thế constraint. Transaction không tự bảo đảm business invariant. `COMMIT` database cũng không làm một lệnh gọi HTTP hoặc publish message bên ngoài trở nên atomic.
+
+Các invariant mẫu trong bài:
+
+1. email không trùng khi so sánh không phân biệt hoa thường;
+2. số dư không âm;
+3. một idempotency key chỉ mô tả đúng một transfer;
+4. hai tài khoản của transfer phải khác nhau;
+5. một trang feed không bỏ sót item có cùng timestamp.
 
 ---
 
-## Mô hình hóa dữ liệu & chuẩn hóa
+## Schema là executable policy
 
-Thiết kế schema tốt là hiệu năng rẻ nhất bạn từng mua. Chuẩn hóa về **3NF** mặc định — mọi cột non-key phụ thuộc vào key, toàn bộ key, và chỉ key.
+Chạy local bằng image major đã ghim; trong CI/production nên ghim cả patch hoặc digest:
+
+```bash
+docker run --name pg18 \
+  -e POSTGRES_PASSWORD=local-only \
+  -p 127.0.0.1:5432:5432 \
+  -d postgres:18-alpine
+```
+
+`citext` là extension, vì vậy migration phải bật nó trước khi dùng:
 
 ```sql
+CREATE EXTENSION IF NOT EXISTS citext;
+
 CREATE TABLE users (
   id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  email       citext UNIQUE NOT NULL,          -- case-insensitive text
+  email       citext NOT NULL UNIQUE,
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE posts (
-  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  author_id   bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  title       text NOT NULL,
-  body        text NOT NULL,
-  status      text NOT NULL DEFAULT 'draft'
-              CHECK (status IN ('draft','published','archived')),
+  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  author_id    bigint NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  title        text NOT NULL CHECK (length(title) BETWEEN 1 AND 200),
+  body         text NOT NULL,
+  status       text NOT NULL DEFAULT 'draft'
+               CHECK (status IN ('draft', 'published', 'archived')),
+  meta         jsonb NOT NULL DEFAULT '{}'::jsonb,
   published_at timestamptz,
-  created_at  timestamptz NOT NULL DEFAULT now()
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  CHECK ((status = 'published') = (published_at IS NOT NULL))
+);
+
+CREATE TABLE accounts (
+  id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id      bigint NOT NULL REFERENCES users(id),
+  balance_cents bigint NOT NULL DEFAULT 0 CHECK (balance_cents >= 0)
+);
+
+CREATE TABLE transfers (
+  id               uuid PRIMARY KEY,
+  idempotency_key  text NOT NULL UNIQUE,
+  from_account_id  bigint NOT NULL REFERENCES accounts(id),
+  to_account_id    bigint NOT NULL REFERENCES accounts(id),
+  amount_cents     bigint NOT NULL CHECK (amount_cents > 0),
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  CHECK (from_account_id <> to_account_id)
 );
 ```
 
-Thói quen senior trong DDL đó: `bigint` khóa `bigint`, `timestamptz` không phải `timestamp`, `citext` cho email, `CHECK` thay vì tin app, và `ON DELETE CASCADE` để ý định tham chiếu rõ ràng.
+Điểm thiết kế cần nói rõ:
 
-> Phi chuẩn hóa **có chủ ý và về sau** — chỉ khi một đường đọc đã đo đòi hỏi, không bao giờ là điểm bắt đầu.
+- `timestamptz` phù hợp cho một thời điểm tuyệt đối. Lịch “9 giờ sáng theo múi giờ cửa hàng” cần lưu thêm timezone/quy tắc nghiệp vụ; không có một kiểu thời gian đúng cho mọi bài toán.
+- `citext` tiện cho email nhưng có semantics/cost riêng. Với hệ thống đa locale, hãy chốt chính sách canonicalization và collation thay vì mặc định mọi chuỗi giống email.
+- `ON DELETE RESTRICT` ở `posts` thể hiện quyết định không âm thầm xóa nội dung. `CASCADE` chỉ đúng khi vòng đời của child thực sự thuộc parent.
+- constraint là hàng rào cuối. Application vẫn cần trả lỗi domain dễ hiểu khi constraint từ chối write.
 
 ---
 
-## Index — đúng loại cho mỗi query
+## Index bắt đầu từ query, không từ danh sách cột
 
-Index là một đánh đổi: đọc nhanh hơn đổi lấy ghi chậm hơn và tốn đĩa hơn. Kỹ năng senior là khớp loại index với pattern truy cập.
+Không có quy tắc “cột filter/join/sort nào cũng phải index”. Một index đáng tồn tại khi workload đủ quan trọng và planner có thể dùng nó hiệu quả hơn chi phí duy trì.
 
-| Index | Dùng cho |
-| --- | --- |
-| **B-tree** (default) | equality & range: `=`, `<`, `>`, `BETWEEN`, `ORDER BY` |
-| **GIN** | `JSONB`, arrays, full-text (`@>`, `?`, `@@`) |
-| **GiST** | geometry, ranges, nearest-neighbour |
-| **BRIN** | huge, naturally-ordered tables (time-series) |
-| **Hash** | equality only, rarely worth it over B-tree |
+Feed dưới đây lọc equality rồi sắp xếp theo thời gian và id:
 
 ```sql
--- Composite index: column order matters — most selective / leading filter first
-CREATE INDEX idx_posts_author_status ON posts (author_id, status);
+SELECT id, title, published_at
+FROM posts
+WHERE author_id = $1
+  AND status = 'published'
+ORDER BY published_at DESC, id DESC
+LIMIT 20;
+```
 
--- Partial index: index only the rows you actually query
-CREATE INDEX idx_posts_published ON posts (published_at DESC)
+Index khớp access path:
+
+```sql
+CREATE INDEX idx_posts_author_feed
+  ON posts (author_id, published_at DESC, id DESC)
+  INCLUDE (title)
   WHERE status = 'published';
 
--- Covering index: satisfy a query from the index alone (index-only scan)
-CREATE INDEX idx_posts_list ON posts (author_id) INCLUDE (title, created_at);
+CREATE INDEX idx_posts_meta_gin
+  ON posts USING gin (meta jsonb_path_ops);
 
--- GIN for JSONB containment
-CREATE INDEX idx_posts_meta ON posts USING gin (meta jsonb_path_ops);
+CREATE INDEX idx_accounts_owner
+  ON accounts (owner_id);
 ```
 
-> Ghi chú senior: index ghép `(a, b)` phục vụ query lọc theo `a` hoặc `a,b` — nhưng **không** phục vụ `b` đứng một mình. Sắp cột theo cách bạn lọc.
+Thứ tự composite index không đơn giản là “cột selectivity cao nhất trước”. Hãy ưu tiên:
 
----
+1. equality predicate dẫn đường;
+2. range hoặc thứ tự cần tránh sort;
+3. tie-breaker duy nhất cho pagination;
+4. `INCLUDE` chỉ cho cột cần cover, vì index rộng làm write và cache đắt hơn.
 
-## Đọc plan: EXPLAIN ANALYZE
+Một partial index chỉ được dùng khi planner chứng minh predicate của query phù hợp điều kiện `WHERE` của index. Query dùng parameter hoặc biểu thức khác hình dạng có thể không match như bạn kỳ vọng.
 
-Đừng đoán vì sao query chậm — hỏi planner:
+### Đọc plan thay vì săn `Index Scan`
 
 ```sql
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT id, title FROM posts
-WHERE author_id = 42 AND status = 'published'
-ORDER BY published_at DESC LIMIT 20;
+EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS)
+SELECT id, title, published_at
+FROM posts
+WHERE author_id = 42
+  AND status = 'published'
+ORDER BY published_at DESC, id DESC
+LIMIT 20;
 ```
 
-Senior tìm gì:
+Đọc từ dưới lên và kiểm tra:
 
-- `Seq Scan` trên bảng lớn trong query có lọc → thiếu index.
-- tốt; index đang được dùng.
-- ước lượng vs thực tế lệch xa → thống kê cũ; chạy `ANALYZE`.
-- bước `Sort` tràn ra đĩa → cân nhắc index khớp `ORDER BY`.
+- estimated rows so với actual rows: lệch lớn thường chỉ ra statistics hoặc correlation chưa được mô hình hóa;
+- `actual time`, `loops`, rows removed và buffer hit/read;
+- sort có spill ra disk hay không;
+- index scan còn nhiều heap fetch hay không;
+- lock/I/O wait nằm ngoài CPU time của plan như thế nào.
+
+`Seq Scan` không tự động là lỗi. Với bảng nhỏ hoặc query lấy phần lớn bảng, đọc tuần tự có thể rẻ hơn nhảy qua index. Mục tiêu là latency/resource phù hợp SLO, không phải ép planner hiện đúng tên node.
+
+> `EXPLAIN ANALYZE` thực thi statement. Với write query trên production, dùng transaction rollback hoặc replica/anonymized staging và hiểu rõ side effect trước khi chạy.
 
 ---
 
-## Transaction & mức cô lập
+## Isolation level: transaction thấy thế giới nào
 
-Transaction là tất-cả-hoặc-không. Nhưng nó ngăn *những* bất thường nào phụ thuộc vào **mức cô lập** — chủ đề đa số dev backend không thật sự học.
+PostgreSQL triển khai ba mức hữu ích:
 
-| Level | Ngăn | Cho phép |
-| --- | --- | --- |
-| `READ COMMITTED` (default) | dirty reads | non-repeatable & phantom reads |
-| `REPEATABLE READ` | + non-repeatable reads | (in PG) blocks phantoms too |
-| `SERIALIZABLE` | everything — as if serial | may abort with a serialization error |
+| Mức               | Snapshot và failure mode chính                                                         | Khi cân nhắc                                         |
+| ----------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `READ COMMITTED`  | mỗi statement có snapshot mới; có non-repeatable read                                  | CRUD ngắn, atomic update                             |
+| `REPEATABLE READ` | một snapshot ổn định; PostgreSQL không cho phantom read nhưng vẫn có anomaly cần abort | báo cáo/logic cần snapshot ổn định                   |
+| `SERIALIZABLE`    | Serializable Snapshot Isolation; có thể abort `40001`                                  | invariant nhiều bước khó diễn đạt bằng một statement |
+
+Serializable không có nghĩa “không cần nghĩ về concurrency”. Nó đổi anomaly âm thầm thành transaction bị hủy; **ứng dụng phải retry toàn bộ transaction**.
+
+Ngoài `40001` (`serialization_failure`), deadlock có SQLSTATE `40P01`. Retry chỉ an toàn khi toàn bộ side effect nằm trong transaction hoặc được bảo vệ bởi idempotency.
+
+---
+
+## Transfer đúng: lock order, constraint, idempotency, retry
+
+Đầu tiên, validate ngoài transaction để loại input vô nghĩa; database vẫn giữ constraint làm hàng rào cuối:
 
 ```ts
-import { Pool } from 'pg';
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+interface TransferCommand {
+  id: string;
+  idempotencyKey: string;
+  fromAccountId: string;
+  toAccountId: string;
+  amountCents: bigint;
+}
 
-async function transfer(from: number, to: number, cents: number) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
-    await client.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [cents, from]);
-    await client.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [cents, to]);
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err; // on a 40001 serialization_failure, the caller should retry
-  } finally {
-    client.release(); // ALWAYS release back to the pool
+function validateTransfer(cmd: TransferCommand): void {
+  if (cmd.amountCents <= 0n) throw new Error('amountCents must be positive');
+  if (cmd.fromAccountId === cmd.toAccountId)
+    throw new Error('accounts must differ');
+  if (!cmd.idempotencyKey || cmd.idempotencyKey.length > 200) {
+    throw new Error('invalid idempotency key');
   }
 }
 ```
 
-> Ghi chú senior: dưới `SERIALIZABLE`, Postgres có thể hủy transaction với mã `40001`. Đó không phải lỗi — là engine bảo bạn **thử lại**. Bọc transaction kiểu này trong vòng retry nhỏ.
-
-### Lỗi mất cập nhật
-
-Đọc-sửa-ghi qua hai request âm thầm mất dữ liệu. Sửa bằng cách khóa dòng hoặc tính ngay trong SQL:
-
-```sql
--- Pessimistic lock: hold the row until COMMIT
-SELECT balance FROM accounts WHERE id = $1 FOR UPDATE;
-
--- Or avoid the round trip entirely — atomic in one statement
-UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance >= $1;
-```
-
----
-
-## JSONB — quan hệ gặp tài liệu
-
-`JSONB` cho bạn lưu dữ liệu không schema bên trong bảng quan hệ — tốt cho metadata linh hoạt, cài đặt, hay payload sự kiện.
-
-```sql
-ALTER TABLE posts ADD COLUMN meta jsonb NOT NULL DEFAULT '{}';
-
--- containment query, accelerated by the GIN index from 11.2
-SELECT id FROM posts WHERE meta @> '{"featured": true}';
-
--- extract a value; ->> returns text, -> returns jsonb
-SELECT meta->>'source' AS source FROM posts WHERE id = $1;
-```
-
-> Đừng dùng `JSONB` làm cớ né mô hình hóa. Nếu bạn liên tục query hay join trên một field, nâng nó thành cột thật, có index.
-
----
-
-## Pool kết nối với `pg`
-
-Mở kết nối Postgres tốn kém (server tạo một process mỗi kết nối). **Luôn** dùng pool, và tham số hóa mọi query để diệt SQL injection:
+Helper retry tạo một transaction mới cho mỗi lần thử:
 
 ```ts
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
+import { setTimeout as sleep } from 'node:timers/promises';
 
-export const pool = new Pool({
+const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  max: 10,                       // tune to (cores × 2..4), not "bigger is better"
-  idleTimeoutMillis: 30_000,
+  max: 10,
   connectionTimeoutMillis: 5_000,
+  idleTimeoutMillis: 30_000,
+  application_name: 'payments-api',
 });
 
-// Parameterized — NEVER string-concatenate user input into SQL
-const { rows } = await pool.query(
-  'SELECT id, title FROM posts WHERE author_id = $1 LIMIT $2',
-  [authorId, 20],
-);
+function sqlState(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null && 'code' in error
+    ? String(error.code)
+    : undefined;
+}
+
+async function withSerializableRetry<T>(
+  work: (client: PoolClient) => Promise<T>,
+  maxAttempts = 4
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      const result = await work(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      const retryable = ['40001', '40P01'].includes(sqlState(error) ?? '');
+      if (!retryable || attempt >= maxAttempts) throw error;
+      await sleep(25 * 2 ** (attempt - 1) + Math.random() * 50);
+    } finally {
+      client.release();
+    }
+  }
+}
 ```
 
-> Ghi chú senior: trong serverless hay fan-out cao, đặt **PgBouncer** (transaction pooling) trước Postgres — hàng nghìn kết nối app gộp về vài kết nối thật.
+Use case transfer:
+
+```ts
+async function transfer(cmd: TransferCommand) {
+  validateTransfer(cmd);
+
+  return withSerializableRetry(async (client) => {
+    const inserted = await client.query<{
+      id: string;
+      from_account_id: string;
+      to_account_id: string;
+      amount_cents: string;
+    }>(
+      `INSERT INTO transfers
+         (id, idempotency_key, from_account_id, to_account_id, amount_cents)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (idempotency_key) DO NOTHING
+       RETURNING id, from_account_id, to_account_id, amount_cents`,
+      [
+        cmd.id,
+        cmd.idempotencyKey,
+        cmd.fromAccountId,
+        cmd.toAccountId,
+        cmd.amountCents.toString(),
+      ]
+    );
+
+    if (inserted.rowCount === 0) {
+      const existing = await client.query(
+        `SELECT id, from_account_id, to_account_id, amount_cents
+         FROM transfers WHERE idempotency_key = $1`,
+        [cmd.idempotencyKey]
+      );
+      const row = existing.rows[0];
+      if (
+        !row ||
+        row.from_account_id !== cmd.fromAccountId ||
+        row.to_account_id !== cmd.toAccountId ||
+        BigInt(row.amount_cents) !== cmd.amountCents
+      ) {
+        throw new Error('idempotency key was reused with a different command');
+      }
+      return { transferId: row.id, replayed: true };
+    }
+
+    // Lock both rows in a deterministic order to reduce opposite-direction deadlocks.
+    const accounts = await client.query<{ id: string; balance_cents: string }>(
+      `SELECT id, balance_cents
+       FROM accounts
+       WHERE id = ANY($1::bigint[])
+       ORDER BY id
+       FOR UPDATE`,
+      [[cmd.fromAccountId, cmd.toAccountId]]
+    );
+    if (accounts.rowCount !== 2) throw new Error('account not found');
+
+    const debit = await client.query(
+      `UPDATE accounts
+       SET balance_cents = balance_cents - $1
+       WHERE id = $2 AND balance_cents >= $1
+       RETURNING id`,
+      [cmd.amountCents.toString(), cmd.fromAccountId]
+    );
+    if (debit.rowCount !== 1) throw new Error('insufficient funds');
+
+    const credit = await client.query(
+      `UPDATE accounts
+       SET balance_cents = balance_cents + $1
+       WHERE id = $2
+       RETURNING id`,
+      [cmd.amountCents.toString(), cmd.toAccountId]
+    );
+    if (credit.rowCount !== 1) throw new Error('destination account not found');
+
+    return { transferId: cmd.id, replayed: false };
+  });
+}
+```
+
+Điểm đáng chú ý:
+
+- `bigint` của `pg` mặc định được trả về dạng string; chuyển sang `BigInt` có chủ đích, không đi qua `number` gây mất chính xác.
+- cùng idempotency key và cùng payload trả kết quả cũ; cùng key nhưng payload khác bị từ chối.
+- constraint `balance_cents >= 0` vẫn bảo vệ nếu một code path khác quên conditional update.
+- email/webhook không chạy bên trong transaction. Ghi một outbox row trong cùng transaction rồi worker publish sau commit.
 
 ---
 
-## MVCC, VACUUM & phình
+## Keyset pagination không bỏ sót tie
 
-Khái niệm giải thích hành vi đồng thời của Postgres là **MVCC**: `UPDATE` không ghi đè — nó ghi **phiên bản mới** và đánh dấu cái cũ chết, nên reader không chặn writer và ngược lại.
-
-Hệ quả senior tính đến: phiên bản chết dồn lại thành **bloat**, và `VACUUM` (thường autovacuum) thu hồi.
-
-- bảng thay đổi nhiều cần **autovacuum chỉnh mạnh hơn**.
-- transaction chạy lâu giữ snapshot cũ và **chặn vacuum** cả DB.
-- `VACUUM` thu hồi để tái dùng; `VACUUM FULL` viết lại bảng và trả đĩa cho OS nhưng khóa độc quyền.
-
-> Giám sát bằng công cụ sẵn có: `pg_stat_statements` ....
-
----
-
-## SQL nâng cao senior thực dùng
-
-Đẩy logic vào SQL thường tốt hơn lấy dòng rồi lặp trong Node.
+Nếu order là `(published_at DESC, id DESC)`, cursor cũng phải chứa cả hai field:
 
 ```sql
--- Upsert: insert or update atomically (no read-modify-write race)
-INSERT INTO users (email, name) VALUES ($1, $2)
-ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
-RETURNING id;                                   -- RETURNING gives you the row back
-
--- Window function: rank posts per author WITHOUT collapsing rows
-SELECT id, author_id, title,
-       row_number() OVER (PARTITION BY author_id ORDER BY created_at DESC) AS rn
-FROM posts;
-
--- CTE for readable multi-step queries (and recursion for trees/graphs)
-WITH recent AS (
-  SELECT * FROM posts WHERE created_at > now() - interval '7 days'
-)
-SELECT author_id, count(*) FROM recent GROUP BY author_id;
+SELECT id, title, published_at
+FROM posts
+WHERE author_id = $1
+  AND status = 'published'
+  AND (
+    $2::timestamptz IS NULL
+    OR (published_at, id) < ($2::timestamptz, $3::bigint)
+  )
+ORDER BY published_at DESC, id DESC
+LIMIT $4;
 ```
 
-Hai công cụ senior nữa:
+Chỉ lọc `published_at < cursorTime` sẽ bỏ các row có cùng timestamp. Cursor public nên được encode có version; nếu việc sửa sort key được phép, hãy quyết định rõ snapshot semantics hoặc chấp nhận item di chuyển giữa trang.
 
-- **full-text search** — cho tìm kiếm thật mà không cần engine riêng.
-- **`LISTEN`/`NOTIFY`** — pub/sub nhẹ trong Postgres; một write có thể báo cho listener Node real-time.
-- **advisory lock** — khóa cấp app cho việc như "chỉ một worker chạy cron này".
-
-> Với phân tích đắt khi tính trực tiếp, **materialized view** cache kết quả và bạn `REFRESH` theo lịch. Với bảng hàng trăm triệu dòng, dùng **partitioning**.
+Offset vẫn phù hợp cho tập nhỏ, trang admin cần nhảy tới số trang và workload đã đo chấp nhận được. Keyset đổi lại không có random page và cần sort order ổn định.
 
 ---
 
-## Lời cảnh báo của sư phụ
+## JSONB, full-text và LISTEN/NOTIFY: biết ranh giới
 
-- **`timestamptz`, luôn luôn.** Lưu giờ local không có zone là lỗi chờ một lần đổi DST.
-- **`SELECT *` trong code production là mùi xấu** — nêu tên cột để có index-only scan và app sống sót qua đổi schema.
-- **Index khóa ngoại.** Postgres tự index PK nhưng **không** index cột FK — FK không index làm `ON DELETE` và join bò.
-- **Migration, không sửa tay.** Mọi đổi schema đi qua migration có version, đảo ngược được.
+```sql
+SELECT id
+FROM posts
+WHERE meta @> '{"featured": true}'::jsonb;
+
+SELECT id, title
+FROM posts
+WHERE to_tsvector('simple', title || ' ' || body)
+      @@ websearch_to_tsquery('simple', $1);
+```
+
+JSONB hợp với metadata linh hoạt; field tham gia invariant, FK hoặc query nóng thường nên trở thành cột rõ kiểu. Full-text của PostgreSQL đủ mạnh cho nhiều hệ thống trước khi cần search engine riêng.
+
+`LISTEN/NOTIFY` là tín hiệu best-effort, payload nhỏ, không có replay và không thay message broker. Pattern an toàn là lưu state/outbox trước; notification chỉ đánh thức consumer đi đọc dữ liệu bền.
 
 ---
 
-## Thực hành
+## Pooling và shutdown
 
-1. Mô hình blog trong 3NF với khóa, constraint, FK đúng.
-2. Viết query chậm, chạy `EXPLAIN ANALYZE`, thêm index đúng, xác nhận `Seq Scan` thành `Index Scan`.
-3. Tái hiện lost update với hai client đồng thời, rồi sửa bằng `FOR UPDATE` và lần nữa bằng một `UPDATE` nguyên tử.
+Pool là hàng đợi concurrency tới database. Đặt `max` theo ngân sách toàn hệ thống:
+
+```text
+replica tối đa × pool.max
+  + migration/admin/worker headroom
+  ≤ connection budget của database
+```
+
+Pool quá lớn làm tăng context switching và tranh chấp trong PostgreSQL; pool quá nhỏ làm tăng queue time ở app. Đo cả hai phía trước khi đổi.
+
+```ts
+process.on('SIGTERM', async () => {
+  // Trước đó: readiness=false và HTTP server đã ngừng nhận request mới.
+  await pool.end();
+});
+```
+
+Với serverless hoặc replica fan-out cao, dùng pooler/proxy phù hợp. Transaction pooling có trade-off với session state, prepared statement và advisory lock; kiểm tra compatibility thay vì chỉ thêm PgBouncer rồi coi là xong.
 
 ---
 
-## Phần tiếp theo
+## MVCC, VACUUM và failure modes vận hành
 
-Giờ bạn thiết kế và vận hành được database quan hệ vẫn đúng và nhanh. Viết SQL tay là thiết yếu để *hiểu* — nhưng trong codebase TypeScript lớn bạn muốn type safety và migration mà không mất kiểm soát đó. Ở **Phase 12** ta phủ **Prisma** lên kiến thức Postgres này — một ORM type-safe mà schema, migration, và API query ánh xạ thẳng vào mọi thứ bạn vừa học.
+PostgreSQL update bằng cách tạo row version mới. Snapshot cũ cho reader nhất quán nhưng dead tuple cần autovacuum dọn.
+
+Theo dõi:
+
+- transaction mở lâu và `idle in transaction`;
+- dead tuples, autovacuum progress và table/index bloat;
+- lock wait/deadlock;
+- replication lag;
+- query fingerprint qua `pg_stat_statements`;
+- pool acquire time, query p95/p99 và serialization retry count ở Node.
+
+Các failure mode thường gặp:
+
+| Failure mode     | Biểu hiện                       | Hướng xử lý                                |
+| ---------------- | ------------------------------- | ------------------------------------------ |
+| missing index    | I/O/latency tăng theo dữ liệu   | plan + workload-specific index             |
+| over-index       | write/WAL/bloat tăng            | bỏ index không dùng sau chu kỳ quan sát    |
+| long transaction | vacuum bị giữ, lock kéo dài     | transaction ngắn, timeout, điều tra owner  |
+| connection storm | DB hết connection/CPU           | bounded pool, backpressure, pooler         |
+| retry storm      | CPU/lock tăng sau sự cố         | retry budget, exponential backoff + jitter |
+| unsafe migration | lock bảng hoặc code/schema lệch | expand → migrate data → contract           |
+
+Migration “rollback được” không phải lúc nào cũng khả thi. Với thay đổi dữ liệu lớn, forward fix và expand-contract thường an toàn hơn down migration phá dữ liệu.
+
+---
+
+## Kiểm thử và lab
+
+### Test cần có
+
+- property test: tổng tiền trước/sau transfer không đổi;
+- concurrency test: nhiều debit song song không tạo số dư âm;
+- idempotency test: 20 request cùng key chỉ tạo một transfer;
+- serialization test: ép `40001`, xác nhận retry chạy toàn transaction;
+- pagination test: nhiều post cùng `published_at` không thiếu/trùng;
+- migration test: chạy từ schema production gần nhất trên database mới và database có dữ liệu mẫu.
+
+### Lab: payment ledger tối thiểu
+
+Xây `POST /transfers` và `GET /posts` cursor-based trên PostgreSQL 18.
+
+Acceptance criteria:
+
+1. `accounts.balance_cents` có constraint không âm và transfer có unique idempotency key.
+2. 100 request đồng thời không làm âm tiền; tổng balance không đổi.
+3. replay cùng key/payload trả cùng transfer; key/payload khác trả `409`.
+4. transaction retry `40001`/`40P01` có giới hạn, backoff và metric.
+5. feed 1.000 row với nhiều timestamp trùng đi hết không thiếu/trùng.
+6. `EXPLAIN (ANALYZE, BUFFERS)` chứng minh index feed phục vụ query; báo cáo có before/after.
+7. shutdown đóng pool sau khi HTTP drain; test không còn open handle.
+
+---
+
+## Checklist production
+
+- [ ] Invariant quan trọng có constraint hoặc atomic statement ở database.
+- [ ] Transaction ngắn; external side effect đi qua outbox/idempotency.
+- [ ] Lock nhiều row theo thứ tự xác định.
+- [ ] Serializable/deadlock có bounded retry toàn transaction.
+- [ ] Index được biện minh bằng query + plan, không bằng cảm giác.
+- [ ] Cursor chứa toàn bộ sort key và tie-breaker duy nhất.
+- [ ] Pool có budget theo số replica và có acquire timeout/metric.
+- [ ] Có dashboard query latency, lock, retry, bloat và connection.
+- [ ] Migration dùng expand-contract và được thử trên dữ liệu gần production.
+
+---
+
+## Tài liệu chính thức
+
+- [PostgreSQL 18 — Concurrency Control](https://www.postgresql.org/docs/18/mvcc.html)
+- [PostgreSQL 18 — Transaction Isolation](https://www.postgresql.org/docs/18/transaction-iso.html)
+- [PostgreSQL 18 — Serialization Failure Handling](https://www.postgresql.org/docs/18/mvcc-serialization-failure-handling.html)
+- [PostgreSQL 18 — Using EXPLAIN](https://www.postgresql.org/docs/18/using-explain.html)
+- [PostgreSQL 18 — Indexes](https://www.postgresql.org/docs/18/indexes.html)
+- [PostgreSQL 18 — citext](https://www.postgresql.org/docs/18/citext.html)
+- [node-postgres — Pooling](https://node-postgres.com/features/pooling)
+
+Phần tiếp theo đưa cùng các invariant này qua Prisma 7. Mục tiêu không phải che SQL, mà là giữ type safety và migration workflow mà không đánh mất transaction semantics vừa xây.

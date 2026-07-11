@@ -1,146 +1,370 @@
 ---
-title: 'Node.js Super Senior · Phase 18 — Microservices & gRPC'
-description: 'Bonus Phase 18: vượt một process. Khi nào nên (và không nên) tách monolith, giao tiếp đồng bộ với gRPC + Protobuf, event bất đồng bộ qua message queue, API gateway, và xử lý lỗi phân tán (timeout, retry, circuit breaker).'
+title: 'Node.js Production Engineering 18 — Từ Modular Monolith đến Microservices'
+description: 'Tách service có kiểm soát: bounded context, data ownership, gRPC/Protobuf, deadline propagation, retry budget, outbox, saga, mTLS, observability và chiến lược migration.'
 pubDate: 2026-06-22
-tags: [nodejs, microservices, grpc, distributed, node_10]
+updatedDate: 2026-07-11
+tags:
+  [
+    nodejs,
+    microservices,
+    grpc,
+    distributed-systems,
+    architecture,
+    production-engineering,
+  ]
 series: nodejs
 seriesOrder: 18
 draft: false
 ---
 
-Đây là **Bonus Phase 18**. Đến giờ mọi thứ chạy trong một process (kể cả NestJS Phase 14). Khi tổ chức và hệ thống lớn lên, ta tách thành **microservices** — nhiều service nhỏ deploy độc lập. Đây là quyết định kiến trúc *đắt* — phần này nói thẳng cả lợi ích lẫn cái giá, rồi cách giao tiếp giữa service.
+Một team tách `user-service`, `order-service` và `inventory-service` vì muốn deploy độc lập. Sáu tháng sau, một thay đổi checkout cần ba pull request, bốn lần deploy theo đúng thứ tự và một migration trên database dùng chung. Nếu `user-service` chậm, cả checkout chậm theo. Họ có nhiều repository, nhưng vẫn là **một monolith phân tán**.
+
+Microservices không phải đích trưởng thành mặc định. Chúng là cách đổi coupling trong code thành contract, network và ownership boundary — chỉ đáng giá khi ranh giới mới giải quyết một constraint tổ chức hoặc vận hành có thật.
+
+Sau bài này, bạn sẽ có thể:
+
+- nhận biết lúc nên giữ modular monolith và tín hiệu đủ mạnh để tách;
+- đặt service boundary theo business capability và data ownership;
+- chọn gRPC đồng bộ hay event bất đồng bộ từ yêu cầu consistency/latency;
+- thiết kế Protobuf contract có thể tiến hóa;
+- áp deadline, cancellation, retry budget, circuit breaker và bulkhead;
+- migration một capability bằng strangler pattern với đường rollback rõ.
 
 ---
 
-## Cảnh báo trước: monolith first
+## 1. Câu hỏi đầu tiên không phải “tách thế nào?”
 
-Quan điểm senior quan trọng nhất của phase này: **đừng bắt đầu bằng microservices**. Một monolith có cấu trúc tốt (Phase 10) phục vụ phần lớn dự án tốt hơn. Microservices đổi độ phức tạp *code* lấy độ phức tạp *vận hành phân tán* — mạng có thể lỗi, độ trễ là thật, transaction xuyên service rất khó, debug cần distributed tracing (Phase 20).
+Hãy hỏi: **constraint nào không thể giải kinh tế hơn trong một deployable unit?**
+
+Tín hiệu tách service có giá trị:
+
+- hai capability có nhịp thay đổi và owner độc lập thật;
+- một workload cần scale, isolation hoặc compliance khác hẳn phần còn lại;
+- release coordination của bounded context đang là bottleneck đã đo;
+- boundary domain đã ổn định qua thời gian trong modular monolith;
+- team có năng lực on-call, observability, platform và incident response phân tán.
+
+Tín hiệu chưa nên tách:
+
+- boundary vẫn đổi mỗi sprint;
+- nhiều service cần join chung bảng hoặc deploy cùng nhau;
+- team nhỏ nhưng phải vận hành nhiều pipeline, secret và dashboard;
+- động lực chính là “microservices scale hơn” mà chưa có bottleneck;
+- chưa có contract test, trace và ownership rõ.
 
 ```text
-Tách khi:                          Đừng tách khi:
-- team lớn cần deploy độc lập       - team nhỏ, một codebase còn quản được
-- các phần scale rất khác nhau      - chưa rõ ranh giới domain
-- ngôn ngữ/công nghệ khác nhau      - chỉ vì "nghe nói microservices xịn"
+Modular monolith tốt
+
+┌──────────────────── one deployable ────────────────────┐
+│  identity module  │  ordering module  │ inventory module│
+│  public API/port  │  public API/port  │ public API/port │
+│  private tables   │  private tables   │ private tables  │
+└─────────────────────────────────────────────────────────┘
+
+Boundary đã có trước; network là một quyết định migration về sau.
 ```
 
-Tách theo **bounded context** (ranh giới domain), không theo tầng kỹ thuật.
+Modular monolith là nơi rẻ nhất để kiểm chứng boundary: module không import internals của nhau, giao tiếp qua port/event, table ownership rõ và architecture test ngăn dependency sai. Nếu không giữ được kỷ luật này trong một repo, network không tự sửa nó.
 
----
+## 2. Service boundary là business + data + team boundary
 
-## Hai kiểu giao tiếp
-
-Service nói chuyện theo hai cách, và bạn dùng *cả hai*:
+Một service production cần quyền quyết định business invariant và sở hữu lifecycle dữ liệu của capability đó. Tách controller thành service nhưng vẫn cho tất cả truy cập chung schema chỉ thêm network mà không có autonomy.
 
 ```text
-Đồng bộ (request/response):  gRPC hoặc HTTP/REST  — cần câu trả lời ngay
-Bất đồng bộ (event):         message queue (Phase 16) — fire-and-forget, decouple
+Order Service                        Inventory Service
+┌────────────────────┐               ┌────────────────────┐
+│ order invariant    │               │ stock invariant    │
+│ order database     │── contract ──▶│ inventory database │
+│ order owner/on-call│◀── events ────│ inventory owner    │
+└────────────────────┘               └────────────────────┘
 ```
 
-Quy tắc: ưu tiên **bất đồng bộ qua event** để giảm phụ thuộc thời gian thực giữa service; dùng đồng bộ khi thật sự cần kết quả ngay trong luồng request.
+“Database per service” nói về **ownership**, không nhất thiết mỗi service phải có một cụm Postgres vật lý. Hai schema trên cùng cluster vẫn có thể được quản trị riêng nếu credential và migration boundary nghiêm. Điều cấm là service A đọc thẳng table riêng của B rồi biến schema nội bộ thành API không version.
 
----
+Khi cần dữ liệu chéo boundary, chọn một trong ba:
 
-## gRPC + Protocol Buffers
+1. gọi owner đồng bộ khi cần freshness ngay;
+2. subscribe event và giữ local projection khi chấp nhận eventual consistency;
+3. compose ở gateway/BFF cho một use case đọc.
 
-Cho giao tiếp đồng bộ giữa service nội bộ, **gRPC** thường thắng REST: nhanh hơn (HTTP/2, nhị phân), hợp đồng chặt (Protobuf), hỗ trợ streaming. Bạn định nghĩa service trong file `.proto`:
+Không có lựa chọn miễn phí: synchronous call tăng temporal coupling; projection tăng độ trễ và logic reconcile; composition tăng fan-out latency.
+
+## 3. Đồng bộ hay bất đồng bộ là quyết định về coupling
+
+| Câu hỏi                                | RPC đồng bộ                             | Event bất đồng bộ                   |
+| -------------------------------------- | --------------------------------------- | ----------------------------------- |
+| Caller cần kết quả trước khi tiếp tục? | phù hợp                                 | không tự nhiên                      |
+| Hai service phải cùng online?          | có                                      | không tại thời điểm publish/consume |
+| Consistency nhìn thấy ngay?            | dễ hơn, không phải transaction phân tán | thường eventual                     |
+| Failure hiện ở đâu?                    | ngay trong request path                 | backlog/retry/reconciliation        |
+| Debug flow                             | call chain/trace                        | event lineage + message state       |
+
+“Ưu tiên event” không phải luật. `Order Service` hỏi giá hiện tại trước khi confirm có thể cần RPC. Sau khi order đã confirm, phát `OrderConfirmed` cho email/analytics là event tự nhiên.
+
+Một workflow không nên biến thành chuỗi đồng bộ dài:
+
+```text
+gateway → order → user → inventory → pricing → promotion → payment
+```
+
+Mỗi hop cộng latency và xác suất lỗi. Nếu mỗi dependency có availability 99,9% và tất cả bắt buộc, năm hop độc lập cho upper bound gần `0.999⁵ ≈ 99,5%` trước khi tính chính service gọi. Số này chỉ minh họa phép nhân failure domain, không phải dự báo SLO thực.
+
+## 4. gRPC và Protobuf: contract trước implementation
+
+gRPC phù hợp cho internal RPC đa ngôn ngữ, cần IDL chặt, HTTP/2 và streaming. REST/JSON vẫn dễ quan sát, gọi thử và tích hợp ở public edge. Chọn theo ecosystem và contract, không chỉ benchmark serialization.
 
 ```proto
-// user.proto
 syntax = "proto3";
 
-service UserService {
-  rpc GetUser (GetUserRequest) returns (User);
-  rpc ListUsers (ListUsersRequest) returns (stream User); // server streaming
+package identity.v1;
+
+service IdentityService {
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
 }
 
-message GetUserRequest { string id = 1; }
-message User { string id = 1; string name = 2; string email = 3; }
+message GetUserRequest {
+  string user_id = 1;
+}
+
+message GetUserResponse {
+  User user = 1;
+}
+
+message User {
+  string id = 1;
+  string display_name = 2;
+  UserStatus status = 3;
+}
+
+enum UserStatus {
+  USER_STATUS_UNSPECIFIED = 0;
+  USER_STATUS_ACTIVE = 1;
+  USER_STATUS_SUSPENDED = 2;
+}
 ```
 
-Server Node:
+### Quy tắc tiến hóa Protobuf
+
+- không đổi nghĩa hoặc type của field number đã phát hành;
+- xóa field thì `reserved` number và name, không tái sử dụng;
+- thêm field theo hướng reader cũ có thể bỏ qua;
+- enum phải có giá trị `0` mang nghĩa unspecified/unknown;
+- package/service version như `identity.v1` khi cần contract generation mới;
+- phân biệt “vắng mặt” và default bằng presence/`optional` khi business cần.
+
+```proto
+message User {
+  reserved 4;
+  reserved "legacy_username";
+  // field mới dùng number chưa từng phát hành
+  optional string avatar_url = 5;
+}
+```
+
+Node `@grpc/grpc-js` hỗ trợ load `.proto` động, nhưng cast `as any` xóa lợi ích type-safety. Với codebase production, sinh client/server type trong CI bằng toolchain đã chọn, pin version generator và kiểm breaking change của `.proto`.
+
+## 5. Deadline là một phần của contract
+
+Mặc định chờ vô hạn biến dependency chậm thành resource leak. Mỗi RPC cần deadline dựa trên budget còn lại của request, không phải một timeout cố định độc lập ở mỗi hop.
+
+```text
+Client budget 1000 ms
+  ├─ gateway work       80 ms
+  ├─ order service     120 ms
+  └─ downstream budget ≤ 800 ms, còn phải chừa thời gian serialize + response
+```
 
 ```ts
-import * as grpc from '@grpc/grpc-js';
-import * as protoLoader from '@grpc/proto-loader';
+const deadline = new Date(Date.now() + 500);
 
-const def = protoLoader.loadSync('user.proto');
-const proto = grpc.loadPackageDefinition(def) as any;
-
-const server = new grpc.Server();
-server.addService(proto.UserService.service, {
-  GetUser: async (call, callback) => {
-    const user = await db.user.findUnique({ where: { id: call.request.id } });
-    if (!user) return callback({ code: grpc.status.NOT_FOUND, message: 'Không thấy' });
-    callback(null, user);
-  },
+client.getUser({ userId }, { deadline }, (error, response) => {
+  if (error?.code === grpc.status.DEADLINE_EXCEEDED) {
+    metrics.userRpcTimeouts.add(1);
+  }
+  callback(error, response);
 });
-server.bindAsync('0.0.0.0:50051', grpc.ServerCredentials.createInsecure(), () => {});
 ```
 
-Client gọi như hàm cục bộ:
+`Promise.race` với timer chỉ làm caller ngừng chờ; nó **không hủy RPC đang chạy**. Dùng deadline/cancel API của client và truyền cancellation xuống query/upstream nếu thư viện hỗ trợ. Server cũng cần kiểm call đã bị cancel trước khi tiếp tục công việc tốn kém.
 
-```ts
-const client = new proto.UserService('user-svc:50051', grpc.credentials.createInsecure());
-client.GetUser({ id: '1' }, (err, user) => console.log(user));
+Deadline phải xuất hiện trong trace và error mapping. Nếu gateway trả `504`, trace cần cho thấy budget hết ở hop nào, không chỉ “internal error”.
+
+## 6. Retry budget: ít, có điều kiện và ở đúng tầng
+
+Retry làm tăng xác suất thành công với lỗi tạm thời, đồng thời nhân tải đúng lúc dependency yếu nhất. Chỉ retry khi:
+
+- operation idempotent hoặc có idempotency key;
+- status code thật sự retryable (`UNAVAILABLE`, đôi khi `RESOURCE_EXHAUSTED` theo hợp đồng);
+- còn deadline và **retry budget**;
+- backoff có jitter;
+- một tầng chịu trách nhiệm retry, tránh gateway và service cùng nhân số lần gọi.
+
+```text
+Gateway retry 3 × Order retry 3 × DB proxy retry 3 = tối đa 27 attempts
 ```
 
-Protobuf cho **hợp đồng có version, type-safe** giữa service — đổi schema mà không phá client cũ nếu tuân quy tắc tương thích. REST/JSON vẫn hợp cho API hướng ra ngoài; gRPC cho nội bộ service-to-service.
+Không retry `INVALID_ARGUMENT`, `PERMISSION_DENIED` hoặc lỗi invariant. Với `DEADLINE_EXCEEDED`, retry chỉ có ý nghĩa khi còn đủ budget và biết operation chưa tạo side effect hoặc có idempotency.
 
----
+## 7. Circuit breaker, bulkhead và load shedding
 
-## Event-driven giữa service
+Ba pattern xử lý ba failure mode khác nhau:
 
-Cho decoupling, service phát **event** lên broker (Phase 16 — RabbitMQ/Kafka) thay vì gọi thẳng nhau:
+- **circuit breaker**: dừng gọi dependency đang lỗi liên tục, cho nó thời gian hồi phục;
+- **bulkhead**: giới hạn concurrency/connection theo dependency để một nơi chậm không chiếm hết tài nguyên;
+- **load shedding**: từ chối sớm phần tải vượt capacity thay vì để toàn hệ thống timeout muộn.
 
-```ts
-// Order service phát event, KHÔNG gọi thẳng email/inventory service
-await broker.publish('order.created', { orderId, userId, items });
+Circuit breaker không phải thuốc chữa mọi lỗi. Threshold sai có thể mở circuit vì một traffic spike; shared breaker có thể tạo đồng bộ retry. Dashboard cần state transition, rejected count, dependency latency và half-open probes.
 
-// Email service và Inventory service tự subscribe và phản ứng độc lập
-broker.subscribe('order.created', async (evt) => { await sendReceipt(evt); });
+Fallback chỉ hợp khi semantics cho phép. Trả giá cache cũ có thể chấp nhận; giả vờ payment thành công thì không.
+
+## 8. Event delivery: outbox, idempotency và ordering
+
+Khi service vừa commit business state vừa publish event, dùng transactional outbox như Phần 16 để không mất event. Consumer giả định at-least-once và deduplicate theo event id/business key.
+
+```json
+{
+  "eventId": "01J...",
+  "eventType": "OrderConfirmed.v1",
+  "occurredAt": "2026-07-11T08:00:00Z",
+  "aggregateId": "ord_123",
+  "aggregateVersion": 7,
+  "data": { "orderId": "ord_123", "userId": "usr_9" }
+}
 ```
 
-Order service không cần biết ai lắng nghe — thêm service mới không phải sửa nó. Đây là **eventual consistency**: chấp nhận trễ một chút để đổi lấy decoupling và khả năng chịu lỗi.
+Ordering thường chỉ đảm bảo trong một partition/key, không trên toàn hệ thống. `aggregateVersion` giúp consumer phát hiện duplicate, out-of-order hoặc gap. Consumer không nên dựa vào “event sẽ tới đúng một lần và đúng thứ tự toàn cục”.
 
----
+Schema event là contract lâu sống. Thêm field tương thích, giữ consumer tolerant, có owner và retention/replay policy. Đừng phát nguyên ORM entity rồi vô tình công bố mọi cột nội bộ/PII.
 
-## API Gateway & service discovery
+## 9. Workflow nhiều service: Saga và compensation
 
-Client ngoài không nên biết địa chỉ từng service. **API Gateway** là cửa vào duy nhất: định tuyến, auth tập trung (Phase 5), rate limit, gộp response. **Service discovery** (DNS nội bộ của Kubernetes, Consul) cho service tìm nhau mà không hard-code IP — trong K8s (Phase 9-10 docker series) đơn giản là gọi theo tên service.
+Một order flow có các transaction cục bộ:
 
----
-
-## Lỗi phân tán — timeout, retry, circuit breaker
-
-Mạng *sẽ* lỗi. Mỗi lời gọi liên-service phải phòng thủ:
-
-```ts
-// timeout: đừng chờ vô hạn
-const res = await Promise.race([
-  client.getUser(id),
-  new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000)),
-]);
+```text
+Create order → Reserve inventory → Authorize payment → Confirm order
+                   │ lỗi                 │ lỗi
+                   ▼                     ▼
+              release stock        void authorization
 ```
 
-- **Timeout**: luôn đặt deadline cho mọi remote call.
-- **Retry + backoff**: thử lại lỗi tạm thời (chỉ với thao tác **idempotent** — Phase 16).
-- **Circuit breaker**: khi một service hỏng liên tục, "ngắt cầu dao" để dừng dội request, trả fallback nhanh, và tự thử lại sau (thư viện `opossum`).
+Saga không rollback thời gian; nó chạy **compensating action** có semantics nghiệp vụ riêng. Refund không giống “transaction chưa từng xảy ra”: nó có phí, audit và có thể thất bại.
 
-Thiếu những lớp này, một service chậm sẽ kéo sập cả hệ thống theo hiệu ứng domino (cascading failure).
+Hai kiểu coordination:
 
----
+- **orchestration**: một workflow coordinator biết state machine, dễ thấy tiến trình nhưng tập trung coupling;
+- **choreography**: service phản ứng event, autonomy cao nhưng flow dễ trở nên vô hình.
 
-## Thực hành
+Workflow dài, nhiều timer/compensation thường đáng dùng durable workflow engine thay vì tự ghép hàng chục queue handler.
 
-1. Tách capstone thành 2 service: `user-svc` và `order-svc`.
-2. `order-svc` gọi `user-svc` qua **gRPC** (file `.proto` chung) để xác thực user khi tạo order.
-3. Sau khi tạo order, `order-svc` **phát event** `order.created`; một `email-svc` subscribe và gửi receipt qua BullMQ (Phase 16).
-4. Bọc lời gọi gRPC bằng timeout + retry + circuit breaker (`opossum`).
-5. Đặt một API Gateway (Express hoặc Nginx — docker series) trước cả hai, auth JWT tập trung.
-6. Chạy tất cả bằng Docker Compose; quan sát điều gì xảy ra khi tắt `user-svc`.
+## 10. API Gateway và BFF: edge không sở hữu mọi policy
 
----
+Gateway xử lý concern ở edge: TLS termination, routing, coarse rate limit, authentication, request size và correlation id. Service vẫn phải **authorize** hành động trên resource nó sở hữu. Nếu chỉ gateway kiểm role, internal path hoặc message consumer có thể bypass policy.
+
+Frontend thường được lợi từ BFF (Backend for Frontend): web/mobile có contract tổng hợp phù hợp UI, trong khi internal service contract giữ theo domain. BFF không được trở thành nơi chứa toàn bộ business logic; nó orchestrate/present, domain invariant vẫn ở owner service.
+
+## 11. Security giữa service
+
+“Ở trong VPC” không phải trust model. Một baseline:
+
+- workload identity + mTLS cho authentication kênh;
+- authorization theo service principal và action;
+- credential ngắn hạn, rotation tự động;
+- network policy/egress allowlist;
+- validate message và giới hạn kích thước ở mọi boundary;
+- encrypt dữ liệu nhạy cảm, redact telemetry;
+- tenant context được ký/xác minh, không tin header tùy ý từ caller.
+
+External user token không nên được forward vô hạn qua mọi hop. Có thể exchange thành internal identity/claims tối thiểu; mỗi service kiểm audience và authorization của riêng nó.
+
+## 12. Observability của một hệ phân tán
+
+Mỗi RPC/event cần đủ context để trả lời “ai gọi ai, vì operation nào, mất bao lâu, retry mấy lần”. Baseline:
+
+- trace context chuẩn qua gRPC metadata và message envelope;
+- metrics RED theo service + dependency;
+- deadline exceeded, cancellation, retry, circuit/bulkhead rejection;
+- queue age và consumer lag cho event path;
+- structured log có `traceId`, `eventId`, `aggregateId`, không log payload nhạy cảm;
+- service map và SLO theo user journey, không chỉ từng container.
+
+High-cardinality id không đưa vào metric label. Chúng phù hợp với trace/log có sampling và retention kiểm soát.
+
+## 13. Migration bằng strangler, không “big bang split”
+
+Một extraction an toàn theo lát dọc:
+
+1. Đo coupling, traffic, SLO và dependency hiện tại.
+2. Khóa boundary trong monolith bằng port + architecture test.
+3. Chuyển ownership table/API; backfill bằng job có checkpoint.
+4. Chạy shadow read hoặc compare result nếu dữ liệu cho phép.
+5. Route một phần traffic (canary), theo dõi mismatch/latency/error.
+6. Chuyển write authority **một nơi**; tránh dual write không outbox.
+7. Có feature flag/route rollback trong cửa sổ migration.
+8. Xóa đường cũ và quyền truy cập table sau khi ổn định.
+
+Dual read/write kéo dài là trạng thái nguy hiểm, không phải kiến trúc đích. ADR phải ghi owner, success metric, rollback trigger và ngày dọn compatibility layer.
+
+## 14. Decision record mẫu
+
+```text
+ADR-018: Extract Notification capability
+
+Context:
+- traffic burst khác core API 20×
+- deploy notification đang khóa release ordering
+- consistency có thể trễ 60 giây
+
+Decision:
+- event OrderConfirmed.v1 qua durable broker
+- Notification sở hữu template + delivery database
+- outbox ở Order, idempotent inbox ở Notification
+
+Consequences:
+- thêm broker/on-call/dashboard
+- email có thể trễ; UI đọc delivery status eventual
+- rollback: route consumer về module cũ, giữ event contract
+
+Revisit when:
+- queue age p99 > 60 giây trong 7 ngày hoặc ownership thay đổi
+```
+
+Kiến trúc tốt không chỉ có diagram; nó lưu lý do, constraint, hậu quả và điều kiện xem xét lại.
+
+## 15. Checklist trước khi tách service
+
+- [ ] Có constraint và success metric cụ thể, không chỉ mong muốn “scale”.
+- [ ] Boundary đã được kiểm chứng trong modular monolith.
+- [ ] Service sở hữu business invariant, data, migration và on-call.
+- [ ] Contract có version/evolution rule và contract test.
+- [ ] Mọi RPC có deadline, cancellation và retry budget.
+- [ ] Mọi consumer chịu duplicate/out-of-order theo semantics đã ghi.
+- [ ] Không có shared-table backdoor.
+- [ ] Authn/authz, mTLS và tenant propagation được threat-model.
+- [ ] Trace, metrics, log và runbook tồn tại trước cutover.
+- [ ] Migration có canary, rollback trigger và kế hoạch xóa đường cũ.
+
+## 16. Bài thực hành: tách Notification capability
+
+Đừng bắt đầu bằng Order/Payment — chọn capability ít invariant xuyên ranh giới hơn:
+
+1. Giữ app hiện tại là modular monolith, định nghĩa `NotificationPort`.
+2. Trong transaction tạo order, ghi `OrderConfirmed.v1` vào outbox.
+3. Service Notification riêng consume event, lưu inbox/event id và enqueue email.
+4. Công bố gRPC `GetDeliveryStatus` có deadline 300 ms cho trang admin.
+5. Kill relay sau publish, gửi duplicate và đảo thứ tự event; chứng minh outcome không lặp.
+6. Load test khi Notification tắt: checkout vẫn thành công, queue age tăng và alert chạy.
+7. Canary 10% event sang service mới, có dashboard compare và route rollback.
+
+Tiêu chí hoàn thành là **giảm coupling mà vẫn nhìn thấy và phục hồi được failure**, không phải số container tăng lên.
+
+## Tài liệu chính thức
+
+- [gRPC: Core concepts](https://grpc.io/docs/what-is-grpc/core-concepts/)
+- [gRPC: Deadlines](https://grpc.io/docs/guides/deadlines/)
+- [gRPC: Retry](https://grpc.io/docs/guides/retry/)
+- [gRPC for Node.js](https://grpc.io/docs/languages/node/)
+- [Protocol Buffers: Updating a message type](https://protobuf.dev/programming-guides/proto3/#updating)
 
 ## Phần tiếp theo
 
-Microservices và GraphQL subscription đều chạm tới realtime. Ở **Phase 19 — Realtime với WebSockets**, ta đi sâu: WebSocket vs SSE vs polling, dựng server realtime với `ws` và Socket.IO, room và namespace, scale ngang nhiều instance bằng Redis adapter (Phase 13), authentication cho kết nối, và xử lý reconnect.
+Microservices làm tăng số kết nối dài, event và trạng thái tạm thời ở client. Phần 19 thiết kế realtime từ nhu cầu sản phẩm: khi nào polling, SSE hay WebSocket đúng; cách xử lý delivery, reconnect, presence, backpressure và scale-out mà không đánh mất tính đúng đắn.

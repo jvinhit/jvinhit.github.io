@@ -1,0 +1,804 @@
+---
+title: 'Docker for Developers · Part 17 — Kubernetes Security Hardening'
+description: 'Harden workload Kubernetes bằng RBAC tối thiểu, Pod Security Restricted, Secret an toàn, NetworkPolicy, image bất biến và audit drill.'
+pubDate: 2026-07-04
+tags: [kubernetes, k8s, security, rbac, devops]
+series: docker
+seriesOrder: 17
+draft: false
+---
+
+Đây là **Phần 17** của series Docker → Compose → Kubernetes. [Phần 16 — Stateful Workloads & Persistent Storage](/blog/docker-16-kubernetes-stateful-storage/) đã tách dữ liệu khỏi vòng đời Pod. Bây giờ ta giả định điều khó chịu nhưng thực tế hơn: một public-facing container có lỗ hổng remote code execution và attacker đã có shell bên trong Pod.
+
+Câu hỏi production không còn là “container có non-root không?” mà là:
+
+> Từ một Pod bị chiếm, attacker lấy được identity nào, gọi được API nào, đọc được secret nào, nói chuyện được với service nào, ghi được gì lên filesystem và có thể chạy image nào tiếp theo?
+
+Ta sẽ giảm blast radius theo nhiều lớp: **ServiceAccount + RBAC**, **Pod Security Admission**, **securityContext**, **Secret hygiene**, **default-deny NetworkPolicy** và **image supply-chain gate**. Không lớp nào đủ một mình.
+
+> **Điều kiện thực hành:** cluster bật RBAC và Pod Security Admission; CNI thực sự enforce `NetworkPolicy`. Tạo object `NetworkPolicy` thành công không chứng minh traffic đã bị chặn. Lab dùng image có shell để quan sát; production nên dùng image tối giản và debug bằng ephemeral container có kiểm soát.
+
+## Threat model trước, YAML sau
+
+Một baseline hữu ích bắt đầu từ tài sản, entry point và đường leo thang:
+
+| Mối đe dọa                | Đường tấn công                                   | Guardrail chính                                                  |
+| ------------------------- | ------------------------------------------------ | ---------------------------------------------------------------- |
+| RCE trong app             | request độc hại → shell trong container          | non-root, drop capability, seccomp, read-only root FS            |
+| Token bị lấy              | token auto-mount → gọi Kubernetes API            | `automountServiceAccountToken: false`, RBAC tối thiểu            |
+| Lateral movement          | Pod bị chiếm scan/gọi DB, cache, metadata        | default-deny + allow flow cụ thể                                 |
+| Secret lộ                 | env/log, manifest Git, quyền `list/watch` Secret | encryption at rest, volume hẹp, RBAC, external store khi phù hợp |
+| Image bị thay             | tag mutable hoặc registry compromise             | digest, signature/provenance, admission gate                     |
+| Container escape          | kernel/runtime vulnerability, privileged Pod     | Restricted policy, seccomp, node/runtime isolation               |
+| Persistence trong cluster | attacker tạo workload/RBAC mới                   | admission, audit log, quyền create/update cực hẹp                |
+
+Containers cùng node chia sẻ kernel. `runAsNonRoot` giảm quyền trong container nhưng không tạo VM boundary. Workload rất nhạy cảm có thể cần node pool riêng hoặc sandboxed `RuntimeClass`, đổi lại thêm chi phí và overhead.
+
+Security là bài toán **giảm khả năng + giảm phạm vi + tăng khả năng phát hiện**. Phần này tập trung hai vế đầu; [Phần 18 — Observability & Incident Response](/blog/docker-18-kubernetes-observability-incidents/) sẽ biến audit log, policy denial và network anomaly thành tín hiệu hành động được.
+
+## ServiceAccount: identity của workload
+
+Mỗi namespace có ServiceAccount `default`. Pod không chỉ định identity khác sẽ dùng account này; theo mặc định, Kubernetes có thể mount credential của ServiceAccount vào Pod.
+
+Phần lớn web/API business không cần gọi Kubernetes API. Baseline an toàn là một ServiceAccount riêng và **không mount token**:
+
+Đoạn dưới chỉ cô lập lớp identity; thay digest mẫu bằng image thật. Manifest `hardened-web` ở phần `securityContext` sẽ ghép thêm toàn bộ field để pass Restricted policy.
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: web
+  namespace: hardening-lab
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: hardening-lab
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      serviceAccountName: web
+      automountServiceAccountToken: false
+      containers:
+        - name: web
+          image: registry.example.com/web@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          ports:
+            - name: http
+              containerPort: 8080
+```
+
+Sau khi dùng image thật và rollout Pod, kiểm tra token không được inject:
+
+```bash
+kubectl -n hardening-lab exec deploy/web -- \
+  sh -c 'test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token'
+```
+
+Production image có thể không có shell; khi đó kiểm tra Pod spec và dùng policy/audit thay vì phụ thuộc `exec`.
+
+### Workload thật sự cần Kubernetes API
+
+Controller, operator hoặc release worker có thể cần API. Khi đó:
+
+1. Tạo ServiceAccount riêng theo một chức năng.
+2. Cấp `Role` namespaced thay vì `ClusterRole` nếu có thể.
+3. Chỉ cấp resource + verb thật sự cần; tránh `*`.
+4. Bind đúng một subject.
+5. Chỉ mount bound token vào workload cần nó; token ngắn hạn tốt hơn token Secret tĩnh.
+
+Ví dụ worker chỉ đọc trạng thái Deployment trong `hardening-lab`:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: release-reader
+  namespace: hardening-lab
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployment-reader
+  namespace: hardening-lab
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-reader-can-read-deployments
+  namespace: hardening-lab
+subjects:
+  - kind: ServiceAccount
+    name: release-reader
+    namespace: hardening-lab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: deployment-reader
+```
+
+RoleBinding cấp **quyền**, không bắt buộc phải mount credential. Pod dùng `release-reader` và thật sự gọi API có thể override `automountServiceAccountToken: true`; đây phải là ngoại lệ có chủ ý, không phải mặc định cho cả namespace.
+
+Test authorization mà không cần chui vào container:
+
+```bash
+SA=system:serviceaccount:hardening-lab:release-reader
+
+kubectl auth can-i --as="$SA" get deployments -n hardening-lab
+kubectl auth can-i --as="$SA" list deployments -n hardening-lab
+kubectl auth can-i --as="$SA" delete deployments -n hardening-lab
+kubectl auth can-i --as="$SA" get secrets -n hardening-lab
+kubectl auth can-i --as="$SA" '*' '*' -n hardening-lab
+```
+
+Kết quả mong đợi: chỉ hai lệnh đầu là `yes`.
+
+> Quyền tạo Pod thường mạnh hơn vẻ ngoài: người tạo Pod có thể chọn ServiceAccount, mount Secret/PVC và chạy code với quyền của workload trong namespace. Đừng xem `create pods` hay `create deployments` là quyền “developer vô hại”.
+
+## RBAC least privilege: tránh các đường leo thang
+
+Các rule cần review đặc biệt:
+
+- Wildcard resource/verb hoặc `cluster-admin` binding.
+- `create` Pod/Deployment/Job cùng namespace có ServiceAccount mạnh.
+- `get`, `list`, `watch` Secret — cả ba có thể làm lộ nội dung Secret.
+- `create` trên `serviceaccounts/token` — có thể mint credential cho account khác.
+- `impersonate`, `bind`, `escalate` — tên verb nói thẳng mức nguy hiểm.
+- Sửa Namespace label — có thể hạ Pod Security hoặc thay selector NetworkPolicy.
+- Sửa admission webhook/policy — có thể bypass hoặc chặn toàn cluster.
+- Tạo PV tùy ý — có thể dẫn tới `hostPath` và truy cập node.
+
+Giữ blast radius bằng RoleBinding namespaced, namespace tách theo trust boundary và review định kỳ:
+
+```bash
+kubectl get role,rolebinding -A
+kubectl get clusterrolebinding -o wide
+kubectl auth can-i --list \
+  --as=system:serviceaccount:hardening-lab:release-reader \
+  -n hardening-lab
+```
+
+RBAC là allow-only; không có deny rule để “gỡ” một quyền đã được binding khác cấp. Quyền hiệu lực là hợp của tất cả binding, vì vậy phải audit toàn bộ đường cấp quyền.
+
+## Pod Security Admission: enforce baseline ở cửa API
+
+`securityContext` do developer tự nhớ là chưa đủ. Pod Security Admission (PSA) dùng namespace label để áp các Pod Security Standards:
+
+- `privileged`: gần như không hạn chế.
+- `baseline`: chặn các escalation rõ ràng nhưng vẫn tương thích rộng.
+- `restricted`: hardening theo best practice hiện tại, phù hợp mục tiêu bài này.
+
+Rollout an toàn qua ba mode:
+
+1. `warn`: cảnh báo client nhưng vẫn cho request đi qua.
+2. `audit`: ghi violation vào audit event.
+3. `enforce`: từ chối workload vi phạm.
+
+```bash
+kubectl create namespace hardening-lab
+
+# Quan sát trước, chưa phá workload đang deploy
+kubectl label --overwrite namespace hardening-lab \
+  pod-security.kubernetes.io/warn=restricted \
+  pod-security.kubernetes.io/warn-version=latest \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/audit-version=latest
+
+# Sau khi manifest đã pass và owner xử lý warning
+kubectl label --overwrite namespace hardening-lab \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/enforce-version=latest
+```
+
+`latest` tiện cho lab. Production nên pin version theo minor Kubernetes đã kiểm thử để cluster upgrade không âm thầm đổi policy; nâng version bằng rollout riêng.
+
+PSA kiểm tra request tạo/cập nhật Pod, không quay lại sửa Pod cũ. Nó cũng không thay RBAC, NetworkPolicy, image verification hay Secret encryption. Hạn chế quyền sửa Namespace label; nếu team tự hạ `enforce`, policy chỉ còn là trang trí.
+
+## `securityContext`: làm exploit ít quyền hơn
+
+Restricted policy yêu cầu nhiều field quan trọng, nhưng viết rõ trong manifest vẫn giúp review độc lập với cấu hình cluster.
+
+Manifest lab dưới đây chạy BusyBox HTTP server trên cổng không đặc quyền, root filesystem read-only và chỉ mở `/tmp` bằng `emptyDir`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hardened-web-content
+  namespace: hardening-lab
+data:
+  index.html: secure-by-default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hardened-web
+  namespace: hardening-lab
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hardened-web
+  namespace: hardening-lab
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hardened-web
+  template:
+    metadata:
+      labels:
+        app: hardened-web
+    spec:
+      serviceAccountName: hardened-web
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          # Lab tag để dễ chạy; phần supply-chain bên dưới sẽ pin digest.
+          image: busybox:1.36
+          command: [sh, -c, 'exec httpd -f -p 8080 -h /www']
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          volumeMounts:
+            - name: content
+              mountPath: /www
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: content
+          configMap:
+            name: hardened-web-content
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+```
+
+Ý nghĩa từng guardrail:
+
+- `runAsNonRoot` chặn image cố chạy UID 0; `runAsUser` làm identity runtime rõ ràng.
+- `allowPrivilegeEscalation: false` đặt `no_new_privs`, giảm đường qua setuid/setgid.
+- `drop: [ALL]` bỏ Linux capabilities. Nếu app thật sự cần bind cổng dưới 1024, ưu tiên chuyển sang cổng cao; chỉ add lại capability cụ thể sau khi đo.
+- `readOnlyRootFilesystem` chặn ghi bừa vào image layer. Mount writable volume đúng path app cần, với size limit và lifecycle rõ ràng.
+- `RuntimeDefault` dùng seccomp profile mặc định của container runtime để giảm syscall attack surface.
+- `automountServiceAccountToken: false` loại credential không dùng.
+
+Image phải hỗ trợ UID tùy ý và đường dẫn read-only. Nếu app crash khi harden, sửa image/path/permission; đừng phản xạ bằng `privileged: true` hoặc `runAsUser: 0`.
+
+```bash
+kubectl apply -f hardened-web.yaml
+kubectl -n hardening-lab rollout status deploy/hardened-web
+
+# Root filesystem bị chặn, scratch path được phép
+kubectl -n hardening-lab exec deploy/hardened-web -- touch /should-fail
+kubectl -n hardening-lab exec deploy/hardened-web -- touch /tmp/allowed
+```
+
+## Secrets: base64 không phải encryption
+
+Kubernetes Secret cải thiện cách phân phối confidential config, nhưng có giới hạn rõ ràng:
+
+- `data` chỉ base64 encode; ai đọc object vẫn lấy được plaintext.
+- Secret mặc định có thể được lưu **không mã hóa** trong etcd nếu cluster chưa bật encryption at rest.
+- Quyền `list`/`watch` Secret nguy hiểm như `get` vì response chứa data.
+- Secret qua environment variable không tự refresh khi object đổi và dễ xuất hiện trong dump/log debug.
+- Secret mount qua volume vẫn nằm trong trust boundary của Pod; container bị RCE có quyền đọc file thì attacker cũng đọc được.
+- `immutable: true` ngăn mutation và giảm watch load, không mã hóa dữ liệu.
+
+Checklist thực dụng:
+
+1. Không commit manifest chứa credential thật, kể cả đã base64.
+2. Bật encryption at rest cho Secret trong control plane.
+3. Chỉ mount key cần thiết vào container cần nó.
+4. Tránh cấp app RBAC để tự `get/list/watch` Secret nếu kubelet có thể mount giúp.
+5. Không log secret; scrub crash dump và debug output.
+6. Có rotation + restart/reload strategy và audit ai đọc/sửa Secret.
+7. Với yêu cầu cao, cân nhắc external secret store/CSI integration phù hợp platform.
+
+Ví dụ mount đúng một key thành file read-only:
+
+```yaml
+spec:
+  template:
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: api
+          volumeMounts:
+            - name: database-credential
+              mountPath: /run/secrets/database
+              readOnly: true
+      volumes:
+        - name: database-credential
+          secret:
+            secretName: database-credential
+            defaultMode: 0440
+            items:
+              - key: password
+                path: password
+```
+
+Không dùng `subPath` nếu muốn kubelet cập nhật nội dung Secret volume; mount qua `subPath` không nhận update tự động. Dù dùng volume, ứng dụng vẫn phải reload file hoặc restart đúng cách.
+
+Storage encryption của database/PV là bài toán khác với Secret encryption trong etcd; xem lại failure domain và backup ở [Phần 16](/blog/docker-16-kubernetes-stateful-storage/).
+
+## NetworkPolicy: default-deny rồi mở đúng flow
+
+Mặc định, Pod network thường cho phép mọi Pod nói chuyện với mọi Pod. Khi một web Pod bị chiếm, đó là đường lateral movement lý tưởng.
+
+NetworkPolicy làm việc ở L3/L4 và được thực thi bởi network plugin. Policy là **additive**: traffic được phép nếu một rule phù hợp; không có thứ tự “rule đầu thắng”. Với connection giữa hai Pod đã bị isolate, source egress **và** destination ingress đều phải allow. Reply traffic cho connection được allow sẽ được cho qua.
+
+### Bước 1 — default deny cả hai chiều
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: hardening-lab
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+### Bước 2 — mở DNS rõ ràng
+
+Default-deny egress cũng chặn DNS. Policy phổ biến dưới đây giả định CoreDNS có label `k8s-app=kube-dns` trong `kube-system`; kiểm tra cluster thật trước:
+
+```bash
+kubectl -n kube-system get pod -l k8s-app=kube-dns --show-labels
+kubectl get namespace kube-system --show-labels
+```
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cluster-dns
+  namespace: hardening-lab
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+```
+
+### Bước 3 — allow đúng graph `client → api → db`
+
+Các selector sau cùng nằm trong namespace `hardening-lab`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: client-egress-to-api
+  namespace: hardening-lab
+spec:
+  podSelector:
+    matchLabels:
+      app: client
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: api
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-flows
+  namespace: hardening-lab
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: client
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: db
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-ingress-from-api
+  namespace: hardening-lab
+spec:
+  podSelector:
+    matchLabels:
+      app: db
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api
+      ports:
+        - protocol: TCP
+          port: 5432
+```
+
+Graph được phép:
+
+```text
+client --TCP/8080--> api --TCP/5432--> db
+   │                   │
+   └──── DNS/53 ───────┴────> CoreDNS
+```
+
+Không có rule HTTPS ra internet, metadata endpoint, service khác hay namespace khác. Nếu app cần flow mới, thêm rule cùng owner và test — đừng thay bằng `egress: [{}]`.
+
+NetworkPolicy không phải firewall L7: nó không hiểu HTTP path, user hay JWT. NAT, node traffic và ICMP có khác biệt theo plugin. Test từ đúng source Pod và quan sát cả hai chiều.
+
+## Immutable image và supply-chain gate
+
+Tag là con trỏ mutable. Hôm nay `payments:1.4` có thể trỏ digest A; ngày mai registry hoặc pipeline có thể đẩy digest B dưới cùng tag. Manifest không đổi nhưng bytes chạy trong cluster đổi.
+
+Pin digest biến reference thành content-addressed:
+
+```yaml
+containers:
+  - name: payments
+    image: registry.example.com/payments@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
+
+Digest đảm bảo kéo đúng manifest đã chọn; nó **không tự chứng minh** ai build, source commit nào hay image có CVE không. Supply-chain gate đầy đủ cần nhiều bước:
+
+```text
+reviewed source
+  → reproducible BuildKit build
+  → SBOM + provenance attestation
+  → vulnerability/policy evaluation
+  → signature / trusted identity verification
+  → resolve immutable digest
+  → admission rejects tag or untrusted artifact
+  → deploy + runtime monitoring
+```
+
+Docker BuildKit có thể đính kèm SBOM và provenance khi push:
+
+```bash
+IMAGE=registry.example.com/payments
+GIT_SHA=$(git rev-parse HEAD)
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --provenance=mode=max \
+  --sbom=true \
+  --tag "$IMAGE:$GIT_SHA" \
+  --push .
+
+docker scout cves "$IMAGE:$GIT_SHA" --only-severity critical,high
+docker scout policy "$IMAGE:$GIT_SHA"
+docker buildx imagetools inspect "$IMAGE:$GIT_SHA"
+```
+
+CI phải fail theo policy đã thống nhất, không chỉ in report màu đỏ rồi deploy tiếp. Sau khi gate pass, pipeline ghi **digest thật** vào manifest/GitOps source.
+
+Admission layer production nên:
+
+- Từ chối image dùng tag hoặc thiếu digest, gồm regular/init/ephemeral containers.
+- Chỉ cho registry/project đã phê duyệt.
+- Verify signature và provenance từ trusted builder identity.
+- Enforce policy ở workload template và Pod cuối cùng; controller không được bypass.
+- Fail closed khi verifier hỏng nếu risk model yêu cầu.
+
+Pin cả base image trong Dockerfile giúp build đầu vào ổn định. Tuy vậy, digest cũ không tự cập nhật bản vá; automation phải phát hiện base/CVE mới, rebuild, tạo digest mới và rollout có kiểm soát.
+
+## Audit checklist production
+
+| Control        | Evidence cần có                              | Câu hỏi audit                                                |
+| -------------- | -------------------------------------------- | ------------------------------------------------------------ |
+| ServiceAccount | Pod spec + token mount                       | App có thật sự cần Kubernetes API không?                     |
+| RBAC           | Role/Binding + `auth can-i`                  | Có wildcard, cluster scope hoặc đường escalation không?      |
+| Pod Security   | Namespace labels + admission result          | Namespace đã enforce `restricted` và pin version chưa?       |
+| Runtime        | Pod/container `securityContext`              | Non-root, no escalation, drop ALL, seccomp, read-only FS?    |
+| Secrets        | encryption config + RBAC + rotation evidence | Ai đọc được, lưu ở đâu, rotate/rollback thế nào?             |
+| Network        | default deny + explicit allow tests          | Graph thật có khớp policy và CNI có enforce không?           |
+| Images         | digest + attestation + gate result           | Bytes nào chạy, ai build, scan lúc nào?                      |
+| Detection      | audit log + alerts + runbook                 | Policy denial hay token abuse có đánh thức đúng người không? |
+
+Lệnh inventory không in secret value:
+
+```bash
+# Identity và authorization
+kubectl get serviceaccount -A
+kubectl get rolebinding -A
+kubectl get clusterrolebinding -o wide
+
+# Pod Security labels
+kubectl get namespace \
+  -L pod-security.kubernetes.io/enforce \
+  -L pod-security.kubernetes.io/enforce-version
+
+# Runtime/network controls
+kubectl get networkpolicy -A
+kubectl get pod -A \
+  -o custom-columns='NS:.metadata.namespace,POD:.metadata.name,SA:.spec.serviceAccountName'
+
+# Image references: tìm tag mutable và digest đang chạy
+kubectl get pod -A \
+  -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\t"}{range .spec.containers[*]}{.image}{" "}{end}{"\n"}{end}'
+```
+
+Đừng chạy `kubectl get secret -o yaml` như một bước audit chung; output đó đưa credential vào terminal history, log CI hoặc recording.
+
+## Failure modes và cách đọc
+
+| Triệu chứng                                | Nguyên nhân thường gặp                                              | Hướng xử lý                                                    |
+| ------------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------- |
+| Pod bị PSA từ chối                         | thiếu seccomp/non-root/drop ALL hoặc dùng volume/host namespace cấm | đọc message admission, sửa manifest; không hạ namespace policy |
+| App `Permission denied`                    | image không support UID, volume ownership sai                       | sửa image, `fsGroup`/permission đúng; không chạy root vội      |
+| App crash với read-only FS                 | ghi cache/PID vào root                                              | mount `emptyDir` đúng path, đặt size limit                     |
+| DNS timeout sau default-deny               | chưa allow UDP/TCP 53 hoặc selector CoreDNS sai                     | inspect label thật, test cả TCP/UDP                            |
+| Flow vẫn thông dù đã deny                  | CNI không enforce NetworkPolicy hoặc Pod không match selector       | kiểm tra plugin, label và source/destination thực tế           |
+| ServiceAccount “read-only” đọc được Secret | binding khác cấp thêm quyền                                         | audit hợp tất cả RoleBinding/ClusterRoleBinding                |
+| Deploy cùng tag nhưng code khác            | tag mutable                                                         | pin digest, gate admission và audit registry                   |
+| Secret rotate nhưng app dùng giá trị cũ    | env var/subPath hoặc app không reload                               | rollout/reload strategy và metric version                      |
+
+Khi security control gây lỗi, đừng tắt nó toàn cục để “chữa cháy”. Tạo exception có owner, scope, expiry và evidence; sau incident phải xóa exception. Signal và timeline exception thuộc runbook Phần 18.
+
+## Bảng tra nhanh
+
+```bash
+# service account / RBAC
+kubectl get serviceaccount,role,rolebinding -A
+kubectl auth can-i --as=system:serviceaccount:hardening-lab:release-reader \
+  get deployments -n hardening-lab
+
+# Pod Security Admission labels
+kubectl get namespace hardening-lab --show-labels
+
+# inspect effective workload security fields
+kubectl -n hardening-lab get deploy hardened-web -o yaml
+kubectl -n hardening-lab get pod -l app=hardened-web -o wide
+
+# network policy + DNS identity
+kubectl -n hardening-lab get networkpolicy
+kubectl -n kube-system get pod -l k8s-app=kube-dns --show-labels
+
+# image references
+kubectl get pod -A \
+  -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\t"}{range .spec.containers[*]}{.image}{" "}{end}{"\n"}{end}'
+```
+
+## Bài tập / Exercises
+
+### 1. Chứng minh RBAC tối thiểu bằng test âm
+
+Apply `release-reader` + Role + RoleBinding. Xác minh account đọc Deployment nhưng không xóa Deployment, không đọc Secret và không có wildcard.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl apply -f release-reader-rbac.yaml
+SA=system:serviceaccount:hardening-lab:release-reader
+
+test "$(kubectl auth can-i --as="$SA" get deployments -n hardening-lab)" = yes
+test "$(kubectl auth can-i --as="$SA" list deployments -n hardening-lab)" = yes
+test "$(kubectl auth can-i --as="$SA" delete deployments -n hardening-lab)" = no
+test "$(kubectl auth can-i --as="$SA" get secrets -n hardening-lab)" = no
+test "$(kubectl auth can-i --as="$SA" '*' '*' -n hardening-lab)" = no
+```
+
+Test âm quan trọng như test dương: “đọc được Deployment” chưa chứng minh “chỉ đọc được Deployment”.
+
+</details>
+
+### 2. Để Restricted policy từ chối một Pod nguy hiểm
+
+Bật `enforce=restricted` cho `hardening-lab`, apply Pod `privileged`, đọc lỗi admission rồi so với `hardened-web` hợp lệ.
+
+<details>
+<summary>Lời giải</summary>
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: should-be-denied
+  namespace: hardening-lab
+spec:
+  containers:
+    - name: shell
+      image: busybox:1.36
+      command: [sh, -c, 'sleep 1d']
+      securityContext:
+        privileged: true
+```
+
+```bash
+kubectl apply -f privileged-pod.yaml
+# Expected: admission denied; message liệt kê violation Restricted.
+
+kubectl apply -f hardened-web.yaml
+kubectl -n hardening-lab rollout status deploy/hardened-web
+```
+
+Không sửa bằng cách đổi namespace sang `privileged`. Sửa workload để đáp ứng standard hoặc tạo exception hẹp, có expiry và owner nếu risk được chấp nhận.
+
+</details>
+
+### 3. Kiểm tra read-only root filesystem và writable scratch
+
+Từ `hardened-web`, thử ghi vào `/` và `/tmp`; kiểm tra token ServiceAccount không tồn tại.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl -n hardening-lab exec deploy/hardened-web -- \
+  sh -c 'touch /blocked && echo unexpected-success'
+# Expected: Read-only file system
+
+kubectl -n hardening-lab exec deploy/hardened-web -- \
+  sh -c 'touch /tmp/allowed && test -f /tmp/allowed'
+
+kubectl -n hardening-lab exec deploy/hardened-web -- \
+  sh -c 'test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token'
+```
+
+Nếu production image không có shell, chuyển các assert thành integration test trong CI và policy evaluation; đừng thêm shell chỉ để audit.
+
+</details>
+
+### 4. Test graph NetworkPolicy, gồm cả DNS
+
+Tạo ba workload có label `app=client`, `app=api`, `app=db`; API nghe 8080, DB lab nghe 5432. Apply default-deny, DNS allow và ba policy flow. Chứng minh `client → api` và `api → db` thành công, còn `client → db` thất bại.
+
+<details>
+<summary>Lời giải</summary>
+
+Từ các Pod có tool HTTP/TCP phù hợp:
+
+```bash
+# DNS phải còn hoạt động sau default-deny
+kubectl -n hardening-lab exec deploy/client -- nslookup api
+
+# Flow được khai báo
+kubectl -n hardening-lab exec deploy/client -- \
+  wget -qO- --timeout=3 http://api:8080/
+kubectl -n hardening-lab exec deploy/api -- \
+  nc -vz -w 3 db 5432
+
+# Flow không khai báo phải timeout/fail
+kubectl -n hardening-lab exec deploy/client -- \
+  nc -vz -w 3 db 5432
+```
+
+Nếu flow cấm vẫn thành công:
+
+```bash
+kubectl -n hardening-lab get pod --show-labels
+kubectl -n hardening-lab describe networkpolicy
+kubectl get pods -A | grep -E 'calico|cilium|antrea|network'
+```
+
+Xác minh CNI hỗ trợ enforcement và test từ đúng Pod. `kubectl apply` thành công không phải bằng chứng policy hoạt động.
+
+</details>
+
+### 5. Audit tag mutable và thiết kế supply-chain gate
+
+Liệt kê image reference toàn cluster, tìm reference không có `@sha256:`, rồi viết gate CI/admission để chúng không vào production.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl get pod -A \
+  -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\t"}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' \
+  | grep -v '@sha256:'
+```
+
+Gate tối thiểu:
+
+1. Build với `--sbom=true --provenance=mode=max` và push registry được duyệt.
+2. Fail CI nếu vulnerability/policy vượt ngưỡng.
+3. Verify trusted builder/signature theo policy tổ chức.
+4. Resolve digest và cập nhật manifest bằng digest.
+5. Admission từ chối tag/registry lạ/untrusted artifact cho regular, init và ephemeral containers.
+6. Ghi evidence gate cùng release; alert khi admission denial tăng bất thường.
+
+Digest cố định bytes; signature/provenance mới trả lời “ai build từ đâu”. Cần cả hai.
+
+</details>
+
+## Điểm chính
+
+- Bắt đầu từ compromised-Pod threat model và đường leo thang, không bắt đầu từ checklist YAML.
+- App không gọi Kubernetes API nên dùng ServiceAccount riêng với `automountServiceAccountToken: false`.
+- RBAC là allow-only và cộng dồn; RoleBinding namespaced, test âm và audit đường escalation.
+- Pod Security Admission `Restricted` đưa guardrail vào cửa API; rollout `warn`/`audit` trước `enforce` và pin version production.
+- Baseline runtime gồm non-root, no privilege escalation, drop `ALL`, read-only root filesystem và `RuntimeDefault` seccomp.
+- Secret base64 không mã hóa; cần encryption at rest, RBAC hẹp, mount tối thiểu, rotation và chống log leak.
+- Default-deny NetworkPolicy phải mở lại DNS và đúng graph traffic; chỉ có ý nghĩa khi CNI enforce.
+- Digest cố định artifact nhưng không chứng minh nguồn gốc; supply-chain gate cần SBOM, provenance, scan, signature verification và admission.
+- Control không có audit signal/runbook sẽ thất bại âm thầm; nối toàn bộ denial và exception sang Phần 18.
+
+## Tiếp theo
+
+**[Phần 18 — Kubernetes Observability & Incident Response](/blog/docker-18-kubernetes-observability-incidents/)** sẽ thu thập metrics, logs, traces, Events và audit records; dựng SLO/alert; rồi diễn tập incident từ symptom đến rollback và postmortem.
+
+## Tài liệu chính thức
+
+- [Security Checklist — Kubernetes](https://kubernetes.io/docs/concepts/security/security-checklist/)
+- [Application Security Checklist — Kubernetes](https://kubernetes.io/docs/concepts/security/application-security-checklist/)
+- [Service Accounts — Kubernetes](https://kubernetes.io/docs/concepts/security/service-accounts/)
+- [RBAC Good Practices — Kubernetes](https://kubernetes.io/docs/concepts/security/rbac-good-practices/)
+- [Pod Security Admission — Kubernetes](https://kubernetes.io/docs/concepts/security/pod-security-admission/)
+- [Pod Security Standards — Kubernetes](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
+- [Configure a Security Context — Kubernetes](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/)
+- [Good Practices for Kubernetes Secrets](https://kubernetes.io/docs/concepts/security/secrets-good-practices/)
+- [Network Policies — Kubernetes](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
+- [Build Attestations — Docker](https://docs.docker.com/build/metadata/attestations/)
+- [Docker Scout Policy Evaluation](https://docs.docker.com/scout/policy/)

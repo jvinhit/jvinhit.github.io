@@ -1,0 +1,646 @@
+---
+title: 'Docker for Developers · Part 18 — Kubernetes Observability & Incident Response'
+description: 'Từ alert tới nguyên nhân: logs, metrics, traces, events, kubectl debug, SLO và quy trình incident có evidence, rollback và postmortem.'
+pubDate: 2026-07-11
+tags: [kubernetes, observability, debugging, opentelemetry, devops]
+series: docker
+seriesOrder: 18
+draft: false
+---
+
+Ở [Phần 17](/blog/docker-17-kubernetes-security-hardening/), bạn đã giảm blast radius bằng least-privilege RBAC, Pod Security, NetworkPolicy và image policy. Nhưng một hệ thống an toàn vẫn có thể chậm, lỗi hoặc mất dữ liệu. Câu hỏi cuối cùng của series là: **khi production hỏng lúc 02:17, bạn có đủ tín hiệu để biết chuyện gì xảy ra, ổn định hệ thống và chứng minh nó đã hồi phục không?**
+
+Observability không phải mua dashboard. Nó là khả năng suy ra trạng thái bên trong hệ thống từ **events, metrics, logs và traces**, với đủ ngữ cảnh để trả lời một câu hỏi bạn chưa dự đoán trước. Incident response là cách biến các tín hiệu đó thành quyết định dưới áp lực.
+
+> **Version note · 2026-07-11:** command trong bài nhắm Kubernetes 1.36. Metrics Server, backend log/metric/trace và OpenTelemetry Collector đều là add-on; Kubernetes không tự cung cấp một kho telemetry dài hạn.
+
+---
+
+## Mental model: bốn lớp evidence
+
+Một request thất bại đi qua nhiều lớp. Mỗi lớp để lại evidence khác nhau:
+
+```text
+User symptom
+  │  HTTP 5xx · latency · timeout
+  ▼
+Application
+  │  structured logs · RED metrics · distributed traces
+  ▼
+Kubernetes objects
+  │  spec/status · Conditions · Events · rollout history
+  ▼
+Node/runtime/network/storage
+     CPU throttle · OOM · DNS · CNI · disk/PVC · kubelet/runtime logs
+```
+
+Không tín hiệu nào tự đủ:
+
+- **Event** nói scheduler không đặt được Pod, nhưng không cho biết user mất bao nhiêu request.
+- **Metric** cho thấy p99 tăng, nhưng không chỉ ra request nào và call nào chậm.
+- **Trace** cho thấy span database mất 900 ms, nhưng log mới chứa lỗi nghiệp vụ chi tiết.
+- **Log** giàu ngữ cảnh, nhưng query mọi log để phát hiện xu hướng là đắt và chậm.
+
+Quy trình tốt đi từ **triệu chứng người dùng → phạm vi → thay đổi gần nhất → lớp hỏng → evidence chi tiết**, không bắt đầu bằng SSH vào node ngẫu nhiên.
+
+---
+
+## Monitoring, observability và debugging
+
+Ba khái niệm liên quan nhưng không đồng nghĩa:
+
+| Khái niệm     | Câu hỏi                                     | Ví dụ                                  |
+| ------------- | ------------------------------------------- | -------------------------------------- |
+| Monitoring    | Điều mình biết cần theo dõi có vượt ngưỡng? | error rate > 2% trong 10 phút          |
+| Observability | Có thể điều tra câu hỏi chưa biết trước?    | chỉ tenant A chậm sau rollout nào?     |
+| Debugging     | Dùng evidence để kiểm tra giả thuyết cụ thể | EndpointSlice không có endpoint ready? |
+
+Dashboard không tạo ra observability nếu metric thiếu label hữu ích, log không có `trace_id`, trace không truyền context hoặc dữ liệu chỉ giữ năm phút.
+
+Một **observability contract** nên được thiết kế cùng API:
+
+- service name, version, environment và deployment id nhất quán;
+- request/correlation id được truyền xuyên service;
+- log JSON có level, message, operation và trace id;
+- RED metrics cho request; USE metrics cho resource;
+- trace cho boundary quan trọng như HTTP, queue, database;
+- telemetry không chứa secret, token, payload nhạy cảm hay PII không cần thiết.
+
+---
+
+## Desired state cũng là telemetry
+
+Trước khi mở hệ thống monitoring, hãy đọc API Kubernetes. `spec` là điều bạn muốn; `status` và `conditions` là điều controller quan sát:
+
+```bash
+kubectl get deployment web -o wide
+kubectl rollout status deployment/web --timeout=60s
+kubectl rollout history deployment/web
+
+kubectl get deployment web -o jsonpath='{range .status.conditions[*]}{.type}{"="}{.status}{" reason="}{.reason}{"\n"}{end}'
+kubectl get pods -l app=web -o wide
+kubectl describe pod <pod>
+kubectl get events --sort-by='.metadata.creationTimestamp' | tail -40
+```
+
+Đọc theo thứ tự:
+
+```text
+Deployment Available/Progressing?
+  └─ ReplicaSet desired/current/ready?
+      └─ Pod Pending/Running/Terminated?
+          └─ Container state, restart count, last state?
+              └─ Events từ scheduler/kubelet/volume/network?
+```
+
+**Events không phải audit log hay database incident dài hạn.** Chúng có retention giới hạn, có thể aggregate/lặp và không giữ toàn bộ lịch sử. Khi có incident, thu event sớm; đừng đợi sau khi restart mọi thứ.
+
+---
+
+## Logs: stdout là điểm bắt đầu, không phải backend
+
+Ứng dụng container nên ghi log ra `stdout`/`stderr`. Runtime ghi stream theo CRI format; kubelet cho `kubectl logs` đọc bản hiện tại và một instance trước:
+
+```bash
+# Một Pod/container
+kubectl logs <pod> -c <container> --since=15m --timestamps
+
+# Container vừa restart
+kubectl logs <pod> -c <container> --previous --timestamps
+
+# Nhiều Pod của workload — prefix để biết dòng thuộc Pod nào
+kubectl logs -l app=web --all-containers=true --prefix --since=15m
+```
+
+`kubectl logs` không phải kho dài hạn. Khi Pod bị evict hoặc node chết, log local có thể mất; kubelet cũng rotate log. Production thường chạy **node-level agent dạng DaemonSet** để chuyển log sang backend có index, retention và access control.
+
+Log tốt là event có cấu trúc:
+
+```json
+{
+  "timestamp": "2026-07-11T02:17:04.132Z",
+  "level": "error",
+  "service": "checkout",
+  "version": "git-8f2c1d7",
+  "trace_id": "4d7b8f...",
+  "request_id": "req-9a1...",
+  "operation": "charge_payment",
+  "error_code": "UPSTREAM_TIMEOUT",
+  "duration_ms": 3012,
+  "message": "payment provider timed out"
+}
+```
+
+Không log password, bearer token, session cookie, raw authorization header hay toàn bộ request body. Telemetry là dữ liệu production; nó cần redaction, encryption, retention và quyền truy cập như một datastore thật.
+
+### Bẫy cardinality
+
+`user_id`, `request_id` và URL chứa id rất hữu ích trong **log/trace**, nhưng nguy hiểm khi làm metric label: mỗi giá trị mới tạo một time series. Metric label nên có tập giá trị hữu hạn như `method`, route template, status class, region và version.
+
+```text
+GOOD metric label: route="/orders/:id", status="5xx"
+BAD metric label:  path="/orders/98af...", user_id="u_934728"
+```
+
+---
+
+## Metrics: phân biệt autoscaling với monitoring
+
+Kubernetes có hai nhu cầu thường bị trộn:
+
+1. **Resource metrics pipeline**: Metrics Server lấy CPU/memory gần hiện tại từ kubelet, phục vụ `kubectl top`, HPA và VPA.
+2. **Monitoring pipeline**: hệ thống như Prometheus-compatible backend lưu time series dài hạn, query/alert và nhận application metrics.
+
+```bash
+# Metrics API có tồn tại không?
+kubectl get apiservice v1beta1.metrics.k8s.io
+kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes | head
+
+# Current resource sample, không phải lịch sử/SLO dashboard
+kubectl top nodes
+kubectl top pods -A --sort-by=cpu
+kubectl top pod -l app=web --containers
+```
+
+Nếu `kubectl top` báo Metrics API unavailable, đó không chứng minh Pod không dùng CPU; nó chỉ nói pipeline add-on chưa sẵn sàng.
+
+### RED và USE
+
+Đo service bằng **RED**:
+
+- **Rate** — request/second hoặc job/second.
+- **Errors** — tỷ lệ lỗi theo outcome người dùng.
+- **Duration** — distribution latency, đặc biệt p95/p99.
+
+Đo resource bằng **USE**:
+
+- **Utilization** — phần trăm resource bận.
+- **Saturation** — queue/throttle/wait vì hết capacity.
+- **Errors** — OOM, disk error, packet drop, failed I/O.
+
+CPU 90% không luôn là incident; error rate và latency vẫn tốt thì hệ thống có thể chỉ đang dùng capacity hiệu quả. Ngược lại, CPU 20% không chứng minh khỏe nếu mọi request đang chờ database.
+
+### SLI, SLO và error budget
+
+Một alert tốt nối với điều user cảm nhận. Ví dụ:
+
+```text
+SLI availability = successful eligible requests / all eligible requests
+SLO              = 99.9% availability trong 30 ngày
+error budget     = 0.1% của cửa sổ ≈ 43 phút 12 giây
+```
+
+Đừng alert mỗi lần có một request 500. Alert theo **burn rate**: tốc độ tiêu error budget trong nhiều cửa sổ ngắn/dài. Điều này giảm noise nhưng vẫn bắt incident nhanh.
+
+---
+
+## Traces: nối một request xuyên hệ thống
+
+Distributed trace là cây các **span** dùng chung `trace_id`:
+
+```text
+trace 4d7b8f
+└─ POST /checkout                 3.21s
+   ├─ inventory.reserve           42ms
+   ├─ postgres INSERT             18ms
+   └─ payment.authorize          3.10s  ← timeout nằm ở đây
+```
+
+OpenTelemetry tách instrumentation khỏi backend. App gửi OTLP tới **Collector**; Collector nhận, xử lý rồi export:
+
+```text
+Application SDK/auto-instrumentation
+             │ OTLP
+             ▼
+OpenTelemetry Collector
+  receiver → memory limiter → batch → exporter
+             │
+             ├─ traces backend
+             ├─ metrics backend
+             └─ logs backend
+```
+
+Ví dụ cấu hình Collector tối thiểu:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+  batch: {}
+
+exporters:
+  otlp:
+    endpoint: telemetry-backend.observability.svc:4317
+    tls:
+      insecure: false
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp]
+```
+
+App chỉ biết endpoint nội bộ:
+
+```yaml
+env:
+  - { name: OTEL_SERVICE_NAME, value: checkout }
+  - { name: OTEL_RESOURCE_ATTRIBUTES, value: deployment.environment=production }
+  - {
+      name: OTEL_EXPORTER_OTLP_ENDPOINT,
+      value: http://otel-collector.observability:4318,
+    }
+```
+
+Production phải chọn sampling có chủ đích. Giữ mọi trace có thể quá đắt; sampling quá sớm có thể bỏ đúng error hiếm. Tail sampling tại Collector cho phép ưu tiên error/slow trace sau khi đã thấy kết quả, đổi lại cần state và capacity.
+
+---
+
+## `kubectl debug` cho image distroless
+
+Image production tốt thường không có shell, `curl`, `dig` hay `tcpdump`. Đừng cài tool nóng vào container đang chạy. **Ephemeral container** thêm toolbox tạm vào Pod mà không restart workload:
+
+```bash
+kubectl debug -it pod/<pod> \
+  --image=busybox:1.37 \
+  --target=<app-container> \
+  -- sh
+```
+
+Trong debug container, bạn dùng chung network namespace của Pod nên có thể kiểm tra:
+
+```bash
+cat /etc/resolv.conf
+nslookup kubernetes.default.svc
+wget -S -O- http://web.default.svc:80/
+```
+
+Ephemeral container không có đủ mọi quyền theo mặc định; process visibility còn phụ thuộc runtime/process namespace. RBAC phải cho phép subresource `pods/ephemeralcontainers`, và Pod Security/admission có thể chặn profile mạnh.
+
+Nếu phải debug node:
+
+```bash
+kubectl debug node/<node> -it --image=ubuntu:24.04
+```
+
+Đây là quyền có blast radius lớn: debug Pod có thể vào host namespaces và mount filesystem node dưới `/host`. Chỉ dùng qua break-glass access, audit đầy đủ và cleanup ngay sau incident.
+
+---
+
+## Quy trình incident: evidence trước, thay đổi sau
+
+Một runbook tốt giúp cả đội cùng nhịp:
+
+```text
+Detect → Declare → Scope → Stabilize → Diagnose → Recover → Learn
+```
+
+### 1. Detect và declare
+
+Ghi ngay:
+
+- thời điểm bắt đầu theo UTC;
+- symptom/SLO nào vi phạm;
+- service, namespace, cluster, region bị ảnh hưởng;
+- incident commander và kênh giao tiếp;
+- thay đổi gần nhất: deploy, config, secret rotation, node/DB maintenance.
+
+Đừng để năm người cùng chạy năm lệnh thay đổi mà không có timeline.
+
+### 2. Scope blast radius
+
+```bash
+kubectl config current-context
+kubectl get namespace
+kubectl -n shop get deploy,rs,pod,svc,endpointslice -o wide
+kubectl -n shop get events --sort-by='.metadata.creationTimestamp' | tail -50
+```
+
+Hỏi: mọi request hay một route? mọi replica hay một Pod/node/zone? chỉ version mới hay cả cũ? read path hay write path? Điều này biến không gian giả thuyết từ “cả cluster” thành một lát nhỏ.
+
+### 3. Stabilize
+
+Ưu tiên giảm tác động user trước khi tìm root cause hoàn hảo:
+
+- rollback version/config vừa đổi;
+- dừng rollout lỗi;
+- scale replica nếu bottleneck thực sự là capacity và dependency chịu được;
+- loại endpoint NotReady;
+- tạm tắt feature hoặc shed traffic không quan trọng;
+- fail over theo runbook đã test.
+
+```bash
+kubectl -n shop rollout pause deployment/checkout
+kubectl -n shop rollout undo deployment/checkout
+kubectl -n shop rollout status deployment/checkout --timeout=120s
+```
+
+Restart mọi Pod là thao tác phá evidence. Chỉ restart khi có giả thuyết và đã thu logs/status/events cần thiết.
+
+### 4. Diagnose theo tầng
+
+```text
+Rollout/condition
+  → Pod state + Events
+    → readiness + EndpointSlice
+      → resource/OOM/throttle
+        → application logs
+          → trace chậm/lỗi
+            → dependency network/storage
+```
+
+Mỗi bước phải tạo một kết luận hoặc giả thuyết kiểm chứng được. “CPU có vẻ cao” chưa phải root cause; “CPU throttling tăng ngay sau limit giảm từ 1000m xuống 100m, p99 cùng lúc tăng 8x” mới là evidence chain.
+
+### 5. Recover và verify
+
+Không kết thúc incident khi Pod chỉ vừa `Running`:
+
+- rollout complete và replica Available đủ;
+- EndpointSlice có endpoint ready;
+- error rate/latency quay về SLO trong cửa sổ ổn định;
+- queue/backlog đang giảm;
+- không còn data inconsistency;
+- synthetic check và một flow người dùng thật pass.
+
+### 6. Learn
+
+Postmortem không săn người phạm lỗi. Nó ghi:
+
+- impact và timeline có timestamp;
+- detection gap và vì sao guardrail không chặn;
+- contributing factors, không ép một “root cause” duy nhất;
+- điều gì giúp/khó điều tra;
+- action item có owner, deadline và cách verify.
+
+---
+
+## Evidence bundle không chứa secret
+
+Thu output text trước khi mutate workload:
+
+```bash
+NS=shop
+APP=checkout
+
+kubectl config current-context
+kubectl -n "$NS" get deploy,rs,pod,svc,endpointslice -l app="$APP" -o wide
+kubectl -n "$NS" describe deployment "$APP"
+kubectl -n "$NS" get events --sort-by='.metadata.creationTimestamp' | tail -100
+kubectl -n "$NS" logs -l app="$APP" --all-containers=true --prefix --since=30m
+kubectl -n "$NS" top pod -l app="$APP" --containers
+```
+
+Không dump `Secret`, token, toàn bộ environment hay database payload vào ticket/chat. Nếu cần chia sẻ manifest, redact giá trị nhạy cảm và kiểm tra quyền người nhận.
+
+---
+
+## Bốn failure pattern production
+
+### Rollout xong nhưng 5xx tăng
+
+So sánh ReplicaSet/version, readiness và log version mới. Nếu impact rõ, rollback trước; điều tra diff sau.
+
+```bash
+kubectl rollout history deployment/web
+kubectl get rs -l app=web
+kubectl logs -l app=web --prefix --since=10m
+kubectl rollout undo deployment/web
+```
+
+### Pod Running nhưng Service timeout
+
+`Running` không đồng nghĩa `Ready` và Service chọn backend bằng label:
+
+```bash
+kubectl get pod -l app=web
+kubectl get service web -o yaml
+kubectl get endpointslice -l kubernetes.io/service-name=web -o yaml
+kubectl describe pod <pod>
+```
+
+Nếu endpoint rỗng: selector mismatch hoặc readiness fail. Nếu endpoint có nhưng traffic fail: kiểm tra `targetPort`, app listen address, DNS và NetworkPolicy theo [Phần 14](/blog/docker-14-kubernetes-networking-internals/).
+
+### Latency tăng nhưng CPU trung bình thấp
+
+Đừng dừng ở CPU average. Kiểm tra p99, CPU throttling, queue, event-loop lag, connection pool, dependency spans và một Pod/node outlier. Average có thể che một replica nóng hoặc tail latency.
+
+### StatefulSet Pending sau node failure
+
+Đọc event PVC/attach/mount, topology và access mode trước khi xóa claim:
+
+```bash
+kubectl get statefulset,pod,pvc,pv -o wide
+kubectl describe pod <pod>
+kubectl describe pvc <claim>
+kubectl get volumeattachment
+```
+
+Xóa PVC để “thử lại” có thể xóa disk thật theo reclaim policy. Quay lại restore drill của [Phần 16](/blog/docker-16-kubernetes-stateful-storage/).
+
+---
+
+## Bảng tra nhanh
+
+```bash
+# Desired vs actual
+kubectl get deploy,rs,pod -o wide
+kubectl rollout status deployment/<name>
+kubectl rollout history deployment/<name>
+kubectl describe pod <pod>
+kubectl get events --sort-by='.metadata.creationTimestamp'
+
+# Logs
+kubectl logs <pod> -c <container> --since=15m --timestamps
+kubectl logs <pod> -c <container> --previous
+kubectl logs -l app=<app> --all-containers=true --prefix --since=15m
+
+# Resource metrics (requires Metrics Server)
+kubectl top nodes
+kubectl top pod -A --sort-by=cpu
+kubectl top pod -l app=<app> --containers
+
+# Network/data plane
+kubectl get svc,endpointslice
+kubectl get networkpolicy
+kubectl get pvc,pv,volumeattachment
+
+# Distroless / node debug
+kubectl debug -it pod/<pod> --image=busybox:1.37 --target=<container> -- sh
+kubectl debug node/<node> -it --image=ubuntu:24.04
+```
+
+---
+
+## Bài tập / Exercises
+
+**1. Desired-state evidence:** với Deployment `web` từ Phần 10, tạo một báo cáo chỉ dùng `get`, `describe`, Conditions, Events và EndpointSlice. Kết luận workload healthy hay chưa mà không đọc log.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl get deployment web -o wide
+kubectl get deployment web -o jsonpath='{range .status.conditions[*]}{.type}{"="}{.status}{" reason="}{.reason}{"\n"}{end}'
+kubectl get rs,pod -l app=web -o wide
+kubectl get endpointslice -l kubernetes.io/service-name=web
+kubectl get events --sort-by='.metadata.creationTimestamp' | tail -30
+```
+
+Healthy tối thiểu: desired = updated = available replica, `Available=True`, rollout complete, Pod Ready và EndpointSlice có endpoint ready. Đây chưa chứng minh SLO người dùng; chỉ chứng minh control/data-plane cơ bản.
+
+</details>
+
+**2. Previous logs:** tạo CrashLoop có message rõ, tìm message trong `--previous`, rồi giải thích vì sao log hiện tại có thể trống.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl run log-crasher --image=busybox:1.37 --restart=Always \
+  -- sh -c 'echo "fatal: config version 7 rejected" >&2; exit 1'
+
+kubectl get pod log-crasher
+kubectl describe pod log-crasher | tail -20
+kubectl logs log-crasher --previous
+kubectl delete pod log-crasher
+```
+
+Mỗi restart tạo một container instance mới; `--previous` đọc instance đã terminate gần nhất. Log instance hiện tại có thể chưa kịp ghi gì.
+
+</details>
+
+**3. Distroless-style debug:** chạy image `pause` không có shell, chứng minh `exec` fail, rồi thêm ephemeral container để đọc DNS config và resolve Kubernetes Service.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl run debug-demo --image=registry.k8s.io/pause:3.10 --restart=Never
+kubectl exec debug-demo -- sh || true
+
+kubectl debug -it pod/debug-demo \
+  --image=busybox:1.37 \
+  --target=debug-demo \
+  -- sh
+
+# inside ephemeral container:
+cat /etc/resolv.conf
+nslookup kubernetes.default.svc
+exit
+
+kubectl delete pod debug-demo
+```
+
+Nếu admission/RBAC chặn ephemeral container, đó là một security control cần xử lý qua break-glass policy; không vòng qua bằng privileged Pod tùy tiện.
+
+</details>
+
+**4. Empty EndpointSlice:** sửa selector Service `web` thành label không tồn tại. Chẩn đoán timeout theo thứ tự Service → EndpointSlice → Pod labels, rồi sửa.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl patch service web --type merge -p '{"spec":{"selector":{"app":"wrong"}}}'
+kubectl get service web -o jsonpath='{.spec.selector}{"\n"}'
+kubectl get endpointslice -l kubernetes.io/service-name=web
+kubectl get pod -l app=web --show-labels
+
+kubectl patch service web --type merge -p '{"spec":{"selector":{"app":"web"}}}'
+kubectl get endpointslice -l kubernetes.io/service-name=web -w
+```
+
+Service vẫn có ClusterIP dù không có backend; vì thế chỉ `kubectl get svc` là chưa đủ evidence.
+
+</details>
+
+**5. Bad rollout incident:** inject image không tồn tại vào Deployment `web`. Ghi timeline, thu status/events, rollback và chỉ đóng incident sau khi EndpointSlice + rollout cùng healthy.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+date -u +%FT%TZ
+kubectl set image deployment/web web=nginx:does-not-exist
+kubectl rollout status deployment/web --timeout=30s || true
+
+kubectl get deploy,rs,pod -l app=web -o wide
+kubectl get events --sort-by='.metadata.creationTimestamp' | tail -30
+kubectl describe pod -l app=web | tail -30
+
+kubectl rollout undo deployment/web
+kubectl rollout status deployment/web --timeout=120s
+kubectl get pod -l app=web
+kubectl get endpointslice -l kubernetes.io/service-name=web
+date -u +%FT%TZ
+```
+
+Postmortem action tốt không phải “cẩn thận hơn”, mà là policy/CI kiểm tra image tồn tại, deploy canary, alert rollout stuck và runbook rollback đã tập.
+
+</details>
+
+**6. Capstone incident game:** một người inject một lỗi trong image/config/probe/resource/Service/NetworkPolicy/PVC; người còn lại không được xem diff, phải detect, scope, stabilize, diagnose, recover và viết postmortem một trang.
+
+<details>
+<summary>Tiêu chí hoàn thành</summary>
+
+```text
+[ ] Timeline UTC có detect, declare, mitigation, recovery
+[ ] Impact mô tả bằng user symptom/SLI, không chỉ "Pod đỏ"
+[ ] Evidence được thu trước thay đổi phá trạng thái
+[ ] Mỗi lệnh mutate có người thực hiện và lý do
+[ ] Recovery verify rollout + endpoint + SLI/synthetic flow
+[ ] Không copy Secret/token vào evidence
+[ ] Action items có owner, deadline, test xác nhận
+```
+
+Lặp game với failure layer khác. Mục tiêu không phải thuộc lệnh; mục tiêu là giữ được phương pháp khi tín hiệu nhiễu và thời gian gấp.
+
+</details>
+
+---
+
+## Điểm chính
+
+- Observability là **khả năng đặt câu hỏi mới**, không phải số dashboard.
+- Đọc desired state, Conditions và Events trước; nhưng nhớ Events có retention giới hạn.
+- `kubectl logs` phục vụ debug gần; production cần cluster-level backend tách khỏi vòng đời Pod/node.
+- Metrics Server phục vụ resource sample/autoscaling, không thay monitoring dài hạn.
+- RED đo user-facing service; USE đo resource; SLO/error budget giúp alert theo impact.
+- Trace nối một request qua service; correlation id nối trace với log.
+- Ephemeral container debug image tối giản mà không sửa immutable app image.
+- Incident tốt ưu tiên **scope và stabilize**, giữ evidence, rồi mới đào root cause.
+- Recovery phải được chứng minh bằng SLO/data-plane, không chỉ Pod `Running`.
+- Telemetry có thể chứa dữ liệu nhạy cảm; redaction và access control là một phần thiết kế.
+
+---
+
+## Tài liệu chính thức
+
+- [Kubernetes Observability](https://kubernetes.io/docs/concepts/cluster-administration/observability/)
+- [Kubernetes Logging Architecture](https://kubernetes.io/docs/concepts/cluster-administration/logging/)
+- [Resource metrics pipeline](https://kubernetes.io/docs/tasks/debug/debug-cluster/resource-metrics-pipeline/)
+- [Debug Running Pods và ephemeral containers](https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/)
+- [`kubectl debug` reference](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_debug/)
+- [OpenTelemetry trên Kubernetes](https://opentelemetry.io/docs/platforms/kubernetes/)
+- [OpenTelemetry Collector components](https://opentelemetry.io/docs/collector/components/)
+- [Google SRE: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/)
+
+---
+
+## Kết thúc series
+
+Mười phần đầu xây nền Docker → Compose → Kubernetes. Tám phần chuyên sâu biến nền đó thành mental model production: runtime internals, BuildKit/supply chain, Compose cho team và CI, Kubernetes networking, scheduling/autoscaling, stateful storage, security, rồi observability/incident response.
+
+Bạn không cần nhớ mọi flag. Năng lực bền vững hơn là biết **hệ thống đang hứa điều gì, evidence nằm ở đâu, failure mode nào phù hợp với triệu chứng, và thay đổi nào giảm impact với blast radius nhỏ nhất**. Khi đã có cách nghĩ đó, container và orchestrator không còn là hộp đen — chúng là những lớp có thể quan sát, kiểm chứng và vận hành.

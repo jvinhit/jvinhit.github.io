@@ -1,0 +1,674 @@
+---
+title: 'Docker for Developers · Part 14 — Kubernetes Networking Internals'
+description: 'Theo một packet qua Pod, CNI, Service, EndpointSlice, CoreDNS và Gateway API; khóa traffic bằng NetworkPolicy và debug theo từng lớp.'
+pubDate: 2026-06-13
+tags: [kubernetes, networking, cni, gateway-api, networkpolicy]
+series: docker
+seriesOrder: 14
+draft: false
+---
+
+Ở [Phần 13](/blog/docker-13-compose-at-scale/), bạn đã dùng Compose để dựng một application model lặp lại được trên **một Docker host**. Sang Kubernetes, `api` vẫn gọi `db` bằng tên ổn định, nhưng đường đi bên dưới đã có thêm Pod network namespace, CNI, Service VIP, EndpointSlice, DNS và đôi khi cả Gateway. Khi request timeout, đoán “chắc DNS” hoặc “chắc NetworkPolicy” không đủ; bạn cần biết packet đang dừng ở lớp nào.
+
+Phần này xây một mental model từ trong Pod ra ngoài cluster, rồi dùng chính model đó làm playbook debug. Mục tiêu không phải thuộc lòng implementation của một CNI cụ thể. Mục tiêu là phân biệt rõ **API Kubernetes cam kết điều gì**, **controller/plugin nào thực thi**, và **evidence nào chứng minh từng lớp đang đúng**.
+
+> **Môi trường:** các manifest dùng API ổn định của Kubernetes 1.36. Cluster local như kind phù hợp để học object và failure mode, nhưng không chứng minh throughput, failure-domain hay độ sẵn sàng của một cluster production. Bài NetworkPolicy chỉ có hiệu lực khi cluster dùng CNI hỗ trợ enforcement.
+
+---
+
+## Mental model: theo một packet từ client tới API
+
+Giả sử Pod `frontend` gọi `http://api.backend.svc.cluster.local:8080`. Đường đi logic là:
+
+```text
+process trong frontend
+        │
+        │ DNS query: api.backend.svc.cluster.local
+        ▼
+Pod network namespace ──► CoreDNS Service ──► ClusterIP của api
+        │                                           │
+        │ route qua pod network                     │ service proxy / data plane
+        ▼                                           ▼
+      CNI                                      EndpointSlice
+        │                                           │
+        └──────── node / cluster network ───────────┤
+                                                    ▼
+                                      Pod api có endpoint Ready
+                                                    │
+                                                    ▼
+                                           containerPort thực
+```
+
+Đây là các **lớp kiểm tra**, không nhất thiết là chuỗi process chạy tuần tự. Ví dụ ClusterIP thường không phải IP gắn trên một interface thật; kube-proxy hoặc data plane của CNI lập trình rule để packet tới VIP được chuyển tới endpoint. Một CNI eBPF có thể thay cả đường kube-proxy truyền thống nhưng vẫn phải giữ semantics của Service.
+
+Khi debug, hỏi theo thứ tự:
+
+1. Client resolve đúng tên chưa?
+2. Service tồn tại, selector và port đúng chưa?
+3. EndpointSlice có endpoint `ready: true` chưa?
+4. Pod đích có thật sự listen trên `targetPort` không?
+5. NetworkPolicy ở **cả hai đầu** có cho phép không?
+6. CNI, service proxy hoặc Gateway controller có reconcile thành công không?
+
+Đi từ lớp gần application nhất ra ngoài giúp bạn tránh thay ba thứ cùng lúc rồi không biết thứ nào đã sửa lỗi.
+
+---
+
+## Pod network namespace và vai trò của CNI
+
+Mỗi Pod có một network namespace riêng: interface, route, socket và địa chỉ IP riêng. Các container trong **cùng Pod** dùng chung namespace này, vì vậy chúng gọi nhau qua `localhost` và không thể cùng bind một port/protocol.
+
+```text
+Pod frontend (10.244.1.7)
+┌─────────────────────────────────────┐
+│ shared network namespace            │
+│                                     │
+│ app :3000  ◄── localhost ──► sidecar│
+│ eth0: 10.244.1.7                    │
+└──────────────────┬──────────────────┘
+                   │ veth / CNI data plane
+                   ▼
+             node / pod network
+```
+
+Kubernetes định nghĩa network model, nhưng không tự cung cấp toàn bộ data plane. Khi container runtime tạo Pod sandbox, nó gọi plugin theo **Container Network Interface (CNI)** để cấp interface, IP và route. Plugin có thể dùng bridge, overlay, routing thuần, eBPF hoặc hạ tầng cloud. Vì vậy hai cluster cùng manifest có thể có packet path vật lý khác nhau.
+
+Quan sát từ góc nhìn Pod:
+
+```bash
+kubectl get pod -o wide
+kubectl exec deploy/frontend -- ip addr
+kubectl exec deploy/frontend -- ip route
+kubectl exec deploy/frontend -- cat /etc/resolv.conf
+```
+
+Image tối giản có thể không chứa `ip`, `dig` hay shell. Đừng cài tool vào image production chỉ để debug. Tạo Pod tạm cùng namespace:
+
+```bash
+kubectl run net-debug --rm -it --restart=Never \
+  --image=nicolaka/netshoot -- bash
+```
+
+`netshoot` là công cụ lab, không phải dependency production. Trong môi trường hạn chế registry, dùng một debug image đã được tổ chức phê duyệt và mirror nội bộ.
+
+### Điều Kubernetes không hứa
+
+- Pod IP không bền; Pod mới có thể nhận IP mới.
+- Kubernetes không bắt buộc một CNI implementation cụ thể.
+- `containerPort` chỉ mô tả port container dự kiến listen; nó **không mở firewall** và không làm process tự listen.
+- NetworkPolicy API có thể tồn tại nhưng không có tác dụng nếu CNI không implement nó.
+
+---
+
+## Service, EndpointSlice và readiness
+
+Pod là endpoint thay đổi liên tục. Service cung cấp tên DNS và địa chỉ logic ổn định trước một tập Pod được chọn bằng label.
+
+Tạo hai namespace và một client giữ nguyên để chạy toàn bộ lab:
+
+```bash
+kubectl create namespace frontend
+kubectl create namespace backend
+```
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: registry.k8s.io/e2e-test-images/agnhost:2.39
+          command: ['/agnhost', 'serve-hostname', '--http=true', '--port=8080']
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: backend
+spec:
+  selector:
+    app: api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: busybox:1.37
+          command: ['/bin/sh', '-c', 'sleep 1d']
+```
+
+Service controller tạo và cập nhật **EndpointSlice** từ các Pod khớp selector. Kube-proxy hoặc service data plane theo dõi Service + EndpointSlice để lập trình đường traffic. EndpointSlice không chỉ chứa IP; nó còn có conditions như `ready`, `serving` và `terminating`.
+
+```bash
+kubectl get svc api -n backend -o wide
+kubectl get endpointslices -n backend \
+  -l kubernetes.io/service-name=api -o yaml
+kubectl get pods -n backend -l app=api -o wide
+```
+
+Readiness fail không nhất thiết xóa object EndpointSlice. Endpoint thường vẫn hiện diện nhưng `ready: false`; service proxy bình thường sẽ không chọn nó cho traffic mới. Đây là evidence tốt hơn câu “Pod đang Running”. `Running 0/1` nghĩa là process tồn tại nhưng chưa sẵn sàng nhận request.
+
+### Selector và port là hai failure mode khác nhau
+
+Service selector sai tạo **zero endpoint**:
+
+```bash
+kubectl get svc api -n backend -o jsonpath='{.spec.selector}'
+kubectl get pods -n backend --show-labels
+```
+
+`targetPort` sai vẫn có endpoint IP, nhưng request bị `connection refused` hoặc timeout vì process không listen trên port đó:
+
+```bash
+kubectl get svc api -n backend -o yaml
+POD_IP=$(kubectl get pod -n backend -l app=api \
+  -o jsonpath='{.items[0].status.podIP}')
+kubectl run port-debug -n backend --rm -it --restart=Never \
+  --image=busybox:1.37 -- wget -S -O- "http://$POD_IP:8080/"
+```
+
+Dấu hiệu khác nhau giúp khoanh vùng mà chưa cần đọc CNI logs.
+
+---
+
+## CoreDNS và service discovery
+
+Service thường có tên đầy đủ:
+
+```text
+<service>.<namespace>.svc.<cluster-domain>
+api.backend.svc.cluster.local
+```
+
+Pod trong namespace `backend` có thể gọi `api`. Pod trong namespace `frontend` nên gọi `api.backend` hoặc FQDN đầy đủ. Kubelet ghi search domains và `ndots` vào `/etc/resolv.conf`; tên ngắn có thể được thử với nhiều suffix trước khi trở thành truy vấn tuyệt đối.
+
+```bash
+kubectl exec -n frontend deploy/frontend -- cat /etc/resolv.conf
+kubectl exec -n frontend deploy/frontend -- nslookup api.backend
+kubectl exec -n frontend deploy/frontend -- nslookup api.backend.svc.cluster.local
+kubectl get svc -n kube-system kube-dns
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=50
+```
+
+Một Service thường resolve thành ClusterIP. **Headless Service** (`clusterIP: None`) resolve thành IP của các endpoint, hữu ích khi client cần thấy từng replica như StatefulSet. Headless không tự biến ứng dụng thành database cluster và không cung cấp VIP load balancing.
+
+### DNS fail hay network fail?
+
+So sánh hai request:
+
+```bash
+# Qua DNS + Service
+kubectl exec -n frontend deploy/frontend -- \
+  wget -S -O- http://api.backend.svc.cluster.local:8080/
+
+# Trực tiếp một Pod IP lấy từ EndpointSlice, chỉ dùng để chẩn đoán
+kubectl exec -n frontend deploy/frontend -- \
+  wget -S -O- http://10.244.2.8:8080/
+```
+
+- Tên không resolve: kiểm tra DNS policy, CoreDNS, namespace và typo.
+- FQDN resolve nhưng ClusterIP fail, Pod IP chạy: kiểm tra Service port/data plane.
+- Cả ClusterIP và Pod IP fail: kiểm tra process listen, readiness và NetworkPolicy.
+- Pod IP chạy từ namespace backend nhưng fail từ frontend: policy hoặc route liên namespace là nghi phạm mạnh.
+
+Pod IP chỉ là probe chẩn đoán; application vẫn phải gọi qua Service.
+
+---
+
+## ClusterIP, NodePort và LoadBalancer
+
+Ba Service type không phải ba cấp “xịn dần”; chúng giải quyết ba phạm vi truy cập.
+
+| Type           | Ai thường truy cập        | Hạ tầng cần có          | Trade-off chính                        |
+| -------------- | ------------------------- | ----------------------- | -------------------------------------- |
+| `ClusterIP`    | workload trong cluster    | service data plane      | Không trực tiếp public                 |
+| `NodePort`     | client tới IP node + port | route/firewall tới node | Lộ port trên node, ít policy HTTP      |
+| `LoadBalancer` | client ngoài cluster      | cloud/controller cấp LB | Chi phí và behavior phụ thuộc provider |
+
+`NodePort` mở cùng một port logic trên các node đủ điều kiện, nhưng client có tới được node hay không còn phụ thuộc network/firewall. `LoadBalancer` không tự sinh load balancer trên mọi cluster. Trên kind, trạng thái có thể `Pending` nếu chưa cài cloud-provider-kind hoặc implementation tương đương.
+
+```bash
+kubectl get svc -A
+kubectl describe svc api -n backend
+kubectl get nodes -o wide
+```
+
+`externalTrafficPolicy: Local` có thể giữ source IP tốt hơn và tránh hop sang node khác, đổi lại node không có local endpoint sẽ không nhận traffic theo semantics đó. Đừng bật chỉ vì thấy “Local nhanh hơn”; kiểm tra health check của load balancer, phân bố endpoint và yêu cầu source IP trước.
+
+---
+
+## Ingress và Gateway API: API chưa phải data plane
+
+Ingress mô tả HTTP/HTTPS routing và vẫn là API GA, nhưng API đã **frozen**. Kubernetes khuyến nghị Gateway API cho thiết kế mới. Cả hai đều cần implementation thực thi:
+
+```text
+YAML object ──watched by──► controller ──programs──► proxy / load balancer
+
+Ingress        Ingress controller         NGINX, cloud LB, ...
+Gateway API    Gateway controller         provider-specific data plane
+```
+
+Tạo Ingress mà không có Ingress controller chỉ tạo object trong API server. Tương tự, Gateway API **không nằm sẵn trong core Kubernetes**: bạn cần cài CRD bundle và một Gateway controller hỗ trợ các resource/feature muốn dùng.
+
+Gateway API tách trách nhiệm rõ hơn:
+
+- `GatewayClass`: loại hạ tầng do platform team cung cấp.
+- `Gateway`: listener/address cụ thể do infra hoặc app platform quản lý.
+- `HTTPRoute`: rule route mà application team có thể sở hữu.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: edge
+  namespace: backend
+spec:
+  gatewayClassName: example
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api
+  namespace: backend
+spec:
+  parentRefs:
+    - name: edge
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: api
+          port: 8080
+```
+
+`gatewayClassName: example` chỉ là placeholder. Trước khi apply, lấy tên class thật do controller cung cấp:
+
+```bash
+kubectl get crd gateways.gateway.networking.k8s.io
+kubectl get gatewayclass
+kubectl get gateway,httproute -A
+kubectl describe gateway edge -n backend
+kubectl describe httproute api -n backend
+```
+
+Đọc `status.conditions`: `Accepted`, `Programmed` và `ResolvedRefs` giúp phân biệt route hợp lệ với data plane đã sẵn sàng. Object tồn tại chưa có nghĩa traffic đã vào được.
+
+---
+
+## NetworkPolicy: default allow, rồi cộng các allow rule
+
+Mặc định, Pod không bị cô lập cho ingress hoặc egress. Khi một NetworkPolicy chọn Pod cho một chiều, Pod trở thành isolated ở chiều đó và chỉ traffic được **ít nhất một policy** cho phép mới đi qua. Policies là additive; thứ tự file không tạo ưu tiên và API chuẩn không có rule “deny X rồi allow Y” theo kiểu firewall tuần tự.
+
+Traffic chỉ thành công khi:
+
+- egress policy của source cho phép, **và**
+- ingress policy của destination cho phép.
+
+Đầu tiên cô lập ingress của backend. Muốn cô lập egress, thêm `Egress` và một list `egress` rỗng hoặc các allow rule tương ứng:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: backend
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+```
+
+Sau đó cho frontend gọi API:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-api
+  namespace: backend
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: frontend
+          podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+```
+
+Trong cùng một `from` item, `namespaceSelector` và `podSelector` là phép **AND**: Pod label `app=frontend` trong namespace `frontend`. Viết thành hai list items riêng sẽ thành **OR**, mở rộng quyền ngoài ý muốn.
+
+Nếu frontend cũng default-deny egress, cần mở API và DNS:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-and-dns
+  namespace: frontend
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: backend
+          podSelector:
+            matchLabels:
+              app: api
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+```
+
+Label DNS Pod khác nhau giữa distribution. Kiểm tra bằng `kubectl get pods -n kube-system --show-labels` và chỉnh selector; đừng copy policy mù quáng.
+
+### Giới hạn phải nói thẳng
+
+- NetworkPolicy chuẩn chủ yếu là L3/L4; nó không hiểu URL, HTTP method hay user identity.
+- Không có controller enforcement thì object vẫn apply thành công nhưng traffic không đổi.
+- Hành vi với `hostNetwork`, NAT và `ipBlock` có chi tiết phụ thuộc implementation.
+- Policy không sửa được application đang listen sai port hoặc Service selector sai.
+
+---
+
+## Playbook debug theo lớp
+
+Dùng cùng một request thất bại và thu evidence theo thứ tự:
+
+```bash
+# 0. Context và object đúng namespace?
+kubectl config current-context
+kubectl get deploy,pod,svc -n backend -o wide
+
+# 1. DNS từ đúng client
+kubectl exec -n frontend deploy/frontend -- \
+  nslookup api.backend.svc.cluster.local
+
+# 2. Service model
+kubectl get svc api -n backend -o yaml
+kubectl get pods -n backend --show-labels
+
+# 3. EndpointSlice và readiness
+kubectl get endpointslices -n backend \
+  -l kubernetes.io/service-name=api -o yaml
+kubectl describe pod -n backend -l app=api
+
+# 4. Process/port từ trong Pod đích
+POD_IP=$(kubectl get pod -n backend -l app=api \
+  -o jsonpath='{.items[0].status.podIP}')
+kubectl run port-debug -n backend --rm -it --restart=Never \
+  --image=busybox:1.37 -- wget -S -O- "http://$POD_IP:8080/"
+
+# 5. Policy ở cả source và destination
+kubectl get networkpolicy -n frontend -o yaml
+kubectl get networkpolicy -n backend -o yaml
+
+# 6. Timeline reconcile
+kubectl get events -A --sort-by=.metadata.creationTimestamp
+```
+
+Ma trận triệu chứng:
+
+| Triệu chứng                              | Evidence tiếp theo               | Nghi phạm thường gặp                    |
+| ---------------------------------------- | -------------------------------- | --------------------------------------- |
+| `NXDOMAIN`                               | `resolv.conf`, Service namespace | Tên/namespace sai, Service chưa tồn tại |
+| Service có zero EndpointSlice endpoint   | selector vs Pod labels           | Selector typo                           |
+| Endpoint `ready: false`                  | probe, logs, events              | App chưa ready hoặc probe sai           |
+| Pod IP chạy, ClusterIP fail              | Service ports, data plane        | `port/targetPort`, service proxy        |
+| Cùng namespace chạy, khác namespace fail | policies hai đầu                 | ingress/egress policy                   |
+| Gateway `Accepted=False`                 | conditions, refs                 | class/listener/backend ref sai          |
+| Gateway `Programmed=False`               | controller logs/status           | controller hoặc hạ tầng chưa sẵn sàng   |
+
+Đừng bắt đầu bằng restart CoreDNS hay xóa CNI Pod. Thay đổi control-plane component trước khi thu evidence làm mất trạng thái quý nhất của incident.
+
+---
+
+## Bảng tra nhanh
+
+```bash
+# Pod view
+kubectl get pods -A -o wide
+kubectl exec -n <ns> <pod> -- cat /etc/resolv.conf
+kubectl exec -n <ns> <pod> -- nslookup <service>.<namespace>
+
+# Service → endpoint
+kubectl get svc <service> -n <ns> -o yaml
+kubectl get endpointslices -n <ns> \
+  -l kubernetes.io/service-name=<service> -o yaml
+kubectl get pods -n <ns> --show-labels
+
+# Policy
+kubectl get networkpolicy -A
+kubectl describe networkpolicy <name> -n <ns>
+
+# Gateway API
+kubectl get gatewayclass
+kubectl get gateway,httproute -A
+kubectl describe gateway <name> -n <ns>
+kubectl describe httproute <name> -n <ns>
+
+# Timeline
+kubectl get events -A --sort-by=.metadata.creationTimestamp
+```
+
+---
+
+## Bài tập / Exercises
+
+Các bài dùng hai namespace `frontend` và `backend`. Cluster local phải có CNI hỗ trợ NetworkPolicy cho bài 3; nếu không, mục tiêu của bài là chứng minh policy **không được enforce**, không giả vờ rằng nó hoạt động.
+
+**1. DNS hay selector?** Tạo Service `api` với selector `app: api-v2`, trong khi Pod có `app: api`. Từ frontend, chứng minh DNS vẫn resolve nhưng Service không có backend; sửa mà không restart Pod.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl get svc api -n backend
+kubectl exec -n frontend deploy/frontend -- nslookup api.backend
+kubectl get endpointslices -n backend \
+  -l kubernetes.io/service-name=api -o yaml
+kubectl get pods -n backend --show-labels
+
+kubectl patch svc api -n backend --type=merge \
+  -p '{"spec":{"selector":{"app":"api"}}}'
+
+kubectl get endpointslices -n backend \
+  -l kubernetes.io/service-name=api -w
+```
+
+DNS record thuộc Service nên vẫn tồn tại dù selector không khớp. Sửa selector khiến controller tự reconcile EndpointSlice; không cần restart workload.
+
+</details>
+
+**2. Port chain drill:** đổi `targetPort` của Service từ `http` sang `9090`. Chứng minh endpoint IP vẫn có, app vẫn healthy trên `8080`, nhưng request qua Service fail. Sửa bằng named port.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl patch svc api -n backend --type=merge \
+  -p '{"spec":{"ports":[{"name":"http","port":8080,"targetPort":9090}]}}'
+
+kubectl get endpointslices -n backend \
+  -l kubernetes.io/service-name=api -o yaml
+POD_IP=$(kubectl get pod -n backend -l app=api \
+  -o jsonpath='{.items[0].status.podIP}')
+kubectl exec -n frontend deploy/frontend -- \
+  wget -T2 -qO- "http://$POD_IP:8080/"
+kubectl exec -n frontend deploy/frontend -- \
+  wget -T2 -qO- http://api.backend:8080/ || true
+
+kubectl patch svc api -n backend --type=merge \
+  -p '{"spec":{"ports":[{"name":"http","port":8080,"targetPort":"http"}]}}'
+```
+
+Named port buộc Service tham chiếu ý nghĩa `http` thay vì lặp số port ở nhiều file.
+
+</details>
+
+**3. Default-deny có thật sự chạy?** Apply default-deny ingress cho backend. Ghi nhận request trước/sau. Nếu traffic không đổi, xác định CNI có hỗ trợ NetworkPolicy không; sau đó thêm rule chỉ cho `frontend/app=frontend` tới TCP 8080.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl apply -f backend-default-deny.yaml
+kubectl get networkpolicy -n backend
+kubectl exec -n frontend deploy/frontend -- \
+  wget -T2 -qO- http://api.backend:8080/ || true
+```
+
+Nếu request vẫn chạy, object đã được API server chấp nhận nhưng data plane chưa chắc enforce. Kiểm tra CNI đang cài thay vì kết luận policy sai:
+
+```bash
+kubectl get pods -n kube-system -o wide
+kubectl get daemonsets -n kube-system
+```
+
+Với CNI hỗ trợ policy, apply `allow-frontend-to-api` trong bài rồi test lại. Tạo thêm Pod không có label `app=frontend`; Pod đó phải tiếp tục bị chặn.
+
+</details>
+
+**4. Readiness và EndpointSlice:** làm readiness probe sai port. Theo dõi Pod `Running` nhưng `0/1`, EndpointSlice `ready: false` và Service không route. Sửa probe, không đổi Service.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl patch deployment api -n backend --type=strategic -p \
+  '{"spec":{"template":{"spec":{"containers":[{"name":"api","readinessProbe":{"httpGet":{"path":"/","port":9999}}}]}}}}'
+
+kubectl get pods -n backend -w
+kubectl get endpointslices -n backend \
+  -l kubernetes.io/service-name=api -o yaml
+
+kubectl patch deployment api -n backend --type=strategic -p \
+  '{"spec":{"template":{"spec":{"containers":[{"name":"api","readinessProbe":{"httpGet":{"path":"/","port":"http"}}}]}}}}'
+kubectl rollout status deployment/api -n backend
+```
+
+Service không hỏng; chính Pod condition làm endpoint chưa đủ điều kiện nhận traffic.
+
+</details>
+
+**5. Gateway preflight:** trước khi apply `Gateway`/`HTTPRoute`, chứng minh cluster có CRD và GatewayClass. Sau khi apply, phân biệt `Accepted` với `Programmed`; cố tình dùng backend Service không tồn tại và tìm `ResolvedRefs=False`.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl get crd gateways.gateway.networking.k8s.io
+kubectl get gatewayclass
+
+# Chỉ apply sau khi đã cài Standard CRDs và controller phù hợp.
+kubectl apply -f gateway.yaml -f route.yaml
+kubectl describe gateway edge -n backend
+kubectl describe httproute api -n backend
+
+kubectl patch httproute api -n backend --type=json -p \
+  '[{"op":"replace","path":"/spec/rules/0/backendRefs/0/name","value":"missing"}]'
+kubectl describe httproute api -n backend
+```
+
+CRD cho phép API server hiểu object; GatewayClass/controller mới biến desired state thành data plane. `Accepted=True` không tự suy ra `Programmed=True`.
+
+</details>
+
+---
+
+## Điểm chính
+
+- Container trong cùng Pod dùng chung network namespace; Pod khác nhau giao tiếp qua pod network do CNI thực thi.
+- Service là contract ổn định; EndpointSlice mới là danh sách backend và trạng thái sẵn sàng hiện thời.
+- CoreDNS tạo service discovery theo namespace; luôn test từ đúng client Pod.
+- `ClusterIP`, `NodePort` và `LoadBalancer` khác phạm vi và dependency hạ tầng, không phải ba mức chất lượng.
+- Ingress đã frozen; Gateway API rõ ownership hơn nhưng cần **CRD bundle + controller**.
+- NetworkPolicy mặc định không cô lập; khi đã chọn Pod, các allow rule được cộng lại và cả source egress lẫn destination ingress phải cho phép.
+- Debug theo lớp DNS → Service → EndpointSlice → process/port → policy → controller; thu evidence trước khi restart hạ tầng.
+
+---
+
+## Tài liệu chính thức
+
+- [Kubernetes network model](https://kubernetes.io/docs/concepts/services-networking/)
+- [Services](https://kubernetes.io/docs/concepts/services-networking/service/)
+- [EndpointSlices](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/)
+- [DNS for Services and Pods](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/)
+- [Network Policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
+- [Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/)
+- [Gateway API — Getting started](https://gateway-api.sigs.k8s.io/guides/getting-started/)
+- [kind networking configuration](https://kind.sigs.k8s.io/docs/user/configuration/#networking)
+
+---
+
+## Tiếp theo
+
+**[Phần 15 — Kubernetes Scheduling, Resilience & Autoscaling](/blog/docker-15-kubernetes-scheduling-autoscaling/)** — hiểu scheduler chọn node từ requests, giữ workload qua disruption và scale bằng HPA mà không tạo thêm Pod `Pending` vô ích.

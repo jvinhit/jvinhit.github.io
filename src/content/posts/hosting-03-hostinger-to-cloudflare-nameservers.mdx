@@ -1,0 +1,456 @@
+---
+title: 'Domain, DNS & Hosting · Phần 3 — Chuyển Nameserver từ Hostinger sang Cloudflare'
+description: 'Runbook chuyển domain đăng ký tại Hostinger sang Cloudflare authoritative DNS: audit web và mail, xử lý DNSSEC, verify, rollback an toàn.'
+pubDate: 2026-07-11
+tags: [hosting, domain, dns, devops, cloudflare, hostinger, hosting_dns_10]
+series: hosting-dns
+seriesOrder: 3
+lang: vi
+draft: false
+---
+
+import HostingDiagram from '../../components/blog/HostingDiagram.astro';
+
+Kết thúc bài này, bạn có thể chuyển một domain **đăng ký tại Hostinger** sang
+Cloudflare Full setup mà không đánh cược website và email vào nút “Continue”.
+
+Outcome cụ thể:
+
+- đăng ký/gia hạn vẫn ở Hostinger; Cloudflare trở thành authoritative DNS bằng
+  đúng hai nameserver được gán;
+- web, mail và verification records được copy có kiểm chứng;
+- DNSSEC cũ/mới đi đúng thứ tự, mỗi lớp có command và tiêu chí rollback.
+
+Đây là **DNS control-plane migration**, không phải transfer domain và cũng
+không tự chuyển website khỏi Hostinger. Origin có thể tiếp tục nằm trên
+Hostinger, VPS, GitHub Pages hoặc provider khác.
+
+> Lab dùng `example.com` và các địa chỉ TEST-NET như `192.0.2.10`. Chúng chỉ
+> dành cho tài liệu. Tên Cloudflare nameserver trong bài là placeholder; luôn
+> copy chính xác cặp được hiển thị cho **zone của bạn**.
+
+---
+
+## Mental model của cuộc chuyển đổi
+
+<HostingDiagram
+  kind="migration-flow"
+  caption="Dựng zone Cloudflare giống zone cũ, tháo DS cũ, đổi delegation tại Hostinger, xác minh rồi mới bật proxy và DNSSEC mới"
+/>
+
+Trước cutover:
+
+```text
+.com parent ──NS──► authoritative DNS cũ ──A/MX/TXT──► web + mail
+          registrar: Hostinger
+```
+
+Sau cutover:
+
+```text
+.com parent ──NS──► Cloudflare authoritative DNS ──► web + mail cũ
+          registrar: Hostinger                 └── optional proxy cho web
+```
+
+Registrar cập nhật delegation ở parent; Cloudflare giữ zone mới. Hosting và
+email không tự di chuyển, chúng chạy tiếp nếu record được copy đúng.
+
+Năm invariant an toàn:
+
+1. **Zone mới hoàn chỉnh trước khi đổi NS.**
+2. **Cloudflare Quick Scan không phải nguồn sự thật.**
+3. **DS/DNSSEC cũ phải được gỡ và cache phải hết trước khi thay NS.**
+4. **Chỉ dùng đúng cặp nameserver Cloudflare gán cho zone.**
+5. **Bắt đầu DNS only; proxy và DNSSEC mới là các thay đổi sau.**
+
+---
+
+## Chuẩn bị: cửa sổ thay đổi và bộ dữ liệu gốc
+
+Chọn cửa sổ có người theo dõi web/mail và quyền vào cả hai account. Ghi lại:
+
+- domain chưa hết hạn, không ở trạng thái hold/suspended;
+- Hostinger account có quyền đổi nameserver và DNSSEC;
+- Cloudflare account, origin IP/target và health URL;
+- email provider cùng tài khoản test gửi/nhận;
+- nameserver hiện tại, DS hiện tại và toàn bộ zone.
+
+Tạo file runbook riêng, không để dữ liệu chỉ nằm trong clipboard:
+
+```bash
+DOMAIN='example.com' # lab; thay bằng domain thật
+
+dig NS "$DOMAIN" +short
+dig SOA "$DOMAIN" +noall +answer
+dig DS "$DOMAIN" +dnssec +noall +answer
+```
+
+Lưu output cùng timestamp. `dig NS +short` cho set đang được resolver thấy;
+`dig +trace` ở bước sau sẽ xác nhận delegation từ parent.
+
+---
+
+## Bước 1 — Audit zone cũ: web chỉ là một phần
+
+Trong hPanel, mở domain → **DNS / Nameservers**. Tên menu có thể đổi theo phiên
+bản; đối chiếu Help Center hiện hành. Export zone nếu có, nếu không hãy chép từng
+record thành bảng:
+
+| Type  | Full name                   | Value                        | Priority | TTL | Proxy sau này? | Chủ dịch vụ |
+| ----- | --------------------------- | ---------------------------- | -------- | --- | -------------- | ----------- |
+| A     | `example.com`               | `192.0.2.10`                 | —        | 300 | có thể         | web origin  |
+| CNAME | `www.example.com`           | `example.com`                | —        | 300 | có thể         | web origin  |
+| A     | `api.example.com`           | `192.0.2.20`                 | —        | 300 | có thể         | API         |
+| A     | `mail.example.com`          | `192.0.2.25`                 | —        | 300 | **không**      | mail        |
+| MX    | `example.com`               | `mail.example.com`           | 10       | 300 | **không**      | mail        |
+| TXT   | `example.com`               | `v=spf1 ip4:192.0.2.25 -all` | —        | 300 | không          | SPF         |
+| TXT   | `s1._domainkey.example.com` | `v=DKIM1; ...`               | —        | 300 | không          | DKIM        |
+| TXT   | `_dmarc.example.com`        | `v=DMARC1; p=none`           | —        | 300 | không          | DMARC       |
+| CAA   | `example.com`               | `0 issue "letsencrypt.org"`  | —        | 300 | không          | TLS policy  |
+
+Đây là ví dụ, không phải record Hostinger mặc định. Copy giá trị thật từ zone
+và từ từng provider.
+
+Tìm thêm AAAA/wildcard, `autodiscover`/SRV, mọi DKIM selector, verification TXT,
+CAA và subdomain staging/API/webhook. Đừng chỉ tìm `default._domainkey`.
+
+Cloudflare Quick Scan **không bảo đảm tìm đủ record**; custom subdomain, DKIM
+selector và verification token có thể bị bỏ sót. `dig ANY` cũng không phải lệnh
+export zone; nhiều server trả tập con hoặc từ chối ANY.
+
+Đối chiếu từng record quan trọng từ DNS hiện tại:
+
+```bash
+dig "$DOMAIN" A +noall +answer
+dig "$DOMAIN" AAAA +noall +answer
+dig "$DOMAIN" MX +noall +answer
+dig "$DOMAIN" TXT +noall +answer
+dig "_dmarc.$DOMAIN" TXT +noall +answer
+dig "s1._domainkey.$DOMAIN" TXT +noall +answer
+dig "$DOMAIN" CAA +noall +answer
+```
+
+DNS public không liệt kê được tên bạn chưa biết. Export/dashboard là inventory;
+`dig` chỉ xác nhận record đang được phục vụ.
+
+---
+
+## Bước 2 — Onboard `example.com` vào Cloudflare
+
+Trong Cloudflare Dashboard:
+
+1. vào **Domains** → **Onboard a domain**, nhập apex `example.com`;
+2. chọn plan/Full setup và dùng scan/import tạo bản nháp;
+3. review từng dòng với inventory;
+4. đặt A/AAAA/CNAME web ở **DNS only** trong migration.
+
+Cloudflare hiện gán hai standard nameserver cho mỗi zone. Tên được gán tự động,
+có thể khác giữa domain/account và không phải giá trị bạn tự chọn. Lưu chúng
+nguyên văn từ onboarding flow hoặc zone **Overview**:
+
+```bash
+CF_NS_1='COPY_FIRST_ASSIGNED_NAMESERVER'
+CF_NS_2='COPY_SECOND_ASSIGNED_NAMESERVER'
+```
+
+Không lấy cặp nameserver từ screenshot của bài viết, domain khác hoặc một
+tutorial cũ.
+
+### Proxy status ban đầu
+
+- A/AAAA/CNAME HTTP(S): **DNS only** trước cutover.
+- `mail`, `smtp`, `imap`, `pop`, MX target và protocol không được hỗ trợ: DNS
+  only.
+- verification CNAME/TXT: DNS only; TXT/MX vốn không được HTTP proxy.
+
+Bắt đầu DNS only làm migration chỉ thay authoritative provider. Nếu cùng lúc
+bật proxy, bạn thêm edge TLS, cache, redirect, WAF và origin reachability vào
+failure surface.
+
+---
+
+## Bước 3 — Xử lý DNSSEC cũ trước khi thay nameserver
+
+DNSSEC tạo chain of trust từ parent bằng **DS record**. DS cũ trỏ tới key của
+DNS provider cũ. Nếu parent vẫn công bố/cached DS đó nhưng resolver nhận
+DNSKEY/signature từ Cloudflare, validation có thể fail thành `SERVFAIL`.
+
+Kiểm tra từ parent và public validating resolvers:
+
+```bash
+dig DS "$DOMAIN" +trace
+dig @1.1.1.1 DS "$DOMAIN" +dnssec
+dig @8.8.8.8 DS "$DOMAIN" +dnssec
+```
+
+Nếu có DS:
+
+1. vào Hostinger **DNS / Nameservers** → **DNSSEC**;
+2. ghi lại DS cũ và TTL đang quan sát;
+3. xóa/disable DNSSEC record ở registrar;
+4. **chưa đổi nameserver**;
+5. chờ DS cũ hết TTL khỏi parent/public caches;
+6. chạy lại ba command cho tới khi parent không còn công bố DS và public
+   resolver trả NODATA thay vì DS cũ.
+
+Cloudflare khuyến nghị dành cửa sổ 24–48 giờ cho cached DS trong migration thông
+thường, nhưng đó không phải đồng hồ bảo đảm cho mọi TLD. Quyết định dựa trên
+TTL và kết quả query thực tế. `NOERROR` với answer DS trống có thể là NODATA;
+`SERVFAIL` **không** phải bằng chứng DNSSEC đã được gỡ sạch.
+
+Nếu ngay từ đầu parent không có DS, ghi nhận bằng chứng và bỏ qua thời gian chờ
+DNSSEC. Đừng “tạo DNSSEC tạm” chỉ để làm theo checklist.
+
+---
+
+## Bước 4 — Preflight zone Cloudflare trước cutover
+
+Khi zone còn Pending, query trực tiếp cả hai nameserver được gán. Thay biến bằng
+giá trị thật đã copy:
+
+```bash
+dig @"$CF_NS_1" "$DOMAIN" SOA +norecurse
+dig @"$CF_NS_2" "$DOMAIN" SOA +norecurse
+
+dig @"$CF_NS_1" "$DOMAIN" A +noall +answer
+dig @"$CF_NS_2" "$DOMAIN" A +noall +answer
+dig @"$CF_NS_1" "$DOMAIN" MX +noall +answer
+dig @"$CF_NS_1" "$DOMAIN" TXT +noall +answer
+dig @"$CF_NS_1" "_dmarc.$DOMAIN" TXT +noall +answer
+```
+
+Go/no-go criteria:
+
+- cả hai NS trả authoritative SOA cho đúng zone;
+- A/AAAA/CNAME web khớp inventory;
+- MX priority/target và mail hostname khớp;
+- SPF, từng DKIM selector, DMARC, CAA và verification token đủ;
+- không có record proxied ngoài chủ ý;
+- origin hoạt động khi bypass DNS/proxy.
+
+Test origin thật bằng IP thật, không dùng TEST-NET:
+
+```bash
+curl --resolve example.com:443:192.0.2.10 \
+  https://example.com/ -I
+```
+
+Trong lab command không thể tới origin. Production cần `2xx/3xx` mong đợi và
+certificate hợp lệ. Nếu direct Cloudflare authoritative query còn thiếu record,
+**dừng tại đây**; chờ propagation không tự tạo record bị thiếu.
+
+---
+
+## Bước 5 — Đổi delegation tại Hostinger
+
+Theo Help Center hiện hành, đi tới domain trong hPanel, mở **DNS / Nameservers**
+và chọn thay đổi nameserver. UI có thể đổi nhãn, nhưng thao tác cần tìm là
+nameserver của **registration**, không phải form thêm NS record trong zone.
+
+1. Xóa set authoritative nameserver cũ.
+2. Nhập chính xác `$CF_NS_1` và `$CF_NS_2` được gán.
+3. Không thêm Hostinger NS hay Cloudflare NS của zone khác; review typo rồi save.
+
+Hostinger có thể cho nhập nhiều nameserver, nhưng Full setup thông thường của
+Cloudflare yêu cầu đúng hai tên được gán. Trộn old/new NS khiến resolver ngẫu
+nhiên hỏi hai zone không đồng bộ — tệ hơn một cutover dứt khoát.
+
+Hostinger và Cloudflare đều hướng dẫn cho phép thời gian cập nhật có thể tới 24
+giờ. Đây là khoảng dự kiến, không phải cam kết “sau 24 giờ mọi cache giống nhau”.
+Đừng flush DNS rồi kết luận global propagation đã hoàn tất.
+
+---
+
+## Bước 6 — Xác minh từ authority tới user flow
+
+### Lớp 1: parent delegation
+
+```bash
+dig NS "$DOMAIN" +trace
+```
+
+Đoạn delegation từ TLD phải liệt kê đúng `$CF_NS_1` và `$CF_NS_2`, không lẫn NS
+cũ. Đây là bằng chứng registrar/registry đã cập nhật.
+
+### Lớp 2: public recursive resolvers
+
+```bash
+dig @1.1.1.1 NS "$DOMAIN" +noall +answer
+dig @8.8.8.8 NS "$DOMAIN" +noall +answer
+dig @1.1.1.1 "$DOMAIN" A +noall +answer
+dig @8.8.8.8 "$DOMAIN" A +noall +answer
+```
+
+Hai resolver có thể chuyển thời điểm khác nhau vì cache. NS cũ với TTL đang
+đếm xuống khác với `SERVFAIL`: cái đầu có thể là cache hợp lệ; cái sau cần điều
+tra delegation/DNSSEC.
+
+### Lớp 3: authoritative consistency
+
+```bash
+for ns in "$CF_NS_1" "$CF_NS_2"; do
+  dig @"$ns" "$DOMAIN" A +noall +answer
+  dig @"$ns" "$DOMAIN" MX +noall +answer
+done
+```
+
+Cả hai phải cho cùng logical answer. Cloudflare Dashboard phải chuyển zone sang
+**Active**. Pending kéo dài không được chữa bằng cách đoán một cặp NS khác; so
+khớp tuyệt đối delegation và cặp trong Overview.
+
+### Lớp 4: website, TLS và mail
+
+```bash
+curl -Iv "https://$DOMAIN/"
+curl -Iv "https://www.$DOMAIN/"
+dig "$DOMAIN" MX +noall +answer
+dig "s1._domainkey.$DOMAIN" TXT +noall +answer
+dig "_dmarc.$DOMAIN" TXT +noall +answer
+```
+
+- kiểm tra status, redirect, certificate, API và webhook;
+- gửi/nhận mail thật, xem SPF, DKIM và DMARC trong authentication result.
+
+---
+
+## Bước 7 — Chỉ bật proxy sau khi DNS-only ổn định
+
+Khi zone Active, web chạy ổn và edge certificate sẵn sàng, bật **Proxied** từng
+record HTTP(S) có chủ đích. Sau mỗi nhóm nhỏ:
+
+```bash
+dig @1.1.1.1 "$DOMAIN" A +noall +answer
+curl -Iv "https://$DOMAIN/"
+```
+
+Khi proxied, A answer public sẽ là Cloudflare anycast IP, không còn là
+`192.0.2.10` của origin. Đó là expected. Xác minh bằng HTTP/TLS và Cloudflare
+dashboard, không cố ép public DNS phải lộ origin.
+
+Giữ mail host DNS only. Nếu proxy web gây redirect loop hoặc TLS error, đưa
+record về DNS only để cô lập edge khỏi origin rồi kiểm tra SSL mode/certificate;
+đừng đổi nameserver để xử lý một lỗi HTTP.
+
+---
+
+## Bước 8 — Bật lại DNSSEC bằng DS mới
+
+Chỉ làm khi:
+
+- Cloudflare báo Active;
+- delegation mới đã được quan sát từ parent và public resolvers;
+- web/mail ổn định;
+- không còn ý định rollback tức thì.
+
+Trong Cloudflare DNSSEC, enable DNSSEC và lấy đúng bộ DS được hiển thị: Key Tag,
+Algorithm, Digest Type và Digest. Quay lại Hostinger **DNSSEC**, thêm bộ giá trị
+mới đó. Không tái sử dụng DS cũ và không tự tạo digest bằng mắt.
+
+Xác minh:
+
+```bash
+dig @1.1.1.1 DS "$DOMAIN" +dnssec
+dig @"$CF_NS_1" DNSKEY "$DOMAIN" +dnssec
+dig @1.1.1.1 A "$DOMAIN" +dnssec
+```
+
+DS ở parent phải là bộ Cloudflare mới; authoritative Cloudflare phải trả
+DNSKEY. Với validating resolver, flag `ad` trên câu trả lời cuối cho biết dữ
+liệu đã được xác thực. Không thấy `ad` chưa đủ kết luận fail nếu resolver bạn
+hỏi không bật validation; `SERVFAIL` trên nhiều validating resolver mới là tín
+hiệu đỏ.
+
+---
+
+## Failure modes thường gặp
+
+| Triệu chứng                          | Nguyên nhân khả dĩ                                    | Phản ứng đúng                                              |
+| ------------------------------------ | ----------------------------------------------------- | ---------------------------------------------------------- |
+| Cloudflare mãi Pending               | delegation chưa khớp hoặc còn extra NS                | so sánh `+trace` với Overview, sửa tại Hostinger           |
+| `SERVFAIL` sau đổi NS                | DS cũ còn ở parent/cache                              | query DS; gỡ đúng registrar và chờ TTL, không flush local  |
+| Web hoạt động, mail mất              | Quick Scan bỏ sót MX/TXT/DKIM hoặc mail host bị proxy | bổ sung record ở Cloudflare, test gửi/nhận                 |
+| Edit DNS ở Hostinger không đổi       | Hostinger zone không còn authoritative                | sửa Cloudflare zone; xác nhận bằng `dig NS +trace`         |
+| Cloudflare trả 522/525/526           | edge không tới origin hoặc TLS origin lỗi             | chuyển DNS only để cô lập, kiểm tra firewall/cert/SSL mode |
+| Hai mạng cho answer khác hẳn lâu dài | old/new NS bị trộn hoặc zone không đồng bộ            | parent chỉ giữ đúng cặp Cloudflare assigned                |
+
+---
+
+## Rollback: chọn sửa zone hay quay delegation
+
+Một record thiếu đơn lẻ thường được sửa nhanh và ít rủi ro hơn ngay trong
+Cloudflare. Rollback nameserver phù hợp khi có lỗi hệ thống: nhiều record sai,
+widespread `SERVFAIL`, không kiểm soát được zone/account hoặc mail quan trọng
+không thể phục hồi trong change window.
+
+### Trước khi bật DNSSEC mới
+
+1. Query trực tiếp để chắc old nameserver còn phục vụ zone đúng.
+2. Tại Hostinger, restore **chính xác set NS cũ**, không trộn old/new NS.
+3. Theo dõi `+trace`, public resolvers, web/mail; giữ Cloudflare zone để phân tích.
+
+Nếu old provider không còn phục vụ zone, rebuild/restore zone cũ **trước** khi
+đổi delegation về nó.
+
+### Sau khi DS Cloudflare đã được publish
+
+Không đổi NS về provider cũ trong khi DS Cloudflare còn ở parent/cache. Trình tự
+an toàn:
+
+1. xóa DS Cloudflare tại Hostinger;
+2. chờ TTL, xác minh parent/public resolver không còn DS;
+3. xác nhận zone cũ sẵn sàng rồi mới restore old NS và quan sát lại chain.
+
+Rollback DNSSEC không tức thời vì cached DS vẫn có thể validate theo chain cũ.
+Đây là lý do trì hoãn bật DNSSEC mới tới cuối change window.
+
+Đừng xóa rồi add lại zone Cloudflare để “reset”. Tài liệu Cloudflare cảnh báo
+zone được thêm lại có thể nhận nameserver assignment khác và cấu hình cũ không
+được khôi phục. Khi đó bạn tự tạo thêm một migration giữa sự cố.
+
+---
+
+## Checklist cutover
+
+- [ ] Export đủ web, mail, verification và subdomain records.
+- [ ] Quick Scan đã đối chiếu; cả hai assigned NS trả zone staged đúng.
+- [ ] Ban đầu DNS only; DS cũ đã hết cache; origin/TLS hoạt động.
+- [ ] Old NS/zone và rollback criteria được lưu.
+- [ ] Parent chỉ delegate đúng cặp Cloudflare; zone đã Active.
+- [ ] Public resolvers không `SERVFAIL`; apex, `www`, API và IPv6 đã test.
+- [ ] Mail, SPF, DKIM, DMARC đã test.
+- [ ] Proxy web và DNSSEC mới chỉ bật sau cùng, đều đã verify.
+
+---
+
+## Bài tập thực hành
+
+1. Thêm vào inventory một DKIM selector thứ hai và một TXT verification.
+2. DS còn ở 8.8.8.8 nhưng đã mất ở 1.1.1.1: giải thích quyết định no-go.
+3. Viết rollback sau khi DNSSEC mới bật và chỉ ra lỗi nếu đổi NS trước khi xóa DS.
+
+---
+
+## Điều cốt lõi
+
+Chuyển nameserver từ Hostinger sang Cloudflare an toàn không nằm ở việc click
+đúng menu; nó nằm ở **thứ tự**. Audit zone thật, dựng Cloudflare DNS-only, gỡ DS
+cũ và chờ TTL, query trực tiếp cả hai authoritative NS, đổi delegation bằng
+đúng cặp được gán, kiểm tra parent/public resolver/web/mail, rồi mới bật proxy
+và DNSSEC mới. Mọi bước đều tạo bằng chứng cho bước tiếp theo và giữ rollback
+khả thi.
+
+---
+
+## Nguồn chính thức
+
+Tài liệu được đối chiếu ngày **2026-07-11**:
+
+- [Cloudflare DNS — Set up a primary zone (Full setup)](https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/)
+- [Cloudflare DNS — Records Quick Scan và giới hạn](https://developers.cloudflare.com/dns/zone-setups/reference/dns-quick-scan/)
+- [Cloudflare DNS — DNSSEC](https://developers.cloudflare.com/dns/dnssec/)
+- [Cloudflare — Minimize downtime for a nameserver change](https://developers.cloudflare.com/fundamentals/performance/minimize-downtime/)
+- [Cloudflare DNS — Full setup troubleshooting](https://developers.cloudflare.com/dns/zone-setups/full-setup/troubleshooting/)
+- [Cloudflare DNS — Remove a domain and re-adding caveats](https://developers.cloudflare.com/dns/zone-setups/removal/)
+- [Hostinger — How to change nameservers at Hostinger](https://www.hostinger.com/support/1696789-how-to-change-nameservers-at-hostinger/)
+- [Hostinger — How to manage DNS records](https://support.hostinger.com/en/articles/1583249-how-to-manage-dns-records-at-hostinger)
+- [Hostinger — How to use DNSSEC records](https://www.hostinger.com/support/3667267-how-to-use-dnssec-records-at-hostinger/)

@@ -1,170 +1,386 @@
 ---
-title: 'Node.js Super Senior · Phase 16 — Message Queues & Background Jobs'
-description: 'Bonus Phase 16: đẩy việc nặng ra khỏi request. Vì sao cần hàng đợi, BullMQ trên Redis (job, worker, retry, backoff, scheduling), at-least-once và idempotency, dead-letter queue, và khi nào nâng cấp lên RabbitMQ hay Kafka.'
+title: 'Node.js Production Engineering 16 — Background Jobs và Message Queues'
+description: 'Thiết kế background jobs có thể vận hành: BullMQ, delivery semantics, idempotency, transactional outbox, retry có jitter, dead-letter workflow, backpressure và graceful shutdown.'
 pubDate: 2026-06-22
-tags: [nodejs, queue, bullmq, redis, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, queue, bullmq, redis, architecture, production-engineering]
 series: nodejs
 seriesOrder: 16
 draft: false
 ---
 
-Đây là **Bonus Phase 16**, mở một nhánh mới: vận hành ở quy mô thật. Suốt 15 phase trước, mọi việc xảy ra *bên trong* vòng đời request. Nhưng gửi email, resize ảnh, gọi API bên thứ ba, sinh báo cáo — những việc này **không nên** bắt người dùng chờ, và càng không nên làm sập request khi chúng lỗi. Lời giải của senior là **đẩy việc ra hàng đợi (queue)** và xử lý nền bằng **worker**.
+Một request `POST /orders` đã ghi đơn hàng thành công. Process chết ngay trước lệnh enqueue, nên email xác nhận không bao giờ được gửi. Nếu đảo thứ tự — enqueue trước rồi transaction database rollback — worker lại xử lý một đơn hàng không tồn tại.
+
+Đây là bài toán thật của background jobs: **không phải làm sao để chạy code ở process khác, mà là làm sao để một công việc không bị mất, không gây tác dụng phụ hai lần, và có thể phục hồi khi hạ tầng lỗi**.
+
+Sau bài này, bạn sẽ có thể:
+
+- phân biệt job, command và domain event thay vì gọi tất cả là “message”;
+- triển khai producer/worker BullMQ có type, retry và graceful shutdown;
+- giải thích `at-most-once`, `at-least-once` và vì sao “exactly once” thường chỉ là lời hứa ở một phạm vi hẹp;
+- xử lý dual write bằng transactional outbox;
+- thiết kế idempotency cho database lẫn API bên thứ ba;
+- dùng queue age, throughput và failure rate để quyết định scale worker.
+
+> Phiên bản tham chiếu của bài là **BullMQ 5.x** trên Redis. API recurring job dùng **Job Scheduler**; API `repeat` cũ đã được thay thế từ BullMQ 5.16.
 
 ---
 
-## Vì sao cần hàng đợi
+## 1. Mental model: queue chuyển ranh giới thời gian và lỗi
 
-Làm việc nặng ngay trong handler có ba vấn đề: người dùng chờ lâu, một lỗi tạm thời (API bên thứ ba sập) làm hỏng cả request, và bạn không thể giới hạn tốc độ (gửi 10.000 email sẽ bão hòa SMTP).
+Queue không làm công việc biến mất. Nó chuyển chi phí ra khỏi critical path của request và đặt một **ranh giới chịu lỗi** giữa bên nhận việc với bên thực thi.
 
 ```text
-KHÔNG queue:  POST /signup ─▶ tạo user ─▶ gửi email (chờ SMTP...) ─▶ 200  (chậm, dễ vỡ)
-
-CÓ queue:     POST /signup ─▶ tạo user ─▶ enqueue("welcome-email") ─▶ 200  (nhanh)
-                                                    │
-                            Worker  ◀───────────────┘  xử lý nền, retry nếu lỗi
+HTTP request
+    │
+    ├─ validate + transaction ──▶ 201 Created
+    │                  │
+    │                  └─ durable message ──▶ queue ──▶ worker ──▶ dependency
+    │                                            │           │
+    │                                            │           └─ timeout / retry / compensate
+    │                                            └─ backlog / rate limit / scheduling
+    └─ latency của người dùng không còn chứa thời gian xử lý nền
 ```
 
-Hàng đợi tách **nhận việc** khỏi **làm việc**: producer chỉ bỏ job vào hàng đợi rồi trả lời ngay; một hoặc nhiều worker tiêu thụ job độc lập. Đây là kiến trúc bất đồng bộ Phase 10, áp vào lớp tác vụ nền.
+Ba khái niệm gần nhau nhưng khác ý nghĩa:
 
----
+| Khái niệm   | Ý định                                        | Ví dụ                     | Ai nên đặt tên?   |
+| ----------- | --------------------------------------------- | ------------------------- | ----------------- |
+| **Job**     | yêu cầu thực thi một tác vụ                   | `generate-monthly-report` | hệ thống thực thi |
+| **Command** | yêu cầu một capability làm gì đó              | `SendWelcomeEmail`        | bên gọi           |
+| **Event**   | sự kiện đã xảy ra, không ra lệnh cho consumer | `UserRegistered`          | domain phát sinh  |
 
-## BullMQ trên Redis
+Tên `send-email` khóa producer vào cách xử lý. Tên `user-registered` cho phép email, analytics và CRM phản ứng độc lập. Chọn tên theo mức coupling bạn chấp nhận, không theo thư viện đang dùng.
 
-Bạn đã có Redis từ Phase 13. **BullMQ** là thư viện queue chuẩn cho Node, dùng Redis làm backend — đủ mạnh cho phần lớn app, ít hạ tầng hơn hẳn một message broker riêng.
+### Khi không nên dùng queue
 
-```bash
-npm install bullmq
-```
+Đừng đưa một bước vào nền nếu response chỉ được coi là thành công khi bước đó hoàn tất. Xác thực thanh toán trước khi xác nhận đơn hàng thường nằm trong luồng đồng bộ; gửi hóa đơn có thể chạy nền. Queue cũng không phù hợp để che một query chậm mà client vẫn cần kết quả ngay.
 
-### Producer — bỏ job vào hàng đợi
+## 2. Producer và worker với BullMQ
+
+Payload nên nhỏ, có version và chủ yếu chứa **identifier**. Đừng snapshot cả object người dùng vào Redis nếu worker cần trạng thái mới nhất hoặc payload chứa PII không cần thiết.
 
 ```ts
-import { Queue } from 'bullmq';
+import { Queue, type JobsOptions } from 'bullmq';
 
-const connection = { host: '127.0.0.1', port: 6379 };
-export const emailQueue = new Queue('email', { connection });
+type EmailJob =
+  | { type: 'welcome-email.v1'; userId: string }
+  | { type: 'order-receipt.v1'; orderId: string };
 
-// trong handler /signup — trả response ngay, không chờ
-await emailQueue.add(
-  'welcome',                          // tên job
-  { to: user.email, name: user.name }, // payload
-  { attempts: 5, backoff: { type: 'exponential', delay: 1000 } }
-);
-```
+const connection = {
+  host: process.env.REDIS_HOST ?? '127.0.0.1',
+  port: Number(process.env.REDIS_PORT ?? 6379),
+};
 
-### Worker — tiêu thụ job
+export const emailQueue = new Queue<EmailJob>('email', { connection });
 
-Worker thường chạy ở **process riêng** (deploy độc lập, scale riêng — Phase 7):
-
-```ts
-import { Worker } from 'bullmq';
-
-const worker = new Worker(
-  'email',
-  async (job) => {
-    const { to, name } = job.data;
-    await sendEmail(to, `Chào ${name}!`); // có thể throw → BullMQ tự retry
-  },
-  { connection, concurrency: 5 } // xử lý 5 job song song mỗi worker
-);
-
-worker.on('completed', (job) => console.log(`done ${job.id}`));
-worker.on('failed', (job, err) => console.error(`fail ${job?.id}`, err.message));
-```
-
-`concurrency` + nhiều instance worker = throughput điều chỉnh được, mà không đụng gì tới web server.
-
----
-
-## Retry, backoff & job theo lịch
-
-Sức mạnh thật của queue nằm ở chính sách thử lại. Một job throw sẽ được **retry tự động** theo `attempts` và `backoff`:
-
-```ts
-await queue.add('charge', data, {
+const defaults: JobsOptions = {
   attempts: 5,
-  backoff: { type: 'exponential', delay: 2000 }, // 2s, 4s, 8s, 16s...
+  backoff: { type: 'exponential', delay: 1_000, jitter: 0.5 },
+  removeOnComplete: { age: 3_600, count: 10_000 },
+  removeOnFail: false,
+};
+
+await emailQueue.add(
+  'welcome-email.v1',
+  { type: 'welcome-email.v1', userId: user.id },
+  {
+    ...defaults,
+    // BullMQ deduplicate khi một job cùng id vẫn còn trong queue.
+    // Đây là lớp bảo vệ bổ sung, không thay thế business idempotency.
+    jobId: `welcome-${user.id}`,
+  }
+);
+```
+
+Worker chạy ở process/container riêng để scale, deploy và giới hạn tài nguyên độc lập với HTTP server:
+
+```ts
+import { Worker, type Job } from 'bullmq';
+
+async function processEmail(job: Job<EmailJob>): Promise<void> {
+  switch (job.data.type) {
+    case 'welcome-email.v1': {
+      const user = await users.findById(job.data.userId);
+      if (!user) throw new NonRetryableError('user_not_found');
+      await mailer.sendWelcome(user);
+      return;
+    }
+    case 'order-receipt.v1': {
+      const order = await orders.findById(job.data.orderId);
+      if (!order) throw new NonRetryableError('order_not_found');
+      await mailer.sendReceipt(order);
+    }
+  }
+}
+
+const worker = new Worker<EmailJob>('email', processEmail, {
+  connection,
+  concurrency: 8,
+});
+
+worker.on('failed', (job, error) => {
+  logger.error(
+    {
+      jobId: job?.id,
+      jobName: job?.name,
+      attemptsMade: job?.attemptsMade,
+      error,
+    },
+    'email job failed'
+  );
 });
 ```
 
-Exponential backoff tránh dội bom một dịch vụ đang chập chờn. BullMQ còn hỗ trợ:
+`concurrency: 8` không có nghĩa là “nhanh hơn” trong mọi trường hợp. Với SMTP hoặc API có quota 5 request/giây, concurrency cao chỉ tạo thêm `429`. Nó là một **capacity control**, phải được chọn từ latency của dependency, rate limit và memory mỗi job.
+
+## 3. Retry chỉ dành cho lỗi có thể hồi phục
+
+Một chính sách “retry mọi exception năm lần” vừa tốn tài nguyên vừa che lỗi lập trình. Hãy phân loại lỗi:
+
+| Loại lỗi             | Ví dụ                                   | Hành động                                                |
+| -------------------- | --------------------------------------- | -------------------------------------------------------- |
+| Tạm thời             | timeout, `429`, `503`, connection reset | retry có backoff + jitter                                |
+| Vĩnh viễn theo input | email sai định dạng, user không tồn tại | fail ngay, không retry                                   |
+| Lỗi lập trình        | `TypeError`, invariant bị phá           | fail, alert và sửa code                                  |
+| Không chắc kết quả   | timeout sau khi gửi request thanh toán  | đối soát bằng idempotency key/status API trước khi retry |
+
+Backoff phân tán các lần thử theo thời gian; **jitter** tránh hàng nghìn worker cùng thức dậy ở đúng mốc 2, 4, 8 giây rồi tạo một đợt tải mới.
 
 ```ts
-// trễ: chạy sau 1 giờ
-await queue.add('reminder', data, { delay: 60 * 60 * 1000 });
+class NonRetryableError extends Error {}
 
-// lặp theo lịch (cron) — báo cáo hằng đêm
-await queue.add('nightly-report', {}, { repeat: { pattern: '0 2 * * *' } });
+const worker = new Worker<EmailJob>(
+  'email',
+  async (job) => {
+    try {
+      await processEmail(job);
+    } catch (error) {
+      if (error instanceof NonRetryableError) {
+        await job.discard();
+      }
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+  },
+  { connection, concurrency: 8 }
+);
 ```
 
-`delay` và `repeat` thay thế việc tự viết cron rời rạc — lịch chạy nằm cùng hệ thống job, có retry và quan sát được.
-
----
-
-## At-least-once & idempotency
-
-Đây là tư duy phân biệt junior với senior. Phần lớn queue (BullMQ gồm) đảm bảo **at-least-once**: một job có thể chạy **nhiều hơn một lần** (worker chết sau khi làm xong nhưng trước khi ack, retry sau lỗi mạng tạm…). Vì vậy job phải **idempotent** — chạy lại không gây hại.
+Mỗi network call bên trong job vẫn cần timeout. Queue retry không cứu được một worker đang treo vô hạn:
 
 ```ts
-// ✗ NGUY HIỂM — retry sẽ tính tiền khách hai lần
-await chargeCard(order.amount);
+await mailer.send(payload, { signal: AbortSignal.timeout(10_000) });
+```
 
-// ✓ AN TOÀN — khóa theo id duy nhất, lần chạy thứ hai là no-op
-const key = `charge:${order.id}`;
-if (await redis.set(key, '1', 'NX', 'EX', 86400)) {
-  await chargeCard(order.amount);
+## 4. Delivery semantics và idempotency
+
+Trong hệ phân tán, worker có thể hoàn thành side effect rồi chết trước khi broker ghi nhận hoàn tất. Message sẽ được giao lại. Vì thế phần lớn queue thực dụng cung cấp **at-least-once**: không chủ ý làm mất message, đổi lại consumer phải chấp nhận duplicate.
+
+```text
+worker nhận job
+  ├─ gọi payment provider: thành công
+  ├─ process bị kill trước khi ACK
+  └─ job quay lại queue ──▶ lần chạy thứ hai
+```
+
+Ba mức cam kết thường gặp:
+
+- **at-most-once**: có thể mất, nhưng không chủ ý chạy lại;
+- **at-least-once**: có thể lặp, consumer phải idempotent;
+- **effectively-once**: duplicate vẫn được giao nhưng business outcome chỉ xuất hiện một lần nhờ idempotency.
+
+“Exactly once” chỉ có ý nghĩa khi nói rõ **phạm vi**. Broker có thể đảm bảo một record được commit một lần trong log của nó, nhưng không thể tự động biến một charge ở payment provider và một row ở Postgres thành một transaction nguyên tử.
+
+### Idempotency cho side effect trong database
+
+Nếu side effect chỉ nằm trong một database, ghi dấu xử lý và thay đổi nghiệp vụ trong **cùng transaction**:
+
+```sql
+BEGIN;
+
+WITH claimed AS (
+  INSERT INTO processed_jobs (job_id, processed_at)
+  VALUES ($1, now())
+  ON CONFLICT (job_id) DO NOTHING
+  RETURNING job_id
+)
+UPDATE invoices
+SET status = 'emailed'
+WHERE id = $2
+  AND status = 'pending'
+  AND EXISTS (SELECT 1 FROM claimed);
+
+COMMIT;
+```
+
+Nếu CTE không claim được `job_id`, `UPDATE` tác động 0 row và duplicate được coi là đã xử lý. Một unique constraint là hàng rào concurrency đáng tin cậy hơn chuỗi “SELECT xem có chưa rồi INSERT”.
+
+### Idempotency cho API bên thứ ba
+
+Với thanh toán, gửi cùng một **idempotency key ổn định** cho provider, ví dụ `charge-order-<orderId>`. Lưu provider operation id và trạng thái để worker có thể đối soát sau timeout. Đừng dùng mẫu `SET NX` rồi mới charge: process có thể chết sau khi đặt khóa nhưng trước side effect, khiến lần retry bỏ qua một khoản chưa từng được xử lý.
+
+## 5. Dual write và Transactional Outbox
+
+Request thường cần vừa thay đổi database vừa phát message. Hai hệ thống không cùng transaction tạo hai cửa sổ lỗi:
+
+```text
+DB commit ── process chết ── enqueue        => mất message
+enqueue   ── DB rollback                    => message ma
+```
+
+**Transactional outbox** ghi business state và ý định phát message vào cùng một transaction database:
+
+```sql
+BEGIN;
+
+INSERT INTO orders (id, user_id, status)
+VALUES ($1, $2, 'confirmed');
+
+INSERT INTO outbox (id, topic, aggregate_id, payload, created_at)
+VALUES ($3, 'order.confirmed.v1', $1, $4::jsonb, now());
+
+COMMIT;
+```
+
+Một relay độc lập đọc outbox, enqueue, rồi đánh dấu đã phát:
+
+```ts
+for (const event of await outbox.claimBatch(100)) {
+  await orderQueue.add(event.topic, event.payload, {
+    jobId: `outbox-${event.id}`,
+  });
+  await outbox.markPublished(event.id);
 }
 ```
 
-Quy tắc: thiết kế job sao cho **kết quả không đổi dù chạy 1 hay N lần**. Dùng khóa idempotency, `INSERT ... ON CONFLICT DO NOTHING`, hoặc kiểm tra trạng thái trước khi hành động.
+Relay vẫn có thể chết sau enqueue nhưng trước `markPublished`, nên duplicate vẫn có thể xảy ra. `jobId` giảm trùng trong BullMQ; consumer idempotency mới là lớp bảo vệ cuối. Outbox giải quyết **message bị mất**, không xóa nhu cầu idempotency.
 
----
+Ở tải cao, relay thường claim batch bằng `FOR UPDATE SKIP LOCKED`, có lease/attempt count, và lưu `event_type` + `schema_version` để consumer nâng cấp an toàn.
 
-## Dead-letter & job hỏng
+## 6. Job theo lịch với Job Scheduler
 
-Job vượt quá `attempts` chuyển sang trạng thái **failed** và được giữ lại để bạn điều tra — đó là "dead-letter" của BullMQ. Đừng để mất chúng âm thầm:
+BullMQ 5.16+ dùng `upsertJobScheduler` cho recurring jobs. `upsert` quan trọng trong deployment: chạy setup nhiều lần vẫn cập nhật cùng scheduler thay vì nhân bản lịch.
 
 ```ts
-// dọn job thành công nhưng GIỮ job failed để điều tra
-await queue.add('task', data, {
-  removeOnComplete: { age: 3600, count: 1000 },
-  removeOnFail: false, // giữ lại để truy vết và replay thủ công
-});
+await reportQueue.upsertJobScheduler(
+  'nightly-report-v1',
+  { pattern: '0 2 * * *', tz: 'Asia/Ho_Chi_Minh' },
+  {
+    name: 'nightly-report.v1',
+    data: {},
+    opts: {
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 5_000, jitter: 0.5 },
+    },
+  }
+);
 ```
 
-Production cần một **dashboard** để xem hàng đợi, replay job failed, và cảnh báo khi tồn đọng. `bull-board` cắm vào Express trong vài dòng và đáng giá.
+Lịch không đảm bảo job bắt đầu chính xác từng mili-giây: backlog và worker capacity vẫn chi phối. Nếu yêu cầu là “mỗi ngày có đúng một báo cáo”, model nghiệp vụ nên có unique key theo ngày, ví dụ `(report_type, business_date)`.
 
----
+## 7. Failed jobs không tự trở thành một quy trình recovery
 
-## BullMQ vs RabbitMQ vs Kafka — chọn đúng
+BullMQ giữ job ở trạng thái `failed` khi hết attempts, nhưng đó chưa phải một dead-letter workflow hoàn chỉnh. Production cần trả lời:
 
-| | BullMQ (Redis) | RabbitMQ | Kafka |
-|---|---|---|---|
-| Mô hình | job queue | message broker (AMQP) | log phân tán, append-only |
-| Hợp cho | tác vụ nền, scheduling | routing phức tạp, RPC, fan-out | event streaming, throughput cực lớn, replay |
-| Thứ tự | theo từng queue | theo queue | theo partition |
-| Lưu trữ | tạm (Redis) | tới khi ack | giữ lâu, đọc lại được |
-| Hạ tầng | đã có Redis | thêm broker | thêm cụm + vận hành nặng |
+1. Ai được cảnh báo, ở ngưỡng nào?
+2. Payload và lỗi có đủ để chẩn đoán nhưng không lộ PII không?
+3. Sau khi sửa code, replay có an toàn và có audit log không?
+4. Job nào cần bù trừ thủ công thay vì replay?
+5. Failed jobs được giữ bao lâu và ai chịu trách nhiệm dọn?
 
-Quan điểm senior: **bắt đầu bằng BullMQ** — nó giải quyết 90% nhu cầu "việc nền" với hạ tầng bạn đã có. Lên **RabbitMQ** khi cần routing/topology phức tạp giữa nhiều service. Lên **Kafka** khi bạn làm event streaming thật sự — nhiều consumer cùng đọc lại lịch sử sự kiện ở throughput rất cao. Đừng kéo Kafka vào chỉ để gửi email.
+Một lựa chọn là chuyển message độc sang queue riêng kèm metadata lỗi. Với BullMQ nhỏ hơn, giữ failed jobs và dùng dashboard nội bộ cũng đủ — miễn quyền replay được bảo vệ và mọi lần replay đều có audit.
 
----
+## 8. Backpressure, capacity và tín hiệu vận hành
 
-## Thực hành
+Queue bảo vệ request path nhưng có thể tích nợ thành backlog. Bốn số phải có trên dashboard:
 
-Mở rộng capstone Phase 10 với một lớp tác vụ nền:
+- **arrival rate**: job mới mỗi giây;
+- **completion rate**: job hoàn tất mỗi giây;
+- **oldest job age**: job lâu nhất đã chờ bao lâu;
+- **failure/retry rate**: tỷ lệ lỗi và số lần thử.
 
-1. Tạo `emailQueue`; chuyển email chào mừng ở `/signup` sang enqueue, trả `201` ngay.
-2. Worker process riêng, `concurrency: 5`, retry 5 lần với exponential backoff.
-3. Làm job idempotent bằng khóa Redis `welcome:<userId>`.
-4. Thêm job lặp `repeat` sinh báo cáo hằng đêm lúc 2h sáng.
-5. Giữ `removeOnFail: false`, gắn `bull-board`, và cảnh báo khi hàng đợi tồn đọng > N.
-6. Đóng gói worker thành image Docker riêng, deploy độc lập với web (Phase 7).
+Nếu job trung bình mất `T` giây và mỗi worker xử lý `c` job đồng thời, capacity gần đúng của `n` worker là `n × c / T` job/giây. Đây chỉ là điểm bắt đầu: dependency quota, tail latency, CPU và memory mới quyết định giới hạn thật.
 
----
+Alert theo **oldest job age** thường hữu ích hơn queue length. Một nghìn job 20 ms có thể vô hại; mười job thanh toán chờ 30 phút là sự cố.
+
+Các cơ chế giảm áp:
+
+- giới hạn concurrency và rate theo dependency;
+- tách queue theo workload/SLO để báo cáo nặng không chặn email giao dịch;
+- ưu tiên có kiểm soát, tránh để low-priority starve mãi;
+- load shedding hoặc từ chối producer khi backlog vượt ngưỡng an toàn;
+- scale worker dựa trên queue age, không chỉ CPU.
+
+## 9. Graceful shutdown và deploy worker
+
+Khi nhận `SIGTERM`, dừng nhận job mới và cho job đang chạy thời gian hoàn tất:
+
+```ts
+let shuttingDown = false;
+
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, 'worker shutting down');
+
+  const forceExit = setTimeout(() => process.exit(1), 30_000).unref();
+  await worker.close();
+  await emailQueue.close();
+  clearTimeout(forceExit);
+}
+
+process.once('SIGTERM', () => void shutdown('SIGTERM'));
+process.once('SIGINT', () => void shutdown('SIGINT'));
+```
+
+Deployment phải cho termination grace period dài hơn timeout tối đa hợp lý của một job. Với job hàng giờ, đừng cố giữ container sống hàng giờ; chia nhỏ thành checkpoint có thể resume hoặc dùng workflow engine phù hợp.
+
+## 10. BullMQ, RabbitMQ hay Kafka?
+
+Không có công cụ “cao cấp hơn” theo một trục duy nhất:
+
+| Nhu cầu chính                                                   | Lựa chọn khởi đầu hợp lý | Lý do                                           |
+| --------------------------------------------------------------- | ------------------------ | ----------------------------------------------- |
+| Job nền, delayed job, retry, scheduler trong hệ Node            | BullMQ                   | API job tốt, vận hành gọn nếu đã dùng Redis     |
+| Routing AMQP, queue độc lập, ack và topology broker             | RabbitMQ                 | exchange/routing là primitive hạng nhất         |
+| Event log lưu lâu, replay, nhiều consumer group, throughput lớn | Kafka                    | partitioned log và retention là mô hình cốt lõi |
+| Workflow dài nhiều bước, timer và compensation                  | workflow engine          | trạng thái workflow bền, resume được            |
+
+BullMQ không phải message bus chung cho mọi bài toán; Kafka cũng không phải queue gửi email đắt tiền hơn. Chọn từ delivery semantics, retention, ordering, replay, topology và năng lực vận hành của đội.
+
+## 11. Checklist design review
+
+- [ ] Message name diễn đạt job/command/event đúng ý nghĩa.
+- [ ] Payload có version, nhỏ, không chứa secret hay PII thừa.
+- [ ] DB update + publish không có dual-write gap, hoặc rủi ro đã được chấp nhận rõ.
+- [ ] Consumer idempotent ở business outcome, không chỉ dựa vào `jobId`.
+- [ ] Retry phân biệt lỗi tạm thời và vĩnh viễn; có timeout, backoff, jitter.
+- [ ] Có quy trình failed-job: alert, điều tra, replay, audit và retention.
+- [ ] Concurrency/rate limit bám theo dependency và SLO.
+- [ ] Dashboard có oldest age, throughput, error, retry và processing duration.
+- [ ] Worker dừng êm, deploy độc lập và không nhận job mới khi shutdown.
+
+## 12. Bài thực hành: pipeline xác nhận đơn hàng
+
+Mở rộng capstone của series bằng một luồng có tiêu chí nghiệm thu rõ:
+
+1. Transaction tạo `order` và row `outbox` `order.confirmed.v1`.
+2. Relay enqueue vào BullMQ bằng `outbox-<id>` và chịu được crash ở mọi dòng.
+3. Worker gửi receipt với provider idempotency key; timeout 10 giây, retry có jitter.
+4. Tạo lỗi `503`, lỗi input vĩnh viễn và process kill sau side effect để kiểm ba đường recovery.
+5. Chạy hai worker, chứng minh unique constraint ngăn business outcome lặp.
+6. Expose metrics queue age, duration, attempts và failed count; đặt alert theo SLO.
+7. Gửi `SIGTERM` dưới tải và xác nhận không nhận thêm job trong lúc drain.
+
+Đừng chỉ demo “email đã gửi”. Bài đạt khi bạn có thể kill process ở bất kỳ điểm nào và giải thích trạng thái nào sẽ được phục hồi, trạng thái nào cần operator can thiệp.
+
+## Tài liệu chính thức
+
+- [BullMQ: Queues](https://docs.bullmq.io/guide/queues)
+- [BullMQ: Retrying failing jobs](https://docs.bullmq.io/guide/retrying-failing-jobs)
+- [BullMQ: Job Schedulers](https://docs.bullmq.io/guide/job-schedulers)
+- [PostgreSQL: Explicit Locking](https://www.postgresql.org/docs/current/explicit-locking.html)
 
 ## Phần tiếp theo
 
-Bạn vừa tách *khi nào nhận việc* khỏi *khi nào làm việc* — nền tảng để app chịu tải và chịu lỗi. Để ý lại mạch xuyên suốt: queue tái dùng Redis (Phase 13), chạy như service độc lập (Phase 7), và là biểu hiện cụ thể của kiến trúc bất đồng bộ (Phase 10).
-
-Ở **Phase 17**, ta đổi sang tầng API: **GraphQL** — schema và type system, resolver, vấn đề N+1 và DataLoader, mutation và subscription, rồi khi nào GraphQL thắng REST và khi nào không.
+Queue cho backend quyền trì hoãn và phục hồi công việc. Ở **Phần 17**, ta quay lại hợp đồng với client: thiết kế GraphQL schema, xử lý N+1, nullability, pagination, authorization và giới hạn chi phí query để một API linh hoạt vẫn an toàn trong production.

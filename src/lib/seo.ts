@@ -52,6 +52,8 @@ export interface BlogPostingInput {
   datePublished: string;
   /** ISO 8601 string. */
   dateModified?: string;
+  /** BCP 47 language tag for this post; falls back to the site language. */
+  lang?: string;
   tags?: readonly string[];
 }
 
@@ -65,7 +67,7 @@ export function blogPostingSchema(input: BlogPostingInput): JsonLd {
     image,
     datePublished,
     dateModified: input.dateModified ?? datePublished,
-    inLanguage: SITE.lang,
+    inLanguage: input.lang ?? SITE.lang,
     mainEntityOfPage: { '@type': 'WebPage', '@id': url },
     url,
     author: { '@id': personId(siteUrl) },

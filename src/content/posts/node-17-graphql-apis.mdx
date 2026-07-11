@@ -1,198 +1,423 @@
 ---
-title: 'Node.js Super Senior · Phase 17 — GraphQL APIs'
-description: 'Bonus Phase 17: GraphQL trên Node. Schema và type system, resolver, vấn đề N+1 và DataLoader, mutation và subscription, lỗi & phân quyền, rồi khi nào GraphQL thắng REST — và khi nào không.'
+title: 'Node.js Production Engineering 17 — GraphQL trong Production'
+description: 'Thiết kế GraphQL như một API contract: schema, resolver lifecycle, nullability, DataLoader, cursor pagination, authorization, query-cost control, schema evolution và observability.'
 pubDate: 2026-06-22
-tags: [nodejs, graphql, api, dataloader, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, graphql, api, dataloader, architecture, production-engineering]
 series: nodejs
 seriesOrder: 17
 draft: false
 ---
 
-Đây là **Bonus Phase 17**. Phase 3 bạn dựng REST với Express; giờ ta xét một mô hình API khác. **GraphQL** đảo ngược quyền kiểm soát: thay vì server quyết định mỗi endpoint trả gì, client *hỏi đúng* dữ liệu nó cần trong một request. Mạnh, nhưng không miễn phí — phần này chỉ cả sức mạnh lẫn cạm bẫy (đặc biệt N+1).
+Một query GraphQL trông vô hại trả về 20 bài viết, tác giả và ba bình luận mới nhất. Trên máy local nó chạy nhanh. Ở production, client thêm hai alias và lồng thêm quan hệ; server thực hiện hàng trăm query SQL, p99 tăng vọt và database cạn connection.
+
+GraphQL cho client quyền mô tả dữ liệu cần lấy. Vì vậy server cũng phải chịu trách nhiệm **giới hạn chi phí, bảo vệ từng field và giữ schema tiến hóa an toàn**. Nếu chỉ học cú pháp query và resolver, ta mới học phần dễ nhất.
+
+Sau bài này, bạn sẽ có thể:
+
+- đọc một GraphQL operation như một cây thực thi, không như “một endpoint”;
+- thiết kế nullability, mutation payload và cursor pagination có chủ đích;
+- loại N+1 bằng DataLoader đúng request scope;
+- phân biệt request error, field error và HTTP transport error;
+- đặt query budget, authorization và rate limit theo chi phí;
+- thay đổi schema mà không làm gãy nhiều phiên bản frontend đang tồn tại.
 
 ---
 
-## REST vs GraphQL — vấn đề cốt lõi
+## 1. GraphQL giải bài toán contract, không giải bài toán database
 
-REST hay gặp **over-fetching** (trả thừa field) và **under-fetching** (phải gọi nhiều endpoint để ghép một màn hình). GraphQL giải bằng một endpoint duy nhất nhận query mô tả hình dạng dữ liệu cần:
+REST thường gom dữ liệu theo resource/endpoint. GraphQL công bố một **type graph** và cho client chọn một lát cắt của graph đó:
 
 ```graphql
-# client hỏi đúng những gì cần, lồng nhau trong một round-trip
-query {
-  user(id: "1") {
-    name
-    posts(last: 3) { title }
+query ArticleScreen($slug: String!) {
+  article(slug: $slug) {
+    title
+    author {
+      id
+      name
+      avatarUrl
+    }
+    comments(first: 3) {
+      nodes {
+        id
+        body
+        author {
+          name
+        }
+      }
+      pageInfo {
+        endCursor
+        hasNextPage
+      }
+    }
   }
 }
 ```
 
+Điểm mạnh không chỉ là “một request thay vì ba”. Hợp đồng response phản chiếu trực tiếp nhu cầu của màn hình; frontend có type được sinh từ schema và operation. Đổi lại:
+
+- chi phí một request không còn gần như cố định;
+- HTTP cache không tự nhiên như `GET /articles/:id`;
+- authorization phải đúng ở mọi đường đi tới một field;
+- schema là sản phẩm dùng chung, cần ownership và governance.
+
+GraphQL không tự batch SQL, không tự chống N+1 và không biến một data model kém thành data model tốt. Nó là **execution layer và contract layer** ở trước các nguồn dữ liệu.
+
+## 2. Mental model: validate một lần, resolve theo cây
+
+Một request đi qua các bước:
+
 ```text
-REST:      GET /users/1  +  GET /users/1/posts   (2 request, có thể thừa field)
-GraphQL:   POST /graphql  { user { name posts { title } } }   (1 request, đúng field)
+HTTP parse
+   │
+   ▼
+parse GraphQL document ──▶ validate với schema ──▶ chọn operation
+                                                    │
+                                                    ▼
+                                             execute field tree
+                                           ┌────────┼────────┐
+                                           ▼        ▼        ▼
+                                        resolver resolver resolver
+                                           │        │        │
+                                           └──── response + errors
 ```
 
----
-
-## Schema & type system
-
-GraphQL là **schema-first**: bạn định nghĩa kiểu, query và mutation. Schema là hợp đồng giữa client và server.
-
-```graphql
-type User {
-  id: ID!
-  name: String!
-  posts: [Post!]!     # ! nghĩa là non-null
-}
-
-type Post {
-  id: ID!
-  title: String!
-  author: User!
-}
-
-type Query {
-  user(id: ID!): User
-  posts: [Post!]!
-}
-
-type Mutation {
-  createPost(title: String!, authorId: ID!): Post!
-}
-```
-
-Dùng **Apollo Server** (hoặc GraphQL Yoga, Pothos cho code-first type-safe):
-
-```bash
-npm install @apollo/server graphql
-```
-
----
-
-## Resolver — nơi dữ liệu được lấy
-
-Mỗi field có thể có một **resolver** — hàm trả giá trị cho field đó. Resolver nhận `(parent, args, context, info)`:
+Resolver có chữ ký khái niệm `(parent, args, context, info)`. Resolver field con chỉ chạy sau khi có `parent`; các field sibling có thể tiến triển độc lập. Chính cấu trúc này tạo ra N+1 nếu mỗi resolver field tự query database.
 
 ```ts
+type Context = {
+  actor: { id: string; roles: string[] } | null;
+  db: Database;
+  loaders: Loaders;
+};
+
 const resolvers = {
   Query: {
-    user: (_parent, { id }, ctx) => ctx.db.user.findUnique({ where: { id } }),
-    posts: (_parent, _args, ctx) => ctx.db.post.findMany(),
+    article: (_parent: unknown, args: { slug: string }, ctx: Context) =>
+      ctx.db.article.findBySlug(args.slug),
   },
-  User: {
-    // resolver field: lấy posts cho MỘT user (cha là user)
-    posts: (parent, _args, ctx) => ctx.db.post.findMany({ where: { authorId: parent.id } }),
-  },
-  Mutation: {
-    createPost: (_p, { title, authorId }, ctx) =>
-      ctx.db.post.create({ data: { title, authorId } }),
+  Article: {
+    author: (article: Article, _args: unknown, ctx: Context) =>
+      ctx.loaders.userById.load(article.authorId),
   },
 };
 ```
 
-`context` (tạo mỗi request) là nơi để DB client, user đã auth, và DataLoader — đúng tinh thần dependency injection (Phase 6/10).
+`context` phải được tạo **mỗi request**. Nó chứa actor đã xác thực, request-scoped loader, logger/trace context và các port tới data source. Đừng tạo database pool mới cho mỗi request; context chỉ giữ reference tới dependency sống lâu.
 
----
+## 3. Schema design bắt đầu từ invariant
 
-## Vấn đề N+1 — và DataLoader
+Schema không phải bản sao 1:1 của table. Nó là ngôn ngữ mà product, frontend và backend cùng dùng.
 
-Đây là cái bẫy quan trọng nhất của GraphQL. Query lấy 10 post kèm `author` của mỗi post: resolver `posts` chạy 1 query, rồi resolver `author` chạy **thêm 1 query mỗi post** → 1 + 10 = 11 query. Với danh sách lớn, đây là thảm họa hiệu năng.
+```graphql
+type Article {
+  id: ID!
+  slug: String!
+  title: String!
+  summary: String
+  author: User!
+  comments(first: Int = 20, after: String): CommentConnection!
+}
 
-```text
-posts → 1 query
-  post[0].author → query
-  post[1].author → query
-  ...                       ← N query cho N post  (N+1!)
+type CommentConnection {
+  nodes: [Comment!]!
+  pageInfo: PageInfo!
+}
+
+type PageInfo {
+  endCursor: String
+  hasNextPage: Boolean!
+}
+
+input CreateArticleInput {
+  clientMutationId: String
+  title: String!
+  body: String!
+}
+
+type CreateArticlePayload {
+  article: Article
+  userErrors: [UserError!]!
+}
+
+type Mutation {
+  createArticle(input: CreateArticleInput!): CreateArticlePayload!
+}
 ```
 
-**DataLoader** gộp (batch) các lượt lấy trong cùng một tick và cache trong phạm vi request:
+### Nullability là cam kết vận hành
+
+`String!` không chỉ nói TypeScript không có `null`; nó hứa rằng server **luôn** cung cấp field. Nếu resolver của field non-null lỗi hoặc trả `null`, GraphQL đẩy `null` lên parent gần nhất được phép null — gọi là null bubbling.
+
+```text
+Article.author: User!
+User.name: String!
+
+name lỗi
+  └─ User không thể hợp lệ
+      └─ author không thể null
+          └─ Article có thể trở thành null, dù title đã resolve thành công
+```
+
+Vì vậy đừng đánh `!` mọi nơi để type frontend “đẹp”. Dùng non-null cho invariant thật sự; dùng nullable khi dữ liệu có thể thiếu, dependency có failure domain riêng, hoặc đang migration.
+
+### Mutation trả payload, không chỉ entity
+
+Payload object cho phép thêm `userErrors`, `clientMutationId`, warning hoặc metadata mà không đổi return type về sau. Lỗi validation dự kiến có thể là dữ liệu trong payload; lỗi hệ thống bất ngờ vẫn đi qua GraphQL errors. Team cần quy ước thống nhất để frontend không phải đoán lỗi nằm ở đâu.
+
+### Pagination phải có giới hạn
+
+Không công bố field list không giới hạn như `posts: [Post!]!`. Cursor pagination giữ hiệu năng ổn định hơn offset trên tập lớn và tránh record dịch chuyển khi có insert mới. Cursor phải opaque với client; server có thể encode `(createdAt, id)` để có thứ tự tổng xác định.
+
+## 4. N+1 và DataLoader đúng cách
+
+Query 50 article kèm author thường tạo một query lấy article và 50 query lấy user:
+
+```text
+articles                    1 query
+├─ article[0].author        1 query
+├─ article[1].author        1 query
+└─ ...                     48 query
+```
+
+DataLoader gom các `.load(id)` trong cùng batch window thành một lần lấy và cache trong phạm vi request:
 
 ```ts
 import DataLoader from 'dataloader';
 
-// tạo MỚI mỗi request (đặt trong context) để cache không rò giữa user
-const userLoader = new DataLoader<string, User>(async (ids) => {
-  const users = await db.user.findMany({ where: { id: { in: [...ids] } } });
-  // PHẢI trả đúng thứ tự ids
-  return ids.map((id) => users.find((u) => u.id === id)!);
-});
+function createLoaders(db: Database) {
+  return {
+    userById: new DataLoader<string, User>(async (ids) => {
+      const users = await db.user.findManyByIds([...ids]);
+      const byId = new Map(users.map((user) => [user.id, user]));
+
+      // DataLoader yêu cầu kết quả cùng độ dài và đúng thứ tự keys.
+      return ids.map((id) => {
+        const user = byId.get(id);
+        return user ?? new Error(`User ${id} not found`);
+      });
+    }),
+  };
+}
+
+async function createContext(request: Request): Promise<Context> {
+  const actor = await authenticate(request);
+  return { actor, db, loaders: createLoaders(db) };
+}
+```
+
+Không dùng một DataLoader global: cache có thể trả dữ liệu giữa hai user/request và tăng bộ nhớ không giới hạn. Cũng đừng xem DataLoader là cache Redis; mục tiêu chính là **batch + memoize trong một execution**.
+
+Đo số query trước và sau. “Có DataLoader” không đảm bảo hết N+1 nếu resolver dùng nhiều key shape, relation khác hoặc ORM tự phát query bổ sung.
+
+## 5. Authentication một lần, authorization gần dữ liệu
+
+Authentication xác định actor ở HTTP/context boundary. Authorization phải kiểm theo hành động và resource, không chỉ theo tên resolver gốc.
+
+```ts
+import { GraphQLError } from 'graphql';
+
+function requireActor(ctx: Context) {
+  if (!ctx.actor) {
+    throw new GraphQLError('Authentication required', {
+      extensions: { code: 'UNAUTHENTICATED' },
+    });
+  }
+  return ctx.actor;
+}
 
 const resolvers = {
-  Post: {
-    author: (post, _args, ctx) => ctx.userLoader.load(post.authorId), // gộp tự động
+  Mutation: {
+    updateArticle: async (_: unknown, { input }: UpdateArgs, ctx: Context) => {
+      const actor = requireActor(ctx);
+      const article = await ctx.db.article.findById(input.id);
+
+      if (!article || !canEditArticle(actor, article)) {
+        // Với resource nhạy cảm, NOT_FOUND tránh tiết lộ resource tồn tại.
+        throw new GraphQLError('Article not found', {
+          extensions: { code: 'NOT_FOUND' },
+        });
+      }
+
+      return ctx.db.article.update(input);
+    },
   },
 };
 ```
 
-Giờ 10 lượt `.load()` gộp thành **1 query** `WHERE id IN (...)`. DataLoader là kiến thức bắt buộc — thiếu nó, GraphQL của bạn sẽ giết database.
+Một lỗi phổ biến là bảo vệ `Query.user` nhưng quên cùng `User` có thể đi tới từ `Article.author`, search hoặc admin report. Policy nên nằm ở application/domain service hoặc data-access boundary có thể tái dùng, không rải các `if (role === ...)` khác nhau khắp resolver.
 
----
+Field-level authorization có thể trả `null`, redacted value hoặc error. Chọn theo sensitivity và hợp đồng client; ghi rõ trong schema docs.
 
-## Mutation, lỗi & phân quyền
+## 6. Error model: “GraphQL luôn trả HTTP 200” là sai
 
-Mutation thay đổi dữ liệu (như POST/PUT/DELETE). Phân quyền làm trong resolver/context, không ở tầng route như REST:
+Cần tách ba lớp lỗi:
+
+| Lớp            | Ví dụ                                                 | Kết quả điển hình                             |
+| -------------- | ----------------------------------------------------- | --------------------------------------------- |
+| HTTP/transport | method sai, JSON hỏng, media type không hỗ trợ        | `4xx/5xx`, có thể chưa có GraphQL response    |
+| Request error  | document parse lỗi, validation lỗi, variable sai type | không execute operation; response có `errors` |
+| Field error    | resolver timeout, permission ở một field              | có thể trả cả `data` một phần và `errors`     |
+
+Với legacy `application/json`, nhiều server trả `200` cho một request GraphQL hợp lệ dù execution có field errors. Draft GraphQL over HTTP định nghĩa media type mới `application/graphql-response+json` để status code biểu đạt transport/request failure rõ hơn. Vì transport spec vẫn đang phát triển, client phải dựa vào `data` và `errors` theo implementation đã thỏa thuận — không viết logic “HTTP 200 nghĩa là mọi field thành công”.
+
+Đừng gửi raw exception, SQL, stack trace hoặc internal path ra client. Log lỗi đầy đủ với `requestId/traceId`, trả code ổn định và message an toàn.
+
+## 7. Demand control: giới hạn chi phí trước khi execute
+
+GraphQL có bề mặt DoS riêng: depth lớn, nhiều alias, fragment lặp, list lồng nhau, batching nhiều operation hoặc field resolver đắt. Chỉ đặt depth limit là chưa đủ — query nông vẫn có thể yêu cầu 100 alias của một field đắt.
+
+Một policy production thường có các lớp:
+
+1. giới hạn body, số operation và số alias;
+2. bắt buộc `first`/`limit`, đặt max page size;
+3. tính **operation cost** từ field weight × list cardinality;
+4. rate limit theo actor và cost, không chỉ request count;
+5. timeout/cancellation xuống database và upstream;
+6. allowlist hoặc persisted operations cho client do mình kiểm soát.
 
 ```ts
-Mutation: {
-  deletePost: (_p, { id }, ctx) => {
-    if (!ctx.user) throw new GraphQLError('Chưa đăng nhập', {
-      extensions: { code: 'UNAUTHENTICATED' },
-    });
-    if (ctx.user.role !== 'admin') throw new GraphQLError('Cấm', {
-      extensions: { code: 'FORBIDDEN' },
-    });
-    return ctx.db.post.delete({ where: { id } });
-  },
+// Pseudocode: API cụ thể tùy GraphQL server/plugin đang dùng.
+const cost = calculateOperationCost(document, schema, variables, {
+  defaultFieldCost: 1,
+  listMultiplierFrom: ['first', 'limit'],
+});
+
+if (cost > actorBudget(actor)) {
+  throw new GraphQLError('Operation exceeds cost budget', {
+    extensions: { code: 'OPERATION_COST_EXCEEDED' },
+  });
 }
 ```
 
-GraphQL luôn trả HTTP 200 kèm mảng `errors` — dùng `extensions.code` để client phân biệt loại lỗi. Validate input bằng schema GraphQL + zod cho luật nghiệp vụ.
+Tắt introspection không phải lớp bảo mật chính: attacker vẫn có thể đoán field, còn client/tooling hợp lệ bị mất khả năng. Authentication, authorization, validation và demand control mới bảo vệ dữ liệu và capacity.
 
----
+## 8. Schema evolution không cần `/v2`, nhưng vẫn cần kỷ luật
 
-## Subscription — realtime
+GraphQL khuyến khích schema cộng dồn:
 
-Ngoài query/mutation, GraphQL có **subscription** cho dữ liệu realtime qua WebSocket (cầu nối tới Phase 19):
+- thêm field nullable thường tương thích;
+- thêm optional input field thường tương thích;
+- rename bằng cách thêm field mới, đánh `@deprecated` field cũ, đo usage rồi mới xóa;
+- thêm enum value có thể làm client dùng exhaustive switch bị vỡ — phối hợp và kiểm codegen;
+- đổi nullable thành non-null hoặc đổi type là breaking change.
 
 ```graphql
-type Subscription {
-  postAdded: Post!
+type User {
+  displayName: String!
+  name: String! @deprecated(reason: "Use displayName; removal after 2026-12-01")
 }
 ```
 
-```ts
-Subscription: {
-  postAdded: { subscribe: () => pubsub.asyncIterator(['POST_ADDED']) },
-}
-// trong createPost: pubsub.publish('POST_ADDED', { postAdded: newPost });
+Pipeline nên chạy schema diff/check trên pull request. Registry hoặc telemetry operation giúp biết field cũ còn client nào dùng. Deprecation không có deadline và owner chỉ biến schema thành nghĩa địa.
+
+### Hợp đồng với frontend
+
+Frontend nên commit **operation documents** cạnh component/feature và sinh type từ đúng operation, không từ toàn schema. Quy ước chung cần bao gồm:
+
+- mapping `extensions.code` sang UX/retry;
+- nullable field được render ra sao;
+- cursor/pageInfo contract;
+- mutation nào idempotent và optimistic update dựa vào key nào;
+- thời hạn deprecation và client version đang được hỗ trợ.
+
+## 9. Caching có nhiều tầng
+
+GraphQL không “không cache được”; nó không tự nhiên dùng cache resource của HTTP như REST. Phân biệt:
+
+- **request cache/DataLoader**: tránh load cùng entity nhiều lần trong một execution;
+- **data cache**: cache entity/query ở service/Redis, phải giải bài toán invalidation;
+- **response cache**: cache toàn operation theo actor/variables khi an toàn;
+- **CDN/HTTP cache**: dễ hơn với persisted query + `GET` cho query thuần đọc và cache key chuẩn.
+
+Không cache response chứa dữ liệu theo user bằng key chỉ gồm query hash. Actor/tenant/permission scope phải là một phần của policy; nếu không, cache trở thành lỗ hổng data isolation.
+
+## 10. Subscription không thay thế event log
+
+GraphQL subscription mô tả stream typed tới client, thường qua `graphql-ws`. Nhưng reconnect, missed event, ordering, fan-out và retention vẫn là bài toán realtime. Một in-memory `PubSub` chỉ phù hợp demo một process.
+
+Nếu client cần phục hồi dữ liệu đã lỡ khi mất mạng, event phải có id/cursor và tồn tại trong nguồn bền; subscription chỉ là kênh giao. Với notification một chiều, SSE có thể đơn giản hơn WebSocket. Phần 19 sẽ thiết kế các lựa chọn này đầy đủ.
+
+## 11. Observability theo operation, không theo raw query
+
+Metric tối thiểu:
+
+- request count/error rate/duration theo **operation name**;
+- parse + validate + execute duration;
+- operation cost và số resolver;
+- DataLoader batch size/cache hit;
+- database query count/time;
+- field error theo code, nhưng kiểm soát cardinality.
+
+Không dùng raw query, variables, user id hay error message làm metric label. Chúng tạo cardinality không giới hạn và có thể chứa secret. Trace có thể tạo span cho operation và dependency chậm; tránh tạo span cho mọi field rẻ vì overhead và noise.
+
+Operation production phải có tên để trace/log và tooling đọc được:
+
+```graphql
+query ArticleScreen($slug: String!) { ... }
 ```
 
----
+Tuy nhiên, operation name vẫn là input do client kiểm soát. Không đưa mọi tên tùy ý vào metric label: với client do mình quản lý, dùng registered/persisted operation ID hoặc allowlist tên đã phát hành; gom tên lạ vào `unknown`. Nếu không, attacker có thể tạo vô hạn operation name và làm nổ cardinality. Không chấp nhận hàng loạt anonymous operation rồi gộp tất cả thành `/graphql` trên dashboard.
 
-## GraphQL vs REST — chọn lựa
+## 12. GraphQL, REST hay BFF?
 
-| | REST (Phase 3) | GraphQL |
-|---|---|---|
-| Hình dạng dữ liệu | server quyết | client hỏi |
-| Round-trip | nhiều endpoint | một query lồng |
-| Caching HTTP | dễ (GET + ETag) | khó hơn (POST) |
-| File upload, đơn giản | tự nhiên | thêm việc |
-| Hợp cho | API công khai, CRUD đơn giản, cache CDN | client đa dạng, đồ thị dữ liệu phức tạp, mobile tiết kiệm băng thông |
+| Constraint                                                   | Lựa chọn thường hợp lý |
+| ------------------------------------------------------------ | ---------------------- |
+| Public API resource-oriented, HTTP/CDN cache mạnh            | REST                   |
+| Nhiều client cần projection khác nhau trên graph chung       | GraphQL                |
+| Một frontend cần orchestration riêng, team muốn contract hẹp | BFF REST/RPC           |
+| Internal service call cần deadline/streaming và IDL chặt     | gRPC                   |
 
-Quan điểm senior: GraphQL tỏa sáng khi nhiều loại client cần *hình dạng khác nhau* trên một đồ thị dữ liệu phong phú. Với CRUD đơn giản hay API cần cache HTTP/CDN mạnh, REST vẫn gọn hơn. Đừng chọn GraphQL vì hype — chọn vì bài toán hình dạng dữ liệu.
+GraphQL có giá trị khi flexibility của client lớn hơn chi phí schema governance, demand control và resolver performance. Một CRUD service nhỏ không tự động tốt hơn chỉ vì gom endpoint thành `/graphql`.
 
----
+## 13. Kiểm thử theo hợp đồng
 
-## Thực hành
+Một test suite cân bằng gồm:
 
-1. Định nghĩa schema `User`/`Post` với quan hệ hai chiều; dựng Apollo Server.
-2. Resolver dùng Prisma (Phase 12) qua `context`.
-3. Tạo bug N+1 cố ý (query posts kèm author), đo số query, rồi sửa bằng DataLoader trong context.
-4. Thêm mutation `createPost` có auth + RBAC (Phase 5) ném `GraphQLError` với `extensions.code`.
-5. Thêm subscription `postAdded` qua `graphql-ws`.
-6. Viết test integration cho một query lồng và xác nhận chỉ 2 query DB chạy.
+1. schema check: breaking change và deprecation;
+2. resolver/application unit test cho policy và mapping;
+3. integration test thực thi operation thật qua HTTP;
+4. query-count test cho đường N+1 quan trọng;
+5. authorization matrix theo actor/resource/action;
+6. cost-limit test với alias, fragment, list lồng và batch;
+7. load test bằng operation distribution giống production, không chỉ một query mẫu.
 
----
+Đừng snapshot toàn JSON response cho mọi test; snapshot lớn giòn và che invariant. Assert field/error code quan trọng, null bubbling và số dependency call.
+
+## 14. Checklist trước khi ship
+
+- [ ] Mọi list có pagination và max page size.
+- [ ] Nullability phản ánh invariant, không chỉ mong muốn type đẹp.
+- [ ] DataLoader tạo theo request và được đo query count.
+- [ ] Authorization bao phủ mọi đường tới resource/field.
+- [ ] Error code ổn định; không lộ stack, query hay secret.
+- [ ] Có operation budget, timeout và rate limit theo cost.
+- [ ] Schema diff/deprecation có owner, deadline và usage telemetry.
+- [ ] Metric dùng operation name, label cardinality hữu hạn.
+- [ ] Cache key chứa đúng actor/tenant/permission scope.
+
+## 15. Bài thực hành: Article API cho ba client
+
+Thiết kế cùng schema cho web, mobile và admin:
+
+1. `Article`, `User`, `CommentConnection`; cursor từ `(createdAt, id)`.
+2. Query màn hình article và mutation tạo comment có `userErrors`.
+3. Tạo N+1 ở `Comment.author`, ghi query count, thêm DataLoader và chứng minh giảm còn batch hữu hạn.
+4. Viết policy: author sửa trong 15 phút, moderator sửa bất kỳ lúc nào, user khác nhận `NOT_FOUND`.
+5. Đặt max `first = 50` và operation cost; tạo query alias để chứng minh request bị chặn trước execute.
+6. Deprecate một field, chạy schema check và ghi kế hoạch xóa.
+7. Dashboard p95 theo operation name, query count và error code.
+
+Tiêu chí hoàn thành không phải “GraphQL Playground trả data”, mà là client linh hoạt trong một **capacity và security envelope có thể đo được**.
+
+## Tài liệu chính thức
+
+- [GraphQL Specification](https://spec.graphql.org/)
+- [GraphQL: Learn](https://graphql.org/learn/)
+- [GraphQL over HTTP draft](https://graphql.github.io/graphql-over-http/draft/)
+- [GraphQL DataLoader](https://github.com/graphql/dataloader)
+- [Apollo Server security](https://www.apollographql.com/docs/apollo-server/security/)
 
 ## Phần tiếp theo
 
-GraphQL cho một API linh hoạt trên *một* service. Khi hệ thống lớn vượt một process, bạn tách thành nhiều service. Ở **Phase 18 — Microservices & gRPC**, ta đi: khi nào nên (và không nên) tách monolith, giao tiếp đồng bộ với **gRPC** + Protocol Buffers, bất đồng bộ qua message queue (Phase 16), service discovery, và xử lý lỗi phân tán.
+Phần 18 đi qua ranh giới process: khi nào modular monolith thực sự cần tách, cách thiết kế contract gRPC, deadline, retry budget, data ownership và workflow nhất quán cuối mà không biến hệ thống thành một distributed monolith.

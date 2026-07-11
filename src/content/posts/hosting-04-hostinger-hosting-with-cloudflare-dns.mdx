@@ -1,0 +1,371 @@
+---
+title: 'Domain, DNS & Hosting · Phần 4 — Hostinger Hosting với Cloudflare DNS'
+description: 'Giữ DNS ở Cloudflare nhưng chạy website trên Hostinger: chọn đúng A/CNAME, bảo toàn email, bật proxy có chủ đích và rollback an toàn.'
+pubDate: 2026-07-11
+lang: vi
+tags: [hosting, domain, dns, cloudflare, hostinger, ssl, hosting_dns_10]
+series: hosting-dns
+seriesOrder: 4
+draft: false
+---
+
+import HostingDiagram from '../../components/blog/HostingDiagram.astro';
+
+Kết thúc bài này, bạn sẽ nối được một domain đang dùng **Cloudflare
+authoritative DNS** tới đúng loại dịch vụ Hostinger mà không làm mất email,
+không bật proxy quá sớm và không copy một cặp nameserver hay IP đã lỗi thời.
+
+Ta sẽ xử lý riêng hai đích đến thường bị trộn lẫn:
+
+- **Hostinger Web/Cloud Hosting**: dùng IPv4 chính xác trong hPanel, với A cho
+  apex và A hoặc CNAME cho `www`;
+- **Hostinger Website Builder**: từ ngày 20/05/2026 không còn nhận phương án A
+  record qua DNS bên ngoài; phải dùng CNAME tới `connect.hostinger.com`.
+
+Cloudflare trong kiến trúc này trước hết là DNS provider. Reverse proxy/CDN là
+lớp thứ hai, chỉ bật sau khi đường đi trực tiếp và TLS đã chạy đúng.
+
+> Các IP `192.0.2.10` trong bài thuộc TEST-NET, chỉ dùng làm tài liệu. IP thật
+> phải lấy từ đúng website/hosting plan trong hPanel.
+
+---
+
+## Inventory trước khi chạm vào DNS
+
+Đừng bắt đầu từ nút **Add record**. Hãy ghi lại current state:
+
+| Câu hỏi                  | Nơi kiểm tra                           | Giá trị cần lưu                           |
+| ------------------------ | -------------------------------------- | ----------------------------------------- |
+| Registrar là ai?         | WHOIS hoặc trang quản lý domain        | nơi đổi nameserver và DS                  |
+| Authoritative DNS là ai? | `dig NS example.com +short`            | phải là cặp Cloudflare được gán           |
+| Website thuộc loại nào?  | hPanel → Websites                      | Web/Cloud hay Website Builder             |
+| Target hiện tại là gì?   | hPanel → Plan Details/connection guide | IP hoặc target do Hostinger cấp           |
+| Email chạy ở đâu?        | DNS zone + email provider              | MX, SPF, DKIM, DMARC                      |
+| Có dịch vụ phụ không?    | export zone                            | `api`, `shop`, verification TXT, CAA, SRV |
+| CDN nào đang bật?        | Hostinger Performance và Cloudflare    | chỉ giữ một CDN                           |
+| DNSSEC có hợp lệ không?  | `dig DS example.com +short`            | DS phải khớp Cloudflare nếu đang bật      |
+
+Hostinger nhấn mạnh rằng nameserver và IP có thể khác theo domain, hosting type
+và account. Vì vậy, `ns1.dns-parking.com` hay một IP trong bài cũ chỉ là ví dụ,
+không phải hằng số để copy.
+
+Nếu `dig NS` chưa trả cặp `*.ns.cloudflare.com` đang hiển thị trong zone
+Overview, dừng lại. Bạn đang sửa một zone chưa có quyền trả lời public DNS.
+
+---
+
+## Chọn kiến trúc trước khi chọn record
+
+| Phương án                        | DNS được quản lý ở đâu? | Phù hợp khi                                          | Đánh đổi                                                                          |
+| -------------------------------- | ----------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Đổi NS sang Hostinger            | hPanel                  | muốn Hostinger quản lý cả web và Hostinger Email     | phải migrate mọi custom record; không còn dùng Cloudflare DNS/proxy theo flow này |
+| Giữ Cloudflare, point A/CNAME    | Cloudflare              | muốn giữ DNS, WAF, rule, subdomain và email hiện tại | tự quản record; proxy là quyết định riêng                                         |
+| Giữ Cloudflare + Website Builder | Cloudflare              | dùng Builder nhưng vẫn cần Cloudflare quản lý zone   | bắt buộc CNAME `@` và `www`, DNS only                                             |
+
+Đổi nameserver không phải là phiên bản “mạnh hơn” của A record. Nó chuyển toàn
+bộ quyền quản lý zone. Nếu chỉ cần website chạy trên Hostinger còn mail và
+subdomain đang ổn ở Cloudflare, phương án record-level có blast radius nhỏ hơn.
+
+<HostingDiagram
+  kind="cloudflare-proxy"
+  caption="Cloudflare có thể chỉ trả DNS để client tới Hostinger trực tiếp, hoặc trở thành reverse proxy; hãy chứng minh đường DNS-only trước rồi mới cân nhắc proxy"
+/>
+
+Ở nhánh **DNS only**, resolver nhận target thật và browser kết nối thẳng tới
+Hostinger. Ở nhánh **Proxied**, resolver nhận IP anycast Cloudflare; edge của
+Cloudflare kết thúc TLS, áp rule/cache rồi mở kết nối thứ hai tới Hostinger.
+Hai đường đi có failure mode khác nhau, nên không nên đổi record và bật cloud
+cam trong cùng một bước.
+
+---
+
+## Runbook A — Hostinger Web/Cloud Hosting
+
+### Bước 1: bind domain ở Hostinger trước
+
+Trong hPanel, thêm domain vào đúng website hoặc chọn **Connect domain**. Shared
+hosting cần biết `Host: example.com` thuộc website nào. Nếu chỉ tạo DNS, request
+có thể tới đúng IP nhưng nhận trang mặc định hoặc `404 Unknown domain`.
+
+Lấy IP từ connection guide hoặc Plan Details của **đúng plan**. Gọi nó là
+`HOSTINGER_IP`.
+
+### Bước 2: tránh hai CDN chồng nhau
+
+Hostinger yêu cầu chỉ bật một CDN tại một thời điểm. Nếu dự định bật orange
+cloud, tắt Hostinger CDN trước. Nếu chỉ dùng Cloudflare làm authoritative DNS
+với record DNS only, traffic không đi qua Cloudflare CDN.
+
+### Bước 3: loại record xung đột
+
+Trong Cloudflare → DNS → Records, kiểm tra cùng hostname `@` và `www`:
+
+- xóa A/AAAA cũ trỏ tới hosting trước;
+- không để `www` vừa có A vừa có CNAME;
+- chỉ giữ AAAA nếu Hostinger thực sự cấp IPv6 cho site;
+- không đụng MX/TXT mail chỉ vì đang sửa web.
+
+### Bước 4: tạo record ở trạng thái DNS only
+
+Recipe bám sát hướng dẫn hiện tại của Hostinger:
+
+| Type | Name  | Content        | Proxy    | TTL  |
+| ---- | ----- | -------------- | -------- | ---- |
+| A    | `@`   | `HOSTINGER_IP` | DNS only | Auto |
+| A    | `www` | `HOSTINGER_IP` | DNS only | Auto |
+
+Một biến thể dễ bảo trì là A cho apex và CNAME cho `www`:
+
+| Type  | Name  | Content        | Proxy    | TTL  |
+| ----- | ----- | -------------- | -------- | ---- |
+| A     | `@`   | `HOSTINGER_IP` | DNS only | Auto |
+| CNAME | `www` | `example.com`  | DNS only | Auto |
+
+Chọn **một** trong hai recipe. A kép bám đúng wizard Hostinger; CNAME giúp `www`
+đi theo apex khi IP đổi. Dù chọn gì, web server Hostinger vẫn phải bind cả hai
+hostname hoặc redirect một hostname về canonical hostname.
+
+### Bước 5: kiểm tra DNS trước TLS
+
+```bash
+dig NS example.com +short
+dig A example.com +short
+dig A www.example.com +short
+dig CNAME www.example.com +short
+dig example.com +trace
+```
+
+Diễn giải:
+
+- NS phải là đúng cặp Cloudflare của zone;
+- khi DNS only, A phải trả `HOSTINGER_IP`;
+- nếu dùng CNAME, `dig CNAME www...` trả `example.com.`;
+- `+trace` giúp phát hiện bạn sửa nhầm zone hoặc delegation chưa đổi.
+
+Sau đó:
+
+```bash
+curl -I http://example.com
+curl -I https://example.com
+curl -I https://www.example.com
+```
+
+`2xx` hoặc redirect `3xx` có chủ đích là tốt. `404`/site mặc định thường là
+binding ở Hostinger, không phải lý do để tiếp tục đổi DNS.
+
+### Bước 6: hoàn tất TLS trực tiếp
+
+Khi record còn DNS only, certificate trình cho browser do Hostinger/origin
+phục vụ; Universal SSL của Cloudflare không tham gia. Đợi hoặc kích hoạt SSL
+cho cả apex và `www` trong hPanel, rồi kiểm tra:
+
+```bash
+openssl s_client \
+  -connect example.com:443 \
+  -servername example.com </dev/null 2>/dev/null |
+  openssl x509 -noout -subject -issuer -dates
+```
+
+Certificate phải chưa hết hạn và có SAN khớp hostname.
+
+### Bước 7: proxy là bước tối ưu tùy chọn
+
+Chỉ chuyển A/CNAME web sang **Proxied** khi:
+
+- site chạy đúng bằng DNS only;
+- Hostinger CDN đã tắt;
+- Cloudflare zone là `Active` và edge certificate đã `Active`;
+- origin hỗ trợ HTTPS.
+
+Với origin certificate hợp lệ, dùng `Full (strict)` để Cloudflare xác minh
+certificate ở chặng edge → Hostinger. Tránh `Flexible`: chặng này dùng HTTP và
+dễ tạo redirect loop khi origin ép HTTPS.
+
+Sau khi proxy:
+
+```bash
+dig A example.com +short
+curl -I https://example.com
+```
+
+`dig` lúc này trả IP Cloudflare, **không** còn trả `HOSTINGER_IP` — đó là kết
+quả mong đợi. Header `server: cloudflare` hoặc `cf-ray` cho biết request đã qua
+edge.
+
+---
+
+## Runbook B — Hostinger Website Builder sau thay đổi 2026
+
+Hostinger công bố rằng từ **20/05/2026**, Website Builder dùng domain đăng ký
+bên ngoài và DNS ngoài Hostinger không còn hỗ trợ point bằng IPv4 A record.
+Recipe hiện tại là:
+
+| Type  | Name  | Content                 | Proxy    | TTL             |
+| ----- | ----- | ----------------------- | -------- | --------------- |
+| CNAME | `@`   | `connect.hostinger.com` | DNS only | Auto hoặc 14400 |
+| CNAME | `www` | `connect.hostinger.com` | DNS only | Auto hoặc 14400 |
+
+Trình tự an toàn:
+
+1. Bind `example.com` vào đúng Website Builder site trong hPanel.
+2. Backup zone và record mail.
+3. Xóa A/AAAA ở `@` và A/CNAME cũ ở `www`.
+4. Tạo hai CNAME trên, giữ **DNS only**.
+5. Trong SSL/TLS, Hostinger hướng dẫn chọn mode `Full`.
+6. Chờ connection status ở Hostinger hoàn tất rồi kiểm tra cả apex và `www`.
+
+DNS truyền thống không cho CNAME cùng tên với SOA/NS ở apex. Cloudflare giải
+quyết bằng **CNAME flattening**, được bật mặc định ở apex trên mọi plan: nó tra
+target rồi trả address record phù hợp cho resolver.
+
+Vì vậy lệnh này có thể không hiện CNAME:
+
+```bash
+dig CNAME example.com +short
+```
+
+Hãy kiểm tra record trong dashboard và kết quả đã flatten:
+
+```bash
+dig A example.com +short
+dig A www.example.com +short
+curl -I https://example.com
+```
+
+Đừng bật orange cloud cho hai record Builder. Hostinger yêu cầu DNS only cho
+flow này. SSL mode trong Cloudflare chỉ chi phối hostname được proxy; TLS mà
+browser thấy ở hai hostname DNS-only vẫn do nền tảng Hostinger phục vụ.
+
+Nếu Builder nằm ở subdomain `shop.example.com`, chỉ tạo:
+
+```text
+shop  CNAME  connect.hostinger.com
+```
+
+Không tự thêm `www.shop`.
+
+---
+
+## Email phải sống độc lập với migration web
+
+Thay A/CNAME web không yêu cầu thay MX. Một zone tối thiểu có thể trông như:
+
+| Type      | Name                  | Content                   | Proxy    |
+| --------- | --------------------- | ------------------------- | -------- |
+| A/CNAME   | `@`                   | target web                | tùy flow |
+| A/CNAME   | `www`                 | target web                | tùy flow |
+| MX        | `@`                   | target của email provider | DNS only |
+| TXT       | `@`                   | SPF do email provider cấp | DNS only |
+| TXT/CNAME | selector `_domainkey` | DKIM thật                 | DNS only |
+| TXT       | `_dmarc`              | DMARC policy thật         | DNS only |
+| A         | `mail` nếu có         | mail server IP            | DNS only |
+
+Cloudflare không proxy SMTP qua proxy web thông thường. MX, TXT luôn là DNS
+only; address record dành riêng cho mail cũng phải gray cloud. Nếu đổi
+nameserver sang Hostinger thay vì giữ Cloudflare, Hostinger có thể cài record
+Hostinger Email mặc định, nên phải phục hồi MX/SPF/DKIM/DMARC của provider cũ.
+
+---
+
+## Failure modes có thể chẩn đoán
+
+### Website trả `DNS_PROBE_FINISHED_NXDOMAIN`
+
+Kiểm tra `dig NS` trước. Nếu delegation là Cloudflare nhưng record chỉ được tạo
+ở hPanel, Internet không nhìn thấy nó. Nếu zone còn `Pending Nameserver
+Update`, kiểm tra cặp NS và DS cũ.
+
+### Apex chạy nhưng `www` lỗi
+
+`www` thiếu record, có record xung đột hoặc chưa được bind/cấp TLS ở Hostinger.
+DNS không tự tạo `www`.
+
+### Website Builder vẫn trỏ A record
+
+Đây là recipe đã hết hỗ trợ từ 20/05/2026. Thay bằng hai CNAME
+`connect.hostinger.com`; không tìm một “IP Builder mới”.
+
+### `ERR_TOO_MANY_REDIRECTS`
+
+Thường do `Flexible` trong khi origin redirect HTTP → HTTPS, hoặc có hai rule
+canonical ngược nhau. Chứng minh origin HTTPS, chuyển sang `Full`/`Full
+(strict)` phù hợp và giữ một nơi chịu trách nhiệm redirect.
+
+### `522` sau khi bật proxy
+
+Cloudflare không kết nối được origin. Chuyển tạm về DNS only để phân biệt lỗi
+origin với lỗi edge; kiểm tra IP, binding, firewall và tình trạng Hostinger.
+
+### Web chạy nhưng mail ngừng
+
+So sánh từng MX, SPF, DKIM, DMARC với inventory. Không proxy `mail` và không
+đoán lại giá trị từ một tutorial.
+
+---
+
+## Rollback rõ ràng
+
+### Web/Cloud Hosting
+
+Trước cutover, lưu record cũ và proxy status. Nếu Hostinger target lỗi:
+
+1. chuyển cloud cam về DNS only nếu vừa bật proxy;
+2. khôi phục A/CNAME cũ tại Cloudflare;
+3. xác nhận bằng resolver công cộng và `curl`;
+4. giữ cấu hình Hostinger mới cho tới khi cache cũ hết và traffic đã ổn;
+5. không đụng MX/TXT nếu email không nằm trong sự cố.
+
+Nếu chỉ lỗi release mới trên cùng Hostinger site, rollback application/deploy
+sẽ nhanh và ít rủi ro hơn rollback DNS.
+
+### Website Builder
+
+Không rollback về A record Builder vì phương án đó đã hết hỗ trợ. Hai đường an
+toàn là:
+
+- khôi phục DNS tới website cũ còn hoạt động; hoặc
+- đổi toàn bộ nameserver sang đúng cặp Hostinger hiện trong hPanel sau khi đã
+  migrate đủ web, mail và custom records.
+
+Nếu đổi nameserver, đó là migration zone riêng: xử lý DNSSEC/DS, inventory và
+rollback delegation; không xem nó là một edit CNAME đơn giản.
+
+---
+
+## Checklist trước khi đóng ticket
+
+- [ ] `dig NS` trả đúng cặp Cloudflare được gán cho domain.
+- [ ] Domain đã bind vào đúng Hostinger website trước khi publish DNS.
+- [ ] IP/target lấy từ hPanel hiện tại, không copy từ bài cũ.
+- [ ] Web/Cloud dùng A `@` và A hoặc CNAME `www`.
+- [ ] Website Builder dùng hai CNAME tới `connect.hostinger.com`, DNS only.
+- [ ] Không còn A/AAAA/CNAME xung đột ở `@` và `www`.
+- [ ] MX, SPF, DKIM, DMARC được bảo toàn và không proxy.
+- [ ] Chỉ một trong Hostinger CDN và Cloudflare CDN được bật.
+- [ ] DNS-only, origin HTTPS và canonical redirect đã pass trước khi proxy.
+- [ ] Có record cũ và điều kiện cụ thể để rollback.
+
+## Bài tập
+
+1. Dùng `dig NS` và export DNS để vẽ bảng “registrar / DNS / web / mail” cho
+   một domain thật, nhưng chưa sửa gì.
+2. Giải thích vì sao `dig CNAME example.com` có thể rỗng dù Cloudflare
+   dashboard có CNAME apex của Website Builder.
+3. Bật DNS only cho một staging subdomain trỏ Hostinger, xác minh TLS, rồi bật
+   proxy và ghi lại sự khác nhau của `dig A` cùng response headers.
+4. Viết rollback trigger đo được, ví dụ: “rollback nếu HTTPS apex hoặc MX check
+   fail liên tục 5 phút”, thay vì “rollback nếu thấy có vẻ lỗi”.
+
+---
+
+## Nguồn chính thức, kiểm tra tháng 07/2026
+
+- [Hostinger — Point a domain to Hostinger](https://www.hostinger.com/support/1863967-how-to-point-a-domain-to-hostinger/)
+- [Hostinger — Website Builder bỏ phương án A record từ 20/05/2026](https://www.hostinger.com/support/hostinger-website-builder-a-record-deprecation/)
+- [Hostinger — Point Website Builder qua Cloudflare](https://www.hostinger.com/support/6865646-how-to-point-a-domain-to-hostinger-website-builder-via-cloudflare/)
+- [Hostinger — Dùng Cloudflare với hosting](https://www.hostinger.com/support/4741545-how-to-use-cloudflare-in-hostinger/)
+- [Hostinger — Chỉ bật một CDN](https://www.hostinger.com/support/5782174-is-cloudflare-supported-at-hostinger/)
+- [Cloudflare — CNAME flattening](https://developers.cloudflare.com/dns/cname-flattening/set-up-cname-flattening/)
+- [Cloudflare — Proxy status và DNS only](https://developers.cloudflare.com/dns/proxy-status/)
+- [Cloudflare — SSL/TLS encryption modes](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/)
+- [Cloudflare — Troubleshoot redirect loop](https://developers.cloudflare.com/ssl/troubleshooting/too-many-redirects/)

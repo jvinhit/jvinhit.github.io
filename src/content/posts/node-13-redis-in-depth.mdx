@@ -1,190 +1,508 @@
 ---
-title: 'Node.js Super Senior · Phase 13 — Redis in Depth'
-description: 'Bonus Phase 13: make it fast and scalable with Redis. Core data types, cache-aside with TTLs and stampede protection, pub/sub vs Streams, atomic rate limiting, distributed locks, sessions, and BullMQ jobs — in TypeScript.'
+title: 'Node.js Production Engineering 13 — Redis beyond Cache'
+description: 'Dùng Redis 8 có chủ đích: cache consistency, stampede control, Pub/Sub và Streams, rate limit atomic, distributed lock với fencing, session, BullMQ và vận hành production.'
 pubDate: 2026-06-10
-tags: [nodejs, redis, caching, queues, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, redis, caching, queues, production-engineering]
 series: nodejs
 seriesOrder: 13
 draft: false
 ---
 
-Đây là **Bonus Phase 13**. Phase 6 có nhắc Redis; giờ ta đi sâu. Redis là kho cấu trúc dữ liệu trong bộ nhớ làm nhiều hơn caching: pub/sub, stream, bộ đếm nguyên tử, khóa, session, và hàng đợi job. Junior dùng nó như cache key-value; senior chọn đúng *primitive* cho mỗi bài toán.
+Redis có thể giảm một query từ 40 ms xuống 1 ms. Nó cũng có thể trả dữ liệu đã bị thu hồi quyền, khóa vĩnh viễn một user vì key không có TTL, hoặc cho hai worker cùng bước vào critical section sau một lần pause GC.
+
+Khác biệt nằm ở guarantee. **Một command Redis là atomic; một chuỗi command của application thì không tự atomic. TTL là lease, không phải bằng chứng sở hữu vĩnh viễn. Pub/Sub là tín hiệu, không phải hàng đợi bền.**
+
+Bài này dùng Redis Open Source 8.x và Node.js 24 để đi xa hơn cache-aside. Sau khi hoàn thành, bạn có thể:
+
+- chọn đúng data structure và consistency model;
+- thiết kế cache có TTL jitter, negative caching và chống stampede;
+- phân biệt Pub/Sub, Streams và job queue;
+- cài fixed-window rate limiter atomic bằng Lua;
+- giải thích vì sao distributed lock cần lease, renewal và fencing token;
+- vận hành session/BullMQ mà không nhầm deduplication với idempotency;
+- quan sát hit rate, evictions, lag, hot key và failure mode.
 
 ---
 
-## Kết nối
+## Mental model: Redis là một remote state machine
+
+```text
+Node process
+   │ command / pipeline / script
+   ▼
+Redis primary ── replication ──▶ replica
+   │
+   ├─ memory + eviction policy
+   ├─ optional AOF/RDB durability
+   └─ key expiry
+```
+
+Mỗi lần dùng Redis, hãy trả lời năm câu:
+
+1. Redis là source of truth hay chỉ là bản sao có thể dựng lại?
+2. Mất key có chấp nhận được không?
+3. Dữ liệu cũ được phép tồn tại bao lâu?
+4. Operation cần atomic ở phạm vi một key, nhiều key hay cả database khác?
+5. Fail-open hay fail-closed khi Redis unavailable?
+
+Cache catalog có thể fail-open sang PostgreSQL. Rate limit thanh toán có thể phải fail-closed. Session store mất kết nối thường buộc request chưa xác thực. Không có một retry policy chung cho mọi use case.
+
+---
+
+## Kết nối: client theo workload, không theo tiện tay
+
+Redis khuyến nghị `node-redis` cho project mới. BullMQ dùng `ioredis` bên dưới và có yêu cầu connection riêng.
 
 ```bash
-docker run --name redis -p 6379:6379 -d redis:7
-npm i ioredis            # or: npm i redis  (node-redis v4)
+docker run --name redis8 \
+  -p 127.0.0.1:6379:6379 \
+  -d redis:8-alpine
+
+npm install redis
 ```
 
 ```ts
-import Redis from 'ioredis';
-export const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379');
+import { createClient } from 'redis';
+
+const url = process.env.REDIS_URL;
+if (!url) throw new Error('REDIS_URL is required');
+
+export const redis = createClient({
+  url,
+  socket: {
+    connectTimeout: 5_000,
+    reconnectStrategy: (retries) => Math.min(50 * 2 ** retries, 3_000),
+  },
+});
+
+redis.on('error', (error) => logger.error({ error }, 'redis client error'));
+await redis.connect();
 ```
 
-> Ghi chú senior: tái dùng **một** client. Nhưng kết nối *subscriber* pub/sub không chạy lệnh thường được — tạo client **riêng** để subscribe.
+Không dùng cùng connection cho command thường và Pub/Sub: subscriber connection chuyển sang chế độ nhận message. Blocking Streams và worker queue cũng cần connection riêng để không giữ đường request.
+
+Retry ở request path phải có budget. Một client tự reconnect vô hạn trong khi HTTP request chờ sẽ biến outage ngắn thành hàng đợi request lớn.
 
 ---
 
-## Các kiểu dữ liệu quan trọng
+## Chọn data structure theo operation
 
-Biết dùng kiểu nào là toàn bộ kỹ năng:
+| Kiểu       | Operation chính           | Use case phù hợp            | Rủi ro cần nhớ                       |
+| ---------- | ------------------------- | --------------------------- | ------------------------------------ |
+| String     | `GET`, `SET`, `INCR`      | JSON cache, counter, flag   | rewrite toàn value                   |
+| Hash       | `HGET`, `HSET`, `HINCRBY` | record nhỏ, field update    | field/key TTL semantics theo version |
+| Set        | `SADD`, `SISMEMBER`       | membership, uniqueness      | không có thứ tự                      |
+| Sorted Set | `ZADD`, range theo score  | leaderboard, sliding window | memory tăng theo member              |
+| Stream     | `XADD`, consumer group    | durable event log có ack    | pending recovery/trim cần vận hành   |
+| Pub/Sub    | `PUBLISH`, `SUBSCRIBE`    | invalidate/signal tạm thời  | subscriber offline mất message       |
 
-| Type | Dùng cho |
-| --- | --- |
-| **String** | cached JSON, counters (`INCR`), flags |
-| **Hash** | objects/records — update one field without rewriting all |
-| **List** | simple queues, recent-items feeds (`LPUSH`/`LRANGE`) |
-| **Set** | uniqueness, tags, "who's online" |
-| **Sorted Set (ZSet)** | leaderboards, rate windows, priority queues (score = rank/time) |
-| **Stream** | append-only event log with consumer groups |
+List có thể làm queue đơn giản, nhưng khi cần retry, visibility timeout, ack, delayed job và metrics, dùng Streams hoặc queue library thay vì tự xây một nửa broker.
 
 ---
 
-## Caching: cache-aside + TTL
-
-Pattern chủ đạo: kiểm cache, nếu miss thì đọc DB và nạp lại kèm hạn.
+## Cache-aside: freshness là quyết định nghiệp vụ
 
 ```ts
-async function getPost(id: number) {
-  const key = `post:${id}`;
+const MISS = '__missing__';
+
+function ttlWithJitter(baseSeconds: number): number {
+  return (
+    baseSeconds + Math.floor(Math.random() * Math.max(1, baseSeconds * 0.1))
+  );
+}
+
+async function getPost(id: bigint) {
+  const key = `post:v3:${id}`;
   const hit = await redis.get(key);
-  if (hit) return JSON.parse(hit);                       // cache hit
 
-  const post = await prisma.post.findUnique({ where: { id } }); // miss → DB (Phase 12)
-  if (post) await redis.set(key, JSON.stringify(post), 'EX', 300); // TTL 5 min
+  if (hit === MISS) return null;
+  if (hit !== null) return JSON.parse(hit) as PostView;
+
+  const post = await prisma.post.findUnique({
+    where: { id },
+    select: { id: true, title: true, body: true, updatedAt: true },
+  });
+
+  if (!post) {
+    // Negative cache ngắn để chặn repeated miss/ID probing vào database.
+    await redis.set(key, MISS, { EX: ttlWithJitter(15) });
+    return null;
+  }
+
+  await redis.set(key, JSON.stringify(post), { EX: ttlWithJitter(300) });
   return post;
 }
 ```
 
-**Luôn đặt TTL** trừ khi có chiến lược vô hiệu rõ ràng — key không hết hạn là rò bộ nhớ chậm. Khi ghi, vô hiệu hóa cache.
+Version trong key (`v3`) cho phép đổi serialization/schema mà không parse nhầm dữ liệu cũ. TTL jitter giảm nhiều key nóng hết hạn cùng giây.
 
-### Cơn giẫm đạp cache
+### Invalidation không tự atomic với database
 
-Khi một key nóng hết hạn, hàng nghìn request đồng thời miss cùng lúc và dộng DB. Phòng vệ: một **khóa** ngắn để chỉ một request dựng lại, **TTL ngẫu nhiên nhẹ** (jitter), hoặc phục vụ dữ liệu cũ trong khi làm mới nền.
+Pattern “update DB rồi `DEL` cache” vẫn có race:
 
----
-
-## Pub/Sub và Streams
-
-Cả hai chuyển tin, nhưng độ bền ngược nhau:
-
-```ts
-// Pub/Sub — fire-and-forget; offline subscribers MISS messages
-sub.subscribe('orders');
-sub.on('message', (ch, msg) => handle(JSON.parse(msg)));
-pub.publish('orders', JSON.stringify({ id: 42 }));
-
-// Streams — durable append-only log; consumers replay & ack what they processed
-await redis.xadd('orders', '*', 'id', '42');
-const res = await redis.xreadgroup('GROUP', 'workers', 'w1', 'COUNT', 10, 'STREAMS', 'orders', '>');
-// ... process, then: redis.xack('orders', 'workers', id)
+```text
+reader: đọc DB cũ ─────────────────────── SET cache cũ
+writer:             COMMIT mới ── DEL cache
 ```
 
-Dùng **Pub/Sub** cho fan-out tạm thời nơi mất tin cũng được. Dùng **Streams** khi mọi sự kiện phải được xử lý ít nhất một lần.
+Nếu `SET cache cũ` xảy ra sau `DEL`, stale value sống đến hết TTL. Tùy freshness budget, chọn một trong các chiến lược:
+
+- TTL ngắn và chấp nhận bounded staleness;
+- version key gắn với version/`updated_at` đã biết;
+- event/CDC invalidation có retry;
+- write-through được thiết kế riêng;
+- bỏ cache cho dữ liệu quyền hạn, balance hoặc inventory nhạy cảm.
+
+Không cache object ORM nguyên khối nếu response chỉ cần view nhỏ. Không dùng wildcard delete trên request path. Thiết kế key namespace và ownership từ đầu.
 
 ---
 
-## Rate limit — bộ đếm nguyên tử
+## Chống cache stampede
 
-Limiter cửa sổ cố định là hai thao tác nguyên tử:
+Khi một hot key hết hạn, hàng nghìn request có thể cùng đọc database. Ba lựa chọn:
+
+1. **request coalescing trong process**: cùng key dùng chung Promise đang chạy;
+2. **lease ngắn xuyên process**: một owner rebuild, request khác dùng stale/fallback;
+3. **stale-while-revalidate**: lưu fresh TTL và stale TTL riêng.
+
+Lease rebuild không nên khiến request khác spin vô hạn. Đặt deadline; nếu không lấy được value mới, trả stale trong freshness budget hoặc fail có kiểm soát.
+
+Đo stampede qua `cache_fill_inflight`, DB query spike và số request chờ cùng key. Hit rate cao không có nghĩa cache tốt nếu invalidation sai.
+
+---
+
+## Rate limit atomic bằng Lua
+
+Đây là code **không atomic**:
 
 ```ts
-async function allow(ip: string, limit = 100, windowSec = 60) {
-  const key = `rl:${ip}`;
-  const count = await redis.incr(key);          // atomic
-  if (count === 1) await redis.expire(key, windowSec); // start the window
-  return count <= limit;
+const count = await redis.incr(key);
+if (count === 1) await redis.expire(key, 60);
+```
+
+Process có thể chết sau `INCR` trước `EXPIRE`, để lại key không TTL. Lua gom read-modify-write vào một operation atomic:
+
+```ts
+const fixedWindowScript = `
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+local ttl = redis.call('PTTL', KEYS[1])
+return { count, ttl }
+`;
+
+interface RateDecision {
+  allowed: boolean;
+  remaining: number;
+  retryAfterMs: number;
+}
+
+async function allowRequest(
+  subject: string,
+  limit = 100,
+  windowMs = 60_000
+): Promise<RateDecision> {
+  // subject phải đến từ identity/IP đã canonicalize và trust-proxy đúng.
+  const key = `rl:api:${subject}`;
+  const [count, ttl] = (await redis.eval(fixedWindowScript, {
+    keys: [key],
+    arguments: [String(windowMs)],
+  })) as [number, number];
+
+  return {
+    allowed: count <= limit,
+    remaining: Math.max(0, limit - count),
+    retryAfterMs: count <= limit ? 0 : Math.max(0, ttl),
+  };
 }
 ```
 
-Vì `INCR` nguyên tử, nó đúng cả khi đồng thời nặng. Cho giới hạn mượt hơn dùng sliding window với **sorted set** timestamp, lý tưởng trong script Lua để nguyên tử.
+Fixed window cho phép burst ở ranh giới: `limit` request cuối cửa sổ rồi thêm `limit` request đầu cửa sổ kế. Sliding window hoặc token bucket mượt hơn nhưng tốn state/CPU hơn. Redis 8.8 có `INCREX` cho một số window-counter use case; Lua vẫn hữu ích khi phải hỗ trợ nhiều Redis 8 minor hoặc logic tùy biến.
+
+Rate limit là policy đa chiều: user, tenant, API key, route và cost. IP-only dễ chặn cả NAT và dễ sai khi proxy header không được cấu hình đúng.
 
 ---
 
-## Khóa phân tán
+## Distributed lock: lease không phải mutex tuyệt đối
 
-Để chỉ một process làm việc gì đó, dùng `SET key value NX PX`:
+Acquire và release tối thiểu:
 
 ```ts
-const token = crypto.randomUUID();
-const got = await redis.set('lock:rebuild', token, 'PX', 10_000, 'NX');
-if (got === 'OK') {
-  try { /* critical section */ }
-  finally {
-    // release ONLY if we still own it (compare-and-delete via Lua)
-    await redis.eval(
-      `if redis.call("get",KEYS[1])==ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`,
-      1, 'lock:rebuild', token,
-    );
-  }
+import { randomUUID } from 'node:crypto';
+
+const releaseScript = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`;
+
+async function tryAcquire(resource: string, ttlMs: number) {
+  const lockKey = `lock:${resource}`;
+  const token = randomUUID();
+  const acquired = await redis.set(lockKey, token, { NX: true, PX: ttlMs });
+  if (acquired !== 'OK') return null;
+
+  return {
+    token,
+    async release() {
+      await redis.eval(releaseScript, {
+        keys: [lockKey],
+        arguments: [token],
+      });
+    },
+  };
 }
 ```
 
-> Ghi chú senior: luôn kèm `token` ngẫu nhiên và giải phóng bằng compare-and-delete. Cho đúng đa node, hiểu tranh luận Redlock trước khi tin một khóa một-instance cho việc liên quan tiền.
+Compare-and-delete ngăn owner cũ xóa lock mới. Nó **không** ngăn timeline này:
+
+```text
+worker A lấy lock ── pause GC dài ── lease hết hạn ───────── write cũ
+worker B                         lấy lock mới ── write mới
+```
+
+Nếu correctness phụ thuộc việc writer cũ không được ghi, downstream cần **fencing token tăng đơn điệu**:
+
+```ts
+const lock = await tryAcquire('invoice:42', 10_000);
+if (!lock) throw new Error('busy');
+
+try {
+  const fence = await redis.incr('fence:invoice:42');
+  await db.query(
+    `UPDATE invoices
+     SET rendered_url = $1, last_fence = $2
+     WHERE id = $3 AND last_fence < $2`,
+    [url, fence, 42]
+  );
+} finally {
+  await lock.release();
+}
+```
+
+Storage nhận write phải lưu và từ chối fence thấp hơn. Nếu không có enforcement này, fencing chỉ là một con số trang trí.
+
+Lease dài giảm expiry giữa việc nhưng làm recovery chậm; lease ngắn cần renewal có deadline. Failover, clock assumptions và network partition thay đổi guarantee của thuật toán nhiều node. Với tiền/inventory trong một database, constraint/row lock/advisory lock ở chính database thường có semantics rõ hơn Redis lock.
 
 ---
 
-## Session
+## Pub/Sub và Streams: tín hiệu hay công việc bền
 
-Redis là kho session chuẩn cho app scale ngang — instance nào cũng đọc được session nào:
+### Pub/Sub
+
+```ts
+const subscriber = redis.duplicate();
+await subscriber.connect();
+await subscriber.subscribe('cache-invalidate', async (message) => {
+  const event = JSON.parse(message) as { key: string };
+  await localCache.delete(event.key);
+});
+```
+
+Subscriber offline sẽ mất message. Vì vậy Pub/Sub hợp cho invalidate local cache, presence hint hoặc live update có thể rebuild từ source of truth.
+
+### Streams
+
+```ts
+const stream = 'orders';
+const group = 'email-workers';
+const consumer = `${process.env.HOSTNAME ?? 'local'}:${process.pid}`;
+
+try {
+  await redis.sendCommand(['XGROUP', 'CREATE', stream, group, '0', 'MKSTREAM']);
+} catch (error) {
+  if (!String(error).includes('BUSYGROUP')) throw error;
+}
+
+await redis.sendCommand([
+  'XADD',
+  stream,
+  'MAXLEN',
+  '~',
+  '100000',
+  '*',
+  'eventId',
+  crypto.randomUUID(),
+  'orderId',
+  '42',
+]);
+
+const batch = await redis.sendCommand([
+  'XREADGROUP',
+  'GROUP',
+  group,
+  consumer,
+  'COUNT',
+  '10',
+  'BLOCK',
+  '5000',
+  'STREAMS',
+  stream,
+  '>',
+]);
+// Parse batch → xử lý idempotently → XACK từng entry thành công.
+```
+
+Streams giữ pending entry cho consumer group, nhưng application vẫn phải:
+
+- tạo idempotency ledger/unique constraint theo `eventId`;
+- `XACK` chỉ sau side effect thành công;
+- reclaim pending của consumer chết bằng `XAUTOCLAIM`;
+- giới hạn retention có chủ đích;
+- đo consumer lag, pending age và poison message;
+- xác định persistence/replication phù hợp, vì “ở trong Stream” không đồng nghĩa bất tử.
+
+Nếu cần routing, retry policy, DLQ, schema governance và multi-region semantics phong phú, đánh giá broker chuyên dụng thay vì ép Redis làm mọi vai trò.
+
+---
+
+## Session: TTL và cookie phải cùng một policy
+
+`connect-redis` 9 dùng `node-redis`:
 
 ```ts
 import session from 'express-session';
 import { RedisStore } from 'connect-redis';
 
-app.use(session({
-  store: new RedisStore({ client: redis }),
-  secret: process.env.SESSION_SECRET!,
-  resave: false, saveUninitialized: false,
-  cookie: { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 86_400_000 },
-}));
+const store = new RedisStore({
+  client: redis,
+  prefix: 'sess:content-api:',
+  ttl: 24 * 60 * 60,
+});
+
+app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal']);
+app.use(
+  session({
+    name: '__Host-session',
+    store,
+    secret: [
+      process.env.SESSION_SECRET_CURRENT!,
+      process.env.SESSION_SECRET_PREVIOUS!,
+    ],
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 24 * 60 * 60_000,
+    },
+  })
+);
 ```
 
-Cái này nối với auth Phase 5 và hé lộ Phase 15: session vs JWT.
+Regenerate session id sau login/đổi privilege để chặn session fixation. Logout phải destroy server session và clear cookie cùng scope. TTL store và cookie expiry phải khớp; rolling session là quyết định security/UX, không phải default vô hại.
+
+`trust proxy` phải phản ánh topology thật. Tin mọi `X-Forwarded-*` từ internet làm secure-cookie, IP và rate limit sai.
 
 ---
 
-## Job nền với BullMQ
-
-Đừng làm việc chậm trong request. Đẩy sang hàng đợi nền Redis và xử lý trong worker:
+## BullMQ: dedupe khác idempotency
 
 ```ts
 import { Queue, Worker } from 'bullmq';
-const connection = { host: 'localhost', port: 6379 };
 
+const connection = { host: 'redis', port: 6379 };
 const emailQueue = new Queue('email', { connection });
-await emailQueue.add('welcome', { to: 'a@ex.com' }, {
-  attempts: 3, backoff: { type: 'exponential', delay: 1000 },  // retry on failure
-});
 
-new Worker('email', async (job) => { await sendEmail(job.data); }, { connection });
+await emailQueue.add(
+  'welcome',
+  { eventId, userId },
+  {
+    jobId: `welcome-${eventId}`,
+    attempts: 5,
+    backoff: { type: 'exponential', delay: 1_000 },
+    removeOnComplete: { age: 24 * 3600, count: 10_000 },
+  }
+);
+
+const worker = new Worker(
+  'email',
+  async (job) => {
+    // Unique constraint trên processed_events(event_id) hoặc provider idempotency key.
+    await sendWelcomeIdempotently(job.data.eventId, job.data.userId);
+  },
+  { connection, concurrency: 20 }
+);
 ```
 
-Có sẵn retry, backoff, job trễ/lặp, và concurrency — cách production giữ độ trễ request thấp.
+`jobId` chỉ ngăn thêm job trùng khi job cũ còn tồn tại trong queue. Auto-removal xóa bằng chứng đó. Retry/stalled worker vẫn có thể chạy processor lại. **Idempotency phải nằm ở side effect**, thường qua unique constraint hoặc idempotency key của provider.
+
+Worker shutdown cần `await worker.close()`; producer request path nên fail nhanh khi Redis unavailable, còn worker connection thường chờ reconnect theo policy BullMQ.
 
 ---
 
-## Lời cảnh báo của sư phụ
+## Observability và failure modes
 
-- **Mọi cache key cần TTL hoặc kế hoạch vô hiệu.**
-- **Vô hiệu cache khó — giữ đơn giản.**
-- **Pub/Sub rớt tin với subscriber offline.**
-- **Khóa phải tự hết hạn và xác minh sở hữu.**
-- **Redis (phần lớn) đơn luồng.** `KEYS *` chặn mọi thứ — dùng `SCAN`.
+Theo dõi theo vai trò, không chỉ một dashboard Redis chung:
+
+- cache: hit/miss, fill latency, stale serve, eviction, hot key;
+- rate limit: allow/deny theo policy có cardinality giới hạn;
+- lock: acquire wait/fail, lease renewal, stale fence rejection;
+- Streams/queue: lag, pending age, retry, poison/DLQ;
+- session: lookup error, active sessions, forced revocation;
+- server: memory, fragmentation, eviction, expired keys, command latency, replication lag, persistence error.
+
+Failure modes quan trọng:
+
+| Failure          | Cache                   | Session                                | Rate limit/lock               |
+| ---------------- | ----------------------- | -------------------------------------- | ----------------------------- |
+| Redis timeout    | fallback DB có bulkhead | thường 503/unauthenticated policy      | chọn fail-open/closed rõ ràng |
+| eviction         | cache miss              | user bị logout nếu eviction sai policy | mất state bảo vệ              |
+| replica failover | stale/missing key       | session có thể mất tùy durability      | lock semantics yếu đi         |
+| hot key          | một shard/core bão hòa  | tenant lớn ảnh hưởng chung             | limiter tự thành bottleneck   |
+
+Đặt maxmemory/eviction policy theo workload. Không trộn cache có thể evict với session/idempotency record không được phép mất trong cùng policy mà không hiểu hậu quả.
 
 ---
 
-## Thực hành
+## Lab và acceptance criteria
 
-1. Thêm cache-aside vào `getPost` Phase 12, kèm TTL jitter và vô hiệu khi ghi.
-2. Dựng middleware rate limit theo user, trả `429` kèm `Retry-After`.
-3. Chuyển gửi email sang worker BullMQ với 3 retry và backoff lũy thừa.
+Xây một API catalog có cache, limiter và background email.
+
+1. Cache key có version, TTL jitter và negative cache ngắn.
+2. Test 100 concurrent miss trên một hot key chứng minh DB loader chạy tối đa một lần mỗi process; bản distributed có stale/fallback rõ ràng.
+3. Rate limiter dùng Lua; kill client giữa request không tạo key không TTL.
+4. Boundary-burst test ghi nhận trade-off fixed window; response `429` có `Retry-After` đúng.
+5. Lock test pause owner quá TTL; downstream từ chối write có fencing token cũ.
+6. Stream consumer crash trước `XACK`; consumer khác reclaim và side effect vẫn chỉ xuất hiện một lần.
+7. BullMQ chạy cùng job hai lần; unique idempotency ledger ngăn gửi email trùng.
+8. Redis unavailable test xác nhận cache fallback, session behavior và limiter fail mode đúng tài liệu.
+9. Dashboard có hit rate, command latency, evictions, stream lag và queue retry.
+10. Shutdown đóng subscriber, worker, queue và Redis client không còn open handle.
 
 ---
 
-## Phần tiếp theo
+## Checklist production
 
-Bạn lưu trữ được và tăng tốc/scale được. Các mảnh đã đủ, nhưng nối tay trong Express trở nên cồng kềnh với team lớn. Ở **Phase 14** ta dùng **NestJS** — một framework có cấu trúc, tiêm phụ thuộc, tổ chức module, provider, guard, pipe, interceptor, và bọc Prisma cùng Redis gọn gàng.
+- [ ] Mỗi Redis use case có source-of-truth và fail mode rõ ràng.
+- [ ] Chuỗi read-modify-write cần atomic đã dùng script/function/transaction phù hợp.
+- [ ] Cache có freshness budget, TTL/version và stampede strategy.
+- [ ] Rate-limit identity/IP đã canonicalize; proxy trust được cấu hình đúng.
+- [ ] Lock có owner token; correctness quan trọng có fencing ở downstream.
+- [ ] Pub/Sub chỉ mang message có thể mất; Streams consumer có reclaim/idempotency.
+- [ ] Session TTL khớp cookie; login regenerate session id.
+- [ ] BullMQ processor idempotent độc lập với `jobId`.
+- [ ] Cache và durable security state không vô tình chung eviction policy nguy hiểm.
+- [ ] Metric không dùng raw key/user id làm label.
+
+---
+
+## Tài liệu chính thức
+
+- [Redis — Node.js clients](https://redis.io/docs/latest/develop/clients/nodejs/)
+- [Redis — Rate limiter](https://redis.io/docs/latest/develop/use-cases/rate-limiter/)
+- [Redis — INCR rate-limiter race và Lua fix](https://redis.io/docs/latest/commands/incr/)
+- [Redis — Distributed locks](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
+- [Redis — Streams introduction](https://redis.io/docs/latest/develop/data-types/streams/)
+- [Redis — Persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
+- [connect-redis](https://github.com/tj/connect-redis)
+- [BullMQ — Connections](https://docs.bullmq.io/guide/connections)
+- [BullMQ — Idempotent jobs](https://docs.bullmq.io/patterns/idempotent-jobs)
+- [BullMQ — Auto-removal và duplicate job IDs](https://docs.bullmq.io/guide/queues/auto-removal-of-jobs)
+
+Phần tiếp theo nhìn NestJS như một kiến trúc runtime: module graph, DI scope và request pipeline phải phục vụ boundary của hệ thống, không trở thành lý do để business logic phụ thuộc framework.

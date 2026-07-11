@@ -1,0 +1,588 @@
+---
+title: 'Docker chuyên sâu · Part 12 — BuildKit, Multi-platform Images & Supply Chain'
+description: 'Hiểu BuildKit như DAG, dùng cache/secret/SSH mounts, build amd64+arm64, xuất cache CI và gắn SBOM/provenance vào image.'
+pubDate: 2026-05-30
+tags: [docker, buildkit, buildx, oci, security]
+series: docker
+seriesOrder: 12
+draft: false
+---
+
+Ở [Phần 11 — Container Internals](/blog/docker-11-container-internals/) ta đi từ `docker run` xuống OCI, containerd, runc và kernel. Bài này đi theo hướng ngược lại của vòng đời: **trước khi runtime có image để chạy, builder đã biến source code thành một đồ thị content-addressed, nhiều manifest theo platform và một tập metadata supply-chain**.
+
+Một build “thành công” chưa đủ. Build production cần trả lời thêm: cache nào có thể tái dùng trong CI, credential có lọt vào layer không, image chạy được trên cả AMD64 và ARM64 bằng chiến lược nào, tag đang trỏ tới digest nào, và ta có bằng chứng gì về package lẫn quy trình đã tạo artifact.
+
+> Các ví dụ dùng Buildx/BuildKit hiện đại và `ubuntu:24.04`. Kiểm tra trước bằng `docker buildx version` và `docker buildx inspect --bootstrap`. Docker Desktop hoặc Docker Engine mới thường đã có Buildx; một số output/cache backend còn phụ thuộc build driver và containerd image store.
+
+---
+
+## Từ Dockerfile tuần tự tới LLB dependency graph
+
+Dockerfile được viết từ trên xuống, nhưng BuildKit không coi nó là một shell script dài. **Dockerfile frontend** chuyển file thành **LLB** (Low-Level Build), một DAG content-addressed mô tả operation, input mount và dependency.
+
+```text
+  Dockerfile
+      │ frontend
+      ▼
+  LLB dependency graph
+      ├── base ── deps ── test ──┐
+      │                           ├── release
+      └── assets ─────────────────┘
+                 BuildKit solver
+```
+
+Hệ quả quan trọng:
+
+- stage độc lập có thể chạy song song;
+- stage không ảnh hưởng target cuối có thể bị bỏ qua;
+- chỉ file context thực sự được dùng mới cần truyền tới builder;
+- cache key dựa trên operation + input content/mount, không chỉ dựa vào “layer trước nhìn giống nhau”.
+
+Ví dụ, nếu target `release` không phụ thuộc stage `debug`, BuildKit không cần build `debug`:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM ubuntu:24.04 AS debug
+RUN echo "debug tools" > /debug-only
+
+FROM ubuntu:24.04 AS release
+RUN echo "release" > /artifact
+CMD ["cat", "/artifact"]
+```
+
+```bash
+docker buildx build --target release --progress=plain --load -t graph-demo .
+```
+
+Đừng tối ưu bằng cách gộp mọi thứ vào một `RUN` khổng lồ. Một graph tốt cân bằng hai mục tiêu: output không giữ file rác, và boundary cache phản ánh đúng thứ hay thay đổi.
+
+---
+
+## Builder, driver và output: ba thứ không nên nhập làm một
+
+**Buildx** là CLI orchestration; **BuildKit** là build engine. Một builder có một hoặc nhiều node và dùng driver khác nhau.
+
+```bash
+docker buildx ls
+docker buildx inspect --bootstrap
+```
+
+| Driver phổ biến         | BuildKit chạy ở đâu          | Trade-off chính                                                                              |
+| ----------------------- | ---------------------------- | -------------------------------------------------------------------------------------------- |
+| `docker`                | Tích hợp trong Docker Engine | Setup ít; capability output/cache phụ thuộc image store của Engine.                          |
+| `docker-container`      | Container BuildKit riêng     | Feature đầy đủ, config/upgrade tách biệt; multi-platform thường push/export thay vì tự load. |
+| `kubernetes` / `remote` | Cluster hoặc daemon từ xa    | Scale và cache chung; phải vận hành trust, auth và capacity của builder.                     |
+
+Output cũng độc lập với driver:
+
+- `--load` đưa **single-platform** result vào local Docker image store;
+- `--push` đẩy image/index thẳng tới registry;
+- `--output type=oci` xuất OCI layout tar;
+- `--output type=local` xuất filesystem artifact, không phải image.
+
+Docker Engine 29 fresh install và Docker Desktop mới dùng containerd image store, hỗ trợ multi-platform image/attestation tốt hơn. Host upgrade còn classic store có thể vẫn cần `docker-container` builder + `--push`.
+
+---
+
+## `RUN --mount`: input tạm thời không nhất thiết thành layer
+
+BuildKit cho một build step mount dữ liệu với lifecycle rõ ràng.
+
+| Mount         | Dữ liệu đến từ đâu              | Có nằm trong image cuối?                         | Use case                                     |
+| ------------- | ------------------------------- | ------------------------------------------------ | -------------------------------------------- |
+| `type=bind`   | Build context/stage             | Không, trừ output bạn chủ động copy/ghi ra layer | Compile từ source mà không `COPY` cả cây.    |
+| `type=cache`  | Cache store của builder         | Không                                            | npm/apt/pip/go/cargo cache qua nhiều build.  |
+| `type=secret` | File/env từ client              | Không nếu lệnh không tự copy nó                  | Token tải private dependency.                |
+| `type=ssh`    | SSH agent socket/key forwarding | Không                                            | Git clone qua SSH mà không copy private key. |
+
+### Bind mount: chỉ đưa input cần cho một operation
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM node:24-bookworm-slim
+WORKDIR /app
+
+RUN --mount=type=bind,source=package.json,target=/app/package.json \
+    --mount=type=bind,source=package-lock.json,target=/app/package-lock.json \
+    --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev
+
+COPY . .
+CMD ["node", "server.js"]
+```
+
+Bind mount mặc định read-only và biến mất sau `RUN`; `node_modules` mà `npm ci` ghi vào layer vẫn còn. Cache checksum tính input của bind mount, nên đổi lockfile invalidates đúng step.
+
+### Cache mount: cache tích lũy, layer cache vẫn chính xác
+
+```dockerfile
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
+    && apt-get install -y --no-install-recommends curl
+```
+
+Nếu layer cache hit, `RUN` không chạy. Nếu step phải chạy lại, cache mount giúp package manager tái dùng archive/index đã có. Cache là optimization, không phải input đáng tin để tạo hành vi khác: build đúng phải vẫn thành công với cache rỗng.
+
+### Secret và SSH mount: capability theo từng step
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM node:24-bookworm-slim
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=true \
+    npm ci --omit=dev
+```
+
+```bash
+docker buildx build \
+  --secret id=npmrc,src="$HOME/.npmrc" \
+  --load -t myapp:dev .
+```
+
+Với Git qua SSH:
+
+```dockerfile
+RUN --mount=type=ssh,required=true git clone git@github.com:acme/private-lib.git
+```
+
+```bash
+docker buildx build --ssh default --load -t myapp:dev .
+```
+
+Không dùng `ARG TOKEN` hay `ENV TOKEN` cho secret: chúng có thể xuất hiện trong history, image config hoặc provenance. Secret mount chỉ giảm leak nếu command **không tự copy/in secret** ra output hay log.
+
+Một chi tiết cache dễ quên: **giá trị secret không tham gia cache key**. Rotate token không tự rerun step. Nếu artifact private thực sự đổi theo secret/version, thêm một build arg không nhạy cảm như `PRIVATE_DEPS_REV` để invalidation có chủ đích.
+
+---
+
+## External cache cho CI: cache thuộc builder, không thuộc repo source
+
+Cache nội bộ nằm trong builder. Runner CI thường ephemeral, nên build sau không thấy cache của build trước nếu bạn không export.
+
+```bash
+docker buildx build \
+  --cache-from type=registry,ref=ghcr.io/acme/myapp:buildcache \
+  --cache-to type=registry,ref=ghcr.io/acme/myapp:buildcache,mode=max \
+  --tag ghcr.io/acme/myapp:1.4.0 \
+  --push .
+```
+
+- `--cache-from` khai báo nguồn có thể import;
+- `--cache-to` xuất cache sau build;
+- `mode=max` giữ cache trung gian nhiều stage hơn, đổi lại artifact cache lớn hơn;
+- cache ref nên tách khỏi release tag để lifecycle hai loại artifact không lẫn nhau.
+
+Các backend phổ biến gồm `registry`, `local`, `inline`, `gha`; hỗ trợ cụ thể phụ thuộc driver. Với default `docker` driver, một số external backend cần containerd image store.
+
+Thiết kế cache CI theo trust boundary:
+
+- PR không tin cậy chỉ **đọc** cache nền hoặc ghi scope riêng;
+- protected branch mới được ghi shared cache/release registry;
+- cache miss phải làm build chậm hơn, không làm build sai;
+- không dùng cache để truyền secret hay artifact cần audit;
+- giới hạn retention/dung lượng và tránh nhiều job ghi đè cùng một cache ref không kiểm soát.
+
+---
+
+## Multi-platform image: một index, nhiều manifest
+
+Tag multi-platform thường trỏ tới OCI image index. Registry/client chọn manifest khớp `os/architecture` của node:
+
+```text
+  ghcr.io/acme/myapp:1.4.0
+               │
+               ▼
+        OCI image index
+          ├── linux/amd64 manifest ── config + layers
+          └── linux/arm64 manifest ── config + layers
+```
+
+Build hai platform:
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --tag ghcr.io/acme/myapp:1.4.0 \
+  --push .
+```
+
+### Ba chiến lược build
+
+| Chiến lược            | Điểm mạnh                                  | Failure mode / trade-off                                                |
+| --------------------- | ------------------------------------------ | ----------------------------------------------------------------------- |
+| **QEMU emulation**    | Không cần sửa nhiều Dockerfile; dễ bắt đầu | Chậm rõ khi compile/compress; có thể lộ khác biệt emulator.             |
+| **Native nodes**      | Nhanh và chạy test đúng kiến trúc thật     | Phải vận hành builder AMD64 + ARM64, cache/network/toolchain đồng nhất. |
+| **Cross-compilation** | Compiler chạy native, thường nhanh nhất    | Chỉ hợp toolchain hỗ trợ; CGO/native dependency và test target khó hơn. |
+
+BuildKit cung cấp `BUILDPLATFORM`, `TARGETPLATFORM`, `TARGETOS`, `TARGETARCH`. Pin compiler stage về build platform để tránh vô tình chạy compiler qua QEMU:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS build
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /app
+RUN printf 'build=%s target=%s\n' "$BUILDPLATFORM" "$TARGETPLATFORM" \
+    > /app/platform.txt
+
+# Runtime base tự resolve theo target platform
+FROM node:24-bookworm-slim
+COPY --from=build /app/platform.txt /app/platform.txt
+CMD ["cat", "/app/platform.txt"]
+```
+
+Ví dụ trên chỉ minh họa args; JavaScript thường không “cross-compile” bytecode như Go/Rust. Nếu có native addon, bạn phải build/test artifact đúng target architecture thay vì giả định source JS làm mọi platform giống nhau.
+
+Multi-platform không đồng nghĩa “đã test đa kiến trúc”. Policy tốt yêu cầu test smoke/integration trên node thật hoặc emulator phù hợp cho **từng manifest** trước khi promote index digest.
+
+---
+
+## Tag, index digest và platform digest
+
+Ba identity cần phân biệt:
+
+| Reference                | Mutable?                      | Nó định danh gì?                     |
+| ------------------------ | ----------------------------- | ------------------------------------ |
+| `myapp:1.4.0`            | Có, trừ khi registry khóa tag | Tên thuận tiện có thể trỏ lại.       |
+| `myapp@sha256:<index>`   | Không                         | Toàn bộ tập multi-platform manifest. |
+| platform manifest digest | Không                         | Đúng một biến thể như `linux/arm64`. |
+
+```bash
+docker buildx imagetools inspect ghcr.io/acme/myapp:1.4.0
+```
+
+Trong deployment đa kiến trúc, pin **index digest** giữ nguyên tập platform và vẫn cho node tự chọn manifest. Pin platform digest khi workload cố định một platform và policy muốn artifact cụ thể nhất.
+
+Digest chứng minh content tải về khớp hash, nhưng **không tự chứng minh ai đã build/push**. Authenticity cần signature hoặc attestation được ký bởi identity/builder mà policy tin tưởng.
+
+Quy trình release thực dụng:
+
+1. build/push tag dễ đọc;
+2. lấy index digest sau push;
+3. scan/test từng platform manifest;
+4. promote deployment bằng `repository@sha256:...`;
+5. giữ tag để con người tìm, digest để máy deploy.
+
+---
+
+## SBOM và provenance attestations: bằng chứng gắn với artifact
+
+BuildKit tạo hai loại metadata chính:
+
+- **SBOM**: danh sách package/file thành phần, mặc định theo SPDX khi dùng generator chuẩn;
+- **provenance**: source/material, builder, platform, tham số và thông tin quy trình build.
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --sbom=true \
+  --provenance=mode=max \
+  --tag ghcr.io/acme/myapp:1.4.0 \
+  --push .
+```
+
+Buildx mặc định tạo provenance `mode=min` cho result phù hợp và attach khi push registry. `mode=max` giàu dữ liệu hơn, nhưng cũng có thể công bố build args/environment; đó là lý do credential phải đi qua secret mount, không qua build arg.
+
+Attestation được gắn quanh image index/manifest theo format OCI-compatible. Với classic local image store, attestation có thể không được giữ khi `--load`; push thẳng registry hoặc dùng containerd image store.
+
+Inspect sau push:
+
+```bash
+docker buildx imagetools inspect ghcr.io/acme/myapp:1.4.0
+
+docker buildx imagetools inspect ghcr.io/acme/myapp:1.4.0 \
+  --format '{{json .SBOM}}'
+
+docker buildx imagetools inspect ghcr.io/acme/myapp:1.4.0 \
+  --format '{{json .Provenance}}'
+```
+
+### Metadata có mặt chưa đồng nghĩa metadata đáng tin
+
+Một gate grep thấy `SPDX` chỉ xác nhận **có object**, không xác nhận:
+
+- scanner nhìn thấy mọi dependency hay không;
+- provenance do builder được tin tưởng tạo hay không;
+- metadata có chữ ký hợp lệ hay không;
+- source revision đã review có đúng artifact đang deploy hay không.
+
+Supply-chain policy nên nối các lớp bằng digest:
+
+| Lớp bằng chứng       | Câu hỏi nó trả lời                                          |
+| -------------------- | ----------------------------------------------------------- |
+| Digest               | Byte/index có đúng artifact đã chọn?                        |
+| SBOM                 | Artifact chứa thành phần nào mà scanner nhận diện?          |
+| Provenance           | Build dùng source/material/builder/tham số nào?             |
+| Signature + identity | Ai chứng thực artifact/attestation này?                     |
+| Policy               | Với môi trường này, bằng chứng trên có đạt chuẩn để deploy? |
+
+Rule production thường gồm: registry allowlist, base image pin bằng digest, đủ `amd64` + `arm64`, SBOM/provenance bắt buộc, signature từ CI identity được phép, vulnerability/license threshold, và deployment chỉ nhận digest đã promote.
+
+Docker Build policy có thể validate input như base image/registry/digest ngay lúc build trên Buildx hỗ trợ. Admission/deploy policy vẫn cần kiểm tra output và attestation ở biên triển khai; build-time policy không thay thế deploy-time enforcement.
+
+---
+
+## Failure modes cần nhớ
+
+| Triệu chứng                               | Nguyên nhân thường gặp                               | Cách xử lý                                                               |
+| ----------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------ |
+| Build CI luôn lạnh                        | Mỗi job dùng builder mới, không external cache       | Cấu hình `cache-from/cache-to`, kiểm tra scope/quyền.                    |
+| Secret đổi nhưng step vẫn cached          | Secret value không tham gia cache key                | Thêm revision arg không nhạy cảm hoặc invalidate stage có chủ đích.      |
+| Secret xuất hiện trong history/provenance | Truyền qua `ARG`/`ENV` hoặc echo/copy                | Dùng secret mount; scrub log; rotate credential đã lộ.                   |
+| `--load` multi-platform fail              | Docker exporter/local store chỉ nhận single platform | Push registry, xuất OCI layout hoặc dùng containerd image store phù hợp. |
+| ARM build rất chậm                        | Compile qua QEMU                                     | Cross-compile hoặc thêm native ARM builder.                              |
+| Index có ARM manifest nhưng app crash     | Chưa test native addon/binary target                 | Chạy test trên từng target platform.                                     |
+| Attestation biến mất sau build            | Exporter/store không giữ attestation                 | `--push` trực tiếp hoặc containerd image store.                          |
+| Có SBOM nhưng policy vẫn từ chối          | Thiếu signature/identity, package hoặc platform      | Kiểm tra toàn bộ evidence contract, không chỉ file tồn tại.              |
+
+---
+
+## Bảng tra nhanh
+
+```bash
+# Builder và graph
+docker buildx version
+docker buildx ls
+docker buildx inspect --bootstrap
+docker buildx build --check .
+docker buildx build --progress=plain --load -t app:dev .
+
+# Cache, secret, SSH
+docker buildx build --cache-from type=registry,ref=<cache-ref> \
+  --cache-to type=registry,ref=<cache-ref>,mode=max .
+docker buildx build --secret id=token,src=token.txt .
+docker buildx build --ssh default .
+
+# Multi-platform và output
+docker buildx build --platform linux/amd64,linux/arm64 --push -t <image> .
+docker buildx build --platform linux/amd64,linux/arm64 \
+  --output type=oci,dest=image.tar .
+docker buildx imagetools inspect <image>
+
+# Supply-chain metadata
+docker buildx build --sbom=true --provenance=mode=max --push -t <image> .
+docker buildx imagetools inspect <image> --format '{{json .SBOM}}'
+docker buildx imagetools inspect <image> --format '{{json .Provenance}}'
+```
+
+---
+
+## Bài tập / Exercises
+
+Tạo thư mục `docker-lab-12/`. Mỗi bài dùng một Dockerfile riêng để bằng chứng không lẫn nhau.
+
+### 1. Chứng minh cache mount sống qua lần build bị invalidate
+
+Build hai lần với `CACHE_BUST` khác nhau để bắt step `apt` chạy lại, rồi quan sát lần hai tái dùng package cache thay vì bắt đầu hoàn toàn lạnh.
+
+<details>
+<summary>Lời giải</summary>
+
+Tạo `Dockerfile.cache`:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM ubuntu:24.04
+
+ARG CACHE_BUST=0
+RUN rm -f /etc/apt/apt.conf.d/docker-clean
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    echo "cache-bust=${CACHE_BUST}" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends curl
+
+CMD ["curl", "--version"]
+```
+
+```bash
+docker buildx build --progress=plain \
+  --build-arg CACHE_BUST=1 \
+  --load -f Dockerfile.cache -t lab12-cache:one .
+
+docker buildx build --progress=plain \
+  --build-arg CACHE_BUST=2 \
+  --load -f Dockerfile.cache -t lab12-cache:two .
+
+docker run --rm lab12-cache:two
+```
+
+Cả hai step phải chạy vì arg đổi; output lần hai thường tải ít hơn nhờ apt cache. Mức chênh phụ thuộc mirror/cache sẵn có, nên bằng chứng đúng là log package manager + build thành công khi cache bị invalidate, không phải một con số thời gian cố định.
+
+</details>
+
+### 2. Dùng secret mount và chứng minh giá trị không nằm trong image
+
+Build một image cần token ở đúng một `RUN`. Xác nhận build fail nếu thiếu secret, thành công khi có, `/run/secrets/token` không tồn tại lúc runtime và history không chứa giá trị.
+
+<details>
+<summary>Lời giải</summary>
+
+Tạo `Dockerfile.secret`:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM ubuntu:24.04
+
+RUN --mount=type=secret,id=token,required=true \
+    test "$(cat /run/secrets/token)" = "lab-secret-value" \
+    && printf 'authenticated-at-build\n' > /result.txt
+
+CMD ["cat", "/result.txt"]
+```
+
+```bash
+# Thiếu secret: phải fail vì required=true
+docker buildx build --load -f Dockerfile.secret -t lab12-secret . || true
+
+LAB_TOKEN=lab-secret-value docker buildx build \
+  --secret type=env,id=token,env=LAB_TOKEN \
+  --load -f Dockerfile.secret -t lab12-secret .
+
+docker run --rm lab12-secret
+docker run --rm lab12-secret sh -c '
+  test ! -e /run/secrets/token && echo "secret mount is absent at runtime"
+'
+
+if docker history --no-trunc lab12-secret | grep -F 'lab-secret-value'; then
+  echo "LEAK: rotate the credential" >&2
+  exit 1
+else
+  echo "secret value not found in image history"
+fi
+```
+
+Đây là kiểm tra tối thiểu, không phải proof mật mã. CI còn phải cấm command echo/copy secret, bảo vệ build log và rotate ngay nếu giá trị thật từng đi qua `ARG`/`ENV`.
+
+</details>
+
+### 3. Build OCI index cho AMD64 và ARM64 không cần registry
+
+Dùng build stage native để sinh script theo target, xuất OCI layout tar và đọc `index.json` để thấy hai platform descriptor.
+
+<details>
+<summary>Lời giải</summary>
+
+Tạo `Dockerfile.multi`:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM ubuntu:24.04 AS generate
+ARG TARGETOS
+ARG TARGETARCH
+RUN mkdir -p /out \
+    && printf '#!/bin/sh\necho target=%s/%s\n' "$TARGETOS" "$TARGETARCH" \
+      > /out/show-target \
+    && chmod +x /out/show-target
+
+FROM ubuntu:24.04
+COPY --from=generate /out/show-target /usr/local/bin/show-target
+ENTRYPOINT ["/usr/local/bin/show-target"]
+```
+
+```bash
+docker buildx create --name lab12-builder \
+  --driver docker-container --use --bootstrap
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --provenance=false \
+  --output type=oci,dest=lab12-multi.tar \
+  -f Dockerfile.multi .
+
+tar -xOf lab12-multi.tar index.json \
+  | tr ',' '\n' \
+  | grep -E '"os"|"architecture"'
+
+docker buildx rm lab12-builder
+```
+
+Stage `generate` luôn chạy trên `BUILDPLATFORM`; final base được resolve cho từng target nhưng không chạy foreign binary, nên lab không cần QEMU. Trong app compile thật, thêm cross-compiler hoặc native/emulated builder tùy trade-off.
+
+Để publish, thay output bằng `--tag <registry>/<namespace>/lab12:0.1 --push`, rồi inspect bằng `docker buildx imagetools inspect`.
+
+</details>
+
+### 4. Gắn và kiểm tra SBOM + provenance attestations
+
+Push image lab 3 tới registry bạn có quyền ghi, bật SBOM và max provenance, rồi gate sự hiện diện của hai attestation và lấy index digest bất biến.
+
+<details>
+<summary>Lời giải</summary>
+
+Đặt `IMAGE` thành repository thật và login registry tương ứng:
+
+```bash
+export IMAGE=ghcr.io/your-user/lab12:0.1
+docker login ghcr.io
+
+docker buildx create --name lab12-attest \
+  --driver docker-container --use --bootstrap
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --sbom=true \
+  --provenance=mode=max \
+  --tag "$IMAGE" \
+  --push \
+  -f Dockerfile.multi .
+
+docker buildx imagetools inspect "$IMAGE"
+
+docker buildx imagetools inspect "$IMAGE" \
+  --format '{{json .SBOM}}' > sbom.json
+docker buildx imagetools inspect "$IMAGE" \
+  --format '{{json .Provenance}}' > provenance.json
+
+grep -q '"SPDX"' sbom.json && echo "SBOM present"
+grep -q '"SLSA"' provenance.json && echo "provenance present"
+
+DIGEST=$(docker buildx imagetools inspect "$IMAGE" \
+  | awk '/^Digest:/ {print $2; exit}')
+echo "promote this immutable index: ${IMAGE%:*}@${DIGEST}"
+
+docker buildx rm lab12-attest
+```
+
+Hai lệnh `grep` chỉ là presence gate. Production còn phải verify signature/builder identity, source revision, materials, platform set và policy vulnerability/license trước khi promote digest.
+
+</details>
+
+---
+
+## Điểm chính
+
+- BuildKit giải Dockerfile thành LLB DAG content-addressed, có thể parallelize stage độc lập và bỏ stage không cần.
+- Bind/cache/secret/SSH mount cấp input theo **scope của một build operation**; chúng không tự trở thành image layer.
+- Cache mount tăng tốc nhưng build phải đúng với cache rỗng; external cache CI cần scope và quyền ghi rõ ràng.
+- Multi-platform image là OCI index trỏ tới manifest riêng cho từng platform. QEMU, native nodes và cross-compilation có failure mode khác nhau.
+- Tag thuận tiện nhưng mutable; digest bất biến. Index digest giữ nguyên tập platform của release.
+- SBOM mô tả thành phần; provenance mô tả cách build. Cả hai là input cho trust policy, không tự thay thế signature hay quyết định deploy.
+- Push registry hoặc containerd image store là đường giữ multi-platform result và attestations đáng tin cậy hơn classic `--load`.
+
+---
+
+## Tiếp theo
+
+**[Phần 13 — Compose at Scale: Config, Secrets, CI & Team Workflows](/blog/docker-13-compose-at-scale/)**: đưa artifact đã build tốt vào workflow nhiều môi trường — precedence, secrets/configs, merge/include, health gates, CI integration test và ranh giới nơi Compose nên dừng.
+
+---
+
+## Tài liệu chính thức
+
+- [Docker Build — BuildKit and LLB](https://docs.docker.com/build/buildkit/)
+- [Docker Build — Optimize cache usage](https://docs.docker.com/build/cache/optimize/)
+- [Docker Build — Cache storage backends](https://docs.docker.com/build/cache/backends/)
+- [Docker Build — Build secrets and SSH mounts](https://docs.docker.com/build/building/secrets/)
+- [Docker Build — Multi-platform builds](https://docs.docker.com/build/building/multi-platform/)
+- [Docker Buildx — `build` reference](https://docs.docker.com/reference/cli/docker/buildx/build/)
+- [Docker Buildx — Inspect registry manifests and attestations](https://docs.docker.com/reference/cli/docker/buildx/imagetools/inspect/)
+- [Docker Build — Build attestations](https://docs.docker.com/build/metadata/attestations/)
+- [Docker Build — SBOM attestations](https://docs.docker.com/build/metadata/attestations/sbom/)
+- [Docker Build — Provenance attestations](https://docs.docker.com/build/metadata/attestations/slsa-provenance/)
+- [Docker Build — Validating build inputs with policies](https://docs.docker.com/build/policies/)
+- [OCI Image Format Specification](https://github.com/opencontainers/image-spec)

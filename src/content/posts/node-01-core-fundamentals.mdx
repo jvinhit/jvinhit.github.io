@@ -1,48 +1,41 @@
 ---
-title: 'Node.js Super Senior · Phase 1 — Core Fundamentals'
-description: 'Phase 1: how Node really works (V8, libuv, bindings), the event loop phase-by-phase, the libuv thread pool, async from callbacks to async/await, ESM vs CommonJS, the core modules that matter, worker threads vs cluster, and memory.'
+title: 'Node.js Production Engineering 01 — V8, libuv và Event Loop'
+description: 'Hiểu đường đi của một tác vụ qua V8, libuv và event loop; từ đó kiểm soát concurrency, stream, worker thread, bộ nhớ và độ trễ production.'
 pubDate: 2026-06-09
-tags: [nodejs, event-loop, async, fundamentals, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, event-loop, async, runtime, production-engineering]
 series: nodejs
 seriesOrder: 1
 draft: false
 ---
 
-Chào mừng tới **Phase 1 của series 10 phase** (cộng các deep dive bonus) đưa bạn từ *gà mờ* thành **Super Senior Node.js backend developer**. Đây không phải chuyến dạo API — mà là con đường tới kỹ thuật *production-ready, đẳng cấp enterprise*. Mỗi phase đều thực hành và kết thúc bằng dự án thật.
+Một API có thể chỉ dùng 20% CPU nhưng vẫn timeout hàng loạt. Nguyên nhân thường không nằm ở "Node.js chậm", mà ở một callback giữ event loop quá lâu, một thread pool bị bão hòa, hoặc một batch bất đồng bộ mở nhiều công việc hơn dependency chịu được. Muốn chẩn đoán đúng, ta phải nhìn xuyên qua cú pháp `async/await` xuống runtime bên dưới.
 
-Ta dùng **Node.js 24 LTS** và **TypeScript** xuyên suốt. Phase 1 dài và quan trọng nhất: mọi thứ sau này — Express, database, auth, hiệu năng — chỉ là *các mẫu xây trên những primitive này*.
+Bài mở đầu xây mental model đó trên **Node.js 24 LTS** và TypeScript. Sau khi đọc, bạn có thể:
+
+- lần theo một tác vụ từ JavaScript qua V8, binding, libuv tới hệ điều hành;
+- dự đoán thứ tự callback, microtask, timer và I/O mà không học thuộc output;
+- phân biệt concurrency với parallelism, event loop với worker pool;
+- chọn Promise combinator, giới hạn concurrency, hủy công việc và stream dữ liệu đúng chỗ;
+- nhận diện các failure mode làm tăng p99 latency, bộ nhớ hoặc thời gian shutdown.
+
+**Kiến thức cần có:** JavaScript hiện đại, Promise và TypeScript cơ bản. Code minh họa giả định ESM; với project build ra JavaScript, hãy giữ `tsconfig` và runtime contract nhất quán.
 
 ---
 
-## Lộ trình
+## Lộ trình 20 phần
 
 ```text
-PHASE 1  → PHASE 2 → PHASE 3 → PHASE 4 → PHASE 5
-Core       HTTP      Express   Database  Auth
-
+01 Runtime → 02 HTTP → 03 Express → 04 Data Layer → 05 Security
       ↓
-
-PHASE 6  → PHASE 7 → PHASE 8 → PHASE 9 → PHASE 10
-Patterns   DevOps    Perf      Testing   Architecture
-
-      ↓  (bonus deep dives)
-
-PHASE 11 → PHASE 12 → PHASE 13
-PostgreSQL  Prisma     NestJS
+06 Patterns → 07 Delivery → 08 Performance → 09 Testing → 10 Architecture
+      ↓
+11 PostgreSQL → 12 Prisma → 13 Redis → 14 NestJS → 15 Identity
+      ↓
+16 Queues → 17 GraphQL → 18 Microservices/gRPC → 19 Realtime → 20 Observability
 ```
 
-1. event loop, async, core module (bạn đang ở đây).
-2. giao thức, server thô, khái niệm middleware.
-3. routing, middleware, xử lý lỗi.
-4. SQL & NoSQL, ORM, transaction.
-5. Passport, JWT, OAuth2, RBAC.
-6. DI, repository, caching, queue.
-7. Docker, PM2, CI/CD.
-8. profiling, tối ưu, clustering.
-9. unit, integration, E2E, coverage.
-10. clean architecture, microservices, CQRS, SOLID.
-
-Giờ là Phase 1.
+Series đi từ runtime và protocol tới data, security, delivery, distributed systems và observability. Mỗi phần trả lời ba câu hỏi: **hệ thống hoạt động thế nào, sẽ hỏng ở đâu, và chứng minh bản sửa bằng gì**. Bài này là nền để suy luận các phần còn lại.
 
 ---
 
@@ -70,7 +63,7 @@ Giờ là Phase 1.
    └─────────────────────────────────────────────┘
 ```
 
-Mô hình **đơn luồng, hướng sự kiện** là ý tưởng cốt lõi: thay vì một luồng OS mỗi request (mỗi luồng *chờ* I/O), Node chạy **một luồng chính không bao giờ chờ** — đẩy I/O chậm sang libuv, đăng ký callback, rồi lập tức sang việc kế.
+Mô hình **một luồng JavaScript, hướng sự kiện** là ý tưởng cốt lõi: thay vì giữ một luồng OS chờ cho mỗi request, Node đăng ký công việc I/O rồi để event loop tiếp tục phục vụ callback khác. Event loop có thể ngủ hiệu quả ở pha poll khi chưa có sự kiện; điều cần tránh là để **code JavaScript của ứng dụng** giữ luồng đó quá lâu.
 
 > "Đơn luồng" là nói về **JavaScript của bạn**. Bên dưới libuv vẫn giữ một pool nhỏ các luồng OS, và kernel làm I/O song song — nên Node xử lý hàng chục nghìn kết nối đồng thời trên một core.
 
@@ -78,7 +71,7 @@ Mô hình **đơn luồng, hướng sự kiện** là ý tưởng cốt lõi: th
 
 ## 2. Event loop, từng pha một
 
-Đây là chủ đề phỏng vấn senior được hỏi nhiều nhất, và là nguồn của mọi bug "sao nó in sai thứ tự?".
+Đây không chỉ là câu hỏi lý thuyết. Nó giải thích vì sao timer trễ, vì sao một callback CPU-bound kéo chậm mọi request, và vì sao cùng một đoạn code có thể đổi thứ tự giữa top-level và bên trong I/O callback.
 
 Sau khi Node chạy code đồng bộ top-level, libuv vào một vòng lặp với **các pha riêng biệt**, mỗi pha có hàng đợi callback riêng:
 
@@ -104,9 +97,11 @@ Sau khi Node chạy code đồng bộ top-level, libuv vào một vòng lặp v�
 └────────────────┘  loop again while there is work
 ```
 
-Pha bạn cần quan tâm nhất là **poll**: đây là nơi loop *đỗ lại* và chờ I/O hoàn tất. Nếu không còn việc, Node ngủ ở đây hiệu quả thay vì quay vòng tốn CPU.
+Sơ đồ trên là mental model ở mức ứng dụng, không phải đặc tả từng bước nội bộ. Từ libuv 1.45 (được Node.js 20+ sử dụng), timer được xử lý sau pha poll thay vì cả trước lẫn sau như các phiên bản cũ; vì vậy đừng dựa vào một sơ đồ cũ để cam kết thứ tự giữa `setTimeout(0)` và `setImmediate`.
 
-### Microtask: hàng đợi *giữa* các pha
+Pha bạn cần quan tâm nhất là **poll**: đây là nơi loop _đỗ lại_ và chờ I/O hoàn tất. Nếu không còn việc, Node ngủ ở đây hiệu quả thay vì quay vòng tốn CPU.
+
+### Microtask: hàng đợi _giữa_ các pha
 
 Promise **không** nằm trong các pha libuv kia. Chúng chạy trong hai hàng microtask mà Node rút cạn **sau mỗi callback** và giữa các pha:
 
@@ -135,23 +130,25 @@ console.log('6: sync end');
 // 3: setImmediate
 ```
 
-> thứ tự `setTimeout(fn, 0)` vs `setImmediate(fn)` ở top-level **không** đảm bảo (tùy thời điểm loop). Nhưng **bên trong một I/O callback**, `setImmediate` *luôn* chạy trước `setTimeout`, vì loop đã qua timers và tới check kế tiếp.
+> thứ tự `setTimeout(fn, 0)` vs `setImmediate(fn)` ở top-level **không** đảm bảo (tùy thời điểm loop). Nhưng **bên trong một I/O callback**, `setImmediate` _luôn_ chạy trước `setTimeout`, vì loop đã qua timers và tới check kế tiếp.
 
 ### `process.nextTick` là cái bẫy
 
-Vì nextTick rút cạn *hoàn toàn* trước khi loop tiếp tục, một `nextTick` đệ quy **bỏ đói event loop** — I/O không bao giờ tới lượt:
+Vì nextTick rút cạn _hoàn toàn_ trước khi loop tiếp tục, một `nextTick` đệ quy **bỏ đói event loop** — I/O không bao giờ tới lượt:
 
 ```ts
 // ❌ This freezes all I/O forever — the poll phase is never reached
-function loop() { process.nextTick(loop); }
+function loop() {
+  process.nextTick(loop);
+}
 loop();
 ```
 
-Quy tắc senior: ưu tiên `queueMicrotask` hoặc `setImmediate` cho "chạy sớm"; chỉ dùng `process.nextTick` cho trường hợp hẹp: cho caller gắn listener trước khi bạn emit.
+Khuyến nghị mặc định: ưu tiên `queueMicrotask` khi cần microtask theo chuẩn web, hoặc `setImmediate` khi muốn nhường event loop sang lượt kế. Chỉ dùng `process.nextTick` cho trường hợp tương thích API Node cần chạy trước khi event loop tiếp tục; không dùng nó để tạo vòng lặp công việc dài.
 
 ### Thread pool của libuv — phần người ta hay quên
 
-I/O mạng (socket TCP/HTTP) bất đồng bộ thật ở mức OS, nên dùng `epoll`/`kqueue` và **không** cần thread. Nhưng vài thao tác *không* có API async ở OS, nên libuv chạy chúng trên **thread pool** (mặc định **4** luồng):
+I/O mạng (socket TCP/HTTP) bất đồng bộ thật ở mức OS, nên dùng `epoll`/`kqueue` và **không** cần thread. Nhưng vài thao tác _không_ có API async ở OS, nên libuv chạy chúng trên **thread pool** (mặc định **4** luồng):
 
 - thao tác hệ thống tệp
 - `dns.lookup` (nhưng không phải `dns.resolve`)
@@ -163,11 +160,11 @@ I/O mạng (socket TCP/HTTP) bất đồng bộ thật ở mức OS, nên dùng 
 UV_THREADPOOL_SIZE=16 node server.js
 ```
 
-Hiểu biết senior: một `bcrypt.hash` chậm không chặn *event loop*, nhưng nó chiếm một *slot thread-pool* — chạy năm cái với pool bốn thì cái thứ năm phải xếp hàng.
+Một `bcrypt.hash` triển khai trên worker pool có thể không chặn event loop, nhưng vẫn chiếm một slot của pool dùng chung. Khi pool bão hòa, thao tác filesystem hoặc crypto khác phải xếp hàng; tăng `UV_THREADPOOL_SIZE` chỉ là một quyết định capacity cần load test, không phải bản sửa mặc định.
 
 ---
 
-## 3. Lập trình bất đồng bộ, kiểu senior
+## 3. Lập trình bất đồng bộ có kiểm soát
 
 ### Tiến hóa
 
@@ -178,14 +175,15 @@ import { readFile } from 'node:fs';
 
 readFile('a.txt', 'utf8', (err, a) => {
   if (err) return console.error(err);
-  readFile('b.txt', 'utf8', (err2, b) => {  // rightward drift begins...
+  readFile('b.txt', 'utf8', (err2, b) => {
+    // rightward drift begins...
     if (err2) return console.error(err2);
     // ...the abyss
   });
 });
 ```
 
-**Promise** là máy trạng thái ba trạng thái — *pending → fulfilled* hoặc *pending → rejected* — và chỉ settle một lần. **async/await** là cú pháp đường trên chúng, đọc như code đồng bộ mà vẫn non-blocking:
+**Promise** là máy trạng thái ba trạng thái — _pending → fulfilled_ hoặc _pending → rejected_ — và chỉ settle một lần. **async/await** là cú pháp đường trên chúng, đọc như code đồng bộ mà vẫn non-blocking:
 
 ```ts
 import { readFile } from 'node:fs/promises'; // the promise-based variant
@@ -232,21 +230,21 @@ const fastest = await Promise.any([fromCacheA(), fromCacheB()]);
 
 ### Kiểm soát đồng thời — đừng tự DoS dependency của mình
 
-`Promise.all` trên 10.000 item mở 10.000 kết nối cùng lúc và làm chảy DB. Senior giới hạn độ đồng thời:
+`Promise.all` trên 10.000 item có thể khởi tạo 10.000 lời gọi gần như cùng lúc và làm bão hòa DB. Hãy giới hạn concurrency theo capacity đã đo của dependency:
 
 ```ts
 /** Run an async mapper over items with a hard concurrency limit. */
 async function mapLimit<T, R>(
   items: readonly T[],
   limit: number,
-  fn: (item: T, index: number) => Promise<R>,
+  fn: (item: T, index: number) => Promise<R>
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let cursor = 0;
 
   async function worker(): Promise<void> {
     while (cursor < items.length) {
-      const index = cursor++;            // claim a slot atomically (single-threaded)
+      const index = cursor++; // claim a slot atomically (single-threaded)
       results[index] = await fn(items[index], index);
     }
   }
@@ -258,7 +256,9 @@ async function mapLimit<T, R>(
 }
 
 // 1000 URLs, at most 8 in flight at any moment
-const bodies = await mapLimit(urls, 8, (url) => fetch(url).then((r) => r.text()));
+const bodies = await mapLimit(urls, 8, (url) =>
+  fetch(url).then((r) => r.text())
+);
 ```
 
 ### Hủy & timeout với AbortController
@@ -272,7 +272,7 @@ const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
 // Combine your own cancel + a timeout
 const ac = new AbortController();
 const signal = AbortSignal.any([ac.signal, AbortSignal.timeout(10_000)]);
-button.onClick = () => ac.abort();          // cancel on user action
+button.onClick = () => ac.abort(); // cancel on user action
 const data = await fetch(url, { signal });
 ```
 
@@ -293,23 +293,26 @@ Hai lưới an toàn mức process — **log rồi thoát**, đừng nuốt lỗ
 ```ts
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled rejection:', reason);
-  process.exitCode = 1;           // let in-flight work drain, then exit non-zero
+  process.exitCode = 1; // let in-flight work drain, then exit non-zero
 });
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
-  process.exit(1);                // state is corrupt — exit hard, let the orchestrator restart
+  process.exit(1); // state is corrupt — exit hard, let the orchestrator restart
 });
 ```
 
 ### Context theo request với AsyncLocalStorage
 
-Một công cụ senior: mang request id / user qua chuỗi gọi async **mà không phải truyền qua từng tham số hàm**:
+`AsyncLocalStorage` mang request id hoặc trace context qua chuỗi gọi async **mà không phải truyền qua từng tham số hàm**:
 
 ```ts
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-interface RequestContext { requestId: string; userId?: string }
+interface RequestContext {
+  requestId: string;
+  userId?: string;
+}
 export const als = new AsyncLocalStorage<RequestContext>();
 
 // At the edge (e.g. an HTTP middleware):
@@ -326,15 +329,15 @@ function log(msg: string): void {
 
 ## 4. Module: ESM vs CommonJS
 
-Node hỗ trợ hai hệ, và bug senior trốn trong khác biệt của chúng.
+Node hỗ trợ hai hệ module; khác biệt resolution và interop giữa chúng là nguồn lỗi phổ biến khi đóng gói ứng dụng hoặc thư viện.
 
-| Khía cạnh | CommonJS (CJS)            | ES Modules (ESM)                    |
-| -------------------- | ------------------------- | ----------------------------------- |
-| Nhập | `const x = require('x')`  | `import x from 'x'`                 |
-| Xuất | `module.exports = …`      | `export` / `export default`        |
-| Tải | đồng bộ | bất đồng bộ |
-| `__dirname`          | có sẵn | use `import.meta.dirname` (Node 20+) |
-| Top-level `await`    | không | có |
+| Khía cạnh         | CommonJS (CJS)           | ES Modules (ESM)                     |
+| ----------------- | ------------------------ | ------------------------------------ |
+| Nhập              | `const x = require('x')` | `import x from 'x'`                  |
+| Xuất              | `module.exports = …`     | `export` / `export default`          |
+| Tải               | đồng bộ                  | bất đồng bộ                          |
+| `__dirname`       | có sẵn                   | use `import.meta.dirname` (Node 20+) |
+| Top-level `await` | không                    | có                                   |
 
 Chọn ESM cho dự án mới — đặt một lần trong `package.json`:
 
@@ -352,16 +355,16 @@ Chọn ESM cho dự án mới — đặt một lần trong `package.json`:
 // ESM essentials you'll use constantly
 import { readFile } from 'node:fs/promises';
 
-const here = import.meta.dirname;          // replaces __dirname
-const isMain = import.meta.url === `file://${process.argv[1]}`; // "run directly?"
+const here = import.meta.dirname; // replaces __dirname
+const isMain = import.meta.main; // Node.js 24: "run directly?"
 
 // Dynamic import — load on demand, or conditionally (returns a Promise)
 const { default: chalk } = await import('chalk');
 ```
 
-> Luôn dùng **tiền tố `node:`** cho built-in: nó resolve nhanh hơn và không bao giờ bị một package npm độc tên `fs` chiếm chỗ.
+> Nên dùng **tiền tố `node:`** cho built-in để biểu đạt rõ đây là module lõi và tránh nhầm với dependency có tên gần giống. Lợi ích chính là tính tường minh, không phải một cam kết tối ưu tốc độ resolution.
 
-Ghi chú TypeScript: Node 24 chạy `.ts` trực tiếp qua type-stripping, và `tsx` vẫn là trình chạy dev mượt nhất. Type-stripping bỏ type nhưng **không** biến đổi enum hay namespace — giữ code "có thể xóa type".
+Ghi chú TypeScript: Node.js 24 có thể chạy `.ts` chứa **erasable syntax** bằng type stripping. Runtime không type-check, không đọc `tsconfig.json`, không hỗ trợ `.tsx`, và không biến đổi cú pháp cần sinh JavaScript như `enum` hoặc parameter property. Dùng `tsx`/compiler khi dự án cần đầy đủ semantics TypeScript; dù chạy trực tiếp, CI vẫn phải chạy `tsc --noEmit`.
 
 ---
 
@@ -374,13 +377,13 @@ Thành thạo chúng và bạn phụ thuộc ít package npm hơn nhiều.
 ```ts
 import { readFile, writeFile, mkdir, readdir, stat } from 'node:fs/promises';
 
-await mkdir('data', { recursive: true });              // mkdir -p, no error if exists
+await mkdir('data', { recursive: true }); // mkdir -p, no error if exists
 await writeFile('data/out.txt', 'hello', 'utf8');
 const entries = await readdir('.', { withFileTypes: true }); // Dirent[] — has isDirectory()
-const info = await stat('data/out.txt');               // size, mtime, mode...
+const info = await stat('data/out.txt'); // size, mtime, mode...
 ```
 
-Ưu tiên `node:fs/promises` hơn bản sync — `readFileSync` chặn cả event loop. Và đừng *kiểm-tra-rồi-làm* (đua TOCTOU); cứ thử và xử lý mã lỗi:
+Ưu tiên `node:fs/promises` hơn bản sync — `readFileSync` chặn cả event loop. Và đừng _kiểm-tra-rồi-làm_ (đua TOCTOU); cứ thử và xử lý mã lỗi:
 
 ```ts
 // ❌ Race: the file can vanish between exists() and readFile()
@@ -389,8 +392,9 @@ async function readOrNull(path: string): Promise<string | null> {
   try {
     return await readFile(path, 'utf8');
   } catch (err) {
-    if (err instanceof Error && 'code' in err && err.code === 'ENOENT') return null;
-    throw err;                 // ENOENT = not found; anything else is a real problem
+    if (err instanceof Error && 'code' in err && err.code === 'ENOENT')
+      return null;
+    throw err; // ENOENT = not found; anything else is a real problem
   }
 }
 ```
@@ -402,9 +406,9 @@ import { join, resolve, basename, extname, parse } from 'node:path';
 import { cpus, tmpdir, homedir, platform } from 'node:os';
 
 join('data', 'cache', 'file.json'); // cross-platform separators (\ on Windows)
-extname('report.pdf');              // '.pdf'
-parse('/a/b/c.txt');               // { dir:'/a/b', base:'c.txt', name:'c', ext:'.txt' }
-cpus().length;                      // core count → size your worker/cluster pool
+extname('report.pdf'); // '.pdf'
+parse('/a/b/c.txt'); // { dir:'/a/b', base:'c.txt', name:'c', ext:'.txt' }
+cpus().length; // core count → size your worker/cluster pool
 ```
 
 ### `events` — mẫu EventEmitter
@@ -433,7 +437,7 @@ const [result] = await once(job, 'done');
 
 Đọc file 5 GB vào một `Buffer` giết process. Stream xử lý theo **chunk** với bộ nhớ phẳng. Có bốn loại: Readable (nguồn), Writable (đích), Duplex (cả hai), Transform (Duplex biến đổi, vd gzip).
 
-Công cụ senior là `pipeline`, nối stream và tự xử lý **backpressure** và dọn dẹp:
+Công cụ mặc định là `pipeline`, nối stream và phối hợp **backpressure**, error propagation cùng việc đóng các stream:
 
 ```ts
 import { pipeline } from 'node:stream/promises';
@@ -443,8 +447,8 @@ import { createGzip } from 'node:zlib';
 // Compress a file of ANY size using almost no memory
 await pipeline(
   createReadStream('big.log'),
-  createGzip(),                  // a Transform stream
-  createWriteStream('big.log.gz'),
+  createGzip(), // a Transform stream
+  createWriteStream('big.log.gz')
 );
 ```
 
@@ -468,11 +472,11 @@ const upper = new Transform({
 
 ```ts
 const buf = Buffer.from('café', 'utf8');
-console.log(buf.length);          // 5 — 'é' is 2 bytes in UTF-8, not 1
+console.log(buf.length); // 5 — 'é' is 2 bytes in UTF-8, not 1
 
 // ✅ Buffer.alloc zero-fills.  ❌ allocUnsafe reuses memory (may leak old data)
-const safe = Buffer.alloc(1024);          // zeroed, safe to send anywhere
-const fast = Buffer.allocUnsafe(1024);    // faster, but MUST fully overwrite first
+const safe = Buffer.alloc(1024); // zeroed, safe to send anywhere
+const fast = Buffer.allocUnsafe(1024); // faster, but MUST fully overwrite first
 ```
 
 ### `util`, `timers`, `crypto`, `process`
@@ -482,19 +486,22 @@ import { promisify, parseArgs, styleText } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { randomUUID, createHash } from 'node:crypto';
 
-await sleep(1000);                          // promise-based delay, no callback
-const id = randomUUID();                    // RFC 4122 v4 UUID
+await sleep(1000); // promise-based delay, no callback
+const id = randomUUID(); // RFC 4122 v4 UUID
 const digest = createHash('sha256').update('data').digest('hex');
 
 // Parse CLI flags without a dependency (Node 18.3+)
 const { values } = parseArgs({
-  options: { top: { type: 'string' }, verbose: { type: 'boolean', short: 'v' } },
+  options: {
+    top: { type: 'string' },
+    verbose: { type: 'boolean', short: 'v' },
+  },
 });
 
 // process — your window into the runtime
-process.argv;        // [node, script, ...args]
+process.argv; // [node, script, ...args]
 process.env.NODE_ENV;
-process.cwd();       // current working dir
+process.cwd(); // current working dir
 process.on('SIGTERM', () => server.close()); // graceful shutdown on orchestrator signal
 ```
 
@@ -502,10 +509,10 @@ process.on('SIGTERM', () => server.close()); // graceful shutdown on orchestrato
 
 ## 6. Đồng thời, song song, worker thread & cluster
 
-Một phân biệt mọi senior phải nói rõ:
+Một phân biệt cần nói rõ khi thiết kế capacity:
 
-- **Đồng thời** — *xử lý* nhiều việc bằng đan xen trên một luồng (mô hình I/O của event loop).
-- **Song song** — *thực thi* nhiều việc cùng một thời điểm trên nhiều core CPU.
+- **Đồng thời** — _xử lý_ nhiều việc bằng đan xen trên một luồng (mô hình I/O của event loop).
+- **Song song** — _thực thi_ nhiều việc cùng một thời điểm trên nhiều core CPU.
 
 Với **I/O**, concurrency của event loop là đủ. Với việc **nặng CPU** thật sự, một luồng chặn mọi thứ — đẩy sang **worker thread**:
 
@@ -521,7 +528,9 @@ import { Worker } from 'node:worker_threads';
 
 function runHeavy(input: unknown): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL('./worker.ts', import.meta.url), { workerData: input });
+    const worker = new Worker(new URL('./worker.ts', import.meta.url), {
+      workerData: input,
+    });
     worker.once('message', resolve);
     worker.once('error', reject);
     worker.once('exit', (code) => {
@@ -532,13 +541,13 @@ function runHeavy(input: unknown): Promise<unknown> {
 // The main event loop stays responsive while the worker crunches.
 ```
 
-Worker vs cluster: **worker thread** chia sẻ bộ nhớ và dành cho việc CPU *trong* một process. module **`cluster`** fork **cả process** chia sẻ cổng lắng nghe, để dùng hết core cho *throughput I/O* — dù production thường để PM2 / orchestrator làm thay.
+Worker vs cluster: **worker thread** chia sẻ bộ nhớ và dành cho việc CPU _trong_ một process. module **`cluster`** fork **cả process** chia sẻ cổng lắng nghe, để dùng hết core cho _throughput I/O_ — dù production thường để PM2 / orchestrator làm thay.
 
-> Phán đoán senior: worker thêm phức tạp thật (chi phí serialize, bộ nhớ mỗi isolate) — chỉ dùng cho nút thắt CPU *đã đo*, đừng dùng cho I/O.
+> Worker thêm chi phí khởi tạo, truyền dữ liệu và bộ nhớ cho mỗi isolate. Chỉ đưa công việc CPU-bound đã đo sang worker; với I/O bất đồng bộ, thêm worker thường không giải đúng bottleneck.
 
 ---
 
-## 7. Bộ nhớ & thu gom rác — điều senior theo dõi
+## 7. Bộ nhớ & thu gom rác trong production
 
 V8 quản lý bộ nhớ trong một **heap** chia thành **young generation** (vật thể ngắn hạn, gom thường xuyên và rẻ) và **old generation** (vật thể sống sót, gom hiếm nhưng đắt).
 
@@ -579,7 +588,32 @@ console.log(`took ${(performance.now() - t0).toFixed(1)}ms`);
 
 ---
 
-## 9. Dự án thực hành
+## 9. Failure modes và hợp đồng độ trễ
+
+Runtime chỉ hữu ích khi nối được với triệu chứng người dùng. Với frontend, một event loop bị giữ 400 ms không hiện ra dưới tên "event-loop bug"; nó hiện ra thành API timeout, skeleton kéo dài, thao tác bị retry hoặc WebSocket mất heartbeat. Vì vậy API contract cần quy định timeout, khả năng retry và request id thay vì để client tự đoán.
+
+| Failure mode                      | Dấu hiệu quan sát được                            | Cách xác nhận                                            | Hướng xử lý                                                          |
+| --------------------------------- | ------------------------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------- |
+| Callback CPU-bound giữ event loop | p99 tăng, event-loop delay tăng, CPU một core cao | CPU profile và `monitorEventLoopDelay`                   | chia nhỏ, tối ưu thuật toán hoặc chuyển sang worker pool riêng       |
+| libuv worker pool bão hòa         | `fs`, DNS hoặc crypto cùng chậm dù loop rảnh      | load test từng nhóm việc và đo thời gian xếp hàng        | giảm concurrency, tách workload; chỉ tăng pool sau khi đo            |
+| `Promise.all` không giới hạn      | dependency trả 429/timeout, socket và memory tăng | metric in-flight và error theo dependency                | semaphore/queue, backoff và deadline                                 |
+| Buffer/cache không giới hạn       | RSS tăng nhưng heap có thể không tăng tương ứng   | `process.memoryUsage()` và heap snapshot                 | stream, quota, TTL/LRU và backpressure                               |
+| Timer/listener giữ process sống   | deploy không shutdown hết deadline                | log active phase, kiểm tra handle trong môi trường debug | cleanup, `unref()` khi đúng semantics, graceful shutdown có deadline |
+
+### Chọn cơ chế thực thi
+
+| Công việc                    | Mặc định                               | Chuyển hướng khi                                        |
+| ---------------------------- | -------------------------------------- | ------------------------------------------------------- |
+| HTTP, database, socket       | I/O bất đồng bộ trên event loop        | dependency không có API async hoặc cần cô lập failure   |
+| Hash/parse/compress CPU nặng | worker thread hoặc process chuyên dụng | chi phí truyền dữ liệu lớn hơn lợi ích; benchmark trước |
+| File lớn                     | stream + `pipeline`                    | cần random access có giới hạn rõ                        |
+| Batch gọi API                | concurrency có giới hạn + deadline     | provider có batch API tốt hơn                           |
+
+Không có một con số concurrency đúng cho mọi hệ thống. Giá trị đó là một capacity decision: bắt đầu thấp, load test với latency/error budget của dependency, rồi tăng đến trước điểm p95/p99 xấu đi rõ rệt.
+
+---
+
+## 10. Dự án thực hành
 
 Dựng cả ba — đây là cách khái niệm thấm vào.
 
@@ -589,23 +623,44 @@ Dựng cả ba — đây là cách khái niệm thấm vào.
 
 3. Logger dựa trên EventEmitter: `class Logger extends EventEmitter` phát `log`/`error`; một listener ghi JSON ra file qua writable stream, một listener in console. Chứng minh điều gì xảy ra khi `'error'` không có listener.
 
-Bài tập thêm: dự đoán output script trộn `setTimeout`/`setImmediate`/`Promise`/`nextTick` (top-level *và* trong I/O callback); chuyển API callback sang async/await bằng `promisify`; đẩy vòng hash nặng CPU sang worker thread và xác nhận loop chính vẫn phản hồi; viết `mapLimit` và chứng minh nó không vượt giới hạn.
+Bài tập thêm: dự đoán output script trộn `setTimeout`/`setImmediate`/`Promise`/`nextTick` (top-level _và_ trong I/O callback); chuyển API callback sang async/await bằng `promisify`; đẩy vòng hash nặng CPU sang worker thread và xác nhận loop chính vẫn phản hồi; viết `mapLimit` và chứng minh nó không vượt giới hạn.
+
+**Tiêu chí hoàn thành:** mỗi project có lệnh chạy, test cho happy path và failure path, log thời gian xử lý, và một README ngắn giải thích vì sao chọn event loop, stream hay worker. Với bài `mapLimit`, test phải ghi nhận số tác vụ in-flight lớn nhất và chứng minh nó không vượt `limit`.
 
 ---
 
-## 10. Checklist senior
+## 11. Checklist trước khi ship
 
 - Giải thích được các pha event loop và vị trí của Promise/`nextTick`.
-- Không bao giờ chặn loop.
+- Không chạy tác vụ CPU dài hoặc API đồng bộ trong request path; nếu có ngoại lệ, phải đo duration và cô lập tác động.
 - Mặc định `Promise.all`, nhưng giới hạn đồng thời cho batch lớn.
 - Hủy bằng `AbortSignal` và không nuốt lỗi.
 - Stream dữ liệu lớn và dọn mọi timer/listener.
-- Chỉ dùng worker thread cho việc CPU *đã đo*.
+- Chỉ dùng worker thread cho việc CPU _đã đo_.
+
+## Nếu chỉ nhớ năm điều
+
+- JavaScript chạy trên một luồng chính; network I/O không đồng nghĩa với một thread cho mỗi request.
+- Microtask được rút trước khi event loop sang công việc kế, nên một chuỗi microtask vô hạn cũng có thể gây starvation.
+- Event loop và worker pool là hai tài nguyên khác nhau; phải đo cả hai.
+- Concurrency không giới hạn chỉ chuyển bottleneck sang database hoặc dịch vụ khác.
+- Stream, deadline, cancellation và cleanup là phần của correctness, không phải tối ưu thêm sau.
 
 ---
 
 ## Phần tiếp theo
 
-Giờ bạn nắm nền tảng mà mọi senior suy luận từ đó: Node được dựng thế nào, event loop và microtask, thread pool libuv, bộ công cụ async đầy đủ, module, core module, và mô hình bộ nhớ.
+Giờ bạn có mental model để suy luận thay vì học thuộc: Node được dựng thế nào, event loop và microtask phối hợp ra sao, worker pool bị bão hòa như thế nào, và khi nào dùng stream hoặc worker thread.
 
 Ở **Phase 2**, ta lên một tầng tới **HTTP & nền tảng web** — giao thức chuyên sâu, dựng server Node.js thô không framework, parse request (kể cả upload file và body streaming), tự routing, và khám phá khái niệm middleware từ gốc.
+
+Đọc tiếp: [HTTP từ Wire đến API Contract](/blog/node-02-http-and-web-fundamentals/).
+
+## Tài liệu chính thức
+
+- [Node.js: The event loop, timers and `nextTick`](https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick)
+- [Node.js: Don't block the event loop or worker pool](https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop)
+- [Node.js 24: Modules — TypeScript](https://nodejs.org/download/release/latest-v24.x/docs/api/typescript.html)
+- [Node.js 24: ECMAScript modules](https://nodejs.org/download/release/latest-v24.x/docs/api/esm.html)
+- [Node.js 24: Streams API](https://nodejs.org/download/release/latest-v24.x/docs/api/stream.html)
+- [libuv: Thread pool work scheduling](https://docs.libuv.org/en/v1.x/threadpool.html)

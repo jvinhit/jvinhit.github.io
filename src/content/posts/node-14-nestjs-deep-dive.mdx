@@ -1,264 +1,586 @@
 ---
-title: 'Node.js Super Senior · Phase 14 — NestJS Deep Dive'
-description: 'Bonus Phase 14: master NestJS — modules, controllers, providers and DI, DTO validation, guards and role-based auth, interceptors, exception filters, the request lifecycle, Prisma, config, queues, and testing.'
+title: 'Node.js Production Engineering 14 — NestJS dưới Góc nhìn Kiến trúc'
+description: 'Thiết kế NestJS 11 như một runtime kiến trúc: module boundary, DI scope, request lifecycle, validation, policy guard, interceptor, error contract, Prisma 7, testing và graceful shutdown.'
 pubDate: 2026-06-10
-tags: [nodejs, nestjs, architecture, typescript, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, nestjs, architecture, typescript, production-engineering]
 series: nodejs
 seriesOrder: 14
 draft: false
 ---
 
-Đây là **Bonus Phase 14**. Bạn lưu trữ được (Phase 11–12) và tăng tốc với Redis (Phase 13); giờ ta cho tất cả một cấu trúc. Suốt series bạn tự dựng pipeline middleware, DI container, kiến trúc phân tầng, validation, guard, và error handler. **NestJS** là điều xảy ra khi các mẫu đó được chính thức hóa thành một framework có chủ kiến, đầy đủ pin. Vì bạn hiểu nền tảng bên dưới, Nest sẽ như *đặt tên cho thứ bạn đã biết*.
+Một codebase NestJS có thể có đủ module, controller, service và decorator nhưng vẫn là một khối coupling lớn: module import vòng tròn, `forwardRef()` khắp nơi, business rule nằm trong guard và request-scoped provider làm latency tăng mà không ai biết.
 
-Nest ưu tiên TypeScript, **ưu tiên dependency injection**, và chạy trên Express (hoặc Fastify) bên dưới.
+NestJS giải quyết **wiring và lifecycle**. Framework không tự tìm bounded context, transaction boundary hay ownership của dữ liệu. Bài này đọc NestJS 11 như một runtime kiến trúc để những cơ chế của framework phục vụ thiết kế, thay vì trở thành thiết kế.
+
+Sau bài này, bạn có thể:
+
+- dùng module như explicit boundary và composition root;
+- chọn provider scope dựa trên lifetime/cost;
+- giải thích chính xác request lifecycle;
+- đặt validation, authentication, authorization, transaction và error mapping đúng tầng;
+- tích hợp Prisma 7 mà không tạo nhiều pool hoặc rò connection;
+- test use case qua port, test HTTP qua module thật;
+- shutdown có readiness/drain và telemetry đầy đủ.
+
+> Baseline: NestJS 11, Node.js 24 LTS, TypeScript và Prisma 7. NestJS 11 dùng Express 5 theo mặc định; route syntax và một số behavior khác NestJS 10/Express 4, vì vậy luôn đọc migration guide khi nâng major.
 
 ---
 
-## Vì sao cần framework như Nest
-
-Express thô cho tự do và không cấu trúc — mỗi team tự bịa folder, DI, quy ước. Nest cung cấp **kiến trúc chuẩn** và một **DI container** thật, nên team lớn build nhất quán và test được.
-
-```bash
-npm i -g @nestjs/cli
-nest new my-api
-nest g resource users    # scaffolds module + controller + service + DTOs + tests
-```
-
----
-
-## Các khối xây dựng
+## Mental model: Nest là ba hệ thống chồng lên nhau
 
 ```text
-Module ── groups a feature (imports, controllers, providers, exports)
-  ├── Controller ── HTTP layer: routes, params (thin — like Phase 3)
-  └── Provider/Service ── business logic, injected via DI (Phase 6)
+compile/startup
+  module graph → provider graph → singleton construction
+
+request
+  adapter → middleware → guards → interceptors(in)
+          → pipes → controller → application service
+          → interceptors(out) → adapter
+
+shutdown
+  signal → readiness off → HTTP drain → lifecycle hooks → process exit
 ```
 
-### Module
+Ba trục này tạo ra ba loại lỗi khác nhau:
 
-Module ráp một feature; `AppModule` là gốc:
+- **graph lỗi**: circular dependency, provider không export/import đúng, token trùng;
+- **request lỗi**: guard/pipe/interceptor sai thứ tự hoặc xử lý nhầm concern;
+- **lifetime lỗi**: request scope lan truyền, resource không đóng, shutdown mất job/trace.
+
+---
+
+## Module là boundary, không phải folder gom file
+
+Một cấu trúc theo capability giúp ownership rõ hơn cấu trúc chỉ theo technical layer:
+
+```text
+src/modules/orders/
+├── domain/           # entity, value object, invariant; không import Nest
+├── application/      # use case + port
+├── infrastructure/   # Prisma repository, broker adapter
+├── presentation/     # controller, DTO, guard binding
+└── orders.module.ts  # composition root của capability
+```
+
+Module chỉ export thứ capability khác thực sự được phép dùng:
 
 ```ts
+// application/order-repository.port.ts
+export const ORDER_REPOSITORY = Symbol('ORDER_REPOSITORY');
+
+export interface OrderRepository {
+  findById(id: string): Promise<Order | null>;
+  save(order: Order): Promise<void>;
+}
+```
+
+```ts
+// application/place-order.use-case.ts
+import { Inject, Injectable } from '@nestjs/common';
+
+@Injectable()
+export class PlaceOrder {
+  constructor(
+    @Inject(ORDER_REPOSITORY)
+    private readonly orders: OrderRepository
+  ) {}
+
+  async execute(command: PlaceOrderCommand): Promise<PlacedOrder> {
+    const order = Order.place(command); // domain giữ invariant
+    await this.orders.save(order);
+    return { id: order.id, status: order.status };
+  }
+}
+```
+
+```ts
+// orders.module.ts
 import { Module } from '@nestjs/common';
 
 @Module({
-  imports: [PrismaModule],        // other modules this one depends on
-  controllers: [UsersController],
-  providers: [UsersService],
-  exports: [UsersService],        // make UsersService available to importing modules
+  imports: [DatabaseModule],
+  controllers: [OrdersController],
+  providers: [
+    PlaceOrder,
+    { provide: ORDER_REPOSITORY, useClass: PrismaOrderRepository },
+  ],
+  exports: [PlaceOrder],
 })
-export class UsersModule {}
+export class OrdersModule {}
 ```
 
-### Controller — tầng HTTP mỏng
+Decorator `@Injectable()` làm application service biết DI container của Nest. Đây là trade-off thực dụng. Nếu application core phải chạy độc lập khỏi Nest, bỏ decorator và tạo factory/provider ở module; đừng tuyên bố “framework-agnostic” khi source vẫn import framework.
+
+### Invariant của module graph
+
+- domain không import presentation/infrastructure;
+- module A không đọc table/private provider của module B;
+- cross-module call đi qua exported use case/port hoặc event contract;
+- một provider có một owner module rõ ràng;
+- `@Global()` là ngoại lệ cho capability thật sự toàn cục như config/telemetry, không phải cách tránh import.
+
+`forwardRef()` có thể tháo một vòng lặp kỹ thuật, nhưng nhiều `forwardRef()` thường báo boundary sai. Tách contract, đổi chiều dependency hoặc dùng domain event trước khi chấp nhận vòng tròn.
+
+---
+
+## Provider scope là quyết định hiệu năng
+
+| Scope               | Lifetime                 | Dùng cho                        | Rủi ro                                  |
+| ------------------- | ------------------------ | ------------------------------- | --------------------------------------- |
+| Singleton (default) | một instance/application | stateless service, pool, config | không giữ mutable request state         |
+| Request             | một instance/request     | dependency thực sự gắn request  | allocation tăng; scope lan lên consumer |
+| Transient           | mỗi lần inject           | object có state ngắn            | khó quan sát số instance                |
+
+Default singleton phù hợp cho phần lớn service. `PrismaClient`, Redis client và SDK connection phải là singleton/process.
+
+Không dùng request scope chỉ để lấy request id. `AsyncLocalStorage` hoặc OpenTelemetry context thường rẻ và ít làm provider graph “bubbling” thành request-scoped hơn.
 
 ```ts
-import { Controller, Get, Post, Param, Query, Body, HttpCode } from '@nestjs/common';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { Injectable } from '@nestjs/common';
 
-@Controller('users')                          // route prefix /users
-export class UsersController {
-  constructor(private readonly users: UsersService) {} // injected by DI
+interface RequestContext {
+  requestId: string;
+  traceId?: string;
+}
 
-  @Get()
-  findAll(@Query('page') page = '1') { return this.users.findAll(Number(page)); }
+@Injectable()
+export class RequestContextStore {
+  private readonly storage = new AsyncLocalStorage<RequestContext>();
 
-  @Get(':id')
-  findOne(@Param('id') id: string) { return this.users.findOne(id); } // 404 thrown in service
+  run<T>(context: RequestContext, callback: () => T): T {
+    return this.storage.run(context, callback);
+  }
+
+  get(): RequestContext | undefined {
+    return this.storage.getStore();
+  }
+}
+```
+
+Context id từ client phải được validate độ dài/ký tự hoặc thay bằng UUID mới để tránh log injection và cardinality không kiểm soát.
+
+---
+
+## Request lifecycle: đặt concern đúng chỗ
+
+Thứ tự tổng quát của Nest:
+
+```text
+1. middleware
+2. guards
+3. interceptors — trước controller
+4. pipes
+5. controller
+6. service/use case
+7. interceptors — sau controller, theo thứ tự ngược
+8. exception filters khi có exception chưa được bắt
+9. response adapter
+```
+
+Ánh xạ concern:
+
+| Concern                                   | Primitive phù hợp          |
+| ----------------------------------------- | -------------------------- |
+| request id, raw header normalization      | middleware/interceptor     |
+| authentication/authorization              | guard                      |
+| parse + validate DTO/parameter            | pipe                       |
+| timing, tracing, response envelope, cache | interceptor                |
+| HTTP error serialization                  | exception filter           |
+| business invariant                        | domain/application service |
+
+Guard không nên parse body business phức tạp; pipe không nên query database để authorize; interceptor không nên nuốt exception rồi trả `200`.
+
+---
+
+## Controller mỏng và DTO runtime rõ ràng
+
+```ts
+import { Body, Controller, HttpCode, Param, Post } from '@nestjs/common';
+import { IsArray, IsInt, IsString, Min, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
+
+class OrderLineDto {
+  @IsString()
+  productId!: string;
+
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  quantity!: number;
+}
+
+class PlaceOrderDto {
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => OrderLineDto)
+  lines!: OrderLineDto[];
+}
+
+@Controller('orders')
+export class OrdersController {
+  constructor(private readonly placeOrder: PlaceOrder) {}
 
   @Post()
   @HttpCode(201)
-  create(@Body() dto: CreateUserDto) { return this.users.create(dto); }
-}
-```
-
-Để ý cái biến mất so với Phase 3: không `res.status().json()` tay, không đấu router — decorator khai báo route và Nest serialize giá trị trả.
-
-### Provider & DI
-
-`@Injectable()` đánh dấu một class mà container có thể tạo và tiêm:
-
-```ts
-import { Injectable, NotFoundException } from '@nestjs/common';
-
-@Injectable()
-export class UsersService {
-  constructor(private readonly prisma: PrismaService) {} // constructor injection
-
-  findAll(page: number) { return this.prisma.user.findMany({ skip: (page - 1) * 20, take: 20 }); }
-
-  async findOne(id: string) {
-    const user = await this.prisma.user.findUnique({ where: { id } });
-    if (!user) throw new NotFoundException('User not found'); // → automatic 404
-    return user;
+  create(@Body() dto: PlaceOrderDto) {
+    return this.placeOrder.execute({ lines: dto.lines });
   }
 }
 ```
 
-Đây là **mẫu repository + service (Phase 6)** và **đảo ngược phụ thuộc (Phase 10)**, giờ được framework thực thi. Provider tùy biến và **scope** hoạt động đúng như container bạn đã dựng.
+Global validation:
+
+```ts
+app.useGlobalPipes(
+  new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+    transformOptions: { enableImplicitConversion: false },
+    stopAtFirstError: false,
+  })
+);
+```
+
+DTO phải là class vì validation cần runtime metadata; TypeScript interface biến mất khi compile. `transform: true` không có nghĩa mọi coercion đều an toàn: dùng `@Type` rõ ràng, giới hạn array/string/number và vẫn validate domain invariant trong use case.
+
+Không trả entity/Prisma model trực tiếp. Response DTO/view model ngăn vô tình lộ `passwordHash`, field nội bộ hoặc thay contract khi schema đổi.
 
 ---
 
-## DTO & validation
+## Authentication và authorization là hai guard khác nhau
 
-Một **DTO** định nghĩa hình dạng dữ liệu đến; `ValidationPipe` toàn cục validate và biến đổi:
+Authentication tạo principal hoặc trả `401`. Authorization đánh giá principal trên resource/policy và trả `403` hoặc `404` theo disclosure policy.
 
 ```ts
-import { IsEmail, IsString, MinLength } from 'class-validator';
+export interface Principal {
+  subject: string;
+  tenantId: string;
+  permissions: ReadonlySet<string>;
+}
 
-export class CreateUserDto {
-  @IsEmail() email!: string;
-  @IsString() @MinLength(8) password!: string;
+@Injectable()
+export class AccessTokenGuard implements CanActivate {
+  constructor(private readonly verifier: AccessTokenVerifier) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const request = context
+      .switchToHttp()
+      .getRequest<Request & { principal?: Principal }>();
+    const token = readBearerToken(request.headers.authorization);
+    if (!token) throw new UnauthorizedException();
+
+    request.principal = await this.verifier.verify(token).catch(() => {
+      throw new UnauthorizedException();
+    });
+    return true;
+  }
 }
 ```
 
 ```ts
-// main.ts — turn it on globally, and strip unknown fields
-app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+export const REQUIRE_PERMISSION = 'require_permission';
+export const RequirePermission = (permission: string) =>
+  SetMetadata(REQUIRE_PERMISSION, permission);
+
+@Injectable()
+export class PermissionGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const permission = this.reflector.getAllAndOverride<string>(
+      REQUIRE_PERMISSION,
+      [context.getHandler(), context.getClass()]
+    );
+    if (!permission) return true;
+
+    const request = context
+      .switchToHttp()
+      .getRequest<{ principal?: Principal }>();
+    if (!request.principal) throw new UnauthorizedException();
+    if (!request.principal.permissions.has(permission))
+      throw new ForbiddenException();
+    return true;
+  }
+}
 ```
 
-`whitelist: true` bỏ thuộc tính không có trong DTO; `transform: true` ép payload về class DTO và kiểu nguyên thủy. Ưu tiên **nestjs-zod** nếu muốn Zod làm nguồn sự thật duy nhất.
+Permission route-level chưa đủ cho ownership/tenant isolation. Repository query phải scope theo `tenantId`/owner hoặc policy service phải kiểm resource. Không nhận `tenantId` từ body rồi tin nó.
+
+Global guard dùng `APP_GUARD` để vẫn tham gia DI; route public cần metadata explicit và được security test.
 
 ---
 
-## Vòng đời request — pipeline của Nest
+## Interceptor cho cross-cutting behavior có giới hạn
 
-Đây là pipeline middleware Phase 2/3, chính thức hóa thành các giai đoạn có tên, có thứ tự:
+```ts
+@Injectable()
+export class MetricsInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const request = context.switchToHttp().getRequest<Request>();
+    const response = context.switchToHttp().getResponse<Response>();
+    const started = performance.now();
+
+    return next.handle().pipe(
+      finalize(() => {
+        httpDuration.observe(
+          {
+            method: request.method,
+            route: request.route?.path ?? 'unmatched',
+            status_class: `${Math.floor(response.statusCode / 100)}xx`,
+          },
+          (performance.now() - started) / 1_000
+        );
+      })
+    );
+  }
+}
+```
+
+Không label metric bằng raw URL, user id hay order id. Interceptor response cache chỉ dành cho query an toàn và phải hiểu auth/tenant/freshness; cache một response cá nhân theo URL chung là data leak.
+
+RxJS observable đi ra interceptor theo thứ tự LIFO. Nếu team không quen RxJS, giữ interceptor nhỏ và test error/cancellation path thay vì xây business workflow trong operator chain.
+
+---
+
+## Error contract: map domain error một lần
+
+```ts
+export class DomainError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    options?: ErrorOptions
+  ) {
+    super(message, options);
+  }
+}
+
+@Catch(DomainError)
+export class DomainErrorFilter implements ExceptionFilter {
+  catch(error: DomainError, host: ArgumentsHost): void {
+    const response = host.switchToHttp().getResponse<Response>();
+    const mapping = domainErrorToHttp(error.code);
+
+    response.status(mapping.status).json({
+      error: {
+        code: error.code,
+        message: mapping.publicMessage,
+      },
+    });
+  }
+}
+```
+
+Giữ code ổn định cho client; message có thể đổi/ngôn ngữ hóa. Unknown error phải log nguyên cause/stack ở server nhưng trả `500` chung. Không biến mọi exception thành `400`, không lộ SQL/Prisma/JWT detail.
+
+Filter route/controller chạy trước filter global và một exception đã được filter bắt không tự đi tiếp qua filter khác. Tránh nhiều filter chồng responsibility không rõ.
+
+---
+
+## Prisma 7 trong Nest: một pool, lifecycle rõ
+
+```ts
+import {
+  Injectable,
+  OnApplicationShutdown,
+  OnModuleInit,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { PrismaClient } from '../generated/prisma/client.js';
+
+@Injectable()
+export class PrismaService
+  extends PrismaClient
+  implements OnModuleInit, OnApplicationShutdown
+{
+  constructor(config: ConfigService) {
+    const connectionString = config.getOrThrow<string>('DATABASE_URL');
+    const adapter = new PrismaPg({
+      connectionString,
+      max: 10,
+      connectionTimeoutMillis: 5_000,
+    });
+    super({ adapter });
+  }
+
+  async onModuleInit(): Promise<void> {
+    await this.$connect();
+  }
+
+  async onApplicationShutdown(): Promise<void> {
+    await this.$disconnect();
+  }
+}
+```
+
+```ts
+@Global()
+@Module({
+  providers: [PrismaService],
+  exports: [PrismaService],
+})
+export class DatabaseModule {}
+```
+
+Chỉ global hóa database adapter khi team chấp nhận coupling đó; kiến trúc chặt hơn có thể chỉ inject repository port vào capability module.
+
+Transaction boundary thuộc use case, không thuộc controller và không bị chia nhỏ qua nhiều repository tự mở transaction. External publish/email đi qua outbox như phần 11–12.
+
+---
+
+## Bootstrap, health và shutdown
+
+```ts
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+
+  app.enableShutdownHooks();
+  app.setGlobalPrefix('api');
+  app.useLogger(app.get(AppLogger));
+  app.useGlobalPipes(productionValidationPipe());
+
+  await app.listen(process.env.PORT ?? 3000);
+}
+```
+
+Shutdown production không chỉ gọi `app.close()`:
 
 ```text
-request
-  ▼
-Middleware ─▶ Guards ─▶ Interceptors(pre) ─▶ Pipes ─▶ Handler
-                                                          │
-response ◄── Interceptors(post) ◄─────────────────────────┘
-  ▲
-Exception Filter  (catches anything thrown anywhere above)
+SIGTERM
+  → readiness=false
+  → load balancer ngừng route
+  → HTTP server ngừng nhận mới, drain in-flight
+  → worker/subscriber ngừng nhận mới và drain
+  → Prisma/Redis/telemetry flush + close
+  → exit trước orchestrator deadline
 ```
 
-### Guard — phân quyền
-
-Guard trả true/false để cho qua — hợp cho auth và RBAC (Phase 5):
-
-```ts
-import { Injectable, CanActivate, ExecutionContext } from '@nestjs/common';
-import { Reflector } from '@nestjs/core';
-
-@Injectable()
-export class RolesGuard implements CanActivate {
-  constructor(private readonly reflector: Reflector) {}
-  canActivate(ctx: ExecutionContext): boolean {
-    const required = this.reflector.get<string[]>('roles', ctx.getHandler());
-    if (!required) return true;
-    const { user } = ctx.switchToHttp().getRequest();
-    return required.includes(user?.role);   // false → automatic 403
-  }
-}
-```
-
-```ts
-// A custom @Roles('admin') decorator attaches metadata the guard reads
-export const Roles = (...roles: string[]) => SetMetadata('roles', roles);
-
-@Post() @Roles('admin') @UseGuards(JwtAuthGuard, RolesGuard)
-remove(@Param('id') id: string) { /* ... */ }
-```
-
-### Interceptor — bọc handler
-
-Interceptor chạy trước *và* sau handler — lý tưởng cho định hình response, log, đo thời gian, cache:
-
-```ts
-@Injectable()
-export class TransformInterceptor implements NestInterceptor {
-  intercept(_ctx: ExecutionContext, next: CallHandler): Observable<unknown> {
-    return next.handle().pipe(map((data) => ({ data, timestamp: Date.now() })));
-  }
-}
-```
-
-### Exception filter — lỗi tập trung
-
-Họ `HttpException` sẵn có lo phần lớn; một filter tùy biến hình dạng response (error handler toàn cục Phase 3, chính thức hóa):
-
-```ts
-@Catch()
-export class AllExceptionsFilter implements ExceptionFilter {
-  catch(exception: unknown, host: ArgumentsHost) {
-    const res = host.switchToHttp().getResponse();
-    const status = exception instanceof HttpException ? exception.getStatus() : 500;
-    res.status(status).json({ error: { status, message: /* ... */ '' } });
-  }
-}
-```
+Liveness phải rẻ và không phụ thuộc database. Readiness có thể phản ánh dependency bắt buộc nhưng cần timeout/cache để probe không tự DDoS database. Thêm startup probe cho app migration/warm-up lâu.
 
 ---
 
-## Database, config & việc async
+## Express hay Fastify adapter
 
-Bọc `PrismaClient` trong một provider tiêm được và export từ một module:
+Nest tách phần lớn API khỏi HTTP platform, nhưng không phải mọi package đều portable:
 
-```ts
-@Injectable()
-export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
-  async onModuleInit() { await this.$connect(); }
-  async onModuleDestroy() { await this.$disconnect(); } // graceful shutdown (Phase 7)
-}
-```
+- middleware nhận `Request`/`Response` Express;
+- file upload, compression, raw body, streaming;
+- plugin lifecycle và error behavior;
+- benchmark phụ thuộc route/payload/plugin chứ không chỉ adapter.
 
-Các module chính thức ánh xạ thẳng vào các phase trước: `@nestjs/config` ....
-
-> Nest cũng có transport **microservices** hạng nhất và **GraphQL** — các kiến trúc Phase 10, dựng sẵn.
+Chọn Fastify khi workload và ecosystem phù hợp, sau benchmark đại diện. Nếu code gọi trực tiếp `res` của Express ở controller, migration adapter không còn là thay một dòng config.
 
 ---
 
-## Kiểm thử
+## Testing theo boundary
 
-DI của Nest khiến test dễ — đổi provider thật bằng mock qua testing module:
+Unit test use case qua port fake, không boot cả Nest application:
 
 ```ts
-import { Test } from '@nestjs/testing';
+describe('PlaceOrder', () => {
+  it('persists an order that satisfies domain invariants', async () => {
+    const orders: OrderRepository = {
+      findById: vi.fn(),
+      save: vi.fn(),
+    };
+    const useCase = new PlaceOrder(orders);
 
+    const result = await useCase.execute(validCommand());
+
+    expect(result.status).toBe('PLACED');
+    expect(orders.save).toHaveBeenCalledOnce();
+  });
+});
+```
+
+Integration test kiểm DI graph và override adapter:
+
+```ts
 const moduleRef = await Test.createTestingModule({
-  providers: [
-    UsersService,
-    { provide: PrismaService, useValue: mockPrisma }, // inject a fake
-  ],
-}).compile();
-
-const service = moduleRef.get(UsersService);
+  imports: [OrdersModule],
+})
+  .overrideProvider(ORDER_REPOSITORY)
+  .useValue(fakeOrderRepository)
+  .compile();
 ```
 
-Cho end-to-end, khởi động app và lái bằng **supertest**, lý tưởng với Postgres Testcontainers.
+E2E test boot app thật với cùng global pipe/guard/filter như production, dùng PostgreSQL/Redis disposable. Đừng tạo test app thiếu global config rồi kết luận production route đã được bảo vệ.
+
+Các contract cần test:
+
+- DTO thừa field bị từ chối;
+- unauthenticated là `401`, thiếu quyền là `403`/policy `404`;
+- tenant A không đọc resource tenant B;
+- domain error map đúng code/status;
+- unknown error không lộ stack;
+- shutdown hoàn tất in-flight request và đóng resource.
 
 ---
 
-## Nest vs Express thô — chọn lựa
+## Failure modes và trade-off
 
-| | Express (Phase 3) | NestJS |
-|---|---|---|
-| Cấu trúc | you decide | enforced, standard |
-| DI | bring your own | built-in |
-| Mã khuôn | minimal | more upfront |
-| Hợp cho | small/bespoke services | large teams, long-lived apps |
+| Failure mode              | Dấu hiệu                              | Cách xử lý                        |
+| ------------------------- | ------------------------------------- | --------------------------------- |
+| fat controller/service    | HTTP, SQL, rule trộn cùng file        | use case + port theo capability   |
+| circular module           | nhiều `forwardRef()`                  | sửa dependency direction/boundary |
+| request-scope cascade     | allocation/latency tăng               | singleton + ALS/context           |
+| global everything         | test/coupling khó thấy                | explicit import/export            |
+| guard chỉ kiểm role       | IDOR/tenant leak                      | resource policy + scoped query    |
+| filter nuốt unknown error | mất signal, trả sai status            | map known error, log unknown      |
+| decorator che side effect | transaction/cache khó thấy            | explicit use case orchestration   |
+| test chỉ mock             | graph/config/migration lỗi khi deploy | integration + E2E disposable deps |
 
-Quan điểm senior: dùng Nest khi **quy mô team và tuổi thọ** xứng với cấu trúc; service nhỏ tập trung có thể vui hơn với Express/Fastify thuần.
-
----
-
-## Thực hành
-
-Dựng lại capstone Phase 10 **trên NestJS**, tái dùng tất cả:
-
-1. module feature với controller + service + DTO.
-2. provider `PrismaService` + schema Phase 12; migration trong CI.
-3. auth JWT, `RolesGuard`, decorator `@Roles`.
-4. `ValidationPipe` toàn cục, `TransformInterceptor`, và exception filter.
-5. queue BullMQ cho email, docs Swagger, và test unit + e2e.
-6. đóng gói Docker và ship qua pipeline Phase 7.
+Nest phù hợp khi team cần convention, DI, lifecycle và ecosystem thống nhất. Với service nhỏ hoặc team ưu tiên explicit functions/minimal abstraction, Fastify/Express/Hono có thể ít ceremony hơn. Đánh giá bằng cost thay đổi, onboarding, runtime và ownership, không bằng số decorator.
 
 ---
 
-## Phần tiếp theo
+## Lab và acceptance criteria
 
-Giờ bạn có một framework có cấu trúc, tiêm được, đã validate quanh dữ liệu (Phase 11–12) và cache (Phase 13). Để ý mạch xuyên suốt: NestJS không dạy bạn điều gì *mới* — nó đặt tên và cấu trúc chuẩn production cho nền tảng bạn tự dựng.
+Xây `OrdersModule` trên Prisma 7 và Redis/BullMQ.
 
-Còn một tầng then chốt — tầng kẻ tấn công dò đầu tiên. Ở **Phase 15**, phần đỉnh, ta đi sâu vào **xác thực & bảo mật với JWT** — xoay access/refresh token, OAuth2/OIDC với PKCE, RBAC làm guard Nest, lưu cookie vs header an toàn, và các đòn tấn công mỗi lựa chọn phòng vệ.
+1. Domain không import Nest/Prisma; application phụ thuộc repository port.
+2. Module chỉ export use case công khai; dependency graph không có `forwardRef()`.
+3. Global `ValidationPipe` reject unknown field và không implicit-coerce ngoài DTO chỉ định.
+4. Auth guard trả `401`; permission/resource policy chặn cross-tenant access.
+5. Place order mở một transaction, ghi order + outbox; không publish trong transaction.
+6. PrismaService chỉ có một instance/process và disconnect khi shutdown.
+7. Metrics interceptor dùng route template/status class, không dùng raw URL/user id.
+8. Unit test use case không boot Nest; integration test override port; E2E dùng config global giống production.
+9. SIGTERM test chứng minh readiness off, request đang chạy hoàn tất, worker/client đóng.
+10. Kiểm tra heap/allocation cho thấy không có request-scoped provider ngoài danh sách đã giải trình.
+
+---
+
+## Checklist production
+
+- [ ] Module map theo capability và có public API rõ.
+- [ ] Provider scope được chọn theo lifetime, không theo tiện lợi.
+- [ ] Controller chỉ dịch transport; invariant nằm trong domain/use case/database.
+- [ ] Validation whitelist input và coercion explicit.
+- [ ] Authentication, permission và resource ownership tách rõ.
+- [ ] Error contract có stable code; unknown error không lộ detail.
+- [ ] Prisma/Redis/SDK là singleton và có lifecycle shutdown.
+- [ ] Transaction bao trọn use case; external side effect qua outbox.
+- [ ] Metric/trace dùng low-cardinality attribute.
+- [ ] Unit, integration và E2E mỗi lớp chứng minh một boundary khác nhau.
+
+---
+
+## Tài liệu chính thức
+
+- [NestJS 11 — Migration guide](https://docs.nestjs.com/migration-guide)
+- [NestJS — Modules](https://docs.nestjs.com/modules)
+- [NestJS — Custom providers](https://docs.nestjs.com/fundamentals/custom-providers)
+- [NestJS — Injection scopes](https://docs.nestjs.com/fundamentals/injection-scopes)
+- [NestJS — Request lifecycle](https://docs.nestjs.com/faq/request-lifecycle)
+- [NestJS — Validation](https://docs.nestjs.com/techniques/validation)
+- [NestJS — Guards](https://docs.nestjs.com/guards)
+- [NestJS — Interceptors](https://docs.nestjs.com/interceptors)
+- [NestJS — Lifecycle events](https://docs.nestjs.com/fundamentals/lifecycle-events)
+- [NestJS — Testing](https://docs.nestjs.com/fundamentals/testing)
+
+Phần tiếp theo đặt identity vào đúng boundary này: access token không phải ID token, OAuth không tự là login, refresh rotation là state machine và authorization phải kiểm audience, tenant lẫn resource.

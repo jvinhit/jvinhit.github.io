@@ -1,22 +1,31 @@
 ---
-title: 'Node.js Super Senior · Phase 2 — HTTP & Web Fundamentals'
-description: 'Phase 2: HTTP in depth (methods, status, headers, REST, idempotency), HTTP/1.1 vs HTTP/2, a raw Node server, request parsing, a hand-rolled router, streaming and SSE, cookies, CORS, caching/ETag, compression, and graceful shutdown.'
+title: 'Node.js Production Engineering 02 — HTTP từ Wire đến API Contract'
+description: 'Theo một HTTP request từ wire tới Node.js handler, rồi thiết kế API contract có giới hạn, timeout, cache, streaming, CORS và graceful shutdown rõ ràng.'
 pubDate: 2026-06-09
-tags: [nodejs, http, rest, middleware, node_10]
+updatedDate: 2026-07-11
+tags: [nodejs, http, api-contract, middleware, production-engineering]
 series: nodejs
 seriesOrder: 2
 draft: false
 ---
 
-Đây là **Phase 2 của lộ trình Super Senior 10 phase**. Trước mọi framework, senior hiểu **giao thức bên dưới**. Ta sẽ dựng server thật chỉ bằng core `http`, *khám phá* vì sao middleware tồn tại, và bao quát những mối lo production mà framework giấu bạn: cookie, CORS, cache, nén, streaming, timeout, và tắt êm.
+Frontend nhận `502` sau 30 giây, gateway ghi `504`, còn application log không có dòng lỗi nào. Ba tín hiệu có thể cùng mô tả một request: client đã timeout, proxy đóng upstream, trong khi Node vẫn làm việc vì contract không có deadline và cancellation rõ ràng. HTTP không chỉ là URL cộng JSON; nó là giao thức, dòng byte, cache semantics và hợp đồng giữa nhiều tầng độc lập.
 
-Mọi thứ ở Phase 1 áp dụng — **HTTP server chỉ là stream vào và stream ra**.
+Bài này dùng **Node.js 24 LTS** và core `node:http` để bóc từng lớp trước khi đưa Express vào. Sau khi đọc, bạn có thể:
+
+- đọc một HTTP/1.1 message và phân biệt method semantics, status với representation;
+- coi request/response là stream có giới hạn và backpressure;
+- thiết kế error, retry, cache và idempotency thành API contract cho frontend;
+- xử lý CORS, cookie, SSE, compression và conditional request có chủ đích;
+- đặt timeout theo từng tầng và shutdown mà không cắt ngang request đang xử lý.
+
+**Kiến thức cần có:** event loop, stream và `AbortSignal` ở [Phần 1](/blog/node-01-core-fundamentals/). Các snippet tập trung vào protocol; chỗ nào lược bớt validation hoặc storage sẽ được ghi rõ.
 
 ---
 
 ## 1. Giao thức HTTP
 
-Mọi tương tác web là một **request** và một **response**, đều là text với cấu trúc xác định.
+HTTP dùng mô hình **request/response**. Ví dụ dưới là HTTP/1.1 dạng text; HTTP/2 và HTTP/3 đóng khung nhị phân, còn body ở mọi phiên bản có thể chứa byte bất kỳ chứ không mặc định là text.
 
 ```text
 REQUEST                          RESPONSE
@@ -33,18 +42,18 @@ Một thông điệp có ba phần: **dòng đầu**, các **header** (metadata)
 
 ### Method — và phân biệt safe/idempotent
 
-| Method  | Mục đích | An toàn | Idempotent |
-| ------- | ------------------------------- | ---------------- | ---------- |
-| GET     | đọc | yes              | yes        |
-| HEAD    | chỉ header| yes              | yes        |
-| POST    | tạo | no               | no         |
-| PUT     | thay toàn bộ | no               | yes        |
-| PATCH   | sửa một phần | no               | no         |
-| DELETE  | xóa | no               | yes        |
+| Method | Mục đích     | An toàn | Idempotent |
+| ------ | ------------ | ------- | ---------- |
+| GET    | đọc          | yes     | yes        |
+| HEAD   | chỉ header   | yes     | yes        |
+| POST   | tạo          | no      | no         |
+| PUT    | thay toàn bộ | no      | yes        |
+| PATCH  | sửa một phần | no      | no         |
+| DELETE | xóa          | no      | yes        |
 
 **Safe** = không đổi trạng thái server. **Idempotent** = làm hai lần cũng như một lần. Điều này quan trọng khi retry: client/proxy có thể an toàn thử lại request idempotent sau sự cố mạng, nhưng thử lại `POST` có thể tạo bản trùng.
 
-> Mẹo senior: để `POST` an toàn khi retry, nhận một header **idempotency key** và khử trùng phía server.
+> Để một thao tác `POST` có thể retry, client gửi **idempotency key** ổn định và server lưu kết quả theo key trong cùng ranh giới consistency với side effect. Chỉ "kiểm tra rồi làm" bằng cache rời không đủ nếu process chết giữa hai bước.
 
 ### Status code — nhớ theo nhóm
 
@@ -56,7 +65,7 @@ Một thông điệp có ba phần: **dòng đầu**, các **header** (metadata)
 5xx Server error 500 Internal · 502 Bad Gateway · 503 Service Unavailable · 504 Gateway Timeout
 ```
 
-Phản xạ senior: trả *đúng* status code là một phần hợp đồng của API. Tạo thất bại là `400`/`422`, không phải `200` kèm lỗi trong body. `401` là *chưa xác thực*; `403` là *đã xác thực nhưng không được phép* — người ta hay nhầm.
+Status code là một phần hợp đồng của API. Request sai syntax có thể là `400`; representation hợp lệ về syntax nhưng không thỏa validation có thể là `422`; conflict với trạng thái hiện tại thường là `409`. `401` yêu cầu thông tin xác thực hợp lệ và thường đi cùng `WWW-Authenticate`; `403` nghĩa là server hiểu request nhưng từ chối cấp quyền.
 
 ### Nguyên tắc REST
 
@@ -69,15 +78,15 @@ Phản xạ senior: trả *đúng* status code là một phần hợp đồng c�
 
 ## 2. Phiên bản HTTP & tái dùng kết nối
 
-Senior biết *vì sao* một API nhanh hay chậm ở tầng vận chuyển.
+Độ trễ API còn phụ thuộc cách kết nối được thiết lập và tái sử dụng:
 
-- một request mỗi kết nối TCP, rồi đóng. Đắt: bắt tay TCP (và TLS) mỗi lần.
-- **keep-alive mặc định**: tái dùng kết nối cho nhiều request tuần tự. Nhưng response trên một kết nối bị **xếp thứ tự** (nghẽn đầu hàng).
-- **ghép kênh**: nhiều stream đồng thời trên một kết nối, cộng nén header (HPACK) và đóng khung nhị phân — loại bỏ phần lớn nghẽn đầu hàng ở tầng HTTP.
-- chạy trên **QUIC (UDP)**, loại nghẽn đầu hàng ở mức TCP; tốt trên mạng hay mất gói.
+- **HTTP/1.0** thường tạo kết nối ngắn nếu không thương lượng keep-alive; bắt tay TCP/TLS lặp lại làm tăng chi phí.
+- **HTTP/1.1** mặc định dùng kết nối persistent. Pipelining hiếm được dùng và response vẫn theo thứ tự trên một kết nối.
+- **HTTP/2** ghép nhiều stream trên một kết nối, dùng binary framing và HPACK. Nó giảm head-of-line blocking ở tầng HTTP nhưng các stream vẫn chia sẻ TCP.
+- **HTTP/3** chạy trên QUIC; mất packet của một stream không buộc stream khác chờ như trên một TCP connection.
 
 ```ts
-import { createServer } from 'node:http';        // HTTP/1.1
+import { createServer } from 'node:http'; // HTTP/1.1
 import { createSecureServer } from 'node:http2'; // HTTP/2 (needs TLS in browsers)
 ```
 
@@ -138,10 +147,11 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 `req.url` chỉ là chuỗi. Parse bằng class `URL`:
 
 ```ts
-const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
-url.pathname;                    // '/search'
-url.searchParams.get('q');       // 'node'
-url.searchParams.getAll('tag');  // ['a','b'] for ?tag=a&tag=b
+// Với server origin cố định, không cần tin giá trị Host do client gửi.
+const url = new URL(req.url ?? '/', 'http://internal.invalid');
+url.pathname; // '/search'
+url.searchParams.get('q'); // 'node'
+url.searchParams.getAll('tag'); // ['a','b'] for ?tag=a&tag=b
 Number(url.searchParams.get('page') ?? '1'); // strings → coerce yourself
 ```
 
@@ -152,49 +162,97 @@ Body không được trao sẵn — gom chunk của stream, kèm chốt kích th
 ```ts
 import type { IncomingMessage } from 'node:http';
 
-async function readJson<T>(req: IncomingMessage, maxBytes = 1_000_000): Promise<T> {
+async function readJson(
+  req: IncomingMessage,
+  maxBytes = 1_000_000
+): Promise<unknown> {
+  const mediaType = req.headers['content-type']?.split(';', 1)[0]?.trim();
+  if (mediaType !== 'application/json') {
+    throw Object.assign(new Error('Content-Type must be application/json'), {
+      status: 415,
+    });
+  }
+
   const chunks: Buffer[] = [];
   let size = 0;
-  for await (const chunk of req) {                 // req is async-iterable
-    size += chunk.length;
+  for await (const chunk of req) {
+    // req is async-iterable
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
     if (size > maxBytes) {
-      const err = new Error('Payload too large');
-      (err as Error & { status?: number }).status = 413; // signal 413 upstream
-      throw err;
+      throw Object.assign(new Error('Payload too large'), { status: 413 });
     }
-    chunks.push(chunk as Buffer);
+    chunks.push(buffer);
   }
-  if (size === 0) return {} as T;
-  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as T;
+  if (size === 0)
+    throw Object.assign(new Error('JSON body is required'), { status: 400 });
+
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+  } catch {
+    throw Object.assign(new Error('Malformed JSON'), { status: 400 });
+  }
 }
 ```
 
-Nhìn xem phải nghĩ bao nhiêu: stream, giới hạn kích thước, nối buffer, encoding, parse có thể ném lỗi. `express.json()` của Express chính là cái này trong một dòng (Phase 3).
+Parse JSON chỉ tạo ra `unknown`; nó **không validate business schema**. Handler vẫn phải kiểm tra shape bằng schema validator trước khi dùng. `express.json()` ở Phần 3 giải phần đọc/parse và giới hạn, không thay thế validation.
 
 ### Form-urlencoded & multipart (upload file)
 
-Form HTML gửi `application/x-www-form-urlencoded`; parse bằng `URLSearchParams`. Upload file dùng `multipart/form-data`, body bị chia bởi boundary thành nhiều phần. Parse multipart thủ công thật sự khó, nên cả senior cũng dùng parser dày dạn như **busboy**:
+Form HTML gửi `application/x-www-form-urlencoded`; parse bằng `URLSearchParams`. Upload file dùng `multipart/form-data`, body bị chia bởi boundary thành nhiều phần. Không nên tự viết multipart parser; dùng thư viện đã xử lý boundary và stream như **busboy**:
 
 ```ts
 import busboy from 'busboy';
 import { createWriteStream } from 'node:fs';
+import { rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 
 function handleUpload(req: IncomingMessage): Promise<void> {
   return new Promise((resolve, reject) => {
-    const bb = busboy({ headers: req.headers, limits: { fileSize: 10 * 1024 * 1024 } });
-    bb.on('file', (_name, file, info) => {
-      // Stream straight to disk — never buffer the whole upload in memory.
-      void pipeline(file, createWriteStream(`uploads/${info.filename}`)).catch(reject);
+    const writes: Promise<void>[] = [];
+    const bb = busboy({
+      headers: req.headers,
+      limits: { files: 1, parts: 10, fileSize: 10 * 1024 * 1024 },
     });
-    bb.on('close', resolve);
+    bb.on('file', (_name, file, _info) => {
+      // Không dùng filename/extension của client làm storage path.
+      const target = join('uploads', `${randomUUID()}.upload`);
+
+      file.once('limit', () => {
+        file.destroy(
+          Object.assign(new Error('File too large'), { status: 413 })
+        );
+      });
+
+      writes.push(
+        pipeline(file, createWriteStream(target)).catch(async (error) => {
+          await rm(target, { force: true }); // dọn file dở/truncated
+          throw error;
+        })
+      );
+    });
+    bb.on(
+      'close',
+      () => void Promise.all(writes).then(() => resolve(), reject)
+    );
     bb.on('error', reject);
+    bb.on('filesLimit', () =>
+      bb.destroy(Object.assign(new Error('Too many files'), { status: 413 }))
+    );
+    bb.on('partsLimit', () =>
+      bb.destroy(Object.assign(new Error('Too many parts'), { status: 413 }))
+    );
+    req.once('aborted', () =>
+      bb.destroy(new Error('Upload aborted by client'))
+    );
     req.pipe(bb);
   });
 }
 ```
 
-Bài học senior: **stream upload ra đĩa/object storage; đừng bao giờ nạp cả file vào bộ nhớ** — cùng nguyên lý backpressure như Phase 1.
+Với upload lớn, hãy stream ra object storage hoặc vùng tạm có quota thay vì buffer toàn bộ. Filename, media type và extension do client gửi đều không đáng tin; tạo storage key phía server, kiểm tra nội dung khi use case yêu cầu, và dọn file dở khi pipeline lỗi.
 
 ---
 
@@ -206,8 +264,17 @@ Vài lệnh `if (method && url)` không co giãn và không hỗ trợ path para
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 type Params = Record<string, string>;
-type Handler = (req: IncomingMessage, res: ServerResponse, params: Params) => void;
-interface Route { method: string; pattern: RegExp; keys: string[]; handler: Handler }
+type Handler = (
+  req: IncomingMessage,
+  res: ServerResponse,
+  params: Params
+) => void;
+interface Route {
+  method: string;
+  pattern: RegExp;
+  keys: string[];
+  handler: Handler;
+}
 
 const routes: Route[] = [];
 
@@ -215,18 +282,29 @@ function add(method: string, path: string, handler: Handler): void {
   const keys: string[] = [];
   // '/users/:id' → /^\/users\/([^/]+)$/  capturing each :param
   const pattern = new RegExp(
-    '^' + path.replace(/:[^/]+/g, (m) => { keys.push(m.slice(1)); return '([^/]+)'; }) + '$',
+    '^' +
+      path.replace(/:[^/]+/g, (m) => {
+        keys.push(m.slice(1));
+        return '([^/]+)';
+      }) +
+      '$'
   );
   routes.push({ method, pattern, keys, handler });
 }
 
 function route(req: IncomingMessage, res: ServerResponse): void {
-  const { pathname } = new URL(req.url ?? '/', `http://${req.headers.host}`);
+  const { pathname } = new URL(req.url ?? '/', 'http://internal.invalid');
   const matches = routes.filter((r) => r.pattern.test(pathname));
-  if (matches.length === 0) { res.writeHead(404).end('Not Found'); return; }
+  if (matches.length === 0) {
+    res.writeHead(404).end('Not Found');
+    return;
+  }
 
   const r = matches.find((m) => m.method === req.method);
-  if (!r) { res.writeHead(405).end('Method Not Allowed'); return; } // path exists, verb doesn't
+  if (!r) {
+    res.writeHead(405).end('Method Not Allowed');
+    return;
+  } // path exists, verb doesn't
 
   const captured = r.pattern.exec(pathname)!.slice(1);
   const params = Object.fromEntries(r.keys.map((k, i) => [k, captured[i]]));
@@ -236,7 +314,7 @@ function route(req: IncomingMessage, res: ServerResponse): void {
 add('GET', '/users/:id', (_req, res, params) => res.end(`user ${params.id}`));
 ```
 
-Lưu ý chi tiết senior: khi **path** khớp nhưng **method** không khớp, đáp án đúng là **`405`**, không phải `404`.
+Khi **path** tồn tại nhưng method không được hỗ trợ, trả `405` và nên kèm header `Allow`; `404` dành cho resource/path không tồn tại. Router minh họa cũng chưa escape ký tự regex trong static path, nên không dùng nguyên trạng cho input route động.
 
 ---
 
@@ -258,14 +336,19 @@ await pipeline(createReadStream('big.zip'), res);
 ```ts
 res.writeHead(200, {
   'Content-Type': 'text/event-stream',
-  'Cache-Control': 'no-cache',
+  'Cache-Control': 'no-cache, no-transform',
   Connection: 'keep-alive',
+  'X-Accel-Buffering': 'no', // hữu ích khi chạy sau Nginx
 });
-const timer = setInterval(() => res.write(`data: ${Date.now()}\n\n`), 1000);
-req.on('close', () => clearInterval(timer)); // stop when the client disconnects
+res.flushHeaders();
+const timer = setInterval(() => {
+  // Với event dày, phải dừng/coalesce khi write() trả false để tôn trọng backpressure.
+  res.write(`event: tick\ndata: ${Date.now()}\n\n`);
+}, 1000);
+res.on('close', () => clearInterval(timer));
 ```
 
-> Luôn dọn dẹp ở `req.on('close')` cho response sống lâu — nếu không bạn rò rỉ timer và bộ nhớ cho mỗi client ngắt kết nối.
+Response sống lâu phải dọn timer/subscription khi `close`. Production còn cần heartbeat comment, giới hạn số connection, proxy timeout phù hợp và cơ chế resume bằng event id/`Last-Event-ID` nếu không được phép mất sự kiện.
 
 ---
 
@@ -274,21 +357,27 @@ req.on('close', () => clearInterval(timer)); // stop when the client disconnects
 Cookie là một chuỗi nhỏ server đặt và trình duyệt gửi lại ở mọi request sau — cách chuẩn để mang session id:
 
 ```ts
-res.setHeader('Set-Cookie', [
-  // The four attributes that matter for security:
-  `sid=${id}`,
-  'HttpOnly',          // JS can't read it → blunts XSS token theft
-  'Secure',            // HTTPS only
-  'SameSite=Lax',      // not sent on cross-site POSTs → blunts CSRF
-  'Path=/; Max-Age=86400',
-].join('; '));
+res.setHeader(
+  'Set-Cookie',
+  [
+    // The four attributes that matter for security:
+    `sid=${id}`,
+    'HttpOnly', // JS can't read it → blunts XSS token theft
+    'Secure', // HTTPS only
+    'SameSite=Lax', // giảm một số cross-site request; không thay thế CSRF defense
+    'Path=/; Max-Age=86400',
+  ].join('; ')
+);
 
 // Reading cookies back:
 const cookies = Object.fromEntries(
-  (req.headers.cookie ?? '').split('; ').filter(Boolean).map((c) => {
-    const i = c.indexOf('=');
-    return [c.slice(0, i), decodeURIComponent(c.slice(i + 1))];
-  }),
+  (req.headers.cookie ?? '')
+    .split('; ')
+    .filter(Boolean)
+    .map((c) => {
+      const i = c.indexOf('=');
+      return [c.slice(0, i), decodeURIComponent(c.slice(i + 1))];
+    })
 );
 ```
 
@@ -298,23 +387,29 @@ Không trạng thái vs có trạng thái: một **id** session + store phía se
 
 ## 8. CORS — từ gốc
 
-**Same-origin policy** của trình duyệt chặn JS đọc response từ origin khác trừ khi server *cho phép* bằng header CORS. Với request "không đơn giản" trình duyệt gửi trước một **preflight `OPTIONS`**:
+**Same-origin policy** của trình duyệt chặn JS đọc response từ origin khác trừ khi server _cho phép_ bằng header CORS. Với request "không đơn giản" trình duyệt gửi trước một **preflight `OPTIONS`**:
 
 ```ts
 function applyCors(req: IncomingMessage, res: ServerResponse): boolean {
-  res.setHeader('Access-Control-Allow-Origin', 'https://app.example.com'); // not '*' with credentials
+  const allowedOrigin = 'https://app.example.com';
+  const origin = req.headers.origin;
+  res.setHeader('Vary', 'Origin');
+  if (origin === allowedOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigin); // không dùng '*' với credentials
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  if (req.method === 'OPTIONS') {           // preflight: answer and stop
-    res.writeHead(204).end();
-    return true;                            // handled
+  res.setHeader('Access-Control-Max-Age', '600');
+  if (req.method === 'OPTIONS') {
+    res.writeHead(origin === allowedOrigin ? 204 : 403).end();
+    return true; // handled
   }
   return false;
 }
 ```
 
-> CORS được thực thi **bởi trình duyệt, không phải server** — `curl` bỏ qua nó. Vậy CORS không phải ranh giới bảo mật; nó là tiện ích/lan can của trình duyệt.
+> Trình duyệt thực thi CORS khi script muốn đọc cross-origin response; `curl` hoặc service backend không chịu ràng buộc đó. Vì vậy CORS không thay authentication, authorization hay CSRF defense. Khi phản chiếu origin từ allowlist động, luôn thêm `Vary: Origin` để cache không phục vụ nhầm policy.
 
 ---
 
@@ -326,15 +421,21 @@ Response rẻ nhất là cái bạn không phải gửi. Dùng `Cache-Control` �
 import { createHash } from 'node:crypto';
 
 const body = JSON.stringify(data);
-const etag = `"${createHash('sha1').update(body).digest('base64')}"`;
+const etag = `"${createHash('sha256').update(body).digest('base64url')}"`;
 
 if (req.headers['if-none-match'] === etag) {
-  res.writeHead(304).end();                 // not modified — send nothing, save bandwidth
+  res.writeHead(304).end(); // not modified — send nothing, save bandwidth
   return;
 }
-res.writeHead(200, { ETag: etag, 'Cache-Control': 'public, max-age=60' });
+res.writeHead(200, {
+  'Content-Type': 'application/json; charset=utf-8',
+  ETag: etag,
+  'Cache-Control': 'public, max-age=60',
+});
 res.end(body);
 ```
+
+`public` chỉ đúng khi representation không chứa dữ liệu riêng theo user. Với dữ liệu cá nhân, chọn `private`, `no-cache` (được lưu nhưng phải revalidate), hoặc `no-store` (không được lưu) theo threat model. Nếu response đổi theo `Accept`, `Origin` hay `Accept-Encoding`, khai báo `Vary` tương ứng.
 
 ---
 
@@ -346,6 +447,7 @@ Nếu client báo `Accept-Encoding: gzip, br`, nén luồng response:
 import { createGzip, createBrotliCompress } from 'node:zlib';
 import { pipeline } from 'node:stream/promises';
 
+// Minh họa đường dữ liệu; production nên dùng parser thương lượng có hỗ trợ q-value.
 const accepts = req.headers['accept-encoding'] ?? '';
 if (accepts.includes('br')) {
   res.writeHead(200, { 'Content-Encoding': 'br', Vary: 'Accept-Encoding' });
@@ -358,7 +460,7 @@ if (accepts.includes('br')) {
 }
 ```
 
-> Đặt `Vary: Accept-Encoding` để cache lưu riêng bản nén và không nén. Production thường để Nginx nén — nhưng bạn phải biết nó hoạt động thế nào.
+> Đặt `Vary: Accept-Encoding` để cache lưu riêng từng representation. Đo trước khi nén payload nhỏ hoặc dữ liệu đã nén như JPEG/ZIP; CPU cost có thể lớn hơn số byte tiết kiệm. Reverse proxy/CDN thường là nơi phù hợp hơn để nén response tĩnh.
 
 ---
 
@@ -367,12 +469,17 @@ if (accepts.includes('br')) {
 Một nhúm header response làm cứng app — đây là cái `helmet` đặt giúp bạn trong Express:
 
 ```ts
-res.setHeader('X-Content-Type-Options', 'nosniff');             // don't MIME-sniff
-res.setHeader('X-Frame-Options', 'DENY');                       // no clickjacking via iframes
-res.setHeader('Strict-Transport-Security', 'max-age=63072000'); // force HTTPS (HSTS)
-res.setHeader('Content-Security-Policy', "default-src 'self'");  // restrict resource origins
+res.setHeader('X-Content-Type-Options', 'nosniff'); // don't MIME-sniff
+res.setHeader('X-Frame-Options', 'DENY'); // defense cũ cho browser hỗ trợ
+res.setHeader('Strict-Transport-Security', 'max-age=63072000'); // chỉ gửi trên HTTPS đã vận hành đúng
+res.setHeader(
+  'Content-Security-Policy',
+  "default-src 'self'; frame-ancestors 'none'"
+);
 res.setHeader('Referrer-Policy', 'no-referrer');
 ```
+
+Header bảo mật không phải bộ giá trị copy-paste. CSP phải khớp resource graph thật và nên rollout bằng report-only trước; HSTS có tác động dài hạn nên chỉ bật sau khi toàn bộ subdomain trong scope phục vụ HTTPS ổn định. Phần 5 sẽ đặt chúng trong threat model đầy đủ.
 
 ---
 
@@ -394,7 +501,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 type Middleware = (
   req: IncomingMessage,
   res: ServerResponse,
-  next: () => Promise<void>,
+  next: () => Promise<void>
 ) => void | Promise<void>;
 
 function compose(middlewares: Middleware[]) {
@@ -416,40 +523,93 @@ function compose(middlewares: Middleware[]) {
 }
 ```
 
-Mẫu `next()` đó *chính là* trái tim của Express và Koa. Bạn vừa dựng một phiên bản nhỏ của nó.
+Mẫu `next()` đó _chính là_ trái tim của Express và Koa. Bạn vừa dựng một phiên bản nhỏ của nó.
 
 ---
 
 ## 13. Timeout & tắt êm
 
-Server production phải phòng client chậm và phải xả các request đang chạy khi deploy.
+Server cần deadline chống client chậm và cần drain request đang chạy khi deploy. Ba timeout dưới đây đo các giai đoạn khác nhau; chọn số dựa trên kích thước upload, proxy timeout và SLO thay vì sao chép nguyên giá trị.
 
 ```ts
 const server = createServer(handler);
 
 // Defend against slow-loris-style attacks and hung sockets:
-server.requestTimeout = 30_000;     // max time to receive the full request
-server.headersTimeout = 10_000;     // max time to receive headers
-server.keepAliveTimeout = 5_000;    // idle keep-alive socket lifetime
+server.requestTimeout = 30_000; // max time to receive the full request
+server.headersTimeout = 10_000; // max time to receive headers
+server.keepAliveTimeout = 5_000; // idle keep-alive socket lifetime
 
 server.listen(3000);
 
 // Graceful shutdown: stop accepting, let active requests finish, then exit.
 function shutdown(signal: string): void {
   console.log(`${signal} received — draining...`);
-  server.close(() => { console.log('closed'); process.exit(0); });
-  // Force-exit if something hangs past the grace period:
-  setTimeout(() => process.exit(1), 10_000).unref();
+  server.close(() => {
+    console.log('closed');
+    process.exit(0);
+  });
+  server.closeIdleConnections();
+
+  // Sau grace period: đóng connection còn lại rồi thoát lỗi để orchestrator ghi nhận.
+  setTimeout(() => {
+    server.closeAllConnections();
+    process.exit(1);
+  }, 10_000).unref();
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 ```
 
-> `server.close()` dừng kết nối mới nhưng chờ kết nối đang chạy — kết hợp với `keepAliveTimeout` để socket keep-alive nhàn rỗi không giữ tiến trình tắt. `.unref()` để timer ép-thoát không tự giữ process sống.
+> `server.close()` dừng nhận connection mới và đợi connection hiện có đóng; trên Node.js hiện đại nó cũng xử lý idle keep-alive connection. `closeIdleConnections()` được gọi tường minh để ý đồ rõ ràng và tương thích baseline cũ hơn; `closeAllConnections()` chỉ là hard deadline cuối, vì nó có thể cắt request đang chạy.
 
 ---
 
-## 14. Dự án thực hành
+## 14. Failure modes và hợp đồng với frontend
+
+Frontend không nên suy luận lỗi từ chuỗi `message`. Hãy công bố một error envelope ổn định, ví dụ dựa trên **Problem Details for HTTP APIs**:
+
+```http
+HTTP/1.1 422 Unprocessable Content
+Content-Type: application/problem+json
+X-Request-Id: 01J...
+
+{
+  "type": "https://api.example.com/problems/validation-error",
+  "title": "Request validation failed",
+  "status": 422,
+  "code": "TASK_TITLE_INVALID",
+  "requestId": "01J...",
+  "errors": [{ "path": "title", "reason": "must_not_be_empty" }]
+}
+```
+
+`code` và `path` là machine-readable contract để client map sang UI; `title`/`detail` phục vụ log hoặc fallback, không phải khóa logic. Không trả stack trace, SQL error hoặc secret. Cùng `requestId` phải xuất hiện trong response và structured log để support lần ngược một failure.
+
+### Retry contract
+
+| Tình huống                            | Client nên làm gì                            | Server phải cung cấp gì                          |
+| ------------------------------------- | -------------------------------------------- | ------------------------------------------------ |
+| `GET` timeout trước khi nhận response | retry có backoff/jitter trong deadline tổng  | operation idempotent, timeout rõ                 |
+| `POST` tạo resource mất response      | chỉ retry với cùng idempotency key           | lưu key, fingerprint request và response kết quả |
+| `429`                                 | chờ theo `Retry-After`, giới hạn tổng số lần | rate-limit policy nhất quán                      |
+| `503` tạm thời                        | retry có budget nếu UX cho phép              | `Retry-After` khi ước lượng được                 |
+| validation `4xx`                      | sửa input, không retry tự động               | field error ổn định                              |
+
+### Failure modes cần diễn tập
+
+| Failure mode                        | Triệu chứng                              | Kiểm chứng                                                     |
+| ----------------------------------- | ---------------------------------------- | -------------------------------------------------------------- |
+| Body vượt giới hạn hoặc slow upload | memory/socket tăng, request treo         | gửi chunk chậm và payload > limit; xác nhận `413`/timeout      |
+| Client đóng giữa response stream    | pipeline reject, file handle còn mở      | hủy download; xác nhận cleanup và không có unhandled rejection |
+| Proxy buffer SSE                    | event tới theo cụm thay vì realtime      | test qua đúng Nginx/CDN production path                        |
+| Cache thiếu `Vary`                  | user/origin nhận nhầm representation     | integration test với hai origin/encoding                       |
+| Deploy trong long request           | client bị reset hoặc process không thoát | gửi `SIGTERM`, đo drain deadline và exit code                  |
+
+API contract không dừng ở OpenAPI schema. Nó gồm method semantics, status, header, body limit, timeout, retry, cache, versioning và hành vi khi request bị hủy.
+
+---
+
+## 15. Dự án thực hành
 
 1. REST API không Express: dựng API `tasks` chỉ bằng `http`, router tự dựng (có xử lý `405`), class `URL`, và `readJson`. Trả đúng status code và hình dạng lỗi nhất quán.
 
@@ -457,11 +617,13 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 3. Endpoint streaming: thêm `GET /download/:file` (stream file bằng `pipeline`), `GET /events` (đồng hồ SSE tự dọn khi ngắt), và thương lượng gzip/brotli.
 
-Bài tập thêm: thêm `ETag` + `304` cho danh sách tasks và chứng minh request lặp tiết kiệm băng thông; thêm `requestTimeout` và tắt êm, xác nhận request đang chạy hoàn tất khi `SIGTERM`; thêm kiểm tra idempotency-key cho `POST /tasks`.
+Bài tập thêm: thêm `ETag` + `304` cho danh sách tasks và chứng minh request lặp tiết kiệm băng thông; thêm `requestTimeout` và tắt êm, xác nhận request đang chạy hoàn tất khi `SIGTERM`; thêm idempotency key cho `POST /tasks`, lưu cả fingerprint request và response để cùng key nhưng khác payload bị từ chối.
+
+**Tiêu chí hoàn thành:** test phải bao phủ malformed JSON (`400`), sai content type (`415`), body quá lớn (`413`), method không hỗ trợ (`405` + `Allow`), conditional GET (`304` không body), CORS từ origin bị từ chối, client hủy stream và shutdown khi đang có request. Ghi lại `curl` command cùng expected status/header cho từng case.
 
 ---
 
-## 15. Checklist senior
+## 16. Checklist trước khi ship
 
 - Trả đúng status code.
 - Giới hạn body và stream upload ra đĩa.
@@ -469,11 +631,34 @@ Bài tập thêm: thêm `ETag` + `304` cho danh sách tasks và chứng minh req
 - Xử lý preflight CORS đúng và biết nó do trình duyệt thực thi.
 - Thêm cache/ETag khi hữu ích và dọn response sống lâu.
 - Đặt timeout và tắt êm khi `SIGTERM`.
+- Error body có schema, code ổn định và request id.
+- Retry policy của client khớp idempotency semantics của endpoint.
+- Cache policy phân biệt public với dữ liệu cá nhân và khai báo `Vary` đúng.
+
+## Nếu chỉ nhớ năm điều
+
+- HTTP semantics là contract; JSON chỉ là một representation.
+- Parse không đồng nghĩa với validate, và mọi input stream đều cần giới hạn.
+- Timeout phải được thiết kế xuyên client, proxy, server và dependency.
+- CORS là browser read policy, không phải authentication hay CSRF defense.
+- Retry, idempotency, cache và error envelope cần được thiết kế cùng frontend từ đầu.
 
 ---
 
 ## Phần tiếp theo
 
-Bạn hiểu HTTP ở mức giao thức, đã dựng server thật bằng `http` thô — routing có param, streaming, SSE, cookie, CORS, cache, nén, header bảo mật, timeout và tắt êm — và đã *tự dựng* khái niệm middleware.
+Bạn hiểu HTTP ở mức giao thức, đã dựng server thật bằng `http` thô — routing có param, streaming, SSE, cookie, CORS, cache, nén, header bảo mật, timeout và tắt êm — và đã _tự dựng_ khái niệm middleware.
 
-Ở **Phase 3**, ta đưa **Express.js** vào và xem mọi điểm đau tan biến — routing khai báo, pipeline middleware, parse body dựng sẵn, validation, và chiến lược xử lý lỗi vững chắc gồm async error wrapper mà mọi app Express cần.
+Ở **Phần 3**, ta đưa **Express 5** vào để chuẩn hóa request pipeline, routing, validation và error boundary — nhưng vẫn giữ nguyên các invariant về stream, timeout và contract vừa xây.
+
+Đọc tiếp: [Express 5 và Request Pipeline](/blog/node-03-express-mastery/).
+
+## Tài liệu chính thức
+
+- [Node.js 24: HTTP API](https://nodejs.org/download/release/latest-v24.x/docs/api/http.html)
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html)
+- [RFC 9111: HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html)
+- [RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457.html)
+- [WHATWG HTML: Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+- [Fetch Standard: CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol)
+- [RFC 6265bis draft: Cookies](https://datatracker.ietf.org/doc/draft-ietf-httpbis-rfc6265bis/)

@@ -1,0 +1,672 @@
+---
+title: 'Docker for Developers · Part 16 — Kubernetes Stateful Workloads & Persistent Storage'
+description: 'Làm chủ Kubernetes storage: PV/PVC/StorageClass/CSI, StatefulSet, topology-aware provisioning, backup, restore và failure drill.'
+pubDate: 2026-06-27
+tags: [kubernetes, k8s, storage, statefulset, devops]
+series: docker
+seriesOrder: 16
+draft: false
+---
+
+Đây là **Phần 16** của series Docker → Compose → Kubernetes. Ở [Phần 15 — Scheduling & Autoscaling](/blog/docker-15-kubernetes-scheduling-autoscaling/), scheduler chọn node dựa trên resource, affinity, taint và topology. Với workload có dữ liệu, quyết định đó còn phải khớp với nơi volume có thể attach. Một Pod được schedule đúng CPU nhưng sai zone vẫn có thể nằm `Pending` mãi.
+
+Phần này xây mental model production cho storage: **PV, PVC, StorageClass và CSI**, sau đó ghép chúng với **StatefulSet + headless Service**. Cuối bài, ta không chỉ “thấy Pod Running” mà còn tự phá Pod, gây lỗi provisioning, tạo backup và diễn tập restore.
+
+> **Điều kiện thực hành:** bạn có cluster và `kubectl`; cluster đã cài một CSI driver hoặc dynamic provisioner. Chạy `kubectl get storageclass` và `kubectl get csidriver` trước. Tên StorageClass, snapshot class và khả năng `ReadWriteMany` phụ thuộc hạ tầng — đừng copy tên từ cloud khác rồi mong nó hoạt động.
+
+## Mental model: Pod tiêu thụ claim, không tiêu thụ disk trực tiếp
+
+Storage bền trong Kubernetes là một chuỗi hợp đồng:
+
+```text
+Pod / StatefulSet
+       │ mount claim
+       ▼
+PersistentVolumeClaim (PVC) — namespace-scoped, nhu cầu của app
+       │ bind 1:1
+       ▼
+PersistentVolume (PV) — cluster-scoped, đại diện volume thật
+       ▲ được tạo theo policy
+       │
+StorageClass — provisioner, topology, reclaim, expansion
+       │ gọi qua CSI
+       ▼
+Storage backend — block disk, file share, distributed storage...
+```
+
+Mỗi lớp trả lời một câu hỏi khác nhau:
+
+| Lớp          | Ai sở hữu        | Câu hỏi chính                                                        |
+| ------------ | ---------------- | -------------------------------------------------------------------- |
+| Pod          | team ứng dụng    | Mount claim nào vào path nào?                                        |
+| PVC          | team ứng dụng    | Cần bao nhiêu dung lượng, access mode và class nào?                  |
+| PV           | platform/cluster | Volume vật lý nào đang đáp ứng claim?                                |
+| StorageClass | platform team    | Tạo volume bằng driver nào, ở topology nào, xóa hay giữ khi release? |
+| CSI driver   | vendor/platform  | Attach, mount, resize và snapshot backend bằng cách nào?             |
+
+`emptyDir` sống theo **Pod**. Container restart vẫn thấy dữ liệu trong `emptyDir`, nhưng Pod bị xóa thì volume cũng mất. PV sống độc lập với một Pod cụ thể; dữ liệu có tồn tại sau khi PVC bị xóa hay không lại do **reclaim policy** và backend quyết định.
+
+## PV và PVC: binding là một hợp đồng 1:1
+
+PVC là yêu cầu có cấu trúc, không phải tên thư mục tùy ý:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: storage-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: durable-rwo
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+Kubernetes tìm hoặc provision một PV phù hợp với class, capacity, `volumeMode`, access mode và selector của claim. Khi bind thành công:
+
+```bash
+kubectl -n storage-lab get pvc app-data -o wide
+kubectl get pv
+
+# PVC ghi tên PV đã bind; PV ghi claimRef ngược về namespace/name của PVC
+kubectl -n storage-lab get pvc app-data \
+  -o jsonpath='{.spec.volumeName}{"\n"}'
+kubectl get pv "$(kubectl -n storage-lab get pvc app-data \
+  -o jsonpath='{.spec.volumeName}')" -o yaml
+```
+
+Các phase thường thấy của PV là `Available`, `Bound`, `Released` và `Failed`. PVC thường `Pending`, `Bound` hoặc `Lost`. Khi PVC `Pending`, đọc `Events` trước khi sửa YAML ngẫu nhiên:
+
+```bash
+kubectl -n storage-lab describe pvc app-data
+kubectl -n storage-lab get events --sort-by=.lastTimestamp
+```
+
+Các nguyên nhân hay gặp:
+
+- `storageClassName` không tồn tại hoặc không có default StorageClass.
+- Provisioner/CSI controller chưa chạy hoặc thiếu credential với backend.
+- Class dùng `WaitForFirstConsumer` nhưng chưa có Pod tiêu thụ claim.
+- Backend hết quota/capacity hoặc zone không phù hợp.
+- Claim yêu cầu access mode hay `volumeMode` mà driver không hỗ trợ.
+
+## StorageClass và dynamic provisioning
+
+Không có dynamic provisioning, platform team phải tạo disk và PV trước. Với dynamic provisioning, PVC kích hoạt provisioner được khai báo trong StorageClass để tạo volume theo nhu cầu.
+
+Đây là **template policy**, không phải manifest portable. `provisioner` và `parameters` là của CSI driver cụ thể; thay chúng bằng giá trị do platform team cung cấp:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: durable-rwo
+provisioner: csi-driver.example-vendor.example
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  tier: durable
+```
+
+Kiểm tra contract thật của cluster:
+
+```bash
+kubectl get storageclass
+kubectl describe storageclass durable-rwo
+kubectl get csidriver
+```
+
+### `reclaimPolicy`: xóa object có xóa dữ liệu không?
+
+PV provision động kế thừa `reclaimPolicy` từ StorageClass:
+
+- **`Delete`**: xóa PVC cuối cùng có thể dẫn tới xóa PV và volume thật. Đây là mặc định nếu StorageClass không khai báo policy.
+- **`Retain`**: PV chuyển sang `Released`; volume thật được giữ để admin thu hồi thủ công. Nó an toàn hơn trước thao tác nhầm nhưng cần quy trình cleanup, nếu không chi phí tăng mãi.
+
+`Retain` không phải backup. Nếu account cloud, vùng lưu trữ hoặc backend bị mất, volume được retain vẫn có thể mất cùng failure domain.
+
+Trước một migration nguy hiểm, kiểm tra policy của **PV đã bind**, không chỉ nhìn StorageClass hiện tại:
+
+```bash
+PV=$(kubectl -n storage-lab get pvc app-data -o jsonpath='{.spec.volumeName}')
+kubectl get pv "$PV" \
+  -o custom-columns=NAME:.metadata.name,CLASS:.spec.storageClassName,RECLAIM:.spec.persistentVolumeReclaimPolicy
+
+# Guardrail tạm thời trước drill có xóa PVC; cần quyền cluster-scoped
+kubectl patch pv "$PV" \
+  -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+```
+
+### `volumeBindingMode`: topology trước hay sau scheduler?
+
+`Immediate` provision/bind ngay khi PVC xuất hiện. Với disk chỉ attach được trong một zone, volume có thể được tạo ở zone A trước khi scheduler biết Pod phải chạy ở zone B.
+
+`WaitForFirstConsumer` trì hoãn provisioning đến khi có Pod dùng PVC. Scheduler lúc đó có thể xét cùng lúc resource, node selector, affinity, taint và topology storage. Đây là lựa chọn production thường hợp lý cho volume bị giới hạn zone.
+
+> Với `WaitForFirstConsumer`, không gán thẳng `spec.nodeName`; cách đó bypass scheduler và có thể làm PVC `Pending`. Nếu thật sự cần ràng buộc node, dùng `nodeSelector` hoặc node affinity như ở Phần 15.
+
+`allowVolumeExpansion: true` cho phép tăng request của PVC nếu driver hỗ trợ. Kubernetes chỉ hỗ trợ **grow**, không shrink:
+
+```bash
+kubectl -n storage-lab patch pvc app-data \
+  -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+kubectl -n storage-lab get pvc app-data -w
+```
+
+## Access mode không đồng nghĩa replication hay file lock
+
+| Mode                        | Ý nghĩa khi mount                        | Bẫy cần nhớ                                                            |
+| --------------------------- | ---------------------------------------- | ---------------------------------------------------------------------- |
+| `ReadWriteOnce` (`RWO`)     | read-write trên một **node**             | Nhiều Pod cùng node vẫn có thể mount; không phải strict single writer  |
+| `ReadOnlyMany` (`ROX`)      | read-only từ nhiều node                  | Access mode dùng để match/mount, không tự biến backend thành immutable |
+| `ReadWriteMany` (`RWX`)     | read-write từ nhiều node                 | Chỉ hoạt động nếu driver/backend hỗ trợ shared filesystem              |
+| `ReadWriteOncePod` (`RWOP`) | read-write bởi đúng một Pod toàn cluster | Chỉ dành cho CSI; dùng khi thật sự cần single writer                   |
+
+Kubernetes dùng access mode để match claim với volume và trong một số trường hợp giới hạn mount. Ngoại trừ `RWOP`, access mode **không phải cơ chế khóa ghi**. Nó cũng không tạo replication, quorum, transaction hay backup.
+
+Ví dụ: hai process trong cùng Pod luôn có thể cùng ghi một mount RWO. Hai Pod trên cùng node cũng có thể dùng một RWO tùy driver. Nếu ứng dụng cần một writer duy nhất, cân nhắc `ReadWriteOncePod` và vẫn giữ cơ chế fencing/leader election ở tầng ứng dụng.
+
+`RWX` cũng không làm một database trở thành distributed database. Chia sẻ cùng data directory cho nhiều PostgreSQL process độc lập là công thức làm hỏng dữ liệu, không phải high availability.
+
+## CSI: đường nối giữa Kubernetes và storage backend
+
+Container Storage Interface tách tích hợp storage ra khỏi core Kubernetes. Một CSI deployment thường có hai nửa:
+
+- **Controller side** gọi API backend để provision, attach, detach, resize hoặc snapshot.
+- **Node side** chạy trên node để stage/mount volume cho kubelet.
+
+StorageClass trỏ tới tên provisioner của driver. PVC/PV giữ desired state; controller reconcile desired state đó thành thao tác thật ở backend.
+
+```bash
+kubectl get csidriver
+kubectl get pods -A | grep -E 'csi|provisioner|attacher|snapshot'
+
+# PVC Pending nhưng YAML có vẻ đúng? Xem event rồi tìm log controller tương ứng.
+kubectl -n storage-lab describe pvc app-data
+kubectl -n kube-system logs deploy/<csi-controller-name> \
+  -c csi-provisioner --tail=100
+```
+
+Tên namespace, Deployment và container khác nhau theo distro/driver. Đừng giả định mọi CSI driver đều hỗ trợ snapshot, resize, topology, `RWX` hoặc `RWOP`; kiểm tra capability matrix của driver đang cài.
+
+## Gắn PVC vào Pod
+
+Sau khi đã có StorageClass thật tên `durable-rwo`, tạo namespace, claim và Pod thử nghiệm:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: storage-lab
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: storage-lab
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: durable-rwo
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer
+  namespace: storage-lab
+spec:
+  containers:
+    - name: writer
+      image: busybox:1.36
+      command:
+        [sh, -c, 'echo "created by $HOSTNAME" >> /data/history; sleep 1d']
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: app-data
+```
+
+```bash
+kubectl apply -f storage-lab.yaml
+kubectl -n storage-lab wait --for=condition=Ready pod/writer --timeout=120s
+kubectl -n storage-lab exec writer -- cat /data/history
+
+kubectl -n storage-lab delete pod writer
+kubectl apply -f storage-lab.yaml
+kubectl -n storage-lab wait --for=condition=Ready pod/writer --timeout=120s
+kubectl -n storage-lab exec writer -- cat /data/history
+```
+
+Recreate **Pod** không recreate PVC, nên marker vẫn còn. Ngược lại, xóa PVC với PV policy `Delete` có thể xóa cả volume thật. Đây là hai failure hoàn toàn khác nhau.
+
+## StatefulSet: identity ổn định + một claim cho mỗi replica
+
+Deployment coi replica có thể thay thế lẫn nhau. StatefulSet thêm ba primitive:
+
+1. Tên Pod ổn định: `ledger-0`, `ledger-1`, `ledger-2`.
+2. DNS ổn định qua headless Service.
+3. PVC ổn định từ `volumeClaimTemplates`, một claim riêng cho mỗi ordinal.
+
+Manifest dưới đây dùng BusyBox HTTP server chỉ để quan sát identity và storage. Nó **không mô phỏng database replication**:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-headless
+  namespace: storage-lab
+spec:
+  clusterIP: None
+  selector:
+    app: ledger
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ledger
+  namespace: storage-lab
+spec:
+  serviceName: ledger-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ledger
+  template:
+    metadata:
+      labels:
+        app: ledger
+    spec:
+      containers:
+        - name: ledger
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "$HOSTNAME" > /data/index.html
+              exec httpd -f -p 8080 -h /data
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app: ledger
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: durable-rwo
+        resources:
+          requests:
+            storage: 2Gi
+```
+
+```bash
+kubectl apply -f ledger.yaml
+kubectl -n storage-lab rollout status statefulset/ledger
+kubectl -n storage-lab get pod,pvc -l app=ledger
+
+# Ba identity, ba claim: data-ledger-0, data-ledger-1, data-ledger-2
+for pod in ledger-0 ledger-1 ledger-2; do
+  kubectl -n storage-lab exec "$pod" -- cat /data/index.html
+done
+```
+
+DNS ổn định có dạng:
+
+```text
+ledger-0.ledger-headless.storage-lab.svc.cluster.local
+ledger-1.ledger-headless.storage-lab.svc.cluster.local
+ledger-2.ledger-headless.storage-lab.svc.cluster.local
+```
+
+Mặc định, scale down hoặc xóa StatefulSet không xóa các PVC đã tạo từ template. Đây là guardrail dữ liệu, đồng thời là nguồn chi phí “mồ côi” nếu không audit.
+
+```bash
+kubectl -n storage-lab scale statefulset ledger --replicas=1
+kubectl -n storage-lab get pvc
+
+# Scale lại: ledger-1 và ledger-2 nhận đúng claim cũ theo ordinal
+kubectl -n storage-lab scale statefulset ledger --replicas=3
+```
+
+StatefulSet chỉ cung cấp identity, ordering và storage attachment. Nó không tự cung cấp replication, consensus, backup, failover, schema migration hay split-brain protection. Với database production, dùng cơ chế HA chính thức của database hoặc operator đã được kiểm chứng.
+
+## Backup và restore: snapshot không tự động là backup
+
+Một kế hoạch đủ tốt phải phân biệt ba lớp:
+
+1. **Application-consistent backup**: database flush/checkpoint hoặc dùng công cụ dump/hot-backup hiểu transaction.
+2. **Storage snapshot**: CSI snapshot chụp volume tại một thời điểm; có thể chỉ crash-consistent nếu ứng dụng chưa quiesce.
+3. **Failure-domain độc lập**: copy backup sang account/region/backend khác, giữ retention và chống xóa nhầm.
+
+Volume Snapshot dùng các CRD `VolumeSnapshot`, `VolumeSnapshotContent` và `VolumeSnapshotClass`; chỉ hoạt động khi distro đã cài snapshot controller/CRD và CSI driver hỗ trợ snapshot.
+
+```bash
+kubectl api-resources | grep -i volumesnapshot
+kubectl get volumesnapshotclass
+```
+
+Tạo snapshot từ PVC:
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: ledger-0-before-upgrade
+  namespace: storage-lab
+spec:
+  volumeSnapshotClassName: durable-snapshots
+  source:
+    persistentVolumeClaimName: data-ledger-0
+```
+
+Restore thành **PVC mới** để kiểm thử mà không đụng claim gốc:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ledger-0-restore-test
+  namespace: storage-lab
+spec:
+  storageClassName: durable-rwo
+  dataSource:
+    name: ledger-0-before-upgrade
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+```
+
+```bash
+kubectl apply -f snapshot.yaml
+kubectl -n storage-lab get volumesnapshot -w
+kubectl apply -f restore-pvc.yaml
+kubectl -n storage-lab get pvc ledger-0-restore-test -w
+```
+
+Một backup chưa từng restore chỉ là **hy vọng**. Mỗi chu kỳ phải có restore test, checksum/record count, thời gian khôi phục thực tế và người chịu trách nhiệm. Các signal snapshot thất bại, PVC `Pending`, attach latency và disk saturation sẽ được nối vào runbook ở [Phần 18 — Observability & Incident Response](/blog/docker-18-kubernetes-observability-incidents/).
+
+## Failure drill: chứng minh hệ thống phục hồi, không chỉ tin YAML
+
+### Drill 1 — Pod mất, dữ liệu còn
+
+```bash
+kubectl -n storage-lab exec ledger-0 -- \
+  sh -c 'echo "drill-$(date +%s)" >> /data/drill.log'
+kubectl -n storage-lab exec ledger-0 -- cat /data/drill.log
+
+kubectl -n storage-lab delete pod ledger-0
+kubectl -n storage-lab wait --for=condition=Ready pod/ledger-0 --timeout=120s
+kubectl -n storage-lab exec ledger-0 -- cat /data/drill.log
+```
+
+Nếu marker mất, kiểm tra Pod có thật sự mount đúng PVC không; đừng kết luận “storage hỏng” trước khi xem `spec.volumes`, `volumeMounts` và Events.
+
+### Drill 2 — PVC `Pending`
+
+Tạo claim với `storageClassName: class-does-not-exist`, rồi điều tra:
+
+```bash
+kubectl -n storage-lab get pvc
+kubectl -n storage-lab describe pvc broken-claim
+kubectl get storageclass
+kubectl get pods -A | grep -E 'csi|provisioner'
+```
+
+Sửa đúng tên class. Nếu class dùng `WaitForFirstConsumer`, tạo một Pod dùng claim trước khi chờ `Bound`.
+
+### Drill 3 — Snapshot và restore cô lập
+
+1. Ghi marker duy nhất vào `data-ledger-0`.
+2. Quiesce ứng dụng hoặc tạo application-consistent backup.
+3. Tạo snapshot và đợi `readyToUse: true`.
+4. Restore sang `ledger-0-restore-test`.
+5. Mount claim restore vào một Pod kiểm tra riêng và xác minh marker/checksum.
+
+Đừng xóa claim gốc trong drill đầu tiên. Mục tiêu là chứng minh đường restore trước, rồi mới diễn tập cutover có runbook và rollback.
+
+### Drill 4 — Failure topology
+
+Nếu cluster nhiều zone, xem node và topology của PV:
+
+```bash
+PV=$(kubectl -n storage-lab get pvc data-ledger-0 \
+  -o jsonpath='{.spec.volumeName}')
+kubectl get pv "$PV" -o yaml
+kubectl -n storage-lab get pod ledger-0 -o wide
+kubectl get node --show-labels | grep topology.kubernetes.io/zone
+```
+
+Drain node trong môi trường lab và quan sát reschedule/attach. Disk single-zone chỉ chuyển sang node khác **trong zone có thể attach**; `WaitForFirstConsumer` không biến disk local/single-zone thành replicated multi-zone storage.
+
+## Failure modes production thường gặp
+
+| Triệu chứng                 | Kiểm tra đầu tiên                 | Nguyên nhân thường gặp                                 |
+| --------------------------- | --------------------------------- | ------------------------------------------------------ |
+| PVC `Pending`               | `describe pvc`                    | class sai, quota, provisioner lỗi, chưa có consumer    |
+| Pod `Pending`               | `describe pod`                    | volume node affinity/topology conflict, attach limit   |
+| Pod `ContainerCreating` lâu | Events + CSI node log             | attach/mount timeout, credential, filesystem lỗi       |
+| `Multi-Attach error`        | PV access mode + Pod cũ           | RWO volume còn attach node khác                        |
+| Dữ liệu mất sau delete PVC  | PV reclaim policy + backend audit | class dùng `Delete`, không có backup độc lập           |
+| StatefulSet rollout kẹt     | Pod ordinal đầu + readiness       | `OrderedReady` chờ replica lỗi trước đó                |
+| Snapshot mãi chưa ready     | snapshot controller/CSI log       | driver không support, class sai, backend timeout       |
+| Disk đầy                    | filesystem + PVC capacity         | không alert, expansion chưa bật hoặc app không cleanup |
+
+Khi xử lý incident, giữ nguyên bằng chứng: Events, YAML PV/PVC, audit log backend, snapshot metadata và timeline. Dọn object quá sớm có thể xóa luôn manh mối hoặc volume thật.
+
+## Bảng tra nhanh
+
+```bash
+# inventory
+kubectl get storageclass,csidriver
+kubectl get pv
+kubectl get pvc -A -o wide
+
+# debug binding / attach / mount
+kubectl -n storage-lab describe pvc app-data
+kubectl -n storage-lab describe pod writer
+kubectl -n storage-lab get events --sort-by=.lastTimestamp
+
+# map PVC -> PV -> reclaim policy
+PV=$(kubectl -n storage-lab get pvc app-data -o jsonpath='{.spec.volumeName}')
+kubectl get pv "$PV" -o yaml
+
+# StatefulSet and per-replica claims
+kubectl -n storage-lab get statefulset,pod,pvc
+kubectl -n storage-lab rollout status statefulset/ledger
+
+# snapshot capability and status
+kubectl api-resources | grep -i volumesnapshot
+kubectl get volumesnapshotclass
+kubectl -n storage-lab get volumesnapshot -o wide
+```
+
+## Bài tập / Exercises
+
+### 1. Vẽ binding chain từ Pod tới backend
+
+Tạo `app-data` và `writer`, rồi lấy: claim name, PV name, StorageClass, provisioner, reclaim policy và node đang chạy Pod.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+NS=storage-lab
+PVC=app-data
+PV=$(kubectl -n "$NS" get pvc "$PVC" -o jsonpath='{.spec.volumeName}')
+SC=$(kubectl get pv "$PV" -o jsonpath='{.spec.storageClassName}')
+
+kubectl -n "$NS" get pod writer -o wide
+kubectl -n "$NS" get pvc "$PVC" -o wide
+kubectl get pv "$PV" -o wide
+kubectl get storageclass "$SC" \
+  -o custom-columns=NAME:.metadata.name,PROVISIONER:.provisioner,RECLAIM:.reclaimPolicy,BINDING:.volumeBindingMode
+```
+
+Nếu không mô tả được chain này, bạn chưa có đủ dữ kiện để xóa PVC an toàn.
+
+</details>
+
+### 2. Chứng minh RWO không có nghĩa “một Pod”
+
+Giải thích vì sao `ReadWriteOnce` vẫn có thể cho nhiều Pod trên cùng node dùng volume, và chọn mode cho workload cần strict single writer toàn cluster.
+
+<details>
+<summary>Lời giải</summary>
+
+`RWO` giới hạn read-write mount ở một **node**, không phải một Pod. Nhiều Pod cùng node vẫn có thể truy cập tùy driver. Workload cần strict single writer nên yêu cầu `ReadWriteOncePod`; mode này chỉ hỗ trợ CSI và vẫn không thay thế lock/fencing ở tầng ứng dụng.
+
+Kiểm tra driver/class thật trước khi đổi:
+
+```bash
+kubectl get csidriver
+kubectl get storageclass
+kubectl -n storage-lab describe pvc app-data
+```
+
+</details>
+
+### 3. Debug claim `Pending` có chủ đích
+
+Tạo PVC 1Gi với `storageClassName: class-does-not-exist`. Thu thập bằng chứng, sau đó sửa sang class có thật. Nếu class dùng `WaitForFirstConsumer`, tạo Pod dùng claim.
+
+<details>
+<summary>Lời giải</summary>
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: broken-claim
+  namespace: storage-lab
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: class-does-not-exist
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+```bash
+kubectl apply -f broken-claim.yaml
+kubectl -n storage-lab describe pvc broken-claim
+kubectl get storageclass
+
+# storageClassName của PVC đã tạo thường không sửa trực tiếp được.
+# Xóa claim chưa từng bind/data, sửa manifest sang class đúng rồi tạo lại.
+kubectl -n storage-lab delete pvc broken-claim
+kubectl apply -f fixed-claim.yaml
+```
+
+</details>
+
+### 4. Chứng minh identity của StatefulSet sống qua Pod replacement
+
+Ghi một marker khác nhau vào mỗi replica, xóa `ledger-1`, rồi kiểm tra Pod mới nhận lại đúng marker và đúng PVC.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+for n in 0 1 2; do
+  kubectl -n storage-lab exec "ledger-$n" -- \
+    sh -c "echo ordinal-$n > /data/ordinal.txt"
+done
+
+kubectl -n storage-lab delete pod ledger-1
+kubectl -n storage-lab wait --for=condition=Ready pod/ledger-1 --timeout=120s
+kubectl -n storage-lab exec ledger-1 -- cat /data/ordinal.txt
+kubectl -n storage-lab get pvc data-ledger-1 -o wide
+```
+
+Kết quả phải là `ordinal-1`; StatefulSet tạo lại identity `ledger-1` và gắn claim `data-ledger-1`.
+
+</details>
+
+### 5. Viết và chạy restore acceptance test
+
+Tạo snapshot của `data-ledger-0`, restore sang PVC mới, mount PVC đó vào Pod kiểm tra và xác minh marker. Nếu cluster không có snapshot API, thực hiện cùng acceptance test bằng công cụ backup chính thức của ứng dụng và ghi rõ giới hạn.
+
+<details>
+<summary>Lời giải</summary>
+
+Sau khi snapshot và restore PVC theo manifest ở trên, tạo Pod chỉ đọc dữ liệu restore:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restore-verifier
+  namespace: storage-lab
+spec:
+  restartPolicy: Never
+  containers:
+    - name: verify
+      image: busybox:1.36
+      command: [sh, -c, 'find /restore -maxdepth 2 -type f -print; sleep 1h']
+      volumeMounts:
+        - name: restored
+          mountPath: /restore
+          readOnly: true
+  volumes:
+    - name: restored
+      persistentVolumeClaim:
+        claimName: ledger-0-restore-test
+        readOnly: true
+```
+
+```bash
+kubectl apply -f restore-verifier.yaml
+kubectl -n storage-lab wait --for=condition=Ready pod/restore-verifier --timeout=120s
+kubectl -n storage-lab exec restore-verifier -- cat /restore/index.html
+kubectl -n storage-lab exec restore-verifier -- cat /restore/drill.log
+```
+
+Acceptance test production còn phải kiểm tra schema/version, checksum hoặc record count và đo thời gian restore so với RTO.
+
+</details>
+
+## Điểm chính
+
+- PVC mô tả nhu cầu; PV đại diện volume; StorageClass là policy/factory; CSI thực thi thao tác với backend.
+- `WaitForFirstConsumer` cho scheduler và storage topology ra quyết định cùng nhau.
+- `Delete` và `Retain` quyết định vòng đời sau khi PVC release; không policy nào thay thế backup.
+- `RWO` là một node, không phải một Pod; `RWOP` mới là strict single-Pod mount và chỉ dành cho CSI.
+- StatefulSet cho identity, ordering và per-replica PVC — không tự tạo database replication hay failover.
+- Snapshot có thể chỉ crash-consistent và cùng failure domain; backup production phải có bản sao độc lập cùng restore test định kỳ.
+- Runbook storage phải được diễn tập bằng Pod loss, PVC `Pending`, topology failure và restore acceptance test.
+
+## Tiếp theo
+
+**Phần 17 — Kubernetes Security Hardening** sẽ giảm blast radius của workload: ServiceAccount/RBAC tối thiểu, Pod Security Admission `Restricted`, `securityContext`, Secret, NetworkPolicy và image supply chain.
+
+Sau đó [Phần 18 — Observability & Incident Response](/blog/docker-18-kubernetes-observability-incidents/) biến Events, storage latency, disk capacity, snapshot status và restore duration thành dashboard, alert và runbook có thể vận hành lúc sự cố thật.
+
+## Tài liệu chính thức
+
+- [Persistent Volumes — Kubernetes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)
+- [Storage Classes — Kubernetes](https://kubernetes.io/docs/concepts/storage/storage-classes/)
+- [Dynamic Volume Provisioning — Kubernetes](https://kubernetes.io/docs/concepts/storage/dynamic-provisioning/)
+- [Volumes and CSI — Kubernetes](https://kubernetes.io/docs/concepts/storage/volumes/#csi)
+- [StatefulSets — Kubernetes](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/)
+- [Volume Snapshots — Kubernetes](https://kubernetes.io/docs/concepts/storage/volume-snapshots/)

@@ -1,0 +1,393 @@
+---
+title: 'Domain, DNS & Hosting · Phần 5 — GitHub Pages Custom Domain qua Cloudflare'
+description: 'Gắn apex và www vào GitHub Pages đúng thứ tự: verify ownership, bind repository, publish DNS, cấp HTTPS và rollback không tạo takeover.'
+pubDate: 2026-07-11
+lang: vi
+tags: [hosting, domain, dns, cloudflare, github-pages, astro, hosting_dns_10]
+series: hosting-dns
+seriesOrder: 5
+draft: false
+---
+
+import HostingDiagram from '../../components/blog/HostingDiagram.astro';
+
+Kết thúc bài này, một Astro site đang chạy ở GitHub Pages sẽ có:
+
+- custom domain ở apex và `www`;
+- ownership verification bằng TXT để giảm rủi ro domain takeover;
+- DNS record đúng theo danh sách GitHub đang công bố;
+- HTTPS do GitHub cấp thành công trước khi cân nhắc Cloudflare proxy;
+- cấu hình `site`/`base` không làm vỡ asset;
+- một rollback path không để DNS trỏ vào hostname GitHub đã bị unbind.
+
+Phần deploy workflow, artifact và Pages environment đã được phân tích trong
+[GitHub Pages + Actions — Deploy, Lưu trữ & Giới hạn](/blog/github-pages-actions-deep-dive/).
+Bài này tập trung vào **domain binding, DNS và TLS**.
+
+---
+
+## Current-state inventory
+
+Chỉ cut over khi site mặc định đã hoạt động. Ghi lại:
+
+| Hạng mục           | Ví dụ                             | Cần xác nhận                         |
+| ------------------ | --------------------------------- | ------------------------------------ |
+| Pages URL hiện tại | `https://vinh.github.io/my-blog/` | build mới nhất trả `2xx`             |
+| Publishing source  | GitHub Actions hoặc branch        | ảnh hưởng cách xử lý file `CNAME`    |
+| GitHub owner       | user hoặc organization            | quyết định CNAME target và TXT name  |
+| Canonical hostname | `www.example.com`                 | chọn một hostname trước khi cấu hình |
+| DNS provider       | Cloudflare                        | `dig NS` khớp zone đang sửa          |
+| Record hiện tại    | A, AAAA, CNAME, wildcard, CAA     | backup trước khi thay                |
+| Astro config       | `site`, `base`                    | custom domain phải được build ở root |
+| Trang cũ           | origin/hosting cũ                 | còn chạy để rollback                 |
+
+Bạn cần quyền admin repository và quyền sửa DNS. Với organization, quyền verify
+domain nằm ở organization settings, không phải repository settings.
+
+<HostingDiagram
+  kind="github-pages"
+  caption="GitHub Pages chỉ phục vụ custom domain an toàn khi ownership, repository binding, DNS routing và certificate cùng khớp; thứ tự triển khai là một phần của security model"
+/>
+
+Hai phía phải đồng ý:
+
+- DNS nói “hostname này đi tới GitHub Pages”;
+- GitHub repository nói “site này được phép trả lời hostname đó”.
+
+Nếu publish DNS trước khi bind domain vào Pages, một repository khác có thể có
+cơ hội claim hostname. Vì vậy thứ tự không phải chi tiết hành chính.
+
+---
+
+## Chọn canonical: ưu tiên `www`
+
+GitHub hỗ trợ apex `example.com`, `www.example.com` và custom subdomain.
+GitHub khuyến nghị luôn cấu hình `www`, ngay cả khi dùng apex, vì CNAME `www`
+không phụ thuộc trực tiếp vào thay đổi IP của GitHub.
+
+Trong lab này:
+
+```text
+Canonical URL       https://www.example.com
+Alternate URL       https://example.com
+GitHub owner        USERNAME
+Default Pages host  USERNAME.github.io
+```
+
+Khi repository custom domain là `www.example.com` và DNS cho cả apex lẫn
+`www` đúng, GitHub Pages tự redirect apex về `www`. Nếu chọn apex làm custom
+domain, chiều redirect sẽ ngược lại.
+
+---
+
+## Bước 1 — verify domain ở account/organization trước
+
+Với personal account:
+
+1. GitHub profile → Settings.
+2. Pages → **Add a domain**.
+3. Nhập `example.com`.
+4. GitHub sinh một TXT name và token riêng.
+
+Record có hình dạng:
+
+| Type | Name                               | Content               | Proxy    |
+| ---- | ---------------------------------- | --------------------- | -------- |
+| TXT  | `_github-pages-challenge-USERNAME` | `TOKEN_DO_GITHUB_CAP` | DNS only |
+
+FQDN thực tế:
+
+```text
+_github-pages-challenge-USERNAME.example.com. IN TXT "TOKEN_DO_GITHUB_CAP"
+```
+
+Kiểm tra trước khi bấm Verify:
+
+```bash
+dig _github-pages-challenge-USERNAME.example.com \
+  +nostats +nocomments +nocmd TXT
+```
+
+Output phải chứa đúng token. GitHub nói thay đổi có thể tức thời hoặc mất tới
+24 giờ. Sau khi verify, **giữ TXT record**; xóa nó làm mất khả năng duy trì
+verification.
+
+Verify apex bảo vệ apex và các immediate subdomain như `www.example.com`,
+`docs.example.com` cho đúng GitHub owner. Nó không biến wildcard DNS thành an
+toàn.
+
+---
+
+## Bước 2 — bind custom domain vào repository trước routing DNS
+
+Repository → Settings → Pages → **Custom domain**, nhập:
+
+```text
+www.example.com
+```
+
+Rồi Save. GitHub bắt đầu DNS check và certificate workflow dựa trên binding
+này.
+
+Một nuance quan trọng:
+
+- nếu publish từ branch, GitHub lưu custom domain trong file `CNAME` ở root
+  publishing source;
+- nếu publish bằng **custom GitHub Actions workflow**, GitHub không tạo file
+  đó, file `CNAME` hiện có bị bỏ qua và không bắt buộc;
+- vì thế đừng coi `public/CNAME` là control plane cho Actions. Repository
+  Settings hoặc Pages API mới là nguồn cấu hình.
+
+Điều này cũng giải quyết sự khác biệt giữa một số Astro guide cũ và GitHub
+Pages hiện tại: với Actions, luôn bind domain trong Settings; không chỉ commit
+một file rồi hy vọng GitHub nhận.
+
+---
+
+## Bước 3 — sửa Astro cho URL root
+
+Project site mặc định thường ở `/repository-name/`:
+
+```js
+import { defineConfig } from 'astro/config';
+
+export default defineConfig({
+  site: 'https://USERNAME.github.io',
+  base: '/my-blog',
+});
+```
+
+Custom domain phục vụ ở root. Đổi thành:
+
+```js
+import { defineConfig } from 'astro/config';
+
+export default defineConfig({
+  site: 'https://www.example.com',
+});
+```
+
+Không giữ `base: '/my-blog'`, nếu không asset và internal link có thể vẫn sinh
+ra dưới `/my-blog/`. Build và kiểm tra local:
+
+```bash
+npm run build
+rg 'USERNAME.github.io|/my-blog/' dist
+```
+
+Một vài occurrence trong nội dung bài viết có thể hợp lệ; canonical URL,
+sitemap, asset URL và navigation không được phụ thuộc base path cũ.
+
+---
+
+## Bước 4 — publish DNS chính xác, vẫn DNS only
+
+GitHub hiện công bố bốn IPv4 cho apex:
+
+| Type  | Name  | Content              | Proxy    |
+| ----- | ----- | -------------------- | -------- |
+| A     | `@`   | `185.199.108.153`    | DNS only |
+| A     | `@`   | `185.199.109.153`    | DNS only |
+| A     | `@`   | `185.199.110.153`    | DNS only |
+| A     | `@`   | `185.199.111.153`    | DNS only |
+| CNAME | `www` | `USERNAME.github.io` | DNS only |
+
+CNAME phải trỏ thẳng tới `USERNAME.github.io` hoặc
+`ORGANIZATION.github.io`. Không thêm repository:
+
+```text
+Đúng:  USERNAME.github.io
+Sai:   USERNAME.github.io/my-blog
+Sai:   example.com
+```
+
+GitHub cũng hỗ trợ IPv6. Nếu bật, thêm **đủ bốn** AAAA và vẫn giữ A vì GitHub
+khuyến nghị IPv4 song song:
+
+| Type | Name | Content               | Proxy    |
+| ---- | ---- | --------------------- | -------- |
+| AAAA | `@`  | `2606:50c0:8000::153` | DNS only |
+| AAAA | `@`  | `2606:50c0:8001::153` | DNS only |
+| AAAA | `@`  | `2606:50c0:8002::153` | DNS only |
+| AAAA | `@`  | `2606:50c0:8003::153` | DNS only |
+
+Xóa parking/default record và mọi A/AAAA/ALIAS/ANAME xung đột ở apex. Ở
+`www`, không để thêm A hay CNAME khác.
+
+### CAA: chỉ sửa khi zone đã dùng CAA
+
+GitHub yêu cầu certificate từ Let's Encrypt. Nếu zone **không có CAA**, không
+cần tạo record chỉ để hoàn thành tutorial. Nếu đã có policy CAA hạn chế, ít
+nhất một record phải cho phép:
+
+```text
+example.com. IN CAA 0 issue "letsencrypt.org"
+```
+
+CAA sai có thể làm DNS check pass nhưng certificate vẫn không được cấp.
+
+### Vì sao chưa bật orange cloud?
+
+Cloudflare khuyến nghị onboarding/cutover bắt đầu với record unproxied cho tới
+khi certificate và origin path được xác nhận. DNS only còn giúp `dig` nhìn thấy
+đúng GitHub IP/CNAME trong lúc GitHub tự kiểm tra.
+
+Proxy Cloudflare **không bắt buộc** cho GitHub Pages. Giữ DNS only tạo topology
+đơn giản nhất: browser → GitHub Pages. Nếu bật proxy sau này, bạn thêm một lớp
+TLS, cache và redirect phải vận hành; chỉ làm sau khi GitHub certificate đã
+active, và dùng `Full (strict)` cho chặng Cloudflare → GitHub.
+
+---
+
+## Bước 5 — kiểm chứng DNS, routing và HTTPS
+
+```bash
+dig A example.com +noall +answer
+dig AAAA example.com +noall +answer
+dig CNAME www.example.com +noall +answer
+dig www.example.com +noall +answer
+```
+
+Kỳ vọng:
+
+- apex A trả đủ bốn IPv4;
+- AAAA rỗng nếu bạn chủ động không bật IPv6, hoặc trả đủ bốn địa chỉ;
+- `www` trả CNAME trực tiếp tới `USERNAME.github.io.`;
+- không thấy target hosting cũ.
+
+Sau đó kiểm tra HTTP:
+
+```bash
+curl -I http://example.com
+curl -I https://example.com
+curl -I https://www.example.com
+```
+
+Trước khi certificate sẵn sàng, HTTPS có thể chưa pass. Repository → Settings
+→ Pages sẽ hiển thị kết quả DNS check. GitHub cho biết tùy chọn **Enforce
+HTTPS** có thể mất tới 24 giờ mới khả dụng.
+
+Khi certificate active:
+
+1. bật **Enforce HTTPS**;
+2. xác nhận HTTP redirect sang HTTPS;
+3. xác nhận apex redirect sang `www`;
+4. kiểm tra certificate:
+
+```bash
+openssl s_client \
+  -connect www.example.com:443 \
+  -servername www.example.com </dev/null 2>/dev/null |
+  openssl x509 -noout -subject -issuer -dates
+```
+
+Cuối cùng mở DevTools Console/Network để tìm mixed content. HTTPS redirect
+không sửa asset hard-code `http://`.
+
+---
+
+## Failure modes và nguyên nhân thật
+
+### “Domain does not resolve to the GitHub Pages server”
+
+Thường có record apex dư, `www` trỏ sai target hoặc Cloudflare proxy đã bật quá
+sớm. Chuyển tất cả GitHub web records về DNS only và so sánh với bảng chính
+thức.
+
+### “Certificate not yet created”
+
+Kiểm tra theo thứ tự:
+
+1. custom domain còn bind trong repository;
+2. A/AAAA/CNAME không có record dư;
+3. CAA cho phép `letsencrypt.org`;
+4. domain đầy đủ ngắn hơn 64 ký tự;
+5. DNS public đã cập nhật.
+
+Sau khi sửa DNS, GitHub hướng dẫn có thể remove rồi add lại custom domain để
+khởi động lại provisioning. Chỉ làm khi routing record và ownership TXT đã
+đúng.
+
+### Apex chạy, `www` không chạy
+
+CNAME `www` phải trỏ tới `USERNAME.github.io`, không trỏ về apex. GitHub cảnh
+báo việc point custom subdomain về apex có thể làm HTTPS lỗi hoặc site không
+tới Pages.
+
+### HTML chạy nhưng CSS/JS 404
+
+Đây thường là `base` cũ của project Pages, không phải propagation. Kiểm tra
+`astro.config.*`, build output và asset URL.
+
+### Domain bị “taken”
+
+Verify domain ở user/organization settings. Nếu domain đã được một owner khác
+verify, chỉ DNS access không tự giải phóng được nó.
+
+### Wildcard nhìn tiện nhưng nguy hiểm
+
+Không tạo `*.example.com CNAME USERNAME.github.io`. GitHub cảnh báo wildcard có
+thể mở đường takeover cho hostname sâu hơn, kể cả khi apex đã verified.
+
+---
+
+## Rollback không để lại dangling domain
+
+Nếu cutover làm production lỗi:
+
+1. khôi phục A/AAAA/CNAME cũ tại Cloudflare;
+2. xác nhận site cũ bằng resolver công cộng và `curl`;
+3. giữ repository custom-domain binding cùng TXT verification trong thời gian
+   DNS cache chuyển về;
+4. khi traffic đã ổn ở origin cũ, mới remove custom domain khỏi repository nếu
+   thực sự không dùng nữa;
+5. giữ TXT verification nếu domain có khả năng quay lại GitHub Pages.
+
+Không remove binding trước rồi để DNS tiếp tục trỏ GitHub. Đó chính là dangling
+configuration tạo takeover risk.
+
+Nếu DNS/TLS ổn nhưng release mới lỗi, rollback deployment hoặc revert commit
+trong GitHub Actions sẽ ít blast radius hơn đổi DNS. Bài
+[GitHub Pages + Actions](/blog/github-pages-actions-deep-dive/) trình bày phần
+deployment.
+
+---
+
+## Checklist
+
+- [ ] Default Pages URL và build hiện tại hoạt động.
+- [ ] Đã chọn canonical apex hay `www`; bài này chọn `www`.
+- [ ] Domain được verify bằng TXT ở đúng user/organization và TXT được giữ lại.
+- [ ] Custom domain được bind trong repository **trước** routing DNS.
+- [ ] Astro `site` là custom domain và không còn project `base`.
+- [ ] Apex có đúng bốn A; AAAA chỉ dùng theo recipe chính thức.
+- [ ] `www` CNAME thẳng tới `USERNAME.github.io`, không có repo/path.
+- [ ] Không có wildcard hoặc record cùng tên xung đột.
+- [ ] CAA cho phép Let's Encrypt nếu zone đang dùng CAA.
+- [ ] Record giữ DNS only tới khi GitHub certificate active.
+- [ ] Enforce HTTPS, apex redirect, `www` và asset đều pass.
+- [ ] Origin cũ và record cũ còn đủ để rollback.
+
+## Bài tập
+
+1. Dùng một subdomain lab, thực hiện TXT verification nhưng chưa routing DNS;
+   giải thích vì sao bước này chưa làm thay đổi traffic.
+2. Build cùng một Astro repo với `base: '/repo'` và không có `base`, so sánh
+   asset URL trong `dist/index.html`.
+3. Thêm một CAA policy trong zone test, dùng `dig CAA example.com` để chứng
+   minh resolver thấy nó, rồi mô tả tác động tới certificate issuance.
+4. Viết teardown theo thứ tự ngược an toàn: DNS rời GitHub → chờ/verify → gỡ
+   repository binding, không để dangling CNAME.
+
+---
+
+## Nguồn chính thức, kiểm tra tháng 07/2026
+
+- [GitHub — Managing a custom domain](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/managing-a-custom-domain-for-your-github-pages-site)
+- [GitHub — Verifying a custom domain](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/verifying-your-custom-domain-for-github-pages)
+- [GitHub — Securing Pages with HTTPS](https://docs.github.com/en/pages/getting-started-with-github-pages/securing-your-github-pages-site-with-https)
+- [GitHub — About custom domains and takeover risk](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/about-custom-domains-and-github-pages)
+- [GitHub — Troubleshooting custom domains](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/troubleshooting-custom-domains-and-github-pages)
+- [Astro — Deploy to GitHub Pages](https://docs.astro.build/en/guides/deploy/github/)
+- [Astro — Configuration: `site` và `base`](https://docs.astro.build/en/guides/configuring-astro/)
+- [Cloudflare — Minimize downtime](https://developers.cloudflare.com/fundamentals/performance/minimize-downtime/)

@@ -1,0 +1,844 @@
+---
+title: 'Docker for Developers · Part 15 — Kubernetes Scheduling & Autoscaling'
+description: 'Hiểu scheduler, requests/limits, QoS, placement, topology spread, PDB và HPA v2; thực hành lỗi Pending, eviction và autoscaling.'
+pubDate: 2026-06-20
+tags: [kubernetes, scheduling, autoscaling, reliability, devops]
+series: docker
+seriesOrder: 15
+draft: false
+---
+
+Ở [Phần 14](/blog/docker-14-kubernetes-networking-internals/), bạn đã theo một request qua DNS, Service, EndpointSlice và NetworkPolicy. Nhưng trước khi Pod trở thành endpoint, scheduler phải tìm được node; khi node được bảo trì, workload phải chịu được eviction; khi tải tăng, HPA phải tạo đúng số replica mà cluster thực sự có chỗ chạy.
+
+Ba bài toán này nối liền nhau:
+
+```text
+requests + placement rules
+          │
+          ▼
+      scheduler ──► node ──► running Pod
+          ▲                       │
+          │                       │ metrics
+          │                       ▼
+      Pending Pod ◄── replicas ◄─ HPA
+                                  │
+                         rollout / drain / PDB
+```
+
+Scale từ 3 lên 10 không tạo thêm capacity nếu 7 Pod mới đều `Pending`. PDB không tạo high availability nếu bạn chỉ có một replica. Và CPU limit không phải lượng CPU scheduler “để dành”. Phần này xây mental model để đọc đúng các tín hiệu đó trước khi chỉnh YAML.
+
+> **Môi trường:** lab dùng kind multi-node để quan sát placement và eviction. Các “node” kind vẫn là container trên cùng một máy, nên bài lab không chứng minh rack/zone isolation, hiệu năng hay HA thực. HPA cần Metrics API, thường do Metrics Server cung cấp riêng.
+
+---
+
+## Scheduler thực sự làm gì?
+
+Khi một Pod mới chưa có `.spec.nodeName`, scheduler xử lý nó qua hai pha logic chính:
+
+1. **Filter:** loại node không đáp ứng điều kiện bắt buộc.
+2. **Score:** chấm điểm các node còn lại và chọn một node phù hợp.
+
+```text
+Pending Pod
+    │
+    ├─ filter: đủ CPU/memory request?
+    │          nodeSelector/required affinity khớp?
+    │          taint có toleration?
+    │          volume/topology constraint hợp lệ?
+    │
+    └─ score: preferred affinity, resource balance,
+              topology spread và plugin scheduler khác
+                           │
+                           ▼
+                         bind
+                           │
+                           ▼
+                 kubelet trên node chạy Pod
+```
+
+Scheduler dùng **desired state và accounting trong API**, đặc biệt là resource requests; nó không chọn node dựa trên ảnh chụp CPU “đang rảnh 80%” từ `kubectl top`. Sau khi Pod đã bind, một node khác có điểm đẹp hơn không làm scheduler tự di chuyển Pod đang chạy. Rebalancing cần rollout, descheduler hoặc một hành động khác có chủ đích.
+
+Xem scheduler đã quyết định gì:
+
+```bash
+kubectl get pods -o wide
+kubectl describe pod <pod>
+kubectl get events --field-selector involvedObject.name=<pod> \
+  --sort-by=.metadata.creationTimestamp
+kubectl describe nodes
+```
+
+Nếu không node nào qua filter, Pod giữ trạng thái `Pending` và event `FailedScheduling` giải thích các lý do như `Insufficient cpu`, taint không được tolerate hoặc node affinity không khớp.
+
+---
+
+## Requests, limits và QoS: ba câu hỏi khác nhau
+
+Một resource spec trả lời ba câu hỏi:
+
+- **Scheduler:** Pod cần bao nhiêu để được đặt lên node?
+- **Kernel/runtime:** process được dùng tối đa thế nào?
+- **Kubelet:** khi node thiếu tài nguyên, Pod nào dễ bị evict hơn?
+
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+```
+
+| Giá trị        | Scheduler                                                   | Khi chạy trên Linux                              |
+| -------------- | ----------------------------------------------------------- | ------------------------------------------------ |
+| CPU request    | Accounting để đặt Pod; tạo trọng số khi CPU tranh chấp      | Pod có thể burst nếu còn CPU và không chạm limit |
+| CPU limit      | Không phải input “nhu cầu tối thiểu”                        | Kernel throttle CPU, không kill vì dùng quá CPU  |
+| Memory request | Accounting để đặt Pod; ảnh hưởng eviction khi node pressure | Không phải trần cứng                             |
+| Memory limit   | Nếu không có request, có thể được copy thành request        | Enforce phản ứng; process có thể bị OOM kill     |
+
+Nếu chỉ khai báo limit mà không có request và không có admission policy đặt mặc định, Kubernetes dùng limit đó làm request. Đây là lý do một Pod “chỉ giới hạn 2 CPU” có thể không schedule trên node còn `1500m` allocatable.
+
+### Capacity khác allocatable
+
+Node giữ tài nguyên cho OS, kubelet và system daemons. Scheduler đặt workload theo `.status.allocatable`, không phải toàn bộ `.status.capacity`:
+
+```bash
+kubectl get nodes -o custom-columns='NAME:.metadata.name,CPU:.status.capacity.cpu,CPU-ALLOC:.status.allocatable.cpu,MEM:.status.capacity.memory,MEM-ALLOC:.status.allocatable.memory'
+kubectl describe node <node>
+```
+
+Trong `kubectl describe node`, mục **Allocated resources** cộng requests và limits của Pod. Tổng limit có thể vượt 100% vì overcommit; tổng request phải còn fit tại thời điểm schedule.
+
+### QoS và node-pressure eviction
+
+Kubernetes suy ra QoS class từ CPU/memory requests và limits:
+
+| QoS          | Điều kiện rút gọn                                       | Khi node pressure                                    |
+| ------------ | ------------------------------------------------------- | ---------------------------------------------------- |
+| `Guaranteed` | Mọi container có CPU + memory request bằng limit        | Ít bị ưu tiên evict nhất                             |
+| `Burstable`  | Có ít nhất một request/limit nhưng không đạt Guaranteed | Sau BestEffort, xét usage so với request và priority |
+| `BestEffort` | Không container nào có CPU/memory request hoặc limit    | Dễ là ứng viên eviction đầu tiên                     |
+
+```bash
+kubectl get pod <pod> -o jsonpath='{.status.qosClass}{"\n"}'
+```
+
+QoS không phải lá chắn tuyệt đối. Container vượt memory limit vẫn có thể `OOMKilled`; Pod Guaranteed vẫn có thể mất khi node hỏng hoặc không còn lựa chọn. Priority, usage so với request và loại pressure cũng tham gia quyết định.
+
+---
+
+## Lab cluster: nhiều node nhưng chung một failure domain
+
+Tạo một control-plane và hai worker để quan sát scheduler:
+
+```yaml
+# kind-scheduling.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+```
+
+```bash
+kind create cluster --name sched-lab --config kind-scheduling.yaml
+kubectl get nodes -o wide
+```
+
+Gắn label phục vụ lab:
+
+```bash
+kubectl label node sched-lab-worker \
+  workload-tier=general topology.kubernetes.io/zone=lab-a
+kubectl label node sched-lab-worker2 \
+  workload-tier=general topology.kubernetes.io/zone=lab-b
+```
+
+`lab-a` và `lab-b` chỉ là labels mô phỏng. Cả hai node vẫn chạy trên một laptop; tắt laptop làm cả “zone” biến mất.
+
+---
+
+## nodeSelector và node affinity
+
+`nodeSelector` là phép AND đơn giản, bắt buộc:
+
+```yaml
+spec:
+  template:
+    spec:
+      nodeSelector:
+        workload-tier: general
+```
+
+Node affinity biểu diễn rule phức tạp và preference:
+
+```yaml
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: workload-tier
+              operator: In
+              values: [general]
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 80
+        preference:
+          matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values: [lab-a]
+```
+
+- `required...` tham gia filter: không khớp thì `Pending`.
+- `preferred...` tham gia score: scheduler cố chọn, nhưng có thể dùng node khác.
+- `IgnoredDuringExecution` nghĩa là đổi label node sau khi Pod chạy không tự evict Pod đó.
+
+Đừng dùng label tùy ý để biểu diễn thuộc tính bảo mật mà user có thể tự sửa trên Node object. Với workload nhạy cảm, platform team cần kiểm soát quyền sửa node labels và dùng label keys phù hợp với cơ chế NodeRestriction.
+
+---
+
+## Taints và tolerations: repel, không phải attract
+
+Taint đặt trên node để **đẩy lùi** Pod không phù hợp:
+
+```bash
+kubectl taint node sched-lab-worker2 dedicated=batch:NoSchedule
+```
+
+Pod có toleration tương ứng được phép qua filter:
+
+```yaml
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: batch
+    effect: NoSchedule
+```
+
+Nhưng toleration không bắt Pod chạy trên node tainted; nó chỉ loại bỏ một lý do từ chối. Muốn workload batch **chỉ** vào pool batch, kết hợp toleration với node selector/affinity:
+
+```bash
+kubectl label node sched-lab-worker2 workload-tier=batch --overwrite
+```
+
+```yaml
+nodeSelector:
+  workload-tier: batch
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: batch
+    effect: NoSchedule
+```
+
+Ba effect thường gặp:
+
+- `NoSchedule`: Pod mới không được đặt nếu không tolerate; Pod đang chạy không bị đuổi.
+- `PreferNoSchedule`: preference mềm.
+- `NoExecute`: chặn Pod mới và có thể evict Pod đang chạy không tolerate; `tolerationSeconds` cho phép ở lại tạm thời.
+
+Taint không thay NetworkPolicy hay authorization. Nó là placement control, không phải ranh giới network/security hoàn chỉnh.
+
+---
+
+## Topology spread: phân bố replica theo failure domain
+
+Anti-affinity có thể ngăn hai replica ở cùng node, nhưng topology spread diễn đạt trực tiếp độ lệch cho phép giữa các domain:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: api
+      containers:
+        - name: api
+          image: registry.k8s.io/e2e-test-images/agnhost:2.39
+          command: ['/agnhost', 'serve-hostname', '--http=true', '--port=8080']
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+```
+
+- `topologyKey` chọn domain: hostname, zone hoặc label tổ chức tự quản lý.
+- `maxSkew: 1` giới hạn chênh lệch số Pod giữa domain đủ điều kiện.
+- `DoNotSchedule` là hard constraint; `ScheduleAnyway` chỉ ưu tiên giảm skew.
+- `labelSelector` phải khớp labels của chính Pod cần đếm. Selector sai tạo “ghost” trong phép tính spread.
+
+```bash
+kubectl get pods -l app=api \
+  -o custom-columns='POD:.metadata.name,NODE:.spec.nodeName,READY:.status.containerStatuses[0].ready'
+```
+
+Topology spread không tự di chuyển Pod sau scale-down hoặc khi node mới xuất hiện. Nó ảnh hưởng các quyết định schedule tiếp theo.
+
+---
+
+## Graceful termination: rời EndpointSlice trước khi process biến mất
+
+Một Pod production không chỉ cần start đúng; nó phải **dừng đúng**. Khi Pod bị xóa theo graceful termination, các cơ chế liên quan diễn ra trong khoảng grace period:
+
+```text
+Pod receives deletion timestamp
+          │
+          ├─ endpoint becomes terminating / normally not Ready
+          ├─ optional preStop hook runs
+          ├─ runtime sends TERM to main process
+          ├─ app stops accepting work and drains in-flight requests
+          └─ grace expires → remaining process receives KILL
+```
+
+Thứ tự chi tiết giữa propagation của endpoint, proxy và signal là distributed; đừng giả định mọi client ngừng gửi traffic ngay trong cùng millisecond. Application phải xử lý `SIGTERM`, dừng nhận việc mới và hoàn tất request đang chạy trong thời gian hữu hạn.
+
+```yaml
+spec:
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          # image, ports, probes...
+          lifecycle:
+            preStop:
+              exec:
+                command: ['/bin/sh', '-c', 'sleep 5']
+```
+
+`preStop` dùng chung grace period; hook treo 30 giây không để lại thời gian cho app drain. `sleep` chỉ minh họa propagation delay, không thay thế endpoint drain thật trong application. Image distroless có thể không có `/bin/sh` hoặc `sleep`.
+
+---
+
+## PodDisruptionBudget: budget cho eviction tự nguyện
+
+PDB giới hạn số Pod của workload được phép unavailable trong các **voluntary disruptions** đi qua Eviction API, ví dụ `kubectl drain`:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: api
+```
+
+Với Deployment ba replica, budget trên cho phép tối đa một replica unavailable tại một thời điểm. Nó giúp cluster operator drain node có kiểm soát, nhưng không mở rộng capacity và không sửa readiness fail.
+
+PDB **không** bảo vệ mọi deletion:
+
+- Node chết hoặc network partition là involuntary disruption; PDB không ngăn được.
+- `kubectl delete pod` trực tiếp không dùng Eviction API và có thể bypass PDB.
+- Xóa Deployment/StatefulSet cũng bypass.
+- Rolling update của workload controller bị chi phối bởi strategy của workload, không bị PDB giới hạn theo cách drain node bị giới hạn.
+
+PDB quá chặt có thể khóa bảo trì. Một Deployment một replica với `minAvailable: 1` không thể tự nguyện evict replica đó; `kubectl drain` sẽ retry hoặc timeout cho tới khi budget thay đổi/có replica thay thế.
+
+```bash
+kubectl get pdb
+kubectl describe pdb api
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data --timeout=30s
+kubectl uncordon <node>
+```
+
+Không dùng `--disable-eviction` hoặc force như phản xạ đầu tiên; chúng bỏ qua safety signal mà application owner đã khai báo.
+
+---
+
+## HPA v2: replica là output của một control loop
+
+HorizontalPodAutoscaler định kỳ đọc metric, tính desired replicas và cập nhật scale subresource của Deployment/StatefulSet. Công thức lõi:
+
+```text
+desiredReplicas = ceil(
+  currentReplicas × currentMetricValue / desiredMetricValue
+)
+```
+
+Ví dụ ba replica đang trung bình 120% target 60%:
+
+```text
+ceil(3 × 120 / 60) = 6 replicas
+```
+
+Controller thực tế còn xử lý Pod chưa Ready, missing metrics, tolerance và stabilization nên kết quả có thể bảo thủ hơn công thức đơn giản.
+
+### Metrics Server và request dependency
+
+CPU target kiểu `Utilization` là usage chia cho **CPU request**, không phải CPU limit và cũng không phải phần trăm toàn node. Nếu container liên quan thiếu CPU request, utilization của Pod không xác định và HPA không thể scale theo metric đó.
+
+```bash
+kubectl get apiservice v1beta1.metrics.k8s.io
+kubectl top pods
+kubectl describe hpa api
+```
+
+`metrics.k8s.io` thường do Metrics Server cung cấp, và Metrics Server phải được cài riêng nếu distribution chưa có. Nó phục vụ autoscaling/`kubectl top`, không phải hệ monitoring lịch sử thay cho Prometheus hay observability backend.
+
+### Manifest HPA có behavior rõ ràng
+
+Deployment target phải có request:
+
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+```
+
+Tạo một Service ổn định để client phát tải tới các replica của Deployment:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector:
+    app: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+```
+
+HPA:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 10
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 15 }
+        - { type: Pods, value: 4, periodSeconds: 15 }
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - { type: Percent, value: 25, periodSeconds: 60 }
+        - { type: Pods, value: 1, periodSeconds: 60 }
+      selectPolicy: Min
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+Scale-up ở đây phản ứng nhanh; scale-down giữ mức đề xuất cao nhất trong cửa sổ năm phút và giảm thận trọng. Điều này hạn chế flapping khi traffic vừa giảm lại tăng.
+
+Theo dõi control loop:
+
+```bash
+kubectl get hpa api -w
+kubectl describe hpa api
+kubectl get deployment api -w
+kubectl get pods -l app=api -o wide -w
+```
+
+### HPA không giải quyết mọi bottleneck
+
+- Database pool cạn nhưng CPU thấp: CPU HPA có thể không scale dù latency tăng.
+- HPA tạo replica nhưng scheduler không có capacity: replica mới `Pending`.
+- `maxReplicas` quá thấp: metric cao nhưng scale bị cap.
+- Startup chậm và readiness sai: HPA có thể phản ứng trên tập metric thiếu/không ổn định.
+- App giữ state local hoặc job không chia tải được: thêm replica không tăng throughput tuyến tính.
+
+Chọn metric theo bottleneck: CPU cho compute-bound; queue depth, concurrency hoặc request rate có thể phù hợp hơn với worker. Custom/external metrics cần adapter và pipeline riêng.
+
+---
+
+## Failure playbook: Pending, eviction và không scale
+
+### Pod Pending
+
+```bash
+kubectl describe pod <pending-pod>
+kubectl get events --field-selector involvedObject.name=<pending-pod> \
+  --sort-by=.metadata.creationTimestamp
+kubectl describe nodes
+```
+
+Đọc toàn bộ message `0/N nodes are available`: một Pod có thể đồng thời vướng request quá lớn, taint và affinity. Thêm toleration không sửa `Insufficient memory`.
+
+### Pod bị evict hoặc OOM
+
+```bash
+kubectl get pod <pod> -o yaml
+kubectl describe pod <pod>
+kubectl logs <pod> --previous
+kubectl get events --sort-by=.metadata.creationTimestamp
+```
+
+- `Reason: OOMKilled` trong container state thường chỉ memory limit/cgroup.
+- Pod phase `Failed`, reason `Evicted` và event node pressure là kubelet eviction.
+- Exit 137 có thể liên quan SIGKILL, nhưng đừng kết luận memory nếu chưa thấy `OOMKilled`/events.
+
+### HPA không scale
+
+```bash
+kubectl get hpa
+kubectl describe hpa api
+kubectl get apiservice v1beta1.metrics.k8s.io
+kubectl top pods
+kubectl get deployment api -o jsonpath='{.spec.template.spec.containers[*].resources.requests.cpu}{"\n"}'
+```
+
+Conditions như `AbleToScale`, `ScalingActive` và `ScalingLimited` nói rõ controller đang thiếu metric, bị giới hạn hay chưa thể cập nhật target.
+
+---
+
+## Bảng tra nhanh
+
+```bash
+# Scheduler / node accounting
+kubectl get pods -A -o wide
+kubectl describe pod <pod>
+kubectl describe node <node>
+kubectl get events --sort-by=.metadata.creationTimestamp
+
+# Placement
+kubectl get nodes --show-labels
+kubectl label node <node> workload-tier=general
+kubectl taint node <node> dedicated=batch:NoSchedule
+kubectl taint node <node> dedicated-
+
+# QoS / resource state
+kubectl get pod <pod> -o jsonpath='{.status.qosClass}{"\n"}'
+kubectl top nodes
+kubectl top pods
+
+# Disruption
+kubectl get pdb
+kubectl describe pdb <name>
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data --timeout=30s
+kubectl uncordon <node>
+
+# Autoscaling
+kubectl get hpa -w
+kubectl describe hpa <name>
+kubectl get apiservice v1beta1.metrics.k8s.io
+```
+
+---
+
+## Bài tập / Exercises
+
+Dùng cluster `sched-lab` ở trên. Dọn taint/cordon sau mỗi bài để failure mode không rò sang bài kế tiếp.
+
+**1. Impossible request:** tạo Pod request `100` CPU. Chứng minh scheduler nhìn request chứ không nhìn usage thấp của laptop; tìm event chính xác và sửa bằng manifest mới.
+
+<details>
+<summary>Lời giải</summary>
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: too-big
+spec:
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.10
+      resources:
+        requests:
+          cpu: '100'
+          memory: 32Mi
+```
+
+```bash
+kubectl apply -f too-big.yaml
+kubectl get pod too-big
+kubectl describe pod too-big
+kubectl get events --field-selector involvedObject.name=too-big \
+  --sort-by=.metadata.creationTimestamp
+kubectl describe nodes | sed -n '/Allocatable:/,/System Info:/p'
+
+kubectl delete pod too-big
+# đổi request thành 10m rồi apply lại
+kubectl apply -f too-big.yaml
+```
+
+Resource requests của Pod thường không phải field bạn “sửa đại” trên Pod trần trong mọi cluster/version. Với lab, delete/recreate làm desired state rõ ràng.
+
+</details>
+
+**2. Toleration không phải selector:** taint worker2 `dedicated=batch:NoSchedule`, tạo bốn replica chỉ có toleration. Quan sát chúng vẫn có thể chạy worker1. Sau đó thêm `nodeSelector: workload-tier=batch` để buộc placement.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl taint node sched-lab-worker2 dedicated=batch:NoSchedule
+kubectl label node sched-lab-worker2 workload-tier=batch --overwrite
+```
+
+Toleration cần có trong Pod template:
+
+```yaml
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: batch
+    effect: NoSchedule
+```
+
+```bash
+kubectl apply -f batch-toleration-only.yaml
+kubectl get pods -l app=batch -o wide
+```
+
+Sau đó thêm:
+
+```yaml
+nodeSelector:
+  workload-tier: batch
+```
+
+```bash
+kubectl apply -f batch-pinned.yaml
+kubectl rollout status deployment/batch
+kubectl get pods -l app=batch -o wide
+
+kubectl delete deployment batch
+kubectl taint node sched-lab-worker2 dedicated-
+kubectl label node sched-lab-worker2 workload-tier=general --overwrite
+```
+
+</details>
+
+**3. Topology spread:** deploy ba replica với `maxSkew: 1` theo hostname. Xác nhận phân bố 2/1 trên hai worker. Sau đó đổi `labelSelector` thành label không tồn tại và giải thích vì sao constraint không còn đếm đúng workload.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl apply -f api-spread.yaml
+kubectl rollout status deployment/api
+kubectl get pods -l app=api \
+  -o custom-columns='POD:.metadata.name,NODE:.spec.nodeName'
+```
+
+Đếm theo node:
+
+```bash
+kubectl get pods -l app=api -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort | uniq -c
+```
+
+Nếu `labelSelector` không khớp `app=api`, các Pod không được tính vào skew. Scheduler có thể tích nhiều replica cùng domain vì constraint đang quan sát một tập rỗng/khác. Sửa selector rồi rollout lại.
+
+</details>
+
+**4. PDB boundary:** tạo Deployment một replica và PDB `minAvailable: 1`. Drain node chứa Pod với timeout ngắn; chứng minh eviction bị chặn. Sau khi uncordon, xóa Pod trực tiếp và quan sát PDB không ngăn thao tác đó.
+
+<details>
+<summary>Lời giải</summary>
+
+```yaml
+# pdb-demo.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pdb-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pdb-demo
+  template:
+    metadata:
+      labels:
+        app: pdb-demo
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 50m, memory: 32Mi }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-demo
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: pdb-demo
+```
+
+```bash
+kubectl apply -f pdb-demo.yaml
+kubectl rollout status deployment/pdb-demo
+NODE=$(kubectl get pod -l app=pdb-demo -o jsonpath='{.items[0].spec.nodeName}')
+
+kubectl drain "$NODE" \
+  --ignore-daemonsets --delete-emptydir-data --timeout=20s || true
+kubectl describe pdb pdb-demo
+kubectl uncordon "$NODE"
+
+POD=$(kubectl get pod -l app=pdb-demo -o jsonpath='{.items[0].metadata.name}')
+kubectl delete pod "$POD"
+kubectl get pods -l app=pdb-demo -w
+```
+
+Drain dùng Eviction API và tôn trọng PDB. Direct delete bypass PDB; Deployment chỉ tự tạo replacement sau khi Pod đã bị xóa.
+
+</details>
+
+**5. HPA `TARGETS: <unknown>`:** tạo HPA CPU cho Deployment thiếu CPU request. Dùng conditions/events tìm nguyên nhân; sau đó thêm request, tạo load và quan sát scale. Nếu Metrics API chưa có, phân biệt lỗi pipeline với lỗi request.
+
+<details>
+<summary>Lời giải</summary>
+
+Đầu tiên, bỏ `requests` khỏi container để chủ động tái hiện lỗi, rồi apply HPA đã lưu ở `hpa.yaml`:
+
+```bash
+kubectl patch deployment api --type=json \
+  -p='[{"op":"remove","path":"/spec/template/spec/containers/0/resources/requests"}]'
+kubectl rollout status deployment/api
+kubectl apply -f hpa.yaml
+```
+
+```bash
+kubectl get apiservice v1beta1.metrics.k8s.io
+kubectl top pods
+kubectl describe hpa api
+kubectl get deployment api -o yaml
+```
+
+Nếu APIService không tồn tại/không Available, cài Metrics Server theo manifest/chart chính thức phù hợp cluster rồi chờ:
+
+```bash
+kubectl get apiservice v1beta1.metrics.k8s.io -w
+```
+
+Đặt CPU request trên container target:
+
+```bash
+kubectl set resources deployment/api -c=api \
+  --requests=cpu=100m,memory=64Mi \
+  --limits=cpu=500m,memory=256Mi
+kubectl rollout status deployment/api
+kubectl get hpa api -w
+```
+
+Lưu Service `api` ở phần manifest HPA thành `api-service.yaml`, apply nó rồi tạo load bằng client tạm:
+
+```bash
+kubectl apply -f api-service.yaml
+```
+
+```bash
+kubectl run load-generator --rm -it --restart=Never \
+  --image=busybox:1.37 -- \
+  /bin/sh -c 'while sleep 0.01; do wget -q -O- http://api/ >/dev/null; done'
+```
+
+Ở terminal khác:
+
+```bash
+kubectl get hpa,pods -w
+kubectl describe hpa api
+```
+
+Sau khi dừng load, scale-down có thể chờ stabilization window; đó là behavior mong muốn, không phải controller bị treo.
+
+</details>
+
+**6. Scale nhưng vẫn Pending:** giới hạn mỗi replica request CPU lớn hơn phần allocatable còn lại, rồi tạo load để HPA tăng desired replicas. Chứng minh HPA hoạt động nhưng scheduler không có capacity.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+kubectl set resources deployment/api -c=api \
+  --requests=cpu=1500m,memory=64Mi \
+  --limits=cpu=1500m,memory=256Mi
+kubectl rollout status deployment/api --timeout=60s || true
+kubectl get hpa,pods -o wide
+kubectl describe pod <pending-pod>
+kubectl describe hpa api
+```
+
+Nếu cluster đủ lớn, tăng request đến mức chỉ một replica fit mỗi worker. Expected evidence là desired replica của HPA tăng trong khi event Pod báo `Insufficient cpu`. Cách sửa có thể là right-size request, thêm node capacity hoặc đổi scaling model; tăng `maxReplicas` không tạo CPU.
+
+</details>
+
+---
+
+## Điểm chính
+
+- Scheduler filter bằng requests và hard constraints, rồi score các node còn lại; nó không dùng usage tức thời để đặt Pod.
+- CPU request, CPU limit, memory request và memory limit có semantics khác nhau; CPU bị throttle, memory có thể OOM kill.
+- QoS ảnh hưởng eviction nhưng không bảo đảm Pod miễn nhiễm với failure.
+- Toleration cho phép vào node tainted; node selector/affinity mới thu hút hoặc bắt buộc placement.
+- Topology spread giúp đặt replica qua domain nhưng không tự biến kind thành HA hay rebalance Pod cũ.
+- Graceful termination cần app xử lý TERM, readiness đúng và grace period thực tế.
+- PDB chỉ giới hạn voluntary eviction qua Eviction API; nó không chặn mọi deletion, rollout hay node failure.
+- HPA CPU cần Metrics API và CPU request; scale replica không đồng nghĩa cluster có capacity để schedule chúng.
+
+---
+
+## Tài liệu chính thức
+
+- [Kubernetes scheduler](https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/)
+- [Resource management for Pods and containers](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
+- [Pod Quality of Service classes](https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/)
+- [Assigning Pods to Nodes](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+- [Taints and Tolerations](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+- [Pod Topology Spread Constraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/)
+- [Pod lifecycle and termination](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+- [Disruptions and PodDisruptionBudget](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/)
+- [Horizontal Pod Autoscaling](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/)
+- [Kubernetes Metrics Server](https://github.com/kubernetes-sigs/metrics-server)
+- [kind multi-node configuration](https://kind.sigs.k8s.io/docs/user/configuration/#nodes)
+
+---
+
+## Tiếp theo
+
+**[Phần 16 — Kubernetes Stateful Workloads & Storage](/blog/docker-16-kubernetes-stateful-storage/)** — nối Pod identity với PV/PVC, StorageClass và StatefulSet, rồi kiểm chứng backup/restore thay vì gọi volume là “bền” theo cảm tính.

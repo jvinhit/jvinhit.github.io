@@ -1,0 +1,453 @@
+---
+title: 'Domain, DNS & Hosting · Phần 2 — Records, Delegation & Propagation'
+description: 'Đọc và sửa DNS zone như một kỹ sư vận hành: record types, apex, delegation, TTL, cache, negative caching, verification và rollback.'
+pubDate: 2026-07-11
+tags: [hosting, domain, dns, devops, cloudflare, hosting_dns_10]
+series: hosting-dns
+seriesOrder: 2
+lang: vi
+draft: false
+---
+
+import HostingDiagram from '../../components/blog/HostingDiagram.astro';
+
+Kết thúc phần này, bạn sẽ đọc được một DNS zone thay vì chỉ nhận ra vài chữ A,
+CNAME. Quan trọng hơn, bạn sẽ biết **câu trả lời nào đang authoritative, cache
+nào còn giữ dữ liệu cũ và khi nào chờ đợi là hợp lý**.
+
+Ta sẽ làm rõ bốn thứ thường bị trộn lẫn:
+
+1. record mô tả một hostname như thế nào;
+2. parent zone delegate quyền trả lời cho nameserver ra sao;
+3. TTL kiểm soát cache chứ không phải một đồng hồ “deploy” toàn cầu;
+4. cách chứng minh thay đổi đúng bằng `dig`, thay vì refresh browser liên tục.
+
+> Các ví dụ dùng `example.com`, IPv4 `192.0.2.0/24` và IPv6 `2001:db8::/32`
+> được dành riêng cho tài liệu. Hãy thay bằng giá trị chính thức của hạ tầng
+> khi thực hành.
+
+---
+
+## Mental model: record là một mệnh đề có thời hạn cache
+
+Một DNS record có thể hình dung như tuple:
+
+```text
+(owner/name, type, value/rdata, TTL)
+```
+
+Ví dụ:
+
+```text
+example.com.  300  IN  A  192.0.2.10
+```
+
+Nó nói: trong Internet class (`IN`), owner `example.com.` có địa chỉ IPv4
+`192.0.2.10`; recursive resolver được cache câu trả lời tối đa 300 giây kể từ
+lúc nhận.
+
+Dấu chấm cuối trong `example.com.` biểu thị một **FQDN** — tên đầy đủ từ node
+tới DNS root. Dashboard thường ẩn dấu chấm và dùng tên tương đối:
+
+| UI nhập                | Trong zone `example.com` thường được hiểu là |
+| ---------------------- | -------------------------------------------- |
+| `@`                    | `example.com.` — zone apex                   |
+| `www`                  | `www.example.com.`                           |
+| `_dmarc`               | `_dmarc.example.com.`                        |
+| `selector1._domainkey` | `selector1._domainkey.example.com.`          |
+
+UI của từng provider có thể tự nối suffix hoặc yêu cầu FQDN. Luôn xem preview
+record sau khi lưu; đừng đoán cách dashboard chuẩn hóa tên.
+
+---
+
+## Delegation: parent chỉ đường, authoritative trả lời
+
+<HostingDiagram
+  kind="dns-delegation"
+  caption="Recursive resolver đi từ root tới .com, nhận delegation của example.com rồi hỏi authoritative nameserver để lấy record cuối cùng"
+/>
+
+Khi resolver chưa có cache và cần A record của `www.example.com`, flow rút gọn:
+
+1. root server chỉ resolver tới nameserver của `.com`;
+2. `.com` trả delegation: nameserver nào có quyền cho `example.com`;
+3. resolver hỏi một authoritative nameserver đó;
+4. authoritative server trả CNAME/A/AAAA hoặc một câu trả lời không tồn tại;
+5. resolver cache từng dữ liệu theo TTL và trả kết quả cho client.
+
+Hai nơi có NS nhưng chức năng không giống nhau:
+
+- **NS ở parent/registrar** tạo delegation cho zone. Đây là thứ phải đổi khi
+  chuyển authoritative DNS provider.
+- **NS trong child zone** cùng SOA mô tả authority của zone. Với setup chuẩn,
+  tập NS ở parent và child phải nhất quán.
+- **NS record cho một subdomain** có thể delegate `docs.example.com` thành zone
+  riêng. Nó không phải cách đổi nameserver cho apex.
+
+Nếu parent trỏ tới nameserver không phục vụ zone, bạn có **lame delegation**:
+đường chỉ dẫn tồn tại nhưng nơi đến không chịu trả lời authoritative.
+
+Kiểm tra delegation từ gốc:
+
+```bash
+dig NS example.com +trace
+```
+
+Đừng chỉ nhìn dòng cuối. Hãy tìm đoạn `.com` trả NS nào cho `example.com`, rồi
+xem chính những NS đó có trả SOA/record hay không.
+
+---
+
+## Bộ record cần thành thạo
+
+### A và AAAA — hostname tới địa chỉ
+
+```text
+@      A      192.0.2.10
+@      AAAA   2001:db8::10
+```
+
+- A chứa IPv4.
+- AAAA chứa IPv6.
+
+Chỉ thêm AAAA nếu origin thật sự phục vụ IPv6. Một AAAA cũ có thể khiến client
+ưu tiên IPv6 đi vào server chết trong khi bạn kiểm tra A và thấy hoàn toàn đúng.
+
+### CNAME — một tên là alias của tên khác
+
+```text
+www    CNAME  example.com.
+```
+
+Resolver theo CNAME rồi tiếp tục lấy A/AAAA của target. Theo mô hình DNS chuẩn,
+một owner có CNAME không được đồng thời có A, MX, TXT hay dữ liệu khác. Vì vậy:
+
+```text
+www  CNAME  example.com.
+www  TXT    "verification=abc"   # xung đột tại cùng owner
+```
+
+Apex cần SOA và NS, nên CNAME thuần ở apex gây xung đột. Một số provider cung
+cấp **ALIAS/ANAME** hoặc **CNAME flattening** để cho UX giống CNAME nhưng trả
+A/AAAA tổng hợp. Đây là tính năng provider, không phải lý do để mặc định mọi
+DNS đều nhận CNAME ở `@`.
+
+### MX — định tuyến email
+
+```text
+@      MX     10 mail.example.com.
+mail   A      192.0.2.25
+```
+
+Số nhỏ hơn có priority cao hơn. Target MX phải là hostname có địa chỉ, không
+phải một IP được nhập trực tiếp. Theo vận hành tốt, target MX cũng không nên là
+alias CNAME. Nếu dùng Cloudflare, hostname mail phải để **DNS only** trừ khi bạn
+dùng một sản phẩm proxy mail được thiết kế riêng.
+
+### TXT — policy và proof
+
+TXT thường mang:
+
+- SPF ở apex;
+- DKIM tại `<selector>._domainkey`;
+- DMARC tại `_dmarc`;
+- verification token cho Google, GitHub, Microsoft hoặc SaaS khác.
+
+```text
+@                     TXT  "v=spf1 ip4:192.0.2.25 -all"
+selector1._domainkey  TXT  "v=DKIM1; k=rsa; p=PUBLIC_KEY..."
+_dmarc                TXT  "v=DMARC1; p=none"
+```
+
+TXT dài có thể được DNS server chia thành nhiều quoted string nhưng client sẽ
+ghép lại. Đừng tự xuống dòng hoặc sửa khoảng trắng trong key nếu provider không
+hướng dẫn.
+
+### CAA — CA nào được phép cấp certificate
+
+```text
+@   CAA   0 issue "letsencrypt.org"
+```
+
+CAA không tự cấp TLS. Nó giới hạn Certificate Authority nào được phép cấp.
+Nếu đổi platform dùng CA khác mà giữ CAA quá chặt, DNS và HTTP có thể đúng nhưng
+certificate issuance vẫn fail.
+
+### SRV, NS, SOA và PTR
+
+- **SRV** mô tả service, protocol, port, priority và target; thường gặp ở SIP,
+  chat hoặc service discovery.
+- **NS** chỉ authoritative nameserver của zone/delegated subzone.
+- **SOA** chứa metadata quản trị, serial và timer của zone; mỗi zone có một SOA.
+- **PTR** ánh xạ IP về hostname trong reverse zone. Chủ sở hữu dải IP, thường là
+  cloud/VPS provider, mới có quyền quản lý; thêm PTR vào forward zone không tạo
+  reverse DNS.
+
+---
+
+## Zone mẫu hoàn chỉnh
+
+Dạng zone-file dưới đây là mô hình để đọc, không phải file production:
+
+```text
+$ORIGIN example.com.
+$TTL 300
+
+@                       IN  A      192.0.2.10
+@                       IN  AAAA   2001:db8::10
+www                     IN  CNAME  example.com.
+
+mail                    IN  A      192.0.2.25
+@                       IN  MX     10 mail.example.com.
+@                       IN  TXT    "v=spf1 ip4:192.0.2.25 -all"
+selector1._domainkey    IN  TXT    "v=DKIM1; k=rsa; p=PUBLIC_KEY..."
+_dmarc                  IN  TXT    "v=DMARC1; p=none"
+
+@                       IN  CAA    0 issue "letsencrypt.org"
+```
+
+Trước khi migration, bảng inventory tối thiểu cần các cột:
+
+```text
+type | full name | value | priority | TTL | proxy status | service owner
+```
+
+Cột `service owner` giúp bạn biết hỏi ai khi một TXT lạ xuất hiện. Xóa token
+“không biết dùng làm gì” là cách làm hỏng verification âm thầm.
+
+---
+
+## TTL không phải thời gian propagation cố định
+
+TTL nói resolver **được giữ câu trả lời bao lâu tính từ lúc nó cache**. Không có
+một tiến trình trung tâm đẩy record mới tới mọi máy trên thế giới.
+
+Giả sử A record có TTL 14.400 giây:
+
+```text
+10:00 Resolver A vừa cache bản cũ, còn gần 4 giờ
+10:05 Bạn đổi A record ở authoritative DNS
+10:06 Resolver B chưa từng hỏi, nhận bản mới ngay
+10:30 Resolver A vẫn trả bản cũ hợp lệ theo cache
+14:00 Resolver A hết TTL, hỏi lại và nhận bản mới
+```
+
+Vì vậy câu “DNS propagation mất đúng 24 giờ” không chính xác. Thời gian quan sát
+phụ thuộc TTL cũ, thời điểm từng resolver cache, negative cache, delegation và
+hành vi của resolver.
+
+### Hạ TTL phải làm trước
+
+Nếu hạ TTL từ 14.400 xuống 300 đúng lúc cutover, resolver đã cache giá trị cũ
+vẫn được giữ nó tới khi **TTL cũ** hết. Muốn chuẩn bị:
+
+1. hạ TTL ít nhất một TTL cũ trước cửa sổ thay đổi;
+2. xác nhận authoritative trả TTL mới;
+3. chờ đủ cửa sổ;
+4. mới đổi target;
+5. sau khi ổn định, nâng TTL lại nếu cần.
+
+### Negative caching
+
+Nếu client hỏi `new.example.com` trước khi bạn tạo record và nhận `NXDOMAIN`,
+resolver có thể cache cả câu “không tồn tại”. Thời gian này liên quan metadata
+SOA/negative caching, không phải TTL của record vừa được tạo sau đó.
+
+Flush cache trên laptop chỉ tác động laptop. Recursive resolver của ISP hoặc
+public DNS vẫn giữ cache riêng. Cloudflare cũng cảnh báo rõ điều này trong tài
+liệu troubleshooting.
+
+### NS change có thêm cache của delegation
+
+Đổi A trong cùng zone và đổi nameserver là hai loại thay đổi khác nhau. NS
+migration liên quan parent delegation, cache NS/glue và đôi khi DNSSEC DS. Vì
+vậy nó cần runbook riêng ở Phần 3.
+
+---
+
+## Đọc `dig` như một kỹ sư vận hành
+
+### 1. Hỏi authoritative trực tiếp
+
+Đầu tiên lấy nameserver:
+
+```bash
+dig NS example.com +short
+```
+
+Sau đó thay `ns-authoritative.example` bằng giá trị thật:
+
+```bash
+dig @ns-authoritative.example example.com A +norecurse
+```
+
+Một response minh họa:
+
+```text
+;; flags: qr aa; QUERY: 1, ANSWER: 1
+example.com.  300  IN  A  192.0.2.10
+```
+
+- flag `aa` nghĩa là authoritative answer;
+- `ANSWER: 1` cho biết có một record trả về;
+- `300` là TTL tại thời điểm authoritative trả lời;
+- nếu authoritative trả sai, chờ cache không giúp được: sửa zone trước.
+
+### 2. So sánh public recursive resolvers
+
+```bash
+dig @1.1.1.1 example.com A +noall +answer
+dig @8.8.8.8 example.com A +noall +answer
+```
+
+Nếu authoritative đã là `192.0.2.10` nhưng một resolver vẫn trả IP cũ với TTL
+đang đếm xuống, đó là cache hợp lệ. Nếu response là `SERVFAIL`, đừng gắn nhãn
+“chưa propagation”; kiểm tra DNSSEC, delegation và authoritative availability.
+
+### 3. Kiểm tra mọi đường có thể đưa traffic đi
+
+```bash
+dig example.com A +noall +answer
+dig example.com AAAA +noall +answer
+dig www.example.com CNAME +noall +answer
+dig example.com MX +noall +answer
+dig example.com TXT +noall +answer
+dig _dmarc.example.com TXT +noall +answer
+dig example.com CAA +noall +answer
+```
+
+Một hostname có cả A và AAAA có hai đường tới origin. Mail có cả MX và các TXT
+policy. Chỉ kiểm tra A là chưa đủ để kết luận zone khỏe.
+
+### 4. Phân biệt DNS-only và proxied
+
+Khi A/CNAME được Cloudflare proxy, public resolver thường trả IP anycast của
+Cloudflare, không trả `192.0.2.10` của origin. Muốn xác nhận origin value, xem
+dashboard/API hoặc tạm dùng record DNS-only trong giai đoạn được kiểm soát;
+đừng kết luận record sai chỉ vì public answer khác origin IP.
+
+---
+
+## Runbook đổi một DNS record an toàn
+
+### T-1 TTL cũ: chuẩn bị
+
+- Lưu current value, TTL, A/AAAA liên quan và ảnh dashboard.
+- Hạ TTL nếu change cần cutover nhanh.
+- Dựng target mới và test bằng `curl --resolve` hoặc hostname tạm.
+- Bảo đảm target cũ tiếp tục phục vụ trong cửa sổ cache.
+
+### T0: thay đổi
+
+- Chỉ đổi một logical target.
+- Không đồng thời bật proxy, redirect và xóa origin cũ.
+- Query authoritative trực tiếp ngay sau save.
+
+### T+N: xác minh theo lớp
+
+```bash
+dig @<authoritative-ns> example.com A +noall +answer
+dig @1.1.1.1 example.com A +noall +answer
+dig @8.8.8.8 example.com A +noall +answer
+curl -Iv https://example.com/
+```
+
+Thay placeholder bằng NS thật; không paste dấu `< >` vào shell. Ghi lại thời
+gian, value và TTL còn lại. DNS đúng chỉ là gate đầu; HTTP status, TLS và health
+của ứng dụng mới chứng minh user flow hoàn chỉnh.
+
+### Hoàn tất
+
+- Theo dõi error rate, access log và certificate.
+- Giữ target cũ qua ít nhất cửa sổ TTL cũ đã quan sát.
+- Nâng TTL lại nếu chiến lược vận hành yêu cầu.
+- Cập nhật runbook/inventory, không để dashboard là tài liệu duy nhất.
+
+---
+
+## Failure modes và cách phân biệt
+
+| Lỗi                             | Dấu hiệu                                       | Hành động đúng                                          |
+| ------------------------------- | ---------------------------------------------- | ------------------------------------------------------- |
+| CNAME và TXT/A cùng owner       | provider từ chối hoặc behavior không nhất quán | tách hostname hoặc dùng verification method khác        |
+| CNAME loop                      | resolver trả `SERVFAIL`/không có answer cuối   | lần theo từng CNAME target, phá vòng lặp                |
+| AAAA cũ                         | lỗi chủ yếu trên mạng hỗ trợ IPv6              | sửa/xóa AAAA hoặc làm origin IPv6 hoạt động             |
+| Apex CNAME không được hỗ trợ    | UI reject hoặc mất NS/SOA semantics            | dùng A/AAAA hoặc tính năng flattening/ALIAS có tài liệu |
+| MX trỏ nhầm/thiếu mail A        | web khỏe nhưng không nhận mail                 | query MX rồi resolve từng target                        |
+| Xóa TXT “lạ”                    | SaaS mất verification hoặc mail fail DKIM      | đối chiếu service owner trước khi xóa                   |
+| Hạ TTL quá muộn                 | một nhóm user vẫn đi target cũ                 | giữ cả hai target, đợi TTL cũ thực sự hết               |
+| Authoritative đúng, browser sai | recursive/local cache hoặc layer HTTP          | so sánh resolver, rồi kiểm tra TLS/HTTP riêng           |
+| `SERVFAIL` sau migration        | DS/DNSSEC hoặc delegation lỗi                  | `dig DS`, `dig +trace`; không chỉ chờ                   |
+
+---
+
+## Rollback không xóa được cache đã phát ra
+
+Nếu target mới lỗi và bạn restore record cũ ở authoritative DNS, resolver đã
+cache target mới vẫn có thể giữ nó tới TTL của bản mới. Vì vậy rollback thực sự
+an toàn cần:
+
+- origin cũ chưa bị hủy;
+- TTL được chuẩn bị trước;
+- target mới có thể ngưng nhận traffic hoặc trả maintenance an toàn;
+- cả cũ và mới tương thích với dữ liệu trong giai đoạn split traffic;
+- tiêu chí rollback được quyết định trước, ví dụ error rate hoặc health check.
+
+DNS không phải transaction toàn cầu. Trong một khoảng thời gian, hai câu trả lời
+cùng tồn tại ở các cache khác nhau là trạng thái bình thường phải thiết kế cho.
+
+---
+
+## Checklist review một zone
+
+- [ ] Parent delegation và child NS nhất quán.
+- [ ] Apex có đúng A/AAAA hoặc provider-supported flattening.
+- [ ] `www` có record hoặc redirect rõ ràng.
+- [ ] Không có CNAME cùng owner với record khác.
+- [ ] Không còn A/AAAA của origin cũ ngoài ý muốn.
+- [ ] MX target resolve được và mail host để DNS only.
+- [ ] SPF, DKIM, DMARC, verification TXT được inventory.
+- [ ] CAA cho phép CA mà platform thực sự dùng.
+- [ ] TTL phù hợp với cửa sổ thay đổi sắp tới.
+- [ ] Có ảnh/export và rollback value trước khi sửa.
+
+---
+
+## Bài tập thực hành
+
+1. Viết FQDN mà UI sẽ tạo từ các Name `@`, `www`, `_dmarc` và
+   `s1._domainkey` trong zone `lab.example.com`.
+2. Giả sử A có TTL 14.400 giây và cutover lúc 20:00. Lập timeline hạ TTL xuống
+   300 sao cho resolver đã cache bản cũ có cơ hội hết hạn trước cutover.
+3. Tạo một bảng zone giả cho website, API và email. Cố tình thêm AAAA cũ và
+   CNAME/TXT cùng owner, sau đó review để tìm hai lỗi.
+4. Chạy `dig +trace` cho domain thật, query authoritative trực tiếp và hai public
+   resolver. Giải thích sự khác biệt giữa TTL authoritative và TTL đang đếm
+   xuống ở resolver.
+
+---
+
+## Điều cốt lõi
+
+DNS record là dữ liệu có owner, type, value và TTL; delegation quyết định server
+nào có quyền cung cấp dữ liệu đó. “Propagation” không phải một làn sóng được đẩy
+đi, mà là nhiều cache độc lập hết hạn ở thời điểm khác nhau. Một thay đổi tốt
+luôn bắt đầu bằng inventory, được chứng minh ở authoritative, so sánh qua
+recursive resolver và kết thúc ở TLS/HTTP.
+
+Phần 3 sẽ áp dụng toàn bộ mental model này để chuyển một domain đăng ký tại
+Hostinger sang Cloudflare authoritative DNS mà không làm rơi website hoặc mail.
+
+---
+
+## Nguồn chính thức
+
+- [Cloudflare DNS — DNS record types](https://developers.cloudflare.com/dns/manage-dns-records/reference/dns-record-types/)
+- [Cloudflare DNS — Time to Live](https://developers.cloudflare.com/dns/manage-dns-records/reference/ttl/)
+- [Cloudflare DNS — General DNS issues and negative caching](https://developers.cloudflare.com/dns/troubleshooting/dns-issues/)
+- [IETF RFC 1034 — Domain Names: Concepts and Facilities](https://datatracker.ietf.org/doc/html/rfc1034)
+- [IETF RFC 1035 — Domain Names: Implementation and Specification](https://datatracker.ietf.org/doc/html/rfc1035)
+- [IETF RFC 2308 — Negative Caching of DNS Queries](https://datatracker.ietf.org/doc/html/rfc2308)
+- [IETF RFC 5737 — IPv4 Address Blocks Reserved for Documentation](https://datatracker.ietf.org/doc/html/rfc5737)
+- [IETF RFC 3849 — IPv6 Address Prefix Reserved for Documentation](https://datatracker.ietf.org/doc/html/rfc3849)

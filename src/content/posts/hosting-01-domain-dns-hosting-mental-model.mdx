@@ -1,0 +1,366 @@
+---
+title: 'Domain, DNS & Hosting · Phần 1 — Mental Model từ tên miền đến server'
+description: 'Hiểu đúng registrar, nameserver, DNS zone, hosting, origin và CDN; sau đó trỏ tên miền theo runbook có thể kiểm tra và rollback.'
+pubDate: 2026-07-11
+tags: [hosting, domain, dns, devops, cloudflare, hosting_dns_10]
+series: hosting-dns
+seriesOrder: 1
+lang: vi
+draft: false
+---
+
+import HostingDiagram from '../../components/blog/HostingDiagram.astro';
+
+Kết thúc bài này, bạn sẽ không còn sửa DNS theo kiểu “thử A, thử CNAME rồi
+đợi xem sao”. Bạn sẽ có một mô hình đủ rõ để:
+
+- biết **đăng nhập ở đâu** khi cần đổi domain, nameserver hay IP;
+- lần theo đường đi từ `https://example.com` tới đúng server;
+- phân biệt lỗi DNS, lỗi hosting, lỗi TLS và lỗi ứng dụng;
+- trỏ tên miền (hay “map domain”) vào shared hosting, VPS hoặc static hosting
+  theo cùng một runbook;
+- thay đổi có kiểm chứng và luôn giữ một đường rollback.
+
+Đây là nền móng của cả series. Nếu mental model sai, một dashboard đẹp đến mấy
+cũng chỉ giúp bạn làm sai nhanh hơn.
+
+> Lab trong bài dùng `example.com`, domain được IANA dành riêng cho tài liệu,
+> và `192.0.2.10`, địa chỉ thuộc dải TEST-NET-1. Chúng **không phải** tài
+> nguyên production. Khi thực hành, thay bằng domain và IP thật do nhà cung cấp
+> của bạn cấp.
+
+---
+
+## Một website public là năm hệ thống ghép lại
+
+Người mới thường gọi tất cả là “hosting”. Trong thực tế, ít nhất năm control
+plane độc lập đang phối hợp:
+
+<HostingDiagram
+  kind="mental-model"
+  caption="Registrar giữ quyền quản lý domain; registry công bố delegation; authoritative DNS giữ zone; edge có thể proxy traffic; origin hosting chạy nội dung thật"
+/>
+
+| Lớp                        | Nó quản lý điều gì?                                                                                     | Thao tác điển hình                                              |
+| -------------------------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| **Registrant/Registrar**   | Registrant giữ quyền sử dụng domain; registrar quản lý đăng ký, ngày hết hạn, contact, delegation và DS | gia hạn, khóa transfer, đổi nameserver, quản lý DNSSEC ở parent |
+| **Registry**               | Cơ sở dữ liệu của TLD như `.com`, nối domain với registrar và nameserver                                | thường không thao tác trực tiếp; registrar cập nhật thay bạn    |
+| **Authoritative DNS**      | Zone chứa A, AAAA, CNAME, MX, TXT…                                                                      | trỏ hostname, mail, verification và subdomain                   |
+| **Edge/CDN/reverse proxy** | Điểm vào public trước origin                                                                            | TLS edge, cache, WAF, DDoS protection, redirect                 |
+| **Origin/hosting**         | File hoặc ứng dụng thật                                                                                 | virtual host, deploy, process, database, TLS origin             |
+
+Một công ty có thể bán nhiều lớp cùng lúc. Hostinger có thể vừa là registrar,
+DNS provider, email provider và hosting provider. Cloudflare có thể vừa là
+authoritative DNS vừa là reverse proxy. Điều đó tiện, nhưng **vai trò vẫn tách
+biệt**.
+
+Ví dụ bạn mua `example.com` tại Hostinger, chuyển nameserver sang Cloudflare,
+nhưng website vẫn nằm trên Hostinger:
+
+```text
+Quyền sử dụng; đăng ký/gia hạn  Registrant; Hostinger Registrar
+Delegation nameserver       cấu hình tại Hostinger
+Authoritative DNS zone      Cloudflare
+Edge proxy                  Cloudflare, nếu bật orange cloud
+Origin chứa website         Hostinger Web Hosting
+```
+
+Sau khi đổi delegation, sửa A record trong hPanel cũ không còn tác dụng với
+Internet. Hostinger vẫn là registrar và hosting provider, nhưng Cloudflare mới
+là nơi trả lời DNS có thẩm quyền.
+
+---
+
+## Domain, hostname, URL và zone không phải một thứ
+
+Với URL:
+
+```text
+https://blog.example.com:443/posts/dns?lang=vi#ttl
+\____/ \______________/ \_/ \________/ \______/ \__/
+scheme      hostname    port    path      query   fragment
+```
+
+- **Domain** `example.com` là tên đã đăng ký dưới TLD `.com`.
+- **Hostname** `blog.example.com` là một tên máy/dịch vụ cụ thể trong domain.
+- **Apex** hay root/naked domain là `example.com`, không có `www` phía trước.
+- **Subdomain** là phần được thêm vào, như `www`, `blog`, `api` hoặc `mail`.
+- **URL** còn chứa protocol, port, path, query và fragment; DNS chỉ quan tâm
+  hostname.
+- **DNS zone** là ranh giới quản trị. Zone `example.com` thường giữ record cho
+  apex và các subdomain, trừ khi một subdomain được delegate thành zone riêng.
+
+Ký hiệu `@` trong nhiều DNS dashboard chỉ có nghĩa là **apex của zone hiện
+tại**. Nó không phải một hostname được gửi qua DNS.
+
+---
+
+## Nameserver trả lời “đọc zone ở đâu”
+
+Đây là chỗ gây nhiều sự cố nhất:
+
+- Đổi **nameserver tại registrar** là đổi nơi cả Internet tìm authoritative
+  DNS của domain.
+- Thêm **A/CNAME trong DNS zone** là đổi câu trả lời cho một hostname.
+- Thêm một NS record tùy ý vào zone **không thay thế** thao tác delegation tại
+  registrar cho apex domain.
+
+Giả sử parent zone `.com` công bố:
+
+```text
+example.com.  NS  <assigned-one>.ns.cloudflare.com.
+example.com.  NS  <assigned-two>.ns.cloudflare.com.
+```
+
+Resolver sẽ hỏi hai nameserver đó về `www.example.com`. Vì vậy, bản ghi bạn
+nhìn thấy trong dashboard Hostinger chỉ có hiệu lực nếu delegation hiện vẫn trỏ
+tới authoritative nameserver của Hostinger.
+
+Bạn có thể xem nơi đang có quyền trả lời bằng:
+
+```bash
+dig NS example.com +short
+dig NS example.com +trace
+```
+
+`+short` cho cái nhìn nhanh, còn `+trace` lần theo root → `.com` → delegation
+của `example.com`. Khi debug migration, kết quả từ parent/delegation đáng tin
+hơn việc nhìn một DNS checker không rõ đang cache gì.
+
+Muốn hiểu sâu resolver, authoritative server, TTL và chuỗi phân giải, đọc thêm
+[Network Programming · Part 4 — DNS & Addressing](/blog/net-04-dns-and-addressing/).
+
+---
+
+## Từ URL tới đúng process trên server
+
+Khi người dùng mở `https://example.com/products`, đường đi rút gọn là:
+
+1. Browser lấy hostname `example.com` từ URL.
+2. Recursive resolver tìm A/AAAA, có thể trả từ cache hoặc hỏi authoritative
+   DNS.
+3. Browser kết nối TCP hoặc QUIC tới IP nhận được ở port 443.
+4. Trong TLS handshake, browser gửi SNI để edge/origin chọn đúng certificate.
+5. Trong HTTP, `Host: example.com` giúp web server chọn đúng virtual host.
+6. Nginx, hosting platform hoặc static host trả file hay chuyển request vào app.
+
+DNS chỉ đưa client tới **địa chỉ**. Nó không biết thư mục nào chứa website,
+process Node chạy port nào hay certificate có hợp lệ không.
+
+Vì thế một A record hoàn toàn đúng vẫn có thể cho:
+
+- trang mặc định của Nginx vì `server_name` chưa khớp;
+- `404 Unknown domain` vì chưa thêm custom domain ở hosting provider;
+- lỗi certificate vì TLS chưa cấp cho hostname;
+- `502 Bad Gateway` vì reverse proxy không tới được app;
+- website cũ vì resolver vẫn giữ record cũ theo TTL.
+
+Mental model hữu ích nhất khi debug là tách từng lớp: **delegation → DNS answer
+→ network/TLS → HTTP routing → application**.
+
+---
+
+## Một zone mẫu có chủ đích
+
+Ta dùng origin giả `192.0.2.10` và mail server giả `192.0.2.25`:
+
+| Type  | Name     | Content                      | Ý nghĩa                              |
+| ----- | -------- | ---------------------------- | ------------------------------------ |
+| A     | `@`      | `192.0.2.10`                 | apex đi tới IPv4 của web origin      |
+| CNAME | `www`    | `example.com`                | `www` là alias của apex              |
+| A     | `mail`   | `192.0.2.25`                 | địa chỉ của mail host                |
+| MX    | `@`      | `10 mail.example.com`        | nhận mail qua mail host, priority 10 |
+| TXT   | `@`      | `v=spf1 ip4:192.0.2.25 -all` | ví dụ SPF tối giản                   |
+| TXT   | `_dmarc` | `v=DMARC1; p=none`           | ví dụ DMARC ở chế độ quan sát        |
+
+Nếu dùng Cloudflare, record web A/CNAME có thể chuyển sang **Proxied** sau khi
+zone và TLS đã ổn. Record mail, MX và các record xác minh nên để **DNS only**;
+Cloudflare proxy thông thường không phải proxy SMTP.
+
+Đừng copy zone mẫu này vào production. SPF, DKIM, DMARC, MX và CAA phải lấy từ
+đúng email/certificate provider của bạn.
+
+---
+
+## Ba cách trỏ tên miền thường gặp
+
+### Shared hosting
+
+Nhà cung cấp cho bạn IP hoặc target. Trình tự thường là:
+
+1. thêm `example.com` vào hosting plan để platform biết domain này thuộc site
+   nào;
+2. tạo A/AAAA hoặc CNAME tại authoritative DNS;
+3. thêm `www` hoặc redirect theo canonical hostname;
+4. chờ/trigger cấp TLS và kiểm tra cả HTTP lẫn HTTPS.
+
+Nếu chỉ làm bước 2, request tới đúng máy nhưng shared server có thể không biết
+site nào phải trả lời.
+
+### VPS
+
+DNS A/AAAA trỏ tới public IP chỉ là cửa đầu tiên. VPS còn cần:
+
+- firewall/security group mở 80 và 443;
+- process hoặc reverse proxy đang listen;
+- virtual host `server_name example.com www.example.com`;
+- TLS certificate;
+- app phía sau khỏe và không chỉ bind vào interface sai.
+
+### GitHub Pages hoặc static hosting
+
+Static provider thường yêu cầu **hai phía cùng xác nhận**:
+
+- thêm custom domain trong dashboard/repository;
+- thêm record chính xác tại authoritative DNS.
+
+Không tự suy luận apex phải dùng CNAME. Apex và `www` thường có hướng dẫn khác
+nhau; hãy dùng đúng record hiện tại do provider công bố. Phần sau của series sẽ
+làm trọn flow GitHub Pages với Cloudflare.
+
+---
+
+## Runbook an toàn cho mọi lần trỏ tên miền
+
+### 1. Chụp trạng thái trước khi sửa
+
+Ghi lại:
+
+- registrar, ngày hết hạn và trạng thái domain;
+- nameserver hiện tại;
+- toàn bộ DNS zone, kể cả MX/TXT/CAA/SRV và subdomain ít dùng;
+- IP/target hiện tại, TTL và proxy status;
+- nơi đang host web, mail và các dịch vụ xác minh domain.
+
+Không dùng `dig ANY` làm bản inventory. DNS không có cơ chế public đáng tin cậy
+để liệt kê toàn bộ zone; hãy export hoặc chụp từ DNS provider và đối chiếu với
+cấu hình của từng dịch vụ.
+
+### 2. Chứng minh origin hoạt động độc lập với DNS
+
+Với IP thật của origin, có thể ép `curl` kết nối tới IP đó nhưng vẫn gửi đúng
+hostname:
+
+```bash
+curl --resolve example.com:443:192.0.2.10 \
+  https://example.com/ -I
+```
+
+Với lab này command sẽ không trả website vì TEST-NET không được dùng làm public
+origin. Trên hạ tầng thật:
+
+- `2xx/3xx` và certificate đúng hostname: origin/TLS đã sẵn sàng;
+- lỗi certificate: origin chưa có cert phù hợp;
+- `404`/site mặc định: virtual host hoặc custom-domain binding sai;
+- timeout/refused: kiểm tra firewall, port và process trước khi đụng DNS.
+
+### 3. Xác định nơi authoritative trước khi edit
+
+```bash
+dig NS example.com +short
+```
+
+Chỉ sửa zone ở provider tương ứng với delegation hiện tại. Nếu đang chuẩn bị
+đổi nameserver, dựng zone mới hoàn chỉnh **trước** khi cutover.
+
+### 4. Thực hiện một thay đổi logic
+
+Tránh cùng lúc đổi nameserver, đổi IP, bật proxy và đổi redirect. Mỗi biến thêm
+vào làm rollback khó hơn. Với migration quan trọng, bắt đầu DNS only, giữ origin
+cũ sống và bật proxy sau khi DNS mới ổn định.
+
+### 5. Kiểm tra từ trong ra ngoài
+
+```bash
+# Delegation đang trỏ tới đâu?
+dig NS example.com +trace
+
+# Authoritative mới trả gì? Thay bằng NS thật được provider gán.
+dig @<authoritative-ns> example.com A +noall +answer
+
+# Hai public resolver đang cache gì?
+dig @1.1.1.1 example.com A +noall +answer
+dig @8.8.8.8 example.com A +noall +answer
+
+# HTTP/TLS cuối đường có hoạt động không?
+curl -I https://example.com/
+```
+
+Không paste nguyên `<authoritative-ns>` vào shell; dấu ngoặc là placeholder.
+Kết quả authoritative đúng nhưng public resolver cũ thường nghĩa là cache chưa
+hết TTL. Authoritative đã sai thì chờ không sửa được gì: phải sửa zone.
+
+### 6. Giữ rollback cho tới khi đủ tín hiệu
+
+Đừng xóa site cũ, zone cũ hoặc certificate cũ ngay khi laptop của bạn mở được.
+Giữ chúng ít nhất qua cửa sổ TTL và thời gian quan sát thực tế của hệ thống.
+Rollback tốt là đổi lại một quyết định đã ghi chép, không phải cố nhớ config
+cũ lúc production đang lỗi.
+
+---
+
+## Những failure mode cần nhận ra ngay
+
+| Triệu chứng                   | Khả năng cao                                  | Kiểm tra đầu tiên                                |
+| ----------------------------- | --------------------------------------------- | ------------------------------------------------ |
+| `NXDOMAIN`                    | thiếu record hoặc hỏi nhầm authoritative zone | `dig +trace`, query authoritative trực tiếp      |
+| `SERVFAIL` sau đổi NS         | DNSSEC/DS cũ hoặc delegation lỗi              | `dig DS`, `dig +dnssec`, kiểm tra registrar      |
+| Apex đúng, `www` lỗi          | thiếu record/redirect cho `www`               | `dig www.example.com A/CNAME`                    |
+| Một số mạng vào IP cũ         | cache chưa hết TTL hoặc AAAA cũ               | so sánh nhiều resolver, kiểm tra cả A và AAAA    |
+| Website đúng nhưng mail chết  | bỏ sót MX/SPF/DKIM/DMARC khi chuyển zone      | query từng record mail, test gửi và nhận         |
+| DNS đúng nhưng trang mặc định | hosting chưa bind custom domain               | `curl --resolve`, virtual host/dashboard hosting |
+| Chỉ HTTPS lỗi                 | certificate/SNI/SSL mode                      | `curl -Iv`, kiểm tra edge và origin cert         |
+| Edit Hostinger không đổi gì   | nameserver đã trỏ sang provider khác          | `dig NS +trace`                                  |
+
+Flush DNS trên laptop chỉ xóa cache **của laptop**. Nó không ép recursive
+resolver của ISP hay toàn Internet quên dữ liệu còn TTL.
+
+---
+
+## Checklist trước khi bấm Save
+
+- [ ] Tôi biết registrar và authoritative DNS hiện tại là ai.
+- [ ] Tôi đã lưu toàn bộ zone cũ, không chỉ A/CNAME của website.
+- [ ] Origin/custom domain đã được cấu hình trước khi đổi DNS.
+- [ ] Giá trị dùng trong bài đã được thay bằng IP/target chính thức của provider.
+- [ ] Tôi đã kiểm tra cả apex, `www`, A, AAAA và mail records.
+- [ ] Thay đổi nameserver và thay đổi record được xem là hai việc khác nhau.
+- [ ] Tôi biết command nào chứng minh từng lớp hoạt động.
+- [ ] Zone/site cũ vẫn còn để rollback.
+
+---
+
+## Bài tập thực hành
+
+1. Với một domain bạn sở hữu, lập bảng năm lớp: registrar, registry/TLD,
+   authoritative DNS, edge và origin. Một công ty có thể xuất hiện nhiều dòng.
+2. Chạy `dig NS <domain> +trace`, tìm đoạn parent zone delegate sang
+   authoritative nameserver. So sánh với dashboard nơi bạn vẫn thường sửa DNS.
+3. Chọn một hostname public, lấy cả A và AAAA. Dùng `curl -Iv` và giải thích lỗi
+   thuộc DNS, TLS, HTTP routing hay application.
+4. Viết rollback cho việc đổi origin IP: cấu hình nào phải giữ, tín hiệu nào
+   kích hoạt rollback và command nào xác nhận đã quay về.
+
+---
+
+## Điều cốt lõi
+
+Domain không “trỏ thẳng vào hosting” bằng một nút thần kỳ. Registrar công bố
+delegation, authoritative DNS trả record, client kết nối tới edge/origin, TLS
+chọn certificate và HTTP server chọn website. Khi bạn gọi đúng tên từng lớp,
+việc trỏ tên miền tới Hostinger, VPS, GitHub Pages hay Cloudflare chỉ còn là
+thay target và
+quy trình xác minh — không còn là đoán.
+
+Phần 2 sẽ đi sâu vào record, delegation, TTL và bản chất thật của
+“propagation” để bạn đọc được mọi DNS zone trước khi sửa nó.
+
+---
+
+## Nguồn chính thức
+
+- [Cloudflare DNS — Concepts](https://developers.cloudflare.com/dns/concepts/)
+- [Cloudflare DNS — Nameservers](https://developers.cloudflare.com/dns/nameservers/)
+- [IANA — Reserved Domains](https://www.iana.org/domains/reserved)
+- [IETF RFC 5737 — IPv4 Address Blocks Reserved for Documentation](https://datatracker.ietf.org/doc/html/rfc5737)
+- [IETF RFC 3849 — IPv6 Address Prefix Reserved for Documentation](https://datatracker.ietf.org/doc/html/rfc3849)

@@ -1,0 +1,381 @@
+---
+title: 'Domain, DNS & Hosting · Phần 7 — Trỏ domain về VPS với Nginx reverse proxy'
+description: 'Runbook production để trỏ domain về VPS: kiểm kê DNS, khóa port, đặt Nginx trước app loopback, cấp TLS công khai, test bằng curl --resolve và rollback an toàn.'
+pubDate: 2026-07-11
+tags:
+  [hosting, domain, dns, vps, nginx, reverse-proxy, tls, devops, hosting_dns_10]
+series: hosting-dns
+seriesOrder: 7
+lang: vi
+draft: false
+---
+
+import HostingDiagram from '../../components/blog/HostingDiagram.astro';
+
+Trỏ một bản ghi `A` về IP của VPS chỉ mất vài giây. Đưa một ứng dụng lên VPS sao cho **đúng domain, đúng virtual host, có HTTPS, không lộ port nội bộ và rollback được** mới là phần quan trọng.
+
+Sau bài này, bạn sẽ có một đường đi production rõ ràng:
+
+```text
+example.com:443 → Nginx → 127.0.0.1:3000 → application
+```
+
+Nginx là tiến trình duy nhất nhận HTTP/HTTPS từ Internet. Application, database và các service quản trị không được mở trực tiếp ra ngoài.
+
+> Toàn bộ địa chỉ trong bài là địa chỉ dành cho tài liệu: IPv4 `203.0.113.10` thuộc TEST-NET-3 và IPv6 `2001:db8:100::10` thuộc prefix documentation. Đừng copy chúng vào DNS thật; thay bằng IP được nhà cung cấp VPS cấp cho bạn.
+
+## Kết quả mục tiêu
+
+Ta giả sử:
+
+| Thành phần   | Giá trị minh họa                            |
+| ------------ | ------------------------------------------- |
+| Domain       | `example.com`, `www.example.com`            |
+| IPv4 VPS mới | `203.0.113.10`                              |
+| IPv6 VPS mới | `2001:db8:100::10`                          |
+| Backend      | `127.0.0.1:3000`                            |
+| Public ports | TCP 80 và 443                               |
+| SSH          | Chỉ mở theo chính sách quản trị của bạn     |
+| Database     | Loopback hoặc private network, không public |
+
+<HostingDiagram
+  kind="vps-origin"
+  caption="Domain phân giải về VPS; Nginx nhận traffic public rồi proxy tới ứng dụng chỉ lắng nghe trên loopback"
+/>
+
+DNS trả lời câu hỏi **đi tới máy nào**. Nginx dùng SNI/`Host` để chọn **site nào trên máy đó**. `proxy_pass` chuyển request tới **process nào**. Ba lớp này độc lập: DNS đúng vẫn có thể gặp default site; Nginx đúng vẫn có thể trả `502` nếu app chết.
+
+## 1. Inventory trước khi thay đổi
+
+Đừng bắt đầu từ dashboard DNS. Hãy ghi lại trạng thái có thể rollback:
+
+```bash
+dig example.com A +noall +answer
+dig example.com AAAA +noall +answer
+dig www.example.com CNAME +noall +answer
+dig example.com CAA +noall +answer
+curl -sS -o /dev/null -w '%{http_code} %{remote_ip} %{url_effective}\n' https://example.com/
+```
+
+Lưu thêm:
+
+- provider đang quản lý authoritative DNS và TTL hiện tại;
+- IP origin cũ, cấu hình `www` và redirect canonical;
+- mọi record `AAAA` đang tồn tại;
+- health endpoint cùng các route quan trọng cần test;
+- vị trí log, lệnh restart và phiên bản release đang chạy;
+- quyền SSH/sudo, firewall của OS và firewall/security group của nhà cung cấp;
+- CA nào được CAA cho phép cấp certificate;
+- cách khôi phục database nếu release mới có migration.
+
+Nếu website đang live, hạ TTL **trước ít nhất một chu kỳ TTL cũ**. Phần 10 sẽ xử lý cutover zero-downtime đầy đủ; ở đây ta tập trung dựng origin mới đúng chuẩn.
+
+## 2. Làm application khỏe trên loopback trước
+
+Ứng dụng phải có một endpoint nhẹ, không phụ thuộc dịch vụ bên thứ ba:
+
+```bash
+curl -fsS http://127.0.0.1:3000/healthz
+# expected: HTTP 200, process is ready to receive traffic
+```
+
+### Nếu chạy bằng systemd
+
+Một unit tối thiểu có thể trông như sau:
+
+```ini
+# /etc/systemd/system/example-app.service
+[Unit]
+Description=example.com application
+After=network.target
+
+[Service]
+Type=simple
+User=example-app
+Group=example-app
+WorkingDirectory=/srv/example-app/current
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=3000
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now example-app
+sudo systemctl status example-app --no-pager
+sudo journalctl -u example-app -n 100 --no-pager
+```
+
+`Restart=on-failure` giúp process hồi phục sau lỗi bất ngờ, nhưng không thay cho monitoring. Nếu app khởi động sai cấu hình rồi crash-loop, systemd chỉ lặp lại lỗi nhanh hơn; log vẫn là nguồn sự thật.
+
+### Nếu chạy bằng Docker
+
+`EXPOSE 3000` chỉ là metadata. `ports` mới publish port ra host. Bind vào loopback của host:
+
+```yaml
+services:
+  app:
+    image: ghcr.io/example/app:2026-07-11
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:3000:3000'
+    environment:
+      NODE_ENV: production
+```
+
+Không dùng `3000:3000` nếu không thật sự muốn toàn Internet chạm thẳng app. Docker cảnh báo port publish mặc định có thể truy cập từ bên ngoài; bind `127.0.0.1` giữ boundary `Internet → Nginx → app`.
+
+Kiểm tra boundary thay vì đoán:
+
+```bash
+sudo ss -ltnp
+curl -fsS http://127.0.0.1:3000/healthz
+```
+
+Kỳ vọng: `:3000` chỉ hiện ở `127.0.0.1` hoặc Unix socket; database cũng không lắng nghe trên `0.0.0.0`. Phần [Docker, SSH & remote files](/blog/dev-cli-09-docker-ssh-remote-files/) đi sâu hơn về thao tác server từ xa.
+
+## 3. Đặt Nginx làm public entry point
+
+Tạo server block HTTP trước để test routing và phục vụ ACME HTTP-01 nếu bạn chọn cách cấp certificate đó:
+
+```nginx
+# /etc/nginx/sites-available/example.com
+server {
+    listen 80;
+    listen [::]:80;
+    server_name example.com www.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/example.com /etc/nginx/sites-enabled/example.com
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+`server_name` không phải trang trí. Nginx chọn virtual server theo địa chỉ/port rồi theo SNI hoặc `Host`; gọi thẳng IP thường đi vào default server. Đó là lý do test đúng domain quan trọng hơn `curl http://203.0.113.10`.
+
+Phần [Nginx reverse proxy & load balancing](/blog/nginx-03-reverse-proxy-and-load-balancing/) giải thích sâu `proxy_pass`, dấu `/` cuối URI, WebSocket và upstream pool. Ở đây ta giữ config ngắn để nhìn rõ boundary vận hành.
+
+## 4. Mở đúng port, không tự khóa SSH
+
+VPS thường có hai lớp lọc: firewall/security group của provider và firewall trong OS. Cả hai phải cho phép 80/443. Trên Ubuntu với UFW:
+
+```bash
+sudo ufw status verbose
+sudo ufw app list
+
+# Cho phép SSH hiện tại TRƯỚC khi enable firewall.
+# Dùng profile/port đúng với cấu hình của chính bạn.
+sudo ufw allow OpenSSH
+sudo ufw allow 'Nginx Full'
+sudo ufw enable
+sudo ufw status numbered
+```
+
+Giữ phiên SSH hiện tại mở và thử đăng nhập bằng terminal thứ hai trước khi đóng phiên cũ. Nếu SSH dùng port tùy chỉnh hoặc chỉ cho phép VPN/IP quản trị, thêm rule tương ứng thay vì copy mù `OpenSSH`.
+
+Baseline public:
+
+| Port           | Ai được truy cập           | Lý do                              |
+| -------------- | -------------------------- | ---------------------------------- |
+| 80/tcp         | Internet                   | HTTP redirect và/hoặc ACME HTTP-01 |
+| 443/tcp        | Internet                   | HTTPS                              |
+| SSH            | IP/VPN quản trị nếu có thể | Vận hành                           |
+| 3000/tcp       | Loopback                   | Backend application                |
+| 5432/3306/6379 | Private/loopback           | Database/cache, không public       |
+
+Ngoài UFW, kiểm tra cả control panel VPS. Một security group chặn 443 sẽ trông giống lỗi Nginx dù `ufw status` hoàn toàn đúng.
+
+## 5. Test origin trước khi cutover bằng `curl --resolve`
+
+Ta chưa cần đổi DNS để kiểm Nginx theo đúng `Host`:
+
+```bash
+curl --resolve example.com:80:203.0.113.10 \
+  -i http://example.com/healthz
+
+curl --resolve www.example.com:80:203.0.113.10 \
+  -i http://www.example.com/
+```
+
+`--resolve host:port:IP` chỉ override lookup trong lần chạy curl; URL và `Host` vẫn là `example.com`. Đây là bài test chính xác cho virtual host và không ảnh hưởng người dùng.
+
+Trên VPS, đối chiếu cùng lúc:
+
+```bash
+sudo tail -f /var/log/nginx/access.log /var/log/nginx/error.log
+sudo journalctl -fu example-app
+```
+
+Bạn cần thấy request đi qua Nginx và xuất hiện ở application log. Nếu Nginx trả `502`, test `curl http://127.0.0.1:3000/healthz` ngay trên VPS; DNS chưa liên quan.
+
+## 6. Cấp certificate công khai
+
+Có hai đường an toàn:
+
+1. **DNS-01 trước cutover:** ACME client tạo TXT challenge trong DNS. Cách này có thể cấp certificate khi A record public vẫn trỏ origin cũ.
+2. **HTTP-01 sau khi DNS trỏ VPS:** port 80 phải tới đúng Nginx và challenge path không bị app chặn.
+
+Với Certbot và plugin Nginx, sau khi domain đã phân giải tới VPS và port 80 hoạt động:
+
+```bash
+sudo certbot --nginx -d example.com -d www.example.com
+sudo nginx -t
+sudo certbot renew --dry-run
+```
+
+Không chạy lệnh cấp certificate trước khi inventory CAA. Nếu zone có CAA nhưng không cho phép CA bạn chọn, issuance sẽ thất bại dù DNS A và port 80 đúng.
+
+Sau khi certificate được cài, kiểm origin trực tiếp qua TLS:
+
+```bash
+curl --resolve example.com:443:203.0.113.10 \
+  -sS -o /dev/null -D - https://example.com/healthz
+
+openssl s_client \
+  -connect 203.0.113.10:443 \
+  -servername example.com \
+  -verify_return_error </dev/null
+```
+
+Kết quả cần có: handshake thành công, certificate chưa hết hạn, SAN chứa `example.com`, chain hợp lệ, health endpoint trả `200`. Xem [Nginx TLS, security & performance](/blog/nginx-04-tls-security-and-performance/) để hiểu certificate chain, redirect HTTPS và security headers thay vì copy một khối TLS dài thiếu ngữ cảnh.
+
+## 7. Cutover DNS và xử lý IPv6 đúng cách
+
+Khi origin đã pass acceptance test, tạo hoặc cập nhật:
+
+| Type         | Name  | Content                | Điều kiện                       |
+| ------------ | ----- | ---------------------- | ------------------------------- |
+| A            | `@`   | IPv4 thật của VPS      | Bắt buộc nếu phục vụ IPv4       |
+| A hoặc CNAME | `www` | VPS hoặc `example.com` | Theo canonical design           |
+| AAAA         | `@`   | IPv6 thật của VPS      | Chỉ khi IPv6 được route và test |
+| AAAA/CNAME   | `www` | Tương ứng              | Chỉ khi thực sự phục vụ IPv6    |
+
+**Xóa AAAA cũ** nếu VPS mới không có IPv6. Client dual-stack có thể ưu tiên IPv6; một AAAA stale tạo lỗi “máy tôi vào được, điện thoại người khác không vào được” rất khó chịu.
+
+```bash
+dig example.com A @1.1.1.1 +short
+dig example.com AAAA @1.1.1.1 +short
+dig www.example.com A @8.8.8.8 +short
+
+curl -4 -sS -o /dev/null -w '%{http_code} %{remote_ip}\n' https://example.com/
+curl -6 -sS -o /dev/null -w '%{http_code} %{remote_ip}\n' https://example.com/
+```
+
+Nếu không publish AAAA, `curl -6` thất bại vì không có đường IPv6 là bình thường. Nếu có AAAA, `curl -6` phải pass như IPv4; không xem IPv6 là “best effort”.
+
+## 8. Acceptance matrix production
+
+| Check         | Lệnh                                      | Pass nghĩa là gì                         |
+| ------------- | ----------------------------------------- | ---------------------------------------- |
+| App local     | `curl -fsS http://127.0.0.1:3000/healthz` | Process sẵn sàng                         |
+| Nginx config  | `sudo nginx -t`                           | Syntax và file include hợp lệ            |
+| Port boundary | `sudo ss -ltnp`                           | Chỉ 80/443 public, app/DB private        |
+| Origin HTTP   | `curl --resolve ...:80:IP`                | `server_name` và proxy đúng              |
+| Origin TLS    | `curl --resolve ...:443:IP`               | SNI, certificate, proxy đúng             |
+| Public DNS    | `dig A/AAAA @1.1.1.1`                     | Resolver thấy record mong muốn           |
+| Public HTTP   | `curl -I http://example.com`              | Một redirect hợp lệ tới HTTPS            |
+| Public HTTPS  | `curl -fsS https://example.com/healthz`   | End-to-end trả `200`                     |
+| Logs          | Nginx + app logs                          | Không tăng 5xx, request tới đúng release |
+
+Đừng chỉ mở homepage bằng browser của bạn: browser cache DNS/redirect và không đại diện cho IPv6, API hay resolver khác.
+
+## Failure modes thường gặp
+
+| Triệu chứng              | Lớp nghi ngờ                  | Kiểm tra đầu tiên                          |
+| ------------------------ | ----------------------------- | ------------------------------------------ |
+| Timeout hoàn toàn        | Provider firewall/UFW/service | `ss -ltnp`, UFW, security group            |
+| Trang “Welcome to nginx” | Virtual host                  | `server_name`, enabled symlink, `nginx -T` |
+| `502 Bad Gateway`        | App/upstream                  | curl loopback, systemd/Docker logs         |
+| `404` từ app             | URI/Host                      | `proxy_pass` có dấu `/` không, app routes  |
+| Certbot challenge fail   | DNS/port 80/CAA               | `dig A`, curl HTTP, `dig CAA`              |
+| TLS trả sai certificate  | SNI/server block              | `openssl s_client -servername ...`         |
+| Chỉ một nhóm user lỗi    | AAAA/cache                    | `dig A` và `AAAA` từ nhiều resolver        |
+| App bị gọi thẳng `:3000` | Port exposure                 | `ss`, Docker `ports`, firewall             |
+
+## Rollback rõ ràng
+
+Rollback có hai loại, không trộn chúng:
+
+### Rollback application
+
+Nếu DNS và Nginx khỏe nhưng release lỗi, giữ nguyên DNS. Chuyển symlink/image về release trước, restart app rồi test loopback và `curl --resolve`. Database migration phải có kế hoạch backward-compatible hoặc restore riêng; đổi A record không undo schema.
+
+### Rollback traffic
+
+Nếu origin mới không đáp ứng acceptance matrix:
+
+1. Khôi phục chính xác A/AAAA/CNAME cũ đã lưu trong inventory.
+2. Giữ VPS mới chạy để điều tra; không xóa certificate/log/data.
+3. Theo dõi cả origin cũ và mới ít nhất một chu kỳ TTL vì resolver có thể dùng hai câu trả lời.
+4. Nếu đã hạ TTL, chỉ nâng lại sau khi hệ thống ổn định.
+
+Ngưỡng rollback nên viết **trước cutover**, ví dụ: health check fail hai lần liên tiếp, core route không đạt `200`, tỷ lệ 5xx vượt baseline đã thỏa thuận, login/payment thất bại, hoặc certificate không hợp lệ. “Cảm giác hơi chậm” không phải ngưỡng vận hành.
+
+## Checklist hoàn thành
+
+- [ ] Đã lưu A/AAAA/CNAME/CAA cũ và TTL.
+- [ ] App pass `/healthz` trên loopback.
+- [ ] systemd hoặc Docker tự khởi động lại có kiểm soát.
+- [ ] Backend và database không lắng nghe public.
+- [ ] Nginx `server_name` đúng apex và `www`.
+- [ ] `nginx -t` pass trước mọi reload.
+- [ ] Provider firewall và OS firewall chỉ mở port cần thiết.
+- [ ] `curl --resolve` pass HTTP và HTTPS trước cutover.
+- [ ] Certificate công khai đúng SAN, chain và renewal test.
+- [ ] Không còn AAAA stale; IPv6 được test nếu publish.
+- [ ] Acceptance matrix pass từ bên ngoài VPS.
+- [ ] Có release rollback và DNS rollback độc lập.
+
+## Bài tập
+
+1. Vì sao `curl http://203.0.113.10` trả default site không chứng minh `example.com` hỏng?
+2. Với Docker Compose, sửa `ports: ['3000:3000']` để app chỉ nhận kết nối từ host.
+3. Website mới chạy tốt trên Wi-Fi nhưng timeout trên một số mạng di động. Hãy viết ba lệnh đầu tiên để kiểm giả thuyết AAAA stale.
+4. Thiết kế acceptance matrix thêm cho một API có `/health/live`, `/health/ready` và endpoint login.
+
+<details>
+<summary>Gợi ý đáp án</summary>
+
+1. Gọi IP không gửi đúng domain/SNI; Nginx có thể chọn default server thay vì block có `server_name example.com`.
+2. Dùng `127.0.0.1:3000:3000`, rồi xác nhận bằng `ss -ltnp`.
+3. `dig example.com A +short`, `dig example.com AAAA +short`, sau đó `curl -6 -v https://example.com/`.
+4. `live` chứng minh process còn sống; `ready` chứng minh instance nhận traffic được; login là synthetic check có dữ liệu test và không làm thay đổi production state.
+
+</details>
+
+## Nguồn chính thức
+
+- [NGINX — How nginx processes a request](https://nginx.org/en/docs/http/request_processing.html)
+- [NGINX — ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html)
+- [Docker — Port publishing and mapping](https://docs.docker.com/engine/network/port-publishing/)
+- [Ubuntu Server — Firewall với UFW](https://documentation.ubuntu.com/server/how-to/security/firewalls/)
+- [Certbot — Instructions](https://certbot.eff.org/instructions)
+- [curl — Command line manual (`--resolve`)](https://curl.se/docs/manpage.html#--resolve)
+- [IETF RFC 5737 — IPv4 Address Blocks Reserved for Documentation](https://www.rfc-editor.org/rfc/rfc5737)
+- [IETF RFC 3849 — IPv6 Address Prefix Reserved for Documentation](https://www.rfc-editor.org/rfc/rfc3849)
+
+---
+
+**Điều cốt lõi:** DNS không làm application production-ready. Dựng app ở loopback, đặt Nginx ở boundary, test đúng Host/SNI bằng `curl --resolve`, cấp TLS, rồi mới đổi A/AAAA. Khi mỗi lớp có health check và rollback riêng, “trỏ domain về VPS” trở thành một change có kiểm soát thay vì một cú click cầu may.

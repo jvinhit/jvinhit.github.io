@@ -1,0 +1,655 @@
+---
+title: 'Docker for Developers · Part 13 — Compose at Scale'
+description: 'Thiết kế workflow Compose lặp lại được với config đã resolve, merge/include, Watch, secrets/configs, CI validation và ranh giới production.'
+pubDate: 2026-06-06
+tags: [docker, docker-compose, devops, containers, ci]
+series: docker
+seriesOrder: 13
+draft: false
+---
+
+Ở [Phần 12](/blog/docker-12-buildkit-multi-platform-supply-chain/), bạn đã biến `docker build` thành một pipeline BuildKit có cache, multi-platform và provenance. Nhưng image tốt chưa đảm bảo môi trường chạy **lặp lại được**. Một stack Compose lớn thường hỏng vì ba thứ ít được nhìn thấy: file override merge khác dự đoán, biến môi trường đến từ sai nguồn, và laptop/CI thực thi hai application model khác nhau.
+
+Phần này đi sâu vào **Docker Compose như một compiler cấu hình**. Đầu vào là YAML, `.env`, shell environment, profile và các file `-f`; đầu ra là một model chuẩn hóa mà Compose gửi cho Docker Engine. Khi luôn kiểm tra **model sau cùng**, bạn không còn debug bằng cách đoán YAML.
+
+> **Điều kiện:** đã học [Compose cơ bản ở Phần 5](/blog/docker-05-compose-fundamentals/) và [healthcheck/profile/override ở Phần 6](/blog/docker-06-compose-in-depth-profiles-healthchecks/). Hãy dùng Compose v2 hiện hành và kiểm tra feature bằng `docker compose version`; một số cú pháp như `include`, `!reset`, `!override` và Watch không có trên các bản cũ.
+
+---
+
+## Mental model: Compose tạo application model
+
+Compose không gửi nguyên file YAML cho Engine. Nó đi qua một pipeline:
+
+```text
+compose.yaml + override files + environment + active profiles
+                         │
+                         ▼
+       interpolate → merge → normalize → validate
+                         │
+                         ▼
+            resolved application model
+                         │
+                         ▼
+       containers · networks · volumes · configs
+```
+
+Lệnh quan trọng nhất của bài này vì thế không phải `up`, mà là:
+
+```bash
+docker compose config
+```
+
+Lệnh này merge các file, nội suy biến và mở rộng short syntax thành model chuẩn. Trước một thay đổi lớn, hãy lưu diff của **output này**, không chỉ diff YAML nguồn.
+
+```bash
+# Chỉ validate, phù hợp cho CI
+docker compose config --quiet
+
+# Xem giá trị nào đã được dùng để nội suy
+docker compose config --environment
+
+# Liệt kê service/profile/image sau khi resolve
+docker compose config --services
+docker compose config --profiles
+docker compose config --images
+
+# Xuất model chuẩn để review hoặc làm artifact CI
+docker compose -f compose.yaml -f compose.ci.yaml config > resolved-compose.yaml
+```
+
+Top-level `version:` không chọn schema Compose v2/v3 nữa; nó chỉ còn để tương thích và có thể phát warning. **Compose Specification** hiện hành mới là contract. Xóa `version: "3.8"` không làm stack mất tính năng.
+
+---
+
+## Hai loại environment thường bị trộn lẫn
+
+Cùng chữ “environment” nhưng có hai thời điểm khác nhau:
+
+1. **Interpolation time:** Compose thay `${DATABASE_URL}` trong YAML trước khi tạo container.
+2. **Container runtime:** service nhận biến qua `environment:` hoặc `env_file:`.
+
+```yaml
+name: ${COMPOSE_PROJECT_NAME:-shop}
+
+services:
+  api:
+    image: ghcr.io/acme/api:${IMAGE_TAG:?IMAGE_TAG is required}
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+    env_file:
+      - path: ./config/common.env
+        required: true
+```
+
+`${VAR:?message}` biến thiếu thành lỗi sớm thay vì tạo container cấu hình nửa vời. Xem nguồn interpolation thực tế bằng:
+
+```bash
+IMAGE_TAG=1.4.2 docker compose config --environment
+IMAGE_TAG=1.4.2 docker compose config --quiet
+```
+
+Một số quy tắc vận hành an toàn:
+
+- Không dùng cùng tên cho biến build, biến interpolation và secret runtime nếu ý nghĩa khác nhau.
+- `environment:` ghi đè giá trị trùng trong `env_file:`; hãy dùng nó cho override có chủ đích.
+- Shell/`--env-file`/`.env` ảnh hưởng **interpolation**; chúng không tự động trở thành env trong container nếu YAML không tham chiếu.
+- Không commit `.env` production. File `.env.example` chỉ nên chứa tên biến và giá trị giả.
+- Luôn chạy `docker compose config --environment` khi giá trị “không hiểu từ đâu tới”.
+
+---
+
+## Project name là namespace của Compose
+
+Compose gắn project name vào container, network và volume. Hai checkout cùng thư mục mặc định có thể đụng tên hoặc dùng nhầm volume. Hãy đặt project name có chủ đích:
+
+```bash
+docker compose -p shop-dev up -d
+docker compose -p shop-pr-482 -f compose.yaml -f compose.ci.yaml up -d
+```
+
+Trong CI, project name nên chứa run/PR id và luôn cleanup đúng namespace:
+
+```bash
+export COMPOSE_PROJECT_NAME="shop-${CI_RUN_ID}"
+docker compose up -d --wait --wait-timeout 120
+# run tests...
+docker compose down --volumes --remove-orphans
+```
+
+`down --volumes` ở đây là chủ đích vì CI stack dùng dữ liệu tạm. Không sao chép lệnh đó vào production nếu volume chứa dữ liệu cần giữ.
+
+---
+
+## Merge file: đọc output, đừng đoán
+
+Một cấu trúc dễ review:
+
+```text
+compose.yaml          # contract chung, chạy được mặc định
+compose.dev.yaml      # bind/watch/debug port
+compose.ci.yaml       # ephemeral data, test runner
+```
+
+`compose.yaml`:
+
+```yaml
+name: shop
+
+services:
+  api:
+    image: ghcr.io/acme/shop-api:${IMAGE_TAG:?required}
+    environment:
+      LOG_LEVEL: info
+    networks: [backend]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+networks:
+  backend:
+    internal: true
+
+volumes:
+  db-data:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+```
+
+`compose.dev.yaml`:
+
+```yaml
+services:
+  api:
+    build:
+      context: .
+      target: development
+    ports:
+      - '127.0.0.1:3000:3000'
+    environment:
+      LOG_LEVEL: debug
+    develop:
+      watch:
+        - action: sync
+          path: ./src
+          target: /app/src
+          initial_sync: true
+        - action: rebuild
+          path: ./package-lock.json
+```
+
+Chạy và kiểm tra:
+
+```bash
+docker compose -f compose.yaml -f compose.dev.yaml config --quiet
+docker compose -f compose.yaml -f compose.dev.yaml up --watch
+```
+
+Quy tắc merge không phải lúc nào cũng là “file sau thay toàn bộ file trước”:
+
+- Mapping được merge theo key; scalar trùng key dùng giá trị sau.
+- Nhiều sequence được append; một số resource có identity riêng để merge.
+- `command`, `entrypoint` và `healthcheck.test` có quy tắc override riêng.
+- Path của các file dùng `-f` được resolve từ project directory của file cơ sở, trừ khi bạn đổi rõ bằng `--project-directory`.
+
+Khi thật sự muốn xóa hoặc thay toàn bộ collection, Compose mới hỗ trợ tag `!reset` và `!override`:
+
+```yaml
+services:
+  api:
+    # Xóa port từ file cơ sở
+    ports: !reset []
+    # Hoặc thay toàn bộ list bằng đúng một mapping mới
+    volumes: !override
+      - ./fixtures:/app/fixtures:ro
+```
+
+Các tag này phụ thuộc phiên bản Compose. CI phải pin/kiểm tra phiên bản CLI thay vì giả định máy nào cũng hiểu.
+
+---
+
+## `include` khác merge như thế nào?
+
+Merge thích hợp khi nhiều file mô tả **cùng một model** và override lẫn nhau. `include` phù hợp khi một hệ lớn ghép các **sub-domain do team khác sở hữu**:
+
+```yaml
+include:
+  - path: ./platform/compose.yaml
+    env_file: ./platform/.env.defaults
+  - path: ./payments/compose.yaml
+
+services:
+  storefront:
+    build: ./storefront
+    depends_on:
+      - payments-api
+```
+
+Mỗi file được include có project directory riêng, nên relative path của nó không bị diễn giải theo file root. Đây là lợi thế lớn trong monorepo.
+
+Chọn đơn giản:
+
+| Nhu cầu                             | Công cụ                             |
+| ----------------------------------- | ----------------------------------- |
+| Dev/CI khác vài field               | Nhiều file `-f`                     |
+| Bật tool tùy chọn                   | `profiles`                          |
+| Team/module sở hữu sub-stack riêng  | `include`                           |
+| Tái sử dụng đoạn YAML nhỏ cùng file | YAML anchor / extension field `x-*` |
+
+Đừng biến Compose thành framework template. Nếu phải đọc năm tầng anchor + override mới hiểu một service, model đã quá trừu tượng.
+
+---
+
+## Profiles cho tool tùy chọn, không cho lõi ứng dụng
+
+Service không có `profiles` luôn hoạt động. Đây nên là API, database và dependency bắt buộc. Tool như admin UI, migration runner hoặc observability local mới nên gắn profile:
+
+```yaml
+services:
+  api:
+    image: ghcr.io/acme/shop-api:${IMAGE_TAG}
+
+  migrate:
+    image: ghcr.io/acme/shop-api:${IMAGE_TAG}
+    command: ['npm', 'run', 'db:migrate']
+    profiles: [tools]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  adminer:
+    image: adminer:latest
+    profiles: [debug]
+    ports:
+      - '127.0.0.1:8080:8080'
+```
+
+```bash
+# Service lõi
+docker compose up -d
+
+# Target trực tiếp service profile để chạy one-shot task
+docker compose run --rm migrate
+
+# Bật toàn bộ profile debug
+docker compose --profile debug up -d
+```
+
+Nếu dependency bắt buộc bị đặt sau profile nhưng caller không bật profile đó, model có thể không hợp lệ. Profile là công tắc use case, không phải hệ dependency injection.
+
+---
+
+## Compose Watch thay bind mount khi cần kiểm soát
+
+Bind mount tiện nhưng mang cả cây file host vào container, có thể chậm trên Docker Desktop và làm lẫn native dependency giữa `arm64`/`amd64`. Watch cho phép hành động theo loại thay đổi:
+
+```yaml
+services:
+  api:
+    build:
+      context: .
+      target: development
+    develop:
+      watch:
+        - action: sync
+          path: ./src
+          target: /app/src
+          initial_sync: true
+          ignore:
+            - node_modules/
+            - '**/*.test.ts'
+        - action: rebuild
+          path: ./package.json
+        - action: rebuild
+          path: ./package-lock.json
+```
+
+```bash
+docker compose up --watch
+```
+
+Image phải có các utility cơ bản mà Watch cần, và `USER` trong container phải ghi được vào `target`. Với image non-root, `COPY --chown=<uid>:<gid>` trong Dockerfile tránh lỗi permission.
+
+Watch phục vụ **developer feedback loop**. Nó không phải cơ chế sync code vào production; production chạy immutable image được build/test trước.
+
+---
+
+## Secrets và configs: cấp quyền theo service
+
+Không truyền password qua `ARG`, Dockerfile `ENV` hay command line. Compose cho phép khai báo secret ở top-level và chỉ grant cho service cần nó:
+
+```yaml
+services:
+  api:
+    secrets:
+      - db_password
+    configs:
+      - source: app_config
+        target: /etc/shop/config.json
+
+secrets:
+  db_password:
+    environment: SHOP_DB_PASSWORD
+
+configs:
+  app_config:
+    file: ./config/app.json
+```
+
+Trong container, secret mặc định xuất hiện như file `/run/secrets/db_password`. App đọc file thay vì yêu cầu env:
+
+```ts
+import { readFileSync } from 'node:fs';
+
+const dbPassword = readFileSync('/run/secrets/db_password', 'utf8').trim();
+```
+
+Đây là cách **giảm phạm vi lộ** và tránh secret nằm trong image. Nhưng Compose local không biến file nguồn thành một vault mã hóa: ai đọc được file host hoặc environment đầu vào vẫn đọc được secret. Production cần secret manager, rotation, audit và quyền host phù hợp.
+
+---
+
+## Tách network theo luồng dữ liệu
+
+Một default network cho mọi service đồng nghĩa mọi service có đường mạng tới nhau. Tách frontend/backend giúp giảm blast radius:
+
+```yaml
+services:
+  proxy:
+    image: nginx:stable-alpine
+    ports:
+      - '127.0.0.1:8080:80'
+    networks: [edge, backend]
+
+  api:
+    image: ghcr.io/acme/shop-api:${IMAGE_TAG}
+    networks: [backend]
+
+  db:
+    image: postgres:16-alpine
+    networks: [data]
+
+networks:
+  edge:
+  backend:
+    internal: true
+  data:
+    internal: true
+```
+
+Ví dụ trên còn thiếu một đường từ `api` sang `data`; đó là lỗi có chủ đích để thấy network membership là allow-list thô. Thêm `data` cho `api`, không thêm cho `proxy`.
+
+Bind port vào `127.0.0.1` khi chỉ cần truy cập từ laptop. Viết `"8080:80"` thường bind mọi interface host (`0.0.0.0`) và có thể vô tình mở dịch vụ ra LAN/Internet.
+
+Compose network **không phải** Kubernetes NetworkPolicy: nó chỉ phân đoạn theo network membership, không biểu đạt rule theo namespace/label/port chi tiết. Phần 14 sẽ xử lý lớp đó.
+
+---
+
+## Một pipeline CI có thể tái hiện
+
+Pipeline integration test tối thiểu cần cùng model, health gate, evidence và cleanup:
+
+```bash
+set -eu
+
+export COMPOSE_PROJECT_NAME="shop-ci-${CI_RUN_ID}"
+export IMAGE_TAG="${GIT_SHA}"
+
+docker compose -f compose.yaml -f compose.ci.yaml config --quiet
+docker compose -f compose.yaml -f compose.ci.yaml build --pull
+docker compose -f compose.yaml -f compose.ci.yaml up -d --wait --wait-timeout 120
+
+docker compose exec -T api npm run test:integration
+
+# Khi fail, lưu evidence trước cleanup
+docker compose ps --all
+docker compose logs --no-color --timestamps > compose.log
+
+docker compose down --volumes --remove-orphans
+```
+
+Trong CI thật, đặt cleanup trong `trap`/finally để nó chạy cả khi test fail. Tách `compose.ci.yaml` để database dùng volume tạm, không publish port không cần thiết và có test runner rõ ràng.
+
+Một validation tốt hơn nữa:
+
+```bash
+# Model có parse/consistent không?
+docker compose -f compose.yaml -f compose.ci.yaml config --quiet
+
+# Image nào thực sự sẽ chạy?
+docker compose -f compose.yaml -f compose.ci.yaml config --images
+
+# Resolve tag thành digest để review artifact bất biến
+docker compose -f compose.yaml config --resolve-image-digests > compose.lock.yaml
+```
+
+Digest lock chỉ có giá trị khi registry artifact đã tồn tại và quy trình cập nhật lock được review. Đừng commit một lock file rồi quên refresh security patch.
+
+---
+
+## Ranh giới: Compose không phải orchestrator cluster
+
+Compose rất mạnh cho local dev, integration test, demo và deployment một host có kiểm soát. Nó không tự mang lại:
+
+- scheduler đặt workload trên nhiều node;
+- service VIP xuyên node và autoscaling theo metrics;
+- declarative rollout/rollback nhiều replica;
+- RBAC, admission policy và NetworkPolicy;
+- dynamic persistent volume hay self-healing khi host chết.
+
+Không cần đưa mọi app lên Kubernetes. Nhưng nếu requirement là multi-node, failure domain, policy và autoscaling, thêm override Compose sẽ không giải quyết đúng bài toán.
+
+---
+
+## Failure modes thường gặp
+
+| Triệu chứng                   | Nguyên nhân hay gặp                             | Bước kiểm tra đầu tiên                        |
+| ----------------------------- | ----------------------------------------------- | --------------------------------------------- |
+| Giá trị env “bí ẩn”           | Shell/`.env`/`--env-file` override              | `docker compose config --environment`         |
+| Port bị lặp sau override      | Sequence được merge, không thay toàn bộ         | `docker compose ... config`                   |
+| CI dùng nhầm volume run trước | Project name cố định + cleanup thiếu            | `docker compose ls`; đặt `-p` duy nhất        |
+| Profile service không chạy    | Profile chưa active hoặc không target trực tiếp | `docker compose config --profiles`            |
+| Watch báo permission denied   | Container `USER` không ghi được target          | kiểm tra `id`, owner và `COPY --chown`        |
+| Secret vẫn lộ                 | File/env nguồn hoặc app log secret              | audit host permission và redaction            |
+| Service healthy nhưng app lỗi | Healthcheck quá nông                            | probe dependency tối thiểu + integration test |
+
+---
+
+## Bảng tra nhanh
+
+```bash
+# Inspect/validate model
+docker compose config
+docker compose config --quiet
+docker compose config --environment
+docker compose config --services
+docker compose config --profiles
+docker compose config --images
+
+# Explicit project and file stack
+docker compose -p shop-dev -f compose.yaml -f compose.dev.yaml up -d
+
+# Development loop
+docker compose up --watch
+docker compose --profile debug up -d
+docker compose run --rm migrate
+
+# CI lifecycle
+docker compose up -d --wait --wait-timeout 120
+docker compose ps --all
+docker compose logs --no-color --timestamps
+docker compose down --volumes --remove-orphans
+```
+
+---
+
+## Bài tập / Exercises
+
+**1. Model diff:** tạo `compose.yaml` có port `3000:3000`, rồi override thêm `3001:3000`. Dự đoán output trước, sau đó xác nhận bằng `config`. Dùng `!override` để chỉ còn một port.
+
+<details>
+<summary>Lời giải</summary>
+
+```yaml
+# compose.override.yaml
+services:
+  api:
+    ports: !override
+      - '127.0.0.1:3001:3000'
+```
+
+```bash
+docker compose -f compose.yaml -f compose.override.yaml config
+```
+
+Nếu CLI không hiểu `!override`, nâng Compose hoặc thiết kế file cơ sở không publish port và chỉ thêm port ở dev override.
+
+</details>
+
+**2. Fail fast env:** bắt buộc `IMAGE_TAG` và `DATABASE_URL`; chứng minh `config --quiet` fail trước khi tạo container.
+
+<details>
+<summary>Lời giải</summary>
+
+```yaml
+services:
+  api:
+    image: ghcr.io/acme/api:${IMAGE_TAG:?set IMAGE_TAG}
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+```
+
+```bash
+env -u IMAGE_TAG -u DATABASE_URL docker compose config --quiet
+IMAGE_TAG=dev DATABASE_URL=postgres://db/app docker compose config --quiet
+```
+
+</details>
+
+**3. Watch non-root:** tạo service Node chạy user `10001`, sync `src/`, rebuild khi lockfile đổi. Chứng minh sửa source không rebuild image nhưng sửa lockfile có rebuild.
+
+<details>
+<summary>Lời giải</summary>
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM node:24-bookworm-slim AS development
+WORKDIR /app
+COPY --chown=10001:10001 package*.json ./
+RUN npm ci
+COPY --chown=10001:10001 . .
+USER 10001
+CMD ["npm", "run", "dev"]
+```
+
+```yaml
+services:
+  api:
+    build: { context: ., target: development }
+    develop:
+      watch:
+        - { action: sync, path: ./src, target: /app/src, initial_sync: true }
+        - { action: rebuild, path: ./package-lock.json }
+```
+
+```bash
+docker compose up --watch
+```
+
+</details>
+
+**4. Secret boundary:** cấp `db_password` cho `api` nhưng không cấp cho `proxy`. Kiểm tra file tồn tại ở đúng service và không nằm trong `docker inspect` image config.
+
+<details>
+<summary>Lời giải</summary>
+
+```yaml
+services:
+  api:
+    image: busybox
+    command: ['sh', '-c', 'test -s /run/secrets/db_password && sleep 3600']
+    secrets: [db_password]
+  proxy:
+    image: busybox
+    command: ['sleep', '3600']
+
+secrets:
+  db_password:
+    environment: SHOP_DB_PASSWORD
+```
+
+```bash
+SHOP_DB_PASSWORD=not-for-production docker compose up -d
+docker compose exec api test -s /run/secrets/db_password
+docker compose exec proxy test ! -e /run/secrets/db_password
+docker image inspect busybox --format '{{json .Config.Env}}'
+docker compose down
+```
+
+</details>
+
+**5. CI isolation drill:** chạy cùng stack hai lần với project name khác nhau. Chứng minh network/volume độc lập, rồi cleanup một project mà project kia vẫn sống.
+
+<details>
+<summary>Lời giải</summary>
+
+```bash
+docker compose -p shop-a up -d
+docker compose -p shop-b up -d
+
+docker compose -p shop-a ps
+docker compose -p shop-b ps
+docker network ls --filter label=com.docker.compose.project=shop-a
+docker network ls --filter label=com.docker.compose.project=shop-b
+
+docker compose -p shop-a down --volumes
+docker compose -p shop-b ps
+docker compose -p shop-b down --volumes
+```
+
+</details>
+
+---
+
+## Điểm chính
+
+- `docker compose config` là source of truth của **model đã resolve**.
+- Tách interpolation khỏi environment trong container; dùng `${VAR:?message}` để fail sớm.
+- Dùng project name duy nhất để cô lập laptop, branch và CI run.
+- Merge cho environment override; `include` cho sub-domain; profile cho service tùy chọn.
+- Watch tối ưu feedback loop nhưng production vẫn chạy immutable image.
+- Compose secrets giảm phạm vi lộ, không thay thế secret manager.
+- CI phải validate, chờ health, lưu evidence và cleanup trong mọi kết quả.
+- Khi requirement chuyển sang multi-node, policy và autoscaling, hãy chuyển mental model sang Kubernetes.
+
+---
+
+## Tài liệu chính thức
+
+- [Compose application model](https://docs.docker.com/compose/intro/compose-application-model/)
+- [`docker compose config`](https://docs.docker.com/reference/cli/docker/compose/config/)
+- [Merge Compose files](https://docs.docker.com/reference/compose-file/merge/)
+- [Use `include` to modularize Compose](https://docs.docker.com/reference/compose-file/include/)
+- [Compose profiles](https://docs.docker.com/compose/how-tos/profiles/)
+- [Compose Watch](https://docs.docker.com/compose/how-tos/file-watch/)
+- [Secrets in the Compose Specification](https://docs.docker.com/reference/compose-file/secrets/)
+
+---
+
+## Tiếp theo
+
+**[Phần 14 — Kubernetes Networking Internals](/blog/docker-14-kubernetes-networking-internals/)** — theo một packet từ Pod qua CNI, Service, EndpointSlice và Gateway, rồi khóa traffic bằng NetworkPolicy.

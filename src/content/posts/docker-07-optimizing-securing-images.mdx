@@ -1,14 +1,15 @@
 ---
 title: 'Docker for Developers · Part 7 — Optimizing & Securing Images'
-description: 'Make images small, fast, and safe: slim and distroless bases, layer-cache discipline, multi-stage recap, running as a non-root user, handling secrets properly, .dockerignore, and image scanning.'
+description: 'Tối ưu và harden image với base nhỏ, cache, multi-stage, non-root, secret mount, .dockerignore và quét lỗ hổng.'
 pubDate: 2025-10-13
+updatedDate: 2026-07-11
 tags: [docker, security, optimization, devops, docker_k8s_10]
 series: docker
 seriesOrder: 7
 draft: false
 ---
 
-Đây là **Phần 7 của series 10 bài** về Docker → Compose → Kubernetes. Ở [Phần 2](/blog/docker-02-images-and-dockerfile/) bạn đã học **build** image — layer, cache, multi-stage, `.dockerignore`. Ở [Phần 6](/blog/docker-06-compose-in-depth-profiles-healthchecks/) bạn điều phối stack nhiều service với profile và health check.
+Đây là **Phần 7 của chặng nền tảng** về Docker → Compose → Kubernetes. Ở [Phần 2](/blog/docker-02-images-and-dockerfile/) bạn đã học **build** image — layer, cache, multi-stage, `.dockerignore`. Ở [Phần 6](/blog/docker-06-compose-in-depth-profiles-healthchecks/) bạn điều phối stack nhiều service với profile và health check.
 
 Image **chạy được** chưa phải image **tốt**. Layer phình làm mọi pull và deploy chậm; mặc định root mở rộng vùng ảnh hưởng; secret nhúng vào layer sống mãi trong `docker history`; base image không ghim khiến build hôm nay khác build tuần sau. Phần này giúp image **nhỏ, nhanh, tái lập và an toàn**.
 
@@ -33,16 +34,16 @@ Kích thước image không phải chuyện “đẹp” — đó là **độ tr
 
 | Kiểu base | Ví dụ | Đánh đổi |
 |---|---|---|
-| **Full** | `node:20`, `python:3.12` | Dễ debug; bề mặt tấn công lớn nhất |
-| **Slim / Alpine** | `node:20-alpine`, `python:3.12-slim` | Nhỏ hơn nhiều; Alpine dùng `musl` — test dependency native |
-| **Distroless** | `gcr.io/distroless/nodejs20-debian12` | Không shell, OS tối thiểu — tốt cho runtime production |
+| **Full** | `node:24`, `python:3.13` | Dễ debug; bề mặt tấn công lớn nhất |
+| **Slim / Alpine** | `node:24-alpine`, `python:3.13-slim` | Nhỏ hơn nhiều; Alpine dùng `musl` — test dependency native |
+| **Distroless** | `gcr.io/distroless/nodejs24-debian12` | Không shell, OS tối thiểu — tốt cho runtime production |
 
 **Ôn multi-stage** (Phần 2): compiler, test runner và `devDependencies` ở **`builder`**; chỉ artifact vào `FROM` cuối.
 
 ```text
-  BEFORE (single-stage, node:20)          AFTER (multi-stage + alpine runtime)
+  BEFORE (single-stage, node:24)          AFTER (multi-stage + alpine runtime)
  ┌────────────────────────────┐          ┌────────────────────────────┐
- │ node:20 + npm ci (all deps)│          │ builder: compile / test    │
+ │ node:24 + npm ci (all deps)│          │ builder: compile / test    │
  │ + source + build tools     │   ──►    │         │ COPY --from      │
  │ ~900 MB typical            │          │ runtime: alpine + artifact │
  └────────────────────────────┘          │ ~80–120 MB typical         │
@@ -95,10 +96,10 @@ Quy tắc mở rộng Phần 2:
 1. **Copy manifest dependency trước source**.
 2. **Gộp `RUN` liên quan** — một layer tốt hơn năm layer cài từng package.
 3. **Đừng phá cache sớm** — tránh `COPY . .` trước `RUN npm ci`.
-4. **Ghim base image** — `node:20-alpine` ổn định hơn `node:latest` cho cache.
+4. **Chọn base có chủ đích** — tag major như `node:24-alpine` dễ đọc; release cần digest nếu yêu cầu artifact bất biến.
 
 ```bash
-DOCKER_BUILDKIT=1 docker build -t myapp:1.0 .
+docker build -t myapp:1.0 .
 docker builder prune    # reclaim stale build cache when disk fills up
 ```
 
@@ -111,7 +112,7 @@ Mặc định, tiến trình trong container chạy **root** (UID 0). Root trong
 Tạo user riêng và chuyển trước `CMD`:
 
 ```dockerfile
-FROM node:20-alpine
+FROM node:24-alpine
 WORKDIR /app
 RUN addgroup -g 1001 -S app && adduser -u 1001 -S app -G app
 COPY --chown=app:app package.json package-lock.json ./
@@ -144,7 +145,7 @@ docker exec -it <container> id
 
 ```dockerfile
 # BAD — do not ship this pattern
-FROM alpine:3.20
+FROM alpine:3.24
 ARG API_KEY=super-secret-key-demo
 ENV API_KEY=${API_KEY}
 RUN echo "configured" > /tmp/ok
@@ -164,18 +165,18 @@ Ví dụ BuildKit:
 
 ```dockerfile
 # syntax=docker/dockerfile:1
-FROM node:20-alpine
+FROM node:24-alpine
 RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
     npm ci --omit=dev
 ```
 
 ```bash
-DOCKER_BUILDKIT=1 docker build \
+docker build \
   --secret id=npmrc,src=$HOME/.npmrc \
   -t myapp:1.0 .
 ```
 
-**Lúc chạy**, đưa secret qua orchestrator hoặc env — không rebuild image với `ENV PASSWORD=...`.
+**Lúc chạy**, ưu tiên secret manager/orchestrator mount secret thành file ngắn hạn; env tiện nhưng vẫn có thể lộ qua inspect, crash dump hoặc log ứng dụng. Dù dùng kênh nào, không rebuild image với `ENV PASSWORD=...`.
 
 ---
 
@@ -218,7 +219,7 @@ Image nhỏ giúp ích, nhưng **lỗ hổng nằm trong package**. Quét mỗi 
 **Docker Scout**:
 
 ```bash
-docker scout quickview node:20-alpine
+docker scout quickview node:24-alpine
 docker scout cves myapp:1.0
 ```
 
@@ -231,12 +232,11 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
 
 Thói quen cứng hóa:
 
-- **Ghim tag**.
-- **Ưu tiên digest** cho prod.
+- **Dùng tag version** để con người đọc được và **digest** khi release cần tham chiếu bất biến.
 - **Rebuild định kỳ** — bản vá base lên Hub; image app không tự khỏe.
 
 ```bash
-docker pull node:20-alpine
+docker pull node:24-alpine
 docker build --pull -t myapp:1.0 .
 ```
 
@@ -262,7 +262,7 @@ docker history myapp:1.0
 docker image inspect myapp:1.0 --format '{{.Config.User}}'
 
 # build slim + cache-friendly
-DOCKER_BUILDKIT=1 docker build --pull -t myapp:1.0 .
+docker build --pull -t myapp:1.0 .
 docker build --no-cache -t myapp:1.0 .
 
 # non-root check
@@ -274,7 +274,9 @@ docker build --secret id=npmrc,src=$HOME/.npmrc -t myapp:1.0 .
 
 # scan
 docker scout cves myapp:1.0
-# trivy: docker run --rm aquasec/trivy image myapp:1.0
+# trivy scans a local Engine image through the Docker socket
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy image myapp:1.0
 
 # cleanup
 docker builder prune
@@ -291,7 +293,7 @@ Tạo `docker-lab-07/` và làm bài trong đó. Mỗi bài chạy độc lập.
 <details>
 <summary>Lời giải</summary>
 
-**Fat**: `node:20` + copy hết trước; **slim**: alpine, dependency trước source, `USER node` (giống multi-stage Phần 2).
+**Fat**: `node:24` + copy hết trước; **slim**: alpine, dependency trước source, `USER node` (giống multi-stage Phần 2).
 
 ```bash
 docker build -f Dockerfile.fat -t lab07:fat .
@@ -355,7 +357,8 @@ docker build -t lab07:slim .
 ```bash
 docker scout cves lab07:slim
 # or:
-docker run --rm aquasec/trivy image lab07:slim
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy image lab07:slim
 ```
 
 Nếu không có Scout, dùng Trivy hoặc UI scan của Docker Desktop.
@@ -371,10 +374,10 @@ Nếu không có Scout, dùng Trivy hoặc UI scan của Docker Desktop.
 - **Kỷ luật cache** — dependency trước source, chỉ thị ít đổi lên trên.
 - **`USER` non-root** giới hạn thiệt hại; `COPY --chown` cho file app cần ghi.
 - **Secret ở runtime hoặc BuildKit mount** — không trong layer `ENV`/`ARG` commit.
-- **`.dockerignore` + quét + tag ghim** giữ build nhanh và CVE lộ trước khi deploy.
+- **`.dockerignore` + quét + digest cho release** giữ build nhanh, artifact bất biến và CVE lộ trước khi deploy.
 
 ---
 
 ## Tiếp theo
 
-**Phần 8** — `docker logs`, `exec`, inspect, exit code, bẫy mạng/volume, và checklist debug khi container hành xử lạ.
+**[Phần 8 — Debugging & Troubleshooting Docker](/blog/docker-08-debugging-troubleshooting-docker/)** — `docker logs`, `exec`, inspect, exit code, bẫy mạng/volume và checklist debug khi container hành xử lạ.
