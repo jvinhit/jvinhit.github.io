@@ -1,0 +1,564 @@
+---
+title: 'Web Components · Phần 8 — Form-associated elements với ElementInternals'
+description: 'Xây kb-priority-picker tham gia HTML form như control gốc: submit value, validation, labels, disabled, reset và state restoration bằng ElementInternals.'
+pubDate: 2026-07-12
+lang: vi
+tags:
+  [
+    web-components,
+    custom-elements,
+    elementinternals,
+    forms,
+    validation,
+    accessibility,
+  ]
+series: web-components
+seriesOrder: 8
+draft: false
+---
+
+`<kb-priority-picker>` có thể hiển thị ba mức ưu tiên và phát custom event, nhưng như vậy chưa đủ để đặt vào `<form>`:
+
+- `new FormData(form)` không tự thấy value của nó;
+- `required` không chặn submit;
+- `<label for="priority">` chưa có contract rõ;
+- reset và disabled `<fieldset>` dễ bị bỏ quên;
+- trình duyệt không biết cách khôi phục lựa chọn khi quay lại trang.
+
+Cách cũ là giấu một `<input>` bên cạnh rồi tự đồng bộ. Cách này tạo hai nguồn state, dễ bỏ sót validation và không giải quyết trọn vẹn lifecycle của form. Form-associated custom elements cùng `ElementInternals` cho phép autonomous custom element tham gia trực tiếp vào hạ tầng form của trình duyệt.
+
+---
+
+## 1. Bật form association một lần khi định nghĩa class
+
+Hai dòng quan trọng nhất:
+
+```js
+class KbPriorityPicker extends HTMLElement {
+  static formAssociated = true;
+  #internals = this.attachInternals();
+}
+```
+
+`static formAssociated = true` nói với custom element registry rằng mọi instance của definition này là form-associated. `attachInternals()` trả về object riêng của element và chỉ được gọi trên custom element phù hợp; gọi lần hai sẽ ném exception.
+
+Từ internals, component có cùng những mảnh contract quen thuộc của native control:
+
+```js
+get form() { return this.#internals.form; }
+get labels() { return this.#internals.labels; }
+get validity() { return this.#internals.validity; }
+get validationMessage() { return this.#internals.validationMessage; }
+get willValidate() { return this.#internals.willValidate; }
+
+checkValidity() { return this.#internals.checkValidity(); }
+reportValidity() { return this.#internals.reportValidity(); }
+```
+
+`labels` là `NodeList` các `<label>` được gắn bằng `for` hoặc bằng cách bọc control. `form` là form owner, kể cả khi association đến từ attribute `form="some-id"` thay vì ancestor trực tiếp.
+
+## 2. Submission value khác restoration state
+
+Component phải gọi `setFormValue()` mỗi khi current value đổi:
+
+```js
+this.#internals.setFormValue('high');
+```
+
+Giá trị đầu tiên có thể là `null`, string, `File` hoặc `FormData`:
+
+```js
+// Không đóng góp entry khi submit.
+internals.setFormValue(null);
+
+// Một entry; tên entry đến từ name của custom element.
+internals.setFormValue('high');
+
+// Nhiều entry. Mỗi entry trong FormData tự mang tên của nó.
+const data = new FormData();
+data.append('priority.code', 'high');
+data.append('priority.label', 'Cao');
+internals.setFormValue(data);
+```
+
+Tham số thứ hai là **state để trình duyệt khôi phục**, không nhất thiết giống submission value:
+
+```js
+internals.setFormValue(
+  'high',
+  JSON.stringify({ version: 1, value: 'high', panelOpen: false })
+);
+```
+
+Với picker, server chỉ cần chuỗi `high`, còn browser có thể giữ representation có version. Nếu value là `null`, control không tạo entry khi submit; state vẫn có thể lưu lựa chọn giao diện cần khôi phục.
+
+`name` không được truyền vào `setFormValue('high')`: trình duyệt lấy nó từ `<kb-priority-picker name="priority">`. Riêng `FormData`, các entry đã có tên riêng và không được tự động thêm prefix từ host.
+
+## 3. Current value và default value phải tách nhau
+
+Markup khai báo giá trị mặc định:
+
+```html
+<kb-priority-picker value="medium"></kb-priority-picker>
+```
+
+Sau khi người dùng chọn `high`, current value là `high`, nhưng `form.reset()` phải quay về `medium`. Vì vậy implementation giữ hai contract:
+
+- attribute `value` là **default value**;
+- property `value` là **current value**;
+- thay property bằng JavaScript không tự phát `input` hoặc `change`, giống native control;
+- chỉ interaction của người dùng mới phát event.
+
+Một dirty flag ngăn thay đổi attribute mặc định vô tình ghi đè lựa chọn hiện tại. Reset xóa dirty flag rồi đọc lại attribute.
+
+## 4. Constraint validation bằng `setValidity()`
+
+Nếu picker có `required` nhưng chưa chọn gì:
+
+```js
+this.#internals.setValidity(
+  { valueMissing: true },
+  'Hãy chọn mức ưu tiên.',
+  firstOptionButton
+);
+```
+
+Object đầu tiên dùng các `ValidityStateFlags` như `valueMissing`, `typeMismatch`, `rangeOverflow` hoặc `customError`. Khi có ít nhất một flag lỗi, message phải có nội dung. Tham số thứ ba là anchor để trình duyệt gắn validation UI gần control nội bộ phù hợp.
+
+Khi hợp lệ, xóa mọi lỗi bằng object rỗng:
+
+```js
+this.#internals.setValidity({});
+```
+
+Text đỏ trong shadow DOM không đủ: nếu internals vẫn báo valid, form vẫn submit. Control cần cả validity state lẫn error UI có thể truy cập.
+
+---
+
+## 5. Các callback nối với form lifecycle
+
+| Callback                                | Trách nhiệm                                                                                              |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `formAssociatedCallback(form)`          | Phản ứng khi form owner đổi; `form` có thể là `null`. Chỉ cần khi component có logic riêng gắn với form. |
+| `formDisabledCallback(disabled)`        | Nhận effective disabled state, kể cả từ `<fieldset disabled>`; khóa option và cập nhật ARIA tại đây.     |
+| `formResetCallback()`                   | Về default value, xóa dirty state, không phát `input`/`change`.                                          |
+| `formStateRestoreCallback(state, mode)` | Khôi phục history/autofill từ đúng format state; bỏ qua version lạ và không phát user event.             |
+
+Nếu đăng ký listener trong `formAssociatedCallback()`, luôn cleanup owner cũ trước khi gắn owner mới.
+
+## 6. Keyboard model của priority picker
+
+Picker là một radio group:
+
+- Tab vào option đang chọn; nếu chưa chọn, vào option đầu;
+- Arrow Right/Down chọn option kế;
+- Arrow Left/Up chọn option trước;
+- Home/End chọn đầu/cuối;
+- click, Enter và Space dựa trên native `<button>` activation;
+- một option có `tabindex="0"`, các option còn lại là `-1`.
+
+Host nhận role `radiogroup` qua internals; mỗi button có `role="radio"` và `aria-checked`. Button thật giữ focus, disabled và activation behavior đáng tin cậy.
+
+## 7. Implementation production-quality
+
+Ví dụ sau có thể chạy trực tiếp bằng ES module:
+
+```js
+const OPTIONS = [
+  { value: 'low', label: 'Thấp' },
+  { value: 'medium', label: 'Vừa' },
+  { value: 'high', label: 'Cao' },
+];
+
+const template = document.createElement('template');
+template.innerHTML = `
+  <style>
+    :host { display: block; color: inherit; }
+    :host([hidden]) { display: none; }
+    .options { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+    button {
+      border: 1px solid var(--kb-priority-border, #94a3b8);
+      border-radius: 999px;
+      padding-inline: 1rem;
+      background: var(--kb-priority-surface, #fff);
+      color: inherit;
+    }
+    button[aria-checked='true'] {
+      border-color: var(--kb-priority-accent, #2563eb);
+      background: var(--kb-priority-selected, #dbeafe);
+    }
+    button:focus-visible {
+      outline: 3px solid var(--kb-focus, #2563eb);
+      outline-offset: 2px;
+    }
+    button:disabled { opacity: 0.55; }
+    .options.invalid { border-inline-start: 3px solid #b91c1c; padding-inline-start: 0.5rem; }
+    .error { margin: 0.5rem 0 0; color: #b91c1c; }
+  </style>
+
+  <div class="options" part="options"></div>
+  <p class="error" aria-live="polite" hidden></p>
+`;
+
+function normalizeValue(value) {
+  const text = value == null ? '' : String(value);
+  return OPTIONS.some((option) => option.value === text) ? text : '';
+}
+
+class KbPriorityPicker extends HTMLElement {
+  static formAssociated = true;
+  static observedAttributes = ['value', 'required', 'disabled'];
+
+  #internals = this.attachInternals();
+  #root;
+  #options;
+  #error;
+  #value = '';
+  #dirty = false;
+  #effectiveDisabled = false;
+  #showValidation = false;
+  #events;
+
+  constructor() {
+    super();
+    this.#root = this.attachShadow({ mode: 'open', delegatesFocus: true });
+    this.#root.append(template.content.cloneNode(true));
+    this.#options = this.#root.querySelector('.options');
+    this.#error = this.#root.querySelector('.error');
+
+    for (const option of OPTIONS) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.setAttribute('role', 'radio');
+      button.dataset.value = option.value;
+      button.textContent = option.label;
+      button.setAttribute('part', `option option-${option.value}`);
+      this.#options.append(button);
+    }
+
+    this.#internals.role = 'radiogroup';
+    this.#internals.ariaErrorMessageElements = [this.#error];
+  }
+
+  get form() {
+    return this.#internals.form;
+  }
+  get labels() {
+    return this.#internals.labels;
+  }
+  get type() {
+    return this.localName;
+  }
+
+  get name() {
+    return this.getAttribute('name') ?? '';
+  }
+  set name(value) {
+    this.setAttribute('name', value);
+  }
+
+  get value() {
+    return this.#value;
+  }
+  set value(value) {
+    this.#setValue(value, { dirty: true, emit: false });
+  }
+
+  get defaultValue() {
+    return this.getAttribute('value') ?? '';
+  }
+  set defaultValue(value) {
+    const normalized = normalizeValue(value);
+    normalized
+      ? this.setAttribute('value', normalized)
+      : this.removeAttribute('value');
+  }
+
+  get required() {
+    return this.hasAttribute('required');
+  }
+  set required(value) {
+    this.toggleAttribute('required', Boolean(value));
+  }
+
+  get disabled() {
+    return this.hasAttribute('disabled');
+  }
+  set disabled(value) {
+    this.toggleAttribute('disabled', Boolean(value));
+  }
+
+  get validity() {
+    return this.#internals.validity;
+  }
+  get validationMessage() {
+    return this.#internals.validationMessage;
+  }
+  get willValidate() {
+    return this.#internals.willValidate;
+  }
+
+  connectedCallback() {
+    if (!this.#dirty) this.#value = normalizeValue(this.defaultValue);
+    this.#effectiveDisabled = this.matches(':disabled');
+
+    this.#events?.abort();
+    this.#events = new AbortController();
+    const { signal } = this.#events;
+
+    this.#root.addEventListener('click', this.#handleClick, { signal });
+    this.#root.addEventListener('keydown', this.#handleKeydown, { signal });
+    this.addEventListener('click', this.#handleHostClick, { signal });
+    this.addEventListener('invalid', this.#handleInvalid, { signal });
+    this.#sync();
+  }
+
+  disconnectedCallback() {
+    this.#events?.abort();
+  }
+
+  attributeChangedCallback(name) {
+    if (name === 'value' && !this.#dirty) {
+      this.#value = normalizeValue(this.defaultValue);
+    }
+    this.#sync();
+  }
+
+  formDisabledCallback(disabled) {
+    this.#effectiveDisabled = disabled;
+    this.#sync();
+  }
+
+  formResetCallback() {
+    this.#dirty = false;
+    this.#showValidation = false;
+    this.#setValue(this.defaultValue, { dirty: false, emit: false });
+  }
+
+  formStateRestoreCallback(state, mode) {
+    if (typeof state !== 'string') return;
+
+    try {
+      const parsed = JSON.parse(state);
+      if (parsed.version !== 1) return;
+      this.#setValue(parsed.value, { dirty: true, emit: false });
+    } catch {}
+  }
+
+  checkValidity() {
+    return this.#internals.checkValidity();
+  }
+
+  reportValidity() {
+    this.#showValidation = true;
+    this.#sync();
+    return this.#internals.reportValidity();
+  }
+
+  focus(options) {
+    this.#focusTarget()?.focus(options);
+  }
+
+  #handleClick = (event) => {
+    const button = event
+      .composedPath()
+      .find((node) => node instanceof HTMLButtonElement && node.dataset.value);
+    if (!button || this.#effectiveDisabled) return;
+    this.#selectFromUser(button.dataset.value);
+    button.focus();
+  };
+
+  #handleHostClick = (event) => {
+    // Label activation tạo click nhắm thẳng host.
+    if (event.composedPath()[0] === this) this.focus();
+  };
+
+  #handleKeydown = (event) => {
+    if (this.#effectiveDisabled || event.defaultPrevented) return;
+
+    const current = event
+      .composedPath()
+      .find((node) => node instanceof HTMLButtonElement && node.dataset.value);
+    if (!current) return;
+
+    const index = OPTIONS.findIndex(
+      ({ value }) => value === current.dataset.value
+    );
+    const last = OPTIONS.length - 1;
+    const nextIndex = {
+      ArrowRight: (index + 1) % OPTIONS.length,
+      ArrowDown: (index + 1) % OPTIONS.length,
+      ArrowLeft: (index - 1 + OPTIONS.length) % OPTIONS.length,
+      ArrowUp: (index - 1 + OPTIONS.length) % OPTIONS.length,
+      Home: 0,
+      End: last,
+    }[event.key];
+
+    if (nextIndex === undefined) return;
+    event.preventDefault();
+
+    const nextValue = OPTIONS[nextIndex].value;
+    this.#selectFromUser(nextValue);
+    this.#buttonFor(nextValue).focus();
+  };
+
+  #handleInvalid = () => {
+    this.#showValidation = true;
+    this.#renderValidation();
+  };
+
+  #selectFromUser(value) {
+    this.#showValidation = true;
+    this.#setValue(value, { dirty: true, emit: true });
+  }
+
+  #setValue(value, { dirty, emit }) {
+    const next = normalizeValue(value);
+    const changed = next !== this.#value;
+    this.#value = next;
+    if (dirty) this.#dirty = true;
+    this.#sync();
+
+    if (changed && emit) {
+      this.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      this.dispatchEvent(
+        new Event('change', { bubbles: true, composed: true })
+      );
+    }
+  }
+
+  #sync() {
+    if (!this.#root) return;
+
+    const buttons = [...this.#options.querySelectorAll('button')];
+    const selected = this.#buttonFor(this.#value);
+    const tabStop = selected ?? buttons[0];
+
+    for (const button of buttons) {
+      const checked = button === selected;
+      button.setAttribute('aria-checked', String(checked));
+      button.tabIndex = button === tabStop ? 0 : -1;
+      button.disabled = this.#effectiveDisabled;
+    }
+
+    this.#internals.ariaRequired = String(this.required);
+    this.#internals.ariaDisabled = String(this.#effectiveDisabled);
+
+    const state = JSON.stringify({ version: 1, value: this.#value });
+    this.#internals.setFormValue(this.#value || null, state);
+
+    if (this.#effectiveDisabled) {
+      this.#internals.setValidity({});
+    } else if (this.required && !this.#value) {
+      this.#internals.setValidity(
+        { valueMissing: true },
+        'Hãy chọn mức ưu tiên.',
+        tabStop
+      );
+    } else {
+      this.#internals.setValidity({});
+    }
+
+    this.#renderValidation();
+  }
+
+  #renderValidation() {
+    const showError =
+      this.#showValidation &&
+      this.#internals.willValidate &&
+      !this.#internals.validity.valid;
+    this.#options.classList.toggle('invalid', showError);
+    this.#error.hidden = !showError;
+    this.#error.textContent = showError
+      ? this.#internals.validationMessage
+      : '';
+    this.#internals.ariaInvalid = String(showError);
+  }
+
+  #buttonFor(value) {
+    return (
+      [...this.#options.querySelectorAll('button')].find(
+        (button) => button.dataset.value === value
+      ) ?? null
+    );
+  }
+
+  #focusTarget() {
+    return (
+      this.#buttonFor(this.#value) ??
+      this.#options.querySelector('button:not(:disabled)')
+    );
+  }
+}
+
+customElements.define('kb-priority-picker', KbPriorityPicker);
+```
+
+Sử dụng như một control bình thường:
+
+```html
+<form id="task-form">
+  <label for="task-title">Tên task</label>
+  <input id="task-title" name="title" required />
+
+  <label for="task-priority">Mức ưu tiên</label>
+  <kb-priority-picker
+    id="task-priority"
+    name="priority"
+    value="medium"
+    required
+  ></kb-priority-picker>
+
+  <button>Lưu task</button>
+</form>
+
+<script type="module" src="./kb-priority-picker.js"></script>
+<script type="module">
+  const form = document.querySelector('#task-form');
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    console.log(Object.fromEntries(new FormData(form)));
+    // { title: '...', priority: 'medium' }
+  });
+</script>
+```
+
+## 8. Failure modes thường gặp
+
+- **Quên gọi `setFormValue()` sau mỗi thay đổi:** UI hiển thị `high` nhưng payload vẫn là value cũ.
+- **Dùng attribute `value` làm current state duy nhất:** `form.reset()` không còn biết default ban đầu là gì.
+- **Property setter tự phát `change`:** code consumer gán `picker.value = 'high'` có thể tạo vòng lặp. Event dành cho interaction người dùng.
+- **Chỉ đọc host `disabled`:** control vẫn hoạt động khi nằm trong `<fieldset disabled>`. Dùng argument của `formDisabledCallback()`.
+- **Hiển thị lỗi nhưng không gọi `setValidity()`:** form vẫn submit. Hoặc đặt validity flag mà không có message, dẫn tới exception/UX thiếu thông tin.
+- **Tạo nhiều tab stop trong radio group:** dùng roving `tabindex` và keyboard model theo radio, không để cả ba option luôn là `0`.
+- **Giả định label chỉ cần đẹp về thị giác:** kiểm tra `picker.labels`, click label, accessible name và focus bằng browser cùng screen reader trong support matrix.
+
+---
+
+## 9. Bài tập
+
+1. **Cơ bản:** đặt picker trong `<fieldset disabled>`, xác nhận button không hoạt động, `willValidate` phù hợp và `FormData` không chứa control bị disabled.
+2. **Mở rộng:** thêm option `urgent`; giữ keyboard wrap-around, validation, reset và restore hoạt động mà không hard-code index ở nhiều nơi.
+3. **Thử thách:** tạo `<kb-estimate-range>` submit hai entry bằng `FormData` (`estimate.min`, `estimate.max`) nhưng lưu restoration state có version riêng. Viết test cho submit, `form.reset()`, `formStateRestoreCallback()` và programmatic setter không phát event.
+
+## Cốt lõi cần nhớ
+
+- `static formAssociated = true` cùng `attachInternals()` đưa autonomous custom element vào form lifecycle.
+- `setFormValue()` truyền submission value; tham số thứ hai lưu restoration state.
+- Attribute `value` nên giữ default, property `value` giữ current state nếu control cần reset đúng nghĩa.
+- `setValidity()` quyết định constraint validation thật; error text chỉ là phần trình bày.
+- Effective disabled state đến từ `formDisabledCallback()`, kể cả qua disabled fieldset.
+- Reset và restore cập nhật state nhưng không giả làm interaction người dùng.
+- `labels`, default ARIA semantics, radio keyboard model và focus contract phải được test cùng nhau.
+
+Mini Kanban giờ đã có composition, theming, event/focus accessible và form control. Phần 9 sẽ ghép các invariant thành checkpoint vanilla hoàn chỉnh; Phần 10 mới khóa public contract trong browser trước khi chuyển sang Lit.
+
+## Nguồn chính thức
+
+- [HTML Standard — Creating a form-associated custom element](https://html.spec.whatwg.org/dev/custom-elements.html#form-associated-custom-element)
+- [HTML Standard — `ElementInternals` và form-associated custom elements](https://html.spec.whatwg.org/dev/custom-elements.html#the-elementinternals-interface)
+- [MDN — `ElementInternals`](https://developer.mozilla.org/en-US/docs/Web/API/ElementInternals)
+- [MDN — `ElementInternals.setFormValue()`](https://developer.mozilla.org/en-US/docs/Web/API/ElementInternals/setFormValue)
+- [MDN — `ElementInternals.setValidity()`](https://developer.mozilla.org/en-US/docs/Web/API/ElementInternals/setValidity)
+- [HTML Standard — Constraint validation](https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constraints)
+- [WAI-ARIA Authoring Practices — Radio Group Pattern](https://www.w3.org/WAI/ARIA/apg/patterns/radio/)

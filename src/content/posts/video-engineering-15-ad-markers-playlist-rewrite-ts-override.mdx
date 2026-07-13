@@ -1,0 +1,284 @@
+---
+title: 'Video Engineering · Phần 15 — Ad marker, rewrite playlist và override TS'
+description: 'Phân biệt CSAI/SSAI, đọc EXT-X-DATERANGE và SCTE-35, rồi rewrite HLS playlist trên fixture tự sở hữu; hiểu vì sao thay binary TS trực tiếp rất dễ vỡ.'
+pubDate: 2026-07-12
+lang: vi
+tags: [video-engineering, video, hls, ad-markers, scte-35, playlist-rewrite]
+series: video-engineering
+seriesOrder: 15
+draft: false
+---
+
+“Cắt quảng cáo khỏi HLS” nghe như thao tác xóa vài file `.ts`, nhưng có ít nhất ba bài toán khác nhau: nhận diện đâu là quảng cáo, thay đổi timeline mà vẫn giữ stream hợp lệ, và triển khai thay đổi ở client hay server. Nếu nhầm marker với media, ta có thể xóa metadata nhưng quảng cáo vẫn phát; nếu chặn segment, player chỉ nhận một lỗ buffer.
+
+Bài này chỉ làm trên fixture tổng hợp do chính ta tạo. Mục tiêu là debug, kiểm thử ad insertion và hiểu cơ chế đóng gói — không vượt quyền truy cập, không né điều khoản dịch vụ, không lấy key và không vô hiệu hóa DRM.
+
+---
+
+## 1. CSAI, SSAI và HLS Interstitial
+
+**CSAI** (client-side ad insertion) để player quyết định lúc tải và phát asset quảng cáo. Request ad và chuyển state thường tách khỏi primary media nên dễ quan sát.
+
+**SSAI** (server-side ad insertion) để packager tạo presentation đã có quảng cáo trong playlist hoặc media timeline. Segment ad có thể cùng CDN với nội dung chính, nên chặn hostname không đáng tin.
+
+**HLS Interstitial** dùng metadata playlist để mô tả nội dung chen giữa. Không phải mọi SSAI đều dùng Interstitial, và `EXT-X-DATERANGE` còn có thể biểu diễn chapter hoặc event.
+
+Nguồn ranh giới đáng tin nên được ưu tiên như sau:
+
+1. marker do hệ thống ad/packager phát ra;
+2. `EXT-X-DATERANGE`, HLS Interstitial hoặc SCTE-35 hợp lệ;
+3. metadata nghiệp vụ đã được đối chiếu với timeline;
+4. heuristic như cảnh đen, im lặng, logo hoặc scene change — chỉ tạo candidate, không phải sự thật.
+
+---
+
+## 2. Ba tag cần hiểu trước khi rewrite
+
+`EXT-X-DATERANGE` gắn một khoảng thời gian thực với bộ attribute. Playlist có date range cần `EXT-X-PROGRAM-DATE-TIME` để ánh xạ wall clock sang media timeline.
+
+SCTE-35 là splice signaling thường dùng trong broadcast/ad workflow. RFC 8216 định nghĩa cách mang splice info qua các attribute `SCTE35-OUT`, `SCTE35-IN` và `SCTE35-CMD` trong `EXT-X-DATERANGE`. Payload là dữ liệu SCTE-35 thực, không phải một chuỗi hex tùy ý.
+
+`EXT-X-DISCONTINUITY` báo ranh giới mà file format, track set hoặc timestamp sequence thay đổi; encoding sequence/parameter đổi cũng là lý do nên có tag. Nó không có nghĩa “đây là quảng cáo”. Một stream có thể chèn quảng cáo hoàn toàn liên tục mà không cần discontinuity, hoặc có discontinuity chỉ vì đổi encoder.
+
+Ba kết luận quan trọng:
+
+- xóa marker không tự xóa media đã stitch;
+- xóa media không có marker đáng tin dễ xóa nhầm nội dung;
+- xóa segment mà bỏ qua timestamp/decoder state dễ tạo stall hoặc A/V drift.
+
+---
+
+## 3. Tạo HLS fixture tự sở hữu
+
+Tạo ba MPEG-TS asset có cùng codec, resolution, frame rate và GOP; màu đỏ là ad tổng hợp:
+
+```bash
+mkdir -p hls-ad-lab
+cd hls-ad-lab
+
+ffmpeg -hide_banner -y \
+  -f lavfi -i "color=c=0x2563eb:s=1280x720:r=25:d=6" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=6" \
+  -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 21 \
+  -pix_fmt yuv420p -g 50 -keyint_min 50 -sc_threshold 0 -flags +cgop \
+  -c:a aac -b:a 128k -f mpegts content-a.ts
+
+ffmpeg -hide_banner -y \
+  -f lavfi -i "color=c=0xdc2626:s=1280x720:r=25:d=4" \
+  -f lavfi -i "sine=frequency=880:sample_rate=48000:duration=4" \
+  -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 21 \
+  -pix_fmt yuv420p -g 50 -keyint_min 50 -sc_threshold 0 -flags +cgop \
+  -c:a aac -b:a 128k -f mpegts ad.ts
+
+ffmpeg -hide_banner -y \
+  -f lavfi -i "color=c=0x16a34a:s=1280x720:r=25:d=6" \
+  -f lavfi -i "sine=frequency=550:sample_rate=48000:duration=6" \
+  -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 21 \
+  -pix_fmt yuv420p -g 50 -keyint_min 50 -sc_threshold 0 -flags +cgop \
+  -c:a aac -b:a 128k -f mpegts content-b.ts
+```
+
+Lưu playlist sau thành `original.m3u8`:
+
+```text
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-PROGRAM-DATE-TIME:2026-07-12T00:00:00Z
+#EXT-X-DATERANGE:ID="synthetic-ad-1",CLASS="com.example.synthetic-ad",START-DATE="2026-07-12T00:00:06Z",DURATION=4.0,X-ASSET-ID="red-card"
+#EXTINF:6.0,
+content-a.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:4.0,
+ad.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:6.0,
+content-b.ts
+#EXT-X-ENDLIST
+```
+
+Ba file được mux riêng nên timestamp reset; discontinuity trước `ad.ts` và `content-b.ts` là có chủ đích. Fixture dùng custom `CLASS`, không giả SCTE-35. Production chỉ dùng marker được splice system tạo và validate.
+
+Kiểm tra trước khi chỉnh:
+
+```bash
+ffprobe -v error -show_programs -show_streams -of json content-a.ts
+ffprobe -v error -show_programs -show_streams -of json ad.ts
+ffplay original.m3u8
+```
+
+---
+
+## 4. Rewrite playlist VOD, không đụng binary TS
+
+Lab biết chính xác URI `ad.ts` do ta tạo. Lưu script sau thành `rewrite.py`:
+
+```python
+from pathlib import Path
+
+DROP_URIS = {"ad.ts"}
+source = Path("original.m3u8").read_text(encoding="utf-8").splitlines()
+output = []
+pending_segment = []
+
+for line in source:
+    value = line.strip()
+
+    if value.startswith("#EXT-X-DATERANGE") and \
+       'CLASS="com.example.synthetic-ad"' in value:
+        continue
+
+    if value.startswith("#EXTINF:"):
+        if pending_segment:
+            raise RuntimeError("Nested EXTINF is invalid for this lab")
+        pending_segment = [line]
+        continue
+
+    if pending_segment:
+        if value.startswith("#"):
+            pending_segment.append(line)
+            continue
+
+        if value not in DROP_URIS:
+            output.extend(pending_segment)
+            output.append(line)
+        pending_segment = []
+        continue
+
+    output.append(line)
+
+if pending_segment:
+    raise RuntimeError("Playlist ended before segment URI")
+
+# Sau khi bỏ ad, hai discontinuity có thể đứng cạnh nhau.
+cleaned = []
+for line in output:
+    if line == "#EXT-X-DISCONTINUITY" and cleaned and cleaned[-1] == line:
+        continue
+    cleaned.append(line)
+
+Path("clean.m3u8").write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+```
+
+Chạy và so sánh:
+
+```bash
+python3 rewrite.py
+diff -u original.m3u8 clean.m3u8
+ffplay clean.m3u8
+```
+
+`content-a.ts` và `content-b.ts` vẫn có timestamp reset vì được mux độc lập, nên giữ một discontinuity giữa chúng là đúng. Script cố ý chỉ hỗ trợ VOD fixture nhỏ và drop-list đã biết; nó **không** phải parser HLS production.
+
+Một rewriter thật phải giữ tag chưa biết, giải quyết URI tương đối, key/map scope, byte range, media/discontinuity sequence, live playlist updates, rendition alignment, signed URL, cache semantics và ad decision thay đổi theo phiên. Dùng parser/spec-aware library và test fixture, không regex một manifest tùy ý.
+
+---
+
+## 5. Phát trong Chrome và dùng Local Overrides
+
+Để có HLS player cục bộ trên Chrome, cài `hls.js` trong thư mục lab:
+
+```bash
+npm init -y
+npm install hls.js
+```
+
+Lưu thành `index.html`:
+
+```html
+<!doctype html>
+<meta charset="utf-8" />
+<video id="video" controls style="width: 720px; max-width: 100%"></video>
+<script src="./node_modules/hls.js/dist/hls.min.js"></script>
+<script>
+  const video = document.querySelector('#video');
+  const source =
+    new URLSearchParams(location.search).get('src') || 'original.m3u8';
+
+  if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = source;
+  } else if (Hls.isSupported()) {
+    const hls = new Hls({ debug: true });
+    hls.loadSource(source);
+    hls.attachMedia(video);
+  } else {
+    document.body.append('Môi trường này không hỗ trợ fixture HLS.');
+  }
+</script>
+```
+
+Chạy `python3 -m http.server 8080`, mở `http://localhost:8080`, rồi trong Network chọn request `original.m3u8` → **Override content**. Chọn thư mục override, cấp quyền, thay body bằng nội dung `clean.m3u8`, lưu và reload. DevTools sẽ phục vụ bản local thay response mạng và tự tắt cache khi Local Overrides hoạt động.
+
+Override chỉ thử giả thuyết trên browser, không sửa origin. Với test lặp lại, đặt logic ở proxy/backend được ủy quyền, version-control rule và lưu manifest trước/sau.
+
+---
+
+## 6. Vì sao override binary `.ts` rất brittle?
+
+TS không phải “blob video” tùy ý. Packet TS dài cố định 188 byte, có PID và continuity counter; PAT/PMT mô tả program/stream; PES mang elementary stream; PCR, PTS và DTS giữ clock cùng presentation order. HLS còn yêu cầu TS segment có decoder initialization phù hợp và continuity chỉ được ngắt khi báo discontinuity.
+
+Thay `ad.ts` bằng một file TS bất kỳ có thể tạo:
+
+- PID/PAT/PMT hoặc codec config khác;
+- timestamp quay lùi, nhảy xa hoặc A/V không cùng gốc;
+- segment không bắt đầu ở random access point;
+- continuity counter và decoder reference không phù hợp;
+- duration thật khác `EXTINF`;
+- MIME, cache key hoặc byte-range không khớp;
+- ciphertext vô nghĩa nếu segment được mã hóa.
+
+Nếu cần asset thay thế hợp lệ trong hệ thống của mình, hãy encode/remux theo đúng rendition contract và cập nhật manifest. Nếu chỉ muốn bỏ một ad đã segment-align, rewrite playlist thường ít phá vỡ hơn chỉnh bytes. Nếu biên không ở keyframe hoặc track/timestamp khác, phải rebuild vùng nối thay vì mong `-c copy` tạo phép cắt sample-accurate.
+
+---
+
+## 7. Encryption và ranh giới an toàn
+
+`EXT-X-KEY` mô tả cách segment HLS được mã hóa; EME kết nối browser với Content Decryption Module và key system. Local Overrides không trao quyền giải mã. Khi fixture thật có FairPlay, Widevine hoặc hệ bảo vệ khác, dừng ở log/metadata mà quyền kiểm thử cho phép và làm việc với chủ hệ thống để có test stream clear hoặc test key hợp lệ.
+
+Bài lab cố ý không có `EXT-X-KEY`, license endpoint hay DRM. Không sửa key URI, không trích key, không patch CDM và không biến phần debug thành hướng dẫn né bảo vệ nội dung.
+
+---
+
+## Failure checklist
+
+- [ ] Coi mọi `EXT-X-DATERANGE` là quảng cáo.
+- [ ] Tạo SCTE-35 hex giả thay vì dùng marker từ hệ thống splice.
+- [ ] Xóa marker nhưng quên ad đã nằm trong media timeline.
+- [ ] Block `ad.ts` và gọi buffer hole là “cắt thành công”.
+- [ ] Xóa cả hai discontinuity dù hai nội dung còn lại reset timestamp.
+- [ ] Rewrite bằng regex nhưng làm mất `EXT-X-KEY`, `EXT-X-MAP` hoặc byte range.
+- [ ] Không cập nhật live sequence/cache semantics.
+- [ ] Thay TS có codec, PID, GOP hoặc duration khác rendition contract.
+- [ ] Test Local Overrides nhưng tưởng origin đã được sửa.
+- [ ] Đụng encrypted stream ngoài phạm vi được ủy quyền.
+
+---
+
+## Bài tập
+
+**1.** Probe packet đầu của ba TS, so PTS/DTS và giải thích vì sao playlist cần discontinuity dù codec giống nhau.
+
+**2.** Đổi `DROP_URIS` thành tập rỗng nhưng xóa date-range marker. Quan sát quảng cáo màu đỏ vẫn phát và viết lại khác biệt giữa signaling với media.
+
+**3.** Encode `content-b.ts` ở 640×360, giữ playlist cũ và xem Media Messages. Sau đó sửa pipeline để mọi asset tuân cùng rendition contract.
+
+**Nâng cao:** viết validator chỉ cho fixture này: parse `EXTINF`, probe duration/codec/resolution của mỗi URI và từ chối output nếu segment sau rewrite không phù hợp. Không mở rộng nó thành công cụ sửa stream bên thứ ba.
+
+---
+
+## Đọc thêm
+
+- [RFC 8216 — HTTP Live Streaming](https://www.rfc-editor.org/rfc/rfc8216.html)
+- [HLS Authoring Specification for Apple devices](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices/)
+- [Apple: Getting Started with HLS Interstitials](https://developer.apple.com/streaming/GettingStartedWithHLSInterstitials.pdf)
+- [ITU-T H.222.0 — MPEG-2 Systems](https://www.itu.int/rec/T-REC-H.222.0/en)
+- [Chrome DevTools Local Overrides](https://developer.chrome.com/docs/devtools/overrides)
+- [Encrypted Media Extensions](https://www.w3.org/TR/encrypted-media-2/)
+
+---
+
+## Bài kế tiếp
+
+[Phần 16 — Capstone: dựng, phát, profile và debug một stream hoàn chỉnh](/blog/video-engineering-16-capstone-stream-lab/)

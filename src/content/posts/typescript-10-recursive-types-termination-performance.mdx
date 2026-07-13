@@ -1,0 +1,444 @@
+---
+title: 'TypeScript Production · Phần 10 — Recursive Types: Termination, Depth & Performance'
+description: 'Viết recursive type có điểm dừng, depth fuel và seen set; chẩn đoán TS2589, đo chi phí bằng diagnostics/trace, và biết lúc nào nên chuyển sang code generation.'
+pubDate: 2026-07-12
+updatedDate: 2026-07-12
+lang: vi
+tags: [typescript, recursive-types, type-performance, type-system]
+series: typescript
+seriesOrder: 10
+draft: false
+---
+
+Recursive type không khó vì cú pháp đệ quy. Nó khó vì bạn đang viết một
+**chương trình chạy trong compiler** nhưng không có debugger, không có stack
+trace quen thuộc, và chi phí của chương trình đó được trả bởi mọi người đang
+gõ code trong editor.
+
+Mục tiêu production không phải tạo type “thông minh nhất”. Mục tiêu là tạo
+contract đủ chính xác, dừng được trên input xấu, báo lỗi gần nguyên nhân và
+không làm language service chậm đi theo kích thước codebase.
+
+## Recursive type là một chương trình
+
+Một recursive type đáng tin phải trả lời được bốn câu hỏi:
+
+1. **Base case là gì?** Khi nào không gọi lại chính nó?
+2. **Mỗi bước nhỏ đi ở đâu?** Bớt một tuple item, một đoạn string hay một mức object?
+3. **Ngân sách là bao nhiêu?** Input nào được phép sâu hoặc rộng tới mức nào?
+4. **Kết quả có đáng chi phí không?** Precision đó có cải thiện API thật hay chỉ làm hover dài hơn?
+
+Ví dụ bóc phần tử cuối của tuple có cả base case lẫn bước tiến rõ:
+
+```ts
+type Last<T extends readonly unknown[]> = T extends readonly [
+  infer Head,
+  ...infer Tail,
+]
+  ? Tail extends readonly []
+    ? Head
+    : Last<Tail>
+  : never;
+
+type A = Last<readonly ['open', 'half-open', 'closed']>;
+//   ^? 'closed'
+
+type B = Last<readonly []>;
+//   ^? never
+```
+
+- `[]` là base case và trả `never`.
+- Nhánh recursive gọi `Last<Tail>`, nhỏ hơn `T` đúng một phần tử.
+- Không có nhánh nào gọi lại với nguyên input.
+
+Checklist “base case + structural descent” bắt được phần lớn recursive type
+không dừng trước khi bạn phải nhìn thấy `TS2589`.
+
+## Tuple recursion: dựng kết quả ở đâu?
+
+Nếu dựng kết quả kiểu `[...Reverse<Tail>, Head]`, mỗi frame phải chờ lời gọi
+recursive rồi mới append. Accumulator chuyển phần đã biết thành type parameter:
+
+```ts
+type ReverseAcc<
+  T extends readonly unknown[],
+  Acc extends readonly unknown[] = [],
+> = T extends readonly [infer Head, ...infer Tail]
+  ? ReverseAcc<Tail, readonly [Head, ...Acc]>
+  : Acc;
+
+type ReversedAcc = ReverseAcc<readonly [1, 2, 3]>;
+//   ^? readonly [3, 2, 1]
+```
+
+Đây là **tail-style recursion**: lời gọi recursive là expression cuối cùng.
+Nó thường giảm intermediate expansion, nhưng không phải lời hứa rằng compiler
+sẽ tối ưu như một JavaScript engine tối ưu tail call.
+
+Accumulator vẫn có thể đắt khi:
+
+- nó lớn thêm ở mỗi bước;
+- mỗi item là một union phải phân phối;
+- kết quả là intersection khiến compiler phải normalize;
+- recursion nằm trong mapped type rộng.
+
+Đổi sang accumulator là một hypothesis cần benchmark, không phải ritual.
+
+## String recursion: luôn có escape hatch cho type rộng
+
+Template literal type cho phép “consume” một đoạn string ở mỗi vòng:
+
+```ts
+type Split<S extends string, Separator extends string> = string extends S
+  ? string[]
+  : string extends Separator
+    ? string[]
+    : Separator extends ''
+      ? never
+      : S extends `${infer Head}${Separator}${infer Tail}`
+        ? [Head, ...Split<Tail, Separator>]
+        : [S];
+
+type Segments = Split<'users.42.profile', '.'>;
+//   ^? ['users', '42', 'profile']
+
+type DynamicSegments = Split<string, '.'>;
+//   ^? string[]
+
+type InvalidSeparator = Split<'abc', ''>;
+//   ^? never
+```
+
+Ba guard đầu tiên quan trọng hơn dòng `infer`:
+
+- `string extends S` phát hiện input đã widen; compiler không thể liệt kê segment.
+- separator động cũng không tạo được kết quả tuple chính xác.
+- separator rỗng không “ăn” ký tự nào, nên recursion không có tiến triển hữu ích.
+
+API production nên degrade về `string[]` khi thông tin literal đã mất. Trả
+một type cực kỳ chính xác từ một `string` bất kỳ thường là lời hứa giả.
+
+## Object recursion cần định nghĩa leaf
+
+“Nếu là object thì recurse” quá rộng. Function, `Date`, `Map`, schema class và
+array đều là object nhưng không nhất thiết là domain record cần đi xuyên qua.
+
+Hãy định nghĩa terminal theo contract đang xây:
+
+```ts
+type Scalar = string | number | boolean | bigint | symbol | null | undefined;
+
+type Callable = (...args: never[]) => unknown;
+
+type DeepReadonlyN<T, Fuel extends readonly unknown[]> = Fuel extends readonly [
+  unknown,
+  ...infer Rest,
+]
+  ? T extends Scalar | Date | RegExp | Callable
+    ? T
+    : T extends readonly (infer Item)[]
+      ? readonly DeepReadonlyN<Item, Rest>[]
+      : T extends object
+        ? { readonly [K in keyof T]: DeepReadonlyN<T[K], Rest> }
+        : T
+  : T;
+```
+
+`DeepReadonlyN` không giả vờ hiểu mọi object trên đời:
+
+- primitive và các leaf đã chọn được giữ nguyên;
+- array recurse vào element nhưng trở thành readonly;
+- record recurse qua key;
+- hết `Fuel` thì trả shape hiện tại và dừng.
+
+Fuel biến một giả định ngầm thành contract review được.
+
+Depth `3` không “đúng” cho mọi domain. Nó chỉ nói utility này cam kết xử lý
+ba bước. Nếu product cần mười hai bước, hãy hỏi trước liệu model có nên phẳng
+hơn, được generate, hoặc chia thành boundary nhỏ hơn không.
+
+## Seen set: cắt cycle, nhưng không miễn phí
+
+Model như `Category = { id: string; children: readonly Category[] }` có thể tự
+tham chiếu hợp lệ. Seen set dừng khi gặp lại shape đã đi qua:
+
+```ts
+type DeepReadonlySeen<T, Seen = never> = [T] extends [Seen]
+  ? T
+  : T extends Scalar | Date | RegExp | Callable
+    ? T
+    : T extends readonly (infer Item)[]
+      ? readonly DeepReadonlySeen<Item, Seen | T>[]
+      : T extends object
+        ? {
+            readonly [K in keyof T]: DeepReadonlySeen<T[K], Seen | T>;
+          }
+        : T;
+
+type ReadonlyCategory = DeepReadonlySeen<Category>;
+```
+
+Tuple wrapper `[T] extends [Seen]` kiểm tra toàn bộ `T`, không phân phối từng
+union member ở guard này.
+
+TypeScript so cấu trúc chứ không so identity khai báo, nên hai type khác tên
+nhưng cùng shape có thể bị dừng sớm. Fuel nghĩa là “chính xác tới N mức”; seen
+set nghĩa là “đừng đi lại shape này”. Chọn theo semantics, không theo độ ngắn.
+
+## Production case: typed path cho normalized config
+
+Ta muốn API đọc config có autocomplete cho path hợp lệ và trả đúng value type.
+Config đã được parse ở runtime trước khi vào core:
+
+```ts
+type AppConfig = {
+  api: {
+    baseUrl: string;
+    retry: {
+      maxAttempts: number;
+      backoff: 'linear' | 'exponential';
+    };
+  };
+  features: {
+    billing: { enabled: boolean };
+    search: { pageSize: number };
+  };
+  regions: readonly string[];
+};
+
+type PathLeaf = Scalar | Date | RegExp | Callable | readonly unknown[];
+type Depth4 = readonly [1, 1, 1, 1];
+
+type Paths<
+  T,
+  Fuel extends readonly unknown[] = Depth4,
+> = Fuel extends readonly [unknown, ...infer Rest]
+  ? T extends object
+    ? {
+        [K in keyof T & string]: T[K] extends PathLeaf
+          ? K
+          : K | `${K}.${Paths<T[K], Rest>}`;
+      }[keyof T & string]
+    : never
+  : never;
+
+type Get<
+  T,
+  P extends string,
+  Fuel extends readonly unknown[] = Depth4,
+> = Fuel extends readonly [unknown, ...infer Rest]
+  ? P extends `${infer Head}.${infer Tail}`
+    ? Head extends keyof T
+      ? Get<T[Head], Tail, Rest>
+      : never
+    : P extends keyof T
+      ? T[P]
+      : never
+  : never;
+```
+
+`Paths` map từng key rồi index lại mapped type để lấy union kết quả. Array là
+leaf có chủ ý: contract cho phép lấy `regions`, không hứa autocomplete cho
+`regions.0`.
+
+```ts
+type ConfigPath = Paths<AppConfig>;
+
+type RetryCount = Get<AppConfig, 'api.retry.maxAttempts'>;
+//   ^? number
+
+type Billing = Get<AppConfig, 'features.billing'>;
+//   ^? { enabled: boolean }
+
+type Typo = Get<AppConfig, 'api.retries.maxAttempts'>;
+//   ^? never
+```
+
+Implementation runtime đi qua từng segment, kiểm tra object/key rồi cô lập một
+assertion ở return boundary:
+
+```ts
+declare function readConfig<const P extends ConfigPath>(
+  config: AppConfig,
+  path: P
+): Get<AppConfig, P>;
+
+declare const config: AppConfig;
+const attempts = readConfig(config, 'api.retry.maxAttempts'); // number
+
+// @ts-expect-error — path không thuộc contract đã normalize
+readConfig(config, 'api.retries.maxAttempts');
+```
+
+Nếu path đến từ database hay query string, nó vẫn là `string`: parse thành
+`ConfigPath` hoặc dùng API runtime trả `unknown`. Generic không validate input.
+
+## Type tests cho recursive contract
+
+Một helper tối giản đủ kiểm tra các kết quả quan trọng:
+
+```ts
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
+    ? true
+    : false;
+
+type Expect<T extends true> = T;
+
+type _split = Expect<
+  Equal<Split<'orders.pending.count', '.'>, ['orders', 'pending', 'count']>
+>;
+
+type _get = Expect<Equal<Get<AppConfig, 'features.search.pageSize'>, number>>;
+
+type _invalid = Expect<Equal<Get<AppConfig, 'features.unknown'>, never>>;
+```
+
+Suite thật nên thêm leaf policy và depth boundary. Snapshot hover dài không
+chứng minh contract; test capability mà consumer dựa vào.
+
+## Vì sao `TS2589` xuất hiện?
+
+`Type instantiation is excessively deep and possibly infinite` không chỉ có
+nghĩa “đệ quy hơn một con số cố định”. Nó có thể đến từ:
+
+- recursion không tiến triển;
+- tuple hoặc string dài;
+- union phân phối ở mỗi mức;
+- mapped type đi qua object rất rộng;
+- nhiều helper lồng nhau cùng materialize một kết quả;
+- generic public bị instantiate với hàng trăm shape ở call site.
+
+Ví dụ recursion gọi lại nguyên input:
+
+```ts
+type BadTrimLeft<S extends string> = S extends ` ${infer _Rest}`
+  ? BadTrimLeft<S>
+  : S;
+
+// BadTrimLeft<' value'> không bao giờ consume phần đã infer.
+```
+
+Ví dụ breadth nhân theo tích Descartes:
+
+```ts
+type Cross<A, B> = A extends unknown
+  ? B extends unknown
+    ? readonly [A, B]
+    : never
+  : never;
+
+type Matrix = Cross<'a' | 'b' | 'c', 1 | 2 | 3>;
+// 3 × 3 = 9 tuple members
+```
+
+Đặt `Cross` trong recursion sâu năm mức không tạo chi phí tuyến tính. Depth
+nhìn nhỏ nhưng breadth có thể nổ. Vì vậy “type chỉ recurse 10 lần” chưa đủ để
+kết luận nó rẻ.
+
+## Điều khiển distribution là thay semantics
+
+Conditional type có naked type parameter sẽ phân phối trên union:
+
+```ts
+type BoxEach<T> = T extends unknown ? { value: T } : never;
+type Each = BoxEach<'a' | 'b'>;
+//   ^? { value: 'a' } | { value: 'b' }
+
+type BoxTogether<T> = [T] extends [unknown] ? { value: T } : never;
+type Together = BoxTogether<'a' | 'b'>;
+//   ^? { value: 'a' | 'b' }
+```
+
+Tuple wrapper có thể giảm số branch, nhưng hai kết quả không tương đương.
+Không tắt distribution chỉ để benchmark đẹp hơn nếu consumer cần correlation
+của từng member.
+
+## `Simplify<T>` không xóa chi phí đã phát sinh
+
+`type Simplify<T> = { [K in keyof T]: T[K] } & {}` làm hover dễ đọc nhưng
+không bảo đảm compiler quên graph đã tạo `T`. Boundary thật là named public
+interface, artifact `.d.ts`, codegen, giảm precision hoặc chia contract nhỏ hơn.
+
+## Benchmark protocol: đo type như đo code
+
+Tạo fixture riêng với `strict`, `noEmit`, `incremental: false`, một file input
+đại diện, rồi chạy diagnostics và trace:
+
+```bash
+tsc -p bench/tsconfig.json --extendedDiagnostics
+tsc -p bench/tsconfig.json --generateTrace bench/trace-run-01
+```
+
+Protocol tối thiểu:
+
+1. Pin Node, TypeScript, lockfile và compiler options.
+2. Đo cold check nhiều lần; dùng median, không chọn lần đẹp nhất.
+3. Chỉ thay một utility giữa baseline và candidate.
+4. Test cả typical input lẫn worst case hợp lệ về depth, width và union size.
+5. Ghi `Types`, `Instantiations`, memory và check time.
+6. Mở `trace.json`/`types.json` để tìm alias hoặc phase lặp lại nhiều, rồi tạo
+   fixture nhỏ tái hiện hotspot.
+7. Kiểm tra editor riêng; CLI nhanh không luôn đồng nghĩa completion nhanh.
+
+Đừng cam kết “nhanh hơn 40%” từ một run trên laptop. Điều cần giữ trong repo
+là input fixture, version, command và budget để người khác lặp lại được.
+
+## Khi nào nên chuyển sang code generation?
+
+Type-level recursion phù hợp khi transform nhỏ, local và input đã là literal.
+Code generation thường tốt hơn khi:
+
+- contract đóng và hữu hạn đã tồn tại trong OpenAPI, schema hay database;
+- cùng grammar phải được parse lại ở runtime;
+- union sinh ra có hàng trăm hoặc hàng nghìn member;
+- error message từ generic xa call site;
+- mỗi keystroke instantiate lại cùng một graph;
+- artifact cần review, diff và version độc lập.
+
+Ví dụ route manifest có 800 route nên được generate thành declaration hoặc
+const artifact từ source of truth. Bắt compiler tự parse lại 800 template
+literal ở mọi consumer chỉ để tránh một build step thường là trade-off tệ.
+
+Rule ngắn: input nhỏ và depth cố định dùng recursive type có fuel; cycle dùng
+seen set hoặc projection hữu hạn; schema đóng thay đổi theo release ưu tiên
+codegen; precision không đổi behavior người dùng thì chọn type đơn giản hơn.
+
+## Lab
+
+1. Viết `DeepPartialN<T, Fuel>` với policy rõ cho array, function và `Date`.
+2. Tạo hai phiên bản `Paths<T>`: recursive trực tiếp và accumulator; benchmark
+   trên object rộng 5, 20 và 50 key ở ba mức sâu.
+3. Thêm recursive domain có cycle; so sánh kết quả fuel với seen set.
+4. Cố ý tạo recursion không tiến triển, đọc diagnostic rồi sửa bằng structural descent.
+5. Lấy một schema thật trong codebase; viết decision note chọn recursive type,
+   explicit interface hay code generation.
+6. Thêm type tests cho typical, invalid, maximum supported depth và widened input.
+
+**Done khi:** utility có semantics tại điểm dừng, có fixture đo được, không hứa
+precision từ input rộng và có tiêu chí rõ để xóa nó nếu compiler cost vượt
+giá trị API mang lại.
+
+## Checklist review cấp Staff
+
+- Base case và bước giảm kích thước có nhìn thấy ngay không?
+- Depth, width, union size production lớn nhất là bao nhiêu?
+- Leaf policy có vô tình recurse vào runtime object đặc biệt không?
+- Widened input degrade về type trung thực nào?
+- Distribution đang giữ correlation hay chỉ nhân work?
+- Assertion runtime có được cô lập ở adapter không?
+- Type tests có negative case và depth boundary không?
+- Diagnostics baseline có pin compiler version không?
+- Consumer có thật sự cần toàn bộ precision này không?
+- Source of truth nên nằm trong type, runtime schema hay generator?
+
+Recursive type production tốt không khoe compiler chịu được sâu tới đâu. Nó
+đặt giới hạn có chủ đích, đo được chi phí và dừng trước khi editor của cả team
+trở thành runtime cho một type puzzle.
+
+## Đọc tiếp
+
+- [Conditional Types](https://www.typescriptlang.org/docs/handbook/2/conditional-types.html)
+- [Mapped Types](https://www.typescriptlang.org/docs/handbook/2/mapped-types.html)
+- [`generateTrace`](https://www.typescriptlang.org/tsconfig/generateTrace.html)
+- [TypeScript Performance Wiki](https://github.com/microsoft/TypeScript/wiki/Performance)

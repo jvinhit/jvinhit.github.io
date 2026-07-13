@@ -1,0 +1,219 @@
+---
+title: 'Video Engineering · Phần 10 — HLS, playlist, segment và adaptive bitrate'
+description: 'Đọc master/media playlist HLS, hiểu ABR, keyframe alignment, MPEG-TS so với fMP4, rồi tự package một stream nhiều rendition bằng FFmpeg.'
+pubDate: 2026-07-12
+lang: vi
+tags: [video-engineering, video, hls, adaptive-bitrate, m3u8, streaming, ffmpeg]
+series: video-engineering
+seriesOrder: 10
+draft: false
+---
+
+Progressive MP4 cho browser một file để tải và seek. Nó rất hợp với clip nhỏ hoặc nội dung không cần đổi chất lượng động. Nhưng với video dài, live stream và mạng thay đổi liên tục, player cần chọn từng đoạn: “6 giây tiếp theo nên lấy bản 360p hay 720p?”
+
+**HTTP Live Streaming (HLS)** biến một presentation thành playlist text và các media segment ngắn. Player định kỳ đọc playlist, tải segment, đo throughput/buffer rồi có thể chuyển rendition. HLS không phải codec, và cũng không đồng nghĩa với file `.ts`.
+
+## 1. Ba lớp cần phân biệt
+
+```text
+master.m3u8
+  ├─ 720p/index.m3u8 ─► seg-000.ts, seg-001.ts, ...
+  ├─ 360p/index.m3u8 ─► seg-000.ts, seg-001.ts, ...
+  ├─ audio-vi/index.m3u8
+  └─ subtitles-vi/index.m3u8
+
+Master playlist  : mô tả các variant/rendition có thể chọn
+Media playlist   : timeline của một rendition
+Media segment    : dữ liệu media trong một khoảng thời gian
+```
+
+Playlist là UTF-8 text bắt đầu bằng `#EXTM3U`. URI có thể tương đối với URL playlist.
+
+Master playlist tối giản:
+
+```text
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:BANDWIDTH=3200000,AVERAGE-BANDWIDTH=3000000,RESOLUTION=1280x720,FRAME-RATE=30.000,CODECS="avc1.64001f,mp4a.40.2"
+v0/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,AVERAGE-BANDWIDTH=950000,RESOLUTION=640x360,FRAME-RATE=30.000,CODECS="avc1.64001e,mp4a.40.2"
+v1/index.m3u8
+```
+
+Media playlist VOD:
+
+```text
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXTINF:6.000000,
+seg-000.ts
+#EXTINF:6.000000,
+seg-001.ts
+#EXTINF:4.000000,
+seg-002.ts
+#EXT-X-ENDLIST
+```
+
+`EXTINF` là duration timeline, không phải kích thước file. `TARGETDURATION` là trần duration segment làm tròn theo quy tắc của spec, không phải lệnh bắt mọi segment dài đúng bằng nhau. Playlist live thường trượt cửa sổ, tăng `MEDIA-SEQUENCE` và chưa có `ENDLIST`.
+
+## 2. ABR chọn rendition, không chỉ chọn resolution
+
+Một adaptive bitrate player thường cân bằng:
+
+- throughput gần đây và độ biến động;
+- lượng buffer còn lại;
+- kích thước viewport/DPR;
+- codec/device support và đôi khi năng lượng;
+- lịch sử stall và chi phí chuyển rendition.
+
+`BANDWIDTH` trong master phải phản ánh peak segment bitrate đủ chính xác để player không chọn quá sức mạng. Chỉ lấy bitrate trung bình toàn file có thể che một segment rất nặng.
+
+Các rendition cần cùng nội dung và **segment boundary ở cùng media time**. Nếu 720p cắt tại 6.0, 12.0 nhưng 360p cắt tại 7.1, 13.4, player khó chuyển chất lượng mà không tạo gap/overlap.
+
+## 3. Tạo ladder hai rendition bằng FFmpeg
+
+Tạo thư mục đầu ra:
+
+```bash
+mkdir -p hls/v0 hls/v1
+```
+
+Package trực tiếp từ nguồn tổng hợp 30 giây:
+
+```bash
+ffmpeg \
+  -f lavfi -i "testsrc2=size=1280x720:rate=30" \
+  -f lavfi -i "sine=frequency=880:sample_rate=48000" \
+  -t 30 \
+  -filter_complex \
+    "[0:v]split=2[v0][v1];[v0]scale=1280:720[v0out];[v1]scale=640:360[v1out]" \
+  -map "[v0out]" -map 1:a \
+  -map "[v1out]" -map 1:a \
+  -c:v libx264 -preset medium -pix_fmt yuv420p -flags +cgop \
+  -b:v:0 2800k -maxrate:v:0 2996k -bufsize:v:0 4200k \
+  -b:v:1 800k  -maxrate:v:1 856k  -bufsize:v:1 1200k \
+  -g 180 -keyint_min 180 -sc_threshold 0 \
+  -c:a aac -b:a:0 128k -b:a:1 96k -ar 48000 \
+  -f hls -hls_time 6 -hls_playlist_type vod \
+  -hls_flags independent_segments \
+  -hls_segment_filename 'hls/v%v/seg-%03d.ts' \
+  -master_pl_name master.m3u8 \
+  -var_stream_map 'v:0,a:0 v:1,a:1' \
+  'hls/v%v/index.m3u8'
+```
+
+Ở 30 fps, GOP 180 frame tương ứng khoảng 6 giây. `-sc_threshold 0` giữ lịch keyframe cố định thay vì để scene-cut tạo boundary ngoài dự kiến; `+cgop` đóng GOP. Vì các segment thật sự bắt đầu ở keyframe độc lập, lệnh mới khai `-hls_flags independent_segments`. Trong production, GOP còn phải cân bằng latency, compression và random access; đừng copy con số 6 giây cho mọi use case.
+
+FFmpeg HLS muxer cắt tại keyframe phù hợp ở sau thời điểm `hls_time`. Vì vậy GOP/forced keyframe mới quyết định boundary thực, không phải riêng `-hls_time`.
+
+## 4. MPEG-TS và fragmented MP4 là hai lựa chọn segment
+
+HLS có thể mang nhiều media segment format. Hai loại phổ biến:
+
+| Thuộc tính           | MPEG-TS               | fragmented MP4                   |
+| -------------------- | --------------------- | -------------------------------- |
+| Extension thường gặp | `.ts`                 | `.m4s` + init `.mp4`             |
+| Đơn vị đóng gói      | Packet TS 188 byte    | ISO BMFF boxes `moof`/`mdat`     |
+| Init data            | PAT/PMT trong segment | `EXT-X-MAP` trỏ init segment     |
+| Overhead             | Thường cao hơn        | Thường gọn hơn                   |
+| Hệ sinh thái         | Broadcast/HLS lâu đời | HLS hiện đại, DASH/CMAF-friendly |
+
+Tạo fMP4 HLS một rendition:
+
+```bash
+mkdir -p hls-fmp4
+
+ffmpeg \
+  -f lavfi -i "testsrc2=size=1280x720:rate=30" \
+  -f lavfi -i "sine=frequency=880:sample_rate=48000" \
+  -t 30 \
+  -c:v libx264 -crf 23 -preset medium -pix_fmt yuv420p -flags +cgop \
+  -g 180 -keyint_min 180 -sc_threshold 0 \
+  -c:a aac -b:a 128k \
+  -f hls -hls_time 6 -hls_playlist_type vod \
+  -hls_flags independent_segments \
+  -hls_segment_type fmp4 \
+  -hls_fmp4_init_filename init.mp4 \
+  -hls_segment_filename 'hls-fmp4/seg-%03d.m4s' \
+  hls-fmp4/index.m3u8
+```
+
+Playlist sẽ có `#EXT-X-MAP:URI="init.mp4"`. Không được bỏ init segment khi copy/rewrite playlist; media segment chỉ có fragment data, thiếu codec initialization thì decoder không khởi tạo được.
+
+## 5. Browser phát HLS bằng đường nào?
+
+Đừng dùng user-agent sniffing. Feature-detect và chọn đường phát:
+
+1. Một số browser có pipeline HLS native và nhận thẳng URL `.m3u8` trong `<video>`.
+2. Player JavaScript trên nhiều browser khác tải playlist/segment, transmux khi cần và append dữ liệu tương thích qua Media Source Extensions (MSE).
+3. Nếu không có đường nào phù hợp, cung cấp progressive fallback hoặc thông báo rõ.
+
+```js
+const video = document.querySelector('video');
+const hlsUrl = '/hls/master.m3u8';
+
+if (video.canPlayType('application/vnd.apple.mpegurl')) {
+  video.src = hlsUrl;
+} else if ('MediaSource' in window) {
+  // Khởi tạo thư viện/player MSE đã chọn; bài 12 giải thích primitive bên dưới.
+} else {
+  video.src = '/progressive.mp4';
+}
+```
+
+`canPlayType()` chỉ là một tín hiệu. Hãy test trên ma trận thiết bị thật và quan sát lỗi runtime.
+
+## 6. Header, cache và CORS
+
+Baseline MIME thường dùng:
+
+```text
+.m3u8  application/vnd.apple.mpegurl
+.ts    video/mp2t
+.m4s   video/iso.segment
+.mp4   video/mp4
+```
+
+`video/iso.segment` là MIME Apple khuyến nghị cho media segment `.m4s`; init segment `.mp4` vẫn dùng `video/mp4`. Hãy giữ MIME nhất quán ở origin/CDN và kiểm thử player mục tiêu thay vì dựa vào extension.
+
+VOD playlist/segment immutable có thể cache lâu với filename versioned. Live media playlist cần TTL ngắn phù hợp cadence update; cache sai có thể giữ cửa sổ cũ và tạo 404 segment đã bị xóa. Nếu player JavaScript fetch cross-origin, playlist, segment, key và subtitle đều cần CORS đúng — không chỉ master playlist.
+
+## 7. Discontinuity, encryption và metadata là một phần timeline
+
+- `EXT-X-DISCONTINUITY` báo thay đổi như timestamp sequence, track/config hoặc format mà player cần reset đường nối.
+- `EXT-X-KEY` mô tả cách giải mã các segment tiếp theo; nó không phải URL trang trí có thể xóa tùy ý.
+- `EXT-X-PROGRAM-DATE-TIME` ánh media timeline sang wall clock.
+- `EXT-X-DATERANGE` đánh dấu một khoảng theo thời gian, hữu ích cho chapter, blackout hoặc ad metadata; playlist dùng tag này phải có ít nhất một `EXT-X-PROGRAM-DATE-TIME`.
+- `EXT-X-INDEPENDENT-SEGMENTS` tuyên bố mọi media sample trong mỗi segment thuộc phạm vi áp dụng có thể decode mà không cần thông tin từ segment khác.
+
+Ta sẽ dùng các tag này ở bài xử lý ad marker; trước hết bài kế tiếp mổ chính file `.ts`.
+
+## Failure checklist
+
+- Master URI và media URI có resolve đúng tương đối không?
+- `BANDWIDTH`, `CODECS`, `RESOLUTION` có mô tả đúng bitstream không?
+- Rendition có keyframe và segment boundary thẳng hàng không?
+- Segment đầu có random access point phù hợp không?
+- fMP4 playlist có `EXT-X-MAP` và init segment truy cập được không?
+- Live playlist có bị CDN cache quá lâu hoặc trỏ tới segment đã hết hạn không?
+- MIME, CORS, auth cookie/token có áp dụng đồng đều cho master, media, segment, key không?
+- Có thay timestamp/codec/track mà thiếu `EXT-X-DISCONTINUITY` không?
+
+## Bài tập
+
+1. Package cùng source thành TS HLS và fMP4 HLS; so tổng dung lượng và cấu trúc playlist, không vội kết luận format nào “tốt hơn mọi mặt”.
+2. Bỏ `-sc_threshold 0`, dùng scene source thay đổi mạnh và đo duration từng rendition. Điều gì xảy ra với boundary?
+3. Cố tình trả MIME `text/plain` cho `.m3u8`, ghi lại khác biệt giữa native HLS và player fetch/MSE.
+4. Dùng Network throttling để xem player chuyển rendition và buffer thay đổi ra sao.
+
+## Đọc thêm
+
+- [RFC 8216 — HTTP Live Streaming](https://www.rfc-editor.org/rfc/rfc8216.html)
+- [Apple — HTTP Live Streaming](https://developer.apple.com/documentation/http-live-streaming)
+- [FFmpeg formats — HLS muxer](https://ffmpeg.org/ffmpeg-formats.html)
+- [Apple HLS examples](https://developer.apple.com/streaming/examples/)
+
+**Phần tiếp theo:** [File `.ts` thực chất là gì?](/blog/video-engineering-11-mpeg-ts-internals/) — packet 188 byte, PID, PAT/PMT, PES, PCR và lý do cắt byte tùy ý thường làm stream vỡ.

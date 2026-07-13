@@ -1,0 +1,228 @@
+---
+title: 'Video Engineering · Phần 8 — Cắt, nối video và quản lý audio/subtitle'
+description: 'Chọn đúng giữa stream copy và cắt chính xác, nối bằng concat demuxer hoặc concat filter, rồi bảo toàn metadata, audio và subtitle mà không phá timeline.'
+pubDate: 2026-07-12
+lang: vi
+tags: [video-engineering, video, ffmpeg, video-editing, keyframes, subtitles]
+series: video-engineering
+seriesOrder: 8
+draft: false
+---
+
+“Cắt từ 4.25 giây đến 9.75 giây” nghe như thao tác đơn giản trên timeline. Với media compressed, nó là một quyết định kiến trúc: giữ packet để nhanh và không mất chất lượng, hay decode/encode để biên cắt bám theo frame và sample? Audio, subtitle, chapter và timestamp còn làm bài toán khó hơn video đơn track.
+
+Bài này không hứa stream copy chính xác từng frame. Thay vào đó, ta chọn chiến lược theo yêu cầu, kiểm chứng keyframe, rồi nối clip bằng đúng công cụ.
+
+---
+
+## 1. Tạo fixture có video, audio và subtitle
+
+Tạo 18 giây video H.264 và audio AAC. GOP cố định 60 frame ở 30 fps cho ta keyframe gần mỗi hai giây:
+
+```bash
+ffmpeg -hide_banner -y -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=18" -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=18" -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -g 60 -keyint_min 60 -sc_threshold 0 -c:a aac -b:a 128k source-av.mkv
+```
+
+Tạo ba cue SRT:
+
+```bash
+printf '%s\n' '1' '00:00:01,000 --> 00:00:05,000' 'Đoạn mở đầu' '' '2' '00:00:06,000 --> 00:00:11,000' 'Đoạn ở giữa' '' '3' '00:00:12,000 --> 00:00:17,000' 'Đoạn kết' '' > ve08-captions.srt
+```
+
+Mux subtitle mềm vào Matroska:
+
+```bash
+ffmpeg -hide_banner -y -i source-av.mkv -i ve08-captions.srt -map 0:v:0 -map 0:a:0 -map 1:s:0 -c:v copy -c:a copy -c:s srt -metadata title="Cut and concat fixture" -metadata:s:a:0 language=vie -metadata:s:s:0 language=vie -metadata:s:s:0 title="Vietnamese captions" -disposition:a:0 default -disposition:s:0 default source.mkv
+```
+
+Probe trước khi edit:
+
+```bash
+ffprobe -v error -show_format -show_streams -of json source.mkv
+```
+
+---
+
+## 2. Vì sao keyframe quyết định stream-copy cut?
+
+H.264 thường dùng I/P/B-frame. Nhiều frame phụ thuộc frame trước hoặc sau; decoder không thể bắt đầu tùy ý ở một P/B-frame nếu thiếu reference. **Keyframe/điểm truy cập ngẫu nhiên** là nơi an toàn hơn để bắt đầu decode độc lập.
+
+Liệt kê timestamp các keyframe đã decode:
+
+```bash
+ffprobe -v error -select_streams v:0 -skip_frame nokey -show_frames -show_entries "frame=best_effort_timestamp_time,pict_type,key_frame" -of csv=p=0 source.mkv
+```
+
+Fixture dự kiến có keyframe quanh 0, 2, 4, 6 giây… nhưng container timestamp và encoder có thể làm giá trị hiển thị khác đôi chút. Với video thật, scene-cut, open GOP hoặc packaging còn khiến khoảng cách không đều.
+
+Stream copy chỉ chuyển compressed packet từ demuxer sang muxer. Nếu yêu cầu bắt đầu ở 4.25 giây, packet video tự đủ dữ liệu gần nhất có thể nằm ở 4 hoặc 6 giây. Muxer có thể thay đổi timestamp đầu ra; nó không tạo được frame mới tại 4.25 giây.
+
+---
+
+## 3. Cắt nhanh bằng stream copy
+
+Khi biên đã thẳng keyframe hoặc sai số nhỏ được chấp nhận:
+
+```bash
+ffmpeg -hide_banner -y -ss 4 -i source.mkv -t 6 -map 0:v:0 -map 0:a:0 -map "0:s:0?" -c copy -map_metadata 0 copy-cut.mkv
+```
+
+`-ss 4` đứng trước input nên FFmpeg yêu cầu demuxer seek nhanh. `-t 6` là duration của output. Không có filter hay encoder.
+
+Ưu điểm:
+
+- chạy nhanh và dùng ít CPU;
+- không thêm generation loss;
+- giữ codec bitstream gốc.
+
+Đổi lại, content thực tế ở đầu clip, timestamp và subtitle cue có thể không khớp đúng con số người dùng nhập. Audio có granularity và priming riêng; biên audio không tự động “đúng theo frame video”.
+
+`-avoid_negative_ts make_zero` có thể dịch timestamp để tránh giá trị âm trong một số output, nhưng nó không làm điểm cắt chính xác hơn. Tương tự, `-copyts` giữ timestamp gốc và có thể hữu ích trong pipeline chuyên biệt, song không nên thêm theo thói quen: output có thể bắt đầu ở timestamp khác 0 và làm logic downstream bất ngờ.
+
+---
+
+## 4. Cắt chính xác bằng decode, trim và encode
+
+Khi biên 4.25 giây là yêu cầu nội dung, dùng filter trên frame/sample đã decode:
+
+```bash
+ffmpeg -hide_banner -y -i source.mkv -filter_complex "[0:v:0]trim=start=4.25:duration=5.5,setpts=PTS-STARTPTS[v];[0:a:0]atrim=start=4.25:duration=5.5,asetpts=PTS-STARTPTS[a]" -map "[v]" -map "[a]" -c:v libx264 -preset medium -crf 21 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart exact-cut.mp4
+```
+
+`trim` chọn video frame trong khoảng; `atrim` chọn audio sample. Cả hai không tự đặt timestamp về 0, nên `setpts` và `asetpts` tạo timeline output mới.
+
+“Chính xác” ở đây nghĩa là chính xác theo **frame có sẵn** và sample boundary sau decode. Với 30 fps, không tồn tại frame ở mọi số thập phân tùy ý. AAC đầu ra còn có encoder delay/priming được container mô tả. Vì thế hãy kiểm chứng nội dung đầu/cuối và sync, không chỉ nhìn duration được in.
+
+Subtitle không đi qua video/audio trim graph. Muốn giữ subtitle mềm, cần cắt/re-time cue theo timeline mới và xử lý cue giao biên. Burn subtitle trước khi trim là một lựa chọn nếu không cần track bật/tắt; còn sản phẩm đa ngôn ngữ nên có bước xử lý subtitle riêng.
+
+Một kỹ thuật tối ưu nâng cao là encode lại GOP ở hai biên rồi copy phần giữa. Nó chỉ an toàn khi codec parameters, extradata, timestamp và join point tương thích; không nên biến thành một one-liner chung cho mọi file.
+
+---
+
+## 5. Concat demuxer: nối các stream tương thích
+
+Concat demuxer đọc danh sách file như một input logic và giữ compressed packet.
+Tạo hai phần bằng cùng cấu hình video encoder. Riêng audio dùng PCM trong
+fixture này để tránh encoder delay/priming xuất hiện riêng ở đầu mỗi file AAC:
+
+```bash
+ffmpeg -hide_banner -y -i source.mkv -filter_complex "[0:v]trim=start=0:duration=4,setpts=PTS-STARTPTS[v];[0:a]atrim=start=0:duration=4,asetpts=PTS-STARTPTS[a]" -map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -g 60 -keyint_min 60 -sc_threshold 0 -c:a pcm_s16le part-a.mkv
+```
+
+```bash
+ffmpeg -hide_banner -y -i source.mkv -filter_complex "[0:v]trim=start=8:duration=4,setpts=PTS-STARTPTS[v];[0:a]atrim=start=8:duration=4,asetpts=PTS-STARTPTS[a]" -map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -g 60 -keyint_min 60 -sc_threshold 0 -c:a pcm_s16le part-b.mkv
+```
+
+Tạo manifest và nối:
+
+```bash
+printf '%s\n' "file 'part-a.mkv'" "file 'part-b.mkv'" > concat.txt
+ffmpeg -hide_banner -y -f concat -safe 0 -i concat.txt -map 0 -c copy joined.mkv
+```
+
+Các part cần cùng topology và thông số stream tương thích: codec, codec configuration, resolution, pixel format, sample rate, channel layout và time-base hợp lý. Concat demuxer không resize hay resample để cứu hai file khác nhau. Duration metadata sai ở part cũng có thể tạo gap/overlap timestamp.
+
+PCM làm fixture lớn hơn nhưng có biên sample dễ kiểm chứng. Nếu encode từng
+part thành AAC riêng, mỗi part có thể mang encoder delay/padding riêng;
+stream-copy concat sẽ giữ những khoảng đó và làm timeline dài hơn dự kiến.
+Trong pipeline thật, ưu tiên segment từ cùng một encode liên tục, hoặc
+decode/concat audio rồi encode một lần ở output nếu cần AAC liền mạch.
+
+`-safe 0` cho phép nhiều dạng đường dẫn hơn trong manifest; với danh sách nhận từ người dùng, hãy validate path thay vì bật nó một cách mù quáng.
+
+---
+
+## 6. Concat filter: normalize rồi nối
+
+Khi hai input khác resolution hoặc audio sample rate, decode và chuẩn hóa trước:
+
+```bash
+ffmpeg -hide_banner -y -i first.mp4 -i second.mp4 -filter_complex "[0:v]scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v0];[0:a]aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a0];[1:v]scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v1];[1:a]aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]" -map "[v]" -map "[a]" -c:v libx264 -preset medium -crf 21 -pix_fmt yuv420p -c:a aac -b:a 128k joined-normalized.mp4
+```
+
+`concat=n=2:v=1:a=1` đòi input pad theo thứ tự video/audio của từng segment. Mỗi segment nên bắt đầu tại timestamp 0. Filter này cho phép normalize nhưng phải encode lại output.
+
+Nếu một clip không có audio, đừng map nhầm pad hoặc bỏ qua topology; tạo silence đúng duration bằng `anullsrc`, hoặc thiết kế graph riêng cho trường hợp thiếu track.
+
+---
+
+## 7. Metadata, audio và subtitle không tự “đi theo”
+
+Với container cho phép giữ subtitle:
+
+```bash
+ffmpeg -hide_banner -y -i source.mkv -map 0:v:0 -map "0:a?" -map "0:s?" -c copy -map_metadata 0 -map_chapters 0 preserved.mkv
+```
+
+Nhưng đổi sang MP4 có thể cần đổi subtitle SubRip thành `mov_text`:
+
+```bash
+ffmpeg -hide_banner -y -i source.mkv -map 0:v:0 -map 0:a:0 -map "0:s:0?" -c:v copy -c:a copy -c:s mov_text -map_metadata 0 output-with-subtitles.mp4
+```
+
+Các điểm phải kiểm tra:
+
+- language, title và default/forced disposition của từng track;
+- subtitle cue cắt qua biên và timestamp sau trim;
+- chapter nằm ngoài khoảng mới hoặc chưa được dịch về timeline 0;
+- audio track có duration, sample rate và channel layout nhất quán;
+- attachment/font của ASS có được container đích hỗ trợ hay không.
+
+`-map_metadata 0` và `-map_chapters 0` chỉ copy dữ liệu; chúng không hiểu ý nghĩa edit của bạn để viết lại chapter/cue. Với cut hoặc concat thật, metadata timeline thường cần tái tạo.
+
+---
+
+## 8. Chọn chiến lược bằng yêu cầu
+
+| Yêu cầu                                              | Chiến lược mặc định                   |
+| ---------------------------------------------------- | ------------------------------------- |
+| Nhanh, không generation loss, biên đã thẳng keyframe | Stream-copy cut                       |
+| Biên nội dung theo frame/sample                      | Decode + trim/atrim + encode          |
+| Nối file cùng stream layout và codec parameters      | Concat demuxer + copy                 |
+| Nối file khác kích thước/FPS/audio format            | Normalize + concat filter + encode    |
+| Giữ subtitle mềm đa ngôn ngữ                         | Map track và xử lý/re-time cue riêng  |
+| Render chữ cố định vào hình                          | Burn subtitle trong video filtergraph |
+
+---
+
+## Failure checklist
+
+- [ ] Hứa stream-copy cut chính xác từng frame.
+- [ ] Chọn điểm cắt mà không xem keyframe/timestamp.
+- [ ] Dùng `-avoid_negative_ts` như cách sửa nội dung biên cắt.
+- [ ] Reset video PTS nhưng quên audio PTS.
+- [ ] Nghĩ exact cut tồn tại giữa hai frame nguồn.
+- [ ] Nối bằng concat demuxer khi codec parameters hoặc stream layout khác nhau.
+- [ ] Concat filter nhưng không normalize resolution, FPS, SAR hoặc audio sample rate.
+- [ ] Quên audio ở một segment làm sai thứ tự pad.
+- [ ] Copy SRT thẳng vào container không hỗ trợ codec subtitle đó.
+- [ ] Copy metadata/chapter rồi giả định timestamp đã được viết lại.
+- [ ] Chỉ kiểm tra duration, không xem frame đầu/cuối và nghe điểm nối audio.
+
+---
+
+## Bài tập
+
+**1.** Cắt fixture từ 5.1 đến 9.6 giây bằng stream copy và bằng trim/encode. Trích frame đầu của hai output, so timestamp và giải thích khác biệt.
+
+**2.** Tạo hai clip khác resolution, nối thử bằng concat demuxer, rồi sửa bằng concat filter có normalize. Probe output để xác nhận SAR, FPS và audio sample rate.
+
+**3.** Cắt một khoảng đi xuyên cue subtitle thứ hai. Thiết kế cue output mong muốn: cue bị bỏ, bị clamp hay được chia? Giải thích lựa chọn UX.
+
+**Nâng cao:** xây pipeline ba đoạn có hai audio language track. Đảm bảo mọi segment có cùng topology, đặt disposition sau mapping và viết bài kiểm tra ffprobe cho output cuối.
+
+---
+
+## Đọc thêm
+
+- [Tài liệu ffmpeg CLI chính thức](https://ffmpeg.org/ffmpeg.html)
+- [Seek với `-ss`, duration với `-t`](https://ffmpeg.org/ffmpeg.html#Main-options)
+- [Concat demuxer trong FFmpeg Formats](https://ffmpeg.org/ffmpeg-formats.html#concat)
+- [Trim, atrim và concat filters](https://ffmpeg.org/ffmpeg-filters.html)
+- [Stream selection và mapping](https://ffmpeg.org/ffmpeg.html#Stream-selection)
+
+---
+
+## Bài kế tiếp
+
+[Phần 9 — HTML video và progressive download](/blog/video-engineering-09-html-video-progressive-download/)

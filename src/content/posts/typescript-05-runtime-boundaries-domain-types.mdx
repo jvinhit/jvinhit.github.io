@@ -1,15 +1,43 @@
 ---
-title: 'TypeScript Production · Phần 5 — Runtime Boundaries & Domain Types'
+title: 'TypeScript Production · Phần 13 — Runtime Boundaries & Domain Types'
 description: 'Biến unknown từ API, storage và env thành domain value đáng tin: parse at the edge, schema evolution, branded types, DTO mapping và contract versioning.'
 pubDate: 2026-06-27
+updatedDate: 2026-07-12
 lang: vi
 tags: [typescript, validation, domain-modeling, api]
 series: typescript
-seriesOrder: 5
+seriesOrder: 13
 draft: false
 ---
 
-Type annotation không validate JSON. Senior TypeScript đặt một quy tắc cứng: **dữ liệu ngoài process là `unknown` cho tới khi được parse**.
+Type annotation không validate JSON. Senior TypeScript đặt một quy tắc cứng:
+**dữ liệu ngoài process là `unknown` cho tới khi được parse**.
+
+## Type erasure và reification
+
+TypeScript xóa phần lớn type khi emit JavaScript:
+
+```ts
+async function readUser(): Promise<User> {
+  return fetch('/api/me').then((response) => response.json());
+}
+```
+
+`Promise<User>` không tạo runtime check. Nếu server trả `{ id: 7 }`, JavaScript
+vẫn nhận object đó và lời hứa của annotation đã bị phá.
+
+**Reification** ở boundary nghĩa là mang contract trở lại runtime bằng code có
+thể quan sát: schema/parser/codec, discriminator, constructor hoặc generated
+validator. Đích không phải "type tồn tại ở runtime"; đích là tạo bằng chứng trước
+khi cấp domain type.
+
+```text
+raw bytes → authenticity/size → syntax parse → structural parse
+          → normalize/transform → domain constructor → trusted core
+```
+
+Mỗi mũi tên có failure mode khác nhau. Gộp tất cả thành `Invalid input` làm mất
+khả năng retry, alert và phân biệt tấn công với producer regression.
 
 ## Boundary inventory
 
@@ -18,6 +46,20 @@ Type annotation không validate JSON. Senior TypeScript đặt một quy tắc c
 - environment variable và config file;
 - form, URL/search params, DOM dataset;
 - dependency không typed hoặc typed quá lạc quan.
+
+Inventory theo **direction + trust + owner**, không chỉ protocol:
+
+| Boundary              | Input thật         | Ai đổi contract       | Failure policy          |
+| --------------------- | ------------------ | --------------------- | ----------------------- |
+| Public HTTP request   | bytes/JSON         | external caller       | 4xx + field errors      |
+| Vendor webhook        | signed raw bytes   | vendor                | quarantine/retry policy |
+| Database row          | driver values      | migration/legacy data | fail closed + alert     |
+| Cache/local storage   | stale serialized   | app version cũ        | migrate/evict           |
+| Environment/config    | strings/files      | deploy system         | fail startup            |
+| Outbound API response | domain/write model | chính team mình       | contract test           |
+
+Outbound cũng là boundary: serialize domain object trực tiếp có thể leak field,
+`Date`, secret hoặc future enum member. Gán owner và parser/encoder cho từng edge.
 
 ```ts
 async function getJson(url: string): Promise<unknown> {
@@ -28,6 +70,9 @@ async function getJson(url: string): Promise<unknown> {
 ```
 
 Đừng viết `response.json() as User`. Assertion đó biến network thành nguồn “đáng tin” mà không tạo bằng chứng.
+
+`response.json()` nên được wrap về `Promise<unknown>` như trên; type declaration
+quá lạc quan của platform/dependency không thay trust model của hệ thống.
 
 ## Parse, rồi map sang domain
 
@@ -60,6 +105,67 @@ async function loadUser(id: UserId, parser: Parser<UserDto>): Promise<User> {
 
 DTO phản ánh wire contract. Domain type phản ánh điều application cần. Mapping này hấp thụ snake_case, date string, nullable legacy field và version drift ở một chỗ.
 
+## Schema/codec có Input khác Output
+
+Parser không bắt buộc trả cùng representation nó nhận:
+
+```ts
+interface Schema<Input, Output> {
+  parse(input: Input): Output;
+}
+
+interface Codec<Wire, Value> extends Schema<Wire, Value> {
+  encode(value: Value): Wire;
+}
+
+type InputOf<S> = S extends Schema<infer Input, infer _Output> ? Input : never;
+type OutputOf<S> =
+  S extends Schema<infer _Input, infer Output> ? Output : never;
+```
+
+Một schema HTTP thường là `Schema<unknown, UserDto>`; codec persistence có thể là
+`Codec<UserWire, User>`. Đừng gọi input/output đều là `User`: bạn sẽ che mất nơi
+representation đổi.
+
+```ts
+type UserWire = {
+  id: string;
+  created_at: string;
+};
+
+declare const userCodec: Codec<UserWire, User>;
+
+type EncodedUser = InputOf<typeof userCodec>; // UserWire
+type DecodedUser = OutputOf<typeof userCodec>; // User
+```
+
+### Thứ tự preprocess/coerce/default/transform/refine
+
+- **preprocess:** đọc raw shape trước schema chính, ví dụ trim query string;
+- **coerce:** chấp nhận representation khác có chủ đích (`"42" → 42`);
+- **default:** chỉ thay absence/`undefined` theo contract, không nuốt invalid value;
+- **transform:** đổi value đã hợp lệ (`ISO string → Date`, DTO → domain);
+- **refine:** kiểm predicate không biểu diễn được bằng primitive schema.
+
+Thứ tự là semantics. Coerce trước khi giới hạn input có thể biến `true`, `[]` hay
+`""` thành số/string "hợp lệ" ngoài ý muốn. Default trước refine có thể che
+producer quên field bắt buộc.
+
+```ts
+function parseLimit(input: unknown): number {
+  if (typeof input !== 'string' || !/^\d{1,3}$/.test(input)) {
+    throw new Error('limit must be 1-3 decimal digits');
+  }
+  const value = Number(input); // coerce sau khi raw form đã được giới hạn
+  if (value < 1 || value > 100) throw new Error('limit out of range');
+  return value;
+}
+```
+
+Transform/refine nên pure và deterministic. Database lookup, authorization hay
+uniqueness check thuộc application layer; nhét I/O vào schema tạo N+1, retry mơ
+hồ và test chậm.
+
 ## Parse, don't validate-and-forget
 
 ```ts
@@ -82,38 +188,294 @@ function parsePositive(value: unknown): Positive {
 }
 ```
 
+Brand/opaque type không tự validate; constructor là nơi tạo proof:
+
+```ts
+declare const userIdBrand: unique symbol;
+export type UserId = string & { readonly [userIdBrand]: 'UserId' };
+
+export function parseUserId(input: unknown): UserId {
+  if (typeof input !== 'string' || !/^usr_[a-z0-9]{8,32}$/.test(input)) {
+    throw new Error('invalid_user_id');
+  }
+  return input as UserId;
+}
+```
+
+Assertion được phép ở một constructor nhỏ **sau** runtime proof. Không export
+brand symbol, không export `asUserId(raw: string)` và không để test fixture cast
+rải rác; nếu cần fixture, gọi constructor hoặc một test-only factory có invariant
+rõ.
+
+Opaque proof cũng có scope. `EmailVerified` có thể hết giá trị khi email đổi;
+`AuthorizedUserId` phụ thuộc actor/request nên không nên lưu như primitive brand
+vĩnh viễn.
+
+## JSON không round-trip domain object
+
+```ts
+const value = {
+  createdAt: new Date('2026-07-12T00:00:00Z'),
+  balance: 10n,
+  labels: new Map([['tier', 'pro']]),
+  nickname: undefined,
+};
+```
+
+`JSON.stringify(value)` không phải encoder hợp lệ:
+
+- `Date` gọi `toJSON()` và thành ISO string, parse lại không tự thành `Date`;
+- `BigInt` mặc định throw `TypeError`; phải có representation explicit;
+- `Map`/`Set` không tự thành entries mong muốn, thường ra object rỗng;
+- `undefined`/function/symbol bị bỏ trong object, thành `null` trong array;
+- `NaN`/`Infinity` thành `null`; integer quá safe range có thể mất precision.
+
+Định nghĩa wire model và encode/decode đối xứng:
+
+```ts
+type AccountWire = {
+  createdAt: string;
+  balanceMinor: string; // decimal BigInt representation
+  labels: ReadonlyArray<readonly [string, string]>;
+};
+
+type Account = {
+  createdAt: Date;
+  balanceMinor: bigint;
+  labels: ReadonlyMap<string, string>;
+};
+```
+
+Round-trip test phải kiểm `decode(encode(domain))`, không snapshot JSON rồi giả
+định TypeScript annotation sẽ phục hồi representation.
+
+## Tách DTO, domain và write model
+
+```ts
+type UserDto = {
+  id: string;
+  display_name: string;
+  avatar_url: string | null;
+  created_at: string;
+};
+
+type User = {
+  id: UserId;
+  displayName: string;
+  avatarUrl: URL | null;
+  createdAt: Date;
+};
+
+type CreateUser = {
+  displayName: string;
+  avatarUrl?: URL | null;
+};
+```
+
+DTO mirror producer/wire. Domain giữ invariant và rich value. Write model chỉ
+expose field actor được phép gửi; đừng dùng `Partial<User>` làm PATCH vì nó kéo
+`id`, `createdAt` và representation domain ra transport.
+
+## `exactOptionalPropertyTypes` và PATCH semantics
+
+```ts
+type UserPatch = {
+  displayName?: string; // absent = giữ nguyên
+  avatarUrl?: string | null; // null = xóa, absent = giữ nguyên
+};
+
+const rename: UserPatch = { displayName: 'Ada' };
+const clearAvatar: UserPatch = { avatarUrl: null };
+
+// @ts-expect-error với exactOptionalPropertyTypes
+const ambiguous: UserPatch = { displayName: undefined };
+```
+
+Absence khác property hiện diện với value `undefined`; toán tử `in` và
+`Object.hasOwn` quan sát được khác biệt. JSON lại không biểu diễn `undefined` ổn
+định, nên PATCH nên dùng omission/no-op và `null`/operation explicit cho clear.
+
+Parser phải reject key present-but-undefined nếu contract không cho phép, và chỉ
+đọc own property để tránh prototype pollution:
+
+```ts
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return typeof input === 'object' && input !== null && !Array.isArray(input);
+}
+
+function parsePatch(input: unknown): UserPatch {
+  if (!isRecord(input)) throw new Error('patch must be an object');
+  const patch: UserPatch = {};
+  if (Object.hasOwn(input, 'displayName')) {
+    patch.displayName = parseDisplayName(input.displayName);
+  }
+  return patch;
+}
+```
+
 ## Error của boundary là dữ liệu vận hành
 
-Parser error nên cho biết:
+Taxonomy tối thiểu:
 
-- boundary nào (`GET /users/:id`, `APP_CONFIG`);
-- path nào (`profile.address.zip`);
-- expected/received ở mức an toàn;
-- correlation ID hoặc schema version;
-- không log secret/PII thô.
+```ts
+type BoundaryError =
+  | { kind: 'payload_too_large'; limitBytes: number }
+  | { kind: 'malformed_json'; offset?: number }
+  | { kind: 'schema'; issues: readonly ParseIssue[] }
+  | { kind: 'unsupported_version'; version: string }
+  | { kind: 'normalization'; code: string }
+  | { kind: 'unauthenticated' };
 
-Đừng catch validation error rồi trả `null`; bạn sẽ biến contract regression thành bug xa nguồn.
+type ParseIssue = {
+  path: readonly (string | number)[];
+  code: string;
+  expected?: string;
+};
+```
+
+Error nên cho biết boundary (`GET /users/:id`, `APP_CONFIG`), safe path/code,
+schema version và correlation ID. Không log raw received value: password/token/PII
+có thể nằm đúng field fail validation.
+
+Observability nên emit metric theo `boundary + error.kind + issue.code`, sample
+trace có redaction và giữ payload hash/size thay raw body. Cardinality không lấy
+user ID, URL đầy đủ hoặc error message tự do làm label.
+
+Đừng catch validation error rồi trả `null`; bạn sẽ biến producer regression
+thành bug xa nguồn. Nhưng cũng đừng alert mọi bad public request: taxonomy quyết
+định 4xx, retry, dead-letter hay page on-call.
 
 ## Evolution: tolerant reader có giới hạn
 
-Optional field hợp lý khi producer thật sự cho phép vắng. Không biến mọi field thành optional để “chống API đổi”. Hãy version rõ khi meaning đổi.
+Tolerant reader chấp nhận **unknown extra fields** khi contract cho phép; nó không
+biến required field thành optional hay coerce sai type. Meaning đổi phải có version.
 
 ```ts
-type UserEvent =
-  | { version: 1; type: 'user.created'; name: string }
-  | { version: 2; type: 'user.created'; firstName: string; lastName: string };
+type UserCreatedWebhook =
+  | { version: 1; event: 'user.created'; name: string }
+  | { version: 2; event: 'user.created'; firstName: string; lastName: string };
 
-function normalize(event: UserEvent): CurrentUserCreated {
+type CurrentUserCreated = {
+  event: 'user.created';
+  displayName: string;
+};
+
+function assertNever(_value: never): never {
+  throw new Error('unreachable_variant');
+}
+
+function normalize(event: UserCreatedWebhook): CurrentUserCreated {
   switch (event.version) {
     case 1:
-      return migrateV1(event);
+      return { event: event.event, displayName: event.name };
     case 2:
-      return event;
+      return {
+        event: event.event,
+        displayName: `${event.firstName} ${event.lastName}`,
+      };
     default:
       return assertNever(event);
   }
 }
 ```
+
+Webhook pipeline có thứ tự bảo mật riêng:
+
+1. giới hạn bytes và giữ raw body;
+2. verify timestamp/signature trên raw bytes, chống replay;
+3. parse JSON thành `unknown`;
+4. parse discriminator/version và payload;
+5. normalize về current internal event;
+6. idempotency/dedup;
+7. authorization/business transition.
+
+Unknown version không được cast về latest. Quarantine/dead-letter cùng metadata
+an toàn; HTTP response/retry phải theo provider contract để tránh retry storm.
+Giữ fixture cho từng version còn support và deadline xóa migration cũ.
+
+## Validation không phải authorization hay business invariant
+
+Schema chứng minh shape/local predicate: UUID format, string length, enum, ISO
+date. Nó không chứng minh:
+
+- signature/token thuộc principal hợp lệ;
+- actor được sửa user này;
+- email chưa tồn tại ở database;
+- order đang ở state cho phép cancel;
+- balance đủ tại thời điểm transaction commit.
+
+Authorization cần request context; invariant cần aggregate/current state và có
+thể race. Đặt chúng sau parse/normalize nhưng trong transaction/application
+policy phù hợp. Trả error taxonomy khác để không leak "resource có tồn tại".
+
+## Schema-first, type-first hay codegen?
+
+| Cách                     | Điểm mạnh                           | Rủi ro chính                          |
+| ------------------------ | ----------------------------------- | ------------------------------------- |
+| Schema-first             | runtime proof là source of truth    | vendor DSL/type inference lan rộng    |
+| Type-first + parser tay  | domain type rõ, ít dependency       | type/parser drift, boilerplate        |
+| Codegen từ OpenAPI/Proto | cross-service contract, nhiều model | spec fidelity, generator/version diff |
+
+Schema-first hợp boundary app nhỏ/vừa; giữ inferred schema types ở adapter rồi
+map sang domain. Type-first hợp invariant/domain constructor nhưng cần contract
+tests. Codegen hợp protocol lớn/đa ngôn ngữ; generated type vẫn không thay runtime
+limits, auth hay mapping domain.
+
+Decision rule: chọn một source of truth cho **wire contract**, không ép nó làm
+source of truth cho domain/write model. CI phải phát hiện drift giữa schema,
+generated artifact và producer fixture.
+
+## Performance và security limits
+
+Validation trên input không tin cậy phải có budget trước khi schema sâu chạy:
+
+- compressed/decompressed byte limit và content type allowlist;
+- max object depth, keys, array items và string length;
+- numeric range/safe integer, date range và regex có bounded complexity;
+- timeout/abort cho async boundary, concurrency/backpressure cho batch;
+- reject dangerous keys (`__proto__`, `constructor`, `prototype`) khi materialize;
+- không merge raw object vào config/domain bằng `Object.assign` mù quáng;
+- pin/audit schema dependency như code chạy trên attacker-controlled input.
+
+Parse một lần rồi truyền typed value. Parse lại ở mọi layer vừa tốn CPU vừa có
+nguy cơ mỗi schema dùng coercion/default khác nhau. Với batch lớn, collect số issue
+có giới hạn; đừng tạo million-error array từ payload tấn công.
+
+Async refine gọi DB cho từng item tạo N+1 và timing side-channel. Batch lookup ở
+application layer sau structural parse, rồi áp business policy trên normalized IDs.
+
+## Runtime tests và type tests
+
+Runtime matrix nên có:
+
+- happy fixture và exact producer fixture cho mỗi version;
+- malformed JSON, wrong primitive, missing/present-undefined/null;
+- extra field, inherited/dangerous key, oversized/deep/large-array payload;
+- invalid date, unsafe integer, BigInt/Map encode-decode round trip;
+- webhook signature/replay/idempotency và redacted error snapshot;
+- fuzz/property test cho parser không throw ngoài error model đã định nghĩa.
+
+Type tests khóa proof và Input/Output:
+
+```ts
+type Compare<T> = <Candidate>() => Candidate extends T ? 1 : 2;
+type Equal<A, B> = Compare<A> extends Compare<B> ? true : false;
+type Expect<T extends true> = T;
+
+type _Wire = Expect<Equal<InputOf<typeof userCodec>, UserWire>>;
+type _Domain = Expect<Equal<OutputOf<typeof userCodec>, User>>;
+
+declare const rawId: string;
+// @ts-expect-error — raw string chưa qua constructor proof
+const id: UserId = rawId;
+
+const okPatch: UserPatch = {};
+// @ts-expect-error với exactOptionalPropertyTypes
+const badPatch: UserPatch = { displayName: undefined };
+```
+
+Negative type test không thay runtime malformed tests; runtime tests không chứng
+minh brand/inference không bị widen. Cần cả hai.
 
 ## Boundary architecture
 
@@ -130,14 +492,32 @@ Core không nên import schema library nếu chỉ boundary cần nó. Điều n
 
 ## Lab
 
-1. Liệt kê mọi `as SomeResponse`; thay một flow bằng `unknown → parse → map`.
-2. Thêm malformed payload tests: thiếu field, sai type, date vô nghĩa, field thừa.
-3. Thiết kế version migration cho một object lưu ở localStorage.
-4. Đo log khi schema fail và loại bỏ PII.
+Xây boundary cho webhook `invoice.paid` version 1/2:
 
-**Done khi:** không có dữ liệu ngoại vi nào vào domain chỉ nhờ annotation/assertion; contract regression fail ngay tại boundary.
+1. inventory raw bytes, signature, JSON, DTO, domain event và write side effect;
+2. định nghĩa `Schema<unknown, WebhookDto>` và normalize hai version;
+3. dùng opaque `InvoiceId`/`Money`, constructor là nơi duy nhất assertion;
+4. encode/decode `Date` + `bigint` bằng wire representation explicit;
+5. model PATCH-style metadata: omitted/no-op, `null`/clear, không dùng undefined;
+6. thêm size/depth/item limits, redaction và error metrics bounded-cardinality;
+7. test signature, replay, malformed/version/extra field và idempotency;
+8. so sánh schema-first với codegen cho cùng fixture, ghi decision record.
+
+**Acceptance criteria:**
+
+- không có `as Webhook`/`as Domain` ngoài audited constructor/adapter;
+- raw input là `unknown`, parse và normalize chỉ chạy một lần;
+- Input/Output codec khác nhau được type test chứng minh;
+- DTO/domain/write model không share nhầm representation/quyền ghi;
+- v1/v2 về cùng current event, unknown version được quarantine;
+- validation/auth/business errors khác taxonomy và không leak payload;
+- performance/security limits fail sớm trước expensive validation;
+- runtime + negative type tests bắt được contract regression.
 
 ## Đọc tiếp
 
-- [TypeScript type declarations](https://www.typescriptlang.org/docs/handbook/2/type-declarations.html)
+- [Erased Types](https://www.typescriptlang.org/docs/handbook/2/basic-types.html#erased-types)
+- [`unknown` top type](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-3-0.html#new-unknown-top-type)
 - [Narrowing `unknown`](https://www.typescriptlang.org/docs/handbook/2/narrowing.html)
+- [`exactOptionalPropertyTypes`](https://www.typescriptlang.org/tsconfig/exactOptionalPropertyTypes.html)
+- [`JSON.stringify` behavior](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify)

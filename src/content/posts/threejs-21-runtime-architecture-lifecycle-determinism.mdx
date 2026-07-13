@@ -1,0 +1,452 @@
+---
+title: 'Three.js from Zero to Senior · Part 21 — Runtime Architecture, Lifecycle & Determinism'
+description: 'Design a Three.js runtime that survives remounts, hidden tabs, stale asset loads and context loss: explicit frame phases, fixed-step simulation, resource ownership, cancellation and testable lifecycle contracts.'
+pubDate: 2026-07-12
+lang: vi
+tags: [threejs, 3d, architecture, lifecycle, determinism, production]
+series: threejs
+seriesOrder: 21
+draft: false
+---
+
+import DemoEmbed from '~/components/blog/DemoEmbed.astro';
+
+Một scene chạy được trong năm phút chưa phải một runtime chạy được trong sản phẩm. Bài kiểm tra thật sự là: đổi route hai mươi lần có còn đúng một animation loop không; tab ẩn mười phút rồi mở lại có làm physics nổ tung không; request model cũ về sau request mới có ghi đè hiện trạng không; WebGL context mất rồi phục hồi thì UI có biết mình đang ở trạng thái nào không.
+
+Đó không còn là câu chuyện “biết API Three.js”. Đó là **thiết kế vòng đời, quyền sở hữu và tính xác định của một hệ thống real-time**.
+
+Lab dưới đây cố ý đặt hai cách triển khai cạnh nhau. Chế độ **managed** giữ một session token, một resource scope và tối đa một frame đã schedule. Chế độ **naive** mô phỏng những lỗi thường gặp nhưng có safety cap để không làm treo máy. Hãy chạy nhiều chu kỳ mount/unmount, bắt đầu một “asset load” rồi unmount ngay, sau đó nhìn các counter thay vì tin cảm giác.
+
+<DemoEmbed
+  slug="threejs-runtime-lifecycle-lab"
+  title="Three.js runtime lifecycle and determinism lab"
+  height="900px"
+/>
+
+## Luận điểm kiến trúc: domain state không phải scene graph
+
+`THREE.Mesh` là một projection phục vụ render, không nên là nguồn sự thật duy nhất của sản phẩm. Nếu business rule, network reconciliation, undo/redo và test đều đọc–ghi trực tiếp `mesh.position`, bạn đã ghép domain vào renderer:
+
+```ts
+// Domain state: serializable, deterministic, testable without WebGL.
+type EntityState = {
+  id: string;
+  position: Vec3;
+  previousPosition: Vec3;
+  velocity: Vec3;
+  selected: boolean;
+};
+
+type WorldState = {
+  tick: number;
+  entities: Map<string, EntityState>;
+};
+
+// Render projection: disposable objects derived from domain state.
+type RenderProjection = {
+  meshesById: Map<string, THREE.Object3D>;
+  project(state: WorldState, alpha: number): void;
+  dispose(): void;
+};
+```
+
+Sự tách lớp này tạo ra ba năng lực cấp hệ thống:
+
+- simulation có thể chạy trong unit test hoặc Worker mà không cần canvas;
+- context loss có thể hủy và dựng lại projection mà không làm mất domain state;
+- renderer có thể đổi từ WebGL sang một backend khác mà không viết lại business rule.
+
+Scene graph vẫn là cấu trúc cực tốt cho transform, culling và render traversal. Nó chỉ không nên âm thầm trở thành database, event bus và state machine cùng lúc.
+
+## Một frame là pipeline có phase, không phải một hàm `tick()` hỗn hợp
+
+Khi mọi subsystem tự sửa mọi thứ bất cứ lúc nào, kết quả phụ thuộc thứ tự callback và rất khó tái hiện. Runtime production nên công khai phase và luật ghi dữ liệu:
+
+```text
+collect input
+    ↓
+apply commands / network snapshot
+    ↓
+simulate fixed steps (0..N)
+    ↓
+derive presentation state
+    ↓
+project domain → scene graph
+    ↓
+render
+    ↓
+publish metrics / deferred cleanup
+```
+
+Ví dụ một scheduler nhỏ:
+
+```ts
+function frame(now: number) {
+  timer.update(now);
+  const frameDelta = Math.min(timer.getDelta(), MAX_FRAME_DELTA);
+
+  input.flushInto(commandQueue);
+  commands.apply(world);
+
+  accumulator += frameDelta;
+  let steps = 0;
+  while (accumulator >= FIXED_DT && steps < MAX_STEPS_PER_FRAME) {
+    snapshotPreviousTransforms(world);
+    simulate(world, FIXED_DT);
+    accumulator -= FIXED_DT;
+    steps += 1;
+  }
+
+  if (steps === MAX_STEPS_PER_FRAME && accumulator >= FIXED_DT) {
+    droppedCatchUpSeconds += accumulator;
+    accumulator = 0; // shed debt; do not enter the spiral of death
+  }
+
+  projection.project(world, accumulator / FIXED_DT);
+  renderer.render(scene, camera);
+  metrics.commitFrame({ frameDelta, steps });
+}
+```
+
+Điểm quan trọng không phải tên phase. Điểm quan trọng là **mỗi mutation có một nơi được phép xảy ra**. Input không tự dịch chuyển mesh. Loader không tự ý `scene.add()` từ một callback đã cũ. Render không sửa domain state. Khi xảy ra bug, bạn biết phase nào phá invariant.
+
+## `Timer`, tab ẩn và delta không đáng tin tuyệt đối
+
+Một delta lấy sau khi laptop sleep hoặc tab bị browser suspend có thể dài hàng phút. Đưa thẳng delta đó vào movement hay physics là biến một lần resume thành teleport, tunneling hoặc hàng nghìn bước catch-up.
+
+Three.js cung cấp `Timer` như lựa chọn thay cho `Clock`. `update()` chốt một delta cho cả simulation step; `connect(document)` dùng Page Visibility API để tránh delta lớn khi ứng dụng inactive. Điều đó rất hữu ích, nhưng **không thay thế policy của runtime**:
+
+```ts
+const timer = new THREE.Timer();
+timer.connect(document);
+
+const MAX_FRAME_DELTA = 0.1; // policy: never ingest more than 100 ms at once
+
+function onFrame(timestamp: number) {
+  timer.update(timestamp);
+  const delta = Math.min(timer.getDelta(), MAX_FRAME_DELTA);
+  scheduler.advance(delta);
+}
+```
+
+Policy nên phân biệt ba sự kiện:
+
+1. **hidden**: dừng schedule frame mới và ghi nhận thời điểm pause;
+2. **visible**: reset timer/accumulator, invalidate một frame, không “trả nợ” thời gian đã mất;
+3. **explicit pause**: vẫn nhận input quản trị nếu sản phẩm cần, nhưng simulation time không tiến.
+
+Tài liệu `Timer` xác nhận `connect(document)` và `dispose()` là phần của contract; hãy coi cả hai là lifecycle resource, không phải tiện ích global sống mãi: [Three.js Timer](https://threejs.org/docs/pages/Timer.html).
+
+## Fixed timestep: ổn định simulation, interpolation làm hình ảnh mượt
+
+Render cadence phụ thuộc màn hình và tải hệ thống; simulation thường cần một bước ổn định. Với `FIXED_DT = 1 / 60`, cùng seed và cùng command stream sẽ tạo cùng chuỗi state dễ kiểm thử hơn.
+
+Accumulator giải quyết chênh lệch giữa render và simulation:
+
+```ts
+const FIXED_DT = 1 / 60;
+const MAX_STEPS = 5;
+let accumulator = 0;
+
+function advance(frameDelta: number) {
+  accumulator += frameDelta;
+  let steps = 0;
+
+  while (accumulator >= FIXED_DT && steps < MAX_STEPS) {
+    previous.copy(current);
+    simulate(FIXED_DT);
+    accumulator -= FIXED_DT;
+    steps += 1;
+  }
+
+  const alpha = accumulator / FIXED_DT;
+  mesh.position.lerpVectors(previous.position, current.position, alpha);
+}
+```
+
+Ba điều thường bị trộn lẫn:
+
+- **deterministic step** không có nghĩa mọi floating-point result giống bit-for-bit trên mọi kiến trúc;
+- **interpolation** chỉ là presentation, không được ghi ngược vào state simulation;
+- **catch-up cap** là quyết định sản phẩm: khi quá tải, ta chấp nhận mất simulation time thay vì khóa main thread để đuổi theo một món nợ không thể trả.
+
+Với multiplayer authoritative, có thể phải giữ tick và resimulate command. Với configurator, bỏ phần thời gian dư thường đúng hơn. Architecture tốt làm trade-off này hiện ra trong code và metric.
+
+## Render-on-demand và continuous không phải hai tôn giáo
+
+Gameplay, particle và skeletal animation cần continuous render. Product viewer đang đứng yên thì không. Render liên tục một chiếc giày không đổi là đốt pin để tạo cùng một ảnh.
+
+Mô hình hybrid giữ một scheduler duy nhất:
+
+```ts
+let frameRequested = false;
+let continuousReasons = 0;
+
+function invalidate() {
+  if (frameRequested) return;
+  frameRequested = true;
+  requestAnimationFrame(runFrame);
+}
+
+function runFrame(now: number) {
+  frameRequested = false;
+  frame(now);
+  if (continuousReasons > 0) invalidate();
+}
+
+function beginContinuous(): () => void {
+  continuousReasons += 1;
+  invalidate();
+  return () => {
+    continuousReasons = Math.max(0, continuousReasons - 1);
+  };
+}
+```
+
+`OrbitControls` có thể invalidate khi phát `change`; animation action giữ một continuous lease; asset load hoàn tất invalidate một frame; resize invalidate một frame. Counter thay vì boolean tránh lỗi “subsystem A dừng loop trong khi subsystem B vẫn cần nó”. Hướng dẫn chính thức của Three.js cũng khuyến nghị render theo thay đổi cho editor, map và product viewer: [Rendering on demand](https://threejs.org/manual/en/rendering-on-demand.html).
+
+## Quyền sở hữu: thứ không có owner sẽ thành leak hoặc double-dispose
+
+`scene.remove(mesh)` không giải phóng buffer, texture hay shader program. Ngược lại, gọi `dispose()` một texture đang được ba material dùng chung có thể tạo hitch khi Three.js phải upload lại. Câu hỏi đúng không phải “dispose ở đâu?” mà là **ai sở hữu resource và khi nào ownership kết thúc?**
+
+Một scope gom mọi cleanup theo session:
+
+```ts
+class ResourceScope {
+  #cleanup: Array<() => void> = [];
+  #disposed = false;
+
+  own<T extends { dispose(): void }>(value: T): T {
+    this.#cleanup.push(() => value.dispose());
+    return value;
+  }
+
+  listen(
+    target: EventTarget,
+    type: string,
+    handler: EventListener,
+    options?: AddEventListenerOptions
+  ) {
+    target.addEventListener(type, handler, options);
+    this.#cleanup.push(() =>
+      target.removeEventListener(type, handler, options)
+    );
+  }
+
+  defer(fn: () => void) {
+    this.#cleanup.push(fn);
+  }
+
+  dispose() {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    for (const fn of this.#cleanup.splice(0).reverse()) fn();
+  }
+}
+```
+
+Scope phải **idempotent** và dispose theo thứ tự ngược lúc acquire. Với asset dùng chung, đặt cache có reference count ở scope cao hơn:
+
+```ts
+const asset = cache.acquire('robot-v7'); // refs +1
+sessionScope.defer(() => cache.release('robot-v7')); // refs -1
+```
+
+Chỉ khi refs về 0 cache mới dispose geometry, material và texture. `ImageBitmap` còn cần `close()` ở application layer. Hướng dẫn chính thức liệt kê rõ resource nào không được Three.js tự giải phóng: [How to dispose of objects](https://threejs.org/manual/en/how-to-dispose-of-objects.html) và [Cleanup](https://threejs.org/manual/en/cleanup.html).
+
+## Async result cũng có vòng đời: abort chưa đủ, cần session token
+
+`AbortController` rất tốt khi API hỗ trợ abort. Nhưng decode, callback loader cũ hoặc Promise đã resolve có thể vẫn giao kết quả. Vì vậy runtime cần cả cancellation **và** identity:
+
+```ts
+let sessionVersion = 0;
+
+async function mountScene(url: string, scope: ResourceScope) {
+  const myVersion = ++sessionVersion;
+  const abort = new AbortController();
+  scope.defer(() => abort.abort());
+
+  const asset = await loadAsset(url, { signal: abort.signal });
+
+  if (abort.signal.aborted || myVersion !== sessionVersion) {
+    asset.dispose(); // result arrived, but no longer belongs to this world
+    return;
+  }
+
+  attachAsset(asset);
+}
+
+function unmountScene() {
+  sessionVersion += 1; // invalidate every in-flight continuation
+}
+```
+
+Session token trả lời “kết quả này thuộc incarnation nào?”, khác với cache key trả lời “đây là asset nào?”. Không phân biệt hai khái niệm này là nguồn gốc lỗi model A xuất hiện trong route B sau mạng chậm.
+
+Đừng chỉ bỏ qua stale result; nếu callback đã tạo GPU resource, phải dispose kết quả không còn owner.
+
+## Context loss là state transition, không phải lỗi console
+
+GPU reset, đổi GPU, áp lực tài nguyên hoặc browser policy có thể làm mất WebGL context. Khi đó toàn bộ WebGL resource phía dưới renderer không còn hợp lệ. Runtime nên chuyển trạng thái rõ ràng:
+
+```ts
+canvas.addEventListener('webglcontextlost', (event) => {
+  event.preventDefault(); // opt in to restoration
+  lifecycle.send({ type: 'CONTEXT_LOST' });
+  scheduler.stop();
+  showRecoveryUI();
+});
+
+canvas.addEventListener('webglcontextrestored', () => {
+  rebuildProjectionFromDomainState();
+  lifecycle.send({ type: 'CONTEXT_RESTORED' });
+  scheduler.invalidate();
+});
+```
+
+`WEBGL_lose_context` tồn tại chính để test đường đi này; specification nói `loseContext()` hủy graphics resource và restoration chỉ dùng được sau khi `webglcontextlost` hoàn tất: [Khronos WEBGL_lose_context](https://registry.khronos.org/webgl/extensions/WEBGL_lose_context/).
+
+Đừng tự động retry vô hạn. Nếu restore lặp lại thất bại, chuyển sang fallback ảnh/2D, giữ domain state và cung cấp nút thử lại. “Canvas đen” không phải một lifecycle state hợp lệ.
+
+## Lifecycle là state machine có invariant
+
+Một boolean `mounted` không mô tả đủ loading, pause và recovery. Một state machine nhỏ khiến race condition thành transition bị từ chối:
+
+```text
+idle
+  └─ MOUNT ─→ mounting
+                 ├─ READY ─→ running ⇄ paused
+                 ├─ FAIL  ─→ failed
+                 └─ UNMOUNT → disposed
+
+running / paused
+  ├─ CONTEXT_LOST ─→ recovering ── CONTEXT_RESTORED → running|paused
+  └─ UNMOUNT ─────→ disposing ──── DONE → disposed
+```
+
+Các invariant đáng assert trong development:
+
+- `running` có đúng một scheduler owner;
+- `disposed` có zero listener, zero in-flight continuation thuộc session và zero resource lease;
+- `recovering` không submit render;
+- callback chỉ mutate nếu token khớp session hiện tại;
+- mount sau unmount tạo projection mới nhưng có thể dùng lại domain snapshot hợp lệ.
+
+State machine không cần thư viện. Một reducer thuần trả `{ nextState, effects }` đã đủ để test transition table mà không dựng WebGL.
+
+## React StrictMode là fault injector miễn phí
+
+Three.js là external system đối với React. World không được tạo trong render; Effect phải setup và cleanup đối xứng:
+
+```tsx
+function ThreeViewport({ modelUrl }: { modelUrl: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const runtime = new Runtime(canvas);
+    runtime.mount({ modelUrl });
+
+    return () => runtime.dispose();
+  }, [modelUrl]);
+
+  return <canvas ref={canvasRef} aria-label="3D product preview" />;
+}
+```
+
+Trong development, StrictMode chạy thêm chu kỳ setup → cleanup → setup để lộ cleanup thiếu. Đừng né bằng một global `hasMounted`; hãy sửa ownership cho tới khi user không phân biệt được mount một lần với chu kỳ stress đó. Đây là contract chính thức của React: [StrictMode](https://react.dev/reference/react/StrictMode) và [useEffect](https://react.dev/reference/react/useEffect).
+
+Boundary tốt còn có hai lớp:
+
+- React sở hữu **khi nào** runtime mount/dispose và props nào trở thành command;
+- runtime sở hữu canvas, loop, Three object và cleanup **trong khoảng đời đó**.
+
+Đừng đẩy object Three.js vào React state mỗi frame. Transient high-frequency state ở trong runtime; React nhận snapshot thưa, semantic như `selectedId`, `loading`, `error`.
+
+## Thiết kế để test mà không cần đoán
+
+Chia test thành ba tầng:
+
+### 1. Pure simulation
+
+Cho seed và command stream cố định, chạy 600 fixed steps rồi snapshot state. Test invariant, không snapshot pixel:
+
+```ts
+const world = createWorld({ seed: 0x5eed });
+for (let tick = 0; tick < 600; tick += 1) {
+  simulate(world, 1 / 60);
+}
+expect(hashWorld(world)).toBe('known-state-hash');
+```
+
+### 2. Lifecycle contract
+
+Dùng fake scheduler, fake loader và fake disposer:
+
+```ts
+mount();
+startLoad();
+unmount();
+resolveOldLoad();
+
+expect(activeFrames()).toBe(0);
+expect(activeListeners()).toBe(0);
+expect(staleResultsDisposed()).toBe(1);
+expect(sceneMutationsAfterDispose()).toBe(0);
+```
+
+### 3. Browser integration
+
+Trong browser thật, chạy mount/unmount nhiều lần, resize, hidden/visible và `WEBGL_lose_context`. Theo dõi counter cùng `renderer.info`, nhưng nhớ `renderer.info.memory` có thể giữ resource nội bộ để tái sử dụng; nó là signal, không phải heap profiler tuyệt đối.
+
+Acceptance criteria nên viết được bằng số:
+
+- sau 20 remount: một active loop, một bộ listener, cache refs trở về baseline;
+- stale load không bao giờ đổi current scene;
+- resume không có delta vượt policy;
+- context restore giữ domain selection và camera intent;
+- dispose gọi hai lần không throw và không giảm ref-count âm.
+
+## Checklist review cấp Staff/Principal
+
+Trước khi duyệt runtime Three.js, hỏi:
+
+1. Nguồn sự thật nằm ở domain hay rải trong mesh?
+2. Frame phase và mutation boundary có được viết ra không?
+3. Fixed-step debt được cap và đo hay có thể spiral?
+4. Continuous render có reason/lease, hay chỉ có một rAF sống mãi?
+5. Geometry, material, texture, controls, observer, timer và listener thuộc scope nào?
+6. Shared asset có ref-count hay bị double-dispose?
+7. Async continuation chứng minh nó còn thuộc session hiện tại bằng gì?
+8. Context loss là transition nào, fallback cuối cùng là gì?
+9. Framework remount có để lại loop hoặc context không?
+10. Những invariant trên được test bằng fake time/seed hay chỉ test bằng mắt?
+
+Nếu câu trả lời là “component unmount chắc browser tự dọn”, runtime chưa sẵn sàng cho production.
+
+## Lab bắt bạn quan sát điều gì?
+
+Trong runtime lab:
+
+1. Chọn **Managed**, chạy 10 mount cycle. `active loops`, `listeners` và resource refs phải trở về baseline rồi ổn định ở một session.
+2. Bắt đầu async load, unmount trước khi nó hoàn tất. Managed phải tăng `stale dropped`, không tăng `late mutations`.
+3. Lặp lại ở **Naive**. Counter tăng cho thấy leak là ownership bug, dù ảnh vẫn “trông đúng”. Safety cap sẽ chặn trước khi máy bị quá tải.
+4. Tắt motion để runtime chuyển sang on-demand; xoay camera và quan sát chỉ các frame cần thiết được render.
+5. Mô phỏng context loss/restore. Domain tick được giữ, projection được invalidate và lifecycle có trạng thái recovery rõ ràng.
+6. Nhấn Emergency reset để xác nhận cleanup có thể đưa hệ thống về một baseline biết trước.
+
+## Phần tiếp theo
+
+Runtime đúng vòng đời chưa chắc đạt frame budget. Ở **Phần 22**, ta chuyển từ “FPS thấp” sang chẩn đoán có giả thuyết: tách CPU submit khỏi GPU work, đọc giới hạn của `renderer.info`, tạo workload draw/vertex/fragment/upload, rồi xây adaptive-quality controller có EWMA, hysteresis, cooldown, SLO và rollout guardrail.
+
+## Tài liệu chính thức để kiểm chứng
+
+- [Three.js `Timer`](https://threejs.org/docs/pages/Timer.html)
+- [Three.js `WebGLRenderer`](https://threejs.org/docs/pages/WebGLRenderer.html)
+- [Three.js: Rendering on demand](https://threejs.org/manual/en/rendering-on-demand.html)
+- [Three.js: How to dispose of objects](https://threejs.org/manual/en/how-to-dispose-of-objects.html)
+- [Khronos `WEBGL_lose_context`](https://registry.khronos.org/webgl/extensions/WEBGL_lose_context/)
+- [React `StrictMode`](https://react.dev/reference/react/StrictMode)
+- [React `useEffect`](https://react.dev/reference/react/useEffect)

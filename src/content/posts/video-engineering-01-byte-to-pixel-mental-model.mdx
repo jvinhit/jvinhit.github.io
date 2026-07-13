@@ -1,0 +1,211 @@
+---
+title: 'Video Engineering · Phần 1 — Từ byte đến pixel: container, codec và pipeline'
+description: 'Dựng mental model từ file video tới màn hình: container, stream, packet, frame, demux, decode, render; phân biệt remux, transcode và kiểm chứng bằng FFmpeg.'
+pubDate: 2026-07-12
+lang: vi
+tags: [video-engineering, video, ffmpeg, container, codec, media-pipeline]
+series: video-engineering
+seriesOrder: 1
+draft: false
+---
+
+Một file có đuôi `.mp4` không có nghĩa “video dùng codec MP4”. Một packet trong FFmpeg cũng không nhất thiết là packet mạng. Và đổi `.mkv` thành `.mp4` không biến codec bên trong thành H.264.
+
+Ba nhầm lẫn này nghe nhỏ, nhưng chúng kéo theo hàng giờ debug sai tầng: sửa player khi container hỏng, đổi container khi thiết bị không hỗ trợ codec, hoặc re-encode cả video chỉ để thay vỏ. Bài đầu tiên xây một bản đồ đủ chính xác để ta luôn biết byte đang ở đâu và bước nào thực sự biến đổi nó.
+
+## Mental model: bốn lớp dữ liệu khác nhau
+
+Hãy xem một video như một kiện hàng có nhiều ngăn:
+
+```text
+File / luồng byte
+└─ Container: MP4, Matroska/WebM, MPEG-TS…
+   ├─ video stream: các packet H.264/AV1/VP9…
+   ├─ audio stream: các packet AAC/Opus…
+   ├─ subtitle stream: WebVTT/ASS/tx3g…
+   └─ metadata + index + timing
+```
+
+Mỗi khái niệm trả lời một câu hỏi riêng:
+
+| Khái niệm     | Nó là gì?                                                                 | Ví dụ                                             |
+| ------------- | ------------------------------------------------------------------------- | ------------------------------------------------- |
+| **Container** | Cách đóng gói nhiều stream, timestamp, index và metadata vào một cấu trúc | MP4, MKV, WebM, MPEG-TS                           |
+| **Codec**     | Quy tắc nén/giải nén nội dung media                                       | H.264, AV1, AAC, Opus                             |
+| **Stream**    | Một luồng logic trong container                                           | video chính, audio tiếng Việt, subtitle tiếng Anh |
+| **Packet**    | Đơn vị dữ liệu nén mà demuxer chuyển cho decoder, kèm timestamp/flags     | một cụm byte H.264 có PTS/DTS                     |
+| **Frame**     | Đơn vị media đã decode: ảnh video hoặc một khối audio samples             | `VideoFrame` YUV 640×360                          |
+
+“Stream” ở đây là khái niệm media bên trong container, không nhất thiết đồng nghĩa với TCP stream hay JavaScript `ReadableStream`. “Packet” cũng là packet của demuxer/codec; ranh giới của nó không bắt buộc trùng IP packet, HTTP chunk hay một frame. Với một số codec/container, quan hệ packet–frame có thể là một-một, một-nhiều hoặc cần nhiều packet mới dựng được frame.
+
+Container và codec liên quan nhưng không thay thế nhau. MP4 có thể chứa nhiều codec mà đặc tả của nó cho phép; player còn phải hỗ trợ đúng **tổ hợp container + codec + profile + level + pixel format**. Vì vậy kiểm tra mỗi extension là chưa đủ.
+
+## Pipeline phát: demux → decode → render
+
+Khi người dùng bấm Play, player không “mở MP4 rồi vẽ thẳng”. Một mô hình hữu ích là:
+
+```text
+byte từ file/network
+  ↓
+demuxer đọc container, index và chọn stream
+  ↓
+packet video nén ──► video decoder ──► frame YUV/RGB ──► renderer/compositor
+packet audio nén ──► audio decoder ──► PCM samples ────► audio device
+                           timestamps ──► đồng bộ hai nhánh
+```
+
+**Demuxer** hiểu cấu trúc container. Nó tìm track, đọc packet, timestamp và metadata rồi tách các stream. Nó không có nhiệm vụ tái tạo pixel.
+
+**Decoder** hiểu bitstream của codec. Nó nhận packet nén và dựng frame. Video thường ra các plane YUV; audio thường ra samples PCM. Decoder có thể cần giữ state từ các packet trước vì phần lớn video dùng dự đoán giữa frame.
+
+**Renderer** quyết định frame nào được trình bày, khi nào trình bày, scale/crop/chuyển màu ra sao và đưa kết quả vào pipeline hiển thị. Trong browser, `<video>` che phần lớn công việc này. Browser có thể dùng các process, queue, decoder hoặc đường compositing khác nhau tùy hệ điều hành, codec, driver và trạng thái runtime; đừng suy ra “chắc chắn chạy trên GPU” chỉ vì playback mượt.
+
+Âm thanh thường đóng vai trò clock quan trọng vì audio device tiêu thụ samples theo nhịp khá đều. Player so timestamp của audio và video để quyết định chờ, trình bày hoặc đôi khi bỏ frame. Ta sẽ mổ xẻ PTS/DTS và A/V sync ở Phần 3.
+
+## Tự tạo fixture: không cần tải video mẫu
+
+`lavfi` cho phép dùng filter source như một input. Lệnh sau sinh sáu giây hình kiểm thử và tone 880 Hz, encode H.264 + AAC rồi mux vào MP4:
+
+```bash
+ffmpeg -hide_banner -y \
+  -f lavfi -i "testsrc2=size=640x360:rate=30:duration=6" \
+  -f lavfi -i "sine=frequency=880:sample_rate=48000:duration=6" \
+  -map 0:v:0 -map 1:a:0 \
+  -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 60 \
+  -c:a aac -b:a 128k \
+  -shortest -movflags +faststart \
+  ve01-source.mp4
+```
+
+Nếu build FFmpeg của bạn không có `libx264`, kiểm tra bằng `ffmpeg -encoders` rồi dùng encoder có sẵn. Đó là khác biệt của **build**, không phải bằng chứng máy không thể decode H.264.
+
+Đừng đọc log banner bằng mắt rồi đoán. Hỏi `ffprobe` đúng lớp:
+
+```bash
+ffprobe -v error \
+  -show_entries \
+format=format_name,duration,size,bit_rate:stream=index,codec_type,codec_name,profile,time_base,width,height,pix_fmt,sample_rate,channels \
+  -of json \
+  ve01-source.mp4
+```
+
+Bạn sẽ thấy một `format` và hai `stream`: H.264 video, AAC audio. `format_name` mô tả demuxer/container; `codec_name` nằm ở từng stream. Đây là dữ liệu nên đưa vào bug report thay cho câu “file MP4 bị lỗi”.
+
+Muốn nhìn packet video trong 0,3 giây đầu:
+
+```bash
+ffprobe -v error \
+  -select_streams v:0 \
+  -read_intervals "%+0.3" \
+  -show_packets \
+  -show_entries packet=pts_time,dts_time,duration_time,size,flags \
+  -of compact \
+  ve01-source.mp4
+```
+
+Đầu ra vẫn là dữ liệu **nén**. `size` là số byte packet, không phải kích thước frame raw. `flags=K__` thường đánh dấu packet keyframe. PTS và DTS có thể khác nhau khi codec sắp xếp thứ tự decode khác thứ tự trình bày.
+
+## Chiều ngược lại: encode và mux
+
+Pipeline tạo file gần như đảo chiều playback:
+
+```text
+frame raw ─► filter/convert ─► encoder ─► packet nén ─► muxer ─► container
+PCM audio  ─► filter/resample ─► encoder ─► packet nén ─┘
+```
+
+Filter làm việc trên frame đã decode. Vì vậy thêm `scale`, `crop`, `overlay`, cân màu hoặc burn subtitle thường kéo video qua decode rồi encode lại. Chỉ thay metadata/container có thể không cần đi hết đường đó.
+
+Đây là lúc phải phân biệt ba thao tác:
+
+### Remux: đổi vỏ, giữ payload nén
+
+```bash
+ffmpeg -hide_banner -y \
+  -i ve01-source.mp4 \
+  -map 0 -c copy \
+  ve01-remux.mkv
+```
+
+`-c copy` chọn stream copy: packet được demux khỏi MP4 rồi mux vào Matroska mà không decode/encode nội dung. Remux thường nhanh và không tạo thêm mất mát do encode. Nhưng nó chỉ thành công khi container đích chấp nhận codec/metadata tương ứng; timestamp hoặc feature riêng của container vẫn có thể cần điều chỉnh.
+
+So sánh hai file:
+
+```bash
+ffprobe -v error -show_entries format=format_name:stream=codec_type,codec_name \
+  -of compact ve01-source.mp4
+
+ffprobe -v error -show_entries format=format_name:stream=codec_type,codec_name \
+  -of compact ve01-remux.mkv
+```
+
+Codec không đổi, container đổi. Đổi extension bằng `mv` không làm được việc này vì byte bên trong vẫn giữ cấu trúc cũ.
+
+### Transcode: giải nén rồi nén lại
+
+```bash
+ffmpeg -hide_banner -y \
+  -i ve01-source.mp4 \
+  -map 0:v:0 -map 0:a:0 \
+  -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
+  -c:a aac -b:a 96k \
+  -movflags +faststart \
+  ve01-transcoded.mp4
+```
+
+Transcode đi qua decoder và encoder. Nó cần thiết khi đổi codec, profile, resolution, frame rate, pixel format, bitrate hoặc áp dụng filter. Với codec lossy, encode lại có thể làm mất thêm chi tiết; mức độ phụ thuộc nguồn, codec và cấu hình, không thể kết luận chỉ từ dung lượng file.
+
+### Chỉ copy một số stream
+
+Một output có thể kết hợp hai chiến lược. Ví dụ encode lại video sau khi scale nhưng copy audio:
+
+```bash
+ffmpeg -hide_banner -y \
+  -i ve01-source.mp4 \
+  -map 0:v:0 -map 0:a:0 \
+  -vf "scale=480:-2" \
+  -c:v libx264 -crf 24 -preset veryfast -pix_fmt yuv420p \
+  -c:a copy \
+  ve01-scaled.mp4
+```
+
+`-map` nói rõ stream nào đi vào output. Dựa vào auto-selection có thể ổn trong demo một video/một audio, nhưng dễ chọn sai khi file thật có nhiều ngôn ngữ, commentary, cover art hoặc subtitle.
+
+## Đọc một lỗi theo đúng tầng
+
+Khi playback thất bại, đi từ ngoài vào trong:
+
+1. **Byte/input:** URL có trả đúng nội dung, đủ byte, hỗ trợ Range, không phải HTML lỗi được đặt tên `.mp4`?
+2. **Container/demux:** `ffprobe` có nhận `format_name`, duration và stream không? Index có tồn tại hoặc file đã bị cắt cụt?
+3. **Codec:** player có hỗ trợ codec, profile, level, pixel format và audio format không?
+4. **Timestamp:** PTS/DTS có hợp lệ, tăng hợp lý, hai stream có cùng timeline dự kiến không?
+5. **Decode:** decoder có báo corrupt bitstream, missing reference hay unsupported feature không?
+6. **Render/output:** frame đã decode nhưng bị sai aspect, rotation, color, visibility hoặc audio route?
+
+Đây là **failure checklist** tối thiểu:
+
+- Không tin extension; luôn ghi lại `format_name` và `codec_name`.
+- Không gọi mọi thao tác là “convert”; xác định remux hay transcode.
+- Không dùng `-c copy` rồi kỳ vọng filter có hiệu lực: filter cần frame decoded.
+- Không quên `-map` khi có nhiều stream.
+- Không coi “FFmpeg chạy nhanh” là chắc chắn stream copy; nhìn mapping trong log hoặc probe output.
+- Không đánh giá chất lượng chỉ bằng bitrate/file size; so hình, metric phù hợp và thiết bị đích.
+- Không mặc định decoder, renderer hay phần cứng nằm trên một thread/process cố định.
+
+## Bài tập thực hành
+
+1. Tạo `ve01-source.mp4`, chạy hai lệnh `ffprobe` và viết lại cây container → stream của chính file đó.
+2. Remux sang MKV. So codec, duration và kích thước; giải thích vì sao byte file khác dù nội dung nén phần lớn được giữ.
+3. Thử `-c copy` cùng `-vf scale=320:-2`. Đọc lỗi và giải thích bằng pipeline, đừng chỉ chép thông báo.
+4. Tạo output chỉ có video bằng `-map 0:v:0 -c copy`. Probe lại để chứng minh audio stream đã biến mất.
+5. Encode CRF 18 và CRF 32 từ cùng fixture. So kích thước và quan sát artefact ở vùng chuyển động; không kết luận codec nào “tốt hơn” từ một mẫu duy nhất.
+
+## Đọc thêm
+
+- [FFmpeg — mô hình transcoding và stream selection](https://ffmpeg.org/ffmpeg.html)
+- [ffprobe — đọc format, stream, packet và frame](https://ffmpeg.org/ffprobe.html)
+- [FFmpeg Formats — demuxer, muxer và metadata](https://ffmpeg.org/ffmpeg-formats.html)
+- [MDN — Video processing concepts](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API/Video_processing_concepts)
+- [MDN — Web video codec guide](https://developer.mozilla.org/en-US/docs/Web/Media/Guides/Formats/Video_codecs)
+
+**Phần tiếp theo:** [Encoder, decoder và renderer — ba cỗ máy, ba loại chi phí](/blog/video-engineering-02-encoder-decoder-renderer/) — ta sẽ mở từng hộp, quan sát queue và hiểu vì sao “decode nhanh” chưa đồng nghĩa “phát mượt”.

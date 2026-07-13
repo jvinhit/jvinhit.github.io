@@ -1,0 +1,498 @@
+---
+title: 'TypeScript Production · Phần 12 — Inference Engineering cho Library API'
+description: 'Thiết kế inference như public contract: contextual typing, candidate collection, literal preservation, partial inference, NoInfer, higher-order API và type tests cho config, query, builder.'
+pubDate: 2026-07-12
+updatedDate: 2026-07-12
+lang: vi
+tags: [typescript, inference, generics, library-design, api-design]
+series: typescript
+seriesOrder: 12
+draft: false
+---
+
+Library TypeScript tốt không bắt consumer điền generic mà dữ liệu đã chứa. Nó thu bằng chứng từ call site, giữ đúng literal cần thiết, contextual-type callback, rồi trả kết quả đủ chính xác để bước sau tiếp tục suy luận.
+
+Đó là **inference engineering**: thiết kế nơi compiler được lấy candidate, nơi nào chỉ được kiểm, default nào mang semantics thật, và diagnostic phải xuất hiện ở argument nào. Inference là public contract, không phải hiệu ứng đẹp trong hover.
+
+## Mục tiêu
+
+Mục tiêu là dự đoán contextual typing, widening, freshness và best common type; chọn nguồn sự thật cho từng type parameter; giải partial inference; dùng đúng `satisfies`, `as const`, `const` generic và `NoInfer`; bảo toàn higher-order generic; rồi khóa tất cả bằng type/performance tests.
+
+## Mental model: collect → reconcile → instantiate
+
+Generic declaration đi từ type parameter tới các vị trí sử dụng. Khi gọi hàm, compiler đi chiều ngược lại:
+
+1. **Collect** candidate từ value argument, callback return và contextual type.
+2. **Reconcile** candidate theo vị trí, constraint và assignability.
+3. **Instantiate** signature bằng type argument đã chọn, default hoặc fallback.
+
+Với `first<T>(items: readonly T[]): T | undefined`, call `first(['red', 'green'])` trả `string | undefined`, không phải union literal, vì phần tử array đã widen. Nếu literal identity là dữ liệu cho API tiếp theo, signature phải yêu cầu giữ nó:
+
+```ts
+declare function firstLiteral<const Items extends readonly unknown[]>(
+  items: Items
+): Items[0] | undefined;
+const literal = firstLiteral(['red', 'green']);
+//    ^? 'red' | undefined
+```
+
+Không có chế độ inference “chính xác nhất” cho mọi API. `string` dễ sử dụng cho dữ liệu nghiệp vụ; literal phù hợp route, command, query key và config DSL.
+
+Chi tiết priority là implementation của compiler. Public API không nên sống nhờ một mẹo priority mong manh; hãy tạo một nguồn bằng chứng chính rõ ràng và type-test kết quả consumer cần.
+
+## Contextual typing: type chảy từ ngoài vào trong
+
+Expected type có thể chảy vào object literal và callback, nên parameter không cần annotation:
+
+```ts
+declare function button(options: {
+  onClick(event: { x: number; y: number }): void;
+}): void;
+
+button({
+  onClick(event) {
+    event.x;
+    // @ts-expect-error y là number
+    event.y.toUpperCase();
+  },
+});
+// @ts-expect-error noImplicitAny: callback không còn contextual type
+const detached = (event) => event.x;
+button({ onClick: detached });
+```
+
+Với generic API, compiler suy type nền từ source rồi dùng nó làm context cho transform:
+
+```ts
+function transform<Input, Output>(
+  value: Input,
+  map: (input: Input) => Output
+): Output {
+  return map(value);
+}
+
+const size = transform('production', (text) => text.length);
+// text: string; size: number
+```
+
+Tách callback trước khi có context làm parameter thành implicit `any`; đặt transform trước source cũng khiến nguồn sự thật khó đọc. Convention **source trước, transform sau** là API UX, không chỉ style.
+
+## Literal widening và freshness không giống nhau
+
+Widening quyết định `'GET'` còn là literal hay thành `string`. Freshness quyết định object literal có nhận excess-property check hay không.
+
+```ts
+const method = 'GET'; // 'GET'
+const request = { method: 'GET' }; // property: string vì có thể mutate
+const frozenRequest = { method: 'GET' } as const; // readonly 'GET'
+
+type ServerConfig = {
+  mode: 'development' | 'production';
+  port: number;
+};
+
+const direct: ServerConfig = {
+  mode: 'production',
+  port: 3000,
+  // @ts-expect-error fresh literal: typo bị bắt tại đây
+  porrt: 3001,
+};
+const fromFile = {
+  mode: 'production' as const,
+  port: 3000,
+  porrt: 3001,
+};
+const accepted: ServerConfig = fromFile; // biến không còn fresh; key thừa được phép
+```
+
+Đây không phải runtime validation. Config đọc từ file vẫn phải bắt đầu là `unknown` và được parse ở boundary.
+
+## Annotation, `satisfies`, `as const`
+
+```ts
+const annotated: ServerConfig = { mode: 'production', port: 3000 };
+// annotated.mode: 'development' | 'production'
+const checked = {
+  mode: 'production',
+  port: 3000,
+} satisfies ServerConfig;
+// checked.mode: 'production'
+const frozen = { mode: 'production', port: 3000 } as const;
+// literal giữ sâu; property readonly
+```
+
+| Công cụ     | Check target | Giữ type riêng của expression             | Tự thêm readonly |
+| ----------- | ------------ | ----------------------------------------- | ---------------- |
+| Annotation  | Có           | Không, variable mang target type          | Theo target      |
+| `satisfies` | Có           | Có; target vẫn contextual-type expression | Không            |
+| `as const`  | Không        | Có, ở mức literal sâu                     | Có               |
+
+`as const` một mình không biết `'prodution'` là typo vì chưa có target. Annotation hợp với abstraction boundary ổn định; `satisfies` hợp config cần derive exact key; `as const` hợp tuple/literal readonly; `const` type parameter hợp library function cần giữ inline literal.
+
+## Best common type không tự phát minh domain union
+
+Khi nhiều value phải chia sẻ một type, compiler chọn type chung từ candidate và context; nó không biết domain union bạn định thiết kế.
+
+```ts
+declare function same<T>(left: T, right: T): readonly [T, T];
+// @ts-expect-error API yêu cầu cùng một T
+same(1, 'one');
+same<number | string>(1, 'one'); // domain union được nói rõ
+```
+
+Không có `satisfies readonly State[]`, `status` trong array object thường widen thành `string`. Một `T` ở hai argument cũng không có nghĩa “hãy tạo union”. Nếu heterogeneity là feature, dùng variadic tuple `<const Items extends readonly unknown[]>(...items: Items): Items`; `tuple(1, 'one', true)` khi đó là `readonly [1, 'one', true]`.
+
+## Inference site và nguồn bằng chứng
+
+```ts
+declare function fromValue<T>(value: T): T;
+declare function nested<T>(values: readonly T[]): T;
+declare function produced<T>(factory: () => T): T;
+declare function consumed<T>(consumer: (value: T) => void): T;
+declare function fabricated<T>(): T;
+```
+
+`fromValue`, `nested`, `produced` có candidate; `consumed` cần context khác; `fabricated` không có runtime evidence. Inference-friendly API thường có:
+
+- type parameter nối ít nhất hai vị trí có ý nghĩa;
+- một value input làm authoritative site;
+- callback được contextual-type từ dữ liệu đã biết;
+- constraint tối thiểu; conditional/mapped transform ở output.
+
+```ts
+type InferenceBox<T> = { value: T };
+declare function unboxBad<T>(
+  box: T extends string ? InferenceBox<T> : never
+): T;
+declare function unbox<T>(box: InferenceBox<T>): T;
+```
+
+`unbox` cho compiler nhìn cấu trúc trực tiếp; `unboxBad` bắt nó đảo conditional và cho diagnostic khó đọc hơn.
+
+## Generic chỉ ở return là assertion trá hình
+
+```ts
+declare function decode<T>(json: string): T;
+
+const user = decode<{ id: string }>('{"id": 42}');
+// compiler tin id là string; runtime vẫn là number
+```
+
+Không argument nào chứng minh `T`; caller/context chỉ chọn một assertion. Contract trung thực hơn trả `unknown` hoặc nhận runtime witness:
+
+```ts
+declare function decodeUnknown(json: string): unknown;
+interface Schema<Output> {
+  parse(value: unknown): Output;
+}
+declare function decodeWith<Output>(
+  json: string,
+  schema: Schema<Output>
+): Output;
+```
+
+Nếu API thật sự chỉ cast, hãy đặt tên `unsafeCast<T>` để risk hiển thị tại call site.
+
+## Partial inference problem và generic default
+
+Caller đôi khi muốn pin `Input` nhưng infer `Output`:
+
+```ts
+type Task<Input, Output> = { run(input: Input): Output };
+declare function createTask<Input, Output>(
+  run: (input: Input) => Output
+): Task<Input, Output>;
+type User = { id: string; name: string };
+// @ts-expect-error không có placeholder cho Output
+createTask<User>((user) => user.id);
+```
+
+Thêm default chỉ làm call hợp lệ, không tạo partial inference:
+
+```ts
+declare function createTaskDefault<Input, Output = unknown>(
+  run: (input: Input) => Output
+): Task<Input, Output>;
+const defaulted = createTaskDefault<User>((user) => user.id);
+// Task<User, unknown>, không phải Task<User, string>
+```
+
+Default phải mang semantics thật. Workaround đúng là annotate value site, nhận schema/token runtime, hoặc tạo inference phase mới bằng factory/currying:
+
+```ts
+function taskFor<Input>() {
+  return <Output>(run: (input: Input) => Output): Task<Input, Output> => ({
+    run,
+  });
+}
+
+const findName = taskFor<User>()((user) => user.name);
+// Task<User, string>
+```
+
+Outer call chọn `Input`; inner call có generic `Output` riêng. Đây là lý do API tốt thường có dạng `createRouter<Context>()({...})`.
+
+## Production case 1: config với `const` type parameter
+
+```ts
+type RouteShape = {
+  method: 'GET' | 'POST';
+  path: `/${string}`;
+};
+type ServiceShape = {
+  routes: Record<string, RouteShape>;
+};
+declare function defineService<const Config extends ServiceShape>(
+  config: Config
+): Config;
+const service = defineService({
+  routes: {
+    getUser: { method: 'GET', path: '/users/:id' },
+    createUser: { method: 'POST', path: '/users' },
+  },
+});
+type RouteName = keyof typeof service.routes;
+// 'getUser' | 'createUser'
+```
+
+Invalid literal fail tại property, không phải trong một conditional helper sâu:
+
+```ts
+defineService({
+  routes: {
+    broken: {
+      // @ts-expect-error method ngoài contract
+      method: 'DELETE',
+      path: '/users/:id',
+    },
+  },
+});
+```
+
+`const` modifier chỉ giữ inline expression; nó không phục hồi literal của một biến đã widen. Với `const widened = { routes: { users: { method: 'GET', path: '/users' } } }`, `defineService(widened)` lỗi vì `method/path` đã là `string`. Sửa tại declaration bằng `satisfies ServiceShape`, hoặc truyền inline; đừng rải assertion ở call site.
+
+## `NoInfer`: check nhưng không bỏ phiếu
+
+```ts
+function choose<Color extends string>(
+  allowed: readonly Color[],
+  fallback: NoInfer<Color>
+): Color {
+  return allowed.includes(fallback) ? fallback : allowed[0]!;
+}
+
+choose(['red', 'green'] as const, 'red');
+
+// @ts-expect-error fallback không được widen Color
+choose(['red', 'green'] as const, 'blue');
+```
+
+`NoInfer<T>` chỉ chặn candidate tại vị trí được bọc. Sau khi `T` được chọn từ nơi khác, argument vẫn phải assignable vào `T`; nó không tạo invariance và không validate runtime.
+
+## Production case 2: query có inference authority
+
+`queryFn` quyết định dữ liệu thô; `select` quyết định output; `initialData` chỉ được kiểm:
+
+```ts
+type QueryOptions<QueryData, Selected = QueryData> = {
+  queryFn: () => Promise<QueryData>;
+  select?: (data: QueryData) => Selected;
+  initialData?: NoInfer<QueryData>;
+};
+declare function runQuery<QueryData, Selected = QueryData>(
+  options: QueryOptions<QueryData, Selected>
+): Promise<Selected>;
+type UserRow = { id: string; active: boolean };
+declare function fetchUsers(): Promise<UserRow[]>;
+const allUsers = runQuery({ queryFn: fetchUsers });
+// Promise<UserRow[]>
+const activeIds = runQuery({
+  queryFn: fetchUsers,
+  select: (rows) => rows.filter((row) => row.active).map((row) => row.id),
+});
+// Promise<string[]>
+runQuery({
+  queryFn: fetchUsers,
+  // @ts-expect-error initialData không được đổi QueryData
+  initialData: [{ id: 1, active: true }],
+});
+```
+
+Luồng authority là `queryFn → QueryData → context của select`; callback return suy `Selected`; `initialData` chỉ được check. Default `Selected = QueryData` có semantics thật khi `select` vắng mặt; nếu có `select`, callback return vẫn cung cấp candidate.
+
+## Overload, conditional hay lookup map?
+
+Overload như `read({ as: 'text' }): Promise<string>` cho diagnostic tốt khi chỉ có vài call shape.
+
+Conditional mô tả transformation có quy luật nhưng dễ làm lộ branch dài trong error. Với correlation hữu hạn, lookup map thường rõ và rẻ hơn:
+
+```ts
+type OutputByMode = {
+  text: string;
+  bytes: Uint8Array;
+  json: unknown;
+};
+
+declare function readMapped<Mode extends keyof OutputByMode>(options: {
+  as: Mode;
+}): Promise<OutputByMode[Mode]>;
+
+const bytes = readMapped({ as: 'bytes' });
+// Promise<Uint8Array>
+```
+
+Decision rule: 2–4 call shape rời rạc dùng overload; bảng key-output dùng indexed access; transformation trên union/type structure dùng conditional; tổ hợp option tăng theo tích Descartes thì tách API hoặc dùng discriminant.
+
+## Instantiation expression: specialize không cần wrapper
+
+```ts
+type Store<Value> = { get(): Value; set(value: Value): void };
+declare function createStore<Value>(initial: Value): Store<Value>;
+const createUserStore = createStore<User>;
+const store = createUserStore({ id: 'u1', name: 'Ada' });
+// @ts-expect-error specialized factory chỉ nhận User
+createUserStore({ id: 1, name: 'Ada' });
+```
+
+Instantiation expression hợp với DI registration và fixture factory. Với overload-heavy API, type-test signature còn lại sau specialization thay vì giả định mọi overload đều được giữ như mong muốn.
+
+## Higher-order inference: giữ quan hệ generic
+
+```ts
+declare function makeArray<Value>(value: Value): Value[];
+type Box<Value> = { value: Value };
+declare function makeBox<Value>(value: Value): Box<Value>;
+function compose<A, B, C>(
+  first: (value: A) => B,
+  second: (value: B) => C
+): (value: A) => C {
+  return (value) => second(first(value));
+}
+
+const makeBoxedArray = compose(makeArray, makeBox);
+const numbers = makeBoxedArray(1); // Box<number[]>
+const strings = makeBoxedArray('a'); // Box<string[]>
+```
+
+Signature trực tiếp cho phép compiler propagate generic qua function được trả về. Wrapper dùng utility type có thể xóa quan hệ đó:
+
+```ts
+declare function wrapBad<Fn extends (...args: any[]) => any>(
+  fn: Fn
+): (...args: Parameters<Fn>) => ReturnType<Fn>;
+
+declare function identity<Value>(value: Value): Value;
+const erasedIdentity = wrapBad(identity);
+const erased = erasedIdentity('hello');
+// unknown: quan hệ Value -> Value đã collapse
+```
+
+`Parameters`/`ReturnType` phù hợp function concrete; chúng không tái tạo generic call signature hay overload set. Nếu wrapper giữ nguyên contract, có thể trả `Fn` với assertion nội bộ, nhưng phải test arguments, return, `this`, sync/async và properties được hứa bảo toàn.
+
+## Production case 3: builder tạo nhiều inference phase
+
+```ts
+declare class Pipeline<Context extends object> {
+  use<Added extends object>(
+    middleware: (context: Context) => Added
+  ): Pipeline<Context & Added>;
+  handle<Output>(handler: (context: Context) => Output): {
+    run: (context: Context) => Output;
+  };
+}
+declare function pipelineFor<Base extends object>(): Pipeline<Base>;
+pipelineFor<{ requestId: string }>()
+  .use((context) => ({ prefix: context.requestId.slice(0, 4) }))
+  .use((context) => ({ logLine: `${context.prefix}:start` }))
+  .handle((context) => context.logLine);
+pipelineFor<{ requestId: string }>().handle((context) => {
+  // @ts-expect-error user chưa được thêm vào Context
+  return context.user.id;
+});
+```
+
+Outer factory pin base context; mỗi `.use()` infer capability mới; `.handle()` mở phase cho output. Runtime tests vẫn phải chứng minh middleware merge đúng object và đúng thứ tự.
+
+## Type tests cho inference contract
+
+```ts
+type Equal<Left, Right> =
+  (<T>() => T extends Left ? 1 : 2) extends <T>() => T extends Right ? 1 : 2
+    ? true
+    : false;
+type Expect<Condition extends true> = Condition;
+type QueryInference = Expect<Equal<typeof activeIds, Promise<string[]>>>;
+// @ts-expect-error invalid fallback phải tiếp tục bị từ chối
+choose(['red', 'green'] as const, 'purple');
+```
+
+Positive test khóa capability consumer cần. Negative `@ts-expect-error` bảo đảm API không vô tình widen thành `any`; khi lỗi biến mất, directive “unused” làm suite đỏ. Đặt directive sát đúng dòng phát diagnostic, không snapshot toàn bộ hover dài.
+
+## Failure modes và error ergonomics
+
+- Một `T` đại diện raw data, selected data và fallback: tách parameter, chọn authority, dùng `NoInfer` cho input chỉ-được-kiểm.
+- Constraint bằng full domain model dù algorithm chỉ cần `{ id: string }`: constraint hẹp giúp reuse, diagnostic và compile cost.
+- Default để che partial inference: dùng value annotation hoặc factory/curry.
+- `as const` sau khi value đã widen: giữ literal ở declaration hoặc cổng generic.
+- Conditional/mapped type ở input: nhận cấu trúc trực tiếp, transform ở output.
+- Wrapper dùng `Parameters`/`ReturnType` cho generic function: viết higher-order signature trực tiếp hoặc giữ `Fn` với test.
+- Nhiều input cùng quyết định một parameter: thêm option có thể làm output widen; xác định source of truth.
+
+Diagnostic tốt fail gần argument consumer kiểm soát. Ưu tiên constraint trực tiếp, discriminated options, named helper type và `satisfies` tại config declaration. Tránh “custom error message” bằng intersection thương hiệu nếu nó làm parameter khó đọc; TypeScript không cam kết format diagnostic.
+
+`Simplify<T> = { [K in keyof T]: T[K] }` có thể làm hover phẳng hơn nhưng không mặc định giảm instantiation cost. Display ergonomics và compiler performance là hai ngân sách khác nhau.
+
+## Performance: precision có giá
+
+Inference có thể làm editor chậm khi public signature phân phối union lớn qua nhiều conditional, có overload tăng theo tổ hợp, recursive type duyệt config tree, `const` generic giữ object khổng lồ, hoặc builder tích lũy hàng trăm intersection.
+
+Guardrail:
+
+- lookup map thay conditional chain cho correlation hữu hạn;
+- export boundary type có tên và annotate return khi exact internal shape không hữu ích;
+- chia pipeline dài thành intermediate boundary;
+- benchmark fixture gần production bằng `--extendedDiagnostics`;
+- dùng compiler trace khi cần tìm instantiation nóng;
+- theo dõi check time và `.d.ts` size trong release gate.
+
+Đừng giảm precision theo cảm giác. Xác định capability consumer thật sự cần, rồi đo bản exact và bản đơn giản trên cùng fixture.
+
+## Decision table
+
+| Tình huống                            | Công cụ ưu tiên                  |
+| ------------------------------------- | -------------------------------- |
+| Input đã chứa type                    | Infer từ value parameter         |
+| Giữ inline literals                   | `const` type parameter           |
+| Check config và derive exact key      | `satisfies`                      |
+| Input chỉ được kiểm, không được infer | `NoInfer`                        |
+| Pin type trước, infer callback sau    | Factory/currying                 |
+| Specialize toàn bộ generic function   | Instantiation expression         |
+| Generic chỉ ở return                  | Runtime witness hoặc `unknown`   |
+| Ít call shape rời rạc                 | Overload                         |
+| Key-output hữu hạn                    | Lookup map + indexed access      |
+| Biến đổi union có quy luật            | Conditional type                 |
+| Exact type làm editor quá tải         | Boundary annotation hoặc codegen |
+
+## Lab — inference-first data client
+
+Xây package mini `@acme/data-client`:
+
+1. `defineClient()` giữ exact route name/method/path; config tách biến dùng `satisfies`; method sai fail tại property.
+2. `query()` để `queryFn` quyết định `QueryData`, `select` infer `Selected`, `initialData` dùng `NoInfer`.
+3. `clientFor<Context>()` trả builder `.use()`/`.handle()`; capability được tích lũy, đọc trước khi thêm phải fail.
+4. `withMetrics()` bọc generic query function mà không collapse thành `unknown`; test forwarding runtime và generic relation.
+5. Thêm positive tests, negative `@ts-expect-error`, baseline check time và declaration size.
+
+**Done khi:** happy path không có explicit generic ở nơi dữ liệu đã đủ; invalid path fail gần argument sai; generic return không giả runtime validation; diagnostics và compile cost có regression gate.
+
+## Kết luận
+
+Hãy hỏi: **compiler được phép biết type này từ bằng chứng nào?** Contextual typing đưa expected type vào expression; widening quyết định precision; factory tạo inference phase; `const` giữ literal; `satisfies` kiểm shape; `NoInfer` khóa authority; higher-order signature giữ quan hệ generic. Khi inference là public contract, nó cần type tests và performance budget như mọi API khác.
+
+Phần tiếp theo chuyển từ compile-time evidence sang dữ liệu thật: JSON, env và storage bắt đầu là `unknown`, rồi mới được parse thành domain type đáng tin.
+
+## Đọc tiếp
+
+- [Type Inference](https://www.typescriptlang.org/docs/handbook/type-inference.html)
+- [`NoInfer`](https://www.typescriptlang.org/docs/handbook/utility-types.html#noinfertype)
+- [Phần 13 — Runtime Boundaries & Domain Types](/blog/typescript-05-runtime-boundaries-domain-types/)

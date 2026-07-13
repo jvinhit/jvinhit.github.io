@@ -1,0 +1,204 @@
+---
+title: 'Video Engineering · Phần 2 — Encoder, decoder và renderer: ba cỗ máy, ba loại chi phí'
+description: 'Tách rõ decoder, encoder và renderer; hiểu software/hardware path, packet/frame queue, backpressure, latency và cách đo từng tầng bằng fixture FFmpeg tự tạo.'
+pubDate: 2026-07-12
+lang: vi
+tags: [video-engineering, video, ffmpeg, encoder, decoder, renderer]
+series: video-engineering
+seriesOrder: 2
+draft: false
+---
+
+“Máy này có GPU mà video vẫn giật” không phải chẩn đoán. “FFmpeg encode được H.264” cũng không chứng minh browser sẽ decode file đó bằng phần cứng. Encoder, decoder và renderer đứng gần nhau trong sơ đồ nhưng nhận input khác nhau, tối ưu mục tiêu khác nhau và có thể nghẽn độc lập.
+
+Ta cần tách ba cỗ máy trước khi nói về tốc độ:
+
+```text
+packet nén ──► DECODER ──► frame raw ──► RENDERER ──► màn hình
+                  ▲                            │
+                  │                        media clock
+frame raw ───► ENCODER ──► packet nén          │
+```
+
+Video có thể decode nhanh nhưng render trễ vì main thread bận. Editor có thể preview mượt nhưng export chậm. Live pipeline có thể tăng latency dù từng stage chưa crash vì queue không có giới hạn.
+
+## Decoder: từ bitstream thành frame
+
+Decoder nhận packet của một codec, khôi phục state và phát ra frame video hoặc khối audio samples. Với video dùng dự đoán giữa frame, decoder có thể phải giữ reference frames và chờ thêm dữ liệu trước khi output. Vì thế không nên viết logic giả định “gọi decode một lần thì nhận đúng một frame ngay lập tức”.
+
+Chi phí decode phụ thuộc ít nhất vào:
+
+- codec, profile, level, resolution, bit depth và frame rate;
+- cấu trúc GOP, reference frame và khả năng của implementation;
+- CPU/media engine, driver, workload cạnh tranh và đường copy/convert frame phía sau.
+
+“Hardware decode” nghĩa implementation có thể dùng khối media chuyên dụng hoặc API tăng tốc. Nó không đồng nghĩa toàn pipeline ở GPU hay bảo đảm zero-copy. Player vẫn có thể fallback về software vì profile, giới hạn thiết bị, driver hoặc bước xử lý phía sau.
+
+## Encoder: từ frame thành quyết định nén
+
+Encoder nhận frame raw rồi quyết định cách biểu diễn chúng bằng bitstream. Nó phải cân bằng nhiều mục tiêu:
+
+| Mục tiêu              | Câu hỏi thực tế                                      |
+| --------------------- | ---------------------------------------------------- |
+| Chất lượng            | Chi tiết và chuyển động nào được giữ ở bitrate này?  |
+| Dung lượng/băng thông | Output có nằm trong storage/CDN/network budget?      |
+| Độ trễ                | Encoder có buffer/lookahead nhiều frame không?       |
+| Khả năng phát         | Thiết bị đích hỗ trợ codec/profile/pixel format nào? |
+
+Preset của `libx264` đổi lượng công việc tìm cách nén; nó không phải thang chất lượng độc lập với CRF/bitrate. Cùng CRF, preset chậm hơn thường dùng bit hiệu quả hơn, nhưng kết quả còn phụ thuộc nội dung. Hardware encoder cũng có semantics rate-control riêng; đừng thay tên encoder rồi giữ mọi tham số như thể tương đương.
+
+## Renderer: frame đúng chưa đủ, phải đúng lúc
+
+Renderer nhận frame đã decode, gắn chúng với media timeline và đưa ra màn hình. Công việc có thể gồm:
+
+- chọn frame theo clock và trạng thái playback;
+- chuyển màu, áp dụng aspect/rotation/scale;
+- kết hợp layer rồi trình bày qua display pipeline.
+
+Trong browser, `<video>` dùng media pipeline của engine, nhưng thread/process và hardware path là chi tiết implementation. Đưa video vào canvas, đọc pixel về JavaScript hoặc tạo overlay nặng có thể đổi chi phí/copy path. `requestVideoFrameCallback()` giúp đồng bộ overlay; nó không làm callback nặng trở nên miễn phí.
+
+Một renderer realtime không thể “chậm bao lâu cũng được” như encoder offline. Khi deadline đã qua, giữ mọi frame có thể chỉ làm playback trễ dần. Tùy policy, player có thể bỏ frame video để bắt kịp clock trong khi audio tiếp tục.
+
+## Fixture: đo decode riêng khỏi encode
+
+Tạo tám giây video H.264 + AAC hoàn toàn từ `lavfi`:
+
+```bash
+ffmpeg -hide_banner -y \
+  -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=8" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=8" \
+  -map 0:v:0 -map 1:a:0 \
+  -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+  -c:a aac -b:a 128k -shortest \
+  ve02-source.mp4
+```
+
+Trước khi benchmark, ghi lại build và codec:
+
+```bash
+ffmpeg -hide_banner -version
+
+ffprobe -v error \
+  -show_entries stream=index,codec_type,codec_name,profile,width,height,pix_fmt,r_frame_rate \
+  -of compact \
+  ve02-source.mp4
+```
+
+Đo đường **demux + decode video**, bỏ audio và gửi frame tới null output:
+
+```bash
+ffmpeg -hide_banner -benchmark \
+  -i ve02-source.mp4 \
+  -map 0:v:0 -an \
+  -f null -
+```
+
+`-benchmark` đo cả process, không cô lập hoàn hảo từng hàm decoder, nhưng tốt hơn gọi toàn bộ thời gian transcode là “decode”. Chạy vài lần và giữ CPU/power mode nhất quán.
+
+Giờ đo **decode + filter**, vẫn không encode file:
+
+```bash
+ffmpeg -hide_banner -benchmark \
+  -i ve02-source.mp4 \
+  -map 0:v:0 -an \
+  -vf "scale=640:-2,boxblur=2:1" \
+  -f null -
+```
+
+Chênh lệch gồm filter/conversion và có thể cả thay đổi đường xử lý. Tắt từng filter trước khi quy toàn bộ chi phí cho `scale`.
+
+Cuối cùng, encode một nguồn raw mới để quan sát riêng phía encoder:
+
+```bash
+ffmpeg -hide_banner -benchmark -y \
+  -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=8" \
+  -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p \
+  -an \
+  ve02-encoded.mp4
+```
+
+Lab vẫn có chi phí sinh source, nhưng không có demux/decode video nén. Khi so preset, giữ fixture, CRF, build và máy rồi chỉ đổi một biến.
+
+## Software hay hardware: hỏi capability, đừng đoán
+
+Các lệnh sau chỉ **liệt kê những gì build FFmpeg biết**, chưa chứng minh thiết bị hiện tại chạy được mọi tổ hợp:
+
+```bash
+ffmpeg -hide_banner -decoders
+ffmpeg -hide_banner -encoders
+ffmpeg -hide_banner -hwaccels
+```
+
+Tên encoder/decoder tăng tốc phụ thuộc nền tảng và build. Trong browser, `canPlayType()` hỏi khả năng phát cơ bản; Media Capabilities bổ sung tín hiệu `supported`, `smooth`, `powerEfficient`. Đây là đánh giá của user agent, không phải SLA cho mọi phiên phát.
+
+## Queue: nơi latency âm thầm tích tụ
+
+Pipeline thật cần queue vì các stage không hoàn thành cùng nhịp:
+
+```text
+demux
+  │ encoded packet queue
+  ▼
+decode
+  │ decoded frame queue
+  ▼
+render
+```
+
+Queue ngắn giúp hấp thụ jitter. Queue vô hạn biến chênh lệch tốc độ thành RAM và latency. Giả sử input live đến 30 fps nhưng stage xử lý trung bình chỉ xong 25 fps: backlog tăng khoảng 5 frame mỗi giây. Sau một phút, hệ thống có thể chậm hàng giây dù không crash.
+
+**Backpressure** làm producer chậm lại, chờ consumer, giảm chất lượng hoặc áp dụng drop policy khi queue vượt ngưỡng. Transcode offline có thể chờ; live preview có thể ưu tiên frame mới; editor không được drop bừa vì phải giữ đúng timeline.
+
+Tăng `thread_queue_size` có thể cần khi input riêng bị burst, nhưng không sửa được consumer chậm bền vững. Nó chỉ cho backlog thêm chỗ ở. Luôn đo queue depth, thời gian frame nằm trong queue và end-to-end latency.
+
+Mô phỏng input realtime bằng `-re`, rồi xử lý và bỏ output:
+
+```bash
+ffmpeg -hide_banner -re \
+  -i ve02-source.mp4 \
+  -map 0:v:0 -an \
+  -vf "scale=640:-2,fps=15" \
+  -progress pipe:1 -nostats \
+  -f null -
+```
+
+`-re` giới hạn tốc độ đọc gần tốc độ media để mô phỏng nguồn realtime; nó không phải bộ điều khiển backpressure chung. `-progress` in `frame`, `fps`, `out_time` và `speed`.
+
+Với WebCodecs, `VideoDecoder.decodeQueueSize` và `VideoEncoder.encodeQueueSize` là tín hiệu số request đang pending. Đừng gọi `decode()` vô hạn rồi chỉ `flush()` ở cuối file dài. Giới hạn số chunk đang bay, chờ output/drain theo thiết kế và đóng `VideoFrame` khi không còn dùng để giải phóng resource sớm.
+
+## Debug theo triệu chứng
+
+| Triệu chứng                      | Tầng nghi ngờ đầu tiên | Bằng chứng cần lấy                                                  |
+| -------------------------------- | ---------------------- | ------------------------------------------------------------------- |
+| CPU cao trước khi có frame       | demux/decode           | codec/profile, benchmark decode-to-null, decoder log                |
+| Export chậm nhưng preview mượt   | encoder/filter         | preset, resolution, filter graph, encoder utilization               |
+| Decode nhanh nhưng playback giật | render/scheduling      | dropped frames, media timeline, Performance trace, main-thread load |
+| RAM và latency tăng dần          | queue/backpressure     | queue depth theo thời gian, producer/consumer rate                  |
+| Chỉ một số máy lỗi               | capability/fallback    | OS, browser, driver, codec string, hardware/software path           |
+
+Failure checklist trước khi sửa:
+
+- Đã tách thời gian decode khỏi encode và filter chưa?
+- Có đang lấy `speed=2x` của transcode làm bằng chứng decoder chạy 2x không?
+- Queue có giới hạn và metric hay chỉ có một mảng tăng mãi?
+- Frame/resource có được release (`VideoFrame.close()`) đúng lúc?
+- Hardware path được xác nhận bằng log/capability hay chỉ suy từ tên GPU?
+- Benchmark có cùng fixture, build, thermal/power state và chỉ đổi một biến?
+
+## Bài tập thực hành
+
+1. Chạy hai benchmark null-output ở trên ba lần. Báo median thay vì chọn lần đẹp nhất.
+2. Đổi fixture từ 720p lên 1080p, giữ 30 fps. So decode-to-null và filter-to-null; ghi rõ giới hạn của kết luận.
+3. Encode cùng CRF bằng `ultrafast`, `medium` và `slow`. So thời gian, size và hình; giải thích vì sao preset không phải nút chất lượng độc lập.
+4. Chạy lệnh `-re`, quan sát `out_time` và `speed`. Bỏ `-re` rồi giải thích sự khác nhau giữa tốc độ đọc file và realtime deadline.
+
+## Đọc thêm
+
+- [FFmpeg — pipeline, codec options và stream handling](https://ffmpeg.org/ffmpeg.html)
+- [FFmpeg Codecs Documentation](https://ffmpeg.org/ffmpeg-codecs.html)
+- [FFmpeg Filters Documentation](https://ffmpeg.org/ffmpeg-filters.html)
+- [MDN — WebCodecs API](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API)
+- [MDN — Media Capabilities API](https://developer.mozilla.org/en-US/docs/Web/API/Media_Capabilities_API)
+- [MDN — requestVideoFrameCallback](https://developer.mozilla.org/en-US/docs/Web/API/HTMLVideoElement/requestVideoFrameCallback)
+
+**Phần tiếp theo:** [Timestamp, GOP và keyframe — vì sao seek không rơi đúng frame](/blog/video-engineering-03-timestamps-gop-keyframes/) — ta sẽ đọc time base, PTS/DTS, I/P/B-frame và dựng một fixture VFR để thấy timeline không phải phép đếm frame.

@@ -1,0 +1,270 @@
+---
+title: 'Video Engineering · Phần 13 — Debug media bằng Chrome DevTools'
+description: 'Dùng Network, Media, Sources, Performance và chrome://media-internals để lần request, buffer, decoder, frame drop; sau đó đóng gói HAR và FFmpeg report.'
+pubDate: 2026-07-12
+lang: vi
+tags:
+  [
+    video-engineering,
+    video,
+    chrome-devtools,
+    media-debugging,
+    ffprobe,
+    observability,
+  ]
+series: video-engineering
+seriesOrder: 13
+draft: false
+---
+
+Một player báo “video không chạy” chưa phải là chẩn đoán. Request có thể chưa rời browser, server có thể trả sai MIME, demuxer có thể không đọc được container, decoder có thể từ chối codec, buffer có thể cạn, hoặc frame đã decode nhưng không tới compositor đúng hạn.
+
+Chrome DevTools hữu ích khi ta giao cho mỗi panel một câu hỏi rõ ràng. Bài này xây một phòng lab hoàn toàn cục bộ, rồi dùng Network, Media, Sources, Performance và `chrome://media-internals` để tạo chuỗi bằng chứng từ HTTP tới frame hiển thị.
+
+> Chỉ thu thập request, token, manifest và media từ hệ thống bạn sở hữu hoặc được phép kiểm thử. HAR và player log có thể chứa URL ký số, cookie hoặc header xác thực.
+
+---
+
+## 1. Fixture tổng hợp và trang quan sát
+
+Tạo video 12 giây bằng nguồn `lavfi`; không cần tải asset bên ngoài:
+
+```bash
+mkdir -p media-debug-lab
+cd media-debug-lab
+
+ffmpeg -hide_banner -y \
+  -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=12" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=12" \
+  -map 0:v:0 -map 1:a:0 \
+  -c:v libx264 -preset veryfast -crf 21 -pix_fmt yuv420p \
+  -g 60 -keyint_min 60 -sc_threshold 0 \
+  -c:a aac -b:a 128k -movflags +faststart fixture.mp4
+```
+
+Lưu trang sau thành `index.html`:
+
+```html
+<!doctype html>
+<meta charset="utf-8" />
+<title>Media debug lab</title>
+<style>
+  body {
+    font: 16px system-ui;
+    max-width: 900px;
+    margin: 2rem auto;
+  }
+  video {
+    width: 100%;
+    background: #111;
+  }
+  pre {
+    min-height: 12rem;
+    padding: 1rem;
+    background: #111827;
+    color: #d1fae5;
+  }
+</style>
+
+<video id="video" controls preload="metadata" src="./fixture.mp4"></video>
+<p><button id="range">Fetch byte 0–1023</button></p>
+<pre id="log"></pre>
+
+<script>
+  const video = document.querySelector('#video');
+  const log = document.querySelector('#log');
+  const line = (message) => {
+    log.textContent += `${performance.now().toFixed(1)}ms ${message}\n`;
+  };
+
+  for (const name of [
+    'loadstart',
+    'loadedmetadata',
+    'loadeddata',
+    'canplay',
+    'playing',
+    'waiting',
+    'stalled',
+    'seeking',
+    'seeked',
+    'error',
+    'ended',
+  ]) {
+    video.addEventListener(name, () => {
+      const ranges = Array.from(
+        { length: video.buffered.length },
+        (_, i) =>
+          `${video.buffered.start(i).toFixed(2)}-${video.buffered.end(i).toFixed(2)}`
+      );
+      line(
+        `${name} t=${video.currentTime.toFixed(2)} buffer=[${ranges.join(',')}]`
+      );
+    });
+  }
+
+  setInterval(() => {
+    const q = video.getVideoPlaybackQuality();
+    line(`quality total=${q.totalVideoFrames} dropped=${q.droppedVideoFrames}`);
+  }, 2000);
+
+  document.querySelector('#range').addEventListener('click', async () => {
+    const response = await fetch('./fixture.mp4', {
+      headers: { Range: 'bytes=0-1023' },
+    });
+    line(
+      `range status=${response.status} content-range=${response.headers.get('content-range')}`
+    );
+    await response.arrayBuffer();
+  });
+</script>
+```
+
+Chạy web server, mở `http://localhost:8080`, rồi bật DevTools:
+
+```bash
+python3 -m http.server 8080
+```
+
+`SimpleHTTPRequestHandler` ở phiên bản Python của bạn có thể trả `200` thay vì `206` cho nút Range. Đó là một kết quả quan sát hợp lệ: server đã bỏ qua Range. Đừng thêm `Accept-Ranges: bytes` bằng cấu hình giả nếu server chưa thực sự triển khai partial response.
+
+---
+
+## 2. Network: request nào, do ai tạo, mất thời gian ở đâu?
+
+Trong Network, bật **Preserve log**, chọn **Disable cache**, reload trang và lọc `Media`. Mở request `fixture.mp4`, rồi đọc theo thứ tự:
+
+1. **Headers**: URL cuối sau redirect, status, `Content-Type`, `Content-Length`, `Content-Range`, cache và CORS.
+2. **Initiator**: parser, script hay request khác đã khởi tạo tải media.
+3. **Timing**: queueing, connection, TTFB và content download.
+4. **Response**: hữu ích với manifest text; binary media không nên được “đọc” như văn bản.
+
+Status `206 Partial Content` cùng `Content-Range` cho thấy server đã đáp ứng một byte range. `200` không luôn là lỗi: media nhỏ có thể được tải toàn bộ. Nhưng với progressive MP4 lớn, thiếu Range thường làm seek và resume kém hiệu quả. `304` là cache validation, còn `(blocked:cors)`, `404`, `416` hay request đỏ là bằng chứng cụ thể cần giữ lại.
+
+Bỏ filter `Media`, bấm nút **Fetch byte 0–1023**, rồi so request `Fetch/XHR` với request do `<video>` tạo. Cùng một URL nhưng initiator và hành vi cache có thể khác. Đây là lý do không nên kết luận “curl chạy thì browser phải chạy”.
+
+Network throttling giúp tái hiện cạn buffer. Chọn một profile chậm, phát video và theo dõi `waiting`, Waterfall cùng `video.buffered`. Request blocking thích hợp để mô phỏng file hoặc segment biến mất; nó là công cụ fault injection, không phải cách sửa stream.
+
+---
+
+## 3. Media panel: trạng thái bên trong player
+
+Mở **More tools → Media**, reload trang và chọn player tương ứng. Bốn tab trả lời bốn câu hỏi khác nhau:
+
+- **Properties**: URL, codec/decoder, kích thước, trạng thái pipeline và các thuộc tính player mà Chrome công bố.
+- **Events**: chuỗi sự kiện theo thời gian; tìm seek, buffer, pipeline state và thay đổi cấu hình.
+- **Messages**: warning/error từ media stack; giữ nguyên thông điệp và thời điểm thay vì chỉ chụp màn hình đen.
+- **Timeline**: playback và buffer biến đổi ra sao khi video chạy.
+
+Network chứng minh bytes đã đến; Media panel cho biết player làm gì với chúng. Nếu request thành công nhưng Media báo decoder initialization failed, tiếp tục sửa CDN sẽ không đúng tầng. Ngược lại, không có đủ dữ liệu trong buffer thì việc đổi codec chưa có cơ sở.
+
+Nhấp phải player và chọn **Save player info** để xuất JSON. File này rất hữu ích khi lỗi chỉ xảy ra trên một máy, vì nó giữ nhiều property và event hơn một ảnh chụp.
+
+---
+
+## 4. Sources: dừng đúng nơi tạo request hoặc đổi state
+
+Trong **Sources → XHR/fetch Breakpoints**, thêm chuỗi `fixture.mp4`, sau đó bấm nút Range. Debugger dừng tại dòng `fetch()` gửi request. Breakpoint này không nhất thiết dừng ở request media do browser tự tạo từ thuộc tính `src`; nó dành cho XHR/fetch do JavaScript khởi tạo.
+
+Khi player dùng thư viện streaming, các breakpoint hữu ích là:
+
+- URL substring `.m3u8`, `.mpd`, `.ts`, `.m4s` hoặc endpoint license/telemetry thuộc môi trường được phép;
+- exception breakpoint để dừng tại promise rejection bị nuốt;
+- line breakpoint/logpoint nơi gọi `appendBuffer()`, `remove()`, `currentTime = ...` hoặc chuyển rendition;
+- event-listener breakpoint cho media event, hoặc breakpoint trực tiếp trong handler của ứng dụng.
+
+Logpoint tốt hơn `console.log()` tạm khi bạn không muốn sửa source. Ghi `currentTime`, `readyState`, `networkState`, `buffered` và URL đang xử lý; tránh log toàn ArrayBuffer khiến DevTools nặng hơn chính lỗi cần đo.
+
+---
+
+## 5. Performance: main thread có chặn frame không?
+
+Mở Performance, record khoảng năm giây trong lúc phát, seek và bấm nút Range. Tìm long task, layout/paint dày, garbage collection và handler JavaScript chạy sát nhau. Một visualizer xử lý pixel trên main thread có thể làm callback trễ dù decoder vẫn hoạt động.
+
+Tuy nhiên, Performance panel không thay thế Media panel. Demux, hardware decode và compositor có thể chạy ngoài main thread. Main thread “rảnh” không chứng minh decoder khỏe; CPU cao cũng chưa nói frame bị drop. Đối chiếu trace với `getVideoPlaybackQuality()`, `requestVideoFrameCallback()` và Media Timeline.
+
+Một phép đo hữu ích là tỷ lệ:
+
+```js
+const q = video.getVideoPlaybackQuality();
+const droppedRatio = q.totalVideoFrames
+  ? q.droppedVideoFrames / q.totalVideoFrames
+  : 0;
+```
+
+Ghi cả thời gian đo, rendition, resolution, playback rate và trạng thái tab. Một con số thiếu bối cảnh khó so sánh giữa hai lần chạy.
+
+---
+
+## 6. `chrome://media-internals`: log sâu theo phiên browser
+
+Mở `chrome://media-internals` ở tab riêng, sau đó reload lab. Tìm player bằng URL và xem properties, buffered data, event log cùng media-cache activity. Công cụ này đặc biệt hữu ích khi Media panel không giữ đủ lịch sử hoặc bạn cần log rộng hơn một tab DevTools.
+
+Nó cũng dễ gây nhầm vì lưu nhiều player từ nhiều tab. Hãy đóng player thừa, tạo một phiên tái hiện mới và ghi thời điểm. File/line trong lỗi nội bộ thường thuộc Chromium C++, không phải vị trí JavaScript của ứng dụng; dùng Sources để nối ngược về code web.
+
+---
+
+## 7. Đóng gói bằng chứng: HAR, probe và FFmpeg report
+
+Trong Network, export **HAR sanitized**. Bản sanitized mặc định loại các header nhạy cảm như `Cookie`, `Set-Cookie` và `Authorization`; vẫn phải kiểm tra URL query, response body và dữ liệu riêng trước khi chia sẻ. Chỉ export HAR có sensitive data khi người nhận và kênh truyền được phép.
+
+Kèm một probe gọn:
+
+```bash
+ffprobe -v error \
+  -show_format -show_streams \
+  -show_entries "format=filename,format_name,duration,size,bit_rate:stream=index,codec_type,codec_name,profile,width,height,pix_fmt,r_frame_rate,avg_frame_rate,time_base,sample_rate,channels" \
+  -of json fixture.mp4 > fixture.probe.json
+```
+
+Nếu nghi timestamp hoặc decode, tạo report cục bộ:
+
+```bash
+ffmpeg -hide_banner -report -debug_ts -i fixture.mp4 -map 0:v:0 -map 0:a:0 -f null -
+```
+
+`-debug_ts` dành cho debug và format log có thể đổi giữa phiên bản; đừng parse nó như API ổn định. Bug bundle tối thiểu nên có URL đã redact, bước tái hiện, thời điểm, Chrome/OS, player JSON, HAR sanitized, `ffprobe` JSON và FFmpeg report.
+
+---
+
+## Failure checklist
+
+- [ ] Reload trước khi mở Network nên mất request đầu tiên.
+- [ ] Filter `Media` làm ẩn manifest được tải qua Fetch/XHR.
+- [ ] Chỉ nhìn status `200` mà bỏ qua MIME, redirect, body và timing.
+- [ ] Cho rằng request `<video>` sẽ kích hoạt XHR/fetch breakpoint.
+- [ ] Throttle hoặc request blocking còn bật từ lần debug trước.
+- [ ] Dùng Performance để suy luận decoder mà không đối chiếu Media panel.
+- [ ] So dropped frames giữa hai rendition/resolution khác nhau.
+- [ ] Không tạo phiên sạch trong `chrome://media-internals`.
+- [ ] Chia sẻ HAR chứa signed URL, cookie hoặc token.
+- [ ] Không lưu phiên bản browser, FFmpeg và câu lệnh tái hiện.
+
+---
+
+## Runbook 10 phút
+
+1. Tái hiện trên fixture hoặc asset được ủy quyền; ghi thời điểm.
+2. Network: status, MIME, Range, CORS, cache, initiator, timing.
+3. Media: properties, events, messages, timeline; export player JSON.
+4. Sources: breakpoint nơi fetch/append/seek và pause on exceptions.
+5. Performance: record đúng cửa sổ xảy ra lỗi, ghi dropped-frame ratio.
+6. Probe asset; nếu cần, chạy `-report -debug_ts`.
+7. Export HAR sanitized và viết một giả thuyết có tầng, không chỉ mô tả triệu chứng.
+
+---
+
+## Đọc thêm
+
+- [Chrome DevTools Media panel](https://developer.chrome.com/docs/devtools/media-panel)
+- [Chrome DevTools Network](https://developer.chrome.com/docs/devtools/network)
+- [Network features reference và HAR](https://developer.chrome.com/docs/devtools/network/reference)
+- [XHR/fetch và các loại breakpoint](https://developer.chrome.com/docs/devtools/javascript/breakpoints)
+- [Chromium Media Internals](https://www.chromium.org/audio-video/media-internals/)
+- [Chrome DevTools Protocol: Media domain](https://chromedevtools.github.io/devtools-protocol/tot/Media/)
+- [Tài liệu ffprobe chính thức](https://ffmpeg.org/ffprobe.html)
+
+---
+
+## Bài kế tiếp
+
+[Phần 14 — Playbook xử lý lỗi playback theo từng tầng](/blog/video-engineering-14-playback-failure-playbook/)

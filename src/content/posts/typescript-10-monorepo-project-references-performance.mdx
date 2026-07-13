@@ -1,15 +1,33 @@
 ---
-title: 'TypeScript Production · Phần 10 — Monorepo, Project References & Type Performance'
+title: 'TypeScript Production · Phần 18 — Monorepo, Project References & Type Performance'
 description: 'Scale TypeScript bằng build graph rõ: composite projects, tsc -b, declaration boundaries, incremental build, diagnostics và cách giảm type instantiation cost.'
 pubDate: 2026-07-07
+updatedDate: 2026-07-12
 lang: vi
 tags: [typescript, monorepo, performance, project-references]
 series: typescript
-seriesOrder: 10
+seriesOrder: 18
 draft: false
 ---
 
-Khi editor chậm, phản xạ kém nhất là đổ thêm RAM rồi tiếp tục. Hãy tách ba nguồn chi phí: graph quá lớn, build lặp lại, hay type-level computation đắt.
+Khi editor chậm, phản xạ kém nhất là đổ thêm RAM rồi tiếp tục. Hãy tách ba
+nguồn chi phí: graph quá lớn, build lặp lại, hay type-level computation đắt.
+
+Ở cấp staff, mục tiêu không phải thắng một benchmark đẹp. Mục tiêu là làm thời
+gian type-check **dự đoán được**, quy được về owner, và không tăng âm thầm sau
+mỗi schema, package hay generic helper mới.
+
+Giữ ba graph tách biệt trong đầu:
+
+```text
+source graph       file nào import file nào
+build graph        project nào phải build trước project nào
+declaration graph  consumer thật sự nhìn thấy type nào
+```
+
+Project reference sửa build graph. Public annotation và `exports` thu nhỏ
+declaration graph. Type refactor giảm công việc relation/instantiation trong
+từng node. Trộn ba vấn đề này dẫn tới các "fix" không chạm nguyên nhân.
 
 ## Project reference biến repo thành build graph
 
@@ -45,6 +63,32 @@ Referenced package:
 
 `tsc -b` tìm dependency order, chỉ build project out-of-date, và consumer type-check qua `.d.ts` của dependency thay vì nuốt toàn source graph.
 
+`composite` là contract vận hành, không chỉ một flag tăng tốc:
+
+- project phải khai báo đầy đủ file qua `include`/`files`;
+- declaration output phải tồn tại để consumer thấy boundary;
+- `rootDir`, `outDir` và `.tsbuildinfo` cần ổn định giữa local/CI;
+- reference graph phải acyclic và đi cùng dependency direction runtime.
+
+Inspect quyết định của build orchestrator trước khi sửa cache:
+
+```bash
+tsc -b --dry --verbose
+tsc -b packages/domain packages/sdk apps/web --verbose
+```
+
+`--force` hữu ích để đo full rebuild nhưng không nên là lệnh mặc định; nó xóa
+lợi ích up-to-date check. Một consumer import deep source path của dependency
+cũng phá ý nghĩa declaration boundary dù `references` nhìn vẫn đúng.
+
+```ts
+// tốt: đi qua public surface đã emit declaration
+import type { UserId } from '@acme/domain';
+
+// tránh: kéo implementation detail vào consumer graph
+import type { UserId } from '../../domain/src/internal/user-id';
+```
+
 ## Boundary kỹ thuật phải khớp boundary tổ chức
 
 Đừng tạo project reference cho từng folder. Mỗi project có overhead và declaration contract. Tách khi có ít nhất một lý do:
@@ -55,15 +99,103 @@ Referenced package:
 - public API nhỏ hơn implementation nhiều;
 - runtime/deployment target khác.
 
-## Đo trước khi chữa
+## Đo cold và warm như hai sản phẩm khác nhau
+
+**Cold build-state** nghĩa là output và `.tsbuildinfo` không tồn tại. **Warm
+build** chạy lại cùng commit, config và compiler mà không đổi file. Nó không đồng
+nghĩa với cold/warm OS filesystem cache; hãy ghi rõ định nghĩa trong report.
 
 ```bash
-tsc -p tsconfig.json --extendedDiagnostics
-tsc -p tsconfig.json --generateTrace .trace
-tsc -b --verbose
+# cold build-state
+tsc -b --clean
+time tsc -b --extendedDiagnostics
+
+# warm no-change build
+time tsc -b --extendedDiagnostics
+
+# đo riêng node nghi ngờ, không trộn thời gian package khác
+tsc -p packages/sdk/tsconfig.json --extendedDiagnostics --noEmit
 ```
 
-Theo dõi file count, type count, instantiation count, memory và check time. Regression budget hữu ích hơn tranh luận cảm giác “IDE hơi lag”.
+Protocol đủ tin cậy cho regression review:
+
+1. pin Node, TypeScript, lockfile và cùng loại runner;
+2. tắt watch/editor plugin khỏi phép đo CLI;
+3. chạy ít nhất năm lần, báo median cùng khoảng dao động;
+4. tách cold, warm no-change và warm one-file-change;
+5. không dùng run có `--generateTrace` làm benchmark vì tracing có overhead;
+6. lưu command, commit SHA và config hash cạnh kết quả.
+
+Warm nhanh nhưng cold chậm thường là declaration emit/graph size. Cold ổn nhưng
+one-file-change rebuild cả repo thường là boundary hoặc cache invalidation sai.
+
+## Đọc `--extendedDiagnostics` theo giả thuyết
+
+Một output rút gọn có thể trông như sau:
+
+```text
+Files:                       1842
+Lines of TypeScript:       286410
+Types:                     421337
+Instantiations:           3281042
+Memory used:              812440K
+Assignability cache size:  194282
+I/O Read time:               0.42s
+Parse time:                  1.13s
+Bind time:                   0.46s
+Check time:                  8.91s
+Emit time:                   0.73s
+Total time:                 11.86s
+```
+
+Đừng nhìn một con số đơn lẻ:
+
+- **Files/lines + I/O/parse tăng:** graph nạp thêm file, duplicate `@types`, glob
+  `include` rộng, generated source lớn hoặc storage chậm.
+- **Types/Instantiations + Check time tăng:** conditional/mapped/recursive generic
+  tạo nhiều type instance; tìm call site hoặc schema fan-out.
+- **Check time tăng nhưng Instantiations gần như đứng:** nghi relation/assignability
+  giữa union/intersection/object lớn; cần trace để định vị comparison.
+- **Emit time và `.d.ts` bytes tăng:** public inferred type hoặc re-export đang
+  kéo implementation graph ra boundary.
+- **Warm total cao nhưng check/emit thấp:** kiểm tra up-to-date scan, cache path,
+  timestamp và số project quá vụn.
+
+`Assignability cache size` là số entry, không phải số giây spent checking
+assignability. Nó là tín hiệu tương quan, không phải kết luận. So delta trên cùng
+compiler/máy; đừng so raw count giữa hai TypeScript version rồi tuyên bố regression.
+
+## Từ tổng quan tới hotspot với `--generateTrace`
+
+`extendedDiagnostics` nói phase nào đắt; trace trả lời file/type relation nào
+đang ăn thời gian.
+
+```bash
+tsc -p packages/sdk/tsconfig.json --generateTrace .trace/sdk
+npm install --no-save @typescript/analyze-trace
+npx analyze-trace .trace/sdk
+
+# giảm threshold khi project nhỏ; tắt type expansion nếu output quá dài
+npx analyze-trace .trace/sdk \
+  --skipMillis 25 --forceMillis 100 --expandTypes false
+
+# tra type ID khi analyzer chỉ ra một relation đáng ngờ
+npx simplify-trace-types .trace/sdk/types.json .trace/sdk/types.txt
+```
+
+Workflow điều tra:
+
+1. tái hiện trên commit sạch bằng compiler workspace;
+2. trace project nhỏ nhất vẫn chứa regression;
+3. đọc hotspot theo file trước, type ID sau;
+4. phân loại **I/O/parse**, **instantiation**, **assignability/relation** hay
+   **declaration emit**;
+5. tạo refactor nhỏ hoặc minimal reproduction;
+6. đo lại bằng run không tracing, giữ type/runtime tests nguyên vẹn.
+
+Trace chứa path và type shape nội bộ. Scrub trước khi attach issue công khai,
+không commit `.trace`, và tạo trace mới nếu source đã đổi hoặc thư mục trace bị
+di chuyển — analyzer dựa vào quan hệ path với project.
 
 ## Các mẫu type đắt
 
@@ -82,7 +214,90 @@ type Box<T> = T extends unknown ? { value: T } : never;
 type BoxTogether<T> = [T] extends [unknown] ? { value: T } : never;
 ```
 
-Không “tối ưu” bằng mẹo type mù quáng. Đầu tiên hỏi: precision này có tạo UX/bug-prevention tương xứng không?
+### Nested distributive conditional
+
+Hai type parameter cùng distribute tạo tích Descartes:
+
+```ts
+type PairEvery<A, B> = A extends unknown
+  ? B extends unknown
+    ? readonly [A, B]
+    : never
+  : never;
+```
+
+Union 40 × 40 đã tạo 1.600 pair trước khi conditional tiếp theo filter. Nếu
+domain chỉ ghép member cùng discriminator, filter một phía trước:
+
+```ts
+type WithKind<T, Kind> = Extract<T, { kind: Kind }>;
+
+type CompatiblePair<
+  Left extends { kind: PropertyKey },
+  Right extends { kind: PropertyKey },
+> = Left extends unknown
+  ? readonly [Left, WithKind<Right, Left['kind']>]
+  : never;
+```
+
+### Wide mapped/template union
+
+Template literal nhân mọi union ở mỗi interpolation:
+
+```ts
+type RouteName<
+  Version extends string,
+  Resource extends string,
+  Action extends string,
+> = `${Version}:${Resource}:${Action}`;
+
+type HandlerTable<Name extends PropertyKey> = {
+  [K in Name]: (input: unknown) => Promise<unknown>;
+};
+```
+
+Vài chục version/resource/action có thể tạo hàng nghìn key rồi map lại ở nhiều
+consumer. Với protocol đóng sinh từ OpenAPI/schema, codegen một flat union hoặc
+interface thường rẻ và dễ diff hơn type-level cross-product.
+
+### Intersection chain trong fluent builder
+
+Builder tích state qua mỗi call thường tạo chain intersection dài:
+
+```ts
+declare class Builder<State extends object> {
+  with<const Key extends string, Value>(
+    key: Key,
+    value: Value
+  ): Builder<State & Record<Key, Value>>;
+}
+```
+
+Giữ inference cho một số bước có giá trị, rồi materialize qua named interface
+hoặc một `build<Output>()` boundary. Nếu domain có schema cố định, config object
+với `satisfies` thường tốt hơn builder lưu lịch sử mọi bước trong type.
+
+### Recursive type không có depth budget
+
+```ts
+type DeepReadonly<
+  T,
+  Depth extends readonly unknown[] = [],
+> = Depth['length'] extends 8
+  ? T
+  : T extends (...args: never[]) => unknown
+    ? T
+    : T extends object
+      ? { readonly [K in keyof T]: DeepReadonly<T[K], [...Depth, 0]> }
+      : T;
+```
+
+Depth guard biến failure vô hạn thành policy đo được, nhưng `8` không tự nhiên
+đúng cho mọi domain. Loại `Date`, `Map`, array hoặc branded primitive theo
+semantics thật; đừng quảng bá một `Deep*` universal chỉ vì type challenge pass.
+
+Không “tối ưu” bằng mẹo type mù quáng. Đầu tiên hỏi: precision này có tạo
+UX/bug-prevention tương xứng không? Xác định precision frontier rồi đo trước/sau.
 
 ## Named boundaries giúp compiler và con người
 
@@ -100,28 +315,201 @@ export function search(query: Query): Promise<SearchResult> {
 
 Annotation tránh declaration emit một anonymous conditional/intersection khổng lồ và giảm accidental API changes.
 
+Tên alias cũng cho checker điểm cache thay vì evaluate cùng conditional tại mỗi
+method:
+
+```ts
+type Accepted<T> = { readonly ok: true; readonly value: T };
+type Rejected = { readonly ok: false; readonly reason: string };
+
+// before: anonymous computation lặp ở mọi lần relate Resolver<T>
+interface ResolverBefore<T> {
+  resolve<Input>(input: Input): Input extends T ? Accepted<Input> : Rejected;
+}
+
+// after: phép tính có tên, public signature đọc được và dễ trace
+type ResolveResult<Input, Constraint> = Input extends Constraint
+  ? Accepted<Input>
+  : Rejected;
+
+interface Resolver<T> {
+  resolve<Input>(input: Input): ResolveResult<Input, T>;
+}
+```
+
+Refactor theo thứ tự ít rủi ro:
+
+1. đặt alias cho computation đang lặp;
+2. filter union trước mapped/recursive transform;
+3. thay intersection chain ổn định bằng interface `extends`;
+4. annotation public return để chặn inferred internals;
+5. codegen contract phẳng khi input schema đóng và rất rộng.
+
+Codegen chỉ thắng nếu generator, schema version và output diff cùng được review.
+Đừng đổi một generic khó debug thành generated file không ai sở hữu.
+
+## `.d.ts` là API surface và performance artifact
+
+Consumer của composite project đọc declaration, nên hãy inspect artifact thật:
+
+```bash
+tsc -b packages/sdk --force
+wc -c packages/sdk/dist/**/*.d.ts
+npm pack --dry-run --workspace @acme/sdk
+```
+
+Theo dõi raw declaration bytes, số file và các entry point public. Size không
+tuyến tính tuyệt đối với check time, nhưng spike thường lộ:
+
+- inferred return type kéo anonymous union/intersection lớn;
+- barrel re-export quá rộng;
+- `import("../../internal")` xuất hiện trong public declaration;
+- duplicate dependency type đi qua nhiều package;
+- generic default/constraint làm consumer instantiate lại schema lớn.
+
+Annotation bằng named exported type vừa giảm emit work vừa tạo semver firewall.
+Chạy fixture consumer từ tarball/declaration output; source workspace import có
+thể che missing export và accidental deep path.
+
 ## `skipLibCheck` không phải performance plan
 
 Nó có thể giảm thời gian kiểm tra dependency declaration, nhưng không sửa source graph, duplicate types hay generic explosion trong code bạn. Ghi rõ tại sao bật và vẫn test package compatibility ở fixture consumer.
 
+`skipLibCheck` bỏ qua việc check đầy đủ declaration file, không có nghĩa checker
+không đọc type bạn import từ chúng. Nó cũng có thể che hai bản type không tương
+thích trong dependency graph.
+
+`Simplify<T>` cũng không phải nút "materialize rồi miễn phí":
+
+```ts
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+```
+
+Nó có thể làm hover dễ đọc, nhưng computation tạo `T` đã xảy ra và mapped type
+mới còn thêm việc. Chỉ giữ khi measurement chứng minh lợi ích hoặc DX đáng giá;
+đừng dùng tên `Simplify` như bằng chứng performance.
+
 ## CI và cache
 
-- cache theo source, config, lockfile và compiler version;
+- cache key phải chứa source, config, lockfile, compiler version và platform;
 - không dùng `.tsbuildinfo` từ graph/config khác;
-- chạy `tsc -b` cho affected graph nhưng định kỳ chạy full graph;
-- giữ một job đo diagnostics để bắt regression;
-- pin TypeScript version ở CI và editor workspace.
+- PR chạy changed projects **và reverse dependencies** bị ảnh hưởng;
+- main/nightly chạy full graph để bắt lỗi selector/cache;
+- performance job cold không restore build cache; functional affected job có thể;
+- editor và CI dùng cùng workspace TypeScript version.
 
-## Lab
+`tsc -b` biết project nào out-of-date từ build state, nhưng không tự biến Git diff
+thành affected graph hoàn chỉnh cho CI phân tán. Build tool/script phải map changed
+node sang mọi consumer; sau đó `tsc -b <roots>` vẫn chịu trách nhiệm dependency
+order.
 
-1. Lấy baseline `--extendedDiagnostics` và lưu vào PR.
-2. Tách một package có public surface nhỏ bằng project reference.
-3. Inspect declaration trước/sau; đo check time cold/warm.
-4. Tìm top generic đắt bằng trace; đơn giản hóa hoặc đặt named boundary.
+Một budget artifact tối giản:
 
-**Done khi:** build graph có lý do kiến trúc, incremental build đo được nhanh hơn, và team có performance budget thay vì chữa lag theo cảm giác.
+```json
+{
+  "typescript": "6.0.x",
+  "runner": "linux-x64-4core",
+  "coldCheckMs": 8900,
+  "warmNoChangeMs": 310,
+  "instantiations": 3281042,
+  "memoryKiB": 812440,
+  "declarationBytes": 438120
+}
+```
+
+Gate nên có cả ngưỡng tương đối và tuyệt đối, ví dụ fail khi check time tăng hơn
+10% **và** hơn 400 ms. Dùng median trên runner ổn định; shared hosted runner quá
+nhiễu thì diagnostics count và `.d.ts` size là guardrail sớm, timing chỉ cảnh báo.
+
+Upload raw diagnostics, trace chỉ tạo on-demand. Budget phải có owner và review
+date để team không "cập nhật baseline" mỗi khi gate đỏ.
+
+## Production incident playbook
+
+Khi editor hoặc CI type-check đột ngột chậm:
+
+| Triệu chứng                             | Giả thuyết đầu tiên                            |
+| --------------------------------------- | ---------------------------------------------- |
+| Chỉ editor chậm                         | project load/plugin/TS version/source redirect |
+| Cold và parse cùng tăng                 | graph/include/generated files/duplicate deps   |
+| Check + instantiations tăng mạnh        | generic distribution/recursion/schema fan-out  |
+| Check tăng, instantiations gần như đứng | assignability của union/intersection rộng      |
+| Emit và declaration bytes tăng          | inferred public surface/re-export leak         |
+| Một file đổi làm nhiều project rebuild  | boundary/reference/cache invalidation          |
+
+Runbook:
+
+1. ghi mốc bắt đầu, commit tốt cuối, compiler/lockfile/config diff;
+2. phân biệt editor-only với CLI pinned bằng `tsc -b --verbose`;
+3. chạy `--showConfig`/`--explainFiles` nếu graph bất ngờ;
+4. lấy cold/warm `--extendedDiagnostics` trên good và bad commit;
+5. trace project nhỏ nhất, phân loại hotspot trước khi refactor;
+6. mitigation hẹp: rollback schema/dependency, named boundary hoặc giảm fan-out;
+7. chạy type/runtime tests, affected build rồi full build;
+8. postmortem thêm budget, owner và fixture tái hiện regression.
+
+Restart language server có thể khôi phục cache hỏng, nhưng nếu không ghi được
+nguyên nhân và regression guard, đó chỉ là giảm triệu chứng.
+
+## Type tests khóa semantics khi tối ưu
+
+Performance refactor không được âm thầm widen/narrow public API. Test equivalence
+cho representative input và negative call ở consumer boundary:
+
+```ts
+type Compare<T> = <Candidate>() => Candidate extends T ? 1 : 2;
+type Equal<A, B> = Compare<A> extends Compare<B> ? true : false;
+type Expect<T extends true> = T;
+
+type OldResolve<Input, Constraint> = Input extends Constraint
+  ? Accepted<Input>
+  : Rejected;
+
+type _SameText = Expect<
+  Equal<OldResolve<'ready', string>, ResolveResult<'ready', string>>
+>;
+type _SameNumber = Expect<
+  Equal<OldResolve<404, string>, ResolveResult<404, string>>
+>;
+
+declare const resolver: Resolver<string>;
+resolver.resolve('ready');
+
+// @ts-expect-error — public constraint không được widen sau refactor
+const accepted: Accepted<number> = resolver.resolve(404);
+```
+
+Đừng assert mọi internal hover. Khóa những capability consumer dựa vào: input
+hợp lệ, input bị từ chối, correlation, readonly/optional và exported name.
+
+## Lab: điều tra một regression thật
+
+1. Chọn một project có ít nhất hai consumer; vẽ source/build/declaration graph.
+2. Ghi cold, warm no-change, warm one-file-change qua năm run cùng môi trường.
+3. Lưu `extendedDiagnostics`; viết giả thuyết từ phase/count trước khi trace.
+4. Chạy `--generateTrace` + `analyze-trace`, ghi top ba hotspot và category.
+5. Refactor một hotspot bằng named alias, early filter, interface boundary hoặc
+   codegen; không đổi runtime contract.
+6. Inspect `.d.ts`, chạy positive/negative type tests và fixture consumer.
+7. Thêm affected PR job, full scheduled job và budget artifact có owner.
+8. Viết incident note: trigger, evidence, mitigation, rollback và prevention.
+
+**Acceptance criteria:**
+
+- build graph acyclic, mỗi project boundary có lý do ownership/deploy/cache;
+- cold/warm protocol tái lập được và raw diagnostics được đính kèm;
+- hotspot được chứng minh bằng trace, không chọn theo cảm giác;
+- check time hoặc instantiations giảm có ý nghĩa mà type tests vẫn pass;
+- declaration bytes/API surface không phình ngoài chủ đích;
+- affected build không bỏ sót reverse dependency, full build vẫn xanh;
+- budget fail có owner/runbook, không chỉ một con số đỏ.
 
 ## Tài liệu chính thức
 
 - [Project References](https://www.typescriptlang.org/docs/handbook/project-references.html)
+- [`extendedDiagnostics`](https://www.typescriptlang.org/tsconfig/extendedDiagnostics.html)
+- [`generateTrace`](https://www.typescriptlang.org/tsconfig/generateTrace.html)
+- [Performance tracing](https://github.com/microsoft/TypeScript/wiki/Performance-Tracing)
+- [`@typescript/analyze-trace`](https://github.com/microsoft/typescript-analyze-trace)
 - [Performance wiki](https://github.com/microsoft/TypeScript/wiki/Performance)
+- [Publishing declaration files](https://www.typescriptlang.org/docs/handbook/declaration-files/publishing.html)

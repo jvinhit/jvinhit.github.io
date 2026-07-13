@@ -1,0 +1,809 @@
+---
+title: 'LangChain + LangGraph — Build và debug model flow như một state machine'
+description: 'Hướng dẫn TypeScript dùng LangChain cho prompt và structured output, LangGraph cho state, branch và loop; rồi debug từng node bằng streaming, trace, breakpoint và time travel.'
+pubDate: 2026-07-12
+lang: vi
+tags: [ai, langchain, langgraph, agents, debugging, observability]
+series: ai
+seriesOrder: 25
+top: 1
+draft: false
+---
+
+Một model call sai còn tương đối dễ debug: xem input, xem output, kiểm tra
+prompt. Một agent chạy qua bảy node rồi trả lời sai thì
+`console.log(finalAnswer)` chỉ cho bạn thấy **xác chết**, không cho bạn thấy
+**hiện trường**.
+
+Output cuối có thể sai vì model hiểu nhầm, prompt render thiếu biến, state bị
+ghi đè, router đi nhầm nhánh, vòng lặp không tăng counter, tool bị retry hai
+lần, hoặc một thread cũ bị resume nhầm. Nếu gom tất cả dưới nhãn “AI không ổn
+định”, bạn sẽ sửa prompt cho một bug thực ra nằm trong control flow.
+
+Bài này dựng một **AI tutor tự review câu trả lời** bằng TypeScript:
+
+1. LangChain gọi model, compose prompt và ép output của evaluator theo Zod.
+2. LangGraph biến các call thành state machine có branch, loop và checkpoint.
+3. Ta cố tình cài một bug lặp vô hạn và bắt nó bằng state update; sau đó dùng
+   trace, breakpoint và time travel để điều tra, dừng và chạy lại luồng.
+
+Mục tiêu không phải học thuộc framework. Mục tiêu là biến một flow AI từ
+“hộp đen có vẻ chạy” thành một chương trình mà bạn có thể **quan sát, tái hiện
+và test**.
+
+---
+
+## Ba lớp, ba trách nhiệm
+
+| Lớp           | Chịu trách nhiệm                                                                  | Trong lab này                                                          |
+| ------------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| **LangChain** | Model interface, prompt, message, structured output, tool và Runnable composition | `ChatPromptTemplate`, `ChatOpenAI`, `pipe()`, `withStructuredOutput()` |
+| **LangGraph** | State, node, edge, branch, loop, persistence và human-in-the-loop                 | `StateSchema`, `StateGraph`, `MemorySaver`                             |
+| **LangSmith** | Trace, latency, token, lỗi, dataset và eval                                       | Flight recorder tùy chọn; không bắt buộc để chạy local                 |
+
+> **Mental model:** LangChain là bộ linh kiện. LangGraph là bản mạch nối các
+> linh kiện. LangSmith là hộp đen ghi lại bản mạch đã chạy thế nào.
+
+LangGraph không làm model thông minh hơn, và LangSmith không đọc được
+“suy nghĩ bí mật” bên trong model. Ta debug những contract quan sát được:
+prompt đã render, model input/output, tool call, state transition, route, lỗi,
+latency và token.
+
+Các primitive sẽ xuất hiện xuyên suốt bài:
+
+| Primitive         | Nghĩa trong bài                                                               |
+| ----------------- | ----------------------------------------------------------------------------- |
+| **Runnable**      | Một đơn vị có thể `invoke`, `stream` hoặc nối bằng `pipe()`                   |
+| **State**         | Snapshot dữ liệu chung ở một thời điểm                                        |
+| **Node**          | Hàm đọc state và trả partial update                                           |
+| **Edge / router** | Transition cố định / hàm chọn node tiếp theo                                  |
+| **Reducer**       | Quy tắc hợp nhất nhiều update vào cùng state key                              |
+| **Checkpoint**    | Snapshot ở ranh giới một super-step — một nhịp các node có thể chạy song song |
+| **`thread_id`**   | ID của một timeline checkpoint để resume hoặc fork                            |
+
+Nếu luồng chỉ có một model call, LangChain Runnable thường đã đủ. Phần cuối
+bài có decision rule cụ thể cho lúc nào graph thực sự đáng dùng.
+
+---
+
+## Lab: AI tutor tự viết, tự chấm, tự sửa
+
+Input mẫu:
+
+```text
+Câu hỏi:
+Vì sao temperature không làm model biết thêm kiến thức?
+
+Tiêu chí đạt:
+- phân biệt sampling với knowledge;
+- nhắc logits hoặc phân phối xác suất;
+- có một ví dụ.
+```
+
+Nếu phần logits, sampling và temperature còn lạ, đọc
+[Sampling for Agents](/blog/llm-sampling-temperature-top-p-top-k/) trước khi
+chạy lab.
+
+Flow:
+
+```text
+START
+  │
+  ▼
+draft ──► judge ── score >= 8 ──► finish ──► END
+             │
+             ├── score < 8, attempts < 3 ──► revise ──┐
+             │                                        │
+             └── score < 8, attempts >= 3 ─► fallback │
+                                                      │
+                              judge ◄──────────────────┘
+```
+
+`attempts` đếm số lần **sinh câu trả lời**, không đếm số lần evaluator chạy.
+Sau tối đa ba bản, flow không tự quay mãi mà chuyển `status` sang
+`needs_human`.
+
+Đây là một Reflection loop giống pattern ở
+[Agent Patterns](/blog/agent-design-patterns-react-reflection-planning/),
+nhưng lần này control flow được biểu diễn thành state machine rõ ràng.
+
+---
+
+## Setup TypeScript
+
+Prerequisite tối thiểu: Node.js 20+, pnpm, TypeScript cơ bản và API key của
+model provider. Project dùng ESM/NodeNext:
+
+Trong `package.json`:
+
+```json
+{
+  "type": "module"
+}
+```
+
+Trong `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  }
+}
+```
+
+Các snippet dưới đã được type-check với bộ phiên bản:
+
+```bash
+pnpm add @langchain/core@1.2.2 \
+  @langchain/openai@1.5.5 \
+  @langchain/langgraph@1.4.7 \
+  zod@4.4.3
+pnpm add -D typescript tsx @types/node
+```
+
+Đặt API key và model trong environment, không hard-code vào source:
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_MODEL="gpt-4.1-mini-2025-04-14"
+```
+
+Model chỉ là dependency của lab. Bạn có thể thay `ChatOpenAI` bằng integration
+LangChain khác mà không đổi topology của graph. Khi debug regression, nên pin
+model ID, package version và prompt version; alias “latest” làm cùng input hôm
+nay và tháng sau có thể chạy trên hai artifact khác nhau.
+
+Các import nội bộ dùng đuôi `.js` dù source là `.ts`. Đây là convention của
+`moduleResolution: "NodeNext"`: TypeScript type-check source `.ts`, còn đường
+import vẫn đúng sau khi emit JavaScript; `tsx` cũng resolve được khi chạy
+trực tiếp.
+
+---
+
+## Dựng `tutor-flow.ts` từng phần
+
+### 1. State là contract, không phải túi dữ liệu tùy tiện
+
+```ts
+import { ChatPromptTemplate } from '@langchain/core/prompts';
+import { ChatOpenAI } from '@langchain/openai';
+import {
+  END,
+  MemorySaver,
+  START,
+  StateGraph,
+  StateSchema,
+} from '@langchain/langgraph';
+import * as z from 'zod';
+
+const TutorState = new StateSchema({
+  question: z.string(),
+  criteria: z.string(),
+  answer: z.string().default(''),
+  score: z.number().min(0).max(10).default(0),
+  feedback: z.array(z.string()).default(() => []),
+  attempts: z.number().int().nonnegative().default(0),
+  status: z.enum(['running', 'passed', 'needs_human']).default('running'),
+});
+
+const Review = z.object({
+  score: z.number().int().min(0).max(10),
+  feedback: z
+    .array(z.string())
+    .max(3)
+    .describe('Tối đa ba điểm cần sửa, rỗng nếu câu trả lời đã đạt'),
+});
+```
+
+Mỗi node nhận **snapshot hiện tại** và trả về **partial update**. Node không
+nên mutate `state` rồi trả lại toàn bộ object. Với luồng tuần tự ở đây, update
+mới ghi đè giá trị cũ — đúng ý ta cho `answer`, `score` và `feedback`.
+
+Khi nhiều node trong cùng super-step ghi một key mà không có reducer,
+LangGraph báo `INVALID_CONCURRENT_GRAPH_UPDATE`; nó không âm thầm chọn “lần
+ghi cuối”. Lúc đó dùng `ReducedValue` để định nghĩa reducer, hoặc tách thành
+các field riêng. Với message history, dùng `MessagesValue` thay vì tự nối một
+array thường.
+
+### 2. LangChain compose prompt, model và structured evaluator
+
+```ts
+export const MODEL = process.env.OPENAI_MODEL ?? 'gpt-4.1-mini-2025-04-14';
+
+const model = new ChatOpenAI({
+  model: MODEL,
+  temperature: 0,
+  maxRetries: 2,
+});
+
+const draftPrompt = ChatPromptTemplate.fromMessages([
+  [
+    'system',
+    'Bạn là AI tutor. Trả lời chính xác, ngắn gọn và bám sát tiêu chí.',
+  ],
+  ['human', 'Câu hỏi:\n{question}\n\nTiêu chí đạt:\n{criteria}'],
+]);
+
+const revisePrompt = ChatPromptTemplate.fromMessages([
+  [
+    'system',
+    'Bạn là AI tutor. Hãy sửa câu trả lời theo toàn bộ feedback; không nói về quá trình tự sửa.',
+  ],
+  [
+    'human',
+    'Câu hỏi:\n{question}\n\nTiêu chí:\n{criteria}\n\nBản hiện tại:\n{answer}\n\nFeedback:\n{feedback}',
+  ],
+]);
+
+const judgePrompt = ChatPromptTemplate.fromMessages([
+  [
+    'system',
+    'Bạn là evaluator nghiêm khắc. Chấm 0-10 chỉ theo tiêu chí; feedback phải cụ thể và kiểm chứng được.',
+  ],
+  [
+    'human',
+    'Câu hỏi:\n{question}\n\nTiêu chí:\n{criteria}\n\nCâu trả lời:\n{answer}',
+  ],
+]);
+
+const draftChain = draftPrompt.pipe(model);
+const reviseChain = revisePrompt.pipe(model);
+const judgeChain = judgePrompt.pipe(
+  model.withStructuredOutput(Review, {
+    name: 'answer_review',
+    strict: true,
+  })
+);
+```
+
+`withStructuredOutput()` giải quyết một boundary quan trọng: evaluator phải
+trả `{ score, feedback }` đúng schema, thay vì một đoạn văn mà ta parse bằng
+regex. Nó giảm lỗi format; nó **không chứng minh điểm số đúng**. Model judge
+vẫn có bias và cần được calibrate bằng golden set hoặc nhãn human ở hệ thống
+thật.
+
+### 3. Mỗi node làm đúng một việc
+
+```ts
+function requireText(text: string): string {
+  if (!text.trim()) throw new Error('Model returned empty text');
+  return text;
+}
+
+const draft: typeof TutorState.Node = async (state) => {
+  const response = await draftChain.invoke(
+    { question: state.question, criteria: state.criteria },
+    { tags: ['draft'] }
+  );
+
+  return {
+    answer: requireText(response.text),
+    attempts: state.attempts + 1,
+    status: 'running',
+  };
+};
+
+const judge: typeof TutorState.Node = async (state) => {
+  const review = await judgeChain.invoke(
+    {
+      question: state.question,
+      criteria: state.criteria,
+      answer: state.answer,
+    },
+    { tags: ['judge'] }
+  );
+
+  return review;
+};
+
+const revise: typeof TutorState.Node = async (state) => {
+  const response = await reviseChain.invoke(
+    {
+      question: state.question,
+      criteria: state.criteria,
+      answer: state.answer,
+      feedback: state.feedback.map((item) => `- ${item}`).join('\n'),
+    },
+    { tags: ['revise'] }
+  );
+
+  return {
+    answer: requireText(response.text),
+    attempts: state.attempts + 1,
+  };
+};
+```
+
+Tags ở đây đi theo child run. Khi mở trace, bạn có thể lọc riêng model call
+của `draft`, `judge` hoặc `revise`.
+
+### 4. Router là code deterministic
+
+```ts
+export function chooseNext(state: { score: number; attempts: number }) {
+  if (state.score >= 8) return 'finish' as const;
+  if (state.attempts >= 3) return 'fallback' as const;
+  return 'revise' as const;
+}
+
+const routeAfterJudge = (state: typeof TutorState.State) => chooseNext(state);
+
+const finish: typeof TutorState.Node = () => ({ status: 'passed' });
+const fallback: typeof TutorState.Node = () => ({
+  status: 'needs_human',
+});
+```
+
+Đừng hỏi model “node tiếp theo tên gì?” khi quyết định có thể viết bằng code.
+Model chấm theo rubric; code sở hữu budget và route. Tách như vậy giúp unit
+test nhánh mà không tốn một token.
+
+### 5. Nối graph và bật checkpoint
+
+```ts
+export const tutorFlow = new StateGraph(TutorState)
+  .addNode('draft', draft)
+  .addNode('judge', judge)
+  .addNode('revise', revise)
+  .addNode('finish', finish)
+  .addNode('fallback', fallback)
+  .addEdge(START, 'draft')
+  .addEdge('draft', 'judge')
+  .addConditionalEdges('judge', routeAfterJudge, {
+    finish: 'finish',
+    fallback: 'fallback',
+    revise: 'revise',
+  })
+  .addEdge('revise', 'judge')
+  .addEdge('finish', END)
+  .addEdge('fallback', END)
+  .compile({ checkpointer: new MemorySaver() });
+```
+
+`compile()` kiểm tra topology cơ bản và tạo executable graph. `MemorySaver`
+giữ checkpoint trong process, phù hợp cho local/test. Production cần
+checkpointer bền vững; restart process không được làm mất thread đang chờ.
+
+Object cuối của `addConditionalEdges()` vừa là whitelist route vừa giúp graph
+visualizer vẽ đúng ba nhánh có thể xảy ra.
+
+---
+
+## Chạy flow và xem state thay đổi
+
+Tạo `run.ts`:
+
+```ts
+import { MODEL, tutorFlow } from './tutor-flow.js';
+
+const input = {
+  question: 'Vì sao temperature không làm model biết thêm kiến thức?',
+  criteria:
+    'Phân biệt sampling với knowledge; nhắc logits/xác suất; có một ví dụ.',
+};
+
+const config = {
+  configurable: { thread_id: 'lesson-001' },
+  recursionLimit: 10,
+};
+
+for await (const update of await tutorFlow.stream(input, {
+  ...config,
+  streamMode: 'updates',
+})) {
+  console.dir(update, { depth: null });
+}
+
+const snapshot = await tutorFlow.getState(config);
+console.dir(snapshot.values, { depth: null });
+```
+
+Chạy:
+
+```bash
+node --import tsx run.ts
+```
+
+Một trace rút gọn có thể trông như sau:
+
+```text
+draft   → attempts=1, answer="..."
+judge   → score=6, feedback=["Thiếu ví dụ", ...]
+revise  → attempts=2, answer="..."
+judge   → score=9, feedback=[]
+finish  → status="passed"
+```
+
+Output model có thể khác, nhưng invariant của flow phải giữ:
+
+- `attempts` chỉ tăng, không giảm;
+- `judge` luôn chạy sau một answer mới;
+- score đạt thì không revise thêm;
+- hết ba attempt thì kết thúc ở `fallback`;
+- không path nào chạy vô hạn.
+
+Đó mới là phần graph phải đảm bảo. Chất lượng câu trả lời là bài toán eval
+riêng.
+
+---
+
+## Debug level 1: nhìn topology trước khi nhìn prompt
+
+```ts
+const drawable = await tutorFlow.getGraphAsync();
+console.log(drawable.drawMermaid());
+```
+
+Kiểm tra bằng mắt:
+
+- có entry từ `START` không;
+- mỗi nhánh có đường tới `END` không;
+- loop có stop condition không;
+- có vô tình gắn cả fixed edge lẫn conditional edge từ cùng node không;
+- diagram có route lạ do thiếu path map không.
+
+Nếu topology sai, đổi prompt không thể cứu flow.
+
+---
+
+## Debug level 2: stream đúng lượng dữ liệu
+
+LangGraph có nhiều stream mode:
+
+| Mode       | Cho bạn thấy                         | Dùng khi                                    |
+| ---------- | ------------------------------------ | ------------------------------------------- |
+| `updates`  | Partial state do từng node trả về    | Mặc định tốt nhất để debug route và state   |
+| `values`   | Full state sau mỗi step              | Cần xem context tích lũy                    |
+| `messages` | Token model kèm metadata của node    | Debug streaming UI hoặc call nào sinh token |
+| `debug`    | Thông tin chi tiết nhất về execution | Cần soi task/checkpoint/lỗi sâu             |
+
+Có thể bật nhiều mode:
+
+```ts
+for await (const [mode, chunk] of await tutorFlow.stream(input, {
+  configurable: { thread_id: 'lesson-debug-002' },
+  streamMode: ['updates', 'debug'],
+  recursionLimit: 10,
+})) {
+  console.dir({ mode, chunk }, { depth: null });
+}
+```
+
+Đừng dùng lại `thread_id` cho hai case độc lập. Checkpointer hiểu cùng ID là
+cùng một timeline; state cũ có thể đi vào run mới. Tạo ID mới cho request mới,
+chỉ reuse khi bạn thật sự muốn resume hoặc tiếp tục conversation.
+
+---
+
+## Cài một bug thật: counter không bao giờ tăng
+
+Đổi node `revise`:
+
+```ts
+return {
+  answer: requireText(response.text),
+  attempts: 1, // BUG: reset về 1 thay vì tăng từ state hiện tại
+};
+```
+
+Để tái hiện ổn định, tạm thay evaluator bằng fixture deterministic:
+
+```ts
+const judge: typeof TutorState.Node = async () => ({
+  score: 5,
+  feedback: ['Fixture buộc flow revise để test control loop'],
+});
+```
+
+Chạy với `recursionLimit: 8`. Bạn sẽ thấy:
+
+```text
+draft  → attempts=1
+judge  → score=5
+revise → attempts=1
+judge  → score=5
+revise → attempts=1
+...
+GraphRecursionError
+```
+
+Nguyên nhân không nằm ở model. Router đọc đúng state và làm đúng điều được viết:
+`score < 8`, `attempts < 3`, nên quay lại `revise`. Bug là state transition
+của node.
+
+Fix:
+
+```ts
+attempts: state.attempts + 1,
+```
+
+Tăng `recursionLimit` chỉ làm bug chạy lâu và tốn tiền hơn. Recursion limit là
+**cầu chì**, không phải stop condition nghiệp vụ.
+
+Fixture deterministic cũng cho ta một bài học quan trọng: khi debug
+orchestration, hãy loại phương sai model khỏi phương trình. Sau khi graph đúng
+mới đưa model thật và eval chất lượng trở lại.
+
+Khôi phục node `judge` dùng `judgeChain` trước khi tiếp tục các phần trace và
+time travel bên dưới.
+
+---
+
+## Debug level 3: LangSmith trace — request nào làm node sai?
+
+Bật tracing:
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY="..."
+export LANGSMITH_PROJECT="langgraph-debug-lab"
+```
+
+Không cần đổi graph. Truyền tags và metadata khi invoke/stream:
+
+```ts
+await tutorFlow.invoke(input, {
+  configurable: { thread_id: 'lesson-trace-003' },
+  tags: ['tutorial', 'tutor-flow-v1'],
+  metadata: {
+    promptVersion: 'v1',
+    model: MODEL,
+    environment: 'local',
+  },
+});
+```
+
+Đọc trace theo thứ tự này:
+
+1. **Path:** node nào thật sự chạy, chạy bao nhiêu lần?
+2. **State input:** node nhận đúng answer, feedback và attempts chưa?
+3. **Rendered prompt:** placeholder có bị thiếu hoặc stringify sai không?
+4. **Model output:** nội dung sai ngay từ model hay sai sau parse?
+5. **State update/router:** output đúng nhưng được ghi/rẽ nhánh sai ở đâu?
+6. **Cost/latency:** node nào phình token hoặc bị retry?
+
+Khi debug structured output, có thể giữ cả response thô:
+
+```ts
+const debugJudge = model.withStructuredOutput(Review, {
+  name: 'answer_review',
+  strict: true,
+  includeRaw: true,
+});
+
+const result = await debugJudge.invoke('...');
+console.dir(result.raw, { depth: null });
+console.dir(result.parsed, { depth: null });
+```
+
+Trace có thể chứa prompt, output, user data và PII. Với dữ liệu nhạy cảm, tắt
+tracing cho request đó hoặc mask input/output **trước khi** dữ liệu rời
+process. Observability không phải lý do để copy secrets sang một hệ thống
+khác.
+
+---
+
+## Debug level 4: checkpoint, replay và time travel
+
+Vì graph đã compile với `MemorySaver`, mỗi super-step tạo một checkpoint gắn
+với `thread_id`.
+
+```ts
+const config = {
+  configurable: { thread_id: 'lesson-001' },
+};
+
+const current = await tutorFlow.getState(config);
+console.dir({
+  values: current.values,
+  next: current.next,
+  tasks: current.tasks,
+});
+
+const history = [];
+for await (const state of tutorFlow.getStateHistory(config)) {
+  history.push(state);
+}
+```
+
+Tìm checkpoint ngay trước `judge`, sửa answer thủ công rồi tạo một nhánh mới:
+
+```ts
+const beforeJudge = history.find((state) => state.next.includes('judge'));
+
+if (!beforeJudge) throw new Error('Không tìm thấy checkpoint trước judge');
+
+const forkConfig = await tutorFlow.updateState(
+  beforeJudge.config,
+  {
+    answer:
+      'Temperature chỉ đổi phân phối lấy mẫu trên logits; nó không cập nhật trọng số hay thêm dữ liệu cho model.',
+  },
+  'draft'
+);
+
+const forkResult = await tutorFlow.invoke(null, forkConfig);
+console.dir(forkResult, { depth: null });
+```
+
+`updateState()` tạo checkpoint nhánh mới; nó không rewrite lịch sử cũ. Tham
+số `"draft"` nói rằng update này được xem như output của node `draft`, nên
+execution tiếp tục từ successor của nó là `judge`.
+
+Nếu invoke trực tiếp bằng config của checkpoint cũ, các node **sau**
+checkpoint sẽ chạy lại. Model call, API call và interrupt cũng chạy lại; replay
+không phải đọc cache. Node có side effect phải idempotent, đặc biệt khi kết hợp
+retry, resume và time travel.
+
+---
+
+## Debug level 5: breakpoint trước một node
+
+Static breakpoint hữu ích khi muốn dừng ngay trước evaluator:
+
+```ts
+const breakpointConfig = {
+  configurable: { thread_id: 'lesson-breakpoint-004' },
+};
+
+await tutorFlow.invoke(input, {
+  ...breakpointConfig,
+  interruptBefore: ['judge'],
+});
+
+const paused = await tutorFlow.getState(breakpointConfig);
+console.dir(paused.values, { depth: null });
+
+// Tiếp tục từ checkpoint đang dừng
+await tutorFlow.invoke(null, breakpointConfig);
+```
+
+Breakpoint tĩnh là công cụ debug. Human-in-the-loop nghiệp vụ dùng
+`interrupt()` trong node và resume bằng `Command`. Node có dynamic interrupt
+chạy lại từ đầu khi resume, vì vậy side effect đặt trước interrupt phải an
+toàn khi thực thi lại.
+
+---
+
+## Test graph như code thường
+
+Router thuần không cần model:
+
+```ts
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { chooseNext } from './tutor-flow.js';
+
+test('đủ điểm thì finish', () => {
+  assert.equal(chooseNext({ score: 8, attempts: 1 }), 'finish');
+});
+
+test('chưa đủ điểm và còn budget thì revise', () => {
+  assert.equal(chooseNext({ score: 6, attempts: 2 }), 'revise');
+});
+
+test('hết budget thì fallback', () => {
+  assert.equal(chooseNext({ score: 6, attempts: 3 }), 'fallback');
+});
+```
+
+Chạy:
+
+```bash
+node --import tsx --test
+```
+
+Một chiến lược kiểm thử lành mạnh chia thành ba tầng:
+
+| Tầng                   | Dependency                 | Chứng minh                                            |
+| ---------------------- | -------------------------- | ----------------------------------------------------- |
+| Router/state unit test | Không model, không network | Branch, counter, invariant và stop condition          |
+| Graph integration test | Fake/stub Runnable         | Topology, loop, reducer, retry và checkpoint          |
+| Model eval             | Model thật + golden set    | Chất lượng answer, judge calibration, cost và latency |
+
+Đừng gọi API trả phí trong mọi unit test. Inject chain/model vào một
+`buildTutorFlow(deps)` factory, dùng fake Runnable cho CI, rồi chạy eval model
+ở một job CI riêng. Cách xây golden set và regression gate nằm trong
+[Evaluating LLMs & Agents](/blog/evaluating-llms-and-agents/).
+
+---
+
+## Bản đồ triệu chứng → lớp cần kiểm tra
+
+| Triệu chứng                       | Khả năng sai                                          | Bằng chứng cần xem                 |
+| --------------------------------- | ----------------------------------------------------- | ---------------------------------- |
+| Answer dở nhưng path đúng         | Prompt, model, context hoặc rubric                    | Rendered prompt + LLM input/output |
+| Đi sai nhánh                      | State stale hoặc router sai                           | `updates` + unit test `chooseNext` |
+| Lặp tới `GRAPH_RECURSION_LIMIT`   | Counter không tăng hoặc thiếu stop condition          | Chuỗi node + state delta           |
+| Structured output fail            | Schema/provider/output parser                         | Raw response + Zod error           |
+| `INVALID_CONCURRENT_GRAPH_UPDATE` | Node song song ghi cùng key không có reducer          | Topology + channel definition      |
+| Tool chạy hai lần                 | Retry/replay/resume trên side effect không idempotent | Tool run ID + checkpoint history   |
+| Chi phí tăng đột biến             | Loop hoặc prompt/history phình                        | Token và số call theo node         |
+| Run mới mang state cũ             | Reuse nhầm `thread_id`                                | Thread/checkpoint history          |
+| Local đúng, production sai        | Khác model, prompt, package hoặc config               | Tags/metadata + version đã pin     |
+
+Structured output bảo vệ **shape**; eval bảo vệ **meaning**. Checkpoint bảo vệ
+khả năng resume; idempotency bảo vệ side effect. Mỗi guardrail chặn một lớp
+failure khác nhau.
+
+---
+
+## Checklist debug model flow
+
+Trước khi sửa prompt, đi hết checklist:
+
+1. Vẽ graph và xác nhận mọi branch/loop có đường kết thúc.
+2. Reproduce bằng input cố định, model ID cố định và `thread_id` mới.
+3. Stream `updates`; ghi lại node sequence cùng state delta.
+4. Tách model failure khỏi orchestration failure bằng fixture deterministic.
+5. Validate mọi model boundary bằng schema.
+6. Đặt max attempts, `recursionLimit`, token/cost budget và timeout.
+7. Bật checkpoint; xem `values`, `next`, `tasks` trước node nghi ngờ.
+8. Gắn prompt/model/app version vào trace metadata.
+9. Test router, reducer và stop condition không qua network.
+10. Đưa failure thật vào golden set để cùng bug không quay lại.
+
+---
+
+## Khi nào nên dừng ở LangChain
+
+Đừng biến mọi pipeline thành graph chỉ vì diagram đẹp.
+
+```text
+Một prompt → một model → một parser
+```
+
+Trường hợp đó dùng `prompt.pipe(model).pipe(parser)` là đủ. Chuyển sang
+LangGraph khi control flow đã trở thành một phần của domain:
+
+- low confidence phải qua human review;
+- tool failure cần retry có budget;
+- nhiều specialist chạy song song rồi hợp nhất state;
+- workflow cần pause hôm nay và resume ngày mai;
+- output cần critique/revise nhưng phải dừng sau N vòng.
+
+Framework đáng dùng khi nó làm invariant **rõ hơn và kiểm chứng được hơn**,
+không phải khi nó chỉ bọc thêm abstraction.
+
+---
+
+## Tổng kết
+
+Một flow AI đáng tin không phải flow luôn trả lời đúng. Nó là flow mà khi sai,
+bạn chỉ ra được:
+
+- đúng node đã sai;
+- đúng state node đó nhận;
+- đúng prompt/model request đã tạo output;
+- đúng route và checkpoint dẫn tới kết quả;
+- đúng test sẽ ngăn failure quay lại.
+
+LangChain giúp chuẩn hóa các model boundary. LangGraph biến orchestration
+thành state machine. LangSmith giúp đọc execution thật ở quy mô lớn. Ghép ba
+lớp đúng trách nhiệm, “AI không deterministic” không còn là cái cớ cho một hệ
+thống không thể debug.
+
+Bài tiếp theo mở rộng từ một graph sang nhiều worker:
+[Orchestrator Pattern](/blog/orchestrator-pattern-multi-agent/). Nếu muốn ôn
+lại agent loop và tool boundary, đọc
+[Agent Architecture](/blog/agent-architecture-deep-dive/) và
+[Function Calling & Tool Use](/blog/function-calling-and-tool-use/).
+
+---
+
+## Tài liệu chính thức
+
+- [LangGraph — Graph API overview](https://docs.langchain.com/oss/javascript/langgraph/graph-api)
+- [LangGraph — Streaming](https://docs.langchain.com/oss/javascript/langgraph/streaming)
+- [LangGraph — Persistence](https://docs.langchain.com/oss/javascript/langgraph/persistence)
+- [LangGraph — Time travel](https://docs.langchain.com/oss/javascript/langgraph/use-time-travel)
+- [LangGraph — Interrupts](https://docs.langchain.com/oss/javascript/langgraph/interrupts)
+- [LangSmith — Tracing quickstart](https://docs.langchain.com/langsmith/observability-quickstart)
+- [LangSmith — Mask sensitive inputs and outputs](https://docs.langchain.com/langsmith/mask-inputs-outputs)
+- [OpenAI — GPT-4.1 mini model](https://developers.openai.com/api/docs/models/gpt-4.1-mini)

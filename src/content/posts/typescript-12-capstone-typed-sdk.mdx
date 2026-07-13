@@ -1,11 +1,12 @@
 ---
-title: 'TypeScript Production · Phần 12 — Capstone: Typed SDK từ Contract đến Release'
+title: 'TypeScript Production · Phần 20 — Capstone: Typed SDK từ Contract đến Release'
 description: 'Capstone ghép toàn series: xây SDK HTTP có runtime validation, branded IDs, typed errors, cancellation, ESM exports, declaration tests, project references và release gates.'
 pubDate: 2026-07-11
+updatedDate: 2026-07-12
 lang: vi
 tags: [typescript, sdk, capstone, architecture]
 series: typescript
-seriesOrder: 12
+seriesOrder: 20
 draft: false
 ---
 
@@ -13,29 +14,37 @@ Capstone không chấm bạn bằng type dài. Nó chấm khả năng ship một
 
 ## Đề bài
 
-Xây `@acme/users-sdk` với hai operation:
+Xây `@acme/users-sdk` theo hướng contract-first với ba operation. Public surface
+dưới đây là **kết quả cần emit**, không phải ba signature được copy thủ công:
 
 ```ts
-interface UsersClient {
+interface ExpectedUsersClient {
   getUser(
-    id: UserId,
+    input: { params: { id: UserId } },
     options?: RequestOptions
   ): Promise<Result<User, UsersError>>;
   searchUsers(
-    query: SearchQuery,
+    input: { params: SearchQuery },
     options?: RequestOptions
   ): Promise<Result<SearchPage, UsersError>>;
+  createUser(
+    input: { params: NoParams; body: CreateUserInput },
+    options?: RequestOptions
+  ): Promise<Result<User, UsersError>>;
 }
 ```
 
 Yêu cầu:
 
-- browser và Node 20+ dùng native `fetch` được inject;
+- browser và các Node runtime trong support matrix dùng `fetch` được inject;
 - mọi response bắt đầu là `unknown`, parse trước khi map;
 - cancel/timeout qua `AbortSignal`;
 - domain errors là discriminated union;
 - package ESM với explicit exports và declaration;
 - không `any` trong public surface;
+- client và server handler được derive từ cùng contract bằng `infer`, conditional
+  và mapped types;
+- route param, request body, response và error giữ correlation theo operation;
 - runtime, type và packaged-consumer tests;
 - diagnostics baseline cho compiler.
 
@@ -44,6 +53,9 @@ Yêu cầu:
 ```text
 packages/users-domain
   ids.ts, user.ts, errors.ts
+          ↑
+packages/users-contract
+  codec.ts, users-contract.ts
           ↑
 packages/users-sdk
   public.ts
@@ -56,6 +68,225 @@ fixtures/consumer-bundler
 ```
 
 Domain không import `fetch`, schema library hoặc package metadata.
+
+## Bước 0: một contract làm source of truth
+
+Nếu viết riêng `UsersClient`, router handler, DTO parser và test fixture, bốn
+artifact sẽ drift. Nhưng type-only registry cũng không đủ vì runtime cần encode
+request và decode response. Source of truth phải là **runtime value mang theo
+type evidence**.
+
+### Codec phân biệt input và output
+
+Transform/coercion làm type trước và sau parse khác nhau. Dùng codec hai chiều:
+
+```ts
+export type Codec<Encode, Decode> = {
+  encode(value: Encode): unknown;
+  decode(value: unknown): Decode;
+};
+
+export type Result<Value, Failure> =
+  | { ok: true; value: Value }
+  | { ok: false; error: Failure };
+
+type AnyCodec = Codec<never, unknown>;
+
+type EncodedInput<C> =
+  C extends Codec<infer Input, infer _Output> ? Input : never;
+
+type DecodedOutput<C> =
+  C extends Codec<infer _Input, infer Output> ? Output : never;
+```
+
+`Codec<never, unknown>` là constraint nội bộ không làm `any` nhiễm public
+surface: codec cụ thể có thể encode domain input, còn result decode luôn
+assignable vào `unknown`.
+
+Sentinel runtime biểu diễn endpoint không có body:
+
+```ts
+export const noBody = Symbol('no-body');
+export type NoBody = typeof noBody;
+
+type EndpointShape = {
+  method: 'GET' | 'POST' | 'PATCH' | 'DELETE';
+  path: `/${string}`;
+  params: AnyCodec;
+  body: AnyCodec | NoBody;
+  response: AnyCodec;
+  failure: AnyCodec;
+};
+
+type ContractShape = Record<string, EndpointShape>;
+
+export function defineContract<const Contract extends ContractShape>(
+  contract: Contract
+): Contract {
+  return contract;
+}
+```
+
+Các codec thật có thể wrap schema library, nhưng adapter public chỉ phụ thuộc
+interface nhỏ trên. `UserId`, `SearchQuery`, `CreateUserInput`, `User` và error
+domain được định nghĩa ở các bước kế tiếp; TypeScript cho phép type declaration
+tham chiếu trước trong cùng module:
+
+```ts
+type NoParams = Record<PropertyKey, never>;
+
+declare const emptyParams: Codec<NoParams, NoParams>;
+declare const getUserParams: Codec<{ id: UserId }, { id: UserId }>;
+declare const searchParams: Codec<SearchQuery, SearchQuery>;
+declare const createUserBody: Codec<CreateUserInput, CreateUserCommand>;
+declare const userCodec: Codec<User, User>;
+declare const searchPageCodec: Codec<SearchPage, SearchPage>;
+declare const usersErrorCodec: Codec<UsersError, UsersError>;
+
+export const usersContract = defineContract({
+  getUser: {
+    method: 'GET',
+    path: '/users/:id',
+    params: getUserParams,
+    body: noBody,
+    response: userCodec,
+    failure: usersErrorCodec,
+  },
+  searchUsers: {
+    method: 'GET',
+    path: '/users',
+    params: searchParams,
+    body: noBody,
+    response: searchPageCodec,
+    failure: usersErrorCodec,
+  },
+  createUser: {
+    method: 'POST',
+    path: '/users',
+    params: emptyParams,
+    body: createUserBody,
+    response: userCodec,
+    failure: usersErrorCodec,
+  },
+});
+```
+
+`const` generic giữ literal method/path/key. `satisfies`-style constraint kiểm
+shape mà không widen contract thành `ContractShape`.
+
+### Derive client bằng `infer` + mapped type
+
+Client input dùng phía `Encode` của codec; response/error dùng phía `Decode`:
+
+```ts
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+type ClientBody<E extends EndpointShape> = E['body'] extends AnyCodec
+  ? { body: EncodedInput<E['body']> }
+  : {};
+
+type ClientInput<E extends EndpointShape> = Simplify<
+  { params: EncodedInput<E['params']> } & ClientBody<E>
+>;
+
+type ClientMethod<E extends EndpointShape> = (
+  input: ClientInput<E>,
+  options?: RequestOptions
+) => Promise<Result<DecodedOutput<E['response']>, DecodedOutput<E['failure']>>>;
+
+export type ClientFor<Contract extends ContractShape> = {
+  [Operation in keyof Contract]: ClientMethod<Contract[Operation]>;
+};
+
+export type UsersClient = ClientFor<typeof usersContract>;
+```
+
+Không có conditional chain theo tên operation. Thêm contract member tự thêm
+client method với input/output/error correlated:
+
+```ts
+declare const client: UsersClient;
+declare const id: UserId;
+
+const getResult = await client.getUser({ params: { id } });
+// Result<User, UsersError>
+
+const createResult = await client.createUser({
+  params: {},
+  body: { email: 'ada@example.com', displayName: 'Ada' },
+});
+// Result<User, UsersError>
+
+// @ts-expect-error GET endpoint không có body
+client.getUser({ params: { id }, body: {} });
+
+// @ts-expect-error createUser bắt buộc body
+client.createUser({ params: {} });
+```
+
+Nếu public UX muốn `getUser(id)` thay vì object input, viết facade mỏng có tên.
+Đừng làm type machinery phức tạp hơn chỉ để xóa một object literal ở call site.
+
+### Derive server handler từ phía decode
+
+Server nhận output sau khi params/body đã được parse:
+
+```ts
+type ServerBody<E extends EndpointShape> = E['body'] extends AnyCodec
+  ? { body: DecodedOutput<E['body']> }
+  : {};
+
+type ServerInput<E extends EndpointShape> = Simplify<
+  { params: DecodedOutput<E['params']> } & ServerBody<E>
+>;
+
+type HandlerFor<E extends EndpointShape> = (
+  input: ServerInput<E>,
+  context: RequestContext
+) => Promise<Result<EncodedInput<E['response']>, EncodedInput<E['failure']>>>;
+
+export type HandlersFor<Contract extends ContractShape> = {
+  [Operation in keyof Contract]: HandlerFor<Contract[Operation]>;
+};
+```
+
+Registry `satisfies` bắt thiếu operation ngay composition root:
+
+```ts
+export const handlers = {
+  getUser: handleGetUser,
+  searchUsers: handleSearchUsers,
+  createUser: handleCreateUser,
+} satisfies HandlersFor<typeof usersContract>;
+```
+
+Client và server không share implementation, chỉ share contract. Runtime tests
+vẫn phải chứng minh encode/decode và transport routing dùng đúng member.
+
+### Route path và params codec phải khớp
+
+Template parser nhỏ lấy param names từ path:
+
+```ts
+type RouteParamNames<Path extends string> =
+  Path extends `${string}:${infer Param}/${infer Rest}`
+    ? Param | RouteParamNames<`/${Rest}`>
+    : Path extends `${string}:${infer Param}`
+      ? Param
+      : never;
+
+type MissingRouteParams<E extends EndpointShape> = Exclude<
+  RouteParamNames<E['path']>,
+  keyof EncodedInput<E['params']>
+>;
+
+type GetUserParamCheck = MissingRouteParams<(typeof usersContract)['getUser']>;
+// never
+```
+
+Type test khóa `never`; runtime `defineContract`/startup validation cũng phải
+reject param codec thừa/thiếu. Type parser không nhìn được contract tải từ JSON
+và không thay URL encoding/matcher runtime.
 
 ## Bước 1: domain contract
 
@@ -96,13 +327,122 @@ export type ClientConfig = {
 export function createUsersClient(config: ClientConfig): UsersClient {
   assertHttpsOrLocalhost(config.baseUrl);
   return {
-    getUser: (id, options) => getUser(config, id, options),
-    searchUsers: (query, options) => searchUsers(config, query, options),
+    getUser: (input, options) =>
+      executeEndpoint(config, usersContract.getUser, input, options),
+    searchUsers: (input, options) =>
+      executeEndpoint(config, usersContract.searchUsers, input, options),
+    createUser: (input, options) =>
+      executeEndpoint(config, usersContract.createUser, input, options),
   };
 }
 ```
 
 Không nhận global logger/framework type. Diagnostic callback là capability nhỏ; document rõ payload nào không chứa PII.
+
+### Generic executor có một unsafe bridge hẹp
+
+Mapped client ở compile time vẫn cần runtime object implementation. Generic
+function không tự narrow mọi `E extends EndpointShape` theo từng contract
+member, nên đừng rải assertion trong từng operation. Cô lập bridge ở helper:
+
+```ts
+function encodeWith<C extends AnyCodec>(
+  codec: C,
+  value: EncodedInput<C>
+): unknown {
+  const runtime = codec as unknown as Codec<EncodedInput<C>, DecodedOutput<C>>;
+  return runtime.encode(value);
+}
+
+function decodeWith<C extends AnyCodec>(
+  codec: C,
+  value: unknown
+): DecodedOutput<C> {
+  return codec.decode(value) as DecodedOutput<C>;
+}
+
+type BodyCodec<E extends EndpointShape> = Exclude<E['body'], NoBody>;
+
+function encodeBody<E extends EndpointShape>(
+  endpoint: E,
+  input: ClientInput<E>
+): unknown {
+  if (endpoint.body === noBody) return undefined;
+
+  const bodyCodec = endpoint.body as BodyCodec<E>;
+  const withBody = input as ClientInput<E> & {
+    body: EncodedInput<BodyCodec<E>>;
+  };
+
+  return encodeWith(bodyCodec, withBody.body);
+}
+```
+
+Assertion nối lại type information bị mất khi đi qua generic runtime registry.
+Nó hợp lệ vì mọi codec chỉ được tạo qua constructor/schema adapter đã test.
+
+Executor dùng chính endpoint value:
+
+```ts
+declare function mapTransportFailure<E extends EndpointShape>(
+  cause: unknown,
+  scope: RequestScope,
+  endpoint: E
+): DecodedOutput<E['failure']>;
+
+async function executeEndpoint<E extends EndpointShape>(
+  config: ClientConfig,
+  endpoint: E,
+  input: ClientInput<E>,
+  options?: RequestOptions
+): Promise<Result<DecodedOutput<E['response']>, DecodedOutput<E['failure']>>> {
+  const encodedParams = encodeWith<E['params']>(endpoint.params, input.params);
+  const url = buildEndpointUrl(config.baseUrl, endpoint.path, encodedParams);
+  const encodedBody = encodeBody(endpoint, input);
+
+  const scope = createRequestScope(options?.signal, config.defaultTimeoutMs);
+
+  try {
+    const response = await config.fetch(url, {
+      method: endpoint.method,
+      signal: scope.signal,
+      headers:
+        encodedBody === undefined
+          ? undefined
+          : { 'content-type': 'application/json' },
+      body: encodedBody === undefined ? undefined : JSON.stringify(encodedBody),
+    });
+
+    const raw: unknown = await readResponseUnknown(response);
+
+    return response.ok
+      ? {
+          ok: true,
+          value: decodeWith<E['response']>(endpoint.response, raw),
+        }
+      : {
+          ok: false,
+          error: decodeWith<E['failure']>(endpoint.failure, raw),
+        };
+  } catch (cause: unknown) {
+    return {
+      ok: false,
+      error: mapTransportFailure(cause, scope, endpoint),
+    };
+  } finally {
+    scope.dispose();
+  }
+}
+```
+
+`mapTransportFailure` phải trả type thuộc failure contract. Nếu mỗi endpoint có
+error union khác nhau, transport error nên là phần chung được contract builder
+thêm vào, hoặc executor cần mapper theo endpoint. Một cast để “cho qua” error
+không có trong contract là bug thiết kế.
+
+Executor trên là skeleton cần hoàn thiện các edge case: status không có body,
+response-size limit, text/non-JSON error, retry budget, `Retry-After`, redaction
+và diagnostic request ID.
 
 ## Bước 3: parse và normalize
 
@@ -119,11 +459,108 @@ async function decodeUser(response: Response): Promise<User> {
 
 Thêm giới hạn response size ở layer phù hợp. Parser error được map thành `BAD_RESPONSE` và diagnostic có request ID, không log body thô.
 
+Trong contract-first version, logic này nằm trong `userCodec.decode` và
+`readResponseUnknown`. Không gọi `response.json() as User`; `unknown → codec →
+User` là trust transition duy nhất.
+
+### Input/output khác nhau là feature
+
+`createUserBody` có thể nhận API-friendly input nhưng decode server thành command
+domain đã normalize:
+
+```ts
+type CreateUserInput = {
+  email: string;
+  displayName: string;
+};
+
+type CreateUserCommand = {
+  email: EmailAddress;
+  displayName: NonEmptyString;
+};
+```
+
+Client dùng `EncodedInput<typeof createUserBody>`; server handler nhận
+`DecodedOutput<typeof createUserBody>`. Đừng dùng một `z.infer`/single type cho
+cả hai phía nếu codec có trim, default, coerce hoặc transform.
+
 ## Bước 4: concurrency contract
 
 Combine caller signal với timeout. Phân biệt cancel chủ động và timeout để UI/telemetry hành xử khác. Không retry `POST`; `GET` chỉ retry theo policy opt-in, tôn trọng `Retry-After` và total budget.
 
-## Bước 5: public package
+Scope phải có ownership rõ:
+
+```ts
+type RequestScope = {
+  signal: AbortSignal;
+  timedOut(): boolean;
+  dispose(): void;
+};
+```
+
+Mỗi request tạo controller/timer riêng; `dispose` chạy trong `finally`. Khi
+caller signal abort, forward reason nếu runtime hỗ trợ nhưng vẫn map policy theo
+nguồn: caller cancel → `CANCELLED`, timer của SDK → `TIMEOUT`.
+
+Retry loop phải consume **total deadline**, không reset full timeout mỗi attempt.
+Chỉ retry operation được contract đánh dấu idempotent; method `GET` là tín hiệu
+tốt nhưng không tự chứng minh backend side effect-free. `POST` có idempotency key
+có thể retry nếu contract và server cùng enforce.
+
+Type system có thể bắt option:
+
+```ts
+type RetryPolicy<E extends EndpointShape> = E['method'] extends 'GET'
+  ? { retries?: number; backoff?: 'fixed' | 'exponential' }
+  : { retries?: 0 };
+```
+
+Nhưng runtime vẫn quyết định status/network error nào retryable và phải emit
+attempt/deadline diagnostics.
+
+## Bước 5: build graph và declaration boundary
+
+Domain, contract và SDK có thể là project riêng khi ownership/cache/public
+surface đủ rõ:
+
+```json
+// packages/users-sdk/tsconfig.json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
+  },
+  "include": ["src"],
+  "references": [{ "path": "../users-domain" }, { "path": "../users-contract" }]
+}
+```
+
+Root `tsc -b` build theo dependency order. Consumer type-check qua declaration,
+không nuốt toàn source SDK.
+
+Review output trước package:
+
+```bash
+tsc -b --clean
+tsc -b --verbose
+tsc -p packages/users-sdk --emitDeclarationOnly
+```
+
+Public `.d.ts` không được chứa đường dẫn `src/`, schema-library internals,
+anonymous conditional khổng lồ hay type chỉ tồn tại trong workspace alias.
+Annotation bằng `UsersClient`, `UsersError`, `RequestOptions` ở public boundary
+giữ artifact đọc được và ổn định hơn exact implementation type.
+
+Project reference không phải lý do tách từng folder. Nếu domain/contract/SDK luôn
+cùng owner, release và graph nhỏ, một project với explicit public module có thể
+đơn giản hơn.
+
+## Bước 6: public package
 
 ```json
 {
@@ -156,7 +593,9 @@ Không export schema, raw DTO, HTTP adapter hay internal error class. Public API
 ### Type
 
 ```ts
-const result = await client.getUser(parseUserId('usr_1'));
+const result = await client.getUser({
+  params: { id: parseUserId('usr_1') },
+});
 
 if (!result.ok) {
   switch (result.error.code) {
@@ -177,8 +616,40 @@ if (!result.ok) {
 }
 
 // @ts-expect-error raw string chưa có bằng chứng UserId
-await client.getUser('1');
+await client.getUser({ params: { id: '1' } });
 ```
+
+Khóa cả type machinery, không chỉ một happy path:
+
+```ts
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
+    ? true
+    : false;
+
+type Expect<T extends true> = T;
+
+type _GetUserResult = Expect<
+  Equal<Awaited<ReturnType<UsersClient['getUser']>>, Result<User, UsersError>>
+>;
+
+type _RouteParamCoverage = Expect<
+  Equal<MissingRouteParams<(typeof usersContract)['getUser']>, never>
+>;
+```
+
+Negative matrix tối thiểu:
+
+- raw string thay branded ID;
+- endpoint no-body nhận body;
+- endpoint có body bị gọi thiếu body;
+- handler registry thiếu/thừa operation;
+- codec output đổi nhưng handler vẫn trả type cũ;
+- route thêm `:tenantId` nhưng params codec chưa thêm key;
+- failure union thêm member và exhaustive consumer chưa xử lý.
+
+`@ts-expect-error` phải đặt sát dòng lỗi. Chạy suite trên `.d.ts` đã emit vì
+source test có thể pass trong khi declaration bị widen hoặc leak type internal.
 
 ### Artifact
 
@@ -188,17 +659,134 @@ await client.getUser('1');
 - chạy `tsc --noEmit` bằng minimum và current TS version;
 - import subpath nội bộ phải fail.
 
+Consumer matrix không dùng workspace symlink hay path alias. Nó phải cài tarball
+đúng như registry consumer:
+
+```text
+npm pack packages/users-sdk
+npm install ./acme-users-sdk-x.y.z.tgz
+npm run typecheck
+npm run runtime-smoke
+```
+
+Inspect tarball:
+
+- chỉ có artifact cần publish;
+- `.d.ts` import specifier resolve được;
+- dependency runtime nằm trong `dependencies`, type-only/dev tool không leak;
+- source map/declaration map không trỏ path tuyệt đối hoặc file private;
+- `package.json` trong tarball khớp ESM output.
+
+### Performance
+
+Contract derivation chạy ở mọi consumer nên có fixture scale:
+
+```bash
+tsc -p fixtures/contract-10/tsconfig.json --extendedDiagnostics
+tsc -p fixtures/contract-200/tsconfig.json --extendedDiagnostics
+tsc -p fixtures/contract-500/tsconfig.json --generateTrace .trace/contract-500
+```
+
+Theo dõi `Types`, `Instantiations`, check time, memory, `.d.ts` bytes và editor
+completion. Budget không chỉ là “không TS2589”: tăng contract từ 200 lên 500
+operation không được làm check time tăng theo cấp số nhân.
+
+Nếu mapped client/handler expand quá lớn:
+
+1. chia contract theo bounded context;
+2. export named client interfaces tại boundary;
+3. filter union sớm trước conditional transform;
+4. generate declaration/runtime route table từ contract AST;
+5. giảm precision không tạo giá trị cho consumer.
+
+Type tests phải giữ nguyên khi tối ưu; nhanh hơn bằng cách widen thành `any` là
+regression, không phải thắng lợi.
+
+## Contract evolution và Type SemVer
+
+Runtime compatibility và compile-time compatibility có thể lệch nhau.
+
+| Thay đổi                      | Runtime              | Type consumer                         | Mặc định semver   |
+| ----------------------------- | -------------------- | ------------------------------------- | ----------------- |
+| Thêm optional response field  | tương thích          | thường tương thích                    | minor             |
+| Thêm required request field   | breaking             | breaking                              | major             |
+| Thêm error union member       | producer tương thích | exhaustive consumer fail              | thường major      |
+| Widen input                   | server nhận thêm     | wrapper overload/inference có thể đổi | review bằng tests |
+| Narrow output                 | dữ liệu cụ thể hơn   | callback/assignment có thể đổi        | review variance   |
+| Đổi generic default/inference | runtime không đổi    | source có thể fail                    | có thể major      |
+
+Versioned wire response nên parse về stable domain model qua anti-corruption
+layer:
+
+```ts
+type UserDto = UserDtoV1 | UserDtoV2;
+
+function toUser(dto: UserDto): User {
+  switch (dto.version) {
+    case 1:
+      return fromV1(dto);
+    case 2:
+      return fromV2(dto);
+  }
+}
+```
+
+Đừng export raw versioned DTO nếu consumer không cần wire detail. Public domain
+model giảm blast radius; diagnostic vẫn ghi schema version/request ID.
+
+Khi contract thay đổi:
+
+1. chạy API/declaration diff;
+2. chạy consumer fixtures đại diện cho call/inference cũ;
+3. phân loại runtime + type semver riêng;
+4. thêm deprecation/migration path trước breaking release;
+5. canary tarball trong một consumer thật;
+6. có rollback về artifact/compiler version cũ.
+
+## Failure injection và observability
+
+Capstone chưa xong nếu chỉ test response đẹp. Inject:
+
+- DNS/network error trước headers;
+- connection đóng giữa body;
+- response vượt size limit;
+- JSON hợp lệ nhưng schema sai;
+- 429 có `Retry-After` sai format;
+- caller abort cùng lúc timeout;
+- retry attempt cuối vượt total deadline;
+- diagnostic callback tự throw.
+
+Diagnostic event nên là discriminated union có version, operation, duration,
+attempt và outcome; không chứa authorization/body/PII. Callback telemetry không
+được làm request fail—wrap và quarantine lỗi observer.
+
+Từ metrics, trả lời được:
+
+- operation nào có bad-response rate tăng sau deploy;
+- timeout là caller cancel, SDK deadline hay upstream stall;
+- retry có cải thiện success hay chỉ tăng load/latency;
+- schema version nào đang xuất hiện ngoài dự kiến.
+
 ## Release gate
 
 ```text
 [ ] public .d.ts đã review
+[ ] contract path/params/body/response/error giữ correlation bằng type tests
+[ ] handler registry đầy đủ, không có assertion ngoài generic adapter
 [ ] runtime + negative type tests xanh
 [ ] tarball không thiếu file/dependency
 [ ] exports resolve trong consumer matrix
+[ ] minimum/current TypeScript và Node/bundler fixtures xanh
 [ ] API/type diff đã phân loại semver
 [ ] compiler diagnostics không regression ngoài budget
+[ ] timeout/cancel/retry failure injection và redaction tests xanh
 [ ] changelog có migration note và minimum TS version
 ```
+
+Gate phải ghi owner và rollback. Khi check time vượt budget, release không nên
+được “fix” bằng tăng threshold vô hạn; tạo trace, xác định hotspot và mở decision
+record cho simplify/codegen. Khi wire schema mới fail canary, rollback artifact
+và giữ decoder cũ thay vì assertion payload thành version mới.
 
 ## Bài bảo vệ cấp staff
 
@@ -209,9 +797,16 @@ Viết ADR tối đa hai trang giải thích:
 3. public surface nào cam kết semver;
 4. dependency direction được enforce bằng tool nào;
 5. SDK sẽ evolve schema/version mà không khóa producer/consumer ra sao;
-6. số liệu nào chứng minh compiler và runtime health.
+6. vì sao contract derivation dùng pure types thay vì codegen, và ngưỡng đổi;
+7. unsafe bridge nào còn lại, bằng chứng runtime/type test cho nó là gì;
+8. số liệu nào chứng minh compiler và runtime health.
 
-**Bạn hoàn thành series khi:** một engineer khác dùng SDK chỉ từ declaration và README, invalid usage fail sớm, malformed production data không lọt vào domain, artifact chạy thật ngoài monorepo, và bạn bảo vệ được mọi trade-off — không chỉ làm compiler im lặng.
+**Bạn hoàn thành series khi:** một engineer khác dùng SDK chỉ từ declaration và
+README; đổi một contract làm compiler dẫn tới đúng client/handler/test cần sửa;
+invalid usage fail gần call site; malformed production data không lọt vào domain;
+timeout/cancel/retry có semantics quan sát được; artifact chạy thật ngoài
+monorepo; và bạn bảo vệ được mọi trade-off bằng type tests, runtime tests và số
+liệu compiler—không chỉ làm compiler im lặng.
 
 ## Hướng luyện tiếp
 

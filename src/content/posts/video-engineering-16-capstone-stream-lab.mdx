@@ -1,0 +1,372 @@
+---
+title: 'Video Engineering · Phần 16 — Capstone: dựng và debug một stream hoàn chỉnh'
+description: 'Tổng hợp series bằng lab end-to-end: tạo source, probe, encode ladder, đóng gói HLS MPEG-TS và fMP4, phát bằng hls.js, profile, fault injection và xuất debug report.'
+pubDate: 2026-07-12
+lang: vi
+tags: [video-engineering, video, ffmpeg, hls, streaming-lab, capstone]
+series: video-engineering
+seriesOrder: 16
+draft: false
+---
+
+Capstone này biến các khái niệm rời rạc thành một pipeline có thể kiểm chứng: ingest một source tổng hợp, tạo probe baseline, encode hai rendition, package HLS bằng MPEG-TS và fMP4, phát trong browser, profile, cố ý gây lỗi rồi đóng gói debug report.
+
+Toàn bộ media được sinh cục bộ, không cần asset bên thứ ba. Kết quả đạt yêu cầu không chỉ là “video phát được”, mà là mỗi tầng có contract và bằng chứng riêng.
+
+---
+
+## 1. Định nghĩa đầu ra trước khi chạy lệnh
+
+Lab sẽ tạo:
+
+```text
+capstone-stream-lab/
+├── source.mp4
+├── source.probe.json
+├── ts/
+│   ├── master.m3u8
+│   ├── 720p/{index.m3u8,seg_*.ts}
+│   └── 360p/{index.m3u8,seg_*.ts}
+├── fmp4/{index.m3u8,init.mp4,seg_*.m4s}
+├── player.html
+├── server.py
+└── report/
+```
+
+Contract:
+
+- source: H.264 + AAC, 1280×720, 30 fps, 48 kHz;
+- GOP và segment target: hai giây;
+- TS ladder: 720p khoảng 2,8 Mbps và 360p khoảng 0,8 Mbps;
+- fMP4: một rendition 720p có initialization segment;
+- mọi segment video dự kiến bắt đầu ở random access point;
+- MIME do server khai báo rõ; không giả hỗ trợ Range.
+
+Kiểm tra dependency:
+
+```bash
+ffmpeg -version
+ffprobe -version
+node --version
+npm --version
+python3 --version
+curl --version
+```
+
+Các lệnh dùng `libx264`; nếu build thiếu nó, chọn encoder H.264 có sẵn và ghi thay đổi vào report.
+
+---
+
+## 2. Ingest fixture và lưu probe baseline
+
+```bash
+mkdir -p capstone-stream-lab
+cd capstone-stream-lab
+
+ffmpeg -hide_banner -y \
+  -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=24" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=24" \
+  -map 0:v:0 -map 1:a:0 \
+  -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \
+  -g 60 -keyint_min 60 -sc_threshold 0 \
+  -c:a aac -b:a 128k -ar 48000 \
+  -metadata title="Video Engineering capstone fixture" \
+  -movflags +faststart source.mp4
+```
+
+Probe trước khi tạo derivative:
+
+```bash
+ffprobe -v error -show_format -show_streams \
+  -show_entries "format=filename,format_name,duration,size,bit_rate:format_tags=title:stream=index,codec_type,codec_name,profile,width,height,pix_fmt,r_frame_rate,avg_frame_rate,time_base,sample_rate,channels,channel_layout" \
+  -of json source.mp4 > source.probe.json
+```
+
+Đọc JSON và xác nhận hai stream, duration gần 24 giây, video 1280×720/yuv420p và audio 48 kHz. Baseline này giúp phân biệt lỗi đã có ở ingest với lỗi do encode/package phía sau.
+
+---
+
+## 3. Encode và package HLS MPEG-TS ladder
+
+Tạo trước thư mục vì pattern `%v` không thay thế trách nhiệm quản lý output path:
+
+```bash
+mkdir -p ts/720p ts/360p
+```
+
+Encode hai rendition trong một graph rồi giao cho HLS muxer:
+
+```bash
+ffmpeg -hide_banner -y -i source.mp4 \
+  -filter_complex "[0:v]split=2[v720in][v360in];[v720in]scale=1280:720:flags=lanczos[v720];[v360in]scale=640:360:flags=lanczos[v360]" \
+  -map "[v720]" -map 0:a:0 -map "[v360]" -map 0:a:0 \
+  -c:v libx264 -preset veryfast -pix_fmt yuv420p \
+  -g 60 -keyint_min 60 -sc_threshold 0 -flags +cgop \
+  -force_key_frames "expr:gte(t,n_forced*2)" \
+  -b:v:0 2800k -maxrate:v:0 3000k -bufsize:v:0 6000k \
+  -b:v:1 800k -maxrate:v:1 900k -bufsize:v:1 1800k \
+  -c:a aac -b:a 128k -ar 48000 \
+  -f hls -hls_time 2 -hls_playlist_type vod \
+  -hls_flags independent_segments \
+  -var_stream_map "v:0,a:0,name:720p v:1,a:1,name:360p" \
+  -master_pl_name master.m3u8 \
+  -hls_segment_filename "ts/%v/seg_%03d.ts" \
+  "ts/%v/index.m3u8"
+```
+
+`-hls_time 2` là target; muxer cắt ở keyframe kế tiếp. Fixed GOP, tắt scene-cut và force keyframe mỗi hai giây làm segment boundary dự đoán được cho fixture này. `independent_segments` chỉ nên được khai báo khi ta thật sự bảo đảm các segment video bắt đầu độc lập.
+
+Đọc `ts/master.m3u8` và hai media playlist. Master phải có hai variant với bandwidth/resolution khác nhau; mỗi media playlist phải kết thúc bằng `EXT-X-ENDLIST` vì đây là VOD.
+
+---
+
+## 4. Package HLS fMP4
+
+```bash
+mkdir -p fmp4
+
+ffmpeg -hide_banner -y -i source.mp4 \
+  -map 0:v:0 -map 0:a:0 -vf "scale=1280:720:flags=lanczos" \
+  -c:v libx264 -preset veryfast -pix_fmt yuv420p \
+  -g 60 -keyint_min 60 -sc_threshold 0 -flags +cgop \
+  -force_key_frames "expr:gte(t,n_forced*2)" \
+  -b:v 2800k -maxrate 3000k -bufsize 6000k \
+  -c:a aac -b:a 128k -ar 48000 \
+  -f hls -hls_time 2 -hls_playlist_type vod \
+  -hls_flags independent_segments \
+  -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 \
+  -hls_segment_filename "fmp4/seg_%03d.m4s" \
+  fmp4/index.m3u8
+```
+
+Playlist fMP4 phải có `EXT-X-MAP:URI="init.mp4"`. Một `.m4s` riêng lẻ không mang đủ initialization context như một file MP4 hoàn chỉnh; khi probe playback presentation, mở playlist hoặc kết hợp đúng init segment theo format thay vì kết luận từ một fragment cô lập.
+
+TS mang cấu trúc transport trong segment; fMP4 tách initialization khỏi media fragment. Codec có thể giống nhau nhưng byte stream, MIME và cách khởi tạo decoder khác nhau.
+
+---
+
+## 5. Server đúng MIME và player quan sát được
+
+Cài player dependency cục bộ:
+
+```bash
+npm init -y
+npm install hls.js
+```
+
+Lưu `server.py`:
+
+```python
+from pathlib import Path
+from urllib.parse import urlparse
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+
+MIME = {
+    ".m3u8": "application/vnd.apple.mpegurl",
+    ".ts": "video/mp2t",
+    ".m4s": "video/iso.segment",
+    ".mp4": "video/mp4",
+}
+
+class Handler(SimpleHTTPRequestHandler):
+    def guess_type(self, path):
+        suffix = Path(urlparse(path).path).suffix.lower()
+        return MIME.get(suffix, super().guess_type(path))
+
+    def end_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
+```
+
+Server không gửi `Accept-Ranges` vì code trên không triển khai Range một cách có chủ đích. HLS segment nhỏ vẫn đủ cho lab; nếu acceptance test yêu cầu byte range, thay server bằng implementation thật và xác nhận bằng request `Range`.
+
+Lưu `player.html`:
+
+```html
+<!doctype html>
+<meta charset="utf-8" />
+<select id="source">
+  <option value="./ts/master.m3u8">HLS MPEG-TS ladder</option>
+  <option value="./fmp4/index.m3u8">HLS fMP4 720p</option>
+</select>
+<video
+  id="video"
+  controls
+  style="display:block;width:800px;max-width:100%;margin-top:1rem"
+></video>
+<pre id="log"></pre>
+<script src="./node_modules/hls.js/dist/hls.min.js"></script>
+<script>
+  const video = document.querySelector('#video');
+  const select = document.querySelector('#source');
+  const log = document.querySelector('#log');
+  let hls;
+  const write = (value) => (log.textContent += `${value}\n`);
+
+  function load(source) {
+    if (hls) hls.destroy();
+    video.removeAttribute('src');
+    video.load();
+
+    if (Hls.isSupported()) {
+      hls = new Hls({ debug: false });
+      hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) =>
+        write(`level=${data.level}`)
+      );
+      hls.on(Hls.Events.ERROR, (_, data) =>
+        write(`error ${data.type}/${data.details} fatal=${data.fatal}`)
+      );
+      hls.loadSource(source);
+      hls.attachMedia(video);
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = source;
+    } else {
+      write('HLS không được hỗ trợ trong môi trường này');
+    }
+  }
+
+  for (const name of [
+    'loadedmetadata',
+    'playing',
+    'waiting',
+    'seeking',
+    'seeked',
+    'error',
+  ]) {
+    video.addEventListener(name, () =>
+      write(`${name} t=${video.currentTime.toFixed(2)}`)
+    );
+  }
+  setInterval(() => {
+    const q = video.getVideoPlaybackQuality();
+    write(`frames=${q.totalVideoFrames} dropped=${q.droppedVideoFrames}`);
+  }, 3000);
+  select.addEventListener('change', () => load(select.value));
+  load(select.value);
+</script>
+```
+
+Chạy `python3 server.py`, mở `http://127.0.0.1:8080/player.html`, rồi phát và seek cả hai nguồn.
+
+---
+
+## 6. Verification và profile
+
+Probe presentation, không chỉ source:
+
+```bash
+ffprobe -v error -show_programs -show_streams -of json ts/master.m3u8
+ffprobe -v error -show_programs -show_streams -of json fmp4/index.m3u8
+```
+
+Kiểm tra frame đầu mỗi TS segment 720p:
+
+```bash
+for file in ts/720p/seg_*.ts; do
+  printf '%s ' "$file"
+  ffprobe -v error -select_streams v:0 -read_intervals "%+#1" \
+    -show_frames -show_entries "frame=key_frame,pict_type,best_effort_timestamp_time" \
+    -of csv=p=0 "$file"
+done
+```
+
+Mục tiêu là frame đầu có `key_frame=1`/I-picture. Đừng chỉ tin `EXT-X-INDEPENDENT-SEGMENTS` do chính mình ghi.
+
+Trong Chrome:
+
+1. Network: lọc manifest/segment, kiểm tra status, MIME, size, Waterfall và level switch.
+2. Media: lưu Properties, Events, Messages và Timeline.
+3. Performance: record lúc switch source và seek; tìm long task phía ứng dụng.
+4. Console/player log: đối chiếu `waiting` với request và buffer.
+5. `getVideoPlaybackQuality()`: ghi dropped ratio cùng resolution, máy và thời gian đo.
+
+Thử network throttling để xem ABR chuyển xuống 360p; ghi rõ clip ngắn có thể chưa đủ để thuật toán hội tụ.
+
+---
+
+## 7. Fault injection có thể hoàn tác
+
+Trong **Network request blocking**, thêm pattern `*seg_003.ts*`, reload và quan sát request lỗi → buffered range → `waiting` → player error/retry. Sau đó tắt blocking và xác nhận stream phục hồi.
+
+Ba thí nghiệm khác:
+
+- đổi MIME `.m4s` trong `server.py` thành `application/octet-stream`, ghi lỗi rồi hoàn tác;
+- đặt `-hls_time 1` nhưng giữ keyframe mỗi hai giây để thấy target duration không tạo keyframe mới;
+- throttle CPU/network, so dropped frames với segment download time.
+
+Mỗi thí nghiệm chỉ đổi một biến, có expected result và bước restore. Không fault-inject production hoặc stream không thuộc phạm vi ủy quyền.
+
+---
+
+## 8. Tạo debug report bàn giao được
+
+```bash
+mkdir -p report
+ffmpeg -version > report/ffmpeg-version.txt
+ffprobe -version > report/ffprobe-version.txt
+cp source.probe.json report/
+
+ffprobe -v error -show_programs -show_streams -of json \
+  http://127.0.0.1:8080/ts/master.m3u8 > report/ts-playback.json
+
+ffprobe -v error -show_programs -show_streams -of json \
+  http://127.0.0.1:8080/fmp4/index.m3u8 > report/fmp4-playback.json
+
+curl -sS -D report/master.headers \
+  -o report/master.m3u8 http://127.0.0.1:8080/ts/master.m3u8
+
+FFREPORT=file=report/decode.log:level=48 \
+  ffmpeg -hide_banner -report \
+  -i http://127.0.0.1:8080/ts/master.m3u8 -t 8 -f null -
+```
+
+Thêm HAR sanitized, Media player JSON, Chrome/OS, bước tái hiện, expected/actual và thời điểm. Review URL/header trước khi chia sẻ. Report tốt cho người khác tái hiện được mà không cần đoán môi trường của bạn.
+
+---
+
+## Acceptance checklist
+
+- [ ] Source probe đúng hai stream và contract ingest.
+- [ ] TS master có 720p và 360p; URI đều trả đúng MIME.
+- [ ] Segment gần target hai giây và mở đầu bằng keyframe.
+- [ ] fMP4 playlist có `EXT-X-MAP`, init và media fragment đầy đủ.
+- [ ] Cả TS lẫn fMP4 phát, seek và kết thúc trong player.
+- [ ] Network, Media, frame-quality và Performance cùng kể một câu chuyện nhất quán.
+- [ ] Fault injection tạo triệu chứng dự kiến và được hoàn tác.
+- [ ] Report không chứa secret và đủ phiên bản/lệnh để tái hiện.
+- [ ] Không có bước nào phụ thuộc asset hoặc DRM ngoài phạm vi cho phép.
+
+---
+
+## Bài tập mở rộng
+
+**1.** Thêm rendition 854×480, chọn bitrate có lý do và cập nhật `var_stream_map`. Đo chứ không chỉ nhìn master playlist.
+
+**2.** Tạo source VFR, package lại và so timestamp/frame duration. Giải thích vì sao một `avg_frame_rate` không mô tả toàn timeline.
+
+**3.** Viết CI smoke test kiểm tra manifest tồn tại, segment URI resolve được, codec/resolution đúng và frame đầu độc lập. Không dùng kiểm tra text thay cho probe bitstream.
+
+---
+
+## Đọc thêm
+
+- [FFmpeg CLI và transcoding pipeline](https://ffmpeg.org/ffmpeg.html)
+- [FFmpeg Formats: HLS, MPEG-TS và segment muxer](https://ffmpeg.org/ffmpeg-formats.html)
+- [Tài liệu ffprobe](https://ffmpeg.org/ffprobe.html)
+- [RFC 8216 — HTTP Live Streaming](https://www.rfc-editor.org/rfc/rfc8216.html)
+- [Apple HLS Authoring Specification](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices/)
+- [Media Source Extensions](https://www.w3.org/TR/media-source-2/)
+- [Chrome DevTools Media panel](https://developer.chrome.com/docs/devtools/media-panel)
+
+`Media Source Extensions 2` ở liên kết trên là Working Draft tại thời điểm viết; đừng mô tả mọi đề xuất trong draft như tính năng ổn định trên mọi browser. Với HLS nền tảng, dùng RFC 8216 và feature detection thực tế.
+
+---
+
+## Kết series
+
+Ta đã đi trọn đường từ byte, container, timestamp và codec tới FFmpeg graph, web playback, HLS segment, metadata, DevTools và incident report. Khi gặp media bug mới, hãy quay lại mental model của [Phần 1 — Từ byte tới pixel](/blog/video-engineering-01-byte-to-pixel-mental-model/): xác định dữ liệu đang ở dạng nào, thuộc timeline nào, và component kế tiếp kỳ vọng contract gì.
+
+Series kết thúc ở đây; phòng lab này có thể trở thành fixture regression lâu dài cho encoder, packager, player và quy trình vận hành của bạn.

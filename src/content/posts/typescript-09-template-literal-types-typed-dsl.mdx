@@ -1,0 +1,645 @@
+---
+title: 'TypeScript Production · Phần 9 — Template Literal Types & Typed DSLs'
+description: 'Biến route, event topic và i18n placeholder thành contract có type bằng template literals, recursive infer và constrained infer—đồng thời giữ runtime parser cùng một grammar.'
+pubDate: 2026-07-12
+updatedDate: 2026-07-12
+lang: vi
+tags: [typescript, template-literal-types, dsl, router, advanced]
+series: typescript
+seriesOrder: 9
+draft: false
+---
+
+String là nơi type safety thường biến mất:
+
+```ts
+router.get('/orders/:orderId', async (ctx) => {
+  const order = await loadOrder(ctx.params.oderId);
+  // typo chỉ nổ khi request thật chạy qua
+});
+```
+
+Route, event topic, cache key và i18n message không phải “string bất kỳ”. Mỗi cái
+là một **ngôn ngữ nhỏ** có token, delimiter và rule riêng. Template literal
+types cho phép mô tả một phần ngôn ngữ đó ở compile time, còn `infer` giúp bóc
+token từ string literal.
+
+Nhưng một typed DSL chỉ đáng gọi là production-ready khi:
+
+- type parser và runtime parser hiểu cùng một grammar;
+- string bị widen vẫn có fallback trung thực;
+- invalid input báo lỗi gần call site;
+- union không phình thành hàng chục nghìn string;
+- runtime data vẫn được validate thay vì tin vào annotation.
+
+Bài này dùng một route contract xuyên suốt, sau đó áp dụng cùng mental model cho
+event topic và i18n placeholder.
+
+## Template literal type tạo một tập string
+
+Với literal union, template literal tạo tích Descartes:
+
+```ts
+type Version = 'v1' | 'v2';
+type Resource = 'orders' | 'payments';
+
+type ApiPath = `/api/${Version}/${Resource}`;
+// '/api/v1/orders'
+// | '/api/v1/payments'
+// | '/api/v2/orders'
+// | '/api/v2/payments'
+```
+
+Đây không phải regex chạy ở runtime. Compiler liệt kê một tập hữu hạn các
+string literal có thể có. Nếu mỗi vị trí chứa union 20 member và có bốn vị trí,
+số tổ hợp lý thuyết là `20⁴ = 160.000`.
+
+Decision rule đầu tiên: dùng cross multiplication cho vocabulary nhỏ, ổn định.
+Với ID, URL hoặc schema lớn, hãy giữ `string` có brand sau runtime validation
+thay vì cố enumerate mọi giá trị.
+
+## Pattern matching string bằng `infer`
+
+Conditional type có thể khớp một template và đặt tên phần bị bắt:
+
+```ts
+type AfterColon<S extends string> = S extends `:${infer Name}` ? Name : never;
+
+type A = AfterColon<':orderId'>;
+// 'orderId'
+
+type B = AfterColon<'orders'>;
+// never
+```
+
+Nhiều vùng `infer` tạo một parser nhỏ:
+
+```ts
+type SplitOnce<
+  S extends string,
+  Separator extends string,
+> = S extends `${infer Head}${Separator}${infer Tail}`
+  ? [head: Head, tail: Tail]
+  : [head: S, tail: ''];
+
+type Segment = SplitOnce<'orders/:orderId', '/'>;
+// [head: 'orders', tail: ':orderId']
+```
+
+Đừng suy luận behavior từ regex greediness. Template inference có rule của
+compiler, và thêm delimiter lặp lại có thể làm kết quả khác trực giác. Với DSL,
+hãy tokenize từng delimiter rồi recurse; mỗi bước chỉ nên có một quyết định.
+
+## Grammar route tối thiểu
+
+Ta định nghĩa ba loại segment:
+
+- `:id` — parameter bắt buộc, giá trị `string`;
+- `:tab?` — parameter optional;
+- `*rest` — catch-all, giá trị là danh sách segment.
+
+Mỗi segment được map thành object:
+
+```ts
+type ParamsOfSegment<S extends string> = S extends `:${infer Name}?`
+  ? { [K in Name]?: string }
+  : S extends `:${infer Name}`
+    ? { [K in Name]: string }
+    : S extends `*${infer Name}`
+      ? { [K in Name]: readonly string[] }
+      : {};
+```
+
+Sau đó tách path theo `/` và merge kết quả:
+
+```ts
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+type RouteParams<Path extends string> = string extends Path
+  ? Record<string, string | readonly string[] | undefined>
+  : Path extends `${infer Segment}/${infer Rest}`
+    ? Simplify<ParamsOfSegment<Segment> & RouteParams<Rest>>
+    : ParamsOfSegment<Path>;
+```
+
+Guard `string extends Path` rất quan trọng. Nó hỏi input có phải string rộng hay
+không. Nếu caller chỉ có `string`, parser không thể biết tên param, nên phải trả
+fallback rộng và trung thực thay vì `{}`.
+
+```ts
+type OrderRoute = RouteParams<'/shops/:shopId/orders/:orderId'>;
+// { shopId: string; orderId: string }
+
+type SearchRoute = RouteParams<'/search/:tab?/*rest'>;
+// { tab?: string; rest: readonly string[] }
+
+type DynamicRoute = RouteParams<string>;
+// Record<string, string | readonly string[] | undefined>
+```
+
+`Simplify<T>` chủ yếu làm hover dễ đọc. Nó không xóa chi phí compiler đã bỏ ra
+để tạo intersection trước đó. Đừng coi `Simplify` là performance optimization.
+
+## Từ parser tới public router API
+
+Literal path phải được bắt ngay tại inference site:
+
+```ts
+type RouteContext<Path extends string> = {
+  request: Request;
+  params: RouteParams<Path>;
+};
+
+type RouteDefinition<Path extends string> = {
+  path: Path;
+  handle(context: RouteContext<Path>): Response | Promise<Response>;
+};
+
+function defineRoute<const Path extends string>(
+  path: Path,
+  handle: RouteDefinition<Path>['handle']
+): RouteDefinition<Path> {
+  return { path, handle };
+}
+```
+
+```ts
+const getOrder = defineRoute(
+  '/shops/:shopId/orders/:orderId',
+  async ({ params }) => {
+    params.shopId;
+    params.orderId;
+
+    // @ts-expect-error typo bị bắt tại authoring time
+    params.oderId;
+
+    return new Response('ok');
+  }
+);
+```
+
+`const` type parameter yêu cầu compiler ưu tiên literal inference. Nếu `Path`
+widen thành `string`, mọi key cụ thể biến mất và handler quay về record rộng.
+
+### Variable string không thể lấy lại precision đã mất
+
+```ts
+declare const pathFromDatabase: string;
+
+defineRoute(pathFromDatabase, ({ params }) => {
+  params.anything; // fallback rộng, đây là trung thực
+  return new Response('ok');
+});
+```
+
+`as const` không biến runtime string thành literal đã biết:
+
+```ts
+// const invalid = pathFromDatabase as const;
+// chỉ literal expression mới dùng được const assertion theo cách này
+```
+
+Nếu route đến từ file config hoặc database, có ba lựa chọn:
+
+1. parse runtime và chấp nhận type rộng;
+2. generate `.ts`/`.d.ts` từ source of truth;
+3. đưa config về code để literal tồn tại ở compile time.
+
+Assertion `as '/orders/:orderId'` chỉ là lời hứa, không tạo validation.
+
+## Runtime parser phải dùng cùng grammar
+
+TypeScript xóa toàn bộ `RouteParams<Path>` sau emit. Runtime router vẫn phải:
+
+- compile pattern thành matcher;
+- decode URL segment đúng quy tắc;
+- quyết định duplicate slash, trailing slash và percent encoding;
+- tạo `string[]` cho catch-all;
+- reject pattern sai.
+
+Một token model dùng chung giúp giảm drift:
+
+```ts
+type RouteToken =
+  | { kind: 'literal'; value: string }
+  | { kind: 'param'; name: string; optional: boolean }
+  | { kind: 'catchAll'; name: string };
+
+function tokenizeRoute(pattern: string): readonly RouteToken[] {
+  return pattern
+    .split('/')
+    .filter(Boolean)
+    .map((segment): RouteToken => {
+      if (segment.startsWith('*')) {
+        return { kind: 'catchAll', name: segment.slice(1) };
+      }
+
+      if (segment.startsWith(':')) {
+        const optional = segment.endsWith('?');
+        return {
+          kind: 'param',
+          name: segment.slice(1, optional ? -1 : undefined),
+          optional,
+        };
+      }
+
+      return { kind: 'literal', value: segment };
+    });
+}
+```
+
+Đây mới là skeleton. Production parser còn phải reject `':'`, `'*'`, duplicate
+param name và catch-all không nằm cuối. Type parser cũng nên encode cùng rule
+nếu chi phí/diagnostic chấp nhận được; nếu không, validation runtime là source
+of truth và type layer chỉ cung cấp autocomplete.
+
+## Validate grammar, không chỉ extract token
+
+Một parser chỉ extract sẽ chấp nhận tên rỗng:
+
+```ts
+type Bad = RouteParams<'/orders/:/lines/*'>;
+```
+
+Ta thêm validator trả error marker có thể đọc:
+
+```ts
+type ValidateSegment<S extends string> = S extends ':' | ':?' | '*'
+  ? `Invalid empty route parameter: "${S}"`
+  : S;
+
+type ValidateRoute<Path extends string> =
+  Path extends `${infer Segment}/${infer Rest}`
+    ? ValidateSegment<Segment> extends Segment
+      ? ValidateRoute<Rest>
+      : ValidateSegment<Segment>
+    : ValidateSegment<Path>;
+```
+
+Gắn vào API:
+
+```ts
+type CheckedPath<Path extends string> =
+  ValidateRoute<Path> extends Path ? Path : ValidateRoute<Path>;
+
+declare function checkedRoute<const Path extends string>(
+  path: CheckedPath<Path>,
+  handle: (context: RouteContext<Path>) => unknown
+): void;
+```
+
+Error marker string thường dễ đọc hơn `never`, nhưng nó có thể làm signature
+phức tạp và inference vòng. Type test diagnostic không chỉ kiểm “có lỗi”; hãy
+review lỗi có chỉ vào argument `path` và nói được segment nào sai hay không.
+
+## Duplicate param name là một design decision
+
+Route này có hai `:id`:
+
+```ts
+type Duplicate = RouteParams<'/shops/:id/orders/:id'>;
+// { id: string }
+```
+
+Intersection không báo duplicate vì hai field cùng type. Runtime matcher có thể
+ghi đè value đầu bằng value sau. Bạn phải chọn một policy:
+
+- cấm duplicate ở validator;
+- trả array cho duplicate;
+- namespace param;
+- hoặc document “last wins”.
+
+Type precision không thay thế semantic decision. Trong router công khai, cấm
+duplicate thường ít bất ngờ nhất.
+
+## Type-safe event name giữ correlation với payload
+
+Template literal cũng có thể tạo event vocabulary từ model:
+
+```ts
+type Watched<T extends object> = {
+  on<K extends string & keyof T>(
+    event: `${K}Changed`,
+    listener: (value: T[K]) => void
+  ): () => void;
+};
+
+type OrderView = {
+  status: 'draft' | 'paid';
+  total: number;
+};
+
+declare const order: Watched<OrderView>;
+
+order.on('statusChanged', (status) => {
+  // status: 'draft' | 'paid'
+});
+
+order.on('totalChanged', (total) => {
+  // total: number
+});
+
+// @ts-expect-error event không tồn tại
+order.on('priceChanged', () => {});
+```
+
+Pattern ngược lại extract key từ event:
+
+```ts
+type PropertyFromEvent<E extends string> = E extends `${infer K}Changed`
+  ? K
+  : never;
+
+type EventProperty = PropertyFromEvent<'statusChanged'>;
+// 'status'
+```
+
+Nếu public event names phải ổn định qua rename field, đừng derive trực tiếp từ
+object key. Một explicit event map tạo compatibility boundary tốt hơn. “Không
+lặp type” không phải mục tiêu cao hơn versioning.
+
+## I18n placeholder: conditional rest tuple cho call shape chính xác
+
+Catalog literal là source cho placeholder names:
+
+```ts
+const messages = {
+  greeting: 'Xin chào {name}',
+  cart: '{name} có {count} sản phẩm',
+  ready: 'Đã sẵn sàng',
+} as const;
+
+type Messages = typeof messages;
+```
+
+Parser bóc từng placeholder:
+
+```ts
+type PlaceholderNames<S extends string> =
+  S extends `${string}{${infer Name}}${infer Rest}`
+    ? Name | PlaceholderNames<Rest>
+    : never;
+
+type PlaceholderValues<S extends string> = {
+  [K in PlaceholderNames<S>]: string | number;
+};
+```
+
+Message không có placeholder không nên bắt object rỗng. Conditional tuple làm
+argument thứ hai tồn tại đúng lúc:
+
+```ts
+type TranslationArgs<S extends string> = [PlaceholderNames<S>] extends [never]
+  ? []
+  : [values: PlaceholderValues<S>];
+
+declare function translate<K extends keyof Messages>(
+  key: K,
+  ...args: TranslationArgs<Messages[K]>
+): string;
+```
+
+```ts
+translate('ready');
+translate('greeting', { name: 'Vinh' });
+translate('cart', { name: 'Vinh', count: 2 });
+
+// @ts-expect-error thiếu count
+translate('cart', { name: 'Vinh' });
+
+// @ts-expect-error ready không nhận values
+translate('ready', {});
+```
+
+Runtime formatter vẫn phải xử lý escape braces, plural rules, locale và missing
+translation. Nếu grammar tiến gần ICU MessageFormat, tự viết parser type-level
+thường là sai abstraction; dùng parser/runtime library và generate types từ
+catalog đã compile.
+
+## Constrained `infer`: parse primitive literal có điều kiện
+
+`infer` có thể mang constraint ngay tại capture site:
+
+```ts
+type ParsePrimitive<S extends string> = S extends `${infer N extends number}`
+  ? N
+  : S extends `${infer B extends boolean}`
+    ? B
+    : S;
+
+type Port = ParsePrimitive<'443'>;
+// 443
+
+type Enabled = ParsePrimitive<'true'>;
+// true
+
+type Host = ParsePrimitive<'api.internal'>;
+// 'api.internal'
+```
+
+Compiler chỉ giữ primitive literal khi text có thể được round-trip theo rule
+của nó. Các format như leading zero, exponent, whitespace hay số vượt miền an
+toàn có thể widen hoặc không match như bạn đoán.
+
+Đây không phải parser cấu hình runtime. `process.env.PORT` vẫn là string không
+tin cậy; phải parse, kiểm range và báo lỗi khi process khởi động.
+
+## Case transforms hữu ích nhưng dễ mất dữ liệu
+
+Built-in string helpers gồm `Uppercase`, `Lowercase`, `Capitalize` và
+`Uncapitalize`:
+
+```ts
+type GetterName<K extends PropertyKey> = K extends string
+  ? `get${Capitalize<K>}`
+  : never;
+
+type GetterMap<T extends object> = {
+  [K in keyof T as GetterName<K>]: () => T[K];
+};
+```
+
+```ts
+type OrderGetters = GetterMap<{
+  id: string;
+  total: number;
+}>;
+// { getId(): string; getTotal(): number }
+```
+
+Transform key có thể collision: `fooBar` và `FooBar` cùng map tới `getFooBar`.
+TypeScript có thể merge value thành union thay vì báo collision domain-specific.
+Với code generation, bạn có thể phát hiện và báo lỗi tốt hơn.
+
+## Distribution trên union string
+
+Conditional parser phân phối khi input là naked type parameter:
+
+```ts
+type ParamName<S> = S extends `:${infer Name}` ? Name : never;
+
+type Names = ParamName<':id' | ':slug' | 'literal'>;
+// 'id' | 'slug'
+```
+
+Đó thường là điều ta muốn khi filter token. Nhưng đôi khi câu hỏi là “mọi member
+có hợp grammar không?”:
+
+```ts
+type EveryParam<S> = [S] extends [`:${string}`] ? true : false;
+
+type Mixed = EveryParam<':id' | 'literal'>;
+// false
+```
+
+Phân biệt hai câu hỏi:
+
+- distributive: transform/filter **từng member**;
+- non-distributive: kiểm union **như một khối**.
+
+Nếu không viết được câu hỏi bằng lời, conditional type rất dễ trả kết quả đúng
+cú pháp nhưng sai contract.
+
+## Performance: đừng enumerate thế giới
+
+Ba nguồn chi phí chính của string type program:
+
+1. cross product của nhiều union;
+2. recursion theo từng character/segment;
+3. distribution lồng trong mapped type trên catalog lớn.
+
+Ví dụ nguy hiểm:
+
+```ts
+type Digit = '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9';
+type SixDigits = `${Digit}${Digit}${Digit}${Digit}${Digit}${Digit}`;
+// một triệu tổ hợp lý thuyết — không nên materialize
+```
+
+Dùng brand sau runtime check:
+
+```ts
+declare const sixDigitBrand: unique symbol;
+type SixDigitCode = string & { readonly [sixDigitBrand]: true };
+
+function parseSixDigitCode(value: string): SixDigitCode {
+  if (!/^\d{6}$/.test(value)) throw new Error('Expected six digits');
+  return value as SixDigitCode;
+}
+```
+
+Rule: template literal type phù hợp để **derive finite vocabulary và extract
+literal structure**, không phù hợp để enumerate large value domain.
+
+## Type tests và runtime tests phải đi thành cặp
+
+Type test:
+
+```ts
+type ExpectedRoute = {
+  shopId: string;
+  orderId: string;
+};
+
+type _route = Expect<
+  Equal<RouteParams<'/shops/:shopId/orders/:orderId'>, ExpectedRoute>
+>;
+```
+
+Negative test:
+
+```ts
+defineRoute('/orders/:orderId', ({ params }) => {
+  // @ts-expect-error unknown param
+  params.customerId;
+  return new Response();
+});
+```
+
+Runtime matrix tối thiểu:
+
+- encoded slash và Unicode;
+- optional segment có/không có;
+- catch-all rỗng/nhiều segment;
+- duplicate param;
+- trailing slash policy;
+- invalid percent encoding;
+- pattern bị reject giống rule ở type layer.
+
+Nếu type test pass nhưng runtime parser tạo key khác, API vẫn hỏng. Tốt nhất
+generate cả type artifact và runtime matcher từ một AST/schema chung khi DSL đủ
+quan trọng.
+
+## Failure modes cần review
+
+### Literal bị widen trước inference site
+
+Path đi qua biến `string` rồi mới vào `defineRoute`; compiler không thể khôi phục
+literal names.
+
+### Type parser mạnh hơn runtime parser
+
+Autocomplete hứa optional/catch-all nhưng matcher runtime dùng semantics khác.
+
+### Runtime value được assertion thành DSL literal
+
+`as RoutePath` không kiểm dữ liệu từ database, env hay network.
+
+### Error trả ở generic internals
+
+Recursive validator sâu làm diagnostic dài và chỉ vào implementation alias,
+không chỉ vào string sai.
+
+### Cross product quá rộng
+
+Editor lag vì type cố enumerate locale × namespace × key × version.
+
+### Derived public name phá compatibility
+
+Rename property vô tình rename event topic hoặc cache key mà semver review không
+nhìn thấy.
+
+## Khi nào không dùng typed string DSL
+
+Không dùng pure type-level parser khi:
+
+- source of truth không nằm trong TypeScript code;
+- grammar có escaping, precedence hoặc nesting phức tạp;
+- cần diagnostic domain-specific với vị trí dòng/cột;
+- vocabulary lớn hoặc do user tạo;
+- nhiều ngôn ngữ cùng consume contract;
+- runtime artifact phải được version và audit độc lập.
+
+Khi đó, parse/schema/codegen là lựa chọn tốt hơn. TypeScript vẫn có thể consume
+generated union, nhưng không cần tự đóng vai compiler của một language khác.
+
+## Lab: Contract router không drift
+
+Mở rộng grammar route với:
+
+```txt
+/shops/:shopId/orders/:orderId
+/search/:tab?/*rest
+```
+
+Acceptance criteria:
+
+1. `RouteParams` suy đúng required, optional và catch-all;
+2. path literal giữ autocomplete qua `defineRoute`;
+3. input `string` nhận fallback rộng, không nhận `{}` giả chính xác;
+4. empty param, duplicate name và catch-all giữa path bị reject;
+5. positive/negative type tests chạy trên declaration đã build;
+6. runtime matcher dùng cùng grammar và có test encoding/trailing slash;
+7. benchmark 100, 500 và 1.000 route bằng `--extendedDiagnostics`;
+8. viết ngưỡng rõ để chuyển sang AST + codegen.
+
+**Done khi:** đổi tên `:orderId` thành `:id` làm compiler dẫn tới mọi handler
+cần sửa, request runtime tạo đúng key đó, và editor vẫn phản hồi trong budget đã
+đặt.
+
+## Đọc tiếp
+
+- [Template Literal Types](https://www.typescriptlang.org/docs/handbook/2/template-literal-types.html)
+- [Conditional Types and `infer`](https://www.typescriptlang.org/docs/handbook/2/conditional-types.html)
+- [TypeScript 4.8 — Improved Inference for `infer` Types in Template String Types](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-8.html#improved-inference-for-infer-types-in-template-string-types)
+- [`const` Type Parameters](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-5-0.html#const-type-parameters)

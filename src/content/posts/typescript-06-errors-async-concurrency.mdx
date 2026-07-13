@@ -1,119 +1,545 @@
 ---
-title: 'TypeScript Production · Phần 6 — Errors, Async & Concurrency Contracts'
+title: 'TypeScript Production · Phần 14 — Errors, Async & Concurrency Contracts'
 description: 'Thiết kế lỗi và async flow có kiểu: unknown catch, Result, AbortSignal, timeout, retry, Promise concurrency và idempotency thay vì Promise<any>.'
 pubDate: 2026-06-29
+updatedDate: 2026-07-12
 lang: vi
 tags: [typescript, async, error-handling, resilience]
 series: typescript
-seriesOrder: 6
+seriesOrder: 14
 draft: false
 ---
 
-`Promise<User>` chỉ nói happy path. Production contract còn phải nói về cancel, timeout, retry, partial failure và side effect lặp lại.
+`Promise<User>` chỉ mô tả fulfillment. Nó không nói promise reject bằng gì, ai được cancel, timeout thuộc layer nào, retry có lặp side effect không, hoặc kết quả về muộn còn được phép mutate state không.
 
-## Catch variable phải là `unknown`
+Async production contract phải thiết kế cả **ownership**: ai sở hữu operation, deadline, child tasks, error mapping, retry budget và telemetry. Type giúp caller đi đúng nhánh; runtime policy mới giữ hệ thống đúng khi mạng chậm, request trùng và process shutdown.
 
-JavaScript cho phép `throw 'nope'`, `throw 42`, hoặc reject bất kỳ giá trị nào.
+## Thrown channel không có type parameter
+
+JavaScript cho phép `throw 'nope'`, `throw 42`, `Promise.reject(payload)` hoặc library reject một object không kế thừa `Error`. TypeScript không có checked exceptions; `Promise<T>` chỉ mang type của fulfillment.
+
+Với `strict`, catch variable là `unknown`. Normalize ở adapter, không giả định `.message` tồn tại:
 
 ```ts
 function toError(value: unknown): Error {
   if (value instanceof Error) return value;
-  return new Error(typeof value === 'string' ? value : 'Unknown failure', {
-    cause: value,
-  });
+  if (typeof value === 'string') return new Error(value);
+  return new Error('Unknown failure', { cause: value });
+}
+
+async function load(): Promise<string> {
+  try {
+    return await Promise.reject('network down');
+  } catch (cause: unknown) {
+    throw toError(cause);
+  }
 }
 ```
 
-Normalize ở adapter. Domain không nên có mười cách biểu diễn cùng một failure.
+`Error.cause` giữ chain cho debug nhưng vẫn là `unknown`. Không serialize nguyên cause vào HTTP response hay log: nó có thể chứa body, URL có token, SQL, PII hoặc object tuần hoàn.
 
-## Exception hay Result?
+## Exception, `Result` hay `TaskResult`?
 
 ```ts
-type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+type Result<Value, Failure> =
+  | { ok: true; value: Value }
+  | { ok: false; error: Failure };
+
+type TaskResult<Value, Failure> = Promise<Result<Value, Failure>>;
 
 type CheckoutError =
   | { code: 'OUT_OF_STOCK'; sku: string }
-  | { code: 'PAYMENT_DECLINED'; retryable: false }
-  | { code: 'TIMEOUT'; retryable: true };
+  | { code: 'CONFLICT' }
+  | { code: 'RATE_LIMITED'; retryAfterMs?: number }
+  | { code: 'UNAVAILABLE' }
+  | { code: 'TIMEOUT' }
+  | { code: 'CANCELLED' };
 ```
 
-Dùng `Result` khi failure là nhánh domain caller phải xử lý. Dùng exception cho invariant bị phá, programming error hoặc failure xuyên nhiều layer mà local caller không thể giải quyết. Đừng biến mọi function thành monad chỉ vì “type-safe”.
+| Contract            | Dùng khi                                                         | Trade-off                                                       |
+| ------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------- |
+| Exception/rejection | invariant vỡ, programming error, caller local không thể phục hồi | Dễ propagate; thrown channel không typed                        |
+| `Result<T,E>`       | failure dự kiến mà caller phải branch                            | Explicit và exhaustive; plumbing nhiều hơn                      |
+| `TaskResult<T,E>`   | domain failure dự kiến trong async operation                     | Typed expected failure; implementation vẫn có thể reject vì bug |
 
-TypeScript không có checked exceptions; `throws` trong JSDoc là documentation, không được compiler enforce. Nếu caller bắt buộc branch theo loại lỗi, encode vào return.
+`TaskResult` không chứng minh promise “never rejects”. Callback, assertion, out-of-memory hoặc bug vẫn có thể throw. Contract nên nói rõ: expected operational failures nằm trong `E`; unexpected failures reject và được error boundary/incident pipeline xử lý.
 
-## Cancellation là một phần function signature
+Đừng biến mọi helper thành `Result`. Parse/checkout boundary hưởng lợi; pure internal invariant thường rõ hơn khi throw. Adapter chịu trách nhiệm chuyển failure ngoại lai thành vocabulary của owner kế tiếp.
+
+## Error ownership, cause và redaction
+
+Transport biết socket/status/header; application biết operation nào retryable; domain biết failure nào caller xử lý; UI biết message nào được hiển thị. Đừng export nguyên `AxiosError`, `Response` hay database error qua các layer.
 
 ```ts
-type RequestOptions = {
-  signal?: AbortSignal;
-  timeoutMs?: number;
-};
+type TransportFailure =
+  | { kind: 'network'; cause: unknown }
+  | { kind: 'http'; status: number; retryAfterMs?: number; cause: unknown }
+  | { kind: 'aborted'; reason: unknown };
 
-async function loadUser(
-  id: UserId,
-  options: RequestOptions = {}
-): Promise<User> {
-  const timeout = AbortSignal.timeout(options.timeoutMs ?? 5_000);
-  const signal = options.signal
-    ? AbortSignal.any([options.signal, timeout])
-    : timeout;
-
-  const response = await fetch(`/api/users/${id}`, { signal });
-  return parseUser(await response.json());
+function assertNever(value: never): never {
+  throw new Error('Unhandled variant', { cause: value });
 }
 ```
 
-Không swallow `AbortError` rồi retry. Cancellation thường thể hiện caller không còn cần kết quả.
-
-## Concurrency semantics phải có chủ đích
+Transport adapter phải exhaustively map `network/http/aborted`; application quyết định status nào thành `CONFLICT`, `RATE_LIMITED` hay `UNAVAILABLE`. Public error chỉ chứa field caller được phép biết. Internal event có thể giữ cause riêng, nhưng redaction phải allowlist:
 
 ```ts
-const [user, permissions] = await Promise.all([
-  loadUser(id),
-  loadPermissions(id),
-]);
+type SafeCause = { name: string; category: 'network' | 'timeout' | 'unknown' };
+declare function redactCause(cause: unknown): SafeCause;
 ```
 
-`Promise.all` fail-fast nhưng không tự hủy work còn lại. Nếu cần all-or-cancel, chia sẻ `AbortController`. Nếu partial result hợp lệ, dùng `Promise.allSettled` rồi normalize thành domain result; đừng để `PromiseSettledResult` rò lên UI.
+Không dùng raw `error.message` làm metric label; cardinality và secret leakage sẽ tăng cùng lúc.
 
-## Retry chỉ dành cho operation phù hợp
-
-Retry cần trả lời:
-
-- lỗi có transient không?
-- operation có idempotent không?
-- server có idempotency key không?
-- backoff có jitter và budget tổng không?
-- cancellation có dừng retry loop không?
+## Exhaustive mapping ở boundary kế tiếp
 
 ```ts
-type RetryPolicy = {
+function checkoutMessage(error: CheckoutError): string {
+  switch (error.code) {
+    case 'OUT_OF_STOCK':
+      return `Sản phẩm ${error.sku} đã hết hàng`;
+    case 'CONFLICT':
+      return 'Đơn hàng đã thay đổi, vui lòng tải lại';
+    case 'RATE_LIMITED':
+      return 'Hệ thống đang bận, vui lòng thử lại';
+    case 'UNAVAILABLE':
+      return 'Dịch vụ tạm thời không khả dụng';
+    case 'TIMEOUT':
+      return 'Yêu cầu quá thời gian';
+    case 'CANCELLED':
+      return 'Yêu cầu đã bị hủy';
+    default:
+      return assertNever(error);
+  }
+}
+```
+
+Thêm error code mới sẽ kéo compiler tới mọi mapper. Đó là ownership rõ; không phải mọi layer cùng switch trên HTTP status.
+
+## Cancellation là một phần signature
+
+`AbortSignal` là notification hợp tác, không phải thread interruption. Operation phải nhận signal, kiểm trước khi bắt đầu, truyền xuống I/O và kiểm giữa các vòng CPU/loop dài.
+
+```ts
+type TimeoutReason = { kind: 'timeout'; timeoutMs: number };
+
+function withDeadline(caller: AbortSignal | undefined, timeoutMs: number) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError('timeoutMs must be positive');
+  }
+
+  const timeoutController = new AbortController();
+  const timeoutReason = { kind: 'timeout', timeoutMs } satisfies TimeoutReason;
+  const timer = setTimeout(
+    () => timeoutController.abort(timeoutReason),
+    timeoutMs
+  );
+  const signal = caller
+    ? AbortSignal.any([caller, timeoutController.signal])
+    : timeoutController.signal;
+
+  return {
+    signal,
+    timeoutSignal: timeoutController.signal,
+    dispose: () => clearTimeout(timer),
+  };
+}
+```
+
+Caller phải `dispose()` trong `finally` khi hoàn tất sớm. `signal.reason` là arbitrary JavaScript value; giữ tagged reason cho timeout do mình tạo, còn caller reason vẫn phải normalize.
+
+`AbortSignal.any` abort theo signal đầu tiên; `AbortSignal.timeout` tiện cho timeout đơn giản. Kiểm runtime target trước khi dùng, hoặc bọc sau một adapter. Aborted signal là one-shot, không tái sử dụng cho operation mới.
+
+## Timeout ownership và total deadline
+
+Ba timeout độc lập ở UI, service và transport tạo behavior ngẫu nhiên. Chọn owner:
+
+- outer operation sở hữu **total deadline**;
+- mỗi attempt có thể có timeout nhỏ hơn, nhưng không vượt thời gian còn lại;
+- transport chỉ thực thi signal/deadline được truyền, không tự thêm 30 giây bí mật;
+- retry sleep, parse body và backoff đều ăn cùng total budget.
+
+Khi catch abort, phân biệt timeout với caller cancel bằng signal nguồn: nếu `timeoutSignal.aborted` và `combined.reason === timeoutSignal.reason`, map `TIMEOUT`; nếu caller signal sở hữu reason, map `CANCELLED`. Hai signal có thể abort gần nhau; “first reason wins” là contract. Nếu cần provenance chắc hơn, compose bằng controller riêng và tagged reason thay vì suy từ exception name.
+
+## Promise executor và floating promises
+
+Promise executor chạy ngay và constructor **không await promise executor trả về**. Tránh `new Promise(async (...) => ...)`: exception sau `await` có thể thuộc promise bị bỏ quên trong khi outer promise không settle đúng như mong đợi.
+
+```ts
+declare function readCount(): Promise<number>;
+
+// Anti-pattern
+const broken = new Promise<number>(async (resolve) =>
+  resolve(await readCount())
+);
+```
+
+Prefer một `async function` trả trực tiếp `readCount()`. Chỉ dùng constructor để bridge callback API, với executor synchronous và cả resolve/reject path rõ.
+
+Floating promise chuyển ownership thành “không ai”. `void` chỉ đánh dấu intent cho lint; nó không tự xử lý rejection:
+
+```ts
+declare const analyticsEvent: { name: string };
+declare function sendAnalytics(event: { name: string }): Promise<void>;
+declare function reportAnalyticsFailure(error: unknown): void;
+void sendAnalytics(analyticsEvent).catch(reportAnalyticsFailure);
+```
+
+Fire-and-forget production cần error sink, shutdown/drain policy và bounded queue. `void sendAnalytics(...)` một mình vẫn có thể tạo unhandled rejection.
+
+## `Promise.all`: tuple tốt, cancellation không có
+
+```ts
+type User = { id: string };
+type Permissions = readonly string[];
+
+declare function loadUser(): Promise<User>;
+declare function loadPermissions(): Promise<Permissions>;
+
+const tasks = [loadUser(), loadPermissions()] as const;
+const [user, permissions] = await Promise.all(tasks);
+
+type Equal<Left, Right> =
+  (<T>() => T extends Left ? 1 : 2) extends <T>() => T extends Right ? 1 : 2
+    ? true
+    : false;
+type Expect<Condition extends true> = Condition;
+type UserSlot = Expect<Equal<typeof user, User>>;
+type PermissionSlot = Expect<Equal<typeof permissions, Permissions>>;
+
+// @ts-expect-error tuple slot đầu không phải Permissions
+const wrongSlot: Permissions = user;
+```
+
+`Promise.all` preserve tuple và reject fail-fast, nhưng work còn lại vẫn chạy. “Fail-fast” không phải “all-or-cancel”. Muốn cancel sibling, chia sẻ controller và mọi task phải cooperate với signal.
+
+Nếu lưu tasks vào `Promise<unknown>[]` trước, tuple information đã mất. Giữ tuple tại declaration bằng `as const` hoặc một tuple-preserving helper.
+
+## `Promise.allSettled`: partial success cần domain mapping
+
+```ts
+const settled = await Promise.allSettled(tasks);
+type FirstSettled = Expect<
+  Equal<(typeof settled)[0], PromiseSettledResult<User>>
+>;
+type SecondSettled = Expect<
+  Equal<(typeof settled)[1], PromiseSettledResult<Permissions>>
+>;
+
+type ItemResult<Value> = Result<Value, { code: 'FAILED'; cause: unknown }>;
+
+function fromSettled<Value>(
+  item: PromiseSettledResult<Value>
+): ItemResult<Value> {
+  return item.status === 'fulfilled'
+    ? { ok: true, value: item.value }
+    : { ok: false, error: { code: 'FAILED', cause: item.reason as unknown } };
+}
+```
+
+`allSettled` chờ mọi input settle và giữ thứ tự input, không phải completion order. Đừng để `PromiseSettledResult` rò tới UI; map rejection reason về error vocabulary của operation.
+
+## Bounded concurrency và backpressure
+
+`Promise.all(items.map(worker))` khởi động toàn bộ work ngay: dễ mở hàng nghìn connection, giữ response trong memory và làm downstream rate-limit. Giới hạn in-flight work:
+
+```ts
+async function mapConcurrent<Input, Output>(
+  items: readonly Input[],
+  limit: number,
+  worker: (item: Input, index: number, signal?: AbortSignal) => Promise<Output>,
+  signal?: AbortSignal
+): Promise<Output[]> {
+  if (!Number.isInteger(limit) || limit < 1) throw new RangeError('limit');
+
+  const output = new Array<Output>(items.length);
+  let nextIndex = 0;
+
+  async function runWorker(): Promise<void> {
+    while (true) {
+      signal?.throwIfAborted();
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      output[index] = await worker(items[index]!, index, signal);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () =>
+    runWorker()
+  );
+  await Promise.all(workers);
+  return output;
+}
+```
+
+Helper giữ output order theo input. Khi một worker fail, `Promise.all` reject nhưng sibling đang chạy không tự dừng; caller cần controller chung nếu muốn all-or-cancel.
+
+Bounded concurrency chưa chắc là backpressure: nếu đã materialize mười triệu items, memory vẫn tăng. Pipeline streaming nên pull từ `AsyncIterable`, chỉ đọc item mới khi có capacity. Queue cũng cần overload policy: block producer, reject, drop oldest hay persist; “buffer vô hạn” không phải policy.
+
+## Retry bắt đầu từ classification
+
+Không retry vì `error instanceof Error`. Classifier phải biết failure transient, operation idempotent và caller còn budget không.
+
+```ts
+type RetryDecision = { retry: false } | { retry: true; retryAfterMs?: number };
+
+type RetryOptions = {
   maxAttempts: number;
-  shouldRetry(error: unknown, attempt: number): boolean;
-  delayMs(attempt: number): number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  deadlineAt: number;
+  signal: AbortSignal;
+  classify(cause: unknown, attempt: number): RetryDecision;
+  sleep(ms: number, signal: AbortSignal): Promise<void>;
+  now(): number;
+  random(): number;
+};
+
+class TotalDeadlineExceeded extends Error {}
+
+async function retry<Value>(
+  operation: (attempt: number, signal: AbortSignal) => Promise<Value>,
+  options: RetryOptions
+): Promise<Value> {
+  if (!Number.isInteger(options.maxAttempts) || options.maxAttempts < 1) {
+    throw new RangeError('maxAttempts');
+  }
+
+  for (let attempt = 1; attempt <= options.maxAttempts; attempt++) {
+    options.signal.throwIfAborted();
+    if (options.deadlineAt <= options.now()) throw new TotalDeadlineExceeded();
+
+    try {
+      return await operation(attempt, options.signal);
+    } catch (cause: unknown) {
+      options.signal.throwIfAborted();
+      const decision = options.classify(cause, attempt);
+      if (!decision.retry || attempt === options.maxAttempts) throw cause;
+
+      const cap = Math.min(
+        options.maxDelayMs,
+        options.baseDelayMs * 2 ** (attempt - 1)
+      );
+      const jitter = options.random() * cap;
+      const retryAfter = Math.max(0, decision.retryAfterMs ?? 0);
+      const delay = Math.max(jitter, retryAfter);
+      const remaining = options.deadlineAt - options.now();
+      if (delay >= remaining) throw new TotalDeadlineExceeded();
+      await options.sleep(delay, options.signal);
+    }
+  }
+
+  throw new Error('Unreachable');
+}
+```
+
+`maxAttempts` gồm lần đầu. Inject clock/random/sleep để test deterministic. Full jitter tránh mọi client retry cùng nhịp; `Retry-After` là server constraint cần parse, cap và đặt trong total deadline.
+
+## Idempotency trước retry
+
+Timeout không chứng minh server chưa xử lý request. Retrying một POST thanh toán có thể tạo hai charge nếu server không hỗ trợ idempotency key và lưu kết quả theo key.
+
+Classifier chỉ retry network, rate-limit hoặc server failure được policy cho phép; validation/auth/conflict không retry mù. Cùng một key phải sống qua mọi attempt và gắn với business intent, không generate trong loop. Transport parse `Retry-After`; total deadline gồm attempt, backoff, parse và queue wait; cancellation dừng sleep lẫn I/O. Retry policy không thể biến non-idempotent operation thành idempotent — đó là contract producer + storage.
+
+## `Promise.race`, zombie work và stale result
+
+`Promise.race([work, timeout])` chỉ chọn promise settle trước; loser tiếp tục chạy. Nếu timeout thắng, fetch vẫn có thể hoàn tất, ghi cache hoặc mutate database: zombie result.
+
+Timeout phải abort underlying operation qua signal. Nhưng cancel vẫn cooperative; server hoặc bước CPU đã bắt đầu có thể không dừng. Với UI last-write-wins, thêm generation token:
+
+```ts
+type SearchApplyResult = { applied: true } | { applied: false; stale: true };
+
+let searchGeneration = 0;
+declare function search(query: string, signal?: AbortSignal): Promise<string[]>;
+declare function applySearchResults(items: string[]): void;
+
+async function refreshSearch(
+  query: string,
+  signal?: AbortSignal
+): Promise<SearchApplyResult> {
+  const generation = ++searchGeneration;
+  const items = await search(query, signal);
+  if (generation !== searchGeneration) return { applied: false, stale: true };
+  applySearchResults(items);
+  return { applied: true };
+}
+```
+
+Abort previous request để tiết kiệm work; generation check để ngăn kết quả muộn apply state dù cancellation không kịp. Token phải scope theo resource/key, không dùng một global counter cho mọi màn hình.
+
+## Structured concurrency: JavaScript còn cần convention
+
+Promise combinator không tạo task tree có owner, auto-cancel sibling và join children khi scope đóng. `AbortController` chỉ gửi tín hiệu; không thể ép promise không cooperative dừng. Một task scope tối thiểu cần controller chung, registry, error sink, deadline kế thừa và `close()` abort rồi `allSettled` để drain. Child không sống lâu hơn owner trừ khi được handoff sang queue/service có owner mới. Framework có thể cung cấp abstraction mạnh hơn, nhưng `Promise<T>` một mình không mang lifetime; structured concurrency hiện là design discipline của application.
+
+## Production case: submit order
+
+```ts
+type OrderInput = { sku: string; quantity: number };
+type Order = { id: string; status: 'accepted' };
+
+type SubmitOrderError =
+  | { code: 'INVALID_INPUT'; field: string }
+  | { code: 'CONFLICT' }
+  | { code: 'RATE_LIMITED'; retryAfterMs?: number }
+  | { code: 'UNAVAILABLE' }
+  | { code: 'TIMEOUT' }
+  | { code: 'CANCELLED' };
+
+type SubmitOptions = {
+  idempotencyKey: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+};
+
+type SubmitExecution = {
+  signal: AbortSignal;
+  idempotencyKey: string;
+  deadlineAt: number;
+};
+
+type SubmitDependencies = {
+  execute(input: OrderInput, context: SubmitExecution): Promise<Order>;
+  classifyExpected(
+    cause: unknown,
+    context: { signal: AbortSignal; timeoutSignal: AbortSignal }
+  ): SubmitOrderError | undefined;
+  observe(
+    outcome: 'expected-failure' | 'unexpected-failure',
+    code: SubmitOrderError['code'] | undefined,
+    safeCause: SafeCause
+  ): void;
 };
 ```
 
-Tách policy khỏi loop để test deterministic. Inject sleep/clock thay vì chờ thời gian thật.
-
-## Tránh floating promise
+`execute` sở hữu retry classifier nhưng phải giữ nguyên idempotency key và deadline qua mọi attempt. Orchestrator chỉ convert expected failure; programming error vẫn reject:
 
 ```ts
-void sendAnalytics(event).catch(reportAnalyticsFailure);
+async function submitOrder(
+  input: OrderInput,
+  options: SubmitOptions,
+  dependencies: SubmitDependencies
+): TaskResult<Order, SubmitOrderError> {
+  const deadline = withDeadline(options.signal, options.timeoutMs);
+  const deadlineAt = Date.now() + options.timeoutMs;
+
+  try {
+    const order = await dependencies.execute(input, {
+      signal: deadline.signal,
+      idempotencyKey: options.idempotencyKey,
+      deadlineAt,
+    });
+    return { ok: true, value: order };
+  } catch (cause: unknown) {
+    const expected = dependencies.classifyExpected(cause, {
+      signal: deadline.signal,
+      timeoutSignal: deadline.timeoutSignal,
+    });
+    if (expected) {
+      dependencies.observe(
+        'expected-failure',
+        expected.code,
+        redactCause(cause)
+      );
+      return { ok: false, error: expected };
+    }
+
+    dependencies.observe('unexpected-failure', undefined, redactCause(cause));
+    throw toError(cause);
+  } finally {
+    deadline.dispose();
+  }
+}
 ```
 
-`void` chỉ hợp lý khi chủ ý fire-and-forget và có error sink. Bật lint rule cho floating promise; compiler thuần không luôn bắt được.
+Validation nên chạy trước network; ví dụ rút gọn tập trung vào lifecycle. Production code còn phải làm `deadlineAt` dùng cùng injected monotonic clock thay vì trộn clock test với `Date.now()`.
 
-## Lab
+## Positive và negative type tests
 
-1. Model error của một use case bằng discriminated union; UI exhaustively xử lý.
-2. Thêm `AbortSignal` xuyên từ UI tới transport và test cancel.
-3. Viết retry loop có injected clock, jitter strategy và retry budget.
-4. Audit `Promise.all`: flow nào cần fail-fast, partial success, hay cancellation?
+```ts
+declare const orderInput: OrderInput;
+declare const submitDependencies: SubmitDependencies;
 
-**Done khi:** mọi async operation quan trọng có ownership, timeout/cancel policy và error contract rõ; không có rejected promise vô chủ.
+const validSubmitOptions = { idempotencyKey: 'idem_1', timeoutMs: 5_000 };
+const submitted = submitOrder(
+  orderInput,
+  validSubmitOptions,
+  submitDependencies
+);
+type SubmitContract = Expect<
+  Equal<typeof submitted, TaskResult<Order, SubmitOrderError>>
+>;
 
-## Đọc tiếp
+// @ts-expect-error retryable side effect bắt buộc có idempotency key
+submitOrder(orderInput, { timeoutMs: 5_000 }, submitDependencies);
+```
 
-- [Typing functions](https://www.typescriptlang.org/docs/handbook/2/functions.html)
-- [Narrowing](https://www.typescriptlang.org/docs/handbook/2/narrowing.html)
+Negative test khóa input contract; runtime test vẫn phải kiểm empty key, timeout âm và duplicate request semantics.
+
+## Runtime test matrix
+
+| Scenario                        | Assertion                                                  |
+| ------------------------------- | ---------------------------------------------------------- |
+| Success / transient rồi success | Không sleep khi success; attempt đúng và giữ key khi retry |
+| Validation/conflict             | Không retry                                                |
+| `Retry-After` / total deadline  | Tôn trọng server nhưng dừng trước attempt/sleep quá budget |
+| Caller cancel / timeout         | Sleep và transport nhận abort; phân loại đúng reason       |
+| Concurrency / partial batch     | In-flight không vượt limit; mọi item map đúng result       |
+| Stale search                    | Generation cũ không apply state                            |
+| Unexpected bug                  | Promise reject, không bị giả thành domain error            |
+
+Inject fake clock, deterministic random và abortable sleep; test retry không nên đợi thời gian thật. Property test hữu ích cho invariant `attempts <= maxAttempts`, delay không âm và elapsed không vượt total budget ngoài sai số scheduler.
+
+## Observability theo operation, không theo exception string
+
+Metrics/traces cần có total/per-attempt latency, queue wait, attempts, retry delay/`Retry-After`, terminal outcome, in-flight/queue depth, rejected/dropped work, stale-drop count và deadline còn lại.
+
+Log allowlist `operation`, safe error code, attempt, trace/request ID và duration. Không label theo user ID, URL đầy đủ, raw message hay idempotency key. Caller navigation cancel thường là normal outcome, không cần error alert; timeout/retry exhaustion cần signal riêng.
+
+Một operation trace có child span cho attempt; đừng report cùng cause như ba “incident” rồi lại report retry exhausted lần thứ tư. Attempt event phục vụ diagnostics, terminal outcome phục vụ SLO.
+
+## Failure modes thường gặp
+
+- Trả `UNKNOWN_ERROR` cho mọi catch hoặc expose transport exception: nuốt bug, leak secret và phá ownership.
+- Mỗi layer tự tạo timeout; retry mọi rejection: deadline bất định, cancel/validation/non-idempotent side effect bị lặp.
+- `Promise.race` làm timeout hoặc `Promise.all` trên array lớn: zombie work và concurrency vô hạn.
+- `allSettled` rò lên UI; `void promise` thiếu `.catch`: error không có owner.
+- Async Promise executor hoặc abort không generation check: lifecycle sai và stale mutation.
+- Metric label bằng message/ID: cardinality và dữ liệu nhạy cảm tăng.
+
+## Lab — resilient bulk checkout
+
+Xây operation xử lý một batch checkout với concurrency limit và partial result.
+
+1. Model `TaskResult<Order, CheckoutError>`; mapper UI exhaustive.
+2. Nhận caller signal và total deadline; per-attempt timeout không vượt remaining budget.
+3. Retry network/rate-limit bằng full jitter, tôn trọng `Retry-After`.
+4. Bắt buộc idempotency key ổn định cho từng order.
+5. Dùng bounded worker pool; không materialize toàn stream nếu input rất lớn.
+6. Abort sibling khi policy fail-fast; map partial failure khi policy all-settled.
+7. Thêm generation token cho màn hình refresh kết quả.
+8. Ghi terminal outcome, attempt spans, queue depth và stale-drop metric đã redact.
+
+**Acceptance criteria:**
+
+- catch variable và rejected reason được xử lý như `unknown`;
+- expected errors nằm trong discriminated union, unexpected bug vẫn reject;
+- mọi switch trên error union exhaustive;
+- cancel dừng sleep/I/O cooperative và timer được cleanup;
+- không có floating promise hoặc async Promise executor;
+- tuple output của `all`/`allSettled` được type-test;
+- peak in-flight không vượt limit trong runtime test;
+- retry không chạy cho validation/cancel và không vượt total deadline;
+- cùng idempotency key xuất hiện ở mọi attempt;
+- stale result không apply state;
+- logs/metrics không chứa raw payload, token hoặc high-cardinality message.
+
+**Done khi:** operation có owner, deadline và error vocabulary rõ; failure path deterministic dưới fake clock; consumer dùng đúng dễ hơn bỏ qua cancellation, idempotency hoặc exhaustive handling.
+
+## Tài liệu chính thức
+
+- [`useUnknownInCatchVariables`](https://www.typescriptlang.org/tsconfig/useUnknownInCatchVariables.html)
+- [`AbortSignal`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal)
+- [`AbortSignal.throwIfAborted()`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/throwIfAborted)
+- [`Promise.all()`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/all)
+- [`Promise.allSettled()`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/allSettled)
+- [Using promises](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Using_promises)

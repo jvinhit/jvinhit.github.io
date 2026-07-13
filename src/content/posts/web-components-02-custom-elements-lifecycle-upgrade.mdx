@@ -1,0 +1,428 @@
+---
+title: 'Web Components · Phần 2 — Custom Elements: Registry, Upgrade & Lifecycle'
+description: 'Hiểu quy tắc đặt tên, CustomElementRegistry, cơ chế upgrade và lifecycle; làm kb-task-card an toàn khi detach, reconnect, di chuyển hoặc đổi document.'
+pubDate: 2026-07-12
+lang: vi
+tags: [web-components, custom-elements, lifecycle, dom, javascript]
+series: web-components
+seriesOrder: 2
+draft: false
+---
+
+Ở Phần 1, `<kb-task-card>` chạy tốt khi nằm yên. Kanban thật không đứng yên:
+người dùng kéo card từ “Todo” sang “Doing”, bộ lọc tạm tháo card khỏi DOM, router
+giữ lại rồi gắn view cũ trở lại. Nếu mỗi lần nối DOM component lại gắn thêm một
+listener hoặc reset state, một click có thể toggle hai lần và card vừa kéo sẽ
+quên trạng thái trước đó.
+
+Đây không phải edge case. **Detach, move và reconnect là một phần bình thường
+của lifecycle DOM.** Muốn Custom Element bền, ta phải hiểu browser tạo instance,
+upgrade markup và gọi callback theo thứ tự nào.
+
+---
+
+## 1. Tên thẻ là một contract toàn document
+
+Tên autonomous custom element phải là một **valid custom element name**. Quy tắc
+dễ nhớ nhất là tên phải chứa dấu gạch ngang:
+
+```text
+<taskcard>       ❌ không có dấu gạch ngang
+<kb-task-card>   ✅ prefix + tên mô tả
+<kb-list>        ✅ hợp lệ
+```
+
+Dấu gạch ngang dành chỗ cho HTML chuẩn bổ sung thẻ mới mà không đụng tên của
+bạn. Tên còn phải bắt đầu bằng ký tự ASCII thường, không chứa chữ hoa và tuân
+theo grammar trong HTML Standard. Trong codebase thực tế, cứ dùng lowercase
+kebab-case là rõ ràng nhất.
+
+Prefix `kb-` không phải yêu cầu của spec; nó là quyết định kiến trúc. Registry
+được chia sẻ bởi mọi script trong cùng một `Window`, nên prefix ổn định giúp
+design system, widget bên thứ ba và application không tranh cùng một tên.
+
+Tên đã public thì khó đổi: markup server, CSS selector, test và consumer đều đã
+phụ thuộc nó. Hãy coi tên thẻ như package export, không như tên class nội bộ.
+
+---
+
+## 2. `CustomElementRegistry`: nơi tên gặp constructor
+
+`window.customElements` là registry mặc định. API cốt lõi nhỏ:
+
+```js
+class KbTaskCard extends HTMLElement {}
+
+customElements.define('kb-task-card', KbTaskCard);
+
+console.assert(customElements.get('kb-task-card') === KbTaskCard);
+await customElements.whenDefined('kb-task-card');
+```
+
+- `define(name, constructor)` đăng ký một định nghĩa.
+- `get(name)` trả constructor đã đăng ký hoặc `undefined`.
+- `whenDefined(name)` trả Promise resolve khi tên đó được định nghĩa.
+- `upgrade(root)` chủ động upgrade custom elements trong một subtree đã tạo.
+
+Registry không có `undefine()`. Định nghĩa lại cùng tên, hoặc đăng ký cùng một
+constructor dưới tên khác trong cùng registry, sẽ ném `NotSupportedError`. Vì
+vậy module production thường chỉ có một điểm registration rõ ràng.
+
+Trong môi trường hot reload hoặc demo bị import lặp, bạn đôi khi thấy guard:
+
+```js
+if (!customElements.get('kb-task-card')) {
+  customElements.define('kb-task-card', KbTaskCard);
+}
+```
+
+Guard tránh crash khi chính module ấy chạy lại, nhưng có thể che collision giữa
+hai package. Library nên có prefix và entry registration duy nhất.
+
+`whenDefined()` hữu ích ở phía consumer khi cần gọi method public chỉ có sau
+upgrade:
+
+```js
+await customElements.whenDefined('kb-task-card');
+document.querySelector('kb-task-card')?.focusPrimaryAction();
+```
+
+`whenDefined()` chỉ bảo đảm constructor đã được đăng ký và upgrade đã có thể
+xảy ra; nó không hứa một render bất đồng bộ của thư viện đã hoàn tất. Với bản Lit
+ở Phần 11, consumer cần chờ `card.updateComplete` (và promise kế tiếp nếu kết quả
+là `false`, nghĩa là update nối tiếp đã được lên lịch) trước khi gọi method phụ
+thuộc shadow DOM. Contract test Phần 10 gom khác biệt này vào helper `settle()`.
+
+Đừng chờ `whenDefined()` chỉ để hiển thị nội dung. Progressive markup ở Phần 1
+đã có thể paint trước khi definition đến.
+
+---
+
+## 3. Upgrade: markup có trước, class đến sau
+
+HTML parser có thể gặp `<kb-task-card>` trước module định nghĩa nó:
+
+```html
+<kb-task-card data-task-id="KB-101">...</kb-task-card>
+<script type="module" src="./kb-task-card.js"></script>
+```
+
+Browser vẫn tạo node và đặt nó vào DOM. Khi `define()` chạy, browser **upgrade**
+những node phù hợp đang tồn tại: constructor tùy chỉnh chạy trên element ấy,
+observed attributes được phản ứng, rồi `connectedCallback()` chạy nếu node đang
+connected. Identity của node được giữ nguyên; reference mà code khác đã cầm vẫn
+trỏ tới chính element đó.
+
+Node tạo _sau_ registration được dựng bằng constructor tùy chỉnh ngay:
+
+```js
+const card = document.createElement('kb-task-card');
+console.assert(card instanceof KbTaskCard);
+```
+
+Bạn cũng có thể upgrade một fragment trước khi gắn nó vào document:
+
+```js
+const template = document.createElement('template');
+template.innerHTML = `<kb-task-card></kb-task-card>`;
+
+const fragment = template.content.cloneNode(true);
+customElements.upgrade(fragment);
+document.querySelector('[data-column="todo"]').append(fragment);
+```
+
+Đây là API chuyên dụng; flow thông thường chỉ cần `define()` rồi để browser tự
+upgrade. Dùng `upgrade()` khi code cần instance tùy chỉnh hoạt động trong subtree
+đang disconnected trước khi chèn.
+
+### Property được gán trước upgrade
+
+Có một footgun tinh tế. Consumer có thể gán property khi definition chưa tải:
+
+```js
+const card = document.querySelector('kb-task-card');
+card.task = { id: 'KB-101', title: 'Viết test' };
+```
+
+Phép gán tạo **own property** trên object. Khi class upgrade thêm setter `task`
+trên prototype, own property có thể che setter đó. Component có public property
+cần hỗ trợ lazy upgrade có thể “replay” giá trị **một lần ở đầu
+`connectedCallback()`**. Làm ở đây giữ setter có side effect/render ra khỏi
+constructor:
+
+```js
+function upgradeProperty(element, name) {
+  if (!Object.prototype.hasOwnProperty.call(element, name)) return;
+  const value = element[name];
+  delete element[name];
+  element[name] = value; // đi qua setter trên prototype sau khi delete
+}
+```
+
+Phần 3 sẽ dùng pattern này khi thiết kế typed property `task`.
+
+---
+
+## 4. Constructor: làm ít và giữ đúng invariant
+
+Constructor chạy khi instance mới được tạo hoặc khi node cũ được upgrade. Luôn
+gọi `super()` trước khi dùng `this`:
+
+```js
+class KbTaskCard extends HTMLElement {
+  #connectionController;
+  #moveCount = 0;
+
+  constructor() {
+    super();
+    // Hợp lý: khởi tạo private state, bind/reference handler ổn định,
+    // attach shadow root nếu thiết kế cần nó.
+  }
+}
+```
+
+Theo yêu cầu constructor của Custom Elements, đừng đọc attributes hoặc children,
+đừng thêm attributes/children vào chính host và đừng phụ thuộc việc element đã ở
+document. Với parser-created element, children có thể chưa được parse xong; với
+upgrade, trạng thái có thể khác. Việc cần DOM hoặc markup consumer thuộc về
+`connectedCallback()`.
+
+Constructor không phù hợp cho fetch, đọc layout, tìm parent, gắn global listener
+hay render dựa trên child markup.
+
+---
+
+## 5. Lifecycle map
+
+Autonomous custom element có các callback chính:
+
+| Callback                     | Khi nào                                        | Trách nhiệm điển hình                     |
+| ---------------------------- | ---------------------------------------------- | ----------------------------------------- |
+| `constructor()`              | tạo mới hoặc upgrade                           | invariant và state nội bộ tối thiểu       |
+| `connectedCallback()`        | được nối vào document                          | setup listener, đọc child, bắt đầu work   |
+| `disconnectedCallback()`     | bị ngắt khỏi document                          | abort listener/request/timer              |
+| `connectedMoveCallback()`    | được state-preserving move bằng `moveBefore()` | phản ứng với move mà không teardown/setup |
+| `adoptedCallback()`          | chuyển sang `Document` khác                    | cập nhật dependency gắn với document      |
+| `attributeChangedCallback()` | observed attribute đổi                         | đồng bộ public attribute vào UI/state     |
+
+`attributeChangedCallback()` chỉ chạy cho tên được liệt kê trong
+`static observedAttributes`. Ta dành toàn bộ contract attribute cho Phần 3.
+
+Điều quan trọng nhất: `connectedCallback()` và `disconnectedCallback()` **không
+phải mount/unmount một lần duy nhất**. Cùng một object có thể đi qua cặp này nhiều
+lần.
+
+```text
+create/upgrade
+    │
+    ▼
+constructor
+    │ append
+    ▼
+connected ── remove/move kiểu cũ ──► disconnected
+    ▲                                  │
+    └──────────── append lại ──────────┘
+```
+
+---
+
+## 6. `<kb-task-card>` reconnect an toàn với `AbortController`
+
+Ta dùng event delegation trên host và một `AbortController` mới cho **mỗi phiên
+connected**. Khi disconnect, `abort()` gỡ mọi listener dùng signal ấy. Signal đã
+abort không tái sử dụng được, nên reconnect phải tạo controller mới.
+
+```js
+class KbTaskCard extends HTMLElement {
+  #connectionController;
+
+  connectedCallback() {
+    // Phòng callback thừa; một phiên connected chỉ có một controller.
+    if (this.#connectionController) return;
+
+    const controller = new AbortController();
+    this.#connectionController = controller;
+
+    this.addEventListener('click', this.#onClick, {
+      signal: controller.signal,
+    });
+
+    this.#syncView();
+  }
+
+  disconnectedCallback() {
+    this.#connectionController?.abort();
+    this.#connectionController = undefined;
+  }
+
+  connectedMoveCallback() {
+    // moveBefore() giữ nguyên phiên connected; listener vẫn còn.
+    // Chỉ sync phần nào thật sự phụ thuộc vị trí mới.
+    this.#syncView();
+  }
+
+  adoptedCallback(_oldDocument, _newDocument) {
+    // Không cần làm gì trong demo. Component dùng stylesheet/service gắn với
+    // document sẽ cập nhật chúng tại đây.
+  }
+
+  #onClick = (event) => {
+    if (!(event.target instanceof Element)) return;
+    const button = event.target.closest('[data-action="toggle"]');
+    if (!button || !this.contains(button)) return;
+
+    this.toggleAttribute('completed');
+    this.#syncView();
+  };
+
+  #syncView() {
+    const button = this.querySelector('[data-action="toggle"]');
+    if (!(button instanceof HTMLButtonElement)) return;
+
+    const completed = this.hasAttribute('completed');
+    button.setAttribute('aria-pressed', String(completed));
+    button.textContent = completed
+      ? 'Đánh dấu chưa hoàn thành'
+      : 'Đánh dấu hoàn thành';
+  }
+}
+
+customElements.define('kb-task-card', KbTaskCard);
+```
+
+Có thể dùng cùng signal cho listener trên `window`, `document` và `fetch()`.
+Timer không nhận AbortSignal, nên vẫn phải `clearInterval()` khi disconnect.
+
+Không reset dữ liệu business trong `connectedCallback()`. Private field và
+attribute thuộc cùng object nên vẫn tồn tại khi detach/reconnect. Callback chỉ
+thiết lập resource gắn với **phiên kết nối** và sync view từ state hiện có.
+
+---
+
+## 7. Move cũ, state-preserving move và adoption
+
+Di chuyển kiểu phổ biến dùng `append()`, `prepend()` hoặc `insertBefore()`:
+
+```js
+const card = document.querySelector('[data-task-id="KB-101"]');
+const done = document.querySelector('[data-column="done"]');
+done.append(card);
+```
+
+Về lifecycle, đây là remove rồi insert: `disconnectedCallback()` và
+`connectedCallback()` có thể chạy dù old/new parent nằm trong cùng document. Code
+AbortController ở trên chịu được điều đó: teardown rồi setup lại, không trùng
+listener và không mất state.
+
+Web platform còn có state-preserving move bằng `Element.moveBefore()`. Đây là
+API mới, mức hỗ trợ còn hạn chế. Khi API có mặt và class định nghĩa
+`connectedMoveCallback()`, browser có thể chuyển node mà không gọi cặp
+disconnected/connected:
+
+```js
+const before = done.firstElementChild;
+
+if (typeof done.moveBefore === 'function') {
+  done.moveBefore(card, before); // before có thể là null để đưa xuống cuối
+} else {
+  done.insertBefore(card, before); // fallback lifecycle cũ
+}
+```
+
+Đừng phụ thuộc `moveBefore()` nếu compatibility target chưa bảo đảm; lifecycle
+đúng cho remove/insert vẫn là baseline. `connectedMoveCallback()` là tối ưu cho
+component có setup đắt hoặc state khó được browser giữ qua remove/insert.
+
+`adoptedCallback()` là chuyện khác: element chuyển ownership sang một `Document`
+khác, chẳng hạn document trong iframe:
+
+```js
+const adoptedCard = iframe.contentDocument.adoptNode(card);
+iframe.contentDocument.body.append(adoptedCard);
+```
+
+Nếu component đọc `ownerDocument`, dùng document-scoped stylesheet hay service,
+hãy làm mới reference trong callback. Đa số UI component không cần override nó.
+
+---
+
+## 8. Async work cũng thuộc lifecycle
+
+Một fetch bắt đầu khi connected có thể hoàn tất sau khi card đã bị xóa. Kết quả
+không phải lúc nào cũng nguy hiểm, nhưng nó có thể ghi UI lỗi thời hoặc giữ
+resource lâu hơn cần thiết.
+
+```js
+async function loadTask(id, signal) {
+  const response = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    signal,
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+```
+
+Truyền signal của phiên connected vào fetch; coi `AbortError` là cleanup bình
+thường. Với Promise không hủy được, kiểm `this.isConnected` và một request token
+trước khi commit kết quả để tránh response cũ thắng response mới.
+
+---
+
+## Failure modes
+
+- **Gắn listener bằng arrow inline mỗi lần connect:** không có cùng function
+  reference để remove, reconnect tạo bản sao.
+- **Dùng một AbortController suốt đời:** một khi abort, mọi listener đăng ký sau
+  với signal đó cũng bị vô hiệu ngay.
+- **Khởi tạo state mặc định trong mỗi `connectedCallback()`:** kéo card qua cột
+  làm state quay về đầu.
+- **Giả định move trong cùng document không disconnect:** đúng với
+  `moveBefore()` phù hợp, không đúng với baseline `append/insertBefore`.
+- **Đọc child trong constructor:** parser có thể chưa tạo chúng; code phụ thuộc
+  timing và hỏng theo cách element được tạo.
+- **Nuốt collision bằng guard ở mọi package:** trang chạy nhưng có thể dùng nhầm
+  implementation đăng ký trước.
+
+---
+
+## Bài tập: lifecycle probe cho Mini Kanban
+
+1. Thêm `console.count()` vào constructor, connected, disconnected và
+   connectedMove callbacks.
+2. Tạo hai cột và nút “Chuyển cột” dùng `append(card)`. Quan sát cặp callback.
+3. Click toggle năm lần sau năm lượt chuyển. Mỗi click chỉ được xử lý một lần.
+4. Nếu browser hỗ trợ `moveBefore()`, thử nhánh state-preserving và so log.
+5. Thêm interval cập nhật một counter, tạo ở connected và clear ở disconnected.
+   Xóa card rồi kiểm tra counter dừng.
+6. Gán `card.task = {...}` trước khi import module và thử pattern replay property.
+
+**Hoàn thành khi:** card giữ state qua reconnect, không nhân listener/timer và
+log lifecycle khớp với cách node được di chuyển.
+
+---
+
+## Checklist cốt lõi
+
+- Tên Custom Element là public contract; dùng prefix để sở hữu namespace.
+- Registry gắn tên với constructor và không hỗ trợ unregister.
+- Markup có thể xuất hiện trước definition rồi được upgrade mà giữ node identity.
+- Constructor chỉ dựng invariant tối thiểu, không phụ thuộc DOM/attributes/child.
+- Connected/disconnected có thể chạy nhiều lần trên cùng instance.
+- Mỗi setup có teardown tương ứng; mỗi phiên connected có AbortController mới.
+- State business sống qua detach; resource gắn với connection thì không.
+- Baseline move phải chịu được disconnect/reconnect; `moveBefore()` chỉ là nhánh
+  state-preserving khi target hỗ trợ.
+
+Ở **Phần 3**, card sẽ có một public API thật: primitive qua attributes, typed
+data qua properties, boolean reflection đúng chuẩn, method có chủ đích và
+`CustomEvent` để `<kb-task-board>` nhận thay đổi mà không biết implementation bên
+trong.
+
+## Nguồn chính thức
+
+- [HTML Living Standard — Custom elements](https://html.spec.whatwg.org/multipage/custom-elements.html)
+- [MDN — `CustomElementRegistry`](https://developer.mozilla.org/en-US/docs/Web/API/CustomElementRegistry)
+- [MDN — Using custom elements](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_custom_elements)
+- [MDN — `CustomElementRegistry.upgrade()`](https://developer.mozilla.org/en-US/docs/Web/API/CustomElementRegistry/upgrade)
+- [MDN — `Element.moveBefore()`](https://developer.mozilla.org/en-US/docs/Web/API/Element/moveBefore)
+- [MDN — `AbortController`](https://developer.mozilla.org/en-US/docs/Web/API/AbortController)

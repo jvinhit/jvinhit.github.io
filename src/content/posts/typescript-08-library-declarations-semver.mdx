@@ -1,15 +1,31 @@
 ---
-title: 'TypeScript Production · Phần 8 — Library Authoring, .d.ts & Type SemVer'
+title: 'TypeScript Production · Phần 16 — Library Authoring, .d.ts & Type SemVer'
 description: 'Ship package TypeScript đáng tin: declaration emit, exports map, public type surface, type tests, API Extractor mindset và semver cho thay đổi inference.'
 pubDate: 2026-07-03
+updatedDate: 2026-07-12
 lang: vi
 tags: [typescript, library, declaration-files, semver]
 series: typescript
-seriesOrder: 8
+seriesOrder: 16
 draft: false
 ---
 
-Library TypeScript có hai sản phẩm: JavaScript runtime và trải nghiệm compiler của consumer. Test source pass chưa đủ; declaration emit có thể hỏng hoặc lộ internal type.
+Library TypeScript có hai sản phẩm: JavaScript runtime và trải nghiệm compiler
+của consumer. Thực tế còn một lớp giao hàng thứ ba: `package.json` quyết định
+runtime/type entry nào consumer thật sự resolve.
+
+```text
+source + tsconfig
+  ├─ JavaScript runtime artifact
+  ├─ declaration artifact (.d.ts/.d.mts/.d.cts)
+  └─ package metadata + tarball
+                     ↓
+        Node ESM / Node CJS / bundler / TypeScript versions
+```
+
+Test source pass chưa đủ. Declaration có thể lộ internal type; tarball có thể
+thiếu file; `exports` có thể đưa runtime tới ESM nhưng type checker tới declaration
+CJS. Staff-level release kiểm cả ba lớp như một contract duy nhất.
 
 ## Declaration là public ABI ở tầng type
 
@@ -37,6 +53,76 @@ export function createClient(options: ClientOptions): Client {
 
 Annotation ở public export tạo firewall: refactor internals không vô tình đổi type surface.
 
+## Declaration emit pipeline
+
+Compiler không "xóa implementation rồi giữ signature" một cách máy móc. Nó:
+
+1. dựng program/module graph theo config và resolution mode;
+2. type-check source;
+3. bắt đầu từ exported declarations của mỗi module;
+4. tìm tên có thể dùng để biểu diễn mọi type reachable;
+5. serialize declaration và import type cần thiết;
+6. tùy chọn emit declaration source map.
+
+Ba flag có trách nhiệm khác nhau:
+
+- `declaration: true` emit JavaScript **và** declaration;
+- `emitDeclarationOnly: true` chỉ emit declaration, phù hợp khi bundler/Babel/
+  SWC chịu trách nhiệm JavaScript;
+- `declarationMap: true` tạo `.d.ts.map`; Go to Definition về source tốt hơn nếu
+  package cũng ship source, đổi lại artifact lớn hơn và lộ path cần review.
+
+Một pipeline dùng bundler nên tách rõ:
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "module": "node18",
+    "rootDir": "src",
+    "declaration": true,
+    "declarationMap": true,
+    "emitDeclarationOnly": true,
+    "declarationDir": "dist/types"
+  }
+}
+```
+
+Bundler emit JavaScript không chứng minh declaration tương ứng với bundle. Test
+entry/subpath từ tarball để bắt tree-shaking, rename hay plugin transform làm hai
+artifact lệch nhau.
+
+## Public inferred type leakage
+
+Inferred type ở internal code rất hữu ích; ở exported boundary nó có thể kéo cả
+implementation graph vào ABI:
+
+```ts
+// internal/transport.ts
+export interface InternalTransport {
+  request(path: string): Promise<unknown>;
+}
+
+// public.ts — return type bị infer từ concrete implementation
+export function createClient(options: ClientOptions) {
+  return new InternalClient(new FetchTransport(options));
+}
+```
+
+Declaration có thể nhắc `InternalClient`, `FetchTransport` hoặc sinh
+`import("./internal/...")` dài. Consumer giờ phụ thuộc một tên/path bạn không hề
+định hỗ trợ.
+
+```ts
+export function createClient(options: ClientOptions): Client {
+  return new InternalClient(new FetchTransport(options));
+}
+```
+
+Annotation public không chỉ làm hover đẹp. Nó là firewall cho declaration size,
+dependency hygiene và Type SemVer. Inspect output sau emit; source annotation
+đúng nhưng barrel/rollup sai vẫn có thể leak.
+
 ## Public type phải dùng được từ consumer
 
 ```ts
@@ -54,6 +140,9 @@ export interface Client {
 
 ## Package metadata phải khớp output
 
+Với package ESM một entry, giữ root `types` cho tooling/registry cũ và khai báo
+`types` trong từng export public:
+
 ```json
 {
   "files": ["dist"],
@@ -61,38 +150,275 @@ export interface Client {
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js",
+      "default": "./dist/testing.js"
     }
   }
 }
 ```
 
-Luôn test tarball (`npm pack`/`pnpm pack`) từ một fixture consumer sạch. Workspace symlink có thể che missing file và dependency sai classification.
+Trade-off cần hiểu đúng:
+
+- `types` mô tả root khi `exports` không được đọc và giúp tooling nhận biết
+  package typed; nó không tự khai báo type cho mọi subpath.
+- `exports` là allowlist: khi được tôn trọng, subpath không khai báo sẽ bị chặn,
+  kể cả file có thật trong tarball.
+- `typesVersions` chọn declaration theo TypeScript version trong resolution path
+  không đọc `exports`; khi `exports` được đọc, field này không tham gia.
+- Modern `exports` có thể dùng condition `types@<selector>` cho compiler version,
+  đặt condition cụ thể trước fallback `types`.
+
+```json
+{
+  "exports": {
+    ".": {
+      "types@>=5.7": "./dist/index.d.ts",
+      "types": "./dist/types-compat/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "<5.7": {
+      "dist/index.d.ts": ["dist/types-compat/index.d.ts"]
+    }
+  }
+}
+```
+
+Đừng copy cả `typesVersions` lẫn versioned `types` condition mà không test
+resolution mode. Chúng phục vụ đường lookup khác nhau; consumer matrix mới cho
+biết fallback nào thực sự được chọn.
+
+## ESM path là một phần declaration contract
+
+Library chạy trực tiếp trên Node ESM nên author relative import bằng output
+extension:
+
+```ts
+// src/index.ts dưới module node18/nodenext
+export { createClient } from './client.js';
+export type { ClientOptions } from './client.js';
+```
+
+Declaration giữ specifier `./client.js`; TypeScript dùng extension substitution
+để tìm `.d.ts`, còn Node runtime tìm đúng `.js`. Import `./client` có thể chạy
+trong bundler nhưng fail ở Node ESM — `moduleResolution: bundler` không phải bằng
+chứng package Node-compatible.
+
+Module kind của declaration cũng có nghĩa:
+
+- `.d.mts` mô tả `.mjs`/ESM;
+- `.d.cts` mô tả `.cjs`/CommonJS;
+- `.d.ts` mô tả `.js`, và ESM/CJS phụ thuộc nearest `package.json` có
+  `"type": "module"` hay không.
+
+Vì thế đổi `type`, file extension hoặc export condition có thể là Type SemVer
+break dù nội dung interface không đổi.
+
+## Dual package cần dual declaration path
+
+Nếu publish cả ESM và CJS, mỗi runtime entry cần declaration đúng module kind:
+
+```json
+{
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.mts",
+        "default": "./dist/esm/index.mjs"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.cts",
+        "default": "./dist/cjs/index.cjs"
+      }
+    }
+  }
+}
+```
+
+Một `.d.ts` dùng chung có thể nói sai default/named export hoặc interop của một
+nhánh. Một lần type-check source cũng không chứng minh hai emit format đều đúng;
+build và test riêng ESM/CJS artifact, kể cả dependency conditional exports.
+
+Ưu tiên một format nếu consumer không thật sự cần dual package. Mỗi format thêm
+một runtime graph, declaration graph và rollback surface.
+
+Luôn test tarball từ fixture sạch. Workspace symlink có thể che missing file,
+deep import, hoisted dependency và metadata sai.
+
+## `stripInternal` là dao cắt không có type-check hậu kỳ
+
+`stripInternal: true` bỏ declaration có JSDoc `@internal`; JavaScript vẫn emit.
+Compiler cảnh báo rõ đây là option dùng có rủi ro vì nó không chứng minh output
+declaration còn hợp lệ.
+
+```ts
+/** @internal */
+export interface InternalToken {
+  readonly value: string;
+}
+
+// nguy hiểm: sau strip, public API vẫn tham chiếu tên đã biến mất
+export async function authenticate(token: InternalToken): Promise<void> {
+  void token;
+}
+```
+
+Public facade/`exports` allowlist đáng tin hơn việc export mọi thứ rồi strip.
+Nếu dùng `@internal`, CI phải compile một consumer từ declaration đã strip, không
+chỉ check source.
+
+## Module augmentation và global `.d.ts`
+
+Augmentation patch declaration có sẵn; nó không tạo implementation runtime:
+
+```ts
+import 'express-session';
+
+declare module 'express-session' {
+  interface SessionData {
+    userId?: string;
+  }
+}
+
+export {};
+```
+
+Module augmentation không được thêm top-level export mới và không augment được
+default export theo tên. Nó merge như declaration cùng module, nên upgrade
+dependency target có thể làm augmentation conflict.
+
+Global augmentation phải nằm trong external module (`export {}`) rồi dùng
+`declare global`:
+
+```ts
+export {};
+
+declare global {
+  interface Window {
+    acmeSdk?: { version: string };
+  }
+}
+```
+
+Chỉ ship global khi runtime thật sự cài `window.acmeSdk`. Nếu side effect là
+opt-in, expose subpath như `@acme/sdk/register`; đừng để import root âm thầm pollute
+mọi consumer. Test một fixture không import subpath để chắc global không leak.
+
+## API report mindset, không phụ thuộc tool
+
+Bạn không bắt buộc dùng API Extractor để có discipline của API report:
+
+1. emit declaration từ clean build;
+2. chọn các public entry trong `exports`;
+3. tạo canonical snapshot/report của exported declarations;
+4. review diff theo SemVer, không auto-approve vì text nhỏ;
+5. lưu report cạnh source và yêu cầu owner public API duyệt.
+
+Tool có thể rollup/report tốt hơn, nhưng contract là quy trình: mọi public type
+change phải hiện trong review. Raw `.d.ts` diff vẫn có giá trị nếu deterministic,
+không chứa absolute path/timestamp và cover mọi subpath.
 
 ## Type test gồm positive và negative
 
 ```ts
+import { createClient, type Client } from '@acme/sdk';
+
+type Compare<T> = <Candidate>() => Candidate extends T ? 1 : 2;
+type Equal<A, B> = Compare<A> extends Compare<B> ? true : false;
+type Expect<T extends true> = T;
+
+const client: Client = createClient({
+  baseUrl: new URL('https://example.test'),
+});
 const user = await client.getUser('usr_1');
-user.name satisfies string;
+type _Name = Expect<Equal<typeof user.name, string>>;
 
 // @ts-expect-error — number không phải user id
 await client.getUser(123);
+
+// @ts-expect-error — internal subpath không thuộc public exports
+await import('@acme/sdk/internal/transport');
 ```
 
-`@ts-expect-error` tự fail khi dòng không còn error, nên bắt regression “API trở nên quá rộng”. Thêm test inference, overload, subpath import và declaration compatibility trên TypeScript versions bạn support.
+`@ts-expect-error` tự fail khi dòng không còn error, nên bắt regression "API
+trở nên quá rộng". Test ít nhất:
+
+- literal/generic inference consumer dựa vào;
+- overload được chọn cho từng call shape;
+- readonly/optional và error correlation;
+- root + mọi exported subpath import được;
+- deep/internal subpath vẫn bị chặn;
+- declaration compile trên minimum và current TypeScript.
+
+Chạy test này trong fixture cài tarball. Test cùng workspace source có thể bypass
+`exports`, đọc `.ts` thay `.d.ts`, hoặc hưởng `paths` alias consumer thật không có.
 
 ## Type SemVer tinh vi hơn runtime SemVer
 
-Có thể breaking dù JavaScript không đổi:
+JavaScript không đổi vẫn có thể cần major release. Review theo vị trí consumer:
 
-- thêm property bắt buộc vào exported interface;
-- thu hẹp parameter hoặc đổi generic default;
-- thêm overload làm inference chọn nhánh khác;
-- thay `enum`/class làm nominal behavior đổi;
-- expose type mới từ dependency và vô tình bắt consumer cài type đó;
-- tăng minimum TypeScript version bằng syntax `.d.ts` mới.
+| Thay đổi                                | Vì sao có thể breaking                          |
+| --------------------------------------- | ----------------------------------------------- |
+| Thêm field bắt buộc vào input/interface | object literal và implementer cũ không đủ       |
+| Thêm member vào output union            | exhaustive switch consumer không còn exhaustive |
+| Thu hẹp parameter/widen output          | caller nhận ít hơn hoặc phải handle nhiều hơn   |
+| Đổi generic default/constraint          | omitted type argument và inference đổi          |
+| Thêm/sắp xếp overload                   | call chọn signature khác                        |
+| Đổi class/enum/unique symbol            | nominal identity hoặc emitted value đổi         |
+| Dùng syntax declaration mới             | minimum TypeScript cũ không parse được          |
 
-Ngược lại, mở rộng union output thường cũng breaking: consumer exhaustive switch sẽ fail — và compiler đang làm đúng việc.
+### Variance: cùng chữ "widen" nhưng hướng khác nhau
+
+```ts
+interface Hooks {
+  onData(handler: (event: UserEvent) => void): void;
+}
+```
+
+Đổi callback parameter từ `UserEvent` sang `DomainEvent` rộng hơn bắt handler
+consumer nhận nhiều event hơn, nên có thể breaking. Với function property dưới
+`strictFunctionTypes`, parameter được kiểm tra contravariant; method có lịch sử
+bivariant hơn. Đừng phân loại SemVer chỉ bằng assignability trong một config —
+test strict consumer ở đúng syntactic form.
+
+### Overload order và inference là API
+
+```ts
+declare function parse(input: string): ParsedText;
+declare function parse(input: string | Uint8Array): Parsed;
+```
+
+Thêm overload rộng phía trước có thể đổi call resolution. Utility như
+`ReturnType` trên overloaded function suy luận từ signature cuối, không chạy
+overload resolution theo arguments. Reorder để "dọn code" vẫn có thể đổi type.
+
+### Generic default và union member
+
+```ts
+interface Page<Item = unknown> {
+  items: readonly Item[];
+}
+```
+
+Đổi default `unknown` thành `{ id: string }` làm code bỏ type argument có contract
+mới. Thêm member vào **input** union thường additive cho caller, nhưng có thể
+break implementer/callback contravariant; thêm member vào **output** union thường
+break exhaustive consumer.
+
+### Inference regression cũng là regression
+
+`const` type parameter, overload mới, optional parameter hay generic constraint
+có thể đổi literal widening và error location. Positive test phải assert inferred
+result; negative test bảo invalid call vẫn invalid. Không cần đợi runtime crash
+mới gọi đó là breaking.
 
 ## Prefer types hay interface?
 
@@ -102,16 +428,116 @@ Không có luật “public luôn interface”. Dùng interface cho object contr
 
 Nếu declaration public import type từ package khác, consumer cũng cần resolve nó. Dependency type đó thường phải ở `dependencies` hoặc `peerDependencies`, không chỉ `devDependencies`. Inspect declaration graph để quyết định.
 
+## Tarball là artifact cần test
+
+Inspect chính thứ npm sẽ publish, không inspect `dist` riêng lẻ:
+
+```bash
+npm pack --dry-run --json
+npm pack --json
+tar -tf acme-sdk-1.4.0.tgz
+```
+
+Kiểm tra `files`, license/readme, source/maps có chủ đích, mọi path trong
+`exports`, declaration dependency và không có fixture/secret/cache. `npm pack
+--json` cũng cho size/file list để CI đặt budget.
+
+Fixture nên cài tarball với scripts tắt trước để test package content an toàn:
+
+```bash
+npm install --ignore-scripts ../../artifacts/acme-sdk-1.4.0.tgz
+npm run typecheck
+npm run runtime-smoke
+```
+
+Nếu install script là public behavior, test nó ở job sandbox riêng thay vì bật
+ngầm trong mọi fixture.
+
+## Consumer matrix tối thiểu
+
+| Fixture            | Mục tiêu                                            |
+| ------------------ | --------------------------------------------------- |
+| Node ESM           | `module/moduleResolution: node18`, import + runtime |
+| Node CJS           | require path, `.cts` consumer, runtime export shape |
+| Bundler            | `module: preserve`, `moduleResolution: bundler`     |
+| Minimum TypeScript | declaration syntax + supported inference            |
+| Current TypeScript | release hiện tại và lib/module semantics mới        |
+
+Mỗi fixture phải cài cùng `.tgz`, không dùng workspace symlink. Chạy cả
+`tsc --noEmit` và runtime import/require; type pass nhưng `ERR_PACKAGE_PATH_NOT_EXPORTED`
+vẫn là release fail.
+
+Với minimum/current compiler:
+
+```bash
+npx -p typescript@5.7 tsc -p fixtures/node-esm
+npx -p typescript@latest tsc -p fixtures/node-esm
+```
+
+Trong CI thật, pin exact versions thay vì floating `latest`; dòng trên minh họa
+hai đầu support window. Nếu support version-specific declaration, chạy matrix cho
+cả resolution mode đọc `exports` và fallback dùng `typesVersions`.
+
+## Release và rollback runbook
+
+Pre-release:
+
+1. clean build JavaScript + declaration cho từng module format;
+2. diff API report, phân loại runtime/type SemVer;
+3. pack, inspect tarball và declaration graph;
+4. chạy positive/negative type tests cùng consumer matrix;
+5. publish canary bằng dist-tag riêng;
+6. cài canary từ registry sạch, smoke runtime/type lần cuối;
+7. promote `latest` khi evidence đầy đủ.
+
+```bash
+npm publish --tag next
+npm dist-tag add @acme/sdk@1.4.0 latest
+```
+
+Rollback:
+
+1. chuyển dist-tag về version tốt trước để chặn install mới;
+2. deprecate version lỗi với message/action rõ;
+3. publish patch forward — registry version đã publish là immutable;
+4. chỉ unpublish theo policy registry và security/legal incident;
+5. giữ fixture tái hiện, thêm regression test trước release kế tiếp.
+
+```bash
+npm dist-tag add @acme/sdk@1.3.2 latest
+npm deprecate @acme/sdk@1.4.0 "Broken declarations; upgrade to 1.4.1"
+```
+
+Rollback declaration-only bug cũng khẩn như runtime bug: editor/CI của consumer
+có thể bị chặn ngay khi lockfile cập nhật dù production JavaScript chưa chạy.
+
 ## Lab
 
-1. Build một package, đọc toàn bộ entry `.d.ts` như consumer.
-2. Tạo fixture cài tarball và chạy `tsc --noEmit`.
-3. Viết type tests cho inference và invalid calls.
-4. So sánh public declarations trước/sau refactor; phân loại semver.
+1. Build một package ESM có root + subpath, đọc declaration như consumer.
+2. Tạo một inferred leakage, chụp `.d.ts`, rồi sửa bằng named public contract.
+3. Thêm opt-in module/global augmentation khớp runtime side effect.
+4. Pack `.tgz`; chạy Node ESM, Node CJS, bundler, min/current TS fixtures.
+5. Viết positive tests cho inference và negative tests cho invalid/deep import.
+6. Tạo API report trước/sau; phân loại variance, overload, generic/union changes.
+7. Dry-run canary, promotion và rollback dist-tag trong registry test.
 
-**Done khi:** package được test từ artifact đã đóng gói, public declaration nhỏ/ổn định, và release review xét cả runtime lẫn type surface.
+**Acceptance criteria:**
+
+- mọi JavaScript entry có declaration đúng module kind và ESM path;
+- tarball chỉ chứa file có chủ đích, không có declaration trỏ file thiếu;
+- `exports`, root `types` và version fallback được fixture chứng minh;
+- public `.d.ts` không leak internal path/type hoặc dependency chưa khai báo;
+- augmentation chỉ xuất hiện khi import đúng opt-in entry và runtime khớp;
+- positive/negative type tests pass trên min + current TypeScript;
+- API diff có SemVer classification, release/rollback có owner và evidence.
 
 ## Tài liệu chính thức
 
 - [Publishing declaration files](https://www.typescriptlang.org/docs/handbook/declaration-files/publishing.html)
 - [Declaration file introduction](https://www.typescriptlang.org/docs/handbook/declaration-files/introduction.html)
+- [Modules reference: package resolution](https://www.typescriptlang.org/docs/handbook/modules/reference.html)
+- [Choosing compiler options for libraries](https://www.typescriptlang.org/docs/handbook/modules/guides/choosing-compiler-options.html)
+- [`declaration`, `emitDeclarationOnly`, `declarationMap`](https://www.typescriptlang.org/tsconfig/#Emit)
+- [`stripInternal` caveat](https://www.typescriptlang.org/tsconfig/stripInternal.html)
+- [Module augmentation](https://www.typescriptlang.org/docs/handbook/declaration-merging.html#module-augmentation)
+- [Global-modifying module template](https://www.typescriptlang.org/docs/handbook/declaration-files/templates/global-modifying-module-d-ts.html)

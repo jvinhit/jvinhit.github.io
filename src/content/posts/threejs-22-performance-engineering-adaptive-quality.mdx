@@ -1,0 +1,435 @@
+---
+title: 'Three.js from Zero to Senior · Part 22 — Performance Engineering & Adaptive Quality'
+description: 'Turn frame time into an engineering control loop: diagnose CPU versus GPU bottlenecks, budget draw/vertex/fragment/upload work, precompile variants, and ship adaptive quality with SLOs and rollout guardrails.'
+pubDate: 2026-07-12
+lang: vi
+tags: [threejs, 3d, performance, gpu, adaptive-quality, observability]
+series: threejs
+seriesOrder: 22
+draft: false
+---
+
+import DemoEmbed from '~/components/blog/DemoEmbed.astro';
+
+“FPS thấp” là triệu chứng, không phải root cause. Xóa một nửa polygon có thể không thay đổi gì nếu bạn nghẽn draw-call ở CPU. Gộp mọi thứ thành một mesh có thể làm culling tệ hơn. Hạ DPR có thể cứu fragment-bound scene nhưng vô nghĩa khi main thread đang decode JSON. Một tối ưu không bắt đầu bằng giả thuyết và phép đo chỉ là đổi code lấy hy vọng.
+
+Ở cấp Staff/Principal, hiệu năng Three.js là một **control system**:
+
+```text
+measure → classify bottleneck → choose cheapest quality lever
+        → verify visual/latency SLO → roll out → observe → adjust
+```
+
+Lab bên dưới tạo workload có chủ đích: draw-call, vertex, overdraw/fragment, shadow, upload và post-processing. Nó báo frame interval p50/p95, CPU submit time, `renderer.info`, shader program count và GPU time nếu extension timer-query thực sự khả dụng. Khi không có GPU timer, UI nói rõ đang dùng fallback thay vì đặt nhãn sai cho CPU time.
+
+<DemoEmbed
+  slug="threejs-frame-budget-lab"
+  title="Three.js frame budget and adaptive quality lab"
+  height="960px"
+/>
+
+## 16.67 ms là ngân sách của cả hệ thống
+
+Ở màn hình 60 Hz, một refresh interval xấp xỉ `1000 / 60 = 16.67 ms`. Đây không phải “GPU budget 16.67 ms”. Nó là cửa sổ end-to-end mà browser phải chia cho nhiều việc:
+
+```text
+input + framework + application update + animation/physics
++ Three.js traversal/culling/sort + WebGL command submission
++ GPU vertex/fragment/shadow/post work
++ browser composite/present + scheduling noise
+≤ refresh interval
+```
+
+Nếu application dành hết 16 ms cho `renderer.render()`, frame đã trễ trước khi browser composite. Nếu màn 120 Hz, cửa sổ còn khoảng 8.33 ms. Nếu sản phẩm chọn 30 fps, budget khoảng 33.33 ms nhưng input latency và cảm giác chuyển động cũng thay đổi.
+
+Ba metric cần phân biệt:
+
+- **frame interval**: khoảng giữa hai callback/presentation opportunity; phản ánh cadence người dùng cảm nhận nhưng gồm cả chờ vsync và scheduling;
+- **CPU submit/update time**: thời gian JavaScript chạy update + gọi renderer; không đồng nghĩa GPU đã hoàn tất;
+- **GPU elapsed time**: cần timer query bất đồng bộ và có thể không khả dụng hoặc bị invalid bởi trạng thái disjoint.
+
+Đừng lấy `performance.now()` bọc quanh `renderer.render()` rồi gọi kết quả là “GPU time”. WebGL command submission bất đồng bộ; số đó chủ yếu là CPU-side work và driver submission.
+
+## Đo p95, không tối ưu theo một FPS counter đẹp
+
+Average che mất hitch. Một app có 59 frame nhanh và một frame 120 ms vẫn có “average FPS” khá đẹp nhưng người dùng cảm nhận cú giật. Hãy giữ rolling window và báo percentile:
+
+```ts
+function percentile(samples: number[], q: number) {
+  if (samples.length === 0) return 0;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1);
+  return sorted[index];
+}
+
+const p50 = percentile(frameIntervals, 0.5);
+const p95 = percentile(frameIntervals, 0.95);
+```
+
+Measurement policy cũng là code production:
+
+- bỏ sample khi document hidden hoặc vừa resume;
+- tách warm-up/compile/load khỏi steady state, nhưng vẫn đo startup riêng;
+- gắn scenario, quality tier, viewport pixel count và device class vào sample;
+- không so desktop dev build với mobile production như cùng một population;
+- dùng đủ sample và confidence interval trước khi tự động quyết định rollout.
+
+Chrome Performance panel cho frame, CPU và GPU activity, nhưng GPU track không tự động biến mọi event thành cost của một draw. Nó là bằng chứng để nối timeline, không phải oracle: [Chrome DevTools Performance](https://developer.chrome.com/docs/devtools/performance) và [Performance features reference](https://developer.chrome.com/docs/devtools/performance/reference/).
+
+## CPU-bound hay GPU-bound: thay một biến, quan sát độ nhạy
+
+Không phải môi trường nào cũng có GPU timer. Một quy trình chẩn đoán vẫn có thể mạnh nếu dùng controlled experiment:
+
+| Thử nghiệm                                | Nếu frame time giảm mạnh | Nghi phạm chính                                 |
+| ----------------------------------------- | ------------------------ | ----------------------------------------------- |
+| Hạ DPR từ 2 xuống 1                       | Có                       | fragment, bandwidth, post, shadow fill          |
+| Giữ triangle nhưng giảm object/draw       | Có                       | CPU traversal, state change, driver submission  |
+| Giữ draw-call nhưng giảm segment/instance | Có                       | vertex processing hoặc memory bandwidth         |
+| Tắt transparent layers/bloom              | Có                       | overdraw, fragment, render-target bandwidth     |
+| Tắt shadow hoặc giảm light cast shadow    | Có                       | extra scene pass + shadow fill                  |
+| Dừng dynamic buffer/texture upload        | Có                       | CPU update, bus upload, synchronization         |
+| Profile JS khi renderer bị bỏ qua         | Vẫn chậm                 | application/framework/GC, không phải render GPU |
+
+Thay **một biến mỗi lần**. Nếu hạ DPR không đổi p95 nhưng giảm mesh count giúp rõ, đừng tiếp tục làm texture mờ đi. Nếu cả CPU submit lẫn GPU timer đều thấp nhưng frame interval cao, điều tra scheduling, task khác, thermal throttling hoặc compositor.
+
+## `renderer.info` hữu ích, nhưng nó không nói “frame này tốn bao nhiêu ms”
+
+`renderer.info` cho `render.calls`, `render.triangles`, `render.lines`, `render.points`, số geometry/texture và danh sách program. Đây là counter cấu trúc, không phải profiler thời gian.
+
+```ts
+renderer.info.autoReset = false;
+
+function renderWholeFrame() {
+  renderer.info.reset();
+  shadowPrepass();
+  composer.render();
+
+  metrics.calls = renderer.info.render.calls;
+  metrics.triangles = renderer.info.render.triangles;
+  metrics.programs = renderer.info.programs?.length ?? 0;
+}
+```
+
+Mặc định counter reset mỗi render call. Với nhiều pass, cần chủ động reset một lần theo frame nếu muốn tổng số có nghĩa. Tài liệu chính thức mô tả đúng contract này: [Three.js `WebGLRenderer.info`](https://threejs.org/docs/pages/WebGLRenderer.html#info).
+
+Các giới hạn cần ghi ngay trên dashboard:
+
+- 100 draw call không mặc định nhanh hơn 200; material, state và GPU workload khác nhau;
+- triangle không phản ánh fragment cost, overdraw hay texture bandwidth;
+- `memory.textures` không cho biết byte VRAM chính xác;
+- program count chỉ gợi ý variant pressure, không cho thời gian compile;
+- counter từ post-processing có thể sai nếu reset ở từng pass.
+
+Counter dùng để **kiểm chứng shape của workload**. Time measurement dùng để đánh giá cost.
+
+## Sáu lớp bottleneck cần tách
+
+### 1. Draw/submission-bound
+
+Mỗi mesh/material group thường tạo draw call. CPU phải traverse, cull, sort, cập nhật uniform/state và submit lệnh. Một nghìn cube cực ít triangle nhưng một nghìn draw vẫn có thể nghẽn CPU.
+
+Đòn bẩy:
+
+- `InstancedMesh` khi cùng geometry/material;
+- merge theo material và lifecycle, không merge mù quáng qua culling boundary;
+- giảm material group;
+- tránh tạo object/list tạm trong hot loop;
+- chỉ cập nhật matrix khi thay đổi, dùng `matrixAutoUpdate = false` cho static object nếu workflow kiểm soát được.
+
+### 2. Vertex-bound
+
+Vertex shader chạy cho mỗi vertex của mỗi pass. Shadow map có thể chạy geometry lại. Skinned/morph/complex shader tăng cost mỗi vertex.
+
+Đòn bẩy:
+
+- LOD theo projected size, không chỉ distance;
+- offline simplify và meshopt;
+- giảm segment procedural;
+- culling tốt hơn;
+- hạn chế skin influence/morph target theo profile thực tế.
+
+### 3. Fragment/overdraw-bound
+
+Số pixel shader invocation phụ thuộc **drawing-buffer pixel**, diện tích phủ, overdraw, material và pass. Canvas CSS `1000 × 600` ở DPR 2 là `2000 × 1200`: gấp bốn fragment so với DPR 1.
+
+Transparent surface thường vẫn shade pixel dù kết quả sau đó blend. Full-screen post pass chạm gần như mọi pixel. Bloom còn render nhiều target/downsample/blur. Đòn bẩy nhanh nhất thường là DPR/post tier, không phải polygon.
+
+### 4. Shadow-bound
+
+Mỗi shadow-casting light thêm render pass của caster từ góc nhìn light. Point-light shadow cần nhiều hướng. Shadow map resolution tăng pixel cost theo bình phương mỗi chiều.
+
+Đòn bẩy:
+
+- chỉ một số light cast shadow;
+- fit shadow camera chặt;
+- tách static/dynamic caster;
+- giảm map size theo tier;
+- dùng baked/AO/contact-shadow giả khi fidelity cho phép.
+
+### 5. Bandwidth-bound
+
+Texture lớn, render target HDR, MSAA, nhiều G-buffer/post target và sampling pattern đẩy băng thông. File WebP nhỏ không có nghĩa texture trên GPU nhỏ; KTX2/Basis có thể giảm cả transfer và resident footprint tùy format đích.
+
+Đo resolution, format, mip, số lần pass đọc/ghi. “Texture count” không đủ.
+
+### 6. Upload/synchronization-bound
+
+Mỗi frame thay toàn bộ `BufferAttribute`, instance matrix hoặc texture video lớn có thể làm CPU copy và GPU upload. Đọc ngược GPU hoặc ép compile đúng lúc tương tác còn tạo synchronization stall.
+
+Đòn bẩy:
+
+- update range nhỏ;
+- ring/double buffer khi phù hợp;
+- batch mutation;
+- worker cho chuẩn bị CPU, nhưng nhớ GPU upload vẫn ở rendering context;
+- tránh tạo mới geometry/material/texture trong frame loop.
+
+Performance lab cho phép cô lập các lớp trên bằng seed và safety cap cố định. Mục tiêu không phải benchmark tuyệt đối giữa máy, mà là học dấu vân tay khi mỗi trục thay đổi.
+
+## DPR là quality control có hiệu lực lớn nhất
+
+Đừng mặc định `renderer.setPixelRatio(devicePixelRatio)` trên mọi thiết bị. DPR 3 tạo chín lần số pixel của DPR 1. Với canvas lớn, chênh lệch vượt xa việc giảm vài nghìn triangle.
+
+```ts
+function applyResolution(cssWidth: number, cssHeight: number, dprCap: number) {
+  const dpr = Math.min(window.devicePixelRatio, dprCap);
+  renderer.setPixelRatio(dpr);
+  renderer.setSize(cssWidth, cssHeight, false);
+  composer.setSize(cssWidth, cssHeight);
+}
+```
+
+`ResizeObserver` nên quan sát container thật; không chỉ nghe `window.resize`. Khi tier đổi DPR, resize cả renderer lẫn render targets. Nếu chỉ CSS scale canvas, drawing buffer vẫn có thể quá lớn hoặc bị blur.
+
+Quality tier nên định nghĩa **effective drawing pixels**, không chỉ tên “High/Low”. Ví dụ:
+
+| Tier     | DPR cap | Shadow                | Post        | Geometry/particles |
+| -------- | ------: | --------------------- | ----------- | -----------------: |
+| Ultra    |     2.0 | 2048, selected lights | bloom + AA  |               100% |
+| Balanced |     1.5 | 1024, one key light   | lightweight |                70% |
+| Safe     |     1.0 | off/baked             | off         |                45% |
+
+Đây là policy minh họa, không phải universal preset. SLO và visual acceptance của sản phẩm quyết định lever nào được phép hạ.
+
+## Shader compile và program variant: hitch không nằm trong steady FPS
+
+Material combination, light/shadow state, skinning, morph, fog, clipping và define tạo shader program variant. Variant xuất hiện lần đầu giữa tương tác có thể gây hitch dù steady-state p95 đẹp.
+
+`compileAsync()` dùng `KHR_parallel_shader_compile` khi có và resolve khi scene có thể render mà không cần stall compile không cần thiết. Three.js khuyến nghị phiên bản async khi có thể: [WebGLRenderer `compileAsync`](https://threejs.org/docs/pages/WebGLRenderer.html#compileAsync).
+
+```ts
+async function warmScene(renderer, scene, camera, sessionToken) {
+  await renderer.compileAsync(scene, camera);
+  if (sessionToken !== currentSessionToken) return;
+  markReady();
+}
+```
+
+Nhưng precompile không chữa variant explosion. Cần quản trị:
+
+- inventory material features theo product state thực sự;
+- tránh đổi `defines`/material type mỗi frame;
+- tái sử dụng material khi contract giống nhau;
+- warm những variant nằm trên critical interaction path;
+- đo startup compile riêng và hiển thị loading state trung thực;
+- invalidation bằng session token nếu scene đổi trong lúc compile.
+
+Program count tăng không chứng minh leak, nhưng tăng không giới hạn qua route/option cycle là tín hiệu cần điều tra ownership hoặc variant cache.
+
+## GPU timer query: bất đồng bộ, optional và có thể disjoint
+
+`EXT_disjoint_timer_query_webgl2` đo elapsed GPU time mà không cần gọi `gl.finish()`, nhưng result chỉ có ở frame sau. Nếu `GPU_DISJOINT_EXT` true, sample không hợp lệ và phải bỏ. Query object cũng cần xóa.
+
+```ts
+const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+const pending: WebGLQuery[] = [];
+
+function beginGpuSample() {
+  if (!ext || pending.length >= MAX_PENDING) return null;
+  const query = gl.createQuery();
+  if (!query) return null;
+  gl.beginQuery(ext.TIME_ELAPSED_EXT, query);
+  return query;
+}
+
+function endGpuSample(query: WebGLQuery | null) {
+  if (!query || !ext) return;
+  gl.endQuery(ext.TIME_ELAPSED_EXT);
+  pending.push(query);
+}
+
+function pollGpuSamples() {
+  const query = pending[0];
+  if (!query || !ext) return;
+
+  const ready = gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE);
+  const disjoint = gl.getParameter(ext.GPU_DISJOINT_EXT);
+  if (!ready && !disjoint) return;
+
+  if (ready && !disjoint) {
+    const nanoseconds = gl.getQueryParameter(query, gl.QUERY_RESULT);
+    recordGpuMs(nanoseconds / 1e6);
+  }
+  gl.deleteQuery(query);
+  pending.shift();
+}
+```
+
+Extension không phải lúc nào cũng lộ ra do browser, driver, privacy hoặc context. Khi thiếu, dashboard phải ghi “GPU timer unavailable; CPU submit fallback”, không tự đổi nhãn. Contract chính thức nằm ở [Khronos `EXT_disjoint_timer_query_webgl2`](https://registry.khronos.org/webgl/extensions/EXT_disjoint_timer_query_webgl2/).
+
+## Adaptive quality là feedback controller, không phải `if (fps < 60)`
+
+Một threshold đơn làm tier rung liên tục: vừa hạ chất lượng thì frame nhanh, lập tức nâng lại, rồi chậm. Controller cần smoothing, hysteresis, dwell time và cooldown.
+
+```ts
+const alpha = 0.08;
+let ewmaMs = 16.67;
+let slowFrames = 0;
+let fastFrames = 0;
+let lastChangeAt = -Infinity;
+
+function observe(frameMs: number, now: number) {
+  ewmaMs += alpha * (frameMs - ewmaMs);
+
+  const canChange = now - lastChangeAt >= 4_000;
+  if (ewmaMs > 19) {
+    slowFrames += 1;
+    fastFrames = 0;
+  } else if (ewmaMs < 13.5) {
+    fastFrames += 1;
+    slowFrames = 0;
+  } else {
+    slowFrames = fastFrames = 0; // dead band
+  }
+
+  if (canChange && slowFrames >= 45) {
+    degradeOneTier();
+    lastChangeAt = now;
+    slowFrames = fastFrames = 0;
+  } else if (canChange && fastFrames >= 180) {
+    upgradeOneTier();
+    lastChangeAt = now;
+    slowFrames = fastFrames = 0;
+  }
+}
+```
+
+Giải thích policy:
+
+- **EWMA** lọc spike đơn lẻ nhưng vẫn theo xu hướng;
+- threshold downgrade và upgrade khác nhau tạo **hysteresis**;
+- cần ít bằng chứng để cứu frame hơn để nâng fidelity;
+- **cooldown** cho hệ thống ổn định sau resize/rebuild/compile;
+- mỗi lần chỉ đổi một tier để biết lever nào tạo tác động;
+- bỏ sample hidden, loading, compile và resize burst khỏi steady controller.
+
+Controller không nên tự động hạ chất lượng vì một GC pause duy nhất, cũng không nên cố giữ fidelity trong thermal throttling kéo dài.
+
+## Quality tier là product contract
+
+Không phải chi tiết nào cũng được phép mất. Với configurator, màu và silhouette là correctness; shadow softness có thể là enhancement. Với data visualization, label và pick target không được giảm; particle trang trí có thể giảm.
+
+Mỗi tier nên là object versioned, có reason và observability:
+
+```ts
+type QualityTier = {
+  id: 'safe' | 'balanced' | 'ultra';
+  dprCap: number;
+  shadowMapSize: 0 | 1024 | 2048;
+  bloom: boolean;
+  particleScale: number;
+  lodBias: number;
+};
+
+metrics.emit('quality_changed', {
+  from,
+  to,
+  reason: 'ewma_over_budget',
+  ewmaMs,
+  p95Ms,
+  viewportPixels,
+});
+```
+
+Cho người dùng override khi phù hợp và lưu preference có version. Auto mode phải công khai tier hiện tại; “tự nhiên ảnh mờ đi” là UX bug nếu hệ thống giấu quyết định.
+
+## SLO: biến “mượt” thành mục tiêu vận hành
+
+Một SLO khả dụng cần population, metric và time window. Ví dụ minh họa:
+
+- 95% active sessions thuộc device class mục tiêu có steady-state frame p95 không quá 20 ms ở interaction chính;
+- 99.5% scene load không gặp context loss trong năm phút đầu;
+- startup interaction-ready p75 dưới 2.5 s trên network/device profile đã định;
+- adaptive downgrade rate dưới ngưỡng, và tỷ lệ session ở Safe tier không tăng sau release;
+- visual regression của mỗi tier pass golden scene tolerance.
+
+Không dùng một SLO cho mọi route. Landing hero, editor, game và configurator có workload, input latency và fidelity contract khác nhau.
+
+Telemetry cần sampling để không tự tạo bottleneck. Aggregate rolling metric, gửi lúc transition hoặc session end; đừng log mỗi frame. Tránh fingerprinting: không gửi raw GPU renderer string nếu không có lý do và review privacy.
+
+## Rollout: performance change cũng có blast radius
+
+Một thay đổi material, shadow hay asset pipeline có thể chỉ lỗi trên một GPU family. Rollout nên đi theo tầng:
+
+1. benchmark fixture deterministic trong CI để bắt regression lớn;
+2. canary nội bộ với profiler marker và screenshot tier;
+3. 1–5% traffic, so p95, context loss, error, quality distribution;
+4. tăng dần khi guardrail ổn;
+5. kill switch server-config để hạ post/shadow/DPR mà không chờ deploy.
+
+So sánh cohort theo device/viewport/scenario. Nếu release mới “nhanh hơn” chỉ vì controller đẩy nhiều user xuống Safe, đó không phải chiến thắng; phải đọc performance **cùng quality distribution**.
+
+## Quy trình điều tra một regression
+
+Ví dụ sau release, p95 tăng từ 18 lên 28 ms:
+
+1. Xác nhận population và version, loại loading/hidden sample.
+2. So CPU submit, GPU timer (nếu hợp lệ), calls, triangles, programs, DPR pixels và tier.
+3. Reproduce bằng seed/scenario gần cohort xấu.
+4. Hạ DPR: nếu cải thiện mạnh, ưu tiên fragment/post/bandwidth hypothesis.
+5. Tắt shadow rồi post từng cái; không tắt cả hai cùng lúc.
+6. Nếu CPU submit cao nhưng GPU thấp, profile JS/traversal/upload và GC allocation.
+7. Nếu hitch chỉ ở first interaction, kiểm variant compile và asset upload.
+8. Áp lever nhỏ nhất giữ product contract; đo lại trên thiết bị mục tiêu.
+9. Canary và theo guardrail quality/context loss, không chỉ average FPS.
+
+Runbook này nhanh hơn “thử optimize shader” vì mỗi bước cắt bớt không gian nguyên nhân.
+
+## Lab bắt bạn chứng minh điều gì?
+
+1. Chọn **Draw calls**, giữ workload rồi đổi tier. Nếu DPR giảm nhưng calls không đổi và p95 ít đổi, đó là dấu vết submission-bound.
+2. Chọn **Overdraw**, đổi DPR 2 → 1. Quan sát drawing pixels giảm bốn lần và frame cost nhạy hơn.
+3. Chọn **Vertex**, giữ calls thấp nhưng triangle cao. So với Draw calls để thấy cùng FPS xấu có shape khác.
+4. Chọn **Upload**, dừng motion/update. Nếu CPU submit giảm, bottleneck không nằm ở số draw.
+5. Bật/tắt shadow và bloom riêng lẻ; đọc total calls qua nhiều pass với `autoReset = false`.
+6. Chạy `compileAsync` warm-up rồi đổi scenario. Program count và warm-up time giúp tách startup hitch khỏi steady-state.
+7. Bật Adaptive. Lab dùng EWMA + hysteresis + cooldown; quan sát reason mỗi lần đổi tier, không chỉ màu badge.
+8. Nếu GPU timer unavailable, xác nhận UI không bịa GPU ms. Dùng CPU submit + sensitivity test và mở DevTools để tiếp tục chẩn đoán.
+9. Nhấn Emergency reset: workload trở về baseline, pending query bị xóa, DPR về safe và benchmark dừng.
+
+## Definition of done cấp Tech Lead
+
+Một tối ưu Three.js chỉ hoàn tất khi có:
+
+- hypothesis và bottleneck class;
+- fixture/seed tái hiện được;
+- before/after p50, p95, CPU submit, GPU timer nếu hợp lệ;
+- calls/triangles/programs/pixels để mô tả workload;
+- test trên device class mục tiêu, không chỉ laptop dev;
+- visual acceptance theo từng tier;
+- startup/compile và steady-state tách riêng;
+- SLO, telemetry sampling, canary và rollback/kill switch;
+- kết quả không được “mua” bằng việc âm thầm hạ quality distribution.
+
+Đó là khác biệt giữa một mẹo tăng FPS và performance engineering.
+
+## Tài liệu chính thức để kiểm chứng
+
+- [Three.js `WebGLRenderer`](https://threejs.org/docs/pages/WebGLRenderer.html)
+- [Three.js `WebGLRenderer.info`](https://threejs.org/docs/pages/WebGLRenderer.html#info)
+- [Three.js `compileAsync`](https://threejs.org/docs/pages/WebGLRenderer.html#compileAsync)
+- [Three.js `Timer`](https://threejs.org/docs/pages/Timer.html)
+- [Khronos `EXT_disjoint_timer_query_webgl2`](https://registry.khronos.org/webgl/extensions/EXT_disjoint_timer_query_webgl2/)
+- [Khronos WebGL 2.0 specification](https://registry.khronos.org/webgl/specs/latest/2.0/)
+- [Chrome DevTools Performance](https://developer.chrome.com/docs/devtools/performance)
+- [Chrome DevTools Performance reference](https://developer.chrome.com/docs/devtools/performance/reference/)

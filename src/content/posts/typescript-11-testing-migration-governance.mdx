@@ -1,103 +1,471 @@
 ---
-title: 'TypeScript Production · Phần 11 — Testing, Migration & Governance'
-description: 'Kết hợp runtime tests, type tests và lint; migrate JavaScript/legacy TypeScript theo boundary, đo any budget và nâng compiler mà không đóng băng delivery.'
+title: 'TypeScript Production · Phần 19 — Testing, Migration & Governance'
+description: 'Kết hợp runtime, type, artifact và consumer tests; migrate legacy theo boundary, kiểm Type SemVer, nâng compiler bằng canary và vận hành governance không nghẽn delivery.'
 pubDate: 2026-07-09
+updatedDate: 2026-07-12
 lang: vi
 tags: [typescript, testing, migration, governance]
 series: typescript
-seriesOrder: 11
+seriesOrder: 19
 draft: false
 ---
 
-Compiler không test behavior; unit test không test inference; lint không chứng minh domain invariant. Quality system tốt biết mỗi công cụ chịu trách nhiệm cho lớp lỗi nào.
+Compiler không test behavior; unit test không test inference; source typecheck không chứng minh tarball chứa đúng `.d.ts`; một package build được bằng compiler của maintainer chưa chắc chạy với compiler tối thiểu của consumer.
 
-## Kim tự tháp kiểm chứng
+Staff engineer không giải bài toán này bằng “thêm strict”. Họ thiết kế một **quality system** biết mỗi lớp chịu trách nhiệm cho failure nào, release nào phải chặn, debt nào có owner, và cách rollback mà không đóng băng delivery.
 
-| Lớp                  | Bắt lỗi gì                                 | Ví dụ                        |
-| -------------------- | ------------------------------------------ | ---------------------------- |
-| Compiler             | assignability, exhaustiveness, nullability | sai payload event            |
-| Type test            | public inference và invalid calls          | overload regression          |
-| Unit/property test   | runtime logic và invariant                 | parser, state transition     |
-| Integration/contract | boundary thật                              | API/schema/database adapter  |
-| E2E                  | critical user flow                         | checkout                     |
-| Lint                 | unsafe pattern compiler không cấm          | floating promise, unsafe any |
+## Bốn lớp của test pyramid
 
-Không snapshot hover type dài. Assert capability consumer thật sự cần.
+| Lớp         | Artifact được kiểm                                  | Bắt regression                                     | Không chứng minh        |
+| ----------- | --------------------------------------------------- | -------------------------------------------------- | ----------------------- |
+| Runtime     | JavaScript đang chạy                                | parser, state transition, retry, side effect       | public inference        |
+| Type/source | source `.ts` dưới một compiler/config               | assignability, narrowing, positive/negative calls  | package đã publish      |
+| Artifact    | JS, `.d.ts`, `package.json`, exports sau build/pack | declaration leak, sai subpath, JS/type lệch nhau   | app consumer thật       |
+| Consumer    | tarball được install trong fixture độc lập          | resolution, compiler range, module mode, public UX | toàn bộ behavior nội bộ |
 
-## Negative type test là bắt buộc cho guardrail
+Lint, E2E và contract tests bổ sung theo risk, nhưng không thay bốn lớp trên. Một E2E xanh không phát hiện generic output đã widen thành `any`; một type test xanh không biết parser chấp nhận payload sai.
 
-```ts
-declare const client: Client;
+Test nên bám vào failure boundary:
 
-await client.getUser('usr_1');
-
-// @ts-expect-error invalid ID shape must stay rejected
-await client.getUser(123);
+```text
+source contract ──build──> JS + .d.ts + package metadata
+      │                         │
+ type tests                artifact tests
+      │                         │
+      └──────────install tarball──────────> consumer fixture
+runtime input ──parse──> domain value ─────> behavior tests
 ```
 
-Nếu chỉ test positive, API có thể widen thành `any` mà suite vẫn xanh.
+## Một public contract để test xuyên suốt
 
-## Migration theo boundary, không theo phần trăm file
+```ts
+type UserId = `usr_${string}`;
 
-Một chiến lược incremental:
+type User = {
+  id: UserId;
+  name: string;
+};
 
-1. Bật `allowJs` + `checkJs` cho vùng phù hợp.
-2. Đưa input ngoài hệ thống về `unknown` trong adapter.
-3. Tạo domain types và contract cho feature đang thay đổi.
-4. Convert leaf module trước, orchestration sau.
-5. Siết rule theo directory mới; legacy có budget giảm dần.
-6. Chỉ bật strict flag toàn repo khi error category đã có playbook.
+interface Client {
+  getUser(id: UserId): Promise<User>;
+  search(options?: { limit?: number }): Promise<readonly User[]>;
+}
 
-“90% file là `.ts`” không nói hệ thống an toàn nếu 10% boundary vẫn trả `any`.
+declare const client: Client;
+```
 
-## Any budget
+Contract nhỏ này có ít nhất bốn câu hỏi độc lập:
 
-Phân loại thay vì cấm khẩu hiệu:
+1. `getUser('usr_1')` infer `Promise<User>` không?
+2. `getUser(123)` có bị từ chối không?
+3. implementation có parse response trước khi trả `User` không?
+4. consumer cài tarball có resolve được `Client` từ public export không?
 
-- explicit `any` do mình viết;
-- implicit `any`;
-- unsafe assignment/call/member access từ dependency;
-- assertion và non-null assertion;
-- suppression (`@ts-ignore`).
+Chỉ viết một loại test sẽ bỏ sót ba câu còn lại.
 
-Mỗi suppression cần lý do, owner và điều kiện xóa. Dùng `@ts-expect-error` thay `@ts-ignore` để compiler báo khi workaround hết cần.
+## Positive type tests: khóa capability, không snapshot hover
 
-## Nâng TypeScript như một migration sản phẩm
+Positive test xác nhận valid call vẫn dùng được và output vẫn đủ chính xác:
 
-1. Đọc release notes và breaking changes.
-2. Tạo branch chỉ nâng compiler/`@types`, không trộn feature.
-3. Chạy full type tests và declaration consumer fixtures.
-4. Phân loại error: bug thật, inference đổi, lib.d.ts đổi, config deprecation.
-5. Sửa bằng explicit contract trước assertion.
-6. Canary trên một package/app rồi mở rộng.
-7. Ghi minimum supported TS version cho library.
+```ts
+type Equal<Left, Right> =
+  (<T>() => T extends Left ? 1 : 2) extends <T>() => T extends Right ? 1 : 2
+    ? true
+    : false;
 
-TypeScript 6 có deprecation hướng tới TypeScript 7 native. `ignoreDeprecations` chỉ là cầu tạm, không phải kết quả migration.
+type Expect<Condition extends true> = Condition;
 
-## Contract test tại boundary
+const userPromise = client.getUser('usr_1');
+type GetUserOutput = Expect<Equal<typeof userPromise, Promise<User>>>;
 
-Schema consumer test nên chạy trên fixture từ producer hoặc generated spec. Nếu nhiều service, thêm compatibility check vào pipeline producer để biết thay đổi nào phá consumer trước deploy.
+const searchPromise = client.search({ limit: 20 });
+type SearchOutput = Expect<
+  Equal<typeof searchPromise, Promise<readonly User[]>>
+>;
+```
 
-## Governance không làm chậm team
+Đừng snapshot một expanded type dài hàng trăm dòng. Snapshot thay đổi vì alias formatting dù consumer capability không đổi. Hãy assert điều consumer quan sát: return, key, accepted input, readonly, optionality và correlation.
 
-Guardrail tốt tự động và gần feedback loop:
+Equality helper cũng có giới hạn: overloaded function, `any`, intersections chưa normalize và compiler internals có thể cho kết quả khó đọc. Khi equality quá mạnh, dùng assignability hai chiều hoặc test một call thật.
 
-- editor dùng workspace TypeScript version;
-- pre-commit chỉ chạy fast affected checks;
-- PR chạy typecheck/lint/unit/type tests;
-- main/nightly chạy full graph, package fixture, diagnostics;
-- dashboard theo dõi any/suppression và check-time trend.
+```ts
+declare function acceptUser(value: User): void;
 
-## Lab
+userPromise.then(acceptUser);
+```
 
-1. Viết test matrix cho một library: runtime + positive type + negative type + tarball consumer.
-2. Lập inventory `any`/assertion/suppression và tạo baseline budget.
-3. Migrate một vertical slice từ request tới domain, không chỉ đổi extension.
-4. Dry-run nâng compiler, ghi taxonomy lỗi và playbook.
+Call-site test thường cho diagnostic gần trải nghiệm consumer hơn một type puzzle.
 
-**Done khi:** quality gate bắt regression cả runtime lẫn type UX, còn migration giảm risk theo boundary mà feature delivery vẫn tiếp tục.
+## Negative type tests: guardrail phải thật sự khóa cửa
+
+```ts
+await client.getUser('usr_valid');
+
+// @ts-expect-error number không phải UserId
+await client.getUser(123);
+
+// @ts-expect-error prefix phải là usr_
+await client.getUser('customer_1');
+
+// @ts-expect-error limit phải là number
+await client.search({ limit: '20' });
+```
+
+Nếu chỉ test positive, API có thể widen thành `any` và suite vẫn xanh. Negative test biến invalid call thành contract: nếu lỗi biến mất, compiler báo directive không còn cần thiết.
+
+### Caveat của `@ts-expect-error`
+
+Directive chỉ yêu cầu **có một diagnostic ở dòng kế tiếp**. Nó không khóa diagnostic code hay lý do lỗi. Test sau có thể xanh vì typo, không phải vì ID bị chặn:
+
+```ts
+// @ts-expect-error test này mơ hồ: getUsr có thể chỉ là typo
+await client.getUsr(123);
+```
+
+Quy tắc production:
+
+- mỗi directive chỉ bao quanh một misuse;
+- đặt sát token/dòng thực sự phát lỗi, nhất là object literal nhiều dòng;
+- luôn có positive twin chứng minh API đúng vẫn tồn tại;
+- mô tả invariant, không chỉ viết “expected error”;
+- không dùng directive để kiểm exact message vì format diagnostic không phải stable API;
+- phân biệt directive trong type fixture với suppression trong production source.
+
+`@ts-ignore` không báo khi suppression hết cần. Chỉ giữ nó cho compatibility case có lý do cụ thể, owner và ngày xóa; trong test contract, ưu tiên `@ts-expect-error`.
+
+## Plain `tsc`, `expectTypeOf` hay `tsd`?
+
+| Cách                           | Điểm mạnh                                              | Trade-off                                                               |
+| ------------------------------ | ------------------------------------------------------ | ----------------------------------------------------------------------- |
+| Plain fixture + `tsc --noEmit` | Không thêm DSL; config/compiler explicit; gần consumer | Helper equality tự bảo trì; output runner thô                           |
+| `expectTypeOf`                 | Matcher dễ đọc, colocate với Vitest                    | Matcher runtime là no-op; pipeline phải thật sự typecheck test files    |
+| `tsd`/tương đương              | DSL cho `.test-d.ts`, positive/negative API test       | Thêm tool/version/config; vẫn phải bảo đảm test đúng built declarations |
+
+Ví dụ matcher:
+
+```ts
+import { expectTypeOf } from 'vitest';
+
+expectTypeOf(client.getUser('usr_1')).toEqualTypeOf<Promise<User>>();
+```
+
+Chọn một tool làm convention, nhưng artifact fixture vẫn cần plain consumer compile. Tool đẹp không cứu được test đang import source qua workspace alias thay vì `.d.ts` trong tarball.
+
+## Runtime tests: type không thay parser
+
+Runtime boundary phải được test bằng fixture hợp lệ, sai shape, thiếu field, unknown field theo policy và version chưa hỗ trợ.
+
+```ts
+function isUser(value: unknown): value is User {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.id === 'string' &&
+    record.id.startsWith('usr_') &&
+    typeof record.name === 'string'
+  );
+}
+
+const validPayload: unknown = { id: 'usr_1', name: 'Ada' };
+const invalidPayload: unknown = { id: 1, name: 'Ada' };
+
+if (!isUser(validPayload)) throw new Error('valid fixture rejected');
+if (isUser(invalidPayload)) throw new Error('invalid fixture accepted');
+```
+
+Type predicate ở đây vẫn là code có thể sai; runtime tests phải đánh vào từng nhánh. Với schema library, test cả `input` và transformed `output`, không chỉ inferred `z.infer`-style type.
+
+## Artifact test: test thứ mình ship, không test source thay thế
+
+Declaration emit có thể leak private alias, trỏ sai extension hoặc không khớp conditional exports dù source typecheck xanh. Release pipeline phải build rồi test đúng artifact:
+
+```text
+dist/
+  index.js
+  index.d.ts
+  node.js
+  node.d.ts
+package.json
+fixtures/consumer-node/
+fixtures/consumer-bundler/
+```
+
+Flow tối thiểu:
+
+```sh
+npm run build
+npm pack --pack-destination ./artifacts
+# install tarball vào fixture sạch, không dùng workspace link
+npm --prefix fixtures/consumer-node install
+npm --prefix fixtures/consumer-node run typecheck
+npm --prefix fixtures/consumer-node run smoke
+```
+
+Consumer fixture phải import package như user thật:
+
+```ts
+import { createClient } from '@acme/client';
+import type { Client } from '@acme/client';
+
+const clientFromPackage: Client = createClient({
+  baseUrl: new URL('https://api.example.com'),
+});
+
+clientFromPackage.getUser('usr_1');
+// @ts-expect-error public artifact phải tiếp tục từ chối number
+clientFromPackage.getUser(1);
+```
+
+Không dùng `paths` trỏ về `src`, không hoist dependency từ monorepo vào fixture, không import file private. Cài tarball trong directory sạch sẽ bắt thiếu dependency, sai `types`/`exports`, ESM/CJS mismatch và subpath không publish.
+
+Artifact gate nên kiểm:
+
+- entrypoint JS và `.d.ts` cùng tồn tại;
+- mọi public subpath resolve ở module mode được hỗ trợ;
+- declaration không tham chiếu file ngoài tarball;
+- runtime import shape khớp declaration shape;
+- package không vô tình export internal type;
+- tarball consumer chạy với dependency graph thật.
+
+API report hoặc declaration snapshot hữu ích để review surface, nhưng không thay compile fixture: snapshot thấy text đổi, consumer fixture chứng minh assignability và resolution.
+
+## Matrix nhiều compiler version
+
+Minimum supported TypeScript version là một phần contract của library. Matrix nên có ba lane:
+
+| Lane              | Mục đích                                    | Chính sách                         |
+| ----------------- | ------------------------------------------- | ---------------------------------- |
+| Minimum supported | Chứng minh support floor                    | Blocking trên PR/release           |
+| Workspace/current | Feedback hằng ngày                          | Blocking                           |
+| `next`/preview    | Phát hiện sớm breaking inference/lib change | Nightly, canary trước khi blocking |
+
+Mỗi lane compile **consumer fixture từ tarball**, không chỉ source. Nếu package hỗ trợ cả `NodeNext` và `Bundler`, tạo hai tsconfig fixture; đừng nhân toàn bộ Cartesian matrix trên mọi PR. PR chạy floor + current ở mode chính, nightly chạy mode/version mở rộng.
+
+Script có thể gọi compiler alias trực tiếp:
+
+```sh
+node node_modules/typescript-min/bin/tsc -p fixtures/consumer/tsconfig.json
+node node_modules/typescript-current/bin/tsc -p fixtures/consumer/tsconfig.json
+node node_modules/typescript-next/bin/tsc -p fixtures/consumer/tsconfig.json
+```
+
+Pin version chính xác trong lockfile. “Latest” làm kết quả hôm nay không tái hiện được ngày mai. Nếu dùng `typesVersions` hoặc versioned `types` condition, thêm fixture cho từng nhánh; routing declaration không thay thế compatibility test.
+
+## Type SemVer: runtime không đổi vẫn có thể breaking
+
+Các thay đổi sau có thể phá consumer dù JavaScript giống hệt:
+
+- return từ `User` thành `User | undefined`;
+- input từ `string` bị hẹp thành branded ID;
+- đổi generic default làm output inference khác;
+- reorder/remove overload làm call chọn signature khác;
+- thêm union member khiến exhaustive switch của consumer fail;
+- đổi optionality/readonly hoặc minimum compiler requirement;
+- “sửa type sai” nhưng consumer đã phụ thuộc contract cũ.
+
+| Thay đổi                                                    | SemVer gợi ý                          |
+| ----------------------------------------------------------- | ------------------------------------- |
+| Declaration/docs sửa nhưng assignability consumer không đổi | Patch                                 |
+| Thêm API opt-in, overload mới không đổi call cũ             | Minor, phải có regression fixture     |
+| Invalid hóa call cũ hoặc đổi inferred output                | Major, trừ khi policy đã công bố khác |
+
+Đừng quyết định bằng diff `.d.ts` một mình. Chạy consumer corpus cũ với artifact mới: positive calls cũ phải compile; negative calls quan trọng vẫn phải fail. Với package nội bộ, “major” có thể là coordinated migration, nhưng impact vẫn phải được đo và owner consumer phải biết.
+
+Version floor cũng cần policy công khai. Nâng minimum TypeScript version có thể là breaking đối với consumer dù source package không đổi.
+
+## Migration legacy theo boundary, không theo phần trăm file
+
+“90% file là `.ts`” không nói hệ thống an toàn nếu 10% còn lại là auth, payment hoặc API adapter trả `any`. Migrate theo vertical slice và trust boundary:
+
+1. Inventory producer/consumer và điểm dữ liệu ngoài process đi vào.
+2. Baseline compiler errors, suppressions và check time; chưa sửa hàng loạt.
+3. Bật `allowJs` để TS và JS cùng program trong vùng migration.
+4. Bật `checkJs` cho package/leaf phù hợp hoặc dùng `// @ts-check` có chọn lọc.
+5. Đổi external input thành `unknown`, parse tại adapter, đặt domain contract sau parser.
+6. Convert leaf module trước orchestration; giữ PR nhỏ theo behavior.
+7. Siết strict flag theo project/package boundary bằng ratchet.
+8. Xóa bridge declaration/suppression khi consumer cuối đã migrate.
+
+Config cầu nối:
+
+```json
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true
+  },
+  "include": ["src/**/*"]
+}
+```
+
+`allowJs` đưa JavaScript vào program; `checkJs` báo lỗi trong JS được include. Nếu bật toàn repo tạo hàng nghìn lỗi vô chủ, tách solution thành project/package có config riêng. Compiler flags không thể thực sự “strict theo folder” bên trong cùng một program; boundary build graph mới là ratchet đáng tin.
+
+JSDoc là bước trung gian tốt khi rename file làm diff quá lớn:
+
+```js
+// @ts-check
+
+/** @param {unknown} value */
+export function readName(value) {
+  if (typeof value !== 'object' || value === null) return undefined;
+  if (!('name' in value) || typeof value.name !== 'string') return undefined;
+  return value.name;
+}
+```
+
+Không đổi `.js` thành `.ts` rồi thêm `any` cho hết đỏ; đó là chuyển đuôi file, không chuyển trust model.
+
+## Strictness ratchet
+
+Ratchet chỉ đi một chiều và gần code owner:
+
+- code mới/touched lines không được tạo debt mới;
+- package đã strict không được hạ config để merge feature;
+- mỗi migration wave giảm ceiling theo category;
+- exception có expiry và removal condition;
+- rule mới chạy report-only trước, rồi blocking khi đã có playbook;
+- rollback rule nếu false-positive làm nghẽn incident response, không rollback toàn chiến lược.
+
+Không bật một strict flag toàn monorepo chỉ để đạt ngày mốc. Hãy phân loại error, sửa shared declaration trước leaf noise, canary trên package đại diện rồi mở rộng.
+
+## Budget cho `any`, assertion và suppression
+
+Phân loại debt vì risk khác nhau:
+
+| Category                                    | Risk điển hình                                       |
+| ------------------------------------------- | ---------------------------------------------------- |
+| Explicit/implicit `any`                     | Mất kiểm tra lan qua graph                           |
+| Unsafe call/member/assignment từ dependency | `any` ngoại lai đi vào domain                        |
+| `as` và non-null `!`                        | Claim không có runtime proof                         |
+| `@ts-expect-error` trong production         | Debt tạm nhưng có stale detection                    |
+| `@ts-ignore`                                | Debt có thể sống mãi mà không báo                    |
+| Test-only negative directive                | Contract test, không tính như production suppression |
+
+Mỗi production exception cần `kind`, file, owner, lý do, link issue, ngày tạo/expiry và điều kiện xóa. Policy nên chặn **debt mới** và debt quá hạn, không chỉ đếm tổng toàn repo.
+
+Weight theo risk: `any` trong generated fixture khác `any` ở auth adapter; assertion ngay sau validator khác assertion trên response chưa parse. Raw count không đủ để ưu tiên.
+
+## Codemod làm việc cơ học; review giữ semantics
+
+Codemod phù hợp rename API, thêm explicit extension, đổi deprecated option hoặc tạo annotation có quy tắc chắc chắn. Nó không nên tự đoán domain type hay rải `as unknown as T` để làm build xanh.
+
+Workflow:
+
+1. Viết input/output fixtures, gồm comment, overload và syntax edge case.
+2. Dry-run, đo số file/node thay đổi và unsupported cases.
+3. Chạy transform idempotent: lần hai không tạo diff.
+4. Commit mechanical diff riêng, không trộn behavior change.
+5. Chạy format, type/runtime/artifact tests.
+6. Reviewer sample theo risk và xem mọi assertion/suppression mới.
+7. Giao phần codemod không chắc cho owner sửa thủ công.
+
+Review không chỉ hỏi “tsc xanh chưa?” mà hỏi source of truth ở đâu, boundary có parse không, public inference có đổi không, và assertion mới dựa trên proof nào.
+
+## Nâng compiler: canary, rollout, rollback
+
+Compiler upgrade là migration sản phẩm:
+
+1. Freeze baseline bằng lockfile, full diagnostics và artifact fixtures.
+2. Nâng compiler riêng trước; nâng `@types`/toolchain riêng nếu có thể để attribution rõ.
+3. Chạy floor/current/new trên package canary: type-heavy library, app lớn, Node và bundler fixture.
+4. Phân loại lỗi: bug thật, inference đổi, `lib.d.ts`, module resolution, declaration emit, config deprecation hay tool incompatibility.
+5. Sửa bằng explicit contract trước assertion; thêm regression test cho từng class.
+6. Rollout theo wave, quan sát CI time, editor latency và consumer failures.
+7. Promote workspace version chỉ khi canary ổn; giữ previous lock artifact để rollback.
+
+Rollback trigger phải viết trước rollout: release package không build, consumer fixture quan trọng fail, check time vượt budget hoặc false-positive blocker chưa có playbook. Rollback compiler không có nghĩa xóa fixes đúng; giữ commit tách nhỏ để cherry-pick.
+
+`ignoreDeprecations`, `skipLibCheck` hay suppression diện rộng chỉ là bridge có deadline. Nếu dùng để canary, ghi rõ signal nào cho phép gỡ.
+
+## Ownership và governance không nghẽn delivery
+
+| Trách nhiệm                                   | Owner mặc định                      |
+| --------------------------------------------- | ----------------------------------- |
+| Base config, compiler matrix, fixture harness | Platform/tooling                    |
+| Public contract và Type SemVer                | Package maintainer                  |
+| Parser/domain invariant, exception cleanup    | Feature/domain team                 |
+| Release gate và incident coordination         | Package owner + release engineering |
+
+Không bắt platform approve mọi generic. Team tự ship trong paved road; chỉ cần RFC khi đổi supported compiler range, public type pattern dùng toàn tổ chức, boundary policy hoặc shared build graph.
+
+Exception flow phải nhanh: template máy đọc được, owner rõ, SLA theo risk, auto-reminder trước expiry. Governance tốt biến quyết định lặp lại thành automation; review con người dành cho trade-off mới.
+
+## Metrics và bẫy Goodhart
+
+Metric là signal điều tra, không phải điểm thi. “100% TypeScript” có thể đạt bằng `any`; “zero suppressions” có thể đạt bằng assertion; check time thấp có thể do bỏ fixture.
+
+Theo dõi theo cặp:
+
+- debt stock **và** debt mới trên changed lines;
+- suppression count **và** tuổi/P95/expired count;
+- boundary coverage **và** số incident do unvalidated input;
+- compiler check time **và** số project/type tests thực sự chạy;
+- consumer pass rate **và** breadth compiler/module matrix;
+- migration throughput **và** post-migration defect rate.
+
+Không đặt quota cá nhân theo số `any` xóa. Review sample quality: debt có bị đẩy sang assertion không, parser có proof runtime không, public output có widen không. Metric phải dẫn tới hành động cụ thể hoặc bị bỏ.
+
+## CI gates theo feedback loop
+
+| Stage        | Gate                                                             | Blocking                 |
+| ------------ | ---------------------------------------------------------------- | ------------------------ |
+| Editor/local | workspace TS, affected typecheck, lint nhanh                     | Developer                |
+| PR           | source typecheck, unit/runtime, positive/negative type tests     | Có                       |
+| Main         | full graph, declaration build, artifact + consumer current/floor | Có                       |
+| Nightly      | `next`, module modes mở rộng, perf/debt trend                    | Alert trước khi blocking |
+| Release      | pack chính artifact, clean install, runtime smoke, API report    | Có                       |
+
+Cache theo compiler version, tsconfig hash và declaration inputs; cache sai key tạo false green. Không cho release job rebuild artifact khác với artifact vừa test.
+
+## Incident playbook cho type regression
+
+Khi consumer báo “upgrade package xong không compile”:
+
+1. Ghi compiler version, tsconfig/module mode, package manager, lockfile và import path.
+2. Reproduce bằng tarball đã publish trong clean consumer fixture.
+3. Xác định lớp lỗi: source type, emitted `.d.ts`, exports resolution, compiler version hay runtime artifact.
+4. So sánh API report và positive/negative fixtures giữa hai version.
+5. Chọn rollback release, declaration hotfix hay major migration guide theo blast radius.
+6. Thêm consumer reproduction vào corpus trước khi đóng incident.
+7. Viết postmortem về gate thiếu, không chỉ về người tạo diff.
+
+Nếu JS artifact đúng nhưng `.d.ts` sai, vẫn là production incident: TypeScript consumer không thể ship.
+
+## Lab — migration và release một typed library
+
+Chọn một package JS/legacy có ít nhất một external boundary và một public API.
+
+1. Tạo test matrix gồm runtime, positive, negative, built `.d.ts` và tarball consumer.
+2. Chạy consumer bằng minimum/current compiler; cấu hình nightly `next` không blocking.
+3. Inventory `any`, assertion, non-null, `@ts-expect-error`, `@ts-ignore`; gán owner/expiry.
+4. Bật `allowJs`/`checkJs` cho một boundary project; parse input về domain thay vì cast.
+5. Dùng codemod cho một thay đổi cơ học, tách commit và chứng minh idempotence.
+6. Dry-run compiler upgrade trên canary, ghi taxonomy, rollout và rollback trigger.
+7. Giả lập một type regression release và chạy incident playbook.
+
+**Acceptance criteria:**
+
+- valid consumer call infer đúng output; ít nhất ba invalid calls fail bằng negative tests;
+- runtime fixture sai bị parser từ chối;
+- consumer cài tarball sạch, không resolve về workspace source;
+- built declarations compile ở version floor và current;
+- một Type SemVer break được fixture bắt trước release;
+- migration không tăng debt budget và xóa ít nhất một boundary `any`;
+- mọi exception mới có owner, expiry, removal condition;
+- CI time, `.d.ts` size và compiler diagnostics có baseline;
+- rollback có thể thực hiện mà không revert feature không liên quan.
+
+**Done khi:** quality system bắt regression ở đúng lớp, còn team vẫn có fast path để ship change an toàn mà không chờ một nhóm trung tâm approve từng PR.
 
 ## Tài liệu chính thức
 
 - [Migrating from JavaScript](https://www.typescriptlang.org/docs/handbook/migrating-from-javascript.html)
-- [Type checking JavaScript](https://www.typescriptlang.org/docs/handbook/type-checking-javascript-files.html)
+- [`allowJs`](https://www.typescriptlang.org/tsconfig/allowJs.html) và [`checkJs`](https://www.typescriptlang.org/tsconfig/checkJs.html)
+- [`strict`](https://www.typescriptlang.org/tsconfig/strict.html)
+- [`@ts-expect-error` release notes](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-3-9.html#-ts-expect-error-comments)
+- [Publishing declaration files và `typesVersions`](https://www.typescriptlang.org/docs/handbook/declaration-files/publishing.html)
+- [Modules: theory](https://www.typescriptlang.org/docs/handbook/modules/theory.html)
+- [Project references](https://www.typescriptlang.org/docs/handbook/project-references.html)
+- [`expectTypeOf` — Vitest](https://vitest.dev/api/expect-typeof.html)

@@ -160,6 +160,96 @@ const standaloneTools: Tool[] = [
     pinned: true,
   },
   {
+    name: 'Three.js — glTF Import Inspector',
+    description:
+      'Load pinned Khronos sample assets, inspect mesh/material/triangle counts, switch wireframe and environment lighting, and see how a glTF scene maps into Three.js objects.',
+    href: '/tools/threejs-gltf-import-demo/',
+    icon: 'layers',
+    tags: ['threejs', '3d', 'gltf', 'assets', 'demo'],
+    app: true,
+  },
+  {
+    name: 'Three.js — Rigging & Animation',
+    description:
+      'Drive a skinned glTF character through locomotion cross-fades, one-shot emotes, time scaling and facial morph targets with AnimationMixer.',
+    href: '/tools/threejs-animation-demo/',
+    icon: 'layers',
+    tags: ['threejs', '3d', 'animation', 'rigging', 'demo'],
+    app: true,
+  },
+  {
+    name: 'Three.js — Character Interaction',
+    description:
+      'Raycast from pointer intent into a 3D world, click the ground to walk or run, trigger emotes, and coordinate animation through a guarded state controller.',
+    href: '/tools/threejs-interaction-demo/',
+    icon: 'layers',
+    tags: ['threejs', '3d', 'interaction', 'animation', 'demo'],
+    app: true,
+  },
+  {
+    name: 'Three.js — Spatial Math Lab',
+    description:
+      'Trace a point through local, world, view, clip, NDC and screen spaces; compare Euler and quaternion interpolation; unproject pointer input and expose floating-point precision loss.',
+    href: '/tools/threejs-spatial-math-lab/',
+    icon: 'layers',
+    tags: ['threejs', '3d', 'math', 'coordinates', 'precision'],
+    app: true,
+  },
+  {
+    name: 'Three.js — Depth & Transparency Lab',
+    description:
+      'Inject z-fighting and transparency failures, toggle depth test/write, alpha test/hash/blend and render order, then see the draw-call cost of an intermediate render target.',
+    href: '/tools/threejs-depth-transparency-lab/',
+    icon: 'layers',
+    tags: ['threejs', '3d', 'rendering', 'depth', 'transparency'],
+    app: true,
+  },
+  {
+    name: 'Three.js — Runtime Lifecycle Lab',
+    description:
+      'Stress managed versus naïve mount cycles, asset races, fixed-step simulation, resource ownership and context loss while lifecycle counters reveal leaks and stale work.',
+    href: '/tools/threejs-runtime-lifecycle-lab/',
+    icon: 'layers',
+    tags: ['threejs', '3d', 'architecture', 'lifecycle', 'resources'],
+    app: true,
+  },
+  {
+    name: 'Three.js — Frame Budget Lab',
+    description:
+      'Separate draw-call, vertex, fragment/overdraw and upload pressure with deterministic workloads, p50/p95 frame time, GPU timer fallback and adaptive-quality controls.',
+    href: '/tools/threejs-frame-budget-lab/',
+    icon: 'layers',
+    tags: ['threejs', '3d', 'performance', 'gpu', 'profiling'],
+    app: true,
+  },
+  {
+    name: 'Three.js — Asset Pipeline Gate',
+    description:
+      'Evaluate a versioned glTF manifest against device-tier budgets, coordinate and naming contracts, slot-aware KTX2 policy, immutable hashes, license and provenance rules.',
+    href: '/tools/threejs-asset-pipeline-lab/',
+    icon: 'layers',
+    tags: ['threejs', '3d', 'gltf', 'ci', 'assets'],
+    app: true,
+  },
+  {
+    name: 'Three.js — Resilience Workbench',
+    description:
+      'Inject network, decode, stale-response and WebGL context failures; recover through explicit states while a semantic DOM twin keeps the 3D experience keyboard-accessible.',
+    href: '/tools/threejs-resilience-lab/',
+    icon: 'layers',
+    tags: ['threejs', '3d', 'testing', 'accessibility', 'resilience'],
+    app: true,
+  },
+  {
+    name: 'Three.js — WebGPU & TSL Migration Lab',
+    description:
+      'Run the same TSL node material on WebGPU or the WebGL 2 backend, inspect the actual backend, change quality policy and exercise async renderer initialization and fallback UI.',
+    href: '/tools/threejs-webgpu-tsl-lab/',
+    icon: 'layers',
+    tags: ['threejs', '3d', 'webgpu', 'tsl', 'architecture'],
+    app: true,
+  },
+  {
     name: 'Landing Animation Lab',
     description:
       'Live lab of landing-page & component animation techniques — page-load orchestration, scroll reveal, stagger, text reveal, parallax, magnetic hover, gestures, page transitions, reduced motion.',

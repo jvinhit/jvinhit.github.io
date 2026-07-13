@@ -1,0 +1,322 @@
+---
+title: 'Three.js from Zero to Senior · Part 25 — WebGPU, TSL & Migration Strategy'
+description: 'Đánh giá WebGPU bằng dữ liệu, viết material bằng TSL, nhận diện blocker của ShaderMaterial/EffectComposer và rollout renderer mới mà không đặt production vào một cú cược lớn.'
+pubDate: 2026-07-12
+lang: vi
+tags: [threejs, webgpu, tsl, architecture, performance]
+series: threejs
+seriesOrder: 25
+draft: false
+---
+
+import DemoEmbed from '~/components/blog/DemoEmbed.astro';
+
+WebGPU không phải chiếc công tắc **“bật lên để nhanh hơn”**. Nó là một backend, một mô hình tài nguyên và một hệ sinh thái shader mới. Nếu đổi renderer chỉ vì browser có `navigator.gpu`, bạn đang thay kiến trúc bằng feature detection. Nếu giữ WebGL mãi vì “đang chạy ổn”, bạn lại để chi phí migration tăng âm thầm.
+
+Bài cuối đặt câu hỏi đúng hơn:
+
+> Workload nào của sản phẩm hưởng lợi, contract nào phải đổi, và bằng chứng nào đủ để rollout?
+
+Lab dùng `WebGPURenderer` của Three.js r185. Chế độ **Auto** thử WebGPU rồi dùng backend WebGL 2 khi cần; chế độ **Force WebGL 2** cho phép so cùng scene và cùng TSL material mà không đổi code shader. Nếu cả hai backend đều không khởi tạo được, lab hiện lỗi bằng DOM thay vì để lại một canvas đen.
+
+<DemoEmbed
+  slug="threejs-webgpu-tsl-lab"
+  title="Three.js WebGPU and TSL migration lab"
+  height="820px"
+/>
+
+## Trạng thái cần ghi rõ trước mọi ADR
+
+Tại thời điểm bài viết dùng **Three.js r185**:
+
+- `WebGPURenderer` là renderer thế hệ mới, ưu tiên WebGPU và có backend WebGL 2 dự phòng.
+- Renderer này vẫn được tài liệu chính thức đánh dấu **experimental**. Feature coverage, output và hiệu năng phải được kiểm chứng theo scene của bạn.
+- `WebGLRenderer` vẫn được duy trì và vẫn là lựa chọn được khuyến nghị cho ứng dụng chỉ cần WebGL 2.
+- TSL — Three.js Shading Language — biểu diễn shader bằng graph viết trong JavaScript/TypeScript, rồi sinh WGSL hoặc GLSL theo backend.
+
+Đây là **versioned fact**, không phải chân lý vĩnh viễn. Ghi revision vào design doc, pin dependency, đọc migration guide khi nâng từng release. `three` phát hành nhanh; nhảy nhiều revision trong một lần làm thay đổi renderer, ánh sáng, material và addon khó quy lỗi cho nhau.
+
+## Hai renderer không chỉ khác tên class
+
+| Quyết định              | `WebGLRenderer`                           | `WebGPURenderer`                                     |
+| ----------------------- | ----------------------------------------- | ---------------------------------------------------- |
+| Backend                 | WebGL 2                                   | WebGPU; tự fallback WebGL 2                          |
+| Import chính            | `three`                                   | `three/webgpu`                                       |
+| Custom material lâu đời | GLSL, `ShaderMaterial`, `onBeforeCompile` | Node material + TSL                                  |
+| Post-processing         | `EffectComposer` + pass                   | `RenderPipeline` + node composition                  |
+| Khởi tạo                | Đồng bộ                                   | WebGPU init bất đồng bộ                              |
+| Compute/storage buffer  | Không phải abstraction chính của Three    | Năng lực quan trọng, nhưng phụ thuộc backend/feature |
+| Độ trưởng thành         | Ổn định hơn, coverage rộng                | Đang phát triển nhanh; cần test workload             |
+
+Điểm dễ bỏ lỡ: fallback WebGL 2 của `WebGPURenderer` **không biến code GLSL cũ thành TSL**. Nó chạy node-material pipeline trên backend WebGL. Những chỗ phụ thuộc `ShaderMaterial`, `RawShaderMaterial`, `onBeforeCompile()` hay `EffectComposer` vẫn là migration work.
+
+## Bootstrap có failure path
+
+Ví dụ tối thiểu nên chờ init và giữ một đường phục hồi rõ ràng:
+
+```js
+import * as THREE from 'three/webgpu';
+
+async function createRenderer(canvas, forceWebGL = false) {
+  const renderer = new THREE.WebGPURenderer({
+    canvas,
+    antialias: true,
+    forceWebGL,
+  });
+
+  await renderer.init();
+  return renderer;
+}
+
+let renderer;
+try {
+  renderer = await createRenderer(canvas); // WebGPU, rồi fallback WebGL 2
+} catch (primaryError) {
+  // Một canvas không thể đổi loại context sau khi đã configure.
+  // Tạo canvas mới trước lần thử backend tường minh.
+  const replacement = canvas.cloneNode();
+  canvas.replaceWith(replacement);
+  canvas = replacement;
+  try {
+    renderer = await createRenderer(canvas, true);
+  } catch (fallbackError) {
+    showStaticFallback({ primaryError, fallbackError });
+  }
+}
+
+renderer?.setAnimationLoop(render);
+```
+
+`navigator.gpu` chỉ là một tín hiệu capability. Nó không chứng minh adapter, device, shader hay surface của ứng dụng sẽ khởi tạo thành công. Boundary đáng tin là **`await renderer.init()` đã resolve và frame đầu đã render**. Lưu ý WebGL/WebGPU context gắn với canvas; nếu policy đổi loại context sau một lần init dở, hãy dùng canvas mới (hoặc reload runtime), không tái sử dụng mù cùng phần tử.
+
+Trong code đơn giản, `setAnimationLoop()` có thể lo async init cho frame đầu. Ở production, explicit `init()` hữu ích hơn vì bạn có một trạng thái `BOOTING → READY | DEGRADED | FAILED` để đo thời gian, log nguyên nhân và điều khiển fallback.
+
+## TSL: shader trở thành module có thể ghép
+
+GLSL không biến mất; TSL đổi nơi bạn mô tả chương trình. Thay vì nối string vào shader chunk, bạn ghép node có kiểu và để Three sinh code theo backend:
+
+```js
+import * as THREE from 'three/webgpu';
+import { color, mix, oscSine, time, uniform } from 'three/tsl';
+
+const speed = uniform(0.6);
+const pulse = oscSine(time.mul(speed));
+
+const material = new THREE.MeshStandardNodeMaterial();
+material.colorNode = mix(color(0x2563eb), color(0x22d3ee), pulse);
+material.roughnessNode = pulse.mul(0.45).add(0.2);
+
+// Update uniform, không rebuild shader graph.
+speed.value = 1.2;
+```
+
+Giá trị kiến trúc không nằm ở việc code ngắn hơn. Nó nằm ở **composition boundary**:
+
+- một node noise có thể dùng lại cho material và post effect;
+- uniform có ownership rõ, cập nhật không cần string replace;
+- graph chỉ sinh expression cần thiết và có thể nhắm WGSL hoặc GLSL;
+- module shader đi qua import/export, review và test như code ứng dụng.
+
+TSL vẫn là GPU programming. Bạn vẫn phải hiểu coordinate space, derivative, divergence, bandwidth, precision và cost mỗi fragment. Abstraction tốt loại boilerplate; nó không xoá physics của phần cứng.
+
+## Ba blocker phải inventory trước khi estimate
+
+### 1. Shader custom
+
+Lập inventory theo **hành vi**, không chỉ đếm file:
+
+| Nhóm               | Ví dụ                                   | Migration                             |
+| ------------------ | --------------------------------------- | ------------------------------------- |
+| Built-in material  | Standard/Physical không patch           | Thường thấp                           |
+| Parameter custom   | màu, roughness, texture slot            | Chuyển sang uniform/node              |
+| Vertex deformation | wind, wave, skin extension              | Viết `positionNode` tương đương       |
+| Fragment model     | toon, dissolve, SDF                     | Port graph và visual-test             |
+| Engine patch       | thay shader chunk qua `onBeforeCompile` | Rủi ro cao; bỏ phụ thuộc chunk nội bộ |
+
+`onBeforeCompile()` nhìn rẻ vì patch vài dòng, nhưng nó tạo coupling vào shader chunk không phải public contract ổn định. Đừng dịch string patch sang một string patch khác. Hãy rút hành vi thành node có input/output và fixture hình ảnh riêng.
+
+### 2. Post-processing
+
+`EffectComposer` và các pass WebGL không chạy nguyên trạng với `WebGPURenderer`. Stack mới dùng `RenderPipeline` và TSL node. Vì vậy “scene đã render được” chưa phải migration xong nếu sản phẩm còn bloom, outline, SSAO, DoF, tone mapping custom hay picking buffer.
+
+Với mỗi effect, ghi bốn số:
+
+1. render target nào được cấp;
+2. format/precision và resolution scale;
+3. số full-screen pass;
+4. tiêu chí visual + performance để chấp nhận bản thay thế.
+
+Đó là cách tránh một migration nhìn đúng trên screenshot desktop nhưng vỡ bandwidth ở mobile.
+
+### 3. Tooling và capture
+
+Quy trình debug WebGL lâu năm có thể dựa vào extension, shader source và frame debugger cụ thể. WebGPU có validation/error scope và tooling khác. Trước rollout, xác nhận team có thể trả lời:
+
+- backend thực tế là gì;
+- shader/pipeline nào compile lỗi;
+- frame bị CPU hay GPU giới hạn;
+- buffer/texture nào tăng theo phiên;
+- capture nào tái hiện được incident trên device thật.
+
+Không có answer path thì backend mới chưa vận hành được, dù demo đã đẹp.
+
+## Migration theo lát dọc, không theo tầng ngang
+
+Migration theo tầng ngang thường là: “port tất cả material, rồi tất cả post effect, rồi mới render một feature”. Feedback tới quá muộn. Lát dọc tốt hơn:
+
+```text
+1 feature đại diện
+  → asset thật
+  → material thật
+  → interaction thật
+  → post stack tối thiểu
+  → telemetry + fallback
+  → device matrix
+```
+
+Chọn feature có workload gần production nhưng blast radius nhỏ, ví dụ một product viewer độc lập. Giữ nguyên camera path, asset và input recording để A/B hai backend. So:
+
+- correctness: pixel/interaction/animation;
+- startup: fetch, decode, compile, first useful frame;
+- runtime: p50/p95 frame time và long-frame rate;
+- memory: trend qua load/unload, không giả vờ có con số VRAM tuyệt đối;
+- reliability: init failure, context/device loss, fallback success.
+
+Nếu chỉ so FPS trung bình của một torus knot, bạn đang benchmark demo, không benchmark sản phẩm.
+
+## Đừng bọc renderer thành “interface chung” khổng lồ
+
+Một abstraction kiểu này thường thất bại:
+
+```ts
+interface UniversalRenderer {
+  render(scene: unknown, camera: unknown): void;
+  addAnyPostEffect(name: string, options: unknown): void;
+  runAnyComputeJob(job: unknown): Promise<unknown>;
+}
+```
+
+Nó hoặc rò toàn bộ chi tiết backend, hoặc ép cả hai về mẫu số chung thấp nhất. Boundary bền hơn là cô lập **điểm biến thiên thật**:
+
+```ts
+interface RenderRuntime {
+  start(): void;
+  suspend(reason: 'hidden' | 'offscreen' | 'manual'): void;
+  resize(viewport: Viewport): void;
+  dispose(): Promise<void>;
+}
+
+interface MaterialFactory {
+  createProductMaterial(input: ProductSurface): THREE.Material;
+}
+
+interface QualityPolicy {
+  choose(signals: RuntimeSignals): QualityTier;
+}
+```
+
+Scene domain, asset manifest, input intent và quality policy ở ngoài backend. Material factory, post graph và compute implementation ở trong adapter cụ thể. Đây là **branch by abstraction có giới hạn**, không phải giả vờ hai renderer giống hệt nhau.
+
+## WebGPU không mặc định nhanh hơn
+
+Một scene nghẽn JavaScript update, layout, asset decode hoặc 2.000 object riêng vẫn có thể chậm. WebGPU mở đường cho pipeline/compute hiện đại và giảm một số overhead, nhưng kết quả phụ thuộc:
+
+- workload CPU submission hay GPU shader;
+- số pipeline variant và warm-up;
+- driver/browser/device;
+- render target format, MSAA và bandwidth;
+- cách bạn dùng storage buffer/compute, không phải việc API tồn tại.
+
+Decision rule:
+
+- **Giữ `WebGLRenderer`** nếu coverage rộng, độ ổn định và chi phí vận hành quan trọng hơn feature WebGPU cụ thể.
+- **Dùng `WebGPURenderer` + force WebGL trong test** để port TSL/pipeline trong một runtime thống nhất trước khi mở WebGPU.
+- **Rollout WebGPU** khi một workload đo được hưởng lợi hoặc một capability bắt buộc, và fallback đạt cùng product contract.
+
+“Tương lai” không phải business case. Một particle simulation cần compute hoặc post graph cần MRT có thể là business case.
+
+## Capability matrix phải đi cùng quality tier
+
+Đừng tạo hai nhánh `supportsWebGPU ? ultra : broken`. Một policy thực tế chọn theo nhiều tín hiệu:
+
+```ts
+type RuntimeProfile = {
+  backend: 'webgpu' | 'webgl2';
+  reducedMotion: boolean;
+  viewportPixels: number;
+  observedP95Ms: number;
+  memoryPressure?: 'normal' | 'high';
+};
+
+function chooseTier(p: RuntimeProfile): 'low' | 'medium' | 'high' {
+  if (p.reducedMotion || p.memoryPressure === 'high') return 'low';
+  if (p.observedP95Ms > 22 || p.viewportPixels > 6_000_000) return 'medium';
+  return p.backend === 'webgpu' ? 'high' : 'medium';
+}
+```
+
+Backend chỉ là một input. Sau warm-up, telemetry thật có quyền hạ tier. Dùng hysteresis/cooldown của Part 22 để quality không nhảy qua lại mỗi frame.
+
+## Rollout như một thay đổi platform
+
+Một rollout có kiểm soát cần:
+
+1. **Feature flag từ xa** — tắt backend mà không redeploy asset.
+2. **Cohort ổn định** — cùng user/session không đổi backend giữa chừng.
+3. **Canary nhỏ** — tăng dần theo device/browser matrix, không chỉ theo phần trăm tổng.
+4. **Guardrail** — init failure, first useful frame, p95 frame time, crash/context loss, fallback rate.
+5. **Visual contract** — golden scene cho skin, transparency, PBR, shadow và post effect.
+6. **Rollback độc lập** — renderer, asset schema và shader package không bị buộc phải rollback cùng nhau.
+
+SLO ví dụ không nên là “WebGPU nhanh hơn” mà là:
+
+```text
+99.5% phiên vào được first useful frame hoặc static fallback trong 4 giây
+p95 interaction frame < 25 ms trên device tier mục tiêu
+backend-init failure < 0.5%; fallback success > 99%
+không tăng lỗi visual severity-1 trong canary
+```
+
+Con số thật phải lấy từ sản phẩm. Cấu trúc SLO mới là phần tái sử dụng.
+
+## Checklist review ở cấp tech lead
+
+- [ ] Pin revision Three.js; migration guide được review cho từng bước nâng.
+- [ ] Inventory `ShaderMaterial`, `RawShaderMaterial`, `onBeforeCompile` và toàn bộ post pass.
+- [ ] Có golden scenes và input recording chạy trên cả backend.
+- [ ] `await renderer.init()` nằm trong lifecycle có timeout/error/fallback.
+- [ ] Telemetry phân biệt backend yêu cầu và backend thực tế, không thu fingerprint dư thừa.
+- [ ] Quality tier dựa trên observed frame time, không chỉ capability ban đầu.
+- [ ] Feature flag, canary, guardrail và rollback owner đã rõ.
+- [ ] Team có playbook debug pipeline/shader/device loss trên production.
+- [ ] Dependency/decoder được bundle hoặc pin; CDN demo không bị copy nguyên vào production.
+
+## Bài tập capstone
+
+1. Lập inventory một codebase Three.js: phân loại từng material và pass theo bảng blocker; estimate bằng **behavior**, không bằng số file.
+2. Chọn một vertical slice, record camera + input, rồi chạy cùng fixture qua WebGL và WebGPU. Báo p50/p95, first useful frame, output diff và failure rate.
+3. Viết ADR gồm context, options, evidence, rollout, observability và rollback. Một ADR chỉ nói “WebGPU hiện đại hơn” chưa đạt.
+4. Inject lỗi init và shader. Chứng minh DOM fallback vẫn dùng được bằng keyboard và telemetry đủ để chẩn đoán.
+
+## Nguồn chuẩn để theo dõi
+
+- [Three.js r185 release notes](https://github.com/mrdoob/three.js/releases/tag/r185)
+- [WebGPURenderer guide](https://threejs.org/manual/en/webgpurenderer)
+- [WebGPURenderer API](https://threejs.org/docs/pages/WebGPURenderer.html)
+- [TSL specification](https://threejs.org/docs/TSL.html)
+- [Three.js migration guide](https://github.com/mrdoob/three.js/wiki/Migration-Guide)
+- [WebGLRenderer API](https://threejs.org/docs/pages/WebGLRenderer.html)
+
+## Kết series: seniority nằm ở đường phản hồi
+
+Từ Part 1 tới đây, API thay đổi rất nhiều; nguyên tắc thì không. Một hệ 3D production luôn là chuỗi contract:
+
+```text
+intent → state → simulation → scene → renderer → GPU → pixels
+              ↑                              ↓
+         test + asset CI ← telemetry ← user/device
+```
+
+Engineer mạnh không chỉ làm pixel xuất hiện. Họ biết pixel đó đi qua contract nào, tốn budget nào, hỏng ở đâu, ai sở hữu tài nguyên, tín hiệu nào gọi rollback và cách hệ thống tiếp tục phục vụ khi GPU không hợp tác.
+
+Đó là ranh giới từ “biết Three.js” sang **engineering một nền tảng 3D**.

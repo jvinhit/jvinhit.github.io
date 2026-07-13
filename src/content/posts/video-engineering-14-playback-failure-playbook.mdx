@@ -1,0 +1,272 @@
+---
+title: 'Video Engineering · Phần 14 — Playbook xử lý lỗi playback theo tầng'
+description: 'Chẩn đoán stall, màn hình đen, chỉ có tiếng, lệch A/V và seek hỏng bằng một quy trình đi từ HTTP, CORS, Range, MIME tới demux, decode, buffer và render.'
+pubDate: 2026-07-12
+lang: vi
+tags:
+  [
+    video-engineering,
+    video,
+    playback-debugging,
+    video-streaming,
+    chrome-devtools,
+    incident-response,
+  ]
+series: video-engineering
+seriesOrder: 14
+draft: false
+---
+
+`MEDIA_ERR_DECODE`, vòng xoay loading hay một khung hình đen đều là **triệu chứng**, không phải root cause. Nếu đổi codec ngay, ta có thể làm asset mới tình cờ chạy nhưng không biết production đã hỏng ở CDN, manifest, timestamp hay renderer.
+
+Playbook hiệu quả đi theo chiều bytes di chuyển: ứng dụng chọn URL → HTTP giao dữ liệu → demuxer tách stream → decoder tạo frame → buffer xếp timeline → renderer trình bày hình và âm thanh. Chỉ chuyển tầng khi đã có bằng chứng tầng trước hoạt động.
+
+---
+
+## 1. Tạo bộ fixture lỗi có kiểm soát
+
+Tạo một asset hợp lệ mười giây:
+
+```bash
+mkdir -p playback-failure-lab
+cd playback-failure-lab
+
+ffmpeg -hide_banner -y \
+  -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=10" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=10" \
+  -map 0:v:0 -map 1:a:0 \
+  -c:v libx264 -preset veryfast -crf 21 -pix_fmt yuv420p \
+  -g 60 -keyint_min 60 -sc_threshold 0 \
+  -c:a aac -b:a 128k -movflags +faststart ok.mp4
+```
+
+Từ đó tạo ba biến thể tổng hợp:
+
+```bash
+# Có audio nhưng không có video stream.
+ffmpeg -hide_banner -y -i ok.mp4 -map 0:a:0 -c:a copy audio-only.mp4
+
+# Audio bắt đầu muộn 1,5 giây; dùng để phân biệt offset với drift tăng dần.
+ffmpeg -hide_banner -y -i ok.mp4 \
+  -filter_complex "[0:a]adelay=1500:all=1[a]" \
+  -map 0:v:0 -map "[a]" -c:v copy -c:a aac -b:a 128k \
+  -shortest av-offset.mp4
+
+# Giữ đầu file nhưng cắt mất phần lớn media để tạo lỗi giữa playback.
+dd if=ok.mp4 of=truncated.mp4 bs=1024 count=32
+```
+
+Tạo `wrong-mime.mp4` từ bản hợp lệ:
+
+```bash
+cp ok.mp4 wrong-mime.mp4
+```
+
+Lưu server sau thành `server.py`. Nó cố ý trả MIME sai cho đúng một route và chỉ bật CORS khi có biến môi trường:
+
+```python
+import os
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+
+ALLOW_CORS = os.environ.get("ALLOW_CORS") == "1"
+
+class Handler(SimpleHTTPRequestHandler):
+    def guess_type(self, path):
+        if path.endswith("wrong-mime.mp4"):
+            return "text/plain"
+        return super().guess_type(path)
+
+    def end_headers(self):
+        if ALLOW_CORS:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        super().end_headers()
+
+ThreadingHTTPServer(("127.0.0.1", 8081), Handler).serve_forever()
+```
+
+Chạy `python3 server.py`, rồi dùng trang lab ở Phần 13 hoặc một `<video>` đơn giản để đổi `src`. Muốn kiểm tra fetch/MSE từ origin khác, phục vụ trang ở port 8080; lần đầu không CORS, sau đó restart bằng:
+
+```bash
+ALLOW_CORS=1 python3 server.py
+```
+
+Đây là fixture của chính bạn. Không dùng playbook để dò token, vượt quyền truy cập hoặc can thiệp stream bên thứ ba.
+
+---
+
+## 2. Bản đồ tầng và bằng chứng đầu tiên
+
+| Tầng            | Câu hỏi                                          | Bằng chứng ưu tiên                             |
+| --------------- | ------------------------------------------------ | ---------------------------------------------- |
+| App/DOM         | Player có nhận đúng URL và state không?          | Console, Sources, media events                 |
+| HTTP            | Bytes có đến đúng, đủ và đúng kiểu không?        | Network, `curl`, HAR                           |
+| Manifest/buffer | Segment có được chọn và append đúng timeline?    | Manifest text, MSE events, buffered ranges     |
+| Container/demux | Có format, stream, timestamp và keyframe hợp lệ? | `ffprobe` format/stream/packet                 |
+| Decode          | Decoder có tạo được frame/sample?                | Media Messages, null decode                    |
+| Render/output   | Frame có tới compositor, audio sink và UI không? | Media Timeline, frame quality, CSS/Performance |
+
+Với stream live, ghi wall-clock, media time, rendition và sequence number; “lỗi khoảng 10 giờ” không đủ để tìm đúng segment.
+
+---
+
+## 3. Stall hoặc buffering vô hạn
+
+Đầu tiên đọc `video.buffered`, `currentTime`, `readyState` và event `waiting`/`stalled`. Nếu playhead chạm cuối buffered range, vấn đề có thể nằm ở giao dữ liệu. Mở Network:
+
+- không có request mới: player/ABR/state machine có thể đã ngừng lịch tải;
+- request pending lâu: xem TTFB, content download và connection;
+- `404`, `410`, `416`, CORS hoặc request blocked: xử lý delivery trước;
+- segment `200` nhưng size bất thường: lưu response và probe chính segment đó;
+- bytes đến đều nhưng buffer không tăng: kiểm tra append error, timestamp gap và decode.
+
+Với fixture local, bật Slow 3G hoặc Request blocking trước khi reload với cache lạnh. Nếu lỗi chỉ xuất hiện quanh một thời điểm, khoanh packet:
+
+```bash
+ffprobe -v error -read_intervals "4%+2" \
+  -show_packets \
+  -show_entries "packet=stream_index,pts_time,dts_time,duration_time,size,flags" \
+  -of json ok.mp4
+```
+
+Timestamp gap, discontinuity không báo hoặc segment bắt đầu thiếu decoder initialization có thể làm bytes “đã tải” nhưng không trở thành buffered media.
+
+---
+
+## 4. Màn hình đen nhưng vẫn có tiếng
+
+Chia thành ba nhánh nhanh:
+
+1. `video.videoWidth`/`videoHeight` bằng 0: metadata video chưa có, video stream thiếu hoặc pipeline video chưa khởi tạo.
+2. Media panel có decode error: kiểm tra codec/profile/pixel format và bitstream.
+3. `totalVideoFrames` tăng nhưng không nhìn thấy hình: kiểm tra CSS, opacity, kích thước element, overlay, transform, clipping và compositor.
+
+Probe trước khi nhìn CSS quá lâu:
+
+```bash
+ffprobe -v error -show_streams \
+  -show_entries "stream=index,codec_type,codec_name,profile,width,height,pix_fmt,color_space,color_transfer" \
+  -of json audio-only.mp4
+```
+
+File `audio-only.mp4` chứng minh container hợp lệ không đồng nghĩa có video track. Với file có video, chạy decode độc lập:
+
+```bash
+ffmpeg -hide_banner -v error -i ok.mp4 -map 0:v:0 -f null -
+```
+
+Nếu FFmpeg decode được nhưng Chrome không, so codec string, profile, platform decoder và browser support; không kết luận FFmpeg là oracle của mọi browser. Nếu cả hai thất bại ở cùng timestamp, giữ asset gốc và log decoder để điều tra bitstream.
+
+---
+
+## 5. Chỉ có audio hoặc chỉ có video
+
+“Audio-only” có thể là file thật sự không có video, player map nhầm track, video codec không hỗ trợ, hoặc video `SourceBuffer` chưa được append. “Video-only” thường là audio track thiếu, codec/channel layout bị từ chối, autoplay policy chặn tiếng, element muted, hoặc audio sink có vấn đề.
+
+Kiểm tra stream và disposition:
+
+```bash
+ffprobe -v error -show_streams \
+  -show_entries "stream=index,codec_type,codec_name,sample_rate,channels,channel_layout:stream_disposition=default,forced" \
+  -of json ok.mp4
+```
+
+Sau đó decode riêng audio:
+
+```bash
+ffmpeg -hide_banner -v error -i ok.mp4 -map 0:a:0 -f null -
+```
+
+Trong MSE, đối chiếu MIME cộng `codecs`, số `SourceBuffer`, append order và error event. `MediaSource.isTypeSupported()` là feature detection, không phải cam kết mọi bitstream mang nhãn đó đều hợp lệ.
+
+---
+
+## 6. Lệch A/V: offset cố định hay drift tăng dần?
+
+Phát `av-offset.mp4`: audio muộn gần như cố định 1,5 giây. Đây là **offset**. Nếu sai lệch tăng từ từ theo thời gian, nghi time base, sample-rate assumption, frame-rate conversion, clock drift hoặc timestamp bị sinh lại sai.
+
+So packet hai stream quanh cùng khoảng:
+
+```bash
+ffprobe -v error -read_intervals "0%+3" \
+  -show_packets \
+  -show_entries "packet=stream_index,pts_time,dts_time,duration_time" \
+  -of csv=p=1 av-offset.mp4
+```
+
+Ghi PTS đầu audio, PTS đầu video và độ lệch ở đầu/giữa/cuối. Đừng trừ timestamp thô khi hai stream có `time_base` khác nhau. Với HLS, kiểm tra `EXT-X-DISCONTINUITY`, program date time và alignment giữa audio/video rendition. Reset timestamp tùy tiện bằng `setpts` có thể che lỗi thay vì sửa semantics timeline.
+
+---
+
+## 7. Seek sai, quay về đầu hoặc đứng hình
+
+Ba điều kiện thường bị trộn lẫn:
+
+- **HTTP random access**: request Range phải nhận `206` và `Content-Range` đúng nếu server hỗ trợ byte range;
+- **container index**: progressive MP4 cần metadata/index sẵn sàng; `+faststart` đưa `moov` lên đầu để startup tốt hơn;
+- **random access trong codec**: seek thường đáp xuống keyframe gần nhất rồi decode tiến tới thời điểm đích.
+
+Kiểm tra endpoint local:
+
+```bash
+curl -sS -D - -o /dev/null \
+  -H 'Range: bytes=0-1023' \
+  http://127.0.0.1:8081/ok.mp4
+```
+
+Nếu nhận `200`, server đã bỏ qua Range; asset nhỏ vẫn có thể chạy nhưng đó không phải bằng chứng endpoint production hỗ trợ seek hiệu quả. Trong browser, đọc `video.seekable` và Network sau khi kéo playhead. Với HLS, seek còn phụ thuộc playlist window, segment availability và keyframe ở biên.
+
+---
+
+## 8. CORS, MIME và decode: ba lỗi khác nhau
+
+- **CORS** quyết định script có được đọc response qua fetch/MSE hoặc đọc pixel canvas hay không. Plain `<video src>` cross-origin có mô hình sử dụng khác; “thẻ video phát được” không chứng minh `fetch()` hay canvas được phép.
+- **MIME** cho browser biết resource là gì. Kiểm tra `Content-Type` thật trong response, không chỉ extension `.mp4`, `.ts` hay `.m3u8`.
+- **Decode** xảy ra sau khi bytes đã được giao và demux. Status `200` cùng MIME đúng vẫn có thể chứa bitstream hỏng hoặc codec không hỗ trợ.
+
+Mở `wrong-mime.mp4` để quan sát header sai, rồi `truncated.mp4` để quan sát metadata có thể load nhưng playback lỗi về sau. Không “sửa CORS” bằng cách tắt bảo mật browser; sửa response của origin hoặc kiến trúc proxy được ủy quyền.
+
+---
+
+## Failure checklist
+
+- [ ] Đổi codec trước khi xác nhận request và response.
+- [ ] Không phân biệt buffer cạn với decoder đứng.
+- [ ] Coi audio chạy là bằng chứng video track tồn tại.
+- [ ] Bỏ qua CSS dù decoded-frame counter vẫn tăng.
+- [ ] Gọi offset cố định là clock drift.
+- [ ] So PTS thô mà quên time base.
+- [ ] Kiểm tra Range bằng `HEAD` thay vì một `GET` có header `Range`.
+- [ ] Tin extension file thay cho `Content-Type` và probe.
+- [ ] Trộn CORS, MIME và codec thành một lỗi “browser không support”.
+- [ ] Tái hiện trên cache nóng nhưng kết luận network khỏe.
+- [ ] Sửa asset gốc trước khi lưu bằng chứng lỗi.
+
+---
+
+## Bài tập và runbook sự cố
+
+**Bài 1:** phát bốn fixture, lập bảng cho mỗi file gồm Network status/MIME, số stream, decode result, `videoWidth`, buffered range và triệu chứng nhìn thấy.
+
+**Bài 2:** bật/tắt `ALLOW_CORS`, gọi `fetch('http://127.0.0.1:8081/ok.mp4')` từ trang port 8080 và giải thích vì sao kết quả khác `<video src>`.
+
+**Bài 3:** request Range trên server local. Nếu server trả `200`, không giả lập `206`; ghi đây là limitation của fixture server và thay bằng server có range support khi test seek production.
+
+Khi có incident thật, chốt báo cáo bằng một câu có tầng: “request segment N trả 404 nên buffered range dừng ở 18,0 giây”, hoặc “bytes và buffer đầy nhưng video decoder từ chối profile X”. Câu đó hành động được; “Chrome bị màn hình đen” thì chưa.
+
+---
+
+## Đọc thêm
+
+- [HTMLMediaElement và các trạng thái playback](https://developer.mozilla.org/en-US/docs/Web/API/HTMLMediaElement)
+- [HTTP Range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Range_requests)
+- [Media types và MIME](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/MIME_types)
+- [Media Capabilities decodingInfo](https://developer.mozilla.org/en-US/docs/Web/API/MediaCapabilities/decodingInfo)
+- [Media Source Extensions](https://www.w3.org/TR/media-source-2/)
+- [Chrome DevTools Media panel](https://developer.chrome.com/docs/devtools/media-panel)
+- [Tài liệu ffprobe](https://ffmpeg.org/ffprobe.html)
+
+---
+
+## Bài kế tiếp
+
+[Phần 15 — Ad marker, rewrite playlist và giới hạn của việc override TS](/blog/video-engineering-15-ad-markers-playlist-rewrite-ts-override/)

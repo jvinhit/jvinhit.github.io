@@ -1,0 +1,205 @@
+---
+title: 'Video Engineering · Phần 11 — MPEG-TS: packet 188 byte, PID, PAT/PMT và PES'
+description: 'Mổ file .ts từ sync byte 0x47 đến PID, PAT/PMT, PES, PCR, PTS/DTS và continuity counter; hiểu vì sao TS chịu lỗi tốt nhưng không thể cắt byte tùy ý.'
+pubDate: 2026-07-12
+lang: vi
+tags:
+  [video-engineering, video, mpeg-ts, hls, transport-stream, ffprobe, binary]
+series: video-engineering
+seriesOrder: 11
+draft: false
+---
+
+Trong repo web, `.ts` thường là TypeScript. Trong Network panel của một HLS player, `.ts` thường là **MPEG Transport Stream**. Hai thứ chỉ chung extension.
+
+MPEG-TS sinh ra cho môi trường truyền dẫn: broadcast, packet có thể mất, receiver có thể bắt đầu giữa luồng. Nó chia multiplex thành packet dài cố định, lặp lại thông tin nhận diện chương trình và mang clock/timestamp để receiver tái đồng bộ. Đổi lại, cấu trúc có overhead và nhiều lớp hơn MP4.
+
+## 1. Mental model: codec data nằm sâu bên trong
+
+```text
+H.264 NAL units / AAC access units       (elementary stream)
+             │
+             ▼
+PES packet + PTS/DTS                     (Packetized Elementary Stream)
+             │
+             ▼
+TS packets 188 byte, cùng PID            (Transport Stream)
+             │
+             ├─ PAT: chương trình → PMT PID
+             ├─ PMT: stream type → elementary PID
+             └─ PCR: clock tham chiếu cho chương trình
+```
+
+**TS là container/multiplex, không phải video codec.** Một TS có thể mang H.264 video, AAC audio, metadata và stream khác. PID là nhãn định tuyến packet; nó không phải port mạng hay codec id.
+
+## 2. Header bốn byte và sync byte `0x47`
+
+Trong MPEG-TS dùng cho HLS ở series này, mỗi packet dài **188 byte**. Một số hệ đóng gói truyền dẫn thêm prefix/FEC thành đơn vị 192 hoặc 204 byte, nên phải xác định format trước khi áp dụng phép kiểm tra 188 byte. Header TS cơ bản dài 4 byte:
+
+```text
+byte 0      byte 1               byte 2       byte 3
+0x47     flags + PID[12:8]      PID[7:0]    flags + CC
+sync        13-bit PID                         continuity counter
+```
+
+Header còn có:
+
+- `transport_error_indicator`: receiver phát hiện lỗi không sửa được;
+- `payload_unit_start_indicator`: payload bắt đầu PSI section hoặc PES mới;
+- `transport_scrambling_control`: trạng thái scrambling;
+- `adaptation_field_control`: có adaptation field, payload hay cả hai;
+- `continuity_counter`: bộ đếm 4 bit theo PID cho packet có payload.
+
+Xem ba packet đầu:
+
+```bash
+xxd -g 1 -l 564 hls/v0/seg-000.ts
+```
+
+Bạn thường thấy `47` ở offset `0x0000`, `0x00bc` (188), `0x0178` (376) nếu file bắt đầu đúng biên packet.
+
+Kiểm tra toàn file bằng Node.js:
+
+```bash
+node -e '
+const fs = require("node:fs");
+const bytes = fs.readFileSync(process.argv[1]);
+const packetSize = 188;
+const packets = Math.floor(bytes.length / packetSize);
+const remainder = bytes.length % packetSize;
+const bad = [];
+for (let index = 0; index < packets; index++) {
+  const offset = index * packetSize;
+  if (bytes[offset] !== 0x47) bad.push(offset);
+}
+console.log({ bytes: bytes.length, packets, remainder, bad });
+' hls/v0/seg-000.ts
+```
+
+Đây chỉ kiểm tra alignment/sync byte. `remainder` phải bằng 0 cho fixture TS 188 byte; `bad: []` vẫn không chứng minh PAT/PMT, timestamp, continuity hay codec data đều hợp lệ.
+
+## 3. PAT và PMT trả lời “PID nào chứa gì?”
+
+Receiver vào giữa stream chưa biết PID nào là video/audio. Program Specific Information (PSI) giải quyết việc đó:
+
+1. **PAT** (Program Association Table) ở PID `0x0000` ánh `program_number` sang PID của PMT.
+2. **PMT** (Program Map Table) liệt kê stream type và elementary PID của video/audio/metadata; đồng thời chỉ ra PCR PID.
+3. Receiver lọc các PID cần thiết rồi ráp payload thành PES/elementary stream.
+
+Inspect bằng `ffprobe`:
+
+```bash
+ffprobe -v error \
+  -show_programs -show_streams \
+  -show_entries \
+program=program_id,program_num,pmt_pid,pcr_pid:stream=index,id,codec_type,codec_name,time_base \
+  -of json hls/v0/seg-000.ts
+```
+
+`stream.id` thường phản ánh PID ở dạng hex. Đừng hard-code “video luôn PID 256”: muxer có thể cấu hình khác, và PMT mới là nguồn sự thật.
+
+Với HLS TS, RFC 8216 yêu cầu segment chứa một MPEG-2 Program. Mỗi segment phải có PAT/PMT hoặc playlist áp dụng `EXT-X-MAP` phù hợp; RFC cũng khuyến nghị lặp PAT/PMT ở đầu mỗi segment để client có thể khởi tạo khi nhảy vào đó.
+
+## 4. PES, PTS/DTS và PCR có vai trò khác nhau
+
+Elementary data được đóng thành **PES**. PES header có thể mang:
+
+- **PTS**: lúc frame/sample được trình bày;
+- **DTS**: lúc cần decode, quan trọng khi decode order khác presentation order vì B-frame.
+
+**PCR** không thay PTS/DTS. Nó cung cấp clock reference để receiver khóa timing của chương trình; phần base dùng miền 90 kHz và extension đạt độ phân giải clock 27 MHz.
+
+Xem packet timeline:
+
+```bash
+ffprobe -v error -select_streams v:0 \
+  -show_packets \
+  -show_entries packet=pts,dts,pts_time,dts_time,duration_time,flags,pos,size \
+  -of compact=p=0:nk=0 \
+  hls/v0/seg-000.ts | head -20
+```
+
+Nếu có B-frame, DTS có thể khác PTS. So timestamp phải quy đổi theo `time_base`; số tick thô của hai stream không cộng/trừ trực tiếp được.
+
+## 5. Continuity counter phát hiện mất/lặp packet — nhưng có ngữ cảnh
+
+Continuity counter là 4 bit, tăng modulo 16 cho packet cùng PID có payload. Nhảy counter có thể gợi ý packet mất; lặp có thể là duplicate. Nhưng adaptation-only packet và discontinuity được báo hiệu có quy tắc riêng, nên một script chỉ nhìn “counter phải luôn +1” sẽ báo false positive.
+
+FFmpeg có thể phát warning như `Continuity check failed` hoặc `Packet corrupt`:
+
+```bash
+ffmpeg -v warning -i hls/v0/seg-000.ts -map 0 -f null -
+```
+
+Output `null` buộc demux/decode mà không tạo file. Nó hữu ích để xác nhận bitstream có decode qua được, nhưng không chứng minh playback qua mạng/CDN tốt.
+
+## 6. Vì sao TS chịu lỗi tốt?
+
+- packet cố định giúp receiver tìm lại sync byte theo chu kỳ 188;
+- PID cho phép bỏ packet stream không quan tâm;
+- PAT/PMT lặp giúp join giữa luồng;
+- continuity counter giúp phát hiện gap;
+- adaptation field có thể báo discontinuity và mang PCR.
+
+“Chịu lỗi” không có nghĩa “sửa gì cũng được”. Mất packet chứa một slice video có thể làm hỏng nhiều frame tới keyframe kế tiếp. Mất audio packet tạo pop/gap. Timestamp đi lùi có thể khiến player stall dù byte structure vẫn hợp lệ.
+
+## 7. Vì sao không nên `dd` cắt `.ts` theo byte tùy ý?
+
+Cắt tại bội số 188 chỉ giữ **TS packet alignment**. Nó chưa bảo đảm:
+
+- đầu đoạn có PAT/PMT;
+- bắt đầu tại PES boundary;
+- video bắt đầu bằng IDR/random access point;
+- audio/video cùng cắt tại một media time;
+- PTS/DTS/PCR nối đơn điệu với đoạn sau;
+- continuity counter và discontinuity được báo đúng.
+
+```bash
+# Chỉ minh họa packet alignment, KHÔNG phải cách edit video đúng:
+dd if=segment.ts of=tail.ts bs=188 skip=1000
+```
+
+`tail.ts` có thể vẫn được một player khoan dung phát sau vài giây, nhưng đó không phải splice deterministic. Với nội dung sở hữu, ưu tiên cắt ở mức timeline bằng FFmpeg/packager hoặc rewrite playlist tại **segment boundary** đã được encode an toàn. Nếu timestamp sequence thay đổi, dùng `EXT-X-DISCONTINUITY` đúng ngữ nghĩa.
+
+## 8. TS segment có độc lập không?
+
+Một URI `.ts` trong HLS là media segment, nhưng “mỗi segment tự decode được” chỉ đúng khi packager/playlist bảo đảm random access và dependency. `EXT-X-INDEPENDENT-SEGMENTS` là lời tuyên bố mạnh: mọi media sample trong mỗi segment thuộc phạm vi áp dụng có thể decode mà không cần thông tin từ segment khác.
+
+Không có tag đó, hãy inspect frame đầu:
+
+```bash
+ffprobe -v error -select_streams v:0 \
+  -show_frames \
+  -show_entries frame=best_effort_timestamp_time,key_frame,pict_type \
+  -read_intervals '%+1' \
+  -of csv=p=0 hls/v0/seg-000.ts | head
+```
+
+`key_frame=1` là tín hiệu tốt nhưng vẫn cần kiểm tra codec-specific random access và audio/track continuity ở toàn ladder.
+
+## Failure checklist
+
+- File size có chia hết cho 188 và sync byte có thẳng hàng không?
+- PAT ở PID 0 và PMT có xuất hiện đủ sớm không?
+- PMT khai đúng codec/elementary PID/PCR PID không?
+- Continuity warning thuộc PID nào, trước đó có discontinuity hợp lệ không?
+- PTS/DTS/PCR có đi lùi hoặc nhảy bất thường tại splice không?
+- Segment có bắt đầu tại random access point không?
+- Audio và video có cùng timeline/duration không?
+- Playlist có báo discontinuity khi đổi timestamp sequence, codec hoặc track không?
+
+## Bài tập
+
+1. Dùng `ffprobe -show_programs` vẽ bảng `program → PMT/PCR PID → elementary PID` cho segment ở bài 10.
+2. Viết parser header 4 byte bằng JavaScript để đếm số packet theo PID. So kết quả với `ffprobe`.
+3. Xóa đúng một TS packet trong bản copy, chạy decode-to-null và ghi lại PID/timestamp warning.
+4. Cắt tại bội số 188 và tại HLS segment boundary; so khả năng seek, frame đầu và timestamp thay vì chỉ xem “có phát được không”.
+
+## Đọc thêm
+
+- [ITU-T H.222.0 — MPEG-2 Systems](https://www.itu.int/rec/T-REC-H.222.0/en)
+- [RFC 4326 — MPEG-2 Transport Stream qua RTP](https://www.rfc-editor.org/rfc/rfc4326.html)
+- [RFC 8216 — MPEG-2 Transport Streams in HLS](https://www.rfc-editor.org/rfc/rfc8216.html)
+- [FFmpeg formats — MPEG-TS muxer](https://ffmpeg.org/ffmpeg-formats.html#mpegts)
+
+**Phần tiếp theo:** [MSE, WebCodecs và xử lý video trong browser](/blog/video-engineering-12-mse-webcodecs-browser-processing/) — lúc JavaScript cần tham gia vào buffer, frame và backpressure.

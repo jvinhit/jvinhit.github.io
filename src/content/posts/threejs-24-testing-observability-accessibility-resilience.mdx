@@ -1,0 +1,401 @@
+---
+title: 'Three.js from Zero to Senior · Part 24 — Testing, Observability, Accessibility & Resilience'
+description: 'Make Three.js production systems testable and operable: deterministic clocks, browser/visual/perf tests, failure injection, privacy-safe telemetry, accessible canvas twins and incident SLOs.'
+pubDate: 2026-07-12
+lang: vi
+tags:
+  [threejs, 3d, testing, observability, accessibility, resilience, architecture]
+series: threejs
+seriesOrder: 24
+draft: false
+---
+
+import DemoEmbed from '~/components/blog/DemoEmbed.astro';
+
+Một scene chạy đẹp trên laptop của tác giả chưa phải production. Production bắt đầu khi team có thể trả lời bốn câu hỏi mà không cần “mở máy của anh A xem thử”:
+
+1. Cùng input và cùng thời gian, scene có cho cùng state không?
+2. Khi network, decoder hoặc GPU context hỏng, user thấy gì và hệ thống hồi phục ra sao?
+3. Khi lỗi chỉ xảy ra trên 1% session, telemetry có đủ để điều tra mà không biến thiết bị thành fingerprint không?
+4. Người không dùng chuột, không thấy canvas, hoặc cần giảm chuyển động có hoàn thành cùng intent không?
+
+Đó là ranh giới giữa **3D demo** và **3D capability được vận hành như một sản phẩm**.
+
+Lab này dùng Three.js r185 và cho phép inject network failure, decoder failure, stale response và WebGL context loss. Quan sát state machine, fallback và recovery; thử phím mũi tên/Space trên canvas; bật “reduce motion” của hệ điều hành rồi reload để thấy render loop chuyển sang on-demand.
+
+<DemoEmbed
+  slug="threejs-resilience-lab"
+  title="Three.js resilience, context recovery and accessible interaction lab"
+  height="920px"
+/>
+
+## Kiến trúc trước, test sau
+
+Code khó test thường không phải vì WebGL “đặc biệt”, mà vì thời gian, random, input, network và side effect bị giấu trong một `animate()` khổng lồ. Tách core deterministic khỏi adapter browser:
+
+```ts
+type Command =
+  | { type: 'select'; objectId: string }
+  | { type: 'orbit'; yaw: number; pitch: number }
+  | { type: 'move'; x: number; z: number }
+  | { type: 'pause'; value: boolean };
+
+type RuntimeDeps = {
+  now: () => number;
+  random: () => number;
+  requestFrame: (cb: FrameRequestCallback) => number;
+  cancelFrame: (id: number) => void;
+  loadAsset: (id: string, signal: AbortSignal) => Promise<LoadedAsset>;
+};
+
+class WorldModel {
+  step(dtSeconds: number) {
+    /* pure state transition */
+  }
+  dispatch(command: Command) {
+    /* semantic input, not DOM event */
+  }
+  snapshot(): WorldSnapshot {
+    /* serializable state */
+  }
+}
+```
+
+`WorldModel` không đọc `Date.now()`, `Math.random()`, pointer global hay `fetch()` trực tiếp. Browser adapter chuyển pointer/keyboard thành `Command`; renderer chỉ project snapshot thành pixel. Nhờ đó cùng seed + command log + timestep tạo lại cùng state.
+
+### Seed random và điều khiển timestep
+
+```ts
+function mulberry32(seed: number) {
+  return () => {
+    seed |= 0;
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const model = new WorldModel({ random: mulberry32(42) });
+for (let frame = 0; frame < 120; frame++) model.step(1 / 60);
+expect(model.snapshot()).toEqual(expectedAtTwoSeconds);
+```
+
+Test state machine bằng fixed `dt`; test render loop adapter riêng. Nếu physics engine có nondeterminism giữa architecture/engine, snapshot invariant cấp domain — vị trí trong tolerance, state đúng, không `NaN` — thay vì đòi byte-for-byte.
+
+## Testing pyramid cho Three.js
+
+| Tầng                  | Chạy ở đâu                      | Khóa điều gì                                                  | Không nên kỳ vọng            |
+| --------------------- | ------------------------------- | ------------------------------------------------------------- | ---------------------------- |
+| Contract/unit         | Node, không GPU                 | manifest, reducer, state machine, math, disposal ownership    | pixel đúng                   |
+| Component integration | Browser, scene nhỏ              | loader → scene graph, input mapping, focus, resize, lifecycle | hiệu năng thiết bị thật      |
+| Visual regression     | Browser/OS/GPU baseline cố định | camera/material/layout/render output                          | giống tuyệt đối trên mọi GPU |
+| Performance           | runner cố định + device lab     | regression tương đối, p50/p95, memory trend                   | “60 FPS cho mọi user”        |
+| Resilience/E2E        | browser thật, fault injection   | fallback, recovery, stale guard, accessibility intent         | bao phủ mọi driver bug       |
+
+Đừng đảo kim tự tháp bằng hàng trăm screenshot test. Unit test trả lời logic; browser test trả lời platform integration; screenshot trả lời output hình ảnh. Mỗi tầng giữ một loại contract.
+
+## Browser test deterministic
+
+[Playwright Clock](https://playwright.dev/docs/clock) có thể điều khiển `Date`, timer, `requestAnimationFrame`, `performance` và event timestamp. Cài clock **trước khi app khởi tạo timer**:
+
+```ts
+import { test, expect } from '@playwright/test';
+
+test('Idle chuyển sang Walk sau command', async ({ page }) => {
+  await page.clock.install({ time: new Date('2026-07-12T00:00:00Z') });
+  await page.addInitScript(() => {
+    // App test build đọc seed này thay vì Math.random().
+    window.__THREE_TEST_SEED__ = 42;
+  });
+
+  await page.goto('/tools/character/');
+  await page.getByRole('button', { name: 'Đi tới điểm A' }).click();
+  await page.clock.runFor(500);
+
+  await expect(page.getByTestId('character-state')).toHaveText('Walking');
+  await expect(page.getByTestId('selected-object')).toHaveText('robot');
+});
+```
+
+Test assert semantic DOM/state trước, pixel sau. Nếu chỉ biết canvas “khác ảnh cũ”, bạn không biết state machine sai, loader sai hay GPU render khác.
+
+### Network và stale response
+
+[Playwright network routing](https://playwright.dev/docs/network) có thể abort, delay hoặc fulfill request. Bài test race phải buộc request cũ hoàn thành sau request mới:
+
+```ts
+test('response cũ không overwrite lựa chọn mới', async ({ page }) => {
+  await page.route('**/old.glb', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await route.fulfill({ path: 'tests/fixtures/old.glb' });
+  });
+  await page.route('**/new.glb', (route) =>
+    route.fulfill({ path: 'tests/fixtures/new.glb' })
+  );
+
+  await page.goto('/viewer');
+  await page.getByRole('button', { name: 'Old' }).click();
+  await page.getByRole('button', { name: 'New' }).click();
+
+  await expect(page.getByTestId('asset-id')).toHaveText('new');
+  await expect(page.getByTestId('stale-disposals')).toHaveText('1');
+});
+```
+
+Invariant không phải “request old bị abort thành công”. Parse/decoder có thể không abort được. Invariant là **generation cũ không commit và resource của nó được dispose**.
+
+## Visual test: tolerance có chủ đích
+
+[Playwright visual comparisons](https://playwright.dev/docs/test-snapshots) cảnh báo screenshot thay đổi theo OS, browser, hardware, power state và headless mode. Vì vậy:
+
+1. Pin browser version, OS image, font, viewport, DPR, color profile và baseline runner.
+2. Freeze clock, seed random, camera, exposure và animation state.
+3. Chờ asset, decoder và shader compile hoàn tất; app phát `data-render-ready="true"`.
+4. Mask timestamp/debug HUD động.
+5. Dùng tolerance nhỏ, có lý do; không tăng tolerance để “CI xanh”.
+
+```ts
+await page.goto('/product/fixture-chair');
+await page.locator('[data-render-ready="true"]').waitFor();
+await expect(page.locator('[data-scene-root]')).toHaveScreenshot('chair.png', {
+  animations: 'disabled',
+  maxDiffPixelRatio: 0.002,
+});
+```
+
+Kết hợp ba assertion:
+
+- semantic: đúng asset/variant/state;
+- structural: draw call, triangle, texture count không vượt fixture contract;
+- visual: pixel diff trong tolerance.
+
+Không dùng screenshot để gate cross-GPU tuyệt đối. Chạy baseline trên một môi trường ổn định; real-device farm dùng perceptual metrics/tolerance riêng và chủ yếu phát hiện regression lớn.
+
+## Performance test: distribution, không phải một FPS
+
+Một số `fps = 60` giấu hitch 200 ms. Thu frame duration sau warm-up, report distribution:
+
+```ts
+function percentile(sorted: readonly number[], p: number) {
+  if (!sorted.length) return 0;
+  const index = Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1);
+  return sorted[index];
+}
+
+const samples = frameDurations.slice(120).sort((a, b) => a - b);
+const report = {
+  count: samples.length,
+  p50: percentile(samples, 0.5),
+  p95: percentile(samples, 0.95),
+  longFrames: samples.filter((ms) => ms > 50).length,
+};
+```
+
+Quy tắc benchmark:
+
+- workload, camera path, seed và resolution cố định;
+- warm shader/cache trước cửa sổ đo;
+- không update DOM HUD mỗi frame;
+- so với baseline cùng runner, không so laptop CI với điện thoại;
+- gate regression tương đối và hard ceiling có owner;
+- giữ raw samples/artifact khi fail để điều tra.
+
+[`PerformanceObserver`](https://www.w3.org/TR/performance-timeline/) phù hợp để nhận performance entries mà không polling, nhưng không thay frame instrumentation riêng của scene. Feature-detect từng entry type.
+
+## Failure injection matrix
+
+Test happy path chỉ chứng minh ngày đẹp trời. Mỗi boundary cần một fault và một invariant hồi phục:
+
+| Fault inject          | Cách tạo trong test         | Invariant bắt buộc                                          | Evidence                                       |
+| --------------------- | --------------------------- | ----------------------------------------------------------- | ---------------------------------------------- |
+| 404/timeout/offline   | route abort/delay           | UI có retry hoặc static fallback; không spinner vô hạn      | `asset_load_failed` có error code hữu hạn      |
+| Decoder thiếu/hỏng    | block WASM/JS decoder       | asset placeholder; scene còn thao tác được                  | decoder name/version, không raw stack cho user |
+| Stale response        | old chậm, new nhanh         | chỉ generation mới commit; old dispose                      | `asset_stale_ignored` counter                  |
+| Context lost          | `WEBGL_lose_context` khi có | stop submit; status semantic; restore/rebuild hoặc fallback | lost/restored timestamps, recovery outcome     |
+| Context không restore | không gọi restore / timeout | chuyển static fallback, giữ product controls DOM            | `context_recovery_timeout`                     |
+| Shader compile fail   | test-only broken material   | error boundary, không crash cả route                        | material/program key, sanitized code           |
+| Resize/DPR đổi        | đổi viewport/DPR            | drawing buffer đúng, không resize mỗi frame                 | resize count, buffer dimensions                |
+| Route unmount/remount | lặp navigation              | một RAF/context; memory proxy không leo vô hạn              | lifecycle counters trước/sau                   |
+
+WebGL context restored không có nghĩa resource cũ còn hợp lệ. Theo [WebGL context-loss model](https://registry.khronos.org/webgl/specs/latest/1.0/#5.15.2), app phải ngừng dùng context mất và tái tạo state/resource khi restore. Extension `WEBGL_lose_context` chỉ là fault-injection hook; luôn feature-detect vì môi trường có thể không cung cấp.
+
+## Telemetry schema có thể vận hành được
+
+Telemetry tốt trả lời quyết định; telemetry xấu gửi mọi thứ “phòng khi cần”. Định nghĩa schema versioned với cardinality hữu hạn:
+
+```ts
+type SceneEvent = {
+  schema: 'com.example.three.telemetry.v1';
+  type:
+    | 'scene_ready'
+    | 'asset_load_failed'
+    | 'asset_stale_ignored'
+    | 'context_lost'
+    | 'context_recovered'
+    | 'static_fallback_shown';
+  release: string;
+  assetClass: 'critical' | 'optional';
+  deviceTier: 'entry' | 'mid' | 'high' | 'unknown';
+  durationBucketMs?: 50 | 100 | 250 | 500 | 1000 | 2500 | 5000 | 10000;
+  errorCode?: 'http_404' | 'timeout' | 'decoder' | 'integrity' | 'context';
+  sampled: boolean;
+};
+```
+
+Không gửi:
+
+- raw asset URL có customer/product ID;
+- exact GPU renderer/driver string;
+- canvas hash hoặc shader precision fingerprint;
+- full stack chứa query/token/path;
+- frame sample cho từng frame, từng user;
+- user ID khi metric chỉ cần release/tier/error cohort.
+
+[W3C fingerprinting guidance](https://www.w3.org/TR/fingerprinting-guidance/) liệt kê performance characteristics và graphical rendering patterns như nguồn entropy. Vì thế bucket duration, giảm cardinality capability, sample theo session và aggregate server-side. Privacy là property của schema, không phải câu “chúng tôi không cố track”.
+
+### p50/p95 với bounded histogram
+
+Đừng upload mảng frame-time. Giữ histogram nhỏ trong session:
+
+```ts
+const edges = [8, 12, 16, 24, 33, 50, 100, Infinity];
+const counts = new Uint32Array(edges.length);
+
+function observeFrame(ms: number) {
+  const index = edges.findIndex((edge) => ms <= edge);
+  counts[index]++;
+}
+
+function approximatePercentile(p: number) {
+  const total = counts.reduce((sum, n) => sum + n, 0);
+  const target = Math.ceil(total * p);
+  let seen = 0;
+  for (let i = 0; i < counts.length; i++) {
+    seen += counts[i];
+    if (seen >= target) return edges[i];
+  }
+  return 0;
+}
+```
+
+Gửi summary mỗi 30–60 giây hoặc lúc page hide, với session sampling ổn định. Error hiếm có thể có sampling rate cao hơn performance stream, nhưng collector vẫn phải rate-limit và loại duplicate storm. [Reporting API](https://www.w3.org/TR/reporting-1/) cũng nói delivery là best-effort, không phải kênh đáng tin tuyệt đối; telemetry không được trở thành dependency của recovery.
+
+## Canvas accessibility: semantic DOM twin
+
+Canvas là bitmap đối với accessibility tree. Một `aria-label="3D viewer"` không làm các vật thể và hành động bên trong trở nên operable. [WCAG 2.2](https://www.w3.org/TR/WCAG22/) yêu cầu functionality có thể dùng bằng keyboard; chiến lược bền vững là một **semantic DOM twin** dùng cùng application state:
+
+```html
+<section aria-labelledby="viewer-title">
+  <h2 id="viewer-title">Cấu hình ghế</h2>
+
+  <canvas tabindex="0" aria-describedby="viewer-help viewer-status">
+    Trình xem 3D. Dùng danh sách cấu hình ngay sau canvas nếu canvas không khả
+    dụng.
+  </canvas>
+
+  <p id="viewer-help">Phím mũi tên xoay góc nhìn; Space dừng chuyển động.</p>
+  <p id="viewer-status" role="status" aria-live="polite">
+    Đã chọn: Ghế gỗ sồi, màu xanh rêu.
+  </p>
+
+  <fieldset>
+    <legend>Màu</legend>
+    <button aria-pressed="true">Xanh rêu</button>
+    <button aria-pressed="false">Đỏ gạch</button>
+  </fieldset>
+</section>
+```
+
+DOM twin không phải bản mô tả nghèo nàn; nó là interface chính thức cho cùng intent:
+
+- object list/selection có tên và state;
+- mọi pointer action có button/keyboard equivalent;
+- focus visible và không bị trap;
+- status quan trọng được announce có tiết chế, không spam mỗi frame;
+- drag có nút nudge/position input hoặc command thay thế;
+- canvas và DOM dispatch cùng `Command`, không hai logic khác nhau.
+
+Tránh `role="application"` trừ khi bạn thực sự quản lý toàn bộ keyboard model và đã test screen reader; native button/list/form semantics thường tốt hơn.
+
+### Reduced motion là runtime policy
+
+[`prefers-reduced-motion`](https://www.w3.org/TR/mediaqueries-5/#prefers-reduced-motion) không chỉ tắt CSS transition. Three.js phải nghe media query và thay render policy:
+
+```ts
+const motion = matchMedia('(prefers-reduced-motion: reduce)');
+
+function applyMotionPolicy() {
+  world.idleAnimationEnabled = !motion.matches;
+  world.cameraInertiaEnabled = !motion.matches;
+  world.particleIntensity = motion.matches ? 0 : 1;
+  scheduler.mode = motion.matches ? 'on-demand' : 'continuous';
+  scheduler.invalidate();
+}
+
+motion.addEventListener('change', applyMotionPolicy);
+applyMotionPolicy();
+```
+
+Giữ animation cần cho meaning, nhưng loại auto-orbit, parallax, camera swoop và particle không thiết yếu; cung cấp Pause rõ ràng. Reduced motion cũng giảm pin/GPU, nhưng accessibility mới là contract chính.
+
+### Static fallback là một product path
+
+WebGL init fail, context không restore, device quá yếu hoặc JS/CDN lỗi: hiển thị ảnh/poster đã duyệt cùng controls DOM và thông tin sản phẩm. Fallback phải được test và có telemetry riêng. Đừng để nó là `<noscript>` chưa ai mở từ ngày đầu dự án.
+
+## SLO và incident runbook
+
+SLO dưới đây là ví dụ để team hiệu chỉnh, không phải chuẩn chung:
+
+| SLI                        |                                          Example SLO | Cohort                                                         |
+| -------------------------- | ---------------------------------------------------: | -------------------------------------------------------------- |
+| Critical scene-ready       |                                          99.5% ≤ 5 s | session online, browser được support; report unsupported riêng |
+| Fatal-free viewer          |                                                99.9% | mọi session mở viewer, kể cả fallback                          |
+| Input acknowledgement      |                                         99% ≤ 100 ms | command keyboard/pointer hợp lệ                                |
+| Context recovery outcome   |               95% restore hoặc static fallback ≤ 3 s | session có `context_lost`                                      |
+| Accessibility task success | 100% critical intent qua keyboard trong release gate | browser/AT matrix đã định nghĩa                                |
+
+Không loại cohort khó khỏi denominator chỉ để SLO đẹp. Nếu WebGL unsupported, success có thể là static fallback đúng, không phải canvas 3D.
+
+### Runbook khi scene-ready/fatal SLO cháy
+
+1. **Xác nhận scope:** release, manifest hash, asset ID/class, browser family, coarse tier, region; không bắt đầu bằng exact GPU fingerprint.
+2. **Tách boundary:** fetch, integrity, decoder, parse, shader/compile, context, application state.
+3. **Mitigate trước:** rollback manifest về content hash trước; bỏ optional asset; giảm tier; tắt effect qua kill switch; chuyển static fallback.
+4. **Bảo toàn evidence:** gate report, manifest, release, bounded event trail, failed error code; không log raw user data.
+5. **Verify recovery:** synthetic fixture + affected cohort telemetry; không chỉ “máy tôi chạy”.
+6. **Follow-up:** thêm fixture/fault test tái hiện root cause, siết contract/CI gate, ghi owner và deadline.
+
+Manifest content-addressed của Part 23 làm rollback nhanh và tái lập. Resilience không phải cố làm mọi failure vô hình; nó là **failure có state, có fallback, có evidence và có đường hồi phục**.
+
+## Production release gate
+
+- Core state chạy deterministic với injected clock/random/input.
+- Unit test khóa state machine, math, ownership và stale generation.
+- Browser test chạy WebGL thật cho load, resize, focus, keyboard và lifecycle.
+- Visual baseline pin environment; tolerance có review và lý do.
+- Perf test warm-up, workload cố định, report p50/p95/long frames.
+- Fault tests bao phủ 404, timeout, decode, stale response, context lost và recovery timeout.
+- Telemetry schema versioned, bounded cardinality, sampled và không lấy exact GPU/canvas fingerprint.
+- Canvas có semantic DOM twin; critical intent dùng được bằng keyboard.
+- Reduced-motion thay đổi runtime policy; Pause và static fallback được test.
+- SLI/SLO có denominator rõ; alert nối tới runbook và rollback manifest.
+
+## Nguồn chính
+
+- [Playwright Clock](https://playwright.dev/docs/clock), [Network](https://playwright.dev/docs/network), [Visual comparisons](https://playwright.dev/docs/test-snapshots)
+- [WebGL Specification — Context Lost](https://registry.khronos.org/webgl/specs/latest/1.0/#5.15.2)
+- [W3C Performance Timeline](https://www.w3.org/TR/performance-timeline/)
+- [WCAG 2.2](https://www.w3.org/TR/WCAG22/) và [Media Queries Level 5](https://www.w3.org/TR/mediaqueries-5/)
+- [W3C Fingerprinting Guidance](https://www.w3.org/TR/fingerprinting-guidance/)
+- [W3C Reporting API](https://www.w3.org/TR/reporting-1/)
+
+## Cửa cuối: đổi renderer mà không biến production thành canh bạc
+
+Những contract ở Part 21–24 cũng là điều kiện để migration renderer có thể đảo ngược: runtime không phụ thuộc backend, asset có gate, telemetry so được cohort, failure có fallback. **Part 25** áp dụng nền đó vào WebGPU và TSL — chỉ ra feature gap, viết material chung cho hai backend, thiết kế capability matrix và rollout theo dữ liệu.
+
+## Kết luận
+
+Bạn không đạt cấp Staff/Principal bằng số lượng shader thuộc lòng. Bạn đạt tới đó khi biến 3D thành capability có contract xuyên team: asset có provenance và budget; runtime có ownership; input có semantic model; test có determinism; failure có fallback; telemetry đủ vận hành nhưng không xâm phạm; và người dùng không bị loại khỏi sản phẩm chỉ vì họ không tương tác với canvas giống bạn.
+
+Three.js là renderer. Chất lượng production đến từ hệ thống bạn dựng **xung quanh** renderer đó.

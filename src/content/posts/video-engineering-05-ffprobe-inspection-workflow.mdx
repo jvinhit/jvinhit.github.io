@@ -1,0 +1,227 @@
+---
+title: 'Video Engineering · Phần 5 — Quy trình kiểm tra media bằng ffprobe'
+description: 'Dùng ffprobe đọc format, stream, packet và frame dưới dạng JSON; sau đó rút gọn dữ liệu thành báo cáo đủ nhỏ để debug, review asset và tự động hóa pipeline.'
+pubDate: 2026-07-12
+lang: vi
+tags: [video-engineering, video, ffmpeg, ffprobe, media-metadata, debugging]
+series: video-engineering
+seriesOrder: 5
+draft: false
+---
+
+Khi một video “không chạy”, phản xạ tệ nhất là thử đổi codec hoặc encode lại ngay. Ta vừa làm mất bằng chứng, vừa tốn thời gian mà chưa biết lỗi nằm ở container, stream, timestamp hay metadata. Quy trình tốt hơn là **probe trước, thay đổi sau**.
+
+`ffprobe` đi cùng bộ FFmpeg nhưng không phát hay biến đổi media. Nó mở input, đọc cấu trúc container, nhận diện stream và có thể đi sâu tới packet hoặc frame. Bài này xây một workflow từ tổng quan đến chi tiết, rồi tạo báo cáo JSON đủ gọn để dùng trong CI hay đính kèm bug report.
+
+Phần 4 đã dùng từng nhóm field để điều tra rotation, color và audio metadata.
+Ở đây ta không học lại ý nghĩa từng field; mục tiêu mới là **thứ tự điều tra,
+khoanh vùng theo interval và compact report có thể tự động hóa**.
+
+---
+
+## 1. Tạo fixture có thể tái lập
+
+Ta không cần tải video từ Internet. Hai nguồn `lavfi` tạo hình test và âm thanh sin trong 12 giây:
+
+```bash
+ffmpeg -hide_banner -y -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=12" -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=12" -map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -preset veryfast -g 60 -keyint_min 60 -sc_threshold 0 -c:a aac -b:a 128k -metadata title="Video Engineering fixture" -metadata comment="Generated locally with lavfi" -metadata:s:v:0 language=und -metadata:s:a:0 language=vie fixture.mp4
+```
+
+Lệnh hoàn chỉnh này tạo:
+
+- một video H.264, 1280×720, 30 fps;
+- một audio AAC mono, 48 kHz;
+- GOP dự kiến dài 60 frame, tức khoảng hai giây;
+- metadata ở cấp file và cấp từng stream.
+
+`vie`, `eng` và `und` là mã ngôn ngữ ba ký tự thường dùng trong media container; đừng mặc định tag web `vi`/`en` sẽ được muxer lưu theo cùng cách.
+
+`-hide_banner` chỉ giảm log thừa; `-y` cho phép ghi đè fixture. Nếu máy không có encoder `libx264`, kiểm tra bằng `ffmpeg -encoders` rồi chọn encoder H.264 khả dụng. Đừng đổi encoder âm thầm trong pipeline production: tên codec đầu ra giống nhau không có nghĩa profile, pixel format và hành vi rate control giống nhau.
+
+---
+
+## 2. Đi từ format tới stream
+
+Lần probe đầu tiên nên đủ rộng:
+
+```bash
+ffprobe -hide_banner -v error -show_format -show_streams fixture.mp4
+```
+
+Hai nhóm dữ liệu trả lời hai loại câu hỏi:
+
+| Cấp      | Câu hỏi điển hình                                                                            |
+| -------- | -------------------------------------------------------------------------------------------- |
+| `FORMAT` | File/container là gì, dài bao lâu, kích thước và bitrate tổng bao nhiêu, có tag nào?         |
+| `STREAM` | Có mấy track, codec/profile nào, độ phân giải, sample rate, time base và disposition ra sao? |
+
+Đuôi file chỉ là gợi ý. `format_name` mới cho biết demuxer đã nhận diện container nào. Tương tự, `codec_name=h264` mô tả nội dung compressed của video stream; nó không nói file là MP4, MPEG-TS hay Matroska.
+
+Để máy khác xử lý ổn định, xuất JSON thay vì parse output dành cho người:
+
+```bash
+ffprobe -v error -show_format -show_streams -of json fixture.mp4
+```
+
+`-v error` giữ lỗi thật trên stderr nhưng bỏ banner và thông tin không liên quan. Không nên dùng `2>/dev/null` trong automation vì bạn sẽ vô tình nuốt luôn lý do probe thất bại.
+
+---
+
+## 3. Chỉ lấy trường cần thiết
+
+JSON đầy đủ rất hữu ích lúc khám phá, nhưng quá ồn cho log CI. `-show_entries` cho phép mô tả schema đầu ra:
+
+```bash
+ffprobe -v error -show_entries "format=filename,format_name,duration,size,bit_rate:format_tags=title,comment:stream=index,codec_type,codec_name,profile,width,height,pix_fmt,r_frame_rate,avg_frame_rate,time_base,duration,bit_rate,sample_rate,channels,channel_layout:stream_tags=language,title:stream_disposition=default,forced" -of json fixture.mp4
+```
+
+Một vài trường dễ bị hiểu sai:
+
+- `r_frame_rate` thường phản ánh rate danh nghĩa hoặc rate có thể biểu diễn timestamp, không phải phép đo chắc chắn số frame mỗi giây.
+- `avg_frame_rate` là tỉ lệ trung bình dựa trên dữ liệu mà demuxer biết; với VFR, một con số trung bình không mô tả được nhịp frame.
+- `time_base` là đơn vị của timestamp, ví dụ `1/15360`; muốn ra giây phải nhân giá trị timestamp với time base.
+- `duration` ở cấp format và stream có thể khác nhau do edit list, encoder delay, track bắt đầu muộn hoặc container thiếu index.
+- `bit_rate` có thể vắng mặt. “Không có metadata” khác với bitrate bằng 0.
+
+Hãy giữ phân số dưới dạng chuỗi nếu chưa thực sự cần số thực. Chuyển `30000/1001` thành `29.97` quá sớm làm mất độ chính xác và dễ gây drift khi tính timeline dài.
+
+---
+
+## 4. Packet: thứ demuxer lấy ra khỏi container
+
+Khi tổng quan có vẻ đúng nhưng video đứng ở một mốc cố định, hãy kiểm tra packet quanh mốc đó. Lệnh sau chỉ đọc video stream đầu tiên từ giây thứ 5 trong khoảng một giây:
+
+```bash
+ffprobe -v error -select_streams v:0 -read_intervals "5%+1" -show_packets -show_entries "packet=stream_index,pts_time,dts_time,duration_time,size,pos,flags" -of json fixture.mp4
+```
+
+Packet chứa dữ liệu compressed. Các trường quan trọng:
+
+- `pts_time`: lúc nội dung packet nên được trình bày;
+- `dts_time`: lúc packet cần được decode;
+- `duration_time`: thời lượng packet theo timeline;
+- `pos`: vị trí byte trong input nếu demuxer biết;
+- `flags`: `K` thường đánh dấu packet chứa keyframe, `D` có thể đánh dấu discard.
+
+Với codec có B-frame, PTS và DTS không nhất thiết bằng nhau vì thứ tự decode có thể khác thứ tự hiển thị. Vì thế “timestamp không tăng đều trong cột DTS và PTS cùng lúc” chưa chắc là lỗi. Ta cần xác định đang xét thứ tự decode hay presentation.
+
+`-read_intervals` có thể seek tới điểm gần nhất mà input hỗ trợ, không cam kết packet đầu tiên có PTS đúng tuyệt đối 5.000 giây. Đây là công cụ thu hẹp phạm vi, không phải phép cắt chính xác.
+
+---
+
+## 5. Frame: kết quả sau decode
+
+Packet và frame không có quan hệ một-một bắt buộc. Một packet có thể góp dữ liệu cho nhiều frame; một frame cũng có thể cần dữ liệu từ nhiều packet. Để xem kết quả decoder tạo ra:
+
+```bash
+ffprobe -v error -select_streams v:0 -read_intervals "5%+1" -show_frames -show_entries "frame=media_type,key_frame,best_effort_timestamp_time,pkt_duration_time,pict_type,width,height,pix_fmt" -of json fixture.mp4
+```
+
+`best_effort_timestamp_time` là timestamp mà FFmpeg suy ra để trình bày frame, đặc biệt hữu ích khi timestamp gốc thiếu hoặc khó dùng. `pict_type` cho thấy I/P/B-frame; `key_frame=1` giúp kiểm tra biên seek hoặc segment có thực sự bắt đầu bằng điểm truy cập ngẫu nhiên.
+
+`-show_frames` buộc decoder làm nhiều việc hơn `-show_packets`, do đó đắt hơn đáng kể trên file dài. Quy tắc thực tế:
+
+1. probe format và streams;
+2. thu hẹp bằng stream selector và interval;
+3. xem packets;
+4. chỉ decode frames khi câu hỏi thật sự nằm ở frame.
+
+Nếu cần đếm, `-count_packets` và `-count_frames` thêm các trường đếm vào stream:
+
+```bash
+ffprobe -v error -select_streams v:0 -count_packets -count_frames -show_entries "stream=index,nb_read_packets,nb_read_frames" -of json fixture.mp4
+```
+
+Đếm toàn file có thể chậm gần bằng đọc toàn bộ file. Đừng đặt nó vào request path của API chỉ để hiển thị một badge.
+
+---
+
+## 6. Tạo compact report bằng JSON và jq
+
+Một bug report tốt không cần hàng nghìn packet nếu vấn đề chỉ là asset sai profile. Lệnh sau tạo bản tóm tắt có cấu trúc; `jq` là dependency riêng, không thuộc FFmpeg:
+
+```bash
+ffprobe -v error -show_format -show_streams -of json fixture.mp4 | jq '{
+  file: .format.filename,
+  container: .format.format_name,
+  duration_s: (.format.duration // null),
+  size_bytes: (.format.size // null),
+  overall_bit_rate: (.format.bit_rate // null),
+  streams: [
+    .streams[] | {
+      index,
+      type: .codec_type,
+      codec: .codec_name,
+      profile: (.profile // null),
+      dimensions: (if .codec_type == "video" then [.width, .height] else null end),
+      pixel_format: (.pix_fmt // null),
+      nominal_rate: (.r_frame_rate // null),
+      average_rate: (.avg_frame_rate // null),
+      sample_rate: (.sample_rate // null),
+      channels: (.channels // null),
+      language: (.tags.language // null),
+      default: (.disposition.default // 0)
+    }
+  ]
+}'
+```
+
+Giữ giá trị có thể thiếu ở `null` thay vì tự điền 0. Với pipeline nhiều asset, `null` giúp phân biệt “không biết” với “đã đo và bằng không”. Nếu report dùng để chặn upload, hãy validate theo mục tiêu phát: ví dụ video web có thể yêu cầu codec/pixel format cụ thể, audio sample rate hợp lệ và ít nhất một default stream.
+
+---
+
+## 7. Một workflow debug có thứ tự
+
+Khi nhận một asset lạ, hãy ghi lại lệnh và output theo thứ tự:
+
+1. Chạy `ffprobe -v error -show_format -show_streams -of json`.
+2. Xác nhận đúng container, số stream, codec, duration và disposition.
+3. Chọn đúng stream bằng `-select_streams v:0`, `a:0` hoặc index cụ thể.
+4. Khoanh vùng thời gian lỗi bằng `-read_intervals`.
+5. Xem packet để kiểm tra timestamp/keyframe.
+6. Xem frame nếu cần xác nhận decoder thực sự tạo được hình.
+7. Lưu compact report cùng phiên bản `ffprobe -version`, hệ điều hành và lệnh tái hiện.
+
+Workflow này không đảm bảo tự tìm ra mọi lỗi, nhưng nó ngăn ta encode lại mù quáng và làm mất dữ liệu gốc.
+
+---
+
+## Failure checklist
+
+- [ ] Đang tin phần mở rộng file thay vì `format_name`.
+- [ ] Parse output mặc định thay vì dùng `-of json`.
+- [ ] Quên `-v error`, khiến log và JSON trộn lẫn trong cùng pipeline.
+- [ ] Coi `r_frame_rate` là FPS đo được cho mọi asset.
+- [ ] So timestamp nhưng bỏ qua `time_base`.
+- [ ] Kết luận duration format và stream bắt buộc phải giống nhau.
+- [ ] Dùng `-show_frames` cho toàn bộ video dài dù chỉ lỗi ở một giây.
+- [ ] Coi PTS khác DTS là hỏng file.
+- [ ] Điền trường metadata vắng mặt thành 0, làm sai nghĩa dữ liệu.
+- [ ] Không lưu phiên bản FFmpeg và câu lệnh đầy đủ trong bug report.
+
+---
+
+## Bài tập
+
+**1.** Tạo fixture 24 fps và đổi audio sang 44.1 kHz. Viết một lệnh `ffprobe` chỉ trả codec, frame-rate fields, sample rate và channel layout.
+
+**2.** Dùng `-show_packets` tìm các video packet có cờ `K`. Khoảng cách giữa chúng có gần hai giây như cấu hình GOP không? Vì sao scene-cut có thể làm kết quả khác nếu bỏ `-sc_threshold 0`?
+
+**3.** Thêm một audio stream thứ hai bằng `lavfi`, đặt language là `eng`, rồi sửa compact report để liệt kê cả hai track và disposition.
+
+**Nâng cao:** tạo một fixture VFR bằng cách thay đổi timestamp trong filtergraph. So sánh `r_frame_rate`, `avg_frame_rate` và khoảng cách giữa các `best_effort_timestamp_time`; ghi lại vì sao một con số FPS không đủ mô tả VFR.
+
+---
+
+## Đọc thêm
+
+- [Tài liệu ffprobe chính thức](https://ffmpeg.org/ffprobe.html)
+- [Các writer và định dạng output của ffprobe](https://ffmpeg.org/ffprobe.html#Writers)
+- [Cú pháp stream specifier trong FFmpeg](https://ffmpeg.org/ffmpeg.html#Stream-specifiers-1)
+- [Tài liệu tổng quan FFmpeg](https://ffmpeg.org/documentation.html)
+
+---
+
+## Bài kế tiếp
+
+[Phần 6 — FFmpeg CLI như một media graph: option scope, stream mapping, remux và transcode](/blog/video-engineering-06-ffmpeg-cli-media-graph/)

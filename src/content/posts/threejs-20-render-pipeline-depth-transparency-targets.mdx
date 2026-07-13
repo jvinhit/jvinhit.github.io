@@ -1,0 +1,365 @@
+---
+title: 'Three.js from Zero to Senior · Part 20 — Render Pipeline, Depth, Transparency & Render Targets'
+description: 'Mở pipeline renderer: render lists, draw calls, passes, depth test/write, z-fighting, transparency sorting, alpha strategies, render targets, MRT, color pipeline và playbook debug.'
+pubDate: 2026-07-12
+tags: [threejs, 3d, rendering, performance, architecture]
+series: threejs
+seriesOrder: 20
+lang: vi
+draft: false
+---
+
+import DemoEmbed from '~/components/blog/DemoEmbed.astro';
+
+Khi hai mặt chớp nháy, object trong suốt biến mất hoặc post-processing làm màu đổi, cách sửa nhanh nhất thường là… dừng sửa. Trước tiên hãy xác định **pixel hỏng ở stage nào của pipeline**.
+
+Three.js che phần lớn WebGL boilerplate, nhưng không xoá các quy luật bên dưới: object được phân loại và sort, draw call chạy qua depth test, fragment có thể ghi depth rồi blend màu, còn mỗi shadow/post-process pass lại chạy thêm một pipeline khác. `renderOrder = 999` chỉ tác động một lát nhỏ trong chuỗi đó.
+
+Lab bên dưới cho bạn bật/tắt depth test/write, đổi giữa alpha blend, alpha test và alpha hash, ép `renderOrder`, điều chỉnh hai mặt gần coplanar, rồi chèn một render target trung gian. HUD cộng draw calls qua toàn bộ frame để bạn thấy “thêm một pass” thực sự có giá gì.
+
+<DemoEmbed
+  slug="threejs-depth-transparency-lab"
+  title="Three.js depth, transparency and render target lab"
+  height="940px"
+/>
+
+## Mental model: một frame không đồng nghĩa một lần render
+
+Ở mức hữu ích cho debugging, một frame có thể đọc như sau:
+
+```text
+update application state
+  ↓
+update world matrices / camera
+  ↓
+traverse scene → visibility + frustum culling
+  ↓
+build render lists → opaque / transmissive / transparent
+  ↓
+sort each list theo policy của renderer
+  ↓
+bind target + clear color/depth/stencil
+  ↓
+for each item: bind program/state/resources → draw
+  ↓
+repeat cho shadow, reflection, picking, post-processing…
+  ↓
+tone map + output color-space conversion → canvas
+```
+
+Đây không phải public contract để code dựa vào internal render-list implementation. Nó là mental model để hỏi đúng câu:
+
+- Object có lọt qua visibility/culling không?
+- Nó nằm trong opaque hay transparent queue?
+- Draw call có chạy nhưng fragment fail depth test không?
+- Fragment qua depth nhưng blend theo thứ tự nào?
+- Ta đang nhìn target/pass nào và color transform đã chạy chưa?
+
+## Draw call, render item và pass không phải một khái niệm
+
+Một `Mesh` thường tạo ít nhất một render item, nhưng không có đẳng thức “một mesh = một draw call” cho mọi scene:
+
+- geometry có nhiều `groups`/materials có thể tạo nhiều draw calls;
+- double-sided transparent material có thể cần hai draw calls, trừ khi chọn `forceSinglePass` với trade-off phù hợp;
+- shadow-casting mesh được vẽ lại vào shadow map;
+- cùng scene qua reflection, picking hay post-processing có thêm pass;
+- instancing/batching có thể gom nhiều object vào ít draw calls hơn.
+
+Vì vậy budget nên viết theo **frame graph**:
+
+```text
+Main opaque       180 calls
+Main transparent   24 calls
+Shadow × 2        260 calls
+Reflection         90 calls
+Post passes         6 fullscreen calls
+--------------------------------------
+Whole frame        560 calls
+```
+
+Với multipass, mặc định `renderer.info` reset ở mỗi `render()`. Muốn cộng cả frame:
+
+```js
+renderer.info.autoReset = false;
+
+function renderFrame() {
+  renderer.info.reset();
+
+  renderShadowsOrCustomPasses();
+  composer.render();
+
+  const callsForWholeFrame = renderer.info.render.calls;
+  report(callsForWholeFrame);
+  // Frame kế tiếp reset ở đầu frame.
+}
+```
+
+`renderer.info` là signal tốt, không phải GPU profiler. Nó không cho biết fragment shader nặng bao nhiêu, overdraw bao nhiêu hay GPU mất bao lâu. Dùng nó cùng Chrome Performance, GPU timing phù hợp và benchmark trên device mục tiêu.
+
+## Depth test và depth write là hai quyết định độc lập
+
+Mỗi fragment có một depth sau projection. Hai cờ material trả lời hai câu khác nhau:
+
+- `depthTest`: fragment này có phải so với depth đã có không?
+- `depthWrite`: nếu fragment sống sót, nó có cập nhật depth buffer không?
+
+| `depthTest` | `depthWrite` | Hành vi điển hình                                                                    |
+| ----------- | ------------ | ------------------------------------------------------------------------------------ |
+| `true`      | `true`       | Opaque geometry: bị che đúng và che object sau                                       |
+| `true`      | `false`      | Transparent/overlay 3D: vẫn bị opaque che nhưng không khoá depth cho transparent sau |
+| `false`     | implicit off | Screen/UI overlay: luôn hiện theo order, không còn occlusion 3D                      |
+
+```js
+material.depthTest = true;
+material.depthWrite = false;
+```
+
+`depthWrite = false` thường hữu ích cho alpha-blended surface, nhưng không phải universal fix. Các lớp trong suốt vẫn cần order hợp lý; intersection trong cùng object vẫn khó; particle phía sau có thể blend xuyên qua phần đáng lẽ occlude.
+
+Khi `depthTest = false`, Three.js cũng vô hiệu depth write. Nếu cần một invisible occluder, giữ depth test/write và đặt `colorWrite = false` thay vì tắt depth toàn bộ.
+
+## Z-fighting: hai fragment tranh cùng một depth slot
+
+Z-fighting xuất hiện khi hai bề mặt có depth quá gần để buffer phân biệt ổn định. Nguyên nhân phổ biến:
+
+1. Hai surface coplanar thật sự: decal trùng mặt tường, floor bị duplicate.
+2. `near` quá gần và `far` quá xa, làm precision phân bố không phù hợp.
+3. World coordinates quá lớn làm vertex position đã mất precision trước depth stage.
+4. Geometry mỏng hoặc transform tạo gần-coplanar ở góc nhìn cụ thể.
+
+Thứ tự sửa nên giữ semantic trước:
+
+1. Xoá surface duplicate hoặc sửa asset.
+2. Tách geometry theo đơn vị có ý nghĩa nếu đó là hai lớp vật lý khác nhau.
+3. Siết camera `near`/`far` theo content.
+4. Với decal/line overlay có chủ đích, dùng `polygonOffset` và test theo device.
+5. Chỉ sau đó mới đánh giá reversed/logarithmic depth cho dải scale thật sự lớn.
+
+```js
+decalMaterial.polygonOffset = true;
+decalMaterial.polygonOffsetFactor = -1;
+decalMaterial.polygonOffsetUnits = -1;
+```
+
+`polygonOffset` phụ thuộc rasterizer và slope, nên đừng dùng một magic number làm global design token. Chụp visual regression ở camera angle gần song song bề mặt — nơi artifact thường lộ rõ nhất.
+
+## Vì sao transparency sorting chỉ là xấp xỉ
+
+Opaque surface thường có thể vẽ front-to-back để depth test loại fragment sớm. Alpha blending thì phụ thuộc thứ tự: màu “A phủ B” không nhất thiết bằng “B phủ A”. Renderer vì thế sort transparent object back-to-front.
+
+Vấn đề là Three.js sort **object/render item**, không thể sort từng triangle của hai mesh đang xuyên nhau. Với một mesh tự giao hoặc hai tấm kính cắt nhau, không tồn tại một object order đúng cho mọi pixel.
+
+### Alpha blend
+
+```js
+material.transparent = true;
+material.opacity = 0.45;
+material.depthWrite = false;
+```
+
+Phù hợp cho kính, smoke mềm, UI 3D; đổi lại phải quản lý order, overdraw, premultiplied alpha và đôi khi background/refraction.
+
+### Alpha test
+
+```js
+material.transparent = false;
+material.alphaTest = 0.5;
+```
+
+Fragment hoặc sống hoàn toàn, hoặc bị discard. Nó hợp với cutout rõ như lá/hàng rào và có thể ở opaque pipeline, nhưng mép dễ alias và ngưỡng làm mất chi tiết bán trong suốt.
+
+### Alpha hash
+
+```js
+material.transparent = false;
+material.alphaHash = true;
+```
+
+Alpha hash biến opacity thành pattern discard có nhiễu để tránh bài toán sort của alpha blending. Nó hữu ích cho vegetation/hair layers, nhưng tạo grain; temporal anti-aliasing có thể giúp ổn định kết quả. Không nên mô tả nó như “blend không artifact” — nó đổi sorting artifact lấy stochastic noise.
+
+### Alpha-to-coverage
+
+Với MSAA phù hợp, alpha-to-coverage có thể làm cutout edge mượt hơn. Hiệu quả phụ thuộc sample count và renderer/backend configuration; cần kiểm tra support thay vì coi là default path.
+
+## `renderOrder` điều khiển gì — và không điều khiển gì
+
+`Object3D.renderOrder` override thứ tự **trong queue tương ứng**; opaque và transparent vẫn được sort riêng:
+
+```js
+backGlass.renderOrder = 10;
+frontGlass.renderOrder = 20;
+```
+
+Nó hữu ích khi domain có order ổn định: gizmo, decal layer, một tập UI 3D đã biết hierarchy. Nó không:
+
+- biến transparent material thành opaque;
+- tắt depth test hoặc depth write;
+- sort triangle trong một mesh;
+- giải quyết hai surface giao nhau theo từng pixel;
+- đưa transparent item sang opaque queue.
+
+Nếu `renderOrder` thay đổi theo camera hoặc object count, đó thường là dấu hiệu cần đổi representation: split geometry, alpha test/hash, depth prepass, order-independent transparency chuyên biệt, hoặc thiết kế visual khác.
+
+## Render target: vẽ vào texture, không phải vào màn hình
+
+`WebGLRenderTarget` đóng gói color attachment và tuỳ chọn depth/stencil attachment. Nó là nền của shadow map, reflection, GPU picking và post-processing:
+
+```js
+const target = new THREE.WebGLRenderTarget(width, height, {
+  type: THREE.HalfFloatType,
+  depthBuffer: true,
+  stencilBuffer: false,
+});
+
+renderer.setRenderTarget(target);
+renderer.render(scene, camera);
+
+renderer.setRenderTarget(null);
+postMaterial.map = target.texture;
+renderer.render(postScene, postCamera);
+```
+
+Render target là GPU resource có ownership rõ:
+
+```js
+target.setSize(pixelWidth, pixelHeight);
+// ... khi feature/unmount kết thúc:
+target.dispose();
+```
+
+### Tính memory trước khi thêm pass
+
+Ước lượng baseline cho color attachments:
+
+```text
+bytes ≈ width × height × bytesPerPixel × attachments × bufferedTargets
+```
+
+Sau đó cộng depth/stencil, MSAA samples, mip levels và target tạm. Ví dụ RGBA16F thường cần 8 bytes/pixel cho color attachment; ping-pong hai target full-resolution ở DPR 2 tăng rất nhanh vì width và height đều nhân 2.
+
+Đây là lý do “chỉ thêm bloom” không phải một draw call đơn lẻ. Bloom thường downsample/blur/upsample qua nhiều target; mỗi pass đọc texture và ghi texture khác, chịu cả shader cost lẫn memory bandwidth.
+
+## EffectComposer, ping-pong và pass graph
+
+`EffectComposer` thường giữ hai render target để ping-pong: pass đọc kết quả trước và ghi kết quả sau. Mỗi fullscreen pass ít nhất thêm một draw, nhưng số draw call không phản ánh hết chi phí — một shader blur nhiều taps ở 4K có thể đắt hơn hàng chục draw call geometry nhỏ.
+
+```js
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(bloomPass);
+composer.addPass(colorGradePass);
+composer.addPass(new OutputPass());
+```
+
+Ở staff-level, hãy mô tả mỗi pass như một node có contract:
+
+- inputs: color/depth/normal/velocity nào;
+- output format và color space;
+- resolution scale;
+- clear/load/store policy;
+- owner chịu resize/dispose;
+- fallback khi feature/device không đủ.
+
+Từ đó mới quyết định gộp effect, hạ resolution hay bỏ pass trên mobile.
+
+## MRT: bớt geometry pass, tăng attachment bandwidth
+
+Multiple Render Targets cho fragment shader ghi nhiều color attachments trong cùng geometry pass — ví dụ albedo, normal và material parameters cho deferred pipeline. Three.js cho phép tạo nhiều attachments bằng `count`:
+
+```js
+const gBuffer = new THREE.WebGLRenderTarget(width, height, {
+  count: 3,
+  type: THREE.HalfFloatType,
+  depthBuffer: true,
+});
+
+console.log(gBuffer.textures.length); // 3 color attachments
+```
+
+MRT có thể giảm việc traverse/transform/rasterize geometry nhiều lần, nhưng không “miễn phí”:
+
+- fragment shader phải xuất nhiều dữ liệu;
+- bandwidth và VRAM tăng theo attachment/format;
+- MSAA resolve phức tạp và tốn hơn;
+- mobile tile memory có budget khác desktop;
+- material/custom shader phải tuân g-buffer contract.
+
+Chọn forward, deferred hay hybrid từ workload: số light, transparency, material diversity, target device và feature set — không từ việc MRT nghe “advanced”.
+
+## Color pipeline: depth đúng nhưng màu vẫn có thể sai
+
+Depth/blend xảy ra trong render pipeline, còn color cần một contract song song:
+
+```text
+sRGB color textures ─┐
+linear/HDR inputs ───┼→ Linear-sRGB working/render target
+data textures ───────┘
+                         ↓
+                    tone mapping
+                         ↓
+                   sRGB output canvas
+```
+
+- Base color/emissive PNG/JPEG thường được gắn `SRGBColorSpace`.
+- Normal/roughness/depth là data, thường giữ `NoColorSpace`.
+- HDR/EXR environment có thể dùng `LinearSRGBColorSpace`.
+- Tone mapping nén HDR radiance về display range.
+- Output conversion biến Linear-sRGB sang output sRGB.
+
+Khi dùng post-processing WebGL, `OutputPass` thường nằm cuối để tone map và output conversion đúng. Nếu một intermediate target đã encode sRGB rồi pass sau tưởng nó linear, kết quả có thể bị encode hai lần. Ghi color-space contract vào pass API, đừng suy từ tên texture.
+
+## Debugging playbook theo tầng
+
+Khi pixel sai, thay đổi **một biến mỗi lần**:
+
+1. **Visibility:** kiểm `visible`, layers, frustum, camera, material, clipping.
+2. **Geometry:** bật wireframe/helper; tìm duplicate/copanar surface và winding/normal.
+3. **Pass isolation:** render thẳng scene ra canvas; tắt shadow/composer/reflection.
+4. **Depth:** dùng override depth material; thử `depthWrite`/`depthTest` có mục tiêu, không ship thử nghiệm đó như fix.
+5. **Queue/order:** xác định opaque vs transparent; log `transparent`, `alphaTest`, `alphaHash`, `renderOrder`.
+6. **Color:** thay material bằng unlit solid color; kiểm input color spaces, target format và OutputPass.
+7. **Cost:** tắt từng pass, hạ pixel ratio/resolution, đọc whole-frame `renderer.info`, rồi profile GPU.
+
+Một debug view đáng đầu tư cho product 3D có các mode: base color, normals, roughness, depth, overdraw proxy, object ID và render pass. Nó biến “màu trông lạ” thành bằng chứng nằm ở asset, lighting, depth hay color transform.
+
+## Render architecture: pass graph và resource graph
+
+Một renderer production cần hai graph liên quan nhưng không đồng nhất:
+
+- **Pass graph:** pass nào phụ thuộc output nào và chạy theo thứ tự nào.
+- **Resource graph:** target/texture/depth buffer nào được tạo, dùng chung, resize và dispose bởi ai.
+
+Checklist review cho một effect mới:
+
+1. Nó thêm bao nhiêu geometry/fullscreen pass ở quality tiers?
+2. Target format, attachment count, resolution scale và MSAA là gì?
+3. Depth/color input đang ở convention nào?
+4. Ai gọi `setSize()` khi DPR/container đổi?
+5. Ai dispose target/pass/material khi route hoặc feature flag đổi?
+6. Có fallback deterministic khi compile/extension/allocation fail không?
+7. Visual/performance budget được khóa bằng test nào?
+
+Đây mới là khoảng cách từ demo “có bloom” tới hệ thống render mà tech lead có thể vận hành.
+
+## Thực hành có tiêu chí hoàn thành
+
+1. Trong lab, chọn alpha blend và cho hai card giao nhau. Thay `renderOrder`; ghi camera angle mà fix đó thất bại.
+2. Đổi sang alpha test rồi alpha hash. So mép cutout, noise, draw calls và depth behavior — không chỉ chọn cái “đẹp hơn”.
+3. Đặt surface separation về `0`, quan sát z-fighting, rồi thử geometry separation và `polygonOffset` riêng rẽ.
+4. Bật render target trung gian, đổi DPR/viewport và tính lại memory estimator cho 1 so với 3 attachments.
+5. Với một scene thật, viết bảng whole-frame calls theo main/shadow/post passes thay vì chỉ chụp một `renderer.info.render.calls` sau pass cuối.
+
+## Phần tiếp theo
+
+Sau Part 19–20, bạn đã có hai trục để điều tra rendering: **space/precision** của dữ liệu đi vào và **depth/blend/pass graph** tạo pixel đi ra. **Part 21** dựng runtime có frame phases, ownership, cancellation và lifecycle xác định; **Part 22** mới đặt performance engineering lên nền đó để đo CPU/GPU time, overdraw, shader compilation và memory budget bằng bằng chứng thay vì đếm triangle theo cảm giác.
+
+## Tài liệu chính thức
+
+- [Three.js — WebGLRenderer, renderer.info và depth options](https://threejs.org/docs/pages/WebGLRenderer.html)
+- [Three.js — Material depthTest, depthWrite, alphaTest, alphaHash và polygonOffset](https://threejs.org/docs/pages/Material.html)
+- [Three.js — Object3D.renderOrder](https://threejs.org/docs/pages/Object3D.html)
+- [Three.js — RenderTarget và MRT attachments](https://threejs.org/docs/pages/RenderTarget.html)
+- [Three.js Manual — Render targets](https://threejs.org/manual/en/rendertargets.html)
+- [Three.js Manual — Transparency](https://threejs.org/manual/en/transparency.html)
+- [Three.js — EffectComposer](https://threejs.org/docs/pages/EffectComposer.html)
+- [Three.js — OutputPass](https://threejs.org/docs/pages/OutputPass.html)
+- [Three.js Manual — Color management](https://threejs.org/manual/en/color-management.html)

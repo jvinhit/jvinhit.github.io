@@ -1,0 +1,690 @@
+---
+title: 'Web Components · Phần 13 — Reactivity, controllers và kiến trúc Lit'
+description: 'Thiết kế state ownership cho Mini Kanban bằng reactive properties, immutable updates, Lit controllers, @lit/context và @lit/task có chống race/abort.'
+pubDate: 2026-07-12
+lang: vi
+tags:
+  [web-components, lit, reactivity, architecture, state-management, typescript]
+series: web-components
+seriesOrder: 13
+draft: false
+---
+
+Sau Phần 12, ta có thể render gần như mọi giao diện. Nhưng syntax không trả lời
+câu hỏi khó nhất: **state này thuộc về ai?** Nếu board, column và card cùng giữ
+một bản sao, chúng sẽ lệch nhau sau drag/drop hoặc request thất bại. Đẩy tất cả
+vào context lại làm dependency vô hình.
+
+Phần này không lặp lại catalog directive. Ta xây kiến trúc cho Accessible Mini
+Kanban bằng bốn primitive có ranh giới rõ: reactive property, internal state,
+reactive controller và async task. Dữ liệu đi xuống bằng property; ý định đi lên
+bằng event.
+
+---
+
+## 1. Mental model: một nguồn sự thật, nhiều phép chiếu
+
+Với Kanban, state ownership hợp lý là:
+
+```text
+<kb-board-app>  cung cấp repository/service qua context
+      │
+      ▼
+<kb-task-board> sở hữu collection task và trạng thái request
+      │ lọc theo status, render card làm light-DOM child
+      ▼
+<kb-task-column> bố trí default slot theo status
+      │ chứa <kb-task-card .task=...>
+      ▼
+<kb-task-card>  trình bày task, phát intent event
+      │
+      └── kb-task-move / kb-task-toggle ──► <kb-task-board>
+```
+
+Board là nguồn sự thật cho dữ liệu domain. Column không lưu bản sao; nó nhận
+card đã được board lọc làm light-DOM children và chỉ bố trí chúng qua slot. Card
+không tự âm thầm sửa object task; nó phát một event mô tả ý định. State chỉ liên
+quan UI cục bộ, như “card đang mở chi tiết hay chưa”, ở lại card.
+
+Context dành cho dependency mang tính môi trường — repository, locale, theme —
+không phải đường tắt để mọi component đọc/ghi toàn bộ app state. Quy tắc này làm
+data flow nhìn được từ public API và contract test.
+
+## 2. Public reactive property và internal state
+
+Lit tạo accessor reactive cho property được khai báo. Khi setter nhận giá trị
+mới, host lên lịch update bất đồng bộ. Hai nhóm có vai trò khác nhau:
+
+```ts
+import { LitElement, html } from 'lit';
+import { property, state } from 'lit/decorators.js';
+
+interface CardTask {
+  readonly title: string;
+  readonly description?: string;
+}
+
+export class KbTaskCard extends LitElement {
+  // Input công khai: parent/consumer được phép gán.
+  @property({ attribute: false })
+  task: Readonly<CardTask> = { title: 'Task chưa đặt tên' };
+
+  // Chi tiết implementation: không attribute, không public contract.
+  @state()
+  private expanded = false;
+
+  render() {
+    return html`
+      <button
+        type="button"
+        aria-expanded=${String(this.expanded)}
+        @click=${() => (this.expanded = !this.expanded)}
+      >
+        ${this.task.title}
+      </button>
+      ${this.expanded && this.task.description
+        ? html`<p>${this.task.description}</p>`
+        : null}
+    `;
+  }
+}
+```
+
+`@property` nói “đây là input của component”. `@state` nói “giá trị này khiến
+render thay đổi nhưng consumer không được dựa vào nó”. TypeScript `private` chỉ
+giúp ở compile time; điều bảo vệ kiến trúc thật sự là API/documentation/test.
+
+Lit mặc định so sánh bằng identity gần tương đương `newValue !== oldValue`.
+Mutation tại chỗ không đổi reference:
+
+```ts
+// Sai: array vẫn là cùng một object, update có thể không chạy.
+this.tasks.push(newTask);
+
+// Đúng: tạo reference mới.
+this.tasks = [...this.tasks, newTask];
+
+// Sai: object task cũ bị sửa và child có thể không nhận update.
+task.status = 'done';
+
+// Đúng: thay object đúng task, giữ object không đổi cho phần còn lại.
+this.tasks = this.tasks.map((item) =>
+  item.id === task.id ? { ...item, status: 'done' } : item
+);
+```
+
+Có thể gọi `requestUpdate()` sau mutation, nhưng đó chỉ đánh thức host hiện tại.
+Child nhận cùng object reference vẫn có thể bỏ qua update, history/undo khó làm,
+và code khó tìm nơi đã sửa dữ liệu. Với domain state, immutable update là
+default an toàn hơn.
+
+## 3. Update cycle: biết chính xác lúc nào UI ổn định
+
+Nhiều property đổi trong cùng lượt JavaScript được Lit gom vào một update:
+
+```text
+setter reactive
+  → requestUpdate()
+  → microtask được lên lịch
+  → shouldUpdate(changedProperties)
+  → willUpdate(changedProperties)
+  → update() / render()
+  → firstUpdated() [chỉ lần đầu]
+  → updated(changedProperties)
+  → updateComplete resolve
+```
+
+`willUpdate()` phù hợp để tính dữ liệu dẫn xuất đắt tiền trước render.
+`firstUpdated()` phù hợp cho setup chỉ có ý nghĩa sau lần render đầu. `updated()`
+phù hợp để đồng bộ một imperative API với DOM vừa thay đổi. Luôn cleanup
+resource đối xứng khi host disconnect nếu resource sống theo connection.
+
+Ví dụ chỉ focus khi `editing` thật sự chuyển từ false sang true:
+
+```ts
+updated(changed: Map<PropertyKey, unknown>) {
+  if (changed.has('editing') && this.editing) {
+    this.renderRoot.querySelector<HTMLInputElement>('input')?.focus();
+  }
+}
+```
+
+Đừng gán vô điều kiện một reactive property trong `updated()`: update mới sẽ
+gọi `updated()` lần nữa và có thể tạo loop.
+
+`await element.updateComplete` chỉ bảo đảm **update của element đó** đã hoàn
+tất. Nó không mặc định chờ toàn bộ descendants, network request, animation hay
+layout measurement. Trong test, chờ promise của child cụ thể khi contract cần
+child; dùng `requestAnimationFrame()` cho checkpoint liên quan paint; dùng
+`ResizeObserver` khi điều cần quan sát là kích thước. Không biến
+`updateComplete` thành “app đã idle” toàn cục.
+
+## 4. Reactive controller: logic theo lifecycle, không phải UI vô hình
+
+Reactive controller là object được gắn vào host. Nó có thể nhận callback
+`hostConnected`, `hostDisconnected`, `hostUpdate`, `hostUpdated` và yêu cầu host
+render lại. Controller hợp với logic tái sử dụng có lifecycle: media query,
+keyboard scope, data model hoặc task. Nó không render một subtree riêng.
+
+Model controller cho board giữ collection và mọi mutation bất biến:
+
+```ts
+// board-model-controller.ts
+import type { ReactiveController, ReactiveControllerHost } from 'lit';
+
+export type TaskStatus = 'todo' | 'doing' | 'done';
+export type TaskPriority = 'low' | 'medium' | 'high';
+
+export interface TaskRecord {
+  readonly id: string;
+  readonly title: string;
+  readonly description?: string;
+  readonly status: TaskStatus;
+  readonly priority: TaskPriority;
+  readonly assignee?: string;
+  readonly labels: readonly string[];
+  readonly completed: boolean;
+}
+
+export class BoardModelController implements ReactiveController {
+  readonly #host: ReactiveControllerHost;
+  #tasks: readonly TaskRecord[] = [];
+
+  constructor(host: ReactiveControllerHost) {
+    this.#host = host;
+    host.addController(this);
+  }
+
+  get tasks() {
+    return this.#tasks;
+  }
+
+  replace(tasks: readonly TaskRecord[]) {
+    this.#tasks = tasks;
+    this.#host.requestUpdate();
+  }
+
+  move(taskId: string, status: TaskStatus) {
+    const current = this.#tasks.find((task) => task.id === taskId);
+    if (!current || current.status === status) return false;
+
+    this.#tasks = this.#tasks.map((task) =>
+      task.id === taskId ? { ...task, status } : task
+    );
+    this.#host.requestUpdate();
+    return true;
+  }
+
+  toggle(taskId: string, completed: boolean) {
+    const current = this.#tasks.find((task) => task.id === taskId);
+    if (!current || current.completed === completed) return false;
+
+    this.#tasks = this.#tasks.map((task) =>
+      task.id === taskId ? { ...task, completed } : task
+    );
+    this.#host.requestUpdate();
+    return true;
+  }
+}
+```
+
+Controller này chưa cần lifecycle callbacks vì không sở hữu listener hay
+resource bên ngoài. Đừng thêm hook cho đủ bộ. Nếu một controller đăng ký
+`window.addEventListener()` trong `hostConnected()`, nó phải remove listener
+trong `hostDisconnected()` để reconnect không nhân side effect.
+
+Không dùng controller để giả làm visual component. Nếu một đơn vị có markup,
+style, focus và public accessibility semantics riêng, custom element con thường
+là abstraction đúng hơn.
+
+## 5. Context là protocol dependency injection
+
+Cài hai package chính thức dùng trong phần này:
+
+```bash
+npm install @lit/context @lit/task
+```
+
+Đầu tiên khai báo interface repository và một context key duy nhất:
+
+```ts
+// board-repository-context.ts
+import { createContext } from '@lit/context';
+import type { TaskRecord } from './board-model-controller.js';
+
+export interface BoardRepository {
+  load(
+    boardId: string,
+    options: { signal: AbortSignal }
+  ): Promise<readonly TaskRecord[]>;
+
+  save(boardId: string, tasks: readonly TaskRecord[]): Promise<void>;
+}
+
+export const boardRepositoryContext = createContext<BoardRepository>(
+  Symbol('kb-board-repository')
+);
+```
+
+Provider đặt dependency ở một boundary của app:
+
+```ts
+// kb-board-app.ts
+import { LitElement, html } from 'lit';
+import { customElement, property } from 'lit/decorators.js';
+import { provide } from '@lit/context';
+import {
+  boardRepositoryContext,
+  type BoardRepository,
+} from './board-repository-context.js';
+
+@customElement('kb-board-app')
+export class KbBoardApp extends LitElement {
+  @provide({ context: boardRepositoryContext })
+  @property({ attribute: false })
+  repository!: BoardRepository;
+
+  render() {
+    return html`<slot></slot>`;
+  }
+}
+```
+
+Context protocol dùng DOM event để consumer yêu cầu giá trị từ provider gần
+nhất. Vì nó là protocol công khai, component Lit có thể trao đổi với
+implementation khác hỗ trợ cùng protocol. Tuy nhiên identity của context key
+phải giống hệt nhau: export key từ một module chung thay vì tạo `Symbol()` mới ở
+mỗi package.
+
+Context phù hợp cho repository vì card không cần biết URL, authentication hay
+mock backend. Trong test, gán một fake repository vào `<kb-board-app>`. Không
+đẩy `selectedTaskId`, từng task hay mọi callback vào context; chúng là data flow
+của board và nên hiện rõ qua property/event.
+
+## 6. `@lit/task`: latest result, abort và race condition
+
+Một `fetch()` trong `render()` sẽ chạy lại tùy ý và không có cleanup. Một promise
+gán tay trong `connectedCallback()` dễ để response cũ ghi đè board mới. `Task`
+là reactive controller chuyên quản lý pending/complete/error và rerun khi args
+đổi.
+
+Ghép model, context và task trong `<kb-task-board>`:
+
+```ts
+// kb-task-board.ts
+import { LitElement, html } from 'lit';
+import { customElement, property } from 'lit/decorators.js';
+import { repeat } from 'lit/directives/repeat.js';
+import { consume } from '@lit/context';
+import { Task } from '@lit/task';
+import {
+  BoardModelController,
+  type TaskRecord,
+  type TaskStatus,
+} from './board-model-controller.js';
+import {
+  boardRepositoryContext,
+  type BoardRepository,
+} from './board-repository-context.js';
+
+interface TaskMoveDetail {
+  taskId: string;
+  toStatus: TaskStatus;
+}
+
+interface TaskToggleDetail {
+  taskId: string;
+  completed: boolean;
+}
+
+interface TaskCardElement extends HTMLElement {
+  taskId: string;
+  updateComplete?: Promise<unknown>;
+  focusPrimaryAction(options?: FocusOptions): void;
+}
+
+const TASK_STATUSES: readonly TaskStatus[] = ['todo', 'doing', 'done'];
+
+function isTaskStatus(value: unknown): value is TaskStatus {
+  return TASK_STATUSES.includes(value as TaskStatus);
+}
+
+@customElement('kb-task-board')
+export class KbTaskBoard extends LitElement {
+  @property({ attribute: 'board-id' })
+  boardId = '';
+
+  @consume({ context: boardRepositoryContext, subscribe: true })
+  @property({ attribute: false })
+  repository?: BoardRepository;
+
+  readonly #model = new BoardModelController(this);
+
+  readonly #loadBoard = new Task(this, {
+    args: () => [this.boardId, this.repository] as const,
+    task: async ([boardId, repository], { signal }) => {
+      if (!boardId || !repository) {
+        this.#model.replace([]);
+        return [];
+      }
+
+      const tasks = await repository.load(boardId, { signal });
+      signal.throwIfAborted();
+      this.#model.replace(tasks);
+      return tasks;
+    },
+  });
+
+  render() {
+    if (!this.boardId || !this.repository) {
+      return html`<p>Chọn một board.</p>`;
+    }
+
+    return this.#loadBoard.render({
+      pending: () => html`<p role="status">Đang tải board…</p>`,
+      error: (error) => html`
+        <p role="alert">Không tải được board: ${String(error)}</p>
+        <button type="button" @click=${() => this.#loadBoard.run()}>
+          Thử lại
+        </button>
+      `,
+      complete: () => this.#renderColumns(),
+    });
+  }
+
+  #renderColumns() {
+    return html`
+      <section
+        aria-label="Mini Kanban"
+        @kb-task-move=${this.#onTaskMove}
+        @kb-task-toggle=${this.#onTaskToggle}
+      >
+        ${TASK_STATUSES.map(
+          (status) => html`
+            <kb-task-column status=${status}>
+              <span slot="heading">${status}</span>
+              ${repeat(
+                this.#model.tasks.filter((task) => task.status === status),
+                (task) => task.id,
+                (task) => html`
+                  <kb-task-card
+                    task-id=${task.id}
+                    status=${task.status}
+                    priority=${task.priority}
+                    ?completed=${task.completed}
+                    .task=${task}
+                  ></kb-task-card>
+                `
+              )}
+            </kb-task-column>
+          `
+        )}
+      </section>
+    `;
+  }
+
+  #cardForTask(taskId: string) {
+    return Array.from(
+      this.renderRoot.querySelectorAll<TaskCardElement>('kb-task-card')
+    ).find((card) => card.taskId === taskId);
+  }
+
+  async #focusCard(taskId: string) {
+    try {
+      await this.updateComplete;
+      const card = this.#cardForTask(taskId);
+      if (!card) return false;
+      const firstUpdate = card.updateComplete;
+      if (firstUpdate && (await firstUpdate) === false && card.updateComplete) {
+        await card.updateComplete;
+      }
+      card.focusPrimaryAction({ preventScroll: true });
+      return true;
+    } catch (error) {
+      console.warn('Không khôi phục được focus cho task', taskId, error);
+      return false;
+    }
+  }
+
+  readonly #onTaskMove = async (event: CustomEvent<unknown>) => {
+    const detail = event.detail as Partial<TaskMoveDetail> | null;
+    if (
+      !detail ||
+      typeof detail.taskId !== 'string' ||
+      !detail.taskId ||
+      !isTaskStatus(detail.toStatus)
+    ) {
+      return;
+    }
+
+    const origin = event.composedPath()[0];
+    const restoreFocus =
+      origin instanceof HTMLElement &&
+      origin.localName === 'kb-task-card' &&
+      origin.matches(':focus-within');
+    const repository = this.repository;
+    const boardId = this.boardId;
+    if (!repository || !boardId) return;
+
+    const before = this.#model.tasks;
+    const { taskId, toStatus } = detail as TaskMoveDetail;
+    if (!this.#model.move(taskId, toStatus)) return;
+    const optimistic = this.#model.tasks;
+
+    if (restoreFocus) {
+      await this.#focusCard(taskId);
+    }
+
+    try {
+      await repository.save(boardId, optimistic);
+    } catch (error) {
+      if (
+        this.repository === repository &&
+        this.boardId === boardId &&
+        this.#model.tasks === optimistic
+      ) {
+        const refocusAfterRollback =
+          restoreFocus &&
+          this.#cardForTask(taskId)?.matches(':focus-within') === true;
+        this.#model.replace(before);
+        if (refocusAfterRollback) await this.#focusCard(taskId);
+      }
+      this.dispatchEvent(
+        new CustomEvent('kb-task-board-save-error', {
+          detail: { error, taskId, boardId },
+          bubbles: true,
+          composed: true,
+        })
+      );
+    }
+  };
+
+  readonly #onTaskToggle = async (event: CustomEvent<unknown>) => {
+    const detail = event.detail as Partial<TaskToggleDetail> | null;
+    if (
+      !detail ||
+      typeof detail.taskId !== 'string' ||
+      !detail.taskId ||
+      typeof detail.completed !== 'boolean'
+    ) {
+      return;
+    }
+
+    const repository = this.repository;
+    const boardId = this.boardId;
+    if (!repository || !boardId) return;
+
+    const before = this.#model.tasks;
+    const { taskId, completed } = detail as TaskToggleDetail;
+    if (!this.#model.toggle(taskId, completed)) return;
+    const optimistic = this.#model.tasks;
+
+    try {
+      await repository.save(boardId, optimistic);
+    } catch (error) {
+      if (
+        this.repository === repository &&
+        this.boardId === boardId &&
+        this.#model.tasks === optimistic
+      ) {
+        this.#model.replace(before);
+      }
+      this.dispatchEvent(
+        new CustomEvent('kb-task-board-save-error', {
+          detail: { error, taskId, boardId },
+          bubbles: true,
+          composed: true,
+        })
+      );
+    }
+  };
+}
+```
+
+`args()` là dependency list của async work. Khi `boardId` hoặc repository đổi,
+Task chạy lần mới. Task chỉ công bố kết quả của lần chạy mới nhất; `signal` của
+lần cũ được abort. Nhưng AbortSignal không tự hủy I/O: repository phải chuyển
+nó xuống `fetch`:
+
+```ts
+async load(boardId: string, { signal }: { signal: AbortSignal }) {
+  const response = await fetch(`/api/boards/${encodeURIComponent(boardId)}`, {
+    signal,
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return parseTaskRecords(await response.json());
+}
+```
+
+`response.json()` có type runtime là dữ liệu chưa tin cậy. `parseTaskRecords()` ở
+adapter phải kiểm tra id, enum status/priority, boolean và shape của collection
+trước khi trả `TaskRecord[]`; type annotation TypeScript không tự validate JSON.
+
+Nếu adapter dùng API không hỗ trợ `signal`, kiểm tra `signal.aborted` trước khi
+commit side effect. Cơ chế “latest result wins” bảo vệ UI của Task, nhưng không
+thể hoàn tác một POST đã tới server. Mutation cần idempotency/versioning ở API
+nếu race có hậu quả nghiệp vụ.
+
+Ví dụ trên optimistic-update model rồi rollback nếu `save()` fail. Với nhiều
+mutation đồng thời, một snapshot đơn giản chưa đủ; dùng operation id, queue hoặc
+server version. Kiến trúc tốt làm vị trí thay chiến lược rõ ràng: board/model,
+không phải từng card.
+
+## 7. Áp dụng contract data-down, events-up
+
+`<kb-task-column>` nhận `status`; các `<kb-task-card>` là light-DOM children đi
+vào default slot đã thiết kế ở Phần 5. Board dùng `repeat()` để giữ identity và
+gán object qua property. Card phát `kb-task-move` với `{ taskId, toStatus }` hoặc
+`kb-task-toggle` với `{ taskId, completed }`. Column để event bubble xuyên qua;
+board nghe ở boundary, validate payload runtime và là nơi duy nhất đổi
+collection.
+
+```ts
+const renderCard = (task: TaskRecord) => html`
+  <kb-task-card
+    task-id=${task.id}
+    status=${task.status}
+    priority=${task.priority}
+    ?completed=${task.completed}
+    .task=${task}
+  ></kb-task-card>
+`;
+```
+
+Object `task` giữ dữ liệu phức tạp; id/status/priority đồng thời là primitive
+public state hữu ích cho HTML, CSS và event payload. Column không mutate object
+đó mà chỉ chuyển intent lên owner.
+
+Mỗi `repeat()` tạo một key space riêng. Ở đây key giữ node identity khi task
+reorder **trong cùng cột**; move sang status khác sẽ rời directive cũ và tạo card
+ở directive mới. Vì vậy card không nên giữ domain state không thể tái tạo.
+Handler phía trên phát hiện card đang `:focus-within`, chờ board update rồi gọi
+public method `focusPrimaryAction()` trên card mới. Nếu phải giữ editor draft,
+selection hoặc animation identity xuyên cột, hoist state lên board hoặc thiết kế
+một rendering owner keyed duy nhất; `repeat(task.id)` không tự giải quyết move
+giữa hai container.
+
+Contract nên nói bằng intent, không bằng thao tác nội bộ:
+
+```ts
+this.dispatchEvent(
+  new CustomEvent('kb-task-move', {
+    detail: Object.freeze({ taskId: this.taskId, toStatus: 'done' }),
+    bubbles: true,
+    composed: true,
+  })
+);
+```
+
+Tránh event kiểu `set-state` mang cả object mutable hoặc callback parent nhét
+vào context. Intent event có thể log, test, validate và chuyển thành command API
+mà không lộ cấu trúc shadow DOM.
+
+## 8. Failure modes và decision rules
+
+**Nhân đôi domain state.** Board sở hữu task; column/card nhận reference hoặc dữ
+liệu dẫn xuất. Child chỉ giữ ephemeral UI state không cần đồng bộ ngược.
+
+**Mutation tại chỗ rồi gọi `requestUpdate()`.** Cách này dễ bỏ sót child và phá
+time-travel/rollback. Ưu tiên array/object mới; chỉ mutate khi đã đo được lý do
+hiệu năng và bao bọc mutation sau API rõ.
+
+**Dùng context như global store.** Context dành cho dependency ambient hoặc
+giá trị cross-cutting ổn định. Dữ liệu thay đổi theo tương tác gần nên đi qua
+property/event để dependency nhìn thấy.
+
+**Async work trong `render()`.** `render()` phải mô tả UI từ state hiện tại.
+Dùng Task/controller/lifecycle cho work có thời gian, cancellation và error.
+
+**Quên chuyển AbortSignal.** Task có thể đánh dấu run cũ là stale, nhưng network
+vẫn tốn tài nguyên và side effect vẫn xảy ra nếu adapter bỏ qua signal.
+
+**Dùng `updateComplete` như tree-idle.** Promise này không chờ descendants,
+animation, fetch hoặc layout. Chọn đúng synchronization primitive cho contract
+đang test.
+
+**Update loop.** Chỉ gán reactive state trong `updated()` khi có guard dựa trên
+`changedProperties` và giá trị thật sự khác. Tốt hơn nữa, tính derived value
+trong render hoặc `willUpdate()` mà không lưu thêm state nếu không cần.
+
+Decision rule: property cho input, event cho intent, `@state` cho UI nội bộ,
+controller cho logic theo host lifecycle, context cho dependency ambient, Task
+cho async state machine. Khi một giá trị không khớp loại nào, hãy hỏi lại ai sở
+hữu nó trước khi thêm abstraction.
+
+## 9. Bài tập và checklist checkpoint
+
+1. Viết fake `BoardRepository` có thể delay response; đổi `board-id` hai lần và
+   chứng minh response cũ không ghi đè board mới.
+2. Thêm `hostConnected/hostDisconnected` vào một keyboard controller, rồi test
+   ba lần reconnect chỉ tạo một keyboard action.
+3. Cố tình `push()` vào `tasks`, quan sát update; sửa bằng immutable update và
+   thêm contract test cho child column.
+4. Thêm optimistic operation id để hai lần move liên tiếp không rollback nhầm.
+
+Checklist:
+
+- [ ] Board là nguồn sự thật duy nhất cho collection task.
+- [ ] Public input dùng property; internal UI state dùng `@state`.
+- [ ] Array/object được thay reference thay vì mutate ngầm.
+- [ ] Context key được export từ một module chung.
+- [ ] Async task chuyển `AbortSignal` tới API có thể hủy.
+- [ ] Loading, error, empty và success đều có UI/accessibility semantics.
+- [ ] Test không giả định `updateComplete` chờ toàn bộ cây.
+
+## 10. Bridge sang Phần 14
+
+Kiến trúc đã khiến update có nguồn gốc rõ, nhưng production còn hai câu hỏi:
+board có giữ DOM ổn định khi hàng nghìn task thay đổi, và HTML từ server có an
+toàn/nâng cấp được không? Phần 14 đo performance trước khi tối ưu, đặt security
+boundary, rồi nối progressive enhancement với Declarative Shadow DOM, SSR và
+hydration của Lit.
+
+## Nguồn chính thức
+
+- [Lit: Reactive properties](https://lit.dev/docs/components/properties/)
+- [Lit: Reactive update cycle](https://lit.dev/docs/components/lifecycle/)
+- [Lit: Reactive controllers](https://lit.dev/docs/composition/controllers/)
+- [Lit Context protocol](https://lit.dev/docs/data/context/)
+- [Lit Task](https://lit.dev/docs/data/task/)
+- [MDN: AbortSignal](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal)

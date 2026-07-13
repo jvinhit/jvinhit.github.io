@@ -1,0 +1,630 @@
+---
+title: 'TypeScript Production · Phần 8 — Variadic Tuples & Higher-Order APIs'
+description: 'Dùng variadic và labeled tuples để giữ nguyên parameter list qua partial application, Promise concurrency, constructor wrapper và function pipeline mà không rơi về any[].'
+pubDate: 2026-07-12
+updatedDate: 2026-07-12
+lang: vi
+tags: [typescript, variadic-tuples, functions, inference, advanced]
+series: typescript
+seriesOrder: 8
+draft: false
+---
+
+Một wrapper logging tưởng như vô hại thường biến API chính xác này:
+
+```ts
+declare function loadOrder(
+  orderId: string,
+  signal?: AbortSignal
+): Promise<Order>;
+```
+
+thành contract mù:
+
+```ts
+function withLog(fn: Function): Function {
+  return (...args: any[]) => {
+    console.log(args);
+    return fn(...args);
+  };
+}
+```
+
+Caller mất tên parameter, optionality, return type và mọi correlation mà hàm
+gốc từng có. Runtime vẫn chạy nên lỗi dễ lọt qua review.
+
+Variadic tuple types cho phép coi **danh sách tham số là dữ liệu ở tầng type**:
+bắt một prefix, giữ phần còn lại, nối hai danh sách, map từng vị trí và trả lại
+đúng call signature. Đây là nền của decorator, middleware, query key, event
+arguments và concurrency API có type tốt.
+
+Sau bài này, bạn cần làm được bốn việc:
+
+- phân biệt tuple với array ngay cả khi cả hai đều dùng cú pháp `[]`;
+- pattern-match parameter list bằng `infer` và tuple spread;
+- bảo toàn label, optional/rest parameter qua higher-order function;
+- biết lúc nào một variadic API đã vượt quá ngân sách compiler và UX.
+
+## Mental model: tuple là một parameter list đóng gói
+
+Array chỉ nói mọi phần tử có cùng một loại:
+
+```ts
+type Headers = string[];
+```
+
+Tuple giữ type theo vị trí, số lượng và optionality:
+
+```ts
+type RequestArgs = [path: string, init?: RequestInit, retry?: number];
+```
+
+Label `path`, `init`, `retry` không thay đổi assignability. Chúng là metadata
+cho editor và declaration output. Nhưng metadata đó là một phần quan trọng của
+API UX, nên wrapper tốt phải giữ nó.
+
+```ts
+type SameShape = [string, RequestInit?, number?];
+
+declare let labeled: RequestArgs;
+declare let plain: SameShape;
+
+labeled = plain;
+plain = labeled;
+```
+
+Hai phép chiếu thường bị nhầm:
+
+```ts
+type WholeList = RequestArgs;
+// [path: string, init?: RequestInit, retry?: number]
+
+type AnyElement = RequestArgs[number];
+// string | RequestInit | number | undefined
+```
+
+`T[number]` làm mất vị trí và correlation. Nếu đang biến đổi call signature,
+hãy giữ `T` là tuple càng lâu càng tốt.
+
+## `readonly` là một chiều của contract
+
+Literal `as const` tạo readonly tuple:
+
+```ts
+const key = ['order', 'ord_42'] as const;
+// readonly ['order', 'ord_42']
+```
+
+Utility chỉ nhận `unknown[]` sẽ từ chối nó:
+
+```ts
+type HeadBad<T extends unknown[]> = T extends [infer H, ...unknown[]]
+  ? H
+  : never;
+
+// type X = HeadBad<typeof key>; // constraint error
+```
+
+Khi utility chỉ đọc, constraint cũng nên chỉ đọc:
+
+```ts
+type Head<T extends readonly unknown[]> = T extends readonly [
+  infer H,
+  ...(readonly unknown[]),
+]
+  ? H
+  : never;
+
+type KeyHead = Head<typeof key>;
+// 'order'
+```
+
+Decision rule: **input tuple mặc định là `readonly`; chỉ loại `readonly` ở
+output nếu runtime thật sự tạo collection mutable mới.**
+
+## Algebra nhỏ của variadic tuple
+
+Tuple spread có thể xuất hiện ở đầu, giữa hoặc cuối pattern:
+
+```ts
+type Prepend<H, T extends readonly unknown[]> = readonly [H, ...T];
+
+type Append<T extends readonly unknown[], L> = readonly [...T, L];
+
+type Concat<
+  A extends readonly unknown[],
+  B extends readonly unknown[],
+> = readonly [...A, ...B];
+
+type Tail<T extends readonly unknown[]> = T extends readonly [
+  unknown,
+  ...infer R,
+]
+  ? R
+  : [];
+
+type Init<T extends readonly unknown[]> = T extends readonly [
+  ...infer R,
+  unknown,
+]
+  ? R
+  : [];
+
+type SplitLast<T extends readonly unknown[]> = T extends readonly [
+  ...infer Prefix,
+  infer Last,
+]
+  ? [prefix: Prefix, last: Last]
+  : never;
+```
+
+```ts
+type A = Prepend<'GET', [path: string, auth?: boolean]>;
+// readonly ['GET', path: string, auth?: boolean]
+
+type B = SplitLast<[scope: string, ttl: number]>;
+// [prefix: [scope: string], last: number]
+```
+
+Đừng dùng `any[]` làm phần bị bỏ qua nếu `unknown[]` diễn đạt đúng. `any` có
+thể chảy vào nhánh kết quả ở một refactor sau. Với constraint function, đôi
+khi `(...args: any[]) => any` vẫn cần vì variance; hãy giữ nó trong helper
+nội bộ và không để `any` xuất hiện ở public result.
+
+## Type test trước khi xây wrapper
+
+Một bộ assertion nhỏ giúp kiểm tra chính xác inference mà không chạy code:
+
+```ts
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
+    ? true
+    : false;
+
+type Expect<T extends true> = T;
+
+type _tail = Expect<
+  Equal<Tail<[id: string, signal?: AbortSignal]>, [signal?: AbortSignal]>
+>;
+```
+
+Với public library, đặt các test này trong consumer fixture hoặc công cụ type
+test. Test chỉ chạy bằng compiler version của library chưa đủ; declaration cần
+được thử từ package đã build như một consumer thật.
+
+## Case 1: partial application mà không mất phần đuôi
+
+Ta muốn bind một số argument đầu, còn caller sau đó chỉ thấy phần chưa bind.
+
+Naive version thường trả `(...args: any[]) => any`. Variadic version mô tả
+function như hai tuple nối nhau:
+
+```ts
+function partialCall<Prefix extends unknown[], Rest extends unknown[], Result>(
+  fn: (...args: [...Prefix, ...Rest]) => Result,
+  ...prefix: Prefix
+): (...rest: Rest) => Result {
+  return (...rest) => fn(...prefix, ...rest);
+}
+```
+
+Dùng với API production:
+
+```ts
+declare function searchOrders(
+  customerId: string,
+  limit: number,
+  signal?: AbortSignal
+): Promise<readonly Order[]>;
+
+const searchForCustomer = partialCall(searchOrders, 'cus_42');
+// (limit: number, signal?: AbortSignal) => Promise<readonly Order[]>
+
+searchForCustomer(20);
+searchForCustomer(20, new AbortController().signal);
+
+// @ts-expect-error limit vẫn là bắt buộc
+searchForCustomer();
+
+// @ts-expect-error signal không thể đứng ở vị trí limit
+searchForCustomer(new AbortController().signal);
+```
+
+Điểm đáng giá không chỉ là “không có `any`”. Label `limit` và `signal` còn
+nguyên trong autocomplete. Nếu declaration xuất ra `arg_0`, wrapper đã làm UX
+kém đi dù assignability vẫn đúng.
+
+### Prefix phải thật sự là prefix
+
+Ta không thể bind tùy ý argument giữa mà không có một rule runtime rõ. Nếu API
+cần bind theo tên, object parameter thường tốt hơn:
+
+```ts
+type SearchOptions = {
+  customerId: string;
+  limit: number;
+  signal?: AbortSignal;
+};
+
+declare function searchOrdersByOptions(
+  options: SearchOptions
+): Promise<readonly Order[]>;
+```
+
+Variadic tuple phù hợp khi **thứ tự positional là một phần ổn định của
+contract**. Với hơn ba option cùng type hoặc thay đổi thường xuyên, object dễ
+evolve và dễ đọc hơn.
+
+## Case 2: wrapper giữ nguyên toàn bộ signature
+
+Nếu wrapper không đổi argument hay result, dùng chính `Parameters` và
+`ReturnType`:
+
+```ts
+type AnyFunction = (...args: any[]) => unknown;
+
+function withTiming<F extends AnyFunction>(
+  name: string,
+  fn: F
+): (...args: Parameters<F>) => ReturnType<F> {
+  return (...args) => {
+    const startedAt = performance.now();
+
+    try {
+      return fn(...args) as ReturnType<F>;
+    } finally {
+      console.log(name, performance.now() - startedAt);
+    }
+  };
+}
+```
+
+Assertion nằm ở adapter vì compiler không chứng minh được implementation
+generic trả đúng `ReturnType<F>` trong mọi trường hợp. Public boundary vẫn
+chính xác; assertion nhỏ này phải có runtime test.
+
+Nhưng wrapper trên đo thời gian sai với Promise: `finally` chạy ngay khi Promise
+được tạo. Contract type đúng không có nghĩa semantics runtime đúng.
+
+Async-aware version nên nói rõ nó luôn trả Promise:
+
+```ts
+function withAsyncTiming<Args extends unknown[], Result>(
+  name: string,
+  fn: (...args: Args) => Result
+): (...args: Args) => Promise<Awaited<Result>> {
+  return (async (...args: Args) => {
+    const startedAt = performance.now();
+
+    try {
+      return await fn(...args);
+    } finally {
+      console.log(name, performance.now() - startedAt);
+    }
+  }) as (...args: Args) => Promise<Awaited<Result>>;
+}
+```
+
+Đây là decision rule quan trọng: **type-preserving wrapper chỉ hợp lệ khi
+runtime semantics cũng được bảo toàn.** Nếu wrapper đổi sync thành async, type
+phải cho caller thấy thay đổi đó. Assertion vẫn được cô lập trong adapter vì
+compiler không normalize generic `Result` thành `Awaited<Result>` trong body;
+runtime test phải chứng minh Promise lồng và error được forward đúng.
+
+## Case 3: map concurrency mà giữ từng vị trí
+
+`Promise.all` hữu ích vì result là tuple, không phải union array. Ta có thể mô
+phỏng phần type quan trọng bằng mapped tuple:
+
+```ts
+type AwaitedTuple<T extends readonly unknown[]> = {
+  -readonly [K in keyof T]: Awaited<T[K]>;
+};
+
+declare function all<const T extends readonly unknown[]>(
+  values: T
+): Promise<AwaitedTuple<T>>;
+```
+
+```ts
+declare const user: Promise<User>;
+declare const permissions: Promise<readonly Permission[]>;
+
+const result = await all([user, permissions, 200] as const);
+// [User, readonly Permission[], 200]
+
+const [resolvedUser, resolvedPermissions, status] = result;
+```
+
+Nếu viết `Array<Awaited<T[number]>>`, kết quả sẽ là
+`Array<User | readonly Permission[] | 200>` và destructuring mất correlation.
+Mapped type trên tuple giữ từng index; modifier `-readonly` phản ánh việc hàm
+tạo một result array mới.
+
+Production API còn phải quyết định failure semantics. Type trên không nói
+Promise fail-fast, cancellation hay partial result. Đừng để precision ở success
+path che đi error contract mơ hồ.
+
+## Case 4: constructor wrapper giữ argument và instance
+
+Constructor cũng có parameter tuple:
+
+```ts
+type Constructor = new (...args: any[]) => object;
+
+type Instrumented<C extends Constructor> = new (
+  ...args: ConstructorParameters<C>
+) => InstanceType<C>;
+```
+
+```ts
+function instrumentClass<C extends Constructor>(Ctor: C): Instrumented<C> {
+  return class extends Ctor {
+    constructor(...args: any[]) {
+      const startedAt = performance.now();
+      super(...args);
+      console.log(Ctor.name, performance.now() - startedAt);
+    }
+  } as unknown as Instrumented<C>;
+}
+```
+
+`any[]` trong implementation là escape hatch do TypeScript chưa thể biểu diễn
+mọi generic base constructor khi tạo anonymous subclass. Nó không xuất hiện ở
+public signature. Double assertion cũng chỉ nằm tại adapter này; wrapper nhận
+concrete constructor, không nhận abstract class. Test tối thiểu:
+
+```ts
+class OrderRepository {
+  constructor(
+    readonly db: Database,
+    readonly cache?: Cache
+  ) {}
+}
+
+const TimedOrderRepository = instrumentClass(OrderRepository);
+
+new TimedOrderRepository(db);
+new TimedOrderRepository(db, cache);
+
+// @ts-expect-error thiếu Database
+new TimedOrderRepository();
+```
+
+Wrapper class có thêm rủi ro runtime: static fields, private fields, decorator
+metadata, identity và `instanceof`. Nếu chỉ cần telemetry, factory function hoặc
+composition thường ít bất ngờ hơn subclass động.
+
+## Function pipeline: type đúng từng cạnh, không chỉ hai đầu
+
+Pipeline tệ chỉ infer input của hàm đầu và output của hàm cuối. Hai stage ở giữa
+có thể không tương thích nhưng bị `any` che.
+
+Ta bắt đầu từ unary stage:
+
+```ts
+type Stage<Input, Output> = (input: Input) => Output | Promise<Output>;
+
+type StageInput<F> = F extends Stage<infer Input, unknown> ? Input : never;
+
+type StageOutput<F> = F extends (...args: any[]) => infer Output
+  ? Awaited<Output>
+  : never;
+```
+
+Kiểm một cặp cạnh:
+
+```ts
+type Connects<Left, Right> = Left extends (...args: any[]) => any
+  ? Right extends (input: Awaited<ReturnType<Left>>) => any
+    ? true
+    : false
+  : false;
+
+type _validEdge = Expect<
+  Equal<Connects<(raw: string) => number, (id: number) => Promise<User>>, true>
+>;
+
+type _invalidEdge = Expect<
+  Equal<Connects<(raw: string) => number, (enabled: boolean) => User>, false>
+>;
+```
+
+Sau đó recurse trên variadic tuple:
+
+```ts
+type AnyStage = (input: any) => any;
+
+type IsPipeline<Stages extends readonly AnyStage[]> = Stages extends readonly [
+  infer Left extends AnyStage,
+  infer Right extends AnyStage,
+  ...infer Rest extends readonly AnyStage[],
+]
+  ? Connects<Left, Right> extends true
+    ? IsPipeline<readonly [Right, ...Rest]>
+    : false
+  : true;
+
+type FirstStage<T extends readonly AnyStage[]> = T[0];
+
+type LastStage<T extends readonly AnyStage[]> = T extends readonly [
+  ...AnyStage[],
+  infer Last extends AnyStage,
+]
+  ? Last
+  : never;
+
+type PipelineFunction<T extends readonly [AnyStage, ...AnyStage[]]> = (
+  input: StageInput<FirstStage<T>>
+) => Promise<StageOutput<LastStage<T>>>;
+```
+
+Đây mới là **proof**, chưa phải public API đẹp. Gắn proof vào inference của
+`pipe()` thường cần intersection, overload hoặc builder để diagnostic chỉ đúng
+stage lỗi. Một chữ `never` ở toàn bộ rest parameter cho error message rất tệ.
+
+Trong library production, ba lựa chọn thực dụng là:
+
+1. overload cho 3–8 stage phổ biến, error ngắn và editor nhanh;
+2. builder `.pipe(next)` kiểm một cạnh mỗi lần;
+3. variadic recursive type khi số stage thực sự động và đã có benchmark.
+
+Builder thường cho UX tốt nhất:
+
+```ts
+declare function pipeline<Input>(): {
+  pipe<Output>(stage: Stage<Input, Output>): PipelineBuilder<Output>;
+};
+
+interface PipelineBuilder<Input> {
+  pipe<Output>(stage: Stage<Input, Output>): PipelineBuilder<Output>;
+  run(input: Input): Promise<Input>;
+}
+```
+
+Mỗi call tạo một inference boundary nhỏ. Compiler không phải giải cả tuple dài,
+và error nằm ngay stage vừa thêm.
+
+## Optional và rest parameter tạo union ngầm
+
+Tuple có optional member có nhiều length khả dĩ:
+
+```ts
+type FetchArgs = [url: string, init?: RequestInit];
+type FetchLength = FetchArgs['length'];
+// 1 | 2
+```
+
+Tuple có rest member thì length widen thành `number`:
+
+```ts
+type LogArgs = [level: 'info' | 'error', ...messages: string[]];
+type LogLength = LogArgs['length'];
+// number
+```
+
+Đừng dùng `T['length']` như một literal counter nếu `T` có optional/rest. Khi
+recursive algorithm cần termination, dùng tuple counter riêng với length cố
+định.
+
+## Overload và generic function không phải một tuple đơn giản
+
+`Parameters<F>` và conditional inference lấy call signature cuối của overload:
+
+```ts
+declare function parse(value: string): object;
+declare function parse(value: Uint8Array): object;
+declare function parse(value: string | Uint8Array): object;
+
+type ParseArgs = Parameters<typeof parse>;
+// [value: string | Uint8Array]
+```
+
+Wrapper generic không tự giữ toàn bộ overload set. Nếu overload là public UX
+quan trọng, hãy:
+
+- viết overload tương ứng cho wrapper;
+- chuyển contract thành union/discriminated options;
+- hoặc giữ API gốc và instrument ở implementation boundary.
+
+Generic function còn khó hơn vì “một type parameter cho mọi call” khác với
+“một concrete instantiation”. Một wrapper có thể vô tình chốt generic thành
+`unknown`. Type test phải gọi wrapper với ít nhất hai input type khác nhau.
+
+## Performance budget cho tuple program
+
+Recursive tuple types có chi phí theo số stage và độ rộng union ở mỗi stage.
+Nếu một stage trả union 20 member rồi conditional type phân phối qua 30 stage,
+chi phí không còn tuyến tính.
+
+Đo bằng project fixture, không đo bằng số dòng utility:
+
+```bash
+tsc -p fixtures/pipeline/tsconfig.json --extendedDiagnostics
+tsc -p fixtures/pipeline/tsconfig.json --generateTrace .trace/pipeline
+```
+
+Theo dõi ít nhất:
+
+- `Instantiations`;
+- `Types`;
+- `Check time` cold và warm;
+- độ trễ autocomplete trên consumer thực;
+- kích thước `.d.ts` emit.
+
+Budget gợi ý cho public API: error xuất hiện dưới vài trăm mili-giây trong editor,
+declaration không expand thành hàng nghìn dòng anonymous tuple, và check time
+không tăng theo cấp số nhân khi tăng gấp đôi số stage.
+
+## Failure modes cần review
+
+### `T[number]` quá sớm
+
+Bạn biến positional contract thành union rồi không thể ghép lại correlation.
+
+### `as const` không khớp mutable constraint
+
+Utility chỉ đọc nhưng nhận `unknown[]`, làm caller phải copy hoặc assertion.
+
+### Wrapper nói dối semantics
+
+Giữ `ReturnType<F>` dù runtime đổi sync thành async, swallow error hoặc memoize
+theo key không đầy đủ.
+
+### Recursive validation trả `never` ở quá xa lỗi
+
+Type “đúng” nhưng diagnostic không dùng được. Builder hoặc overload có thể tốt
+hơn một variadic signature duy nhất.
+
+### `any[]` thoát ra public surface
+
+Một escape hatch nội bộ biến mọi negative type test thành pass. Inspect `.d.ts`,
+không chỉ source.
+
+### Tuple quá dài trở thành schema language
+
+Khi positional convention cần tài liệu riêng để nhớ index thứ 7 là gì, chuyển
+sang object, runtime schema hoặc code generation.
+
+## Decision rules
+
+- Dùng tuple khi **vị trí và thứ tự** có ý nghĩa ổn định.
+- Dùng variadic tuple khi wrapper thực sự nối hoặc tách parameter list.
+- Giữ tuple `readonly` ở input nếu implementation không mutate.
+- Dùng builder khi cần validate từng stage và ưu tiên diagnostic cục bộ.
+- Dùng object parameter khi options evolve độc lập hoặc có nhiều field cùng type.
+- Dùng overload hữu hạn khi tập call shape nhỏ và UX quan trọng hơn sự “tổng quát”.
+- Chuyển sang codegen khi type program xử lý graph lớn, cần error domain-specific
+  hoặc phải đồng bộ runtime artifact.
+
+## Lab: middleware pipeline có bằng chứng ở từng cạnh
+
+Xây pipeline cho request context:
+
+```ts
+type RawRequest = { headers: Headers; body: unknown };
+type Authenticated = RawRequest & { user: User };
+type Validated = Authenticated & { command: CreateOrder };
+type Completed = Validated & { order: Order };
+```
+
+Yêu cầu:
+
+1. `authenticate: Stage<RawRequest, Authenticated>`;
+2. `validate: Stage<Authenticated, Validated>`;
+3. `execute: Stage<Validated, Completed>`;
+4. pipeline đúng nhận `RawRequest` và trả `Promise<Completed>`;
+5. đảo `validate` và `authenticate` phải fail tại stage bị đảo;
+6. không có `any` trong public declaration;
+7. benchmark 5, 20 và 50 stage bằng `--extendedDiagnostics`.
+
+**Done khi:** negative test fail đúng cạnh, parameter label còn trong declaration,
+runtime test chứng minh sync/async stage được await đúng thứ tự, và bạn ghi được
+ngưỡng chuyển từ recursive tuple sang builder/codegen.
+
+## Đọc tiếp
+
+- [TypeScript 4.0 — Variadic Tuple Types](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-0.html#variadic-tuple-types)
+- [TypeScript 4.0 — Labeled Tuple Elements](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-0.html#labeled-tuple-elements)
+- [Conditional Type Inference](https://www.typescriptlang.org/docs/handbook/2/conditional-types.html#inferring-within-conditional-types)
+- [Utility Types: Parameters and ConstructorParameters](https://www.typescriptlang.org/docs/handbook/utility-types.html)

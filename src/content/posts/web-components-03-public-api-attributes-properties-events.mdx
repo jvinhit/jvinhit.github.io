@@ -1,0 +1,544 @@
+---
+title: 'Web Components · Phần 3 — Public API: Attributes, Properties & Events'
+description: 'Thiết kế contract cho kb-task-card: attribute primitive, property có type, boolean reflection, method có chủ đích và CustomEvent để Kanban giao tiếp lỏng.'
+pubDate: 2026-07-12
+lang: vi
+tags: [web-components, custom-elements, dom-events, api-design, javascript]
+series: web-components
+seriesOrder: 3
+draft: false
+---
+
+`<kb-task-card>` đã sống sót qua detach và reconnect, nhưng consumer vẫn phải
+biết selector `[data-action="toggle"]` và tự sửa child DOM. Đó là một component
+có lifecycle, chưa phải một component có **public API**.
+
+Một tuần sau, server muốn khai báo priority bằng HTML, JavaScript muốn truyền
+object task có labels, còn `<kb-task-board>` cần biết khi card hoàn thành. Nếu mỗi
+consumer chạm implementation theo một cách, refactor nội bộ sẽ phá cả hệ thống.
+
+Phần này thiết kế boundary như thiết kế API package:
+
+```text
+Consumer ── attributes / properties / methods ──► <kb-task-card>
+Consumer ◄──────────── CustomEvent ────────────── <kb-task-card>
+```
+
+Ta chỉ giới thiệu event như một **contract công khai**. Capture, bubble path,
+retargeting và ranh giới Shadow DOM sẽ được mổ xẻ ở Phần 7.
+
+---
+
+## 1. Chọn đúng kênh cho đúng loại dữ liệu
+
+Custom Element có bốn bề mặt giao tiếp chính:
+
+| Kênh      | Phù hợp với                                         | Ví dụ Kanban                   |
+| --------- | --------------------------------------------------- | ------------------------------ |
+| Attribute | primitive biểu diễn được trong HTML                 | `priority="high"`, `completed` |
+| Property  | object, array, function, reference, dữ liệu có type | `card.task = {...}`            |
+| Method    | hành động imperative có chủ đích                    | `card.focusPrimaryAction()`    |
+| Event     | thông báo từ component ra ngoài                     | `kb-task-toggle`               |
+
+Một contract tốt không nhân đôi state. Priority cần markup/CSS nên reflect;
+object task dùng property; focus dùng method; thay đổi của người dùng đi ra bằng
+event.
+
+---
+
+## 2. Attributes: serializable, quan sát được, luôn là chuỗi
+
+Attribute là một phần của HTML:
+
+```html
+<kb-task-card task-id="KB-101" priority="high" completed></kb-task-card>
+```
+
+Trừ việc **có hay không có** attribute, giá trị đọc qua `getAttribute()` là
+chuỗi hoặc `null`:
+
+```js
+card.getAttribute('priority'); // "high"
+card.getAttribute('completed'); // "" trong markup trên
+card.getAttribute('missing'); // null
+```
+
+HTML attribute hợp với primitive cần server render, CSS selector hoặc inspect
+trực tiếp trong DevTools.
+
+Đừng nhét object vào attribute theo phản xạ:
+
+```html
+<!-- Khó escape, khó type, parse lại mỗi lần và dễ tạo XSS boundary. -->
+<kb-task-card task='{"title":"Fix <img ...>"}'></kb-task-card>
+```
+
+JSON attribute đôi khi là contract tích hợp có chủ ý, nhưng không nên là mặc
+định. DOM đã có property để giữ object thật.
+
+### Quan sát attribute
+
+Browser chỉ gọi `attributeChangedCallback()` cho tên được khai báo:
+
+```js
+class KbTaskCard extends HTMLElement {
+  static observedAttributes = ['task-id', 'priority', 'completed'];
+
+  attributeChangedCallback(name, oldValue, newValue) {
+    if (oldValue === newValue) return;
+    this.#syncView(name);
+  }
+}
+```
+
+Callback có thể chạy trong quá trình upgrade, trước `connectedCallback()`. Vì
+vậy `#syncView()` phải chịu được việc child view chưa tồn tại. Đừng giả định
+component đã mount chỉ vì một attribute vừa đổi.
+
+---
+
+## 3. Boolean attribute: presence là `true`
+
+Đây là quy tắc dễ viết sai nhất:
+
+```html
+<kb-task-card completed></kb-task-card>
+<!-- true -->
+<kb-task-card completed=""></kb-task-card>
+<!-- true -->
+<kb-task-card completed="false"></kb-task-card>
+<!-- vẫn true -->
+<kb-task-card></kb-task-card>
+<!-- false -->
+```
+
+Boolean attribute không parse chữ `"false"`. Presence là true, absence là
+false, giống `disabled`, `checked` trong markup hay `required`.
+
+Public property nên phản chiếu quy tắc đó:
+
+```js
+get completed() {
+  return this.hasAttribute('completed');
+}
+
+set completed(value) {
+  this.toggleAttribute('completed', Boolean(value));
+}
+```
+
+Consumer dùng `card.completed = false`; setter **remove** attribute. Không viết
+`setAttribute('completed', 'false')`.
+
+---
+
+## 4. Reflection mà không tạo hai nguồn sự thật
+
+Reflection là đồng bộ property và attribute theo hai chiều. Mẫu an toàn cho
+primitive là để attribute làm storage duy nhất:
+
+```js
+const priorities = new Set(['low', 'medium', 'high']);
+
+get priority() {
+  const value = this.getAttribute('priority');
+  return priorities.has(value) ? value : 'medium';
+}
+
+set priority(value) {
+  const next = String(value);
+  if (!priorities.has(next)) {
+    throw new RangeError(`Unsupported priority: ${next}`);
+  }
+  if (this.getAttribute('priority') !== next) {
+    this.setAttribute('priority', next);
+  }
+}
+```
+
+Getter đọc attribute; setter validate rồi ghi attribute; callback commit view.
+Không có thêm `#priority` để lệch khỏi DOM.
+
+Với input HTML không tin cậy hoàn toàn, getter degrade giá trị lạ về `medium`.
+Với JavaScript consumer, setter ném lỗi sớm để bug không bị nuốt. Hai hành vi
+khác nhau là có chủ đích: parser cần robust, API lập trình cần rõ lỗi.
+
+Không phải property nào cũng nên reflect. Object, array hoặc token bí mật không
+thuộc HTML. Reflection cũng không nên biến mọi internal state thành public API.
+
+---
+
+## 5. Typed property cho task data
+
+Property giữ nguyên type JavaScript và không bị serialize:
+
+```js
+card.task = {
+  title: 'Viết contract cho card',
+  assignee: 'An',
+  labels: ['frontend', 'a11y'],
+};
+```
+
+JSDoc giúp editor hiểu contract mà không đổi runtime:
+
+```js
+/**
+ * @typedef {object} KbTaskData
+ * @property {string} title
+ * @property {string=} assignee
+ * @property {string[]=} labels
+ */
+```
+
+Setter là boundary validate/normalize. Component copy dữ liệu thay vì giữ một
+object mutable do consumer sở hữu:
+
+```js
+/** @type {Readonly<KbTaskData> | null} */
+#task = null;
+
+get task() {
+  return this.#task;
+}
+
+set task(value) {
+  if (!value || typeof value !== 'object') {
+    throw new TypeError('task must be an object');
+  }
+
+  const title = String(value.title ?? '').trim();
+  if (!title) throw new TypeError('task.title is required');
+
+  this.#task = Object.freeze({
+    title,
+    assignee: value.assignee ? String(value.assignee) : '',
+    labels: Object.freeze(
+      Array.isArray(value.labels) ? value.labels.map(String) : []
+    ),
+  });
+
+  this.#syncView('task');
+}
+```
+
+Freeze không phải security; nó làm ownership rõ. Muốn đổi title, consumer gán
+object mới vì mutation sâu không đi qua setter và không phát tín hiệu render.
+
+---
+
+## 6. Public method chỉ cho hành động imperative
+
+Nếu một thứ mô tả state, ưu tiên property. `setPriority('high')` kém tự nhiên hơn
+`card.priority = 'high'`. Method phù hợp khi caller yêu cầu một hành động:
+
+```js
+focusPrimaryAction(options) {
+  const button = this.querySelector('[data-action="toggle"]');
+  if (button instanceof HTMLButtonElement) {
+    button.focus(options);
+  }
+}
+```
+
+Method này giấu selector nội bộ. Sau khi card chuyển button vào Shadow DOM,
+consumer vẫn gọi cùng API. Một public method tốt thường là động từ, có outcome
+rõ và không bắt consumer biết cây DOM bên trong.
+
+Tránh expose `render()`, `getInternalButton()` hoặc method chỉ để consumer vá
+implementation. Đó là dấu hiệu boundary sai.
+
+---
+
+## 7. Event là output, không phải lệnh ngược vào component
+
+Khi người dùng toggle card, component cập nhật state rồi phát một notification:
+
+```js
+this.dispatchEvent(
+  new CustomEvent('kb-task-toggle', {
+    detail: Object.freeze({
+      taskId: this.taskId,
+      completed: this.completed,
+    }),
+    bubbles: true,
+    composed: true,
+  })
+);
+```
+
+Contract cần quyết định rõ:
+
+- **Tên:** prefix `kb-` tránh va với native `change` và event package khác.
+- **Thời điểm:** đây là notification _sau khi_ state đã đổi.
+- **Payload:** object nhỏ, versionable, không lộ node nội bộ.
+- **Propagation:** `bubbles: true` cho ancestor lắng nghe theo delegation.
+  Event đang phát từ host nên `composed` chưa đổi đường đi; đặt `composed: true`
+  công bố đây là event public và vẫn cho phép nó vượt boundary nếu sau này được
+  phát từ một node nội bộ. Phần 7 sẽ tách rõ hai cờ này.
+- **Cancel:** event này không `cancelable`; consumer không được veto một thay đổi
+  đã commit.
+
+Nếu cần hỏi quyền trước khi đổi, dùng event khác như
+`kb-task-toggle-request`, đặt `cancelable: true` và dispatch **trước** commit.
+Đừng trộn request trước commit với notification sau commit.
+
+`detail` nên chứa dữ liệu, không chứa callback. Consumer nghe ở list:
+
+```js
+const board = document.querySelector('kb-task-board');
+
+board.addEventListener('kb-task-toggle', (event) => {
+  if (!(event instanceof CustomEvent)) return;
+  const { taskId, completed } = event.detail;
+  console.log(`${taskId}: ${completed ? 'done' : 'todo'}`);
+});
+```
+
+Phần 7 sẽ giải thích chính xác vì sao event đi qua host, khi nào target bị
+retarget và khác biệt giữa `bubbles` với `composed`.
+
+---
+
+## 8. Ghép thành `<kb-task-card>` có contract hoàn chỉnh
+
+Đoạn module sau enhance progressive markup từ Phần 1 và giữ cleanup từ Phần 2:
+
+```js
+/**
+ * @typedef {object} KbTaskData
+ * @property {string} title
+ * @property {string=} assignee
+ * @property {string[]=} labels
+ */
+
+const priorities = new Set(['low', 'medium', 'high']);
+
+class KbTaskCard extends HTMLElement {
+  static observedAttributes = ['task-id', 'priority', 'completed'];
+
+  /** @type {Readonly<KbTaskData> | null} */
+  #task = null;
+  #connectionController;
+  #replayedPreUpgradeProperties = false;
+
+  connectedCallback() {
+    if (!this.#replayedPreUpgradeProperties) {
+      for (const name of ['task', 'taskId', 'priority', 'completed']) {
+        this.#upgradeProperty(name);
+      }
+      this.#replayedPreUpgradeProperties = true;
+    }
+
+    if (!this.#connectionController) {
+      const controller = new AbortController();
+      this.#connectionController = controller;
+      this.addEventListener('click', this.#onClick, {
+        signal: controller.signal,
+      });
+    }
+
+    this.#syncView('connect');
+  }
+
+  disconnectedCallback() {
+    this.#connectionController?.abort();
+    this.#connectionController = undefined;
+  }
+
+  attributeChangedCallback(name, oldValue, newValue) {
+    if (oldValue !== newValue) this.#syncView(name);
+  }
+
+  get taskId() {
+    return this.getAttribute('task-id') ?? '';
+  }
+
+  set taskId(value) {
+    const next = String(value).trim();
+    if (next) this.setAttribute('task-id', next);
+    else this.removeAttribute('task-id');
+  }
+
+  get priority() {
+    const value = this.getAttribute('priority');
+    return priorities.has(value) ? value : 'medium';
+  }
+
+  set priority(value) {
+    const next = String(value);
+    if (!priorities.has(next)) {
+      throw new RangeError(`Unsupported priority: ${next}`);
+    }
+    if (this.getAttribute('priority') !== next) {
+      this.setAttribute('priority', next);
+    }
+  }
+
+  get completed() {
+    return this.hasAttribute('completed');
+  }
+
+  set completed(value) {
+    this.toggleAttribute('completed', Boolean(value));
+  }
+
+  get task() {
+    return this.#task;
+  }
+
+  set task(value) {
+    if (!value || typeof value !== 'object') {
+      throw new TypeError('task must be an object');
+    }
+    const title = String(value.title ?? '').trim();
+    if (!title) throw new TypeError('task.title is required');
+
+    this.#task = Object.freeze({
+      title,
+      assignee: value.assignee ? String(value.assignee) : '',
+      labels: Object.freeze(
+        Array.isArray(value.labels) ? value.labels.map(String) : []
+      ),
+    });
+    this.#syncView('task');
+  }
+
+  focusPrimaryAction(options) {
+    const button = this.querySelector('[data-action="toggle"]');
+    if (button instanceof HTMLButtonElement) button.focus(options);
+  }
+
+  #onClick = (event) => {
+    if (!(event.target instanceof Element)) return;
+    const button = event.target.closest('[data-action="toggle"]');
+    if (!button || button.closest('kb-task-card') !== this) return;
+
+    this.completed = !this.completed;
+    this.dispatchEvent(
+      new CustomEvent('kb-task-toggle', {
+        detail: Object.freeze({
+          taskId: this.taskId,
+          completed: this.completed,
+        }),
+        bubbles: true,
+        composed: true,
+      })
+    );
+  };
+
+  #syncView(_reason) {
+    const title = this.querySelector('[data-title]');
+    const assignee = this.querySelector('[data-assignee]');
+    const labels = this.querySelector('[data-labels]');
+    const button = this.querySelector('[data-action="toggle"]');
+
+    if (this.#task) {
+      if (title) title.textContent = this.#task.title;
+      if (assignee) assignee.textContent = this.#task.assignee || 'Chưa giao';
+      if (labels) labels.textContent = this.#task.labels.join(', ');
+    }
+
+    if (button instanceof HTMLButtonElement) {
+      button.setAttribute('aria-pressed', String(this.completed));
+      button.textContent = this.completed
+        ? 'Đánh dấu chưa hoàn thành'
+        : 'Đánh dấu hoàn thành';
+    }
+  }
+
+  #upgradeProperty(name) {
+    if (!Object.prototype.hasOwnProperty.call(this, name)) return;
+    const value = this[name];
+    delete this[name];
+    this[name] = value;
+  }
+}
+
+customElements.define('kb-task-card', KbTaskCard);
+```
+
+Markup và consumer:
+
+```html
+<kb-task-board>
+  <kb-task-card task-id="KB-101" priority="high">
+    <article>
+      <h3 data-title>Đang tải task…</h3>
+      <p>Người thực hiện: <span data-assignee>Chưa giao</span></p>
+      <p>Nhãn: <span data-labels>—</span></p>
+      <button type="button" data-action="toggle" aria-pressed="false">
+        Đánh dấu hoàn thành
+      </button>
+    </article>
+  </kb-task-card>
+</kb-task-board>
+
+<script type="module">
+  await customElements.whenDefined('kb-task-card');
+  const card = document.querySelector('kb-task-card');
+
+  card.task = {
+    title: 'Thiết kế public API',
+    assignee: 'An',
+    labels: ['frontend', 'a11y'],
+  };
+  card.completed = false;
+</script>
+```
+
+---
+
+## Failure modes
+
+- `completed="false"` nhưng mong false: boolean attribute chỉ nhìn presence.
+- Giữ cả `#priority` và attribute mà không có owner rõ: hai nguồn sự thật lệch.
+- Serialize object mặc định vào attribute: mất type, tăng parse và rủi ro escape.
+- Mutate `card.task.labels.push(...)`: setter không chạy, component không biết.
+- Event tên `change` với payload tùy ý: dễ nhầm native event và collision.
+- Phát event “changed” trước khi commit hoặc cho cancel event đã commit: semantics
+  mâu thuẫn.
+- Expose node nội bộ: consumer phụ thuộc selector, Shadow DOM refactor sẽ gãy.
+- Attribute callback giả định view đã mount: upgrade markup sớm gây null error.
+
+---
+
+## Bài tập: viết contract trước implementation
+
+1. Thêm reflected property `blocked` theo đúng boolean semantics.
+2. Thêm attribute/property `size` nhận `compact | normal`; setter ném với input
+   JavaScript sai, getter fallback cho markup sai.
+3. Thêm `focusPrimaryAction()` vào card và gọi sau `whenDefined()`.
+4. Cho list nghe `kb-task-toggle` ở một nơi duy nhất, không gắn listener từng card.
+5. Thử gán `task` trước khi module load và xác nhận replay property hoạt động.
+6. Viết bảng contract gồm name, type, default, reflect hay không, và event timing.
+
+**Hoàn thành khi:** consumer không cần query child DOM để đọc/đổi state hoặc nhận
+thông báo; boolean false làm attribute biến mất; object task không bị stringify.
+
+---
+
+## Checklist cốt lõi
+
+- Attribute dành cho primitive serializable và luôn đọc ra chuỗi hoặc `null`.
+- Boolean attribute: có là true, không có là false.
+- Property dành cho typed data/reference; setter là validation boundary.
+- Reflection cần một source of truth và equality guard.
+- Mutation sâu không tự phát tín hiệu; ưu tiên gán object mới.
+- Method biểu diễn hành động imperative, không phơi implementation.
+- Event name, payload, timing, propagation và cancellation đều là public contract.
+- Phân biệt notification sau commit với cancelable request trước commit.
+
+Ở **Phần 4**, ta ngừng `querySelector()` rồi sửa ngẫu hứng sau mỗi thay đổi. Card
+sẽ có `<template>` dùng lại, state owner rõ, mount một lần và commit có mục tiêu
+để giữ node identity, focus và input selection. Ta cũng đặt ranh giới bảo mật rõ
+giữa static template đáng tin và dữ liệu không được đưa vào `innerHTML`.
+
+## Nguồn chính thức
+
+- [HTML Living Standard — Custom elements](https://html.spec.whatwg.org/multipage/custom-elements.html)
+- [MDN — Using custom elements](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_custom_elements)
+- [MDN — `Element.toggleAttribute()`](https://developer.mozilla.org/en-US/docs/Web/API/Element/toggleAttribute)
+- [MDN — `CustomEvent`](https://developer.mozilla.org/en-US/docs/Web/API/CustomEvent)
+- [DOM Standard — Events](https://dom.spec.whatwg.org/#events)
+- [MDN — Using custom elements: responding to attribute changes](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_custom_elements#responding_to_attribute_changes)

@@ -1,0 +1,349 @@
+---
+title: 'Video Engineering · Phần 12 — MSE, WebCodecs và xử lý video trong browser'
+description: 'Chọn giữa video element, Media Source Extensions và WebCodecs; tự append fMP4, quản lý SourceBuffer/backpressure và xử lý VideoFrame an toàn.'
+pubDate: 2026-07-12
+lang: vi
+tags:
+  [
+    video-engineering,
+    video,
+    media-source-extensions,
+    webcodecs,
+    sourcebuffer,
+    browser,
+    streaming,
+  ]
+series: video-engineering
+seriesOrder: 12
+draft: false
+---
+
+Thẻ `<video>` che giấu gần như toàn bộ pipeline. Đó là ưu điểm, không phải hạn chế: browser tự lo fetch, demux, decode, A/V sync và render bằng đường tối ưu của nó. Chỉ khi cần adaptive streaming tùy biến, timeline động, frame analysis hoặc encoder trong browser, ta mới nên xuống API thấp hơn.
+
+Hai API hay bị gộp nhầm:
+
+- **Media Source Extensions (MSE)**: JavaScript xây buffer media cho `<video>` bằng encoded segments.
+- **WebCodecs**: JavaScript đưa encoded chunk vào decoder/encoder và nhận `VideoFrame`/`AudioData`.
+
+MSE không cho bạn raw frame. WebCodecs không tự fetch, demux MP4/HLS, chọn rendition hay sync A/V hoàn chỉnh. Cả hai đặc tả vẫn tiếp tục tiến hóa và implementation có thể chỉ hỗ trợ một phần codec/context; WebCodecs còn yêu cầu secure context. Luôn feature-detect trên browser đích.
+
+## 1. Chọn abstraction thấp nhất vẫn giải quyết được bài toán
+
+| Nhu cầu                                      | Primitive nên bắt đầu                                  |
+| -------------------------------------------- | ------------------------------------------------------ |
+| Phát một MP4/WebM                            | `<video src>`                                          |
+| HLS có native support                        | `<video src="...m3u8">`                                |
+| ABR/custom stream trên browser hỗ trợ        | MSE + player/ABR logic                                 |
+| Nối/loại encoded segment theo timeline       | MSE `SourceBuffer`                                     |
+| Thumbnail, frame analysis, custom compositor | WebCodecs + Canvas/Worker                              |
+| Encode frame trong browser                   | `VideoEncoder` + muxer riêng                           |
+| Transcode container/codec tổng quát          | Server FFmpeg; WASM chỉ khi constraint thực sự yêu cầu |
+
+Xuống thấp hơn nghĩa là tự sở hữu thêm state, backpressure, memory, error recovery và compatibility matrix.
+
+## 2. MSE: JavaScript cấp byte, media element vẫn phát
+
+```text
+fetch init.mp4 + seg-000.m4s + seg-001.m4s
+                 │
+                 ▼
+          SourceBuffer.appendBuffer()
+                 │
+                 ▼
+        browser demux/decode/A-V sync
+                 │
+                 ▼
+               <video>
+```
+
+Ví dụ append fMP4 tuần tự:
+
+```html
+<video id="player" controls></video>
+<script type="module">
+  const video = document.querySelector('#player');
+  const mime = 'video/mp4; codecs="avc1.64001f, mp4a.40.2"';
+  const urls = [
+    '/hls-fmp4/init.mp4',
+    '/hls-fmp4/seg-000.m4s',
+    '/hls-fmp4/seg-001.m4s',
+  ];
+
+  class MediaFetchError extends Error {}
+  class MediaAppendError extends Error {}
+
+  if (!('MediaSource' in window) || !MediaSource.isTypeSupported(mime)) {
+    throw new Error(`MSE không hỗ trợ ${mime}`);
+  }
+
+  const mediaSource = new MediaSource();
+  const objectUrl = URL.createObjectURL(mediaSource);
+  video.src = objectUrl;
+
+  mediaSource.addEventListener(
+    'sourceopen',
+    async () => {
+      // Element đã attach MediaSource; không giữ blob URL lâu hơn cần thiết.
+      URL.revokeObjectURL(objectUrl);
+      const sourceBuffer = mediaSource.addSourceBuffer(mime);
+      sourceBuffer.mode = 'segments';
+
+      try {
+        for (const url of urls) {
+          await append(sourceBuffer, await fetchBytes(url));
+        }
+        mediaSource.endOfStream();
+      } catch (error) {
+        console.error(error);
+        const endOfStreamError =
+          error instanceof MediaFetchError
+            ? 'network'
+            : error instanceof MediaAppendError
+              ? 'decode'
+              : null;
+
+        // Quota/programming error cần eviction hoặc sửa state, không được gắn
+        // nhầm thành network/decode error của media element.
+        if (
+          endOfStreamError &&
+          mediaSource.readyState === 'open' &&
+          !sourceBuffer.updating
+        ) {
+          mediaSource.endOfStream(endOfStreamError);
+        }
+      }
+    },
+    { once: true }
+  );
+
+  async function fetchBytes(url) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`${response.status} ${url}`);
+      return await response.arrayBuffer();
+    } catch (cause) {
+      throw new MediaFetchError(`Không tải được ${url}`, { cause });
+    }
+  }
+
+  function append(sourceBuffer, bytes) {
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        sourceBuffer.removeEventListener('updateend', onEnd);
+        sourceBuffer.removeEventListener('error', onError);
+      };
+      const onEnd = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        cleanup();
+        reject(new MediaAppendError('SourceBuffer append failed'));
+      };
+
+      sourceBuffer.addEventListener('updateend', onEnd, { once: true });
+      sourceBuffer.addEventListener('error', onError, { once: true });
+      try {
+        sourceBuffer.appendBuffer(bytes);
+      } catch (error) {
+        cleanup();
+        reject(error);
+      }
+    });
+  }
+</script>
+```
+
+Demo này cố ý nhỏ. Player production còn phải parse playlist, schedule download, retry, ABR, eviction, live edge, key/DRM, subtitle, track switch và phục hồi discontinuity.
+
+## 3. SourceBuffer là state machine, không phải mảng byte
+
+`appendBuffer()` chuyển `sourceBuffer.updating` sang `true`. Append tiếp trước `updateend` có thể ném `InvalidStateError`. Buffer cũng có quota; giữ stream dài vô hạn có thể ném `QuotaExceededError`.
+
+Evict vùng cũ khi phù hợp:
+
+```js
+async function removeBefore(sourceBuffer, time) {
+  if (sourceBuffer.updating || sourceBuffer.buffered.length === 0) return;
+  const start = sourceBuffer.buffered.start(0);
+  if (time > start) {
+    sourceBuffer.remove(start, time);
+    await new Promise((resolve) =>
+      sourceBuffer.addEventListener('updateend', resolve, { once: true })
+    );
+  }
+}
+```
+
+Các primitive quan trọng:
+
+- `buffered`: các range đã coded-frame-process và giữ lại;
+- `timestampOffset`: dịch timestamp của segment khi ghép timeline;
+- `appendWindowStart/End`: chỉ nhận frame trong cửa sổ;
+- `remove(start, end)`: xóa range, cũng là asynchronous update;
+- `abort()`: hủy update/reset parser state theo quy tắc spec; nó không hủy request `fetch()`.
+
+Đừng dùng `timestampOffset` để che một bitstream sai mà chưa hiểu timestamp gốc. Gap/overlap nhỏ có thể tạo stall hoặc audio click; discontinuity cần được xử lý nhất quán cho mọi track.
+
+## 4. MSE nhận “byte stream format” cụ thể
+
+Không phải MP4 nào cũng append được. MSE byte stream format định nghĩa initialization segment, media segment và random access point. Với ISO BMFF/fMP4:
+
+- init segment mang codec configuration/track metadata;
+- media segment mang fragment (`moof`/`mdat`);
+- codec string khi `addSourceBuffer()` phải khớp dữ liệu;
+- segment cần timestamp và random access hợp lệ.
+
+Kiểm tra trước:
+
+```js
+const candidates = [
+  'video/mp4; codecs="avc1.64001f, mp4a.40.2"',
+  'video/webm; codecs="vp9, opus"',
+];
+
+if ('MediaSource' in globalThis) {
+  for (const candidate of candidates) {
+    console.log(candidate, MediaSource.isTypeSupported(candidate));
+  }
+}
+```
+
+Registry của MSE có byte stream format cho ISO BMFF, WebM và MPEG-2 TS, nhưng browser cụ thể không bắt buộc hỗ trợ mọi format. Feature-detect trên target thật; đừng suy từ spec registry thành ma trận support.
+
+## 5. WebCodecs: encoded chunks vào, raw frames ra
+
+```text
+fetch/container bytes
+      │
+      ▼
+ demuxer của bạn/thư viện
+      │ EncodedVideoChunk
+      ▼
+ VideoDecoder ─► VideoFrame ─► Canvas / encoder / analysis
+```
+
+WebCodecs không demux MP4/TS. Bạn vẫn cần parser trả encoded chunks cùng codec config và timestamp đúng. Với AVC, có `description` nghĩa dữ liệu là `AVCDecoderConfigurationRecord` và chunk dùng dạng length-prefixed `avc`; bỏ `description` thì chunk được hiểu là Annex B. Hai dạng không thể tráo cho nhau chỉ bằng đổi codec string.
+
+Đoạn sau là **skeleton/pseudocode về lifecycle và backpressure**, không phải
+demo độc lập: `avcDecoderConfigurationRecord` và `encodedChunks` phải do một
+demuxer AVC/MP4 thật tạo ra, còn hàm render là consumer của ứng dụng. Các lab
+chạy được trong series vẫn dùng fixture tự tạo; đoạn này cố ý làm rõ contract
+mà một adapter demuxer phải cung cấp.
+
+```js
+const config = {
+  codec: 'avc1.64001f',
+  codedWidth: 1280,
+  codedHeight: 720,
+  description: avcDecoderConfigurationRecord,
+};
+
+if (!('VideoDecoder' in globalThis)) {
+  throw new Error('WebCodecs VideoDecoder không có trên context này');
+}
+
+const support = await VideoDecoder.isConfigSupported(config);
+if (!support.supported) throw new Error('Decoder config unsupported');
+
+const decoder = new VideoDecoder({
+  output(frame) {
+    try {
+      // Hàm này phải dùng frame đồng bộ. Consumer async phải tự giữ ownership
+      // và chịu trách nhiệm close() sau khi hoàn tất.
+      renderOrAnalyzeSynchronously(frame);
+    } finally {
+      frame.close();
+    }
+  },
+  error(error) {
+    console.error('decode error', error);
+  },
+});
+
+decoder.configure(support.config);
+
+// Chunks phải do demuxer tạo, timestamp WebCodecs dùng microsecond.
+for (const chunk of encodedChunks) {
+  await waitForDecodeCapacity(decoder, 8);
+  decoder.decode(chunk);
+}
+
+async function waitForDecodeCapacity(decoder, limit) {
+  while (decoder.decodeQueueSize >= limit) {
+    await new Promise((resolve) =>
+      decoder.addEventListener('dequeue', resolve, { once: true })
+    );
+  }
+}
+
+await decoder.flush();
+decoder.close();
+```
+
+Chunk đầu sau `configure()` phải là key chunk. `flush()` ở ví dụ chỉ dùng khi hết stream; theo lifecycle WebCodecs, sau `flush()` decoder lại yêu cầu key chunk nếu tiếp tục gọi `decode()`. Đừng flush sau từng segment delta.
+
+`VideoFrame` giữ media resource có thể lớn hoặc nằm gần GPU. Gọi `close()` ngay khi xong; chờ GC trong loop 30/60 fps là công thức tạo memory pressure. `decodeQueueSize` chỉ đếm decode request đang chờ codec nhận, không phải số frame sẽ output hay toàn bộ backlog render; ứng dụng vẫn phải giới hạn queue phía consumer.
+
+## 6. Worker, Canvas và chi phí chuyển dữ liệu
+
+WebCodecs dùng được trong dedicated worker trên browser hỗ trợ. `OffscreenCanvas` giúp vẽ ngoài main thread. Nhưng “worker” không tự động là zero-copy:
+
+- demuxer có thể copy `ArrayBuffer`;
+- chuyển frame giữa context có ownership/lifetime cần quản lý;
+- đưa GPU-backed frame về CPU để `getImageData()` có thể đắt;
+- encode/decode phần cứng phụ thuộc codec, driver và config;
+- main thread vẫn chịu DOM/compositor work.
+
+Đo end-to-end latency, dropped frames, memory và power trên thiết bị đích. Đừng chỉ đo thời gian một call JavaScript trả về.
+
+## 7. Quan sát frame được trình bày
+
+Nếu chỉ cần đồng bộ overlay với `<video>`, không cần WebCodecs. Dùng `requestVideoFrameCallback()`:
+
+```js
+function onFrame(now, metadata) {
+  overlay.textContent = [
+    `media=${metadata.mediaTime.toFixed(3)}s`,
+    `presented=${metadata.presentedFrames}`,
+    `late=${Math.max(0, now - metadata.expectedDisplayTime).toFixed(1)}ms`,
+  ].join(' ');
+
+  video.requestVideoFrameCallback(onFrame);
+}
+
+video.requestVideoFrameCallback(onFrame);
+```
+
+Callback liên quan frame đưa tới compositor, phù hợp hơn `timeupdate` cho overlay/frame diagnostics. Nó vẫn chạy callback JavaScript trên lịch của browser; làm việc nặng trong callback có thể tự tạo jank.
+
+## Failure checklist
+
+- Có thật sự cần MSE/WebCodecs hay `<video>` đã đủ không?
+- MIME + codec string có khớp init/bitstream và `isTypeSupported()` không?
+- Init segment có append trước media segment không?
+- Có serialize thao tác theo `updateend`, tránh append/remove đồng thời không?
+- Buffer có gap/overlap, timestamp đi lùi hay thiếu random access point không?
+- Có eviction trước khi chạm quota không?
+- WebCodecs demuxer có truyền config/extradata và timestamp microsecond đúng không?
+- Chunk đầu sau `configure()`/`flush()` có thật sự là key chunk không?
+- Mọi `VideoFrame`/`AudioData` có được `close()` không?
+- Worker path có thật sự giảm main-thread work hay chỉ chuyển/copy thêm dữ liệu?
+
+## Bài tập
+
+1. Dùng fMP4 từ bài 10 xây player append 5 segment; in `SourceBuffer.buffered` sau từng `updateend`.
+2. Đảo thứ tự hai media segment và ghi lại lỗi/range thay vì chỉ nhìn màn hình.
+3. Cố tình append song song để tái hiện `InvalidStateError`, sau đó sửa bằng queue.
+4. Dùng `requestVideoFrameCallback()` vẽ timecode overlay và so với `timeupdate`.
+5. Nếu browser hỗ trợ WebCodecs, decode fixture nhỏ và theo dõi memory khi bỏ/giữ `frame.close()` — chỉ chạy trên asset cục bộ và dừng trước khi gây treo tab.
+
+## Đọc thêm
+
+- [W3C — Media Source Extensions 2](https://www.w3.org/TR/media-source-2/)
+- [W3C — MSE byte stream format registry](https://www.w3.org/TR/mse-byte-stream-format-registry/)
+- [W3C — WebCodecs](https://www.w3.org/TR/webcodecs/)
+- [W3C — AVC/H.264 WebCodecs registration](https://www.w3.org/TR/webcodecs-avc-codec-registration/)
+- [MDN — WebCodecs video processing concepts](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API/Video_processing_concepts)
+
+**Phần tiếp theo:** [Debug video bằng Chrome DevTools](/blog/video-engineering-13-chrome-devtools-media-debugging/) — nối Network, Media, Sources và `chrome://media-internals` thành một investigation có bằng chứng.

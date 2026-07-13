@@ -1,0 +1,510 @@
+---
+title: 'Web Components · Phần 10 — Contract testing và debugging trong browser thật'
+description: 'Kiểm thử public contract của Accessible Mini Kanban trên browser thật: lifecycle, upgrade, attribute/property, event, slot, keyboard và form trước khi refactor sang Lit.'
+pubDate: 2026-07-12
+lang: vi
+tags:
+  [
+    web-components,
+    testing,
+    web-test-runner,
+    playwright,
+    accessibility,
+    javascript,
+  ]
+series: web-components
+seriesOrder: 10
+draft: false
+---
+
+Accessible Mini Kanban đã có những component native hoạt động được. Nhưng “bấm
+thử thấy đúng” chưa bảo vệ ta khỏi các lỗi chỉ xuất hiện khi element được tạo
+trước definition, bị kéo sang cột khác, reconnect, chạy trong Firefox, hoặc được
+thay implementation từ vanilla sang Lit.
+
+Đây là thời điểm viết **contract test**. Ta không khóa test vào số lượng `<div>`
+trong shadow root. Ta khóa những gì consumer được phép dựa vào: attribute,
+property, event, slot, keyboard behavior và form participation. Nhờ vậy cùng một
+test suite có thể chạy với bản native hôm nay và bản Lit ở Phần 11.
+
+---
+
+## 1. Mental model: browser là runtime, public contract là đơn vị test
+
+Custom Elements phụ thuộc vào HTML parser, custom element registry, Shadow DOM,
+focus, native form và event dispatch. DOM shim trong Node có thể hữu ích cho
+logic thuần, nhưng nó không phải nguồn sự thật cho các hành vi ấy. Với component
+platform, vòng lặp đúng là:
+
+```text
+logic thuần                   → unit test nhanh nếu cần
+public DOM contract           → component test trong browser thật
+keyboard/focus/user journey   → browser automation
+```
+
+Trong bài này ta chọn stack rõ ràng:
+
+- **Web Test Runner** chạy test module trực tiếp trong Chromium, Firefox và
+  WebKit thông qua Playwright launcher;
+- **Playwright Test** dành cho thao tác người dùng thật như Tab, Enter, Space và
+  một luồng form hoàn chỉnh.
+
+Các lệnh dưới đây là hướng dẫn cho một package component riêng; bài viết không
+thêm dependency vào blog này:
+
+```bash
+npm install --save-dev \
+  @web/test-runner \
+  @web/test-runner-playwright \
+  @esm-bundle/chai \
+  @playwright/test
+
+npx playwright install
+```
+
+Tạo `web-test-runner.config.mjs`:
+
+```js
+import { playwrightLauncher } from '@web/test-runner-playwright';
+
+export default {
+  files: ['test/**/*.test.js'],
+  nodeResolve: true,
+  browsers: ['chromium', 'firefox', 'webkit'].map((product) =>
+    playwrightLauncher({ product })
+  ),
+};
+```
+
+Sau đó chạy:
+
+```bash
+npx web-test-runner
+```
+
+Web Test Runner dùng Mocha interface, nên `describe`, `it`, `before` và
+`afterEach` có sẵn trong test page. Mỗi assertion vẫn chạy bằng DOM API thật của
+browser tương ứng.
+
+## 2. Viết adapter nhỏ cho cả native lẫn Lit
+
+Public contract của `<kb-task-card>` trong checkpoint này là:
+
+| Bề mặt        | Contract                                                            |
+| ------------- | ------------------------------------------------------------------- |
+| Attribute     | `task-id`, `priority`, `status`, boolean `completed`                |
+| Property      | `taskId`, `task`, `priority`, `status`, `completed`                 |
+| Method        | `focusPrimaryAction(options?)`                                      |
+| Styling       | shadow part `surface` là điểm tùy biến đã công bố                   |
+| Event         | `kb-task-toggle`, `kb-task-move`; bubble + composed, payload domain |
+| Accessibility | button “Hoàn thành”/“Sang trái”/“Sang phải”; `aria-pressed` đồng bộ |
+
+Test không nên biết component dùng `innerHTML`, template clone hay `LitElement`.
+Điểm khác duy nhất là Lit update bất đồng bộ. Ta giấu khác biệt đó sau helper
+`settle()`:
+
+```js
+// test/helpers.js
+export async function settle(element) {
+  if (element.updateComplete instanceof Promise) {
+    await element.updateComplete;
+  }
+
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+export function appendCard(tagName) {
+  const card = document.createElement(tagName);
+  card.setAttribute('task-id', 'KB-101');
+  card.setAttribute('priority', 'high');
+  card.setAttribute('status', 'todo');
+  card.task = {
+    title: 'Viết contract test',
+    assignee: 'An',
+    labels: ['a11y', 'testing'],
+  };
+  document.body.append(card);
+
+  return card;
+}
+```
+
+`requestAnimationFrame()` không phải cách buộc mọi component update trong code
+production. Ở đây nó tạo một điểm ổn định sau microtask và trước assertion phụ
+thuộc render của cây con. Khi test chính xác một Lit element, `updateComplete`
+là tín hiệu trực tiếp hơn; ta sẽ nói rõ giới hạn của nó ở Phần 13.
+
+## 3. Một contract suite chạy cho hai implementation
+
+Tạo `test/task-card.contract.js`:
+
+```js
+import { expect } from '@esm-bundle/chai';
+import { appendCard, settle } from './helpers.js';
+
+export function taskCardContract({ tagName, elementClass }) {
+  describe(`task card contract: <${tagName}>`, () => {
+    before(() => {
+      if (!customElements.get(tagName)) {
+        customElements.define(tagName, class extends elementClass {});
+      }
+    });
+
+    afterEach(() => document.body.replaceChildren());
+
+    it('đồng bộ attribute và property công khai', async () => {
+      const card = appendCard(tagName);
+      await settle(card);
+
+      expect(card.taskId).to.equal('KB-101');
+      expect(card.priority).to.equal('high');
+      expect(card.status).to.equal('todo');
+
+      const surface = card.shadowRoot.querySelector('[part~="surface"]');
+      expect(surface).not.to.equal(null);
+
+      card.focusPrimaryAction();
+      const button = card.shadowRoot.activeElement;
+      expect(button).to.be.instanceOf(HTMLButtonElement);
+      expect(button.textContent.trim()).to.equal('Hoàn thành');
+
+      card.completed = true;
+      await settle(card);
+
+      expect(card.hasAttribute('completed')).to.equal(true);
+      expect(button.getAttribute('aria-pressed')).to.equal('true');
+    });
+
+    it('nhận dữ liệu phức tạp qua property, không serialize vào attribute', async () => {
+      const card = appendCard(tagName);
+      const task = {
+        title: 'Review public contract',
+        assignee: 'Bình',
+        labels: ['web-components', 'testing'],
+      };
+      card.task = task;
+      await settle(card);
+
+      expect(card.task).to.deep.equal(task);
+      expect(card.task).not.to.equal(task);
+      expect(card.hasAttribute('task')).to.equal(false);
+      expect(card.shadowRoot.textContent).to.contain('Review public contract');
+      expect(card.shadowRoot.textContent).to.contain('web-components');
+    });
+
+    it('phát move intent theo status, không theo hướng layout', async () => {
+      const card = appendCard(tagName);
+      await settle(card);
+
+      const received = new Promise((resolve) => {
+        card.addEventListener('kb-task-move', resolve, { once: true });
+      });
+      const moveRight = [...card.shadowRoot.querySelectorAll('button')].find(
+        (button) => button.textContent.trim() === 'Sang phải'
+      );
+      expect(moveRight).not.to.equal(undefined);
+      moveRight.click();
+
+      const event = await received;
+      expect(event.detail).to.deep.equal({
+        taskId: 'KB-101',
+        toStatus: 'doing',
+      });
+      expect(event.bubbles).to.equal(true);
+      expect(event.composed).to.equal(true);
+    });
+
+    it('đưa event public qua shadow boundary với payload ổn định', async () => {
+      const card = appendCard(tagName);
+      const boundary = document.createElement('div');
+      const boundaryRoot = boundary.attachShadow({ mode: 'open' });
+      document.body.append(boundary);
+      boundaryRoot.append(card);
+      await settle(card);
+
+      const received = new Promise((resolve) => {
+        document.addEventListener(
+          'kb-task-toggle',
+          (event) => {
+            resolve({ event, path: event.composedPath() });
+          },
+          { once: true }
+        );
+      });
+
+      card.focusPrimaryAction();
+      card.shadowRoot.activeElement.click();
+      const { event, path } = await received;
+
+      // Ngoài shadow root chứa card, target bị retarget thành boundary host.
+      // Consumer dựa vào type/detail; open-root path chỉ dùng để test cờ.
+      expect(event.target).to.equal(boundary);
+      expect(path).to.include(card);
+      expect(event.bubbles).to.equal(true);
+      expect(event.composed).to.equal(true);
+      expect(event.detail).to.deep.equal({
+        taskId: 'KB-101',
+        completed: true,
+      });
+    });
+
+    it('không nhân listener khi disconnect rồi reconnect', async () => {
+      const card = appendCard(tagName);
+      let eventCount = 0;
+      card.addEventListener('kb-task-toggle', () => eventCount++);
+      await settle(card);
+
+      card.remove();
+      document.body.append(card);
+      await settle(card);
+
+      card.focusPrimaryAction();
+      card.shadowRoot.activeElement.click();
+      expect(eventCount).to.equal(1);
+    });
+
+    it('giữ property được gán trước khi element upgrade', async () => {
+      const suffix = Math.random().toString(36).slice(2);
+      const lateTag = `kb-late-card-${suffix}`;
+      const card = document.createElement(lateTag);
+
+      card.task = {
+        title: 'Gán trước upgrade',
+        assignee: '',
+        labels: ['lazy'],
+      };
+      card.completed = true;
+      document.body.append(card);
+
+      customElements.define(lateTag, class extends elementClass {});
+      await customElements.whenDefined(lateTag);
+      await settle(card);
+
+      expect(card.completed).to.equal(true);
+      expect(card.hasAttribute('completed')).to.equal(true);
+      expect(card.task.title).to.equal('Gán trước upgrade');
+      expect(card.shadowRoot.textContent).to.contain('Gán trước upgrade');
+    });
+  });
+}
+```
+
+Contract runner cần implementation **export class**. Cách sạch nhất là tách
+class-only module khỏi entry point đăng ký tên production. Nếu dùng decorator
+`@customElement` như Phần 11, chỉ import module đó một lần; test vẫn đăng ký một
+subclass mới dưới tag riêng để không redefine cùng constructor/tên:
+
+```js
+// test/native-task-card.test.js
+import { KbTaskCard } from '../src/native/kb-task-card.js';
+import { taskCardContract } from './task-card.contract.js';
+
+taskCardContract({
+  tagName: 'kb-task-card-native-test',
+  elementClass: KbTaskCard,
+});
+```
+
+Khi có bản Lit ở Phần 11, chỉ thêm adapter thứ hai:
+
+```js
+// test/lit-task-card.test.js
+import { KbTaskCard } from '../src/lit/kb-task-card.js';
+import { taskCardContract } from './task-card.contract.js';
+
+taskCardContract({
+  tagName: 'kb-task-card-lit-test',
+  elementClass: KbTaskCard,
+});
+```
+
+Nếu cả hai đều xanh, ta có bằng chứng implementation đổi nhưng contract không
+đổi. Một smoke test riêng vẫn nên import entry point và xác nhận
+`customElements.get('kb-task-card')` trả đúng constructor.
+
+## 4. Keyboard phải được test như người dùng thật
+
+`dispatchEvent(new KeyboardEvent(...))` tạo event không trusted và không luôn
+kích hoạt default action của button. Đừng dùng nó để “chứng minh” Enter/Space
+hoạt động. Playwright điều khiển browser input thật phù hợp hơn.
+
+Giả sử dev server của demo chạy tại `http://localhost:4173`, tạo
+`playwright.config.mjs`:
+
+```js
+import { defineConfig, devices } from '@playwright/test';
+
+export default defineConfig({
+  use: { baseURL: 'http://localhost:4173' },
+  webServer: {
+    command: 'npm run dev',
+    url: 'http://localhost:4173',
+    reuseExistingServer: true,
+  },
+  projects: [
+    { name: 'chromium', use: devices['Desktop Chrome'] },
+    { name: 'firefox', use: devices['Desktop Firefox'] },
+    { name: 'webkit', use: devices['Desktop Safari'] },
+  ],
+});
+```
+
+Test keyboard và focus:
+
+```js
+import { test, expect } from '@playwright/test';
+
+test('task card dùng được bằng keyboard', async ({ page }) => {
+  await page.goto('/demo/kanban.html');
+
+  const card = page.locator('kb-task-card[task-id="KB-101"]');
+  const toggle = card.getByRole('button', { name: 'Hoàn thành', exact: true });
+
+  await toggle.focus();
+  await expect(toggle).toBeFocused();
+
+  await page.keyboard.press('Enter');
+  await expect(card).toHaveAttribute('completed', '');
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+  await page.keyboard.press('Space');
+  await expect(card).not.toHaveAttribute('completed', '');
+
+  await page.evaluate(() => {
+    window.__lastTaskMove = null;
+    document.querySelector('kb-task-card[task-id="KB-101"]').addEventListener(
+      'kb-task-move',
+      (event) => {
+        window.__lastTaskMove = event.detail;
+      },
+      { once: true }
+    );
+  });
+  await page.keyboard.press('Alt+ArrowRight');
+  await expect
+    .poll(() => page.evaluate(() => window.__lastTaskMove))
+    .toEqual({ taskId: 'KB-101', toStatus: 'doing' });
+});
+```
+
+Playwright locator đi qua open shadow root; XPath thì không. Quan trọng hơn,
+test tìm button theo **role và accessible name**, không theo `.toggle-button`.
+Đổi internal class không phá test, nhưng làm mất semantics sẽ phá đúng chỗ.
+
+## 5. Form-associated element cũng cần contract riêng
+
+Với control `<kb-priority-picker>` từ Phần 8, đừng chỉ test
+property `value`. Hãy hỏi browser về `FormData`, reset và disabled state:
+
+```js
+it('tham gia form submission và reset như control gốc', async () => {
+  const form = document.createElement('form');
+  form.innerHTML = `
+    <kb-priority-picker name="priority" value="medium"></kb-priority-picker>
+  `;
+  document.body.append(form);
+
+  await customElements.whenDefined('kb-priority-picker');
+  const control = form.querySelector('kb-priority-picker');
+  await settle(control);
+
+  expect(new FormData(form).get('priority')).to.equal('medium');
+
+  control.value = 'high';
+  expect(new FormData(form).get('priority')).to.equal('high');
+
+  form.reset();
+  expect(control.value).to.equal('medium');
+});
+```
+
+Thêm các case `required`, invalid event, association qua attribute `form`, và
+`<fieldset disabled>` nếu control công khai các khả năng đó. Test public outcome;
+không đọc field `#internals` vốn là implementation detail.
+
+## 6. Debug bằng DevTools theo đúng ranh giới
+
+Khi test đỏ, hãy xác định đang nhìn cây nào:
+
+```js
+const card = document.querySelector('kb-task-card');
+const column = document.querySelector('kb-task-column');
+
+card.getRootNode();
+card.shadowRoot.getRootNode();
+column.shadowRoot.querySelector('slot')?.assignedElements();
+customElements.get('kb-task-card');
+await customElements.whenDefined('kb-task-card');
+```
+
+Một quy trình debug thực dụng:
+
+1. Trong Elements panel, mở `#shadow-root` và kiểm tra badge `slot`/`reveal` để
+   thấy node light DOM đang được phân phối vào đâu.
+2. Chọn host thành `$0`, chạy `$0.shadowRoot` và kiểm tra property công khai.
+3. Dùng Event Listener Breakpoints cho `click`, hoặc breakpoint trong
+   `connectedCallback()`/`disconnectedCallback()` khi nghi listener trùng.
+4. Bật DOM breakpoint “subtree modifications” nếu focus bị mất do code thay cả
+   shadow tree.
+5. Kiểm tra `event.bubbles`, `event.composed`, `event.composedPath()` và nơi
+   listener được gắn thay vì chỉ nhìn `event.target` đã bị retarget.
+6. Chạy riêng Firefox/WebKit trước khi kết luận lỗi thuộc component hay browser.
+
+## 7. Failure modes và decision rules
+
+### Snapshot toàn bộ shadow DOM
+
+Snapshot lớn khóa test vào whitespace và markup nội bộ. Chỉ snapshot fragment
+thật sự là contract; còn lại query bằng role, part, slot hoặc property công khai.
+
+### Mỗi test tự gọi `customElements.define()` cùng một tên
+
+Registry không cho định nghĩa lại. Export class, đăng ký test subclass với tên
+duy nhất, và giữ một smoke test cho entry point production.
+
+### Chỉ test Chrome headless
+
+Lifecycle cơ bản có thể giống nhau nhưng focus, form, accessibility và CSS
+thường bộc lộ khác biệt ở engine khác. Contract suite ngắn nên chạy đủ ba engine;
+journey đắt hơn có thể chia lịch CI hợp lý.
+
+### Dùng sleep cố định
+
+`setTimeout(500)` vừa chậm vừa flaky. Đợi tín hiệu có nghĩa: `whenDefined`,
+`updateComplete`, event, locator state hoặc một animation frame khi cần ổn định
+cả cây.
+
+### Test private DOM thay vì behavior
+
+Nếu consumer không được dựa vào selector `.header > div:nth-child(2)`, test
+cũng không nên. Quy tắc: thay implementation native bằng Lit mà contract suite
+phải không cần sửa.
+
+## 8. Bài tập và checklist
+
+1. Chạy `taskCardContract` với implementation native hiện tại.
+2. Cố tình bỏ cleanup listener rồi chạy case reconnect; quan sát event count.
+3. Đổi button thành `div role="button"` nhưng không thêm keyboard behavior; để
+   Playwright chỉ ra regression, rồi trả lại native button.
+4. Thêm test kiểm tra event có thể bị consumer `preventDefault()` nếu contract
+   của bạn cho phép hủy toggle.
+5. Với `<kb-priority-picker>`, thêm case `FormData`, `form.reset()` và fieldset
+   disabled.
+
+**Hoàn thành khi:** suite chạy trong Chromium, Firefox, WebKit; không dùng sleep
+cố định; reconnect không nhân listener; property trước upgrade được giữ; event
+bubble tới owner; keyboard và form được kiểm bằng hành vi thật.
+
+Ở **Phần 11**, ta viết lại `<kb-task-card>` bằng Lit 3. Markup nội bộ và render
+pipeline sẽ đổi mạnh, nhưng chính contract suite vừa tạo sẽ quyết định refactor
+có an toàn hay không.
+
+## Nguồn chính thức
+
+- [Lit — Testing](https://lit.dev/docs/tools/testing/)
+- [Web Test Runner — Documentation](https://modern-web.dev/docs/test-runner/overview/)
+- [Playwright — Writing tests](https://playwright.dev/docs/writing-tests)
+- [HTML Standard — Custom element upgrades](https://html.spec.whatwg.org/multipage/custom-elements.html#upgrades)
+- [DOM Standard — Event dispatch và composed path](https://dom.spec.whatwg.org/#dispatching-events)
+- [MDN — Using custom elements](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_custom_elements)
+- [MDN — Form-associated custom elements](https://developer.mozilla.org/en-US/docs/Web/API/ElementInternals)

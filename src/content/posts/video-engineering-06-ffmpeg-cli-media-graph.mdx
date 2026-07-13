@@ -1,0 +1,258 @@
+---
+title: 'Video Engineering · Phần 6 — FFmpeg CLI như một media graph'
+description: 'Hiểu scope và thứ tự option, chọn stream bằng -map, rồi phân biệt chính xác demux, decode, filter, encode, mux, remux và transcode trong một lệnh FFmpeg.'
+pubDate: 2026-07-12
+lang: vi
+tags:
+  [
+    video-engineering,
+    video,
+    ffmpeg,
+    media-pipeline,
+    stream-mapping,
+    transcoding,
+  ]
+series: video-engineering
+seriesOrder: 6
+draft: false
+---
+
+FFmpeg không chỉ là “một lệnh đổi đuôi video”. CLI của nó mô tả một **media graph**: mở một hay nhiều input, chọn stream, biến đổi chúng, rồi nối tới một hay nhiều output. Khi hiểu graph và scope của option, những lệnh dài không còn bí ẩn; mỗi đoạn đều trả lời “node nào nhận dữ liệu nào”.
+
+Bài này dùng một fixture có một video và hai audio track. Ta sẽ remux mà không decode, transcode có filter, chọn stream rõ ràng và đọc một lệnh nhiều output theo đúng thứ tự.
+
+---
+
+## 1. Tạo input nhiều stream
+
+```bash
+ffmpeg -hide_banner -y -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=10" -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=10" -f lavfi -i "sine=frequency=660:sample_rate=48000:duration=10" -map 0:v:0 -map 1:a:0 -map 2:a:0 -c:v libx264 -pix_fmt yuv420p -preset veryfast -g 60 -c:a aac -b:a 128k -metadata title="Multi-stream fixture" -metadata:s:a:0 language=vie -metadata:s:a:0 title="Vietnamese tone" -metadata:s:a:1 language=eng -metadata:s:a:1 title="English tone" -disposition:a:0 default -disposition:a:1 0 input.mkv
+```
+
+Xác nhận cấu trúc trước khi làm tiếp:
+
+```bash
+ffprobe -v error -show_entries "stream=index,codec_type,codec_name:stream_tags=language,title:stream_disposition=default" -of json input.mkv
+```
+
+Nếu output không có đúng ba stream, đừng tiếp tục. Một pipeline đáng tin phải kiểm tra giả định đầu vào thay vì hy vọng thứ tự stream luôn giống file mẫu.
+
+---
+
+## 2. Graph thật sự chạy qua những bước nào?
+
+Đường đầy đủ của một stream được biến đổi:
+
+```text
+input bytes
+   ↓
+demuxer → compressed packets
+   ↓
+decoder → raw video frames / audio samples
+   ↓
+filters → frames / samples mới
+   ↓
+encoder → compressed packets mới
+   ↓
+muxer → output container
+```
+
+**Demuxer** đọc container và tách packet theo stream. **Decoder** biến packet compressed thành frame hoặc sample thô. **Filter** làm việc trên dữ liệu đã decode. **Encoder** nén lại. **Muxer** đóng các packet đầu ra vào container.
+
+Với stream copy, graph rút ngắn:
+
+```text
+demuxer → compressed packets → muxer
+```
+
+`-c copy` không decode và không encode, nên nhanh và không làm giảm chất lượng. Nhưng cũng vì vậy, nó không thể resize, burn subtitle, đổi pixel format hay cắt chính xác tùy ý giữa một GOP.
+
+---
+
+## 3. Grammar và scope của option
+
+Cú pháp khái niệm của FFmpeg là:
+
+```text
+ffmpeg [global options] [input options] -i input [output options] output
+```
+
+Ba scope cần nhớ:
+
+- **Global option** áp dụng cho toàn tiến trình, ví dụ `-hide_banner`, `-loglevel warning`, `-y`.
+- **Input option** phải đứng trước `-i` mà nó áp dụng cho, ví dụ `-ss` để input seek, `-f lavfi`, `-thread_queue_size`.
+- **Output option** đứng sau các input và trước tên output tương ứng, ví dụ `-map`, `-c:v`, `-vf`, `-movflags`.
+
+Option thường chỉ áp dụng tới **file kế tiếp** trong scope của nó rồi được reset. Vì vậy hai lệnh nhìn gần giống có thể có ý nghĩa khác:
+
+```bash
+ffmpeg -ss 4 -i input.mkv -t 2 -c copy fast-seek.mkv
+ffmpeg -i input.mkv -ss 4 -t 2 -c:v libx264 -c:a aac accurate-seek.mp4
+```
+
+Lệnh đầu seek ở input, thường nhanh nhưng điểm bắt đầu stream-copy phụ thuộc điểm truy cập/keyframe và timestamp container. Lệnh sau seek ở output sau khi input được đọc; khi transcode, FFmpeg có thể decode rồi bỏ phần trước mốc yêu cầu để tiến gần biên chính xác hơn. Không nên rút gọn thành quy tắc “đặt sau luôn chính xác tuyệt đối”: timestamp, edit list, filter và audio priming vẫn ảnh hưởng kết quả.
+
+---
+
+## 4. `-map`: nối input stream tới output
+
+Không có `-map`, FFmpeg áp dụng automatic stream selection. Nó tiện cho thử nhanh nhưng nguy hiểm cho automation: “audio tốt nhất” theo heuristic không nhất thiết là ngôn ngữ hoặc track bạn muốn.
+
+Lệnh sau chọn video đầu tiên và audio tiếng Việt theo vị trí đã kiểm tra:
+
+```bash
+ffmpeg -hide_banner -y -i input.mkv -map 0:v:0 -map 0:a:0 -c copy selected.mkv
+```
+
+Cú pháp `0:v:0` nghĩa là input 0, loại video, stream video thứ 0. `0:a:1` là audio thứ hai của input 0. Index typed này khác index tuyệt đối in trong output ffprobe.
+
+Muốn giữ mọi stream rồi loại audio thứ hai:
+
+```bash
+ffmpeg -hide_banner -y -i input.mkv -map 0 -map -0:a:1 -c copy without-english.mkv
+```
+
+Negative mapping được xử lý sau mapping dương. Dấu `?` có thể làm một mapping trở thành optional, hữu ích khi input có thể thiếu audio:
+
+```bash
+ffmpeg -hide_banner -y -i input.mkv -map 0:v:0 -map "0:a:0?" -c copy optional-audio.mkv
+```
+
+Optional mapping không thay cho validation. Nếu sản phẩm bắt buộc có audio, hãy fail sớm thay vì âm thầm xuất video câm.
+
+---
+
+## 5. Stream specifier làm option chính xác hơn
+
+Nhiều option nhận hậu tố stream:
+
+- `-c:v:0 libx264`: codec cho video output thứ nhất;
+- `-b:a:0 128k`: bitrate cho audio output thứ nhất;
+- `-metadata:s:a:1 language=eng`: tag cho audio output thứ hai;
+- `-disposition:a:0 default`: đặt disposition cho audio đầu tiên.
+
+Điểm quan trọng là specifier trên output được đánh số **sau mapping**. Nếu bạn map audio input thứ hai thành audio output đầu tiên, nó vẫn nhận option `:a:0`.
+
+Ví dụ đổi thứ tự hai audio track nhưng giữ nguyên packet:
+
+```bash
+ffmpeg -hide_banner -y -i input.mkv -map 0:v:0 -map 0:a:1 -map 0:a:0 -c copy -disposition:a:0 default -disposition:a:1 0 reordered.mkv
+```
+
+Metadata thường được copy tự động theo stream đã map, nhưng hãy kiểm tra output bằng ffprobe. Container khác nhau hỗ trợ tag, attachment, chapter và disposition khác nhau.
+
+---
+
+## 6. Remux: đổi container, giữ packet
+
+Fixture dùng H.264 và AAC, nên có thể remux sang MP4:
+
+```bash
+ffmpeg -hide_banner -y -i input.mkv -map 0:v:0 -map 0:a -c copy -map_metadata 0 -movflags +faststart remuxed.mp4
+```
+
+Không có decoder hay encoder trong đường chính. `-map_metadata 0` yêu cầu copy global metadata từ input 0; `-movflags +faststart` di chuyển metadata MP4 cần cho progressive download lên đầu file.
+
+Remux có thể thất bại nếu container đích không hỗ trợ codec, subtitle, attachment hay kiểu timestamp của stream nguồn. `-c copy` không phải phép “ép mọi dữ liệu vào mọi đuôi”.
+
+Để trích riêng audio tiếng Anh vào M4A:
+
+```bash
+ffmpeg -hide_banner -y -i input.mkv -map 0:a:1 -c copy english.m4a
+```
+
+`-map` loại video khỏi graph; FFmpeg không cần decode những stream không được dùng.
+
+---
+
+## 7. Transcode: khi graph đi qua frame
+
+Resize yêu cầu decoder và filter, nên video phải encode lại:
+
+```bash
+ffmpeg -hide_banner -y -i input.mkv -map 0:v:0 -map 0:a:0 -vf "scale=854:480:flags=lanczos" -c:v libx264 -preset medium -crf 21 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart web-480p.mp4
+```
+
+Graph video là demux → decode → scale → encode → mux. Audio cũng được encode lại ở đây. Nếu codec/container cho phép và không cần filter audio, có thể dùng `-c:a copy` để tránh encode audio:
+
+```bash
+ffmpeg -hide_banner -y -i input.mkv -map 0:v:0 -map 0:a:0 -vf "scale=854:480:flags=lanczos" -c:v libx264 -preset medium -crf 21 -pix_fmt yuv420p -c:a copy mixed-path.mp4
+```
+
+Một output có thể đồng thời transcode video và copy audio. Stream copy/transcode là quyết định theo từng stream, không phải thuộc tính của cả lệnh.
+
+`-vf` cùng `-c:v copy` là mâu thuẫn: filter cần frame đã decode, trong khi copy muốn giữ packet nguyên. FFmpeg sẽ báo lỗi thay vì bí mật encode lại.
+
+---
+
+## 8. Một lệnh, nhiều output
+
+Option output phải được đọc theo từng cụm:
+
+```bash
+ffmpeg -hide_banner -y -i input.mkv -map 0 -c copy archive.mkv -map 0:v:0 -map 0:a:0 -vf "scale=-2:720:flags=lanczos" -c:v libx264 -preset medium -crf 21 -c:a aac -b:a 128k -movflags +faststart web-720p.mp4
+```
+
+`-map 0 -c copy` thuộc `archive.mkv`. Sau tên output đó, cụm `-map ... -vf ... -c:v ...` mô tả `web-720p.mp4`. Đừng đọc lệnh như một túi option toàn cục.
+
+Với graph phức tạp hơn, `-filter_complex` tạo output có nhãn như `[vout]`; sau đó `-map "[vout]"` nối pad đã filter tới output. Bài kế tiếp sẽ dùng cách này để xây renderer.
+
+---
+
+## 9. Kiểm chứng thay vì đoán
+
+Sau mỗi lệnh, probe output:
+
+```bash
+ffprobe -v error -show_format -show_streams -of json web-480p.mp4
+```
+
+Để kiểm tra decoder đọc được toàn bộ mà không lưu media mới:
+
+```bash
+ffmpeg -hide_banner -v warning -i web-480p.mp4 -map 0:v:0 -map 0:a:0 -f null -
+```
+
+`null` muxer bỏ output nhưng graph vẫn đọc và xử lý stream. Exit code khác 0 phải được coi là failure trong automation; đừng chỉ tìm chữ “error” trong log.
+
+---
+
+## Failure checklist
+
+- [ ] Đặt input option sau `-i` hoặc output option sau tên output.
+- [ ] Dựa vào automatic stream selection trong job production.
+- [ ] Nhầm `0:a:1` với absolute stream index 1.
+- [ ] Nghĩ `-c copy` có thể chạy cùng video/audio filter.
+- [ ] Gọi remux là transcode hoặc ngược lại khi ước lượng thời gian/chất lượng.
+- [ ] Đổi container mà không kiểm tra codec/subtitle có được hỗ trợ.
+- [ ] Quên rằng stream specifier output được đánh số sau `-map`.
+- [ ] Dùng optional mapping cho track bắt buộc.
+- [ ] Đọc option của lệnh nhiều output như thể mọi option là global.
+- [ ] Không probe output và không kiểm tra exit code.
+
+---
+
+## Bài tập
+
+**1.** Từ `input.mkv`, tạo MP4 chỉ có video và audio tiếng Anh. Giữ packet nguyên, đặt audio đó thành default và kiểm tra lại language/disposition bằng ffprobe.
+
+**2.** Tạo hai output trong một lệnh: một Matroska remux đủ stream và một MP4 640×360 chỉ có audio tiếng Việt. Viết lại graph bằng lời trước khi chạy.
+
+**3.** Thử ghép `-vf "hflip"` với `-c:v copy`. Đọc lỗi và giải thích node nào trong graph khiến hai option không thể cùng tồn tại.
+
+**Nâng cao:** thêm input logo PNG, dùng `-filter_complex` để overlay và map pad đã filter. Chưa cần tối ưu; mục tiêu là nhận diện input, pad, mapping và output scope.
+
+---
+
+## Đọc thêm
+
+- [Tài liệu ffmpeg CLI chính thức](https://ffmpeg.org/ffmpeg.html)
+- [Mô tả chi tiết transcoding pipeline](https://ffmpeg.org/ffmpeg.html#Detailed-description)
+- [Stream selection và `-map`](https://ffmpeg.org/ffmpeg.html#Stream-selection)
+- [Tài liệu container, demuxer và muxer](https://ffmpeg.org/ffmpeg-formats.html)
+
+---
+
+## Bài kế tiếp
+
+[Phần 7 — Filtergraph và video rendering với FFmpeg](/blog/video-engineering-07-filtergraph-rendering/)

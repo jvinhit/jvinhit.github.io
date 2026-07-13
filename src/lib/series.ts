@@ -33,6 +33,83 @@ export interface SeriesMeta {
 }
 
 export const SERIES: Record<string, SeriesMeta> = {
+  'web-components': {
+    title: 'Web Components từ nền tảng đến production',
+    description:
+      'Series 15 phần về Custom Elements, Shadow DOM, slots, accessibility, form controls, Lit, testing, SSR và đóng gói component library.',
+    blurb:
+      'Lộ trình tiếng Việt 15 phần đi từ mental model của browser platform tới một component library có thể dùng trong HTML thuần, React và Vue. Chặng đầu làm rõ Custom Elements, lifecycle, upgrade, public API, render và state bằng JavaScript không framework. Chặng tiếp theo đào sâu Shadow DOM, composed tree, slots, CSS encapsulation, theming, events, focus, accessibility và form-associated custom elements với ElementInternals. Sau checkpoint vanilla, series chuyển sang testing trên browser thật và Lit: reactive properties, template bindings, directives, update lifecycle, controllers và kiến trúc state. Hai phần cuối xử lý performance, security, Declarative Shadow DOM, SSR, packaging, type, versioning và interoperability. Một Mini Kanban accessible nối các quyết định kỹ thuật xuyên suốt series.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Nền tảng Custom Elements',
+        description:
+          'Hiểu component model gốc của browser, lifecycle, upgrade, public contract và cách render state không cần framework.',
+        from: 1,
+        to: 4,
+      },
+      {
+        title: 'Encapsulation và component tương tác',
+        description:
+          'Làm chủ Shadow DOM, slots, theming, event boundary, focus, accessibility, HTML form và một capstone vanilla.',
+        from: 5,
+        to: 9,
+      },
+      {
+        title: 'Testing và Lit',
+        description:
+          'Khóa public contract bằng browser test rồi thay boilerplate bằng Lit mà không thay đổi component model.',
+        from: 10,
+        to: 13,
+      },
+      {
+        title: 'Production và phát hành',
+        description:
+          'Đánh giá hiệu năng, security, SSR/DSD, đóng gói, versioning và interop qua capstone component library.',
+        from: 14,
+        to: 15,
+      },
+    ],
+    pin: 7,
+  },
+  'video-engineering': {
+    title: 'Video Engineering cho Web Developer — từ byte đến pixel',
+    description:
+      'Series 16 phần về FFmpeg, codec, encoder/decoder, video renderer, metadata, HLS, MPEG-TS, MSE, WebCodecs và debugging media trên web.',
+    blurb:
+      'Series tiếng Việt 16 phần đi từ mental model container–codec–stream–packet–frame tới pipeline demux, decode, render, encode và mux. Bốn chặng lần lượt đào sâu timestamp, GOP, color/audio metadata; biến ffprobe và FFmpeg thành workflow inspect–render–cut–concat có kiểm chứng; giải thích progressive MP4, HTTP Range, HLS/ABR, MPEG-TS, MSE và WebCodecs; rồi kết bằng Chrome DevTools, playbook xử lý stall/decode/CORS, ad marker cùng playlist rewrite trên stream được phép kiểm soát, và một capstone Stream Lab end-to-end. Các lab thực hành dùng fixture tự tạo, phân biệt rõ stream copy với re-encode và ưu tiên bằng chứng thay vì đoán.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Media từ byte đến frame',
+        description:
+          'Xây mental model về container, codec, stream, encoder, decoder, renderer, timestamp, GOP và metadata.',
+        from: 1,
+        to: 4,
+      },
+      {
+        title: 'FFmpeg và ffprobe thực chiến',
+        description:
+          'Inspect, map stream, dựng filtergraph, render, cắt và nối media mà không tự làm hỏng timeline.',
+        from: 5,
+        to: 8,
+      },
+      {
+        title: 'Video trong browser và adaptive streaming',
+        description:
+          'Theo dữ liệu qua HTML video, HTTP Range, HLS, MPEG-TS, MSE và WebCodecs.',
+        from: 9,
+        to: 12,
+      },
+      {
+        title: 'Debugging, ad markers và capstone',
+        description:
+          'Điều tra media bằng Chrome DevTools, sửa lỗi theo tầng và rewrite playlist an toàn trên fixture được phép kiểm thử.',
+        from: 13,
+        to: 16,
+      },
+    ],
+  },
   'tanstack-query': {
     title: 'TanStack Query (React Query) — từ Zero đến Production',
     blurb:
@@ -83,9 +160,9 @@ export const SERIES: Record<string, SeriesMeta> = {
   ai: {
     title: 'AI for Developers — LLMs, Agents & Coding',
     description:
-      'Lộ trình AI cho developer gồm 42 bài: nền tảng LLM, RAG và eval, kiến trúc agent, coding workflow, Cursor, MCP và multi-agent.',
+      'Lộ trình AI cho developer gồm 43 bài: nền tảng LLM, RAG và eval, kiến trúc agent, coding workflow, Cursor, MCP và multi-agent.',
     blurb:
-      'Lộ trình 42 bài dành cho developer muốn hiểu AI từ gốc và dùng được trong công việc thật. Bắt đầu từ lịch sử AI, token, sampling, prompting và embeddings; tiếp tục với cách chọn model, RAG, fine-tuning, eval, safety và tối ưu chi phí; sau đó tự thiết kế agent với context, memory, tool use, patterns, orchestration và MCP; cuối cùng áp dụng vào coding hằng ngày — đọc codebase, build feature, debug, review, viết rules/skills, dùng sub-agent và bàn giao context. Nội dung ưu tiên mental model, trade-off, workflow có thể lặp lại và kiểm chứng, không chạy theo hype hay một model cụ thể.',
+      'Lộ trình 43 bài dành cho developer muốn hiểu AI từ gốc và dùng được trong công việc thật. Bắt đầu từ lịch sử AI, token, sampling, prompting và embeddings; tiếp tục với cách chọn model, RAG, fine-tuning, eval, safety và tối ưu chi phí; sau đó tự thiết kế agent với context, memory, tool use, patterns, orchestration và MCP; cuối cùng áp dụng vào coding hằng ngày — đọc codebase, build feature, debug, review, viết rules/skills, dùng sub-agent và bàn giao context. Nội dung ưu tiên mental model, trade-off, workflow có thể lặp lại và kiểm chứng, không chạy theo hype hay một model cụ thể.',
     lang: 'vi',
     sections: [
       {
@@ -107,28 +184,28 @@ export const SERIES: Record<string, SeriesMeta> = {
         description:
           'Từ context và tool calling đến agent loop, planning, orchestration và giao thức MCP.',
         from: 21,
-        to: 26,
+        to: 27,
       },
       {
         title: 'Workflow coding với AI',
         description:
           'Dùng coding agent để onboard codebase, ship feature, debug, review và test mà vẫn giữ quyền kiểm soát.',
-        from: 27,
-        to: 34,
+        from: 28,
+        to: 35,
       },
       {
         title: 'Tùy biến agent & capstone',
         description:
           'Đóng gói cách làm việc bằng config, rules, skills, sub-agent và handoff; sau đó ghép thành một workflow end-to-end.',
-        from: 35,
-        to: 41,
+        from: 36,
+        to: 42,
       },
       {
         title: 'Sự nghiệp trong kỷ nguyên AI',
         description:
           'Chuyển từ tối ưu tốc độ gõ code sang tối ưu khả năng phán đoán, thiết kế hệ thống và xác minh output.',
-        from: 42,
-        to: 42,
+        from: 43,
+        to: 43,
       },
     ],
     pin: 1,
@@ -151,31 +228,38 @@ export const SERIES: Record<string, SeriesMeta> = {
   typescript: {
     title: 'TypeScript Production Engineering — từ Senior đến Staff',
     description:
-      'Lộ trình TypeScript 12 phần về type system, strict config, API design, runtime boundary, ESM, package authoring, kiến trúc, monorepo, hiệu năng và migration.',
+      'Lộ trình TypeScript 20 phần từ nền tảng soundness tới conditional types, infer, mapped types, recursive types, type-level DSL, runtime contract và kiến trúc codebase lớn.',
     blurb:
-      'Core series tiếng Việt 12 phần dành cho developer đã biết cú pháp TypeScript nhưng muốn dùng type system như một công cụ thiết kế hệ thống. Lộ trình đi từ structural typing, soundness, variance và control-flow analysis tới strict tsconfig theo TypeScript 6, generic API dễ suy luận, runtime validation và domain modeling. Nửa sau tập trung vào async/error contract, ESM và module resolution, viết và kiểm thử declaration cho package, kiến trúc theo boundary, project references và hiệu năng compiler, chiến lược test/migration ở codebase lớn, rồi kết bằng capstone xây một typed SDK production. Hai series Type Challenges và Design Patterns là phòng lab bổ trợ, không phải điều kiện tiên quyết. Mỗi bài có failure mode, decision rule, code TypeScript chạy được, bài tập và tiêu chí tự review.',
+      'Core series tiếng Việt 20 phần dành cho developer đã biết cú pháp TypeScript nhưng muốn dùng compiler như một công cụ thiết kế hệ thống. Bốn phần đầu dựng mental model về soundness, strict config, control-flow analysis và inference. Tám phần chuyên sâu tiếp theo đi thẳng vào conditional types, distributivity, infer và candidate resolution, mapped types với key remapping, variadic tuples, template-literal DSL, recursive types có giới hạn, union algebra và kỹ thuật điều khiển inference cho library API. Nửa sau đưa các công cụ đó qua runtime boundary, async contract, ESM, declaration và Type SemVer, kiến trúc, monorepo, compiler performance, migration/governance, rồi kết bằng capstone typed SDK production. Mỗi bài ưu tiên use case thật, failure mode, type test, performance budget và decision rule — không biến type-level programming thành trò giải đố.',
     lang: 'vi',
     sections: [
       {
-        title: 'Hiểu và điều khiển type system',
+        title: 'Nền tảng để đọc compiler',
         description:
-          'Nắm giới hạn soundness, narrowing và inference để đọc được điều compiler đang chứng minh — và điều nó không thể chứng minh.',
+          'Nắm giới hạn soundness, strictness, narrowing và generic inference trước khi viết type-level code.',
         from: 1,
         to: 4,
       },
       {
-        title: 'Thiết kế contract production',
+        title: 'Type-level engineering chuyên sâu',
         description:
-          'Đưa dữ liệu runtime, lỗi, bất đồng bộ và module boundary vào các contract có thể kiểm tra.',
+          'Dùng conditional types, infer, mapped types, tuple, template literal, recursion và union algebra để xây API có kiểm soát.',
         from: 5,
-        to: 8,
+        to: 12,
+      },
+      {
+        title: 'Contract chạy được ở production',
+        description:
+          'Nối compile-time model với dữ liệu runtime, lỗi, bất đồng bộ, module và public package.',
+        from: 13,
+        to: 16,
       },
       {
         title: 'Scale codebase và tổ chức',
         description:
-          'Thiết kế boundary, package, build graph, type performance, migration và quality gate cho hệ thống lớn.',
-        from: 9,
-        to: 12,
+          'Thiết kế boundary, build graph, type performance, migration, governance và release gate ở cấp Staff.',
+        from: 17,
+        to: 20,
       },
     ],
     pin: 6,
@@ -271,9 +355,49 @@ export const SERIES: Record<string, SeriesMeta> = {
       'The hands-on sequel to the Tailwind/Radix/shadcn series: build one real app — "Pulse", a small CRM/SaaS dashboard — end-to-end with the modern React production stack. Start by scaffolding with pnpm, Vite and TypeScript strict, plus oxlint + oxfmt for fast linting and formatting, then lay the Tailwind v4 + shadcn/ui foundation and an app shell. Wire routing and architecture with React Router v7 (data mode), then master server state with TanStack Query — typed query keys, caching, mutations and optimistic updates with rollback. Build validated forms with react-hook-form + zod, manage genuine client state with Zustand, and ship a real feature: a data table with filters and URL-as-state. Add an auth + API layer, then tune performance (code splitting, prefetching, bundle analysis) and lock in quality with Vitest, React Testing Library and MSW. Finish with a capstone that assembles a full feature flow and a pnpm + oxlint GitHub Actions CI pipeline.',
   },
   threejs: {
-    title: 'Three.js from Zero to Senior',
+    title: 'Three.js Production Engineering — từ Zero đến Staff',
+    description:
+      'Lộ trình Three.js 25 phần từ scene đầu tiên tới GPU profiling, asset CI, runtime architecture, resilience, WebGPU và TSL.',
     blurb:
-      'Go from "gà mờ" to senior on Three.js: the WebGL mental model and your first scene, geometries and materials, the scene graph and cameras, lights and shadows, PBR textures and environment maps, loading glTF models and the animation system, post-processing with the EffectComposer, performance and instancing, raycasting and interaction, and a production capstone covering loading, responsiveness, framework integration, and deployment. Every part ships a live, interactive 3D demo.',
+      'Lộ trình tiếng Việt 25 phần đưa bạn từ scene đầu tiên tới năng lực thiết kế và vận hành một nền tảng 3D production. Ba chặng đầu xây mental model WebGL/Three.js, scene graph, camera, ánh sáng, PBR, glTF, animation, post-processing, interaction, physics và pipeline Blender–glTF–compression qua các demo thực hành. Chặng chuyên sâu đi xuống coordinate space, precision, depth, transparency và render target; sau đó đi lên cấp hệ thống với frame phases, fixed timestep, resource ownership, CPU/GPU profiling, adaptive quality, asset contract + CI, testing, observability, accessibility, context-loss recovery và chiến lược migrate WebGPU/TSL. Nội dung ưu tiên budget đo được, failure mode, decision rule và trade-off kiến trúc thay vì khẩu quyết tối ưu.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Nền tảng realtime rendering',
+        description:
+          'Từ WebGL mental model tới geometry, scene graph, camera, ánh sáng, texture và PBR đúng color pipeline.',
+        from: 1,
+        to: 5,
+      },
+      {
+        title: 'Dựng trải nghiệm 3D tương tác',
+        description:
+          'Nạp model, animation, post-processing, instancing, raycasting, kiến trúc scene và physics qua các lab chạy thật.',
+        from: 6,
+        to: 12,
+      },
+      {
+        title: 'Asset, character và workflow thực tế',
+        description:
+          'Từ configurator, Blender và công cụ DCC tới compression, rigging, state machine và tương tác nhân vật.',
+        from: 13,
+        to: 18,
+      },
+      {
+        title: 'Graphics engineering',
+        description:
+          'Làm chủ toán không gian, precision, depth buffer, transparency và render target để debug bằng mô hình thay vì đoán.',
+        from: 19,
+        to: 20,
+      },
+      {
+        title: 'Production architecture từ Senior đến Staff',
+        description:
+          'Thiết kế runtime, budget CPU/GPU, asset CI, quality engineering, resilience và lộ trình WebGPU/TSL có kiểm soát.',
+        from: 21,
+        to: 25,
+      },
+    ],
   },
   svg: {
     title: 'SVG from Zero to Senior',
@@ -287,8 +411,34 @@ export const SERIES: Record<string, SeriesMeta> = {
   },
   mindset: {
     title: 'Effort, Focus & Grit',
+    description:
+      'Series 10 phần về nỗ lực có chủ đích, tập trung, tính đều đặn, kỷ luật, khả năng phục hồi, năng lượng và hệ thống thực hành bền vững.',
     blurb:
-      'A practical mindset series on effort, focus, consistency, discipline, resilience, and positivity — small daily practices that compound over time.',
+      'Series tiếng Việt 10 phần giúp biến ý chí thành một cách luyện tập bền vững: hiểu vai trò và giới hạn của nỗ lực, bảo vệ sự tập trung, xây tính đều đặn và kỷ luật linh hoạt, học cách hồi phục và đổi khung sau trở ngại, biết khi nào nên kiên nhẫn hoặc điều chỉnh, quản lý năng lượng, rồi nối mục tiêu với vòng phản hồi và một thực hành hằng ngày đủ nhỏ để duy trì. Trọng tâm không phải “cố hơn bằng mọi giá”, mà là luyện có chủ đích, nhận phản hồi, nghỉ đúng lúc và sửa hệ thống theo thực tế.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Nền tảng cho tiến bộ bền vững',
+        description:
+          'Hiểu nỗ lực có chủ đích, tập trung, tính đều đặn và kỷ luật như những kỹ năng có thể thiết kế.',
+        from: 1,
+        to: 4,
+      },
+      {
+        title: 'Phục hồi, điều chỉnh và chơi đường dài',
+        description:
+          'Xử lý trở ngại, đổi khung nhìn, xem lại chỗ chững và quản lý năng lượng mà không đồng nhất bền bỉ với cố chấp.',
+        from: 5,
+        to: 8,
+      },
+      {
+        title: 'Biến ý định thành hệ thống',
+        description:
+          'Nối mục tiêu với vòng phản hồi và gom các nguyên tắc thành một thực hành hằng ngày linh hoạt.',
+        from: 9,
+        to: 10,
+      },
+    ],
   },
 };
 
@@ -365,7 +515,7 @@ export interface SeriesSummary {
   meta: SeriesMeta;
   parts: Post[];
   count: number;
-  /** Most recent part's pubDate — used to order series in listings. */
+  /** Most recent publication/update activity — used to order series in listings. */
   latest: Date;
   /** Earliest part's pubDate — when the series started. */
   started: Date;
@@ -377,14 +527,17 @@ export function listSeries(posts: Post[]): SeriesSummary[] {
     .map(([id, meta]) => {
       const parts = seriesParts(posts, id);
       if (parts.length === 0) return null;
-      const dates = parts.map((p) => p.data.pubDate.getTime());
+      const activityDates = parts.map((p) =>
+        (p.data.updatedDate ?? p.data.pubDate).getTime()
+      );
+      const publicationDates = parts.map((p) => p.data.pubDate.getTime());
       return {
         id,
         meta,
         parts,
         count: parts.length,
-        latest: new Date(Math.max(...dates)),
-        started: new Date(Math.min(...dates)),
+        latest: new Date(Math.max(...activityDates)),
+        started: new Date(Math.min(...publicationDates)),
       } satisfies SeriesSummary;
     })
     .filter((s): s is SeriesSummary => s !== null)

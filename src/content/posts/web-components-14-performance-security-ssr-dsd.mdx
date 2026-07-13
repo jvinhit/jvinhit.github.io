@@ -1,0 +1,627 @@
+---
+title: 'Web Components · Phần 14 — Performance, security, SSR và Declarative Shadow DOM'
+description: 'Đưa Mini Kanban tới production: đo performance, giữ DOM ổn định, đặt ranh giới bảo mật và progressive-enhance SSR bằng Declarative Shadow DOM.'
+pubDate: 2026-07-12
+lang: vi
+tags: [web-components, lit, performance, security, ssr, declarative-shadow-dom]
+series: web-components
+seriesOrder: 14
+draft: false
+---
+
+Accessible Mini Kanban đã có contract test, component Lit và data flow rõ. Nhưng
+“render đúng trên máy dev” chưa phải production-ready. Một board lớn có thể mất
+focus vì DOM bị tạo lại; một chuỗi HTML từ API có thể thành XSS; SSR có thể gửi
+markup nhanh nhưng client lại xóa toàn bộ khi upgrade.
+
+Phần này không đưa ra một lá bùa “bật SSR là nhanh”. Ta dùng ba nguyên tắc:
+**đo trước khi tối ưu**, **coi mọi HTML sink là security boundary**, và **tách
+static server rendering khỏi hydration**. Sau đó ta đặt các API mới vào một
+watchlist thay vì giả định mọi browser mục tiêu đã hỗ trợ.
+
+---
+
+## 1. Mental model production: chi phí và trust đi qua boundary
+
+Một Web Component có ít nhất bốn boundary:
+
+```text
+server HTML ──parse──► shadow/light DOM ──upgrade──► reactive component
+     │                       │                            │
+ trust/data             DOM identity                update cost
+     └──────────────── security contract ────────────────┘
+```
+
+SSR có thể đưa HTML hữu ích tới sớm nhưng thêm chi phí serialize, parse và
+hydrate. Shadow DOM giới hạn selector/style, không giới hạn quyền của script
+cùng origin. Lit giữ DOM expression ổn định nhưng key sai vẫn phá identity.
+
+Vì vậy mỗi tối ưu phải trả lời được:
+
+1. Metric nào đang xấu: thời gian upgrade, interaction, layout, memory hay
+   network?
+2. Work nằm ở server, parser, component update hay browser layout/paint?
+3. Input do developer hay user/CMS/API kiểm soát?
+4. Browser support và fallback là gì?
+
+## 2. Đo trước: từ user action tới frame kế tiếp
+
+DevTools Performance panel cho ta flame chart của scripting, style, layout và
+paint. Performance API thêm mark có tên domain để tìm đúng thao tác Kanban.
+Helper dưới đây dùng trong development hoặc performance test:
+
+```ts
+// profile-board-update.ts
+import type { KbTaskBoard } from './kb-task-board.js';
+
+export async function profileBoardUpdate(
+  board: KbTaskBoard,
+  action: () => void
+) {
+  const id = crypto.randomUUID();
+  const start = `kb-board:${id}:start`;
+  const frame = `kb-board:${id}:next-frame`;
+  const measureName = `kb-board:${id}:action-to-next-frame`;
+
+  performance.mark(start);
+  try {
+    action();
+    await board.updateComplete;
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve())
+    );
+    performance.mark(frame);
+    return performance.measure(measureName, start, frame).duration;
+  } finally {
+    performance.clearMarks(start);
+    performance.clearMarks(frame);
+    performance.clearMeasures(measureName);
+  }
+}
+```
+
+Ví dụ một browser test gọi action thật rồi lưu baseline:
+
+```ts
+const duration = await profileBoardUpdate(board, () => {
+  const moveRight = [
+    ...(card.shadowRoot?.querySelectorAll('button') ?? []),
+  ].find((button) => button.textContent?.trim() === 'Sang phải');
+  if (!moveRight) throw new Error('Không tìm thấy nút “Sang phải”');
+  moveRight.click();
+});
+
+console.log({ duration });
+```
+
+Tên metric cố tình là “tới frame kế tiếp”, không phải “đã paint hoàn tất”.
+`requestAnimationFrame` chạy trước paint. Dùng trace/RUM cho metric người dùng
+thật; lặp browser test và xem percentile thay vì một lần chạy trên laptop.
+
+Đo ít nhất ba kịch bản riêng:
+
+- cold load/custom element upgrade;
+- move/toggle task trên board cỡ thực tế;
+- focus và memory sau nhiều lần reconnect.
+
+Đừng tối ưu 5.000 card nếu sản phẩm chỉ hiển thị 30.
+
+## 3. Giữ DOM identity trước khi vi-tối-ưu
+
+Chi phí thường thấy không nằm ở tagged template, mà ở việc component làm mất
+identity của node. Một input đang focus, selection, animation hoặc state của
+custom element con đều gắn với node cụ thể.
+
+Với danh sách có reorder, dùng `repeat()` và key domain ổn định:
+
+```ts
+import { html, LitElement } from 'lit';
+import { property } from 'lit/decorators.js';
+import { repeat } from 'lit/directives/repeat.js';
+import type { TaskRecord, TaskStatus } from './board-model-controller.js';
+
+const TASK_STATUSES: readonly TaskStatus[] = ['todo', 'doing', 'done'];
+const STATUS_LABELS: Record<TaskStatus, string> = {
+  todo: 'Cần làm',
+  doing: 'Đang làm',
+  done: 'Hoàn thành',
+};
+
+class KbTaskBoard extends LitElement {
+  @property({ attribute: false })
+  tasks: readonly TaskRecord[] = [];
+
+  render() {
+    return html`
+      <section aria-label="Mini Kanban">
+        ${TASK_STATUSES.map(
+          (status) => html`
+            <kb-task-column status=${status}>
+              <span slot="heading">${STATUS_LABELS[status]}</span>
+              ${repeat(
+                this.tasks.filter((task) => task.status === status),
+                (task) => task.id,
+                (task) => html`
+                  <kb-task-card
+                    task-id=${task.id}
+                    priority=${task.priority}
+                    status=${task.status}
+                    ?completed=${task.completed}
+                    .task=${task}
+                  ></kb-task-card>
+                `
+              )}
+            </kb-task-column>
+          `
+        )}
+      </section>
+    `;
+  }
+}
+```
+
+`task.id` phải unique và không đổi trong suốt vòng đời task. Index mảng không
+phải identity: sau reorder, key `0` vẫn ở hàng đầu nhưng đại diện một task khác,
+khiến focus/local state bám sai item. Với list nhỏ chỉ append hoặc không reorder,
+`map()` thường đã đủ; thêm directive chỉ khi behavior/measurement cần nó.
+
+Mỗi lần gọi `repeat()` là một key space riêng. Ví dụ có một directive cho từng
+column, nên key giữ identity khi reorder trong cột nhưng **không** chuyển cùng
+node qua directive của cột khác. Move cross-column cần chiến lược focus/state
+như Phần 13: hoist state có giá trị lên owner và khôi phục focus trên card mới.
+Nếu node identity xuyên cột là hard requirement, thiết kế một rendering owner
+keyed duy nhất rồi đo trade-off layout/composition.
+
+Ưu tiên các quyết định lớn:
+
+- derive/filter ở owner khi input đổi, không tính nặng trong từng binding;
+- truyền object/array qua property, không JSON stringify vào attribute;
+- reflect chỉ primitive cần cho HTML/CSS contract, vì reflection tạo thêm
+  attribute work và nguy cơ vòng đồng bộ;
+- tránh đọc layout xen kẽ ghi style trong loop;
+- không thay toàn bộ `innerHTML` để cập nhật một label — Lit đã cập nhật đúng
+  binding thay đổi.
+
+## 4. Lazy registration, nhưng HTML vẫn phải có giá trị
+
+Custom element chưa được define vẫn là element trong DOM. Ta có thể trì hoãn
+module của board dưới fold mà không trì hoãn HTML fallback:
+
+```js
+const board = document.querySelector('kb-task-board');
+
+if (board) {
+  const loadBoard = async () => {
+    try {
+      await import('./kb-task-board.js');
+    } catch (error) {
+      board.dataset.upgrade = 'failed';
+      const status = board.querySelector('[data-upgrade-status]');
+      if (status) {
+        status.textContent =
+          'Không tải được bảng tương tác. Nội dung tĩnh vẫn dùng được.';
+      }
+      console.error('Không tải được kb-task-board', error);
+    }
+  };
+
+  if (!('IntersectionObserver' in window)) {
+    loadBoard();
+  } else {
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        observer.disconnect();
+        loadBoard();
+      },
+      { rootMargin: '400px' }
+    );
+
+    observer.observe(board);
+  }
+}
+```
+
+Preload component cần cho interaction đầu; lazy-load editor/dialog dưới fold.
+Luôn xử lý lỗi import và giữ semantic fallback nếu JavaScript không tới.
+
+## 5. Security: Shadow DOM không phải sandbox
+
+`mode: 'closed'` chỉ làm `host.shadowRoot` trả về `null`; nó không cô lập script,
+network, storage hay quyền origin. Shadow DOM encapsulate cây/style, **không
+phải security boundary**.
+
+Lit mặc định đặt child expression như text, nên chuỗi này không được parse thành
+markup:
+
+```ts
+render() {
+  return html`<p>${this.commentFromApi}</p>`;
+}
+```
+
+Chuỗi không biến thành element, nhưng URL, CSS, third-party property và backend
+command vẫn cần validation theo ngữ nghĩa.
+
+Bốn escape hatch phải được coi là trusted-code-only:
+
+```ts
+import { unsafeHTML } from 'lit/directives/unsafe-html.js';
+import { unsafeSVG } from 'lit/directives/unsafe-svg.js';
+import { html as staticHtml, unsafeStatic } from 'lit/static-html.js';
+import { unsafeCSS } from 'lit';
+
+const developerOwnedTag = unsafeStatic('section');
+const developerOwnedTemplate = staticHtml`
+  <${developerOwnedTag}>Nội dung tĩnh do developer kiểm soát</${developerOwnedTag}>
+`;
+```
+
+Không truyền comment, tag từ URL, tenant CSS hoặc HTML CMS chưa sanitize vào các
+API này. Trusted Types giúp audit sink, nhưng policy tạo `TrustedHTML` vẫn phải
+sanitize bằng allow list phù hợp.
+`unsafeStatic()` chỉ dùng cùng tag `staticHtml` từ `lit/static-html.js`; ghép nó
+với `html` thường từ `lit` không phải API hợp lệ.
+
+Tương tự, `Element/ShadowRoot.setHTMLUnsafe()` có thể nhận sanitizer ở các
+browser mới nhưng **không sanitize mặc định**. Hậu tố `Unsafe` là cảnh báo thật.
+API `setHTML()` có sanitization mặc định đang xuất hiện nhưng còn limited; feature
+detection và browser matrix vẫn bắt buộc.
+
+## 6. Declarative Shadow DOM: shadow tree do parser tạo
+
+SSR truyền thống không thể biểu diễn shadow root bằng `innerHTML` thông thường.
+Declarative Shadow DOM (DSD) cho HTML parser một cú pháp chuẩn. Server có thể gửi
+task card đã render:
+
+```html
+<kb-task-card task-id="KB-101" priority="high" status="doing" role="article">
+  <template shadowrootmode="open" shadowrootserializable>
+    <style>
+      :host {
+        display: block;
+      }
+      .surface {
+        border: 1px solid #c7c9cc;
+        padding: 1rem;
+      }
+    </style>
+
+    <div
+      class="surface"
+      part="surface"
+      data-priority="high"
+      data-status="doing"
+    >
+      <h3 id="task-KB-101-title">Đo performance</h3>
+      <p>Ưu tiên: high</p>
+      <p>
+        Người thực hiện:
+        <slot name="assignee">Chưa giao</slot>
+      </p>
+      <button
+        type="button"
+        aria-pressed="false"
+        aria-describedby="task-KB-101-upgrade"
+        disabled
+      >
+        Hoàn thành
+      </button>
+      <p id="task-KB-101-upgrade" data-upgrade-status>
+        Chế độ chỉ đọc; tương tác sẽ khả dụng sau khi component được kích hoạt.
+      </p>
+    </div>
+  </template>
+
+  <span slot="assignee">An</span>
+</kb-task-card>
+```
+
+Parser tạo `ShadowRoot` trên parent, chuyển template content vào và render trước
+khi JavaScript tải. Host đã có article semantics; button bị disable cùng thông
+báo read-only thay vì trở thành control “chết”. Upgrade mới bật button và gắn
+listener.
+Object `task` không có representation attribute: server đã dùng nó để tạo nội
+dung tĩnh, nhưng client vẫn phải nhận cùng dữ liệu qua bootstrap/hydration thay
+vì cố nhét JSON vào `task="..."`.
+
+Các parser rule quan trọng:
+
+- attribute chuẩn là `shadowrootmode="open|closed"`, không phải cú pháp
+  `shadowroot` cũ trong bài viết lịch sử;
+- DSD có tác dụng trong luồng parse HTML; gán chuỗi qua `innerHTML` chỉ tạo
+  `HTMLTemplateElement`, không tạo shadow root;
+- `setHTMLUnsafe()` có thể parse declarative shadow roots, nhưng vẫn là injection
+  sink và không sanitize mặc định;
+- nếu cùng một host có nhiều declarative declaration, chỉ root hợp lệ đầu tiên
+  được tạo; đừng dựa vào “root sau sẽ override root trước”.
+
+DSD làm static shadow content xuất hiện sớm. Nó **không tự hydrate event,
+reactive property hoặc template parts**.
+
+## 7. Upgrade mà không vô tình xóa server DOM
+
+Khi code native chỉ cần enhance DSD đã có, reuse root trước khi tạo mới. Ví dụ
+rút gọn này tập trung vào root/listener; class đầy đủ vẫn giữ property contract:
+
+```js
+class KbTaskCard extends HTMLElement {
+  #connection;
+
+  connectedCallback() {
+    const root = this.shadowRoot ?? this.attachShadow({ mode: 'open' });
+
+    this.#connection?.abort();
+    this.#connection = new AbortController();
+    const button = root.querySelector('button');
+    const upgradeStatus = root.querySelector('[data-upgrade-status]');
+    if (button) {
+      button.disabled = false;
+      button.removeAttribute('aria-describedby');
+      upgradeStatus?.remove();
+    }
+    button?.addEventListener(
+      'click',
+      () => {
+        const completed = !this.hasAttribute('completed');
+        this.toggleAttribute('completed', completed);
+        button.setAttribute('aria-pressed', String(completed));
+        this.dispatchEvent(
+          new CustomEvent('kb-task-toggle', {
+            detail: {
+              taskId: this.getAttribute('task-id') ?? '',
+              completed,
+            },
+            bubbles: true,
+            composed: true,
+          })
+        );
+      },
+      { signal: this.#connection.signal }
+    );
+  }
+
+  disconnectedCallback() {
+    this.#connection?.abort();
+  }
+}
+
+customElements.define('kb-task-card', KbTaskCard);
+```
+
+Gọi `attachShadow({ mode: 'open' })` trên host có **declarative** root cùng mode
+sẽ trả root đó nhưng xóa nội dung. Toán tử `??` giữ open root. Load definition
+sau khi DSD được parse và test timing script thực tế của app.
+
+Normal Lit render cũng không đồng nghĩa hydration: nếu không cài hydration
+support, client có thể tạo/clear rồi render DOM mới. Giao diện trông giống nhau
+không chứng minh node identity hay focus được giữ.
+
+## 8. Lit SSR/hydration: hữu ích nhưng vẫn là Lit Labs
+
+`@lit-labs/ssr` và `@lit-labs/ssr-client` hiện thuộc **Lit Labs,
+experimental**. Pin version, đọc limitations và test hydration trong browser.
+
+Server có thể render một Lit template thành iterable rồi collect:
+
+```ts
+import { html } from 'lit';
+import { render } from '@lit-labs/ssr';
+import { collectResult } from '@lit-labs/ssr/lib/render-result.js';
+import './kb-task-card.js';
+
+const task = {
+  id: 'KB-101',
+  title: 'Đo performance',
+  priority: 'high',
+  status: 'doing',
+  assignee: 'An',
+  labels: ['performance'],
+  completed: false,
+} as const;
+
+const result = render(html`
+  <kb-task-card
+    task-id=${task.id}
+    priority=${task.priority}
+    status=${task.status}
+    ?completed=${task.completed}
+    role="article"
+    .task=${task}
+  ></kb-task-card>
+`);
+
+const bodyHtml = await collectResult(result);
+```
+
+Client hydration support phải được import **trước Lit và trước component
+modules**:
+
+```js
+// client-entry.js
+import '@lit-labs/ssr-client/lit-element-hydrate-support.js';
+import { html } from 'lit';
+import { hydrate } from '@lit-labs/ssr-client';
+import { getValidatedInitialTask } from './bootstrap-data.js';
+
+const app = document.querySelector('#app');
+
+function reportHydrationFailure(error) {
+  const container = app ?? document.body ?? document.documentElement;
+  const alert = document.createElement('p');
+  alert.dataset.hydrationError = '';
+  alert.setAttribute('role', 'alert');
+  alert.textContent =
+    'Không kích hoạt được Mini Kanban; nội dung tĩnh vẫn ở chế độ chỉ đọc.';
+  container.prepend(alert);
+  console.error('Không hydrate được Mini Kanban', error);
+}
+
+if (!app) {
+  reportHydrationFailure(new Error('Thiếu container #app'));
+} else {
+  try {
+    const task = getValidatedInitialTask();
+    hydrate(
+      html`
+        <kb-task-card
+          task-id=${task.id}
+          priority=${task.priority}
+          status=${task.status}
+          ?completed=${task.completed}
+          role="article"
+          .task=${task}
+        ></kb-task-card>
+      `,
+      app
+    );
+
+    await import('./kanban-entry.js');
+  } catch (error) {
+    reportHydrationFailure(error);
+  }
+}
+```
+
+Hydration re-associate expressions với node đã parse và gắn listener. Initial
+data/client template phải khớp server; production cần serialize dữ liệu bằng
+kênh chống injection rồi validate lại trong `getValidatedInitialTask()`. Import
+hydrate support phải đứng trước bất kỳ import nào tải Lit. `hydrate()` phía trên
+re-associate outer template; hydrate support giúp từng `LitElement` reuse shadow
+DOM đã SSR. Ta hydrate outer template trước khi định nghĩa card để `.task` được
+gán lên unknown element; lúc dynamic import upgrade nó, Lit giữ property
+pre-upgrade và hydrate shadow tree với đúng initial state. Module bootstrap phải
+thuần dữ liệu, không được lén import Lit trước hydrate support. Entry động đăng
+ký card/board; container, bootstrap data, hydrate và import đều có failure path
+hiển thị alert trong khi static fallback vẫn còn.
+
+Outer template serialize `role="article"` để host có semantics trước upgrade,
+nhưng cố ý không đóng băng `aria-label` từ server. Sau hydration,
+ElementInternals của Phần 11 quản lý accessible name theo title/completed mới;
+một author `aria-label` tĩnh sẽ ưu tiên hơn default đó và dễ trở nên stale.
+
+DOM shim Node của Lit chỉ triển khai một phần browser API. Vì vậy class Phần 11
+guard `attachInternals()` bằng `isServer`; constructor và `willUpdate()` vẫn có
+thể chạy trên server nhưng layout/imperative DOM phải để ở client lifecycle.
+Hiện async component work còn hạn chế và SSR tập trung vào Lit component dùng
+Shadow DOM.
+
+Nếu server chỉ cần nội dung có nghĩa, HTML + DSD có thể đủ. Chọn Lit SSR khi cần
+tái sử dụng Lit template và chấp nhận trạng thái Labs.
+
+## 9. Advanced: clone và serialize shadow roots
+
+Các option `clonable`, `serializable` và `getHTML()` đạt Baseline 2024 trên dòng
+browser mới, nhưng vẫn cần kiểm tra thiết bị cũ trong support matrix:
+
+```js
+const host = document.createElement('kb-task-preview');
+const root = host.attachShadow({
+  mode: 'open',
+  clonable: true,
+  serializable: true,
+});
+
+const title = document.createElement('h3');
+title.textContent = 'KB-101 · Đo performance';
+root.append(title);
+
+const clone = host.cloneNode(true); // bao gồm shadow root vì clonable: true
+
+const wrapper = document.createElement('div');
+wrapper.append(host);
+const snapshot = wrapper.getHTML({ serializableShadowRoots: true });
+```
+
+`getHTML()` phát DSD cho root serializable, không sanitize output. Đừng serialize
+token/PII. Listener, controller, promise và closure state không đi theo HTML.
+
+## 10. Watchlist 2026: học, feature-detect, chưa mặc định
+
+| API/khả năng                                       | Trạng thái cần coi khi thiết kế           | Đường lui hôm nay                                              |
+| -------------------------------------------------- | ----------------------------------------- | -------------------------------------------------------------- |
+| `Element.moveBefore()` + `connectedMoveCallback()` | Limited/experimental                      | lifecycle idempotent với `connected/disconnected`; stable keys |
+| Scoped `CustomElementRegistry` + `initialize()`    | Limited                                   | prefix tên (`kb-*`) và global registry có kiểm soát            |
+| CSS `:has-slotted`                                 | Limited                                   | `slotchange` + state/attribute hoặc fallback CSS               |
+| `referenceTarget` / `shadowrootreferencetarget`    | mới, support chưa đồng đều                | expose semantic control/ARIA contract đã kiểm thử              |
+| `ShadowRoot.setHTML()` + Sanitizer API             | Experimental/limited                      | text nodes/Lit bindings; sanitizer đã audit ở boundary         |
+| Lit SSR + hydration                                | Lit Labs/experimental                     | semantic HTML, DSD thủ công hoặc client render                 |
+| `@lit-labs/signals`                                | Lit Labs/experimental, phụ thuộc proposal | reactive properties/controllers/context ở Phần 13              |
+
+Với watchlist, ghi feature test, fallback, browser matrix và ngày xem lại; chạy
+contract test cho cả nhánh mới lẫn fallback.
+
+## 11. Failure modes và decision rules
+
+**SSR rồi client render lại toàn bộ.** Static output không phải hydration. Đo
+node identity/focus và chọn hydration runtime rõ ràng nếu cần reuse DOM.
+
+**Key bằng index.** Reorder làm state/focus dính sai task. Dùng domain id ổn định
+và unique.
+
+**Reflect JSON để “debug dễ”.** Attribute serialization vừa tốn work vừa mất
+type và có thể lộ dữ liệu. Dữ liệu phức tạp đi qua property.
+
+**Tin rằng closed shadow root bảo vệ secret.** Không đặt secret trong client DOM;
+quyền truy cập phải được bảo vệ ở server/API.
+
+**Dùng unsafe directive vì CMS trả HTML.** Thiết lập sanitizer/allow list tại
+boundary, thêm CSP/Trusted Types khi phù hợp và test payload tấn công. “Nội dung
+đến từ CMS” không đồng nghĩa trusted.
+
+**Dùng API watchlist không fallback.** Feature-detect behavior, không chỉ tên
+property; giữ path chuẩn cho browser support thực tế của sản phẩm.
+
+Tóm lại: giữ identity trước, giảm work sau; giữ dữ liệu ở typed property; render
+untrusted string như text; DSD cho static shadow DOM, hydration cho reactivity;
+và không đưa một API experimental vào critical path chỉ vì demo chạy trên một
+browser.
+
+## 12. Bài tập và checklist production
+
+1. Record Performance trace khi move task với 50, 500 và 5.000 item; xác định
+   scripting, layout hay paint mới là bottleneck trước khi sửa.
+2. Trong cùng một cột, đổi key `task.id` thành index, focus input trong card rồi
+   reorder; viết test bắt regression và khôi phục stable key. Sau đó move card
+   qua cột khác để kiểm tra chiến lược restore focus riêng.
+3. Render payload `<img src=x onerror=alert(1)>` bằng child expression và
+   `unsafeHTML` trong môi trường test để thấy hai threat surface khác nhau.
+4. Serve một DSD task card, tắt JavaScript, rồi bật hydration và xác nhận node
+   button cũ được reuse thay vì thay mới.
+
+Checklist production:
+
+- [ ] Có metric và trace trước mỗi tối ưu đáng kể.
+- [ ] Reorder trong một keyed list dùng domain id; move cross-container có
+      chiến lược focus/state riêng.
+- [ ] Critical HTML vẫn hữu ích trước custom element upgrade.
+- [ ] Shadow DOM không được dùng như access-control boundary.
+- [ ] Mọi unsafe HTML/CSS/static-template input đều có trust policy rõ.
+- [ ] DSD parser, client render và hydration được phân biệt trong thiết kế/test.
+- [ ] Lit Labs package được pin version và theo dõi limitation.
+- [ ] API limited có feature test, fallback và ngày đánh giá lại.
+
+## 13. Bridge sang Phần 15: đóng gói và phát hành
+
+Mini Kanban giờ là một vertical slice từ platform contract tới Lit, security và
+SSR. Phần 15 sẽ đóng gói library: export map/type definitions, semantic
+versioning theo DOM contract, visual regression, compatibility matrix và release
+notes để consumer nâng cấp có chủ đích.
+
+## Nguồn chính thức
+
+- [MDN: Using Shadow DOM và Declarative Shadow DOM](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_shadow_DOM)
+- [MDN: `Element.attachShadow()`](https://developer.mozilla.org/en-US/docs/Web/API/Element/attachShadow)
+- [HTML Standard: dynamic markup insertion và serialization](https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html)
+- [MDN: `Element.getHTML()`](https://developer.mozilla.org/en-US/docs/Web/API/Element/getHTML)
+- [Lit: Repeat directive](https://lit.dev/docs/templates/lists/#the-repeat-directive)
+- [Lit: Security](https://lit.dev/docs/templates/expressions/#security-considerations)
+- [Lit: SSR overview](https://lit.dev/docs/ssr/overview/)
+- [Lit: SSR client usage và hydration](https://lit.dev/docs/ssr/client-usage/)
+- [Lit: giới hạn DOM emulation trên server](https://lit.dev/docs/ssr/dom-emulation/)
+- [Lit: Signals — experimental](https://lit.dev/docs/data/signals/)
+- [MDN: `Element.moveBefore()`](https://developer.mozilla.org/en-US/docs/Web/API/Element/moveBefore)
+- [MDN: Scoped `CustomElementRegistry`](https://developer.mozilla.org/en-US/docs/Web/API/CustomElementRegistry/initialize)
+- [MDN: CSS `:has-slotted`](https://developer.mozilla.org/en-US/docs/Web/CSS/:has-slotted)
+- [WICG: Reference Target explainer](https://github.com/WICG/webcomponents/blob/gh-pages/proposals/reference-target-explainer.md)
+- [MDN: Performance API](https://developer.mozilla.org/en-US/docs/Web/API/Performance_API)

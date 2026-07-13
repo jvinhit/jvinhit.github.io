@@ -1,0 +1,815 @@
+---
+title: 'Web Components · Phần 15 — Capstone: đóng gói và phát hành component library'
+description: 'Khép series bằng Mini Kanban: chốt public contract, package ESM và types, Custom Elements Manifest, SemVer, npm pack, rồi kiểm chứng trong HTML, React và Vue.'
+pubDate: 2026-07-12
+lang: vi
+tags:
+  [web-components, lit, component-library, design-system, npm, interoperability]
+series: web-components
+seriesOrder: 15
+draft: false
+---
+
+Một component chạy đẹp trong repository của tác giả chưa phải là một component
+library. Bài kiểm tra thật bắt đầu khi consumer:
+
+- chỉ import đúng một element mà không kéo cả thư viện;
+- truyền object qua property mà không bị biến thành `"[object Object]"`;
+- nghe event mà không biết internal DOM;
+- nâng patch/minor version mà UI không vỡ;
+- dùng cùng package trong HTML thuần, React và Vue;
+- cài file `.tgz` vào một project sạch và vẫn build được.
+
+Capstone này đóng gói Mini Kanban đã xây xuyên suốt series thành
+`@acme/kb-elements`. Ta không thêm feature tùy hứng để demo trông hoành tráng;
+mọi thay đổi boundary cần cho package phải được gọi tên, document và kiểm thử.
+Sau đó ta biến contract thành artifact có thể phát hành và nâng version một cách
+có trách nhiệm.
+
+> `@acme/kb-elements` là tên minh hoạ. Trước khi publish, thay scope, repository,
+> license và metadata bằng giá trị thật của bạn.
+
+---
+
+## Definition of done: consumer không cần biết implementation
+
+Thư viện cuối series có năm element:
+
+| Element                | Trách nhiệm             | Public API chính                                                                    | Public output                    |
+| ---------------------- | ----------------------- | ----------------------------------------------------------------------------------- | -------------------------------- |
+| `<kb-task-board>`      | sở hữu layout board     | property `tasks`                                                                    | `kb-task-change`                 |
+| `<kb-task-column>`     | compose một cột         | `status`; default, `heading`, `actions` slots                                       | forward toggle/move events       |
+| `<kb-task-card>`       | hiển thị và phát intent | `task`, `taskId`, `priority`, `status`, `completed`; `focusPrimaryAction()`         | `kb-task-toggle`, `kb-task-move` |
+| `<kb-task-search>`     | tìm task bất đồng bộ    | `placeholder`; `focus()`                                                            | `kb-task-select`                 |
+| `<kb-priority-picker>` | control trong form      | `name`, `value`, `defaultValue`, `required`, `disabled`; `focus()`/validity methods | `input`, `change`                |
+
+Bảng này là summary cho release review. README/CEM và contract tests phải chứa
+inventory đầy đủ, gồm read-only form properties, parts, tokens, keyboard và
+reset/restore behavior; không suy ngược rằng mục không vừa ô bảng là private.
+
+Implementation có thể là vanilla Custom Element hoặc Lit. Consumer chỉ được
+phép phụ thuộc vào:
+
+```text
+tag name
+├── attributes và properties
+├── methods
+├── events + detail schema
+├── slots
+├── CSS custom properties
+├── shadow parts
+├── form/keyboard/a11y behavior
+└── browser support đã công bố
+```
+
+Class private, cấu trúc shadow DOM và tên class CSS nội bộ không phải contract.
+Nếu test hoặc consumer query `shadowRoot.querySelector('.card__title')`, ta đã
+vô tình biến implementation thành API.
+
+---
+
+## 1. Chốt ownership: data đi xuống, intent đi lên
+
+Mini Kanban dùng controlled state ở boundary. `<kb-task-board>` nhận snapshot
+qua property; component con phát intent; application quyết định cập nhật,
+persist hay từ chối:
+
+Đây là bước **extract package** có chủ đích so với kiến trúc app ở Phần 13.
+Repository/context ở lại application shell; reusable board không mang URL,
+authentication hay persistence policy của một sản phẩm cụ thể. Board trở thành
+controlled view, còn application là nguồn sự thật ở boundary ngoài cùng. Tại
+đây board chuẩn hóa hai intent con `kb-task-toggle`/`kb-task-move` thành event
+aggregate `kb-task-change`; đây là adapter contract của package, không phải tên
+event đã tồn tại ngầm ở các phần trước.
+
+```ts
+export interface Task {
+  id: string;
+  title: string;
+  status: 'todo' | 'doing' | 'done';
+  priority: 'low' | 'medium' | 'high';
+  assignee?: string;
+  labels: readonly string[];
+  completed: boolean;
+}
+
+const board = document.querySelector('kb-task-board')!;
+board.tasks = await loadTasks();
+
+board.addEventListener('kb-task-change', async (event) => {
+  const { taskId, patch } = event.detail;
+  const next = board.tasks.map((task) =>
+    task.id === taskId ? { ...task, ...patch } : task
+  );
+
+  board.tasks = next;
+  await saveTasks(next);
+});
+```
+
+Component không tự sửa object của owner. Nó phát một patch có schema rõ; owner
+gán array mới trở lại. Quy tắc này:
+
+- tránh hai nguồn sự thật;
+- làm Lit nhận ra reference đã đổi;
+- cho application chèn authorization, optimistic update hoặc rollback;
+- làm cùng contract chạy được ở vanilla, React lẫn Vue.
+
+Nếu thư viện muốn hỗ trợ uncontrolled mode, hãy đặt tên và semantics riêng,
+chẳng hạn `default-tasks` chỉ được đọc khi khởi tạo. Đừng để `tasks` lúc controlled,
+lúc lại là state nội bộ tuỳ code path.
+
+---
+
+## 2. Cấu trúc package: mỗi module có một trách nhiệm
+
+Một layout tối thiểu:
+
+```text
+kb-elements/
+├── src/
+│   ├── elements/
+│   │   ├── kb-task-board.ts
+│   │   ├── kb-task-column.ts
+│   │   ├── kb-task-card.ts
+│   │   ├── kb-task-search.ts
+│   │   └── kb-priority-picker.ts
+│   ├── events.ts
+│   ├── types.ts
+│   └── index.ts
+├── test/
+│   ├── contract/
+│   └── integration/
+├── scripts/
+│   └── validate-cem.mjs
+├── custom-elements-manifest.config.mjs
+├── custom-elements.json
+├── package.json
+├── tsconfig.json
+├── LICENSE
+└── README.md
+```
+
+Mỗi file element export class **và tự đăng ký đúng tag canonical**. Đây là cách
+Lit hiện khuyến nghị khi global `CustomElementRegistry` vẫn là đường production
+chính. Đoạn dưới chỉ rút gọn phần registration/type/package; implementation
+thật giữ nguyên ElementInternals, keyboard và event contract của Phần 11:
+
+```ts
+// src/elements/kb-task-card.ts
+import { LitElement, html } from 'lit';
+import { customElement, property } from 'lit/decorators.js';
+import type { Task } from '../types.js';
+
+/**
+ * @csspart surface - Bề mặt card được phép theme từ bên ngoài.
+ * @fires {CustomEvent} kb-task-toggle - Yêu cầu đổi completed state.
+ * @fires {CustomEvent} kb-task-move - Yêu cầu chuyển task sang status khác.
+ */
+@customElement('kb-task-card')
+export class KbTaskCard extends LitElement {
+  // ElementInternals, keyboard handlers và event methods giữ như Phần 11.
+  @property({ attribute: false })
+  task?: Task;
+
+  @property({ attribute: 'task-id', reflect: true, useDefault: true })
+  taskId = '';
+
+  @property({ reflect: true, useDefault: true })
+  priority: Task['priority'] = 'medium';
+
+  @property({ reflect: true, useDefault: true })
+  status: Task['status'] = 'todo';
+
+  @property({ type: Boolean, reflect: true, useDefault: true })
+  completed = false;
+
+  render() {
+    if (!this.task) return html`<p>Chưa có task.</p>`;
+    return html`
+      <div
+        part="surface"
+        data-priority=${this.priority}
+        data-status=${this.status}
+      >
+        <h3>${this.task.title}</h3>
+      </div>
+    `;
+  }
+}
+
+declare global {
+  interface HTMLElementTagNameMap {
+    'kb-task-card': KbTaskCard;
+  }
+}
+```
+
+ES modules chỉ evaluate một lần cho cùng một URL, nên nhiều nơi import đúng
+module này không đăng ký lặp. Đừng bọc `customElements.define()` bằng
+`if (!customElements.get(name))` để “cho qua”: nếu hai version khác nhau tranh
+cùng tag, im lặng dùng version thắng trước còn nguy hiểm hơn một lỗi rõ ràng.
+
+Scoped Custom Element Registries có thể thay đổi chiến lược này trong tương
+lai, nhưng support vẫn phải được kiểm tra trước khi biến nó thành contract
+production. Không thiết kế v1 dựa trên một watchlist API.
+
+---
+
+## 3. Export map: import một element không kéo cả board
+
+`src/index.ts` chỉ re-export các entry public:
+
+```ts
+export * from './types.js';
+export * from './events.js';
+export * from './elements/kb-task-board.js';
+export * from './elements/kb-task-column.js';
+export * from './elements/kb-task-card.js';
+export * from './elements/kb-task-search.js';
+export * from './elements/kb-priority-picker.js';
+```
+
+`package.json` công bố root entry và subpath entry. Import path có extension để
+thân thiện với native ESM và import maps:
+
+```json
+{
+  "name": "@acme/kb-elements",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "clean": "rimraf dist custom-elements.json",
+    "build": "tsc -p tsconfig.json && cem analyze && node scripts/validate-cem.mjs",
+    "test": "web-test-runner"
+  },
+  "files": ["dist", "src", "custom-elements.json", "README.md", "LICENSE"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./kb-task-board.js": {
+      "types": "./dist/elements/kb-task-board.d.ts",
+      "import": "./dist/elements/kb-task-board.js"
+    },
+    "./kb-task-column.js": {
+      "types": "./dist/elements/kb-task-column.d.ts",
+      "import": "./dist/elements/kb-task-column.js"
+    },
+    "./kb-task-card.js": {
+      "types": "./dist/elements/kb-task-card.d.ts",
+      "import": "./dist/elements/kb-task-card.js"
+    },
+    "./kb-task-search.js": {
+      "types": "./dist/elements/kb-task-search.d.ts",
+      "import": "./dist/elements/kb-task-search.js"
+    },
+    "./kb-priority-picker.js": {
+      "types": "./dist/elements/kb-priority-picker.d.ts",
+      "import": "./dist/elements/kb-priority-picker.js"
+    },
+    "./custom-elements.json": "./custom-elements.json"
+  },
+  "customElements": "custom-elements.json",
+  "sideEffects": ["./dist/index.js", "./dist/elements/*.js"],
+  "dependencies": {
+    "lit": "^3.3.0"
+  }
+}
+```
+
+Giới hạn input của analyzer để không quét lại cả `dist` lẫn source:
+
+```js
+// custom-elements-manifest.config.mjs
+function toPublishedPath(value) {
+  if (!/^(?:\.\/)?src\//u.test(value)) return value;
+  return value.replace(/^(?:\.\/)?src\//u, 'dist/').replace(/\.tsx?$/u, '.js');
+}
+
+function rewriteModuleReferences(value) {
+  if (Array.isArray(value)) {
+    value.forEach(rewriteModuleReferences);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+
+  for (const [key, child] of Object.entries(value)) {
+    if ((key === 'path' || key === 'module') && typeof child === 'string') {
+      value[key] = toPublishedPath(child);
+    } else {
+      rewriteModuleReferences(child);
+    }
+  }
+}
+
+const publishedPaths = () => ({
+  name: 'published-module-paths',
+  packageLinkPhase({ customElementsManifest }) {
+    rewriteModuleReferences(customElementsManifest);
+  },
+});
+
+export default {
+  globs: ['src/**/*.ts'],
+  exclude: ['test/**', 'dist/**'],
+  outdir: '.',
+  packagejson: false,
+  litelement: true,
+  plugins: [publishedPaths()],
+};
+```
+
+```js
+// scripts/validate-cem.mjs
+import { access, readFile } from 'node:fs/promises';
+
+const manifest = JSON.parse(await readFile('custom-elements.json', 'utf8'));
+
+for (const module of manifest.modules ?? []) {
+  if (!module.path?.startsWith('dist/') || !module.path.endsWith('.js')) {
+    throw new Error(`CEM path không phải published JavaScript: ${module.path}`);
+  }
+  await access(module.path);
+}
+```
+
+Đây là phần manifest liên quan public artifact; project còn khai
+`typescript`, `rimraf`, `@custom-elements-manifest/analyzer` và
+`@web/test-runner` trong `devDependencies`. Config bật Lit plugin, giới hạn glob
+ở TypeScript source, rồi rewrite mọi local `path`/`module` reference sang
+JavaScript đã phát hành trong `dist`. `validate-cem.mjs` phải parse manifest,
+từ chối `.ts` path và xác nhận từng `modules[].path` tồn tại trong package
+artifact. CEM schema yêu cầu module path import được; chỉ publish TypeScript
+source không sửa được contract này. `src` vẫn nằm trong tarball để source map và
+declaration map resolve khi debug; export map tiếp tục buộc runtime import
+JavaScript từ `dist`.
+
+Ba quyết định đáng chú ý:
+
+1. `lit` là dependency chuẩn, không bị bundle vào output. Package manager có cơ
+   hội dedupe một version tương thích.
+2. Module đăng ký element có side effect. Khai `sideEffects: false` bừa bãi có
+   thể khiến bundler xoá import mà consumer chỉ dùng để register tag.
+3. Thư viện không bundle, minify hay nhúng polyfill. Đó là quyết định ở tầng
+   application, nơi biết browser target và toàn bộ dependency graph.
+
+Nếu consumer chỉ cần card:
+
+```ts
+import '@acme/kb-elements/kb-task-card.js';
+```
+
+Import root đăng ký cả bộ:
+
+```ts
+import '@acme/kb-elements';
+```
+
+Đo bundle ở **consumer fixture**, không suy từ kích thước source. Export map chỉ
+tạo điều kiện cho tree shaking; bundle analyzer mới chứng minh element nào thật
+sự đi vào output.
+
+---
+
+## 4. Compile TypeScript thành JavaScript hiện đại và `.d.ts`
+
+Thư viện phát hành JavaScript chuẩn, không bắt consumer tự compile decorator
+hoặc TypeScript của tác giả:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2021",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2021", "DOM", "DOM.Iterable"],
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "noEmitOnError": true,
+    "strict": true,
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false
+  },
+  "include": ["src"]
+}
+```
+
+Browser target là một contract phát hành. ES2021 phù hợp với Lit 3 và evergreen
+browsers; nếu sản phẩm cần browser cũ hơn, application có thể transpile và nạp
+polyfill theo policy của nó. Đừng import polyfill toàn cục từ component package.
+
+### Type cả event, không chỉ element
+
+`HTMLElementTagNameMap` giúp `querySelector` và `createElement` suy ra class.
+Ta còn có thể khai event map:
+
+```ts
+// src/events.ts
+import type { Task } from './types.js';
+
+export interface TaskChangeDetail {
+  readonly taskId: string;
+  readonly patch: Readonly<Partial<Omit<Task, 'id'>>>;
+}
+
+export type TaskChangeEvent = CustomEvent<TaskChangeDetail>;
+
+declare global {
+  interface HTMLElementEventMap {
+    'kb-task-change': TaskChangeEvent;
+  }
+}
+```
+
+Sau đó TypeScript hiểu `event.detail`:
+
+```ts
+const board = document.querySelector('kb-task-board')!;
+
+board.addEventListener('kb-task-change', (event) => {
+  event.detail.taskId;
+  event.detail.patch.status;
+});
+```
+
+Không đưa React/Vue types vào core package nếu core không phụ thuộc framework.
+Nếu cần JSX type augmentation hoặc wrapper giàu typing, phát hành adapter entry
+riêng để dependency boundary vẫn sạch.
+
+---
+
+## 5. Custom Elements Manifest là machine-readable contract
+
+README dành cho người; `custom-elements.json` dành cho IDE, docs generator và
+catalog. Manifest community standard có thể mô tả:
+
+- tag, class và module export;
+- attributes, fields, methods, events;
+- named slots và fallback;
+- CSS custom properties;
+- shadow parts.
+
+Một đoạn rút gọn:
+
+```json
+{
+  "schemaVersion": "1.0.0",
+  "readme": "README.md",
+  "modules": [
+    {
+      "kind": "javascript-module",
+      "path": "dist/elements/kb-task-card.js",
+      "declarations": [
+        {
+          "kind": "class",
+          "name": "KbTaskCard",
+          "customElement": true,
+          "tagName": "kb-task-card",
+          "attributes": [
+            { "name": "task-id", "type": { "text": "string" } },
+            { "name": "priority", "type": { "text": "TaskPriority" } },
+            { "name": "status", "type": { "text": "TaskStatus" } },
+            { "name": "completed", "type": { "text": "boolean" } }
+          ],
+          "events": [
+            { "name": "kb-task-toggle", "type": { "text": "CustomEvent" } },
+            { "name": "kb-task-move", "type": { "text": "CustomEvent" } }
+          ],
+          "cssParts": [{ "name": "surface" }]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Đừng duy trì object lớn này bằng tay. Sinh nó từ source/JSDoc trong build, rồi
+review diff như review `.d.ts`. Nếu code đổi event mà manifest không đổi, build
+phải thất bại hoặc release review phải chặn.
+
+Manifest không thay thế documentation về semantics. `kb-task-change` có thể được
+liệt kê, nhưng người đọc vẫn cần biết khi nào event phát, có bubble/composed
+không, detail có immutable không và cancel có tác dụng gì.
+
+---
+
+## 6. Styling API cũng tuân theo SemVer
+
+Theme contract của board:
+
+```css
+kb-task-board {
+  --kb-column-surface: #ffffff;
+  --kb-column-border: #cbd5e1;
+  --kb-column-gap: 0.75rem;
+}
+
+kb-task-card {
+  --kb-card-surface: #ffffff;
+  --kb-card-border: #cbd5e1;
+  --kb-focus: #4f46e5;
+}
+
+kb-task-card::part(surface) {
+  border-inline-start: 3px solid var(--kb-card-border);
+}
+```
+
+Custom property là **token**, `part` là **điểm tuỳ biến cấu trúc**. Expose ít
+nhưng có chủ đích:
+
+- token nên mô tả intent (`--kb-color-danger`), không mô tả một selector nội bộ;
+- part nên ổn định qua refactor shadow DOM;
+- class name trong shadow root không được document như extension point;
+- `::part` không cấp quyền selector tuỳ ý xuyên toàn bộ subtree.
+
+Thay tên token hoặc xoá part đã document là breaking change, dù TypeScript vẫn
+compile. Tương tự, đổi accessible role, keyboard shortcut, form serialization
+hoặc default focus order cũng có thể là breaking behavior.
+
+| Thay đổi                                     | Version thường phù hợp                |
+| -------------------------------------------- | ------------------------------------- |
+| sửa leak listener, không đổi contract        | patch                                 |
+| thêm optional slot/token/property            | minor                                 |
+| đổi event name/detail hoặc form value        | major                                 |
+| xoá part/token đã document                   | major                                 |
+| thay shadow markup nhưng contract giữ nguyên | patch hoặc minor                      |
+| nâng browser floor                           | major, trừ khi policy đã công bố khác |
+
+SemVer chỉ hữu ích khi package liệt kê đủ bề mặt contract để reviewer biết mình
+đang phá cái gì.
+
+---
+
+## 7. Consumer fixture 1 — HTML và DOM API
+
+Fixture đơn giản nhất phải chứng minh package không phụ thuộc framework. Ví dụ
+dưới được serve qua Vite/dev server để resolve bare specifier từ npm; nếu mở
+thẳng bằng native browser, cần import map ánh xạ cả package và `lit`:
+
+```html
+<script type="module">
+  import '@acme/kb-elements';
+
+  const board = document.querySelector('kb-task-board');
+  board.tasks = [
+    {
+      id: 't-1',
+      title: 'Ship component package',
+      status: 'doing',
+      priority: 'high',
+      labels: ['release'],
+      completed: false,
+    },
+  ];
+
+  board.addEventListener('kb-task-change', (event) => {
+    console.log(event.detail);
+  });
+</script>
+
+<kb-task-search></kb-task-search>
+<kb-task-board></kb-task-board>
+```
+
+Đặt markup trước script cũng phải hoạt động nhờ custom-element upgrade. Thêm
+fixture đặt `board.tasks` **trước khi definition được import** để xác nhận Lit
+xử lý pre-upgrade property, và contract test của Phần 10 vẫn chạy qua package
+artifact thay vì source.
+
+---
+
+## 8. Consumer fixture 2 — React
+
+React hiện hiểu tag có dấu gạch ngang là custom element và có thể truyền value
+vào property khi property tồn tại trên element. Tuy vậy, một adapter nhỏ vẫn
+hữu ích cho typing, event có dấu gạch ngang và ownership rõ:
+
+```tsx
+import {
+  useEffect,
+  useRef,
+  type DetailedHTMLProps,
+  type HTMLAttributes,
+} from 'react';
+import '@acme/kb-elements/kb-task-board.js';
+import type { KbTaskBoard, Task, TaskChangeEvent } from '@acme/kb-elements';
+
+declare module 'react' {
+  namespace JSX {
+    interface IntrinsicElements {
+      'kb-task-board': DetailedHTMLProps<
+        HTMLAttributes<KbTaskBoard>,
+        KbTaskBoard
+      >;
+    }
+  }
+}
+
+interface KanbanProps {
+  tasks: Task[];
+  onTaskChange(event: TaskChangeEvent): void;
+}
+
+export function Kanban({ tasks, onTaskChange }: KanbanProps) {
+  const ref = useRef<KbTaskBoard>(null);
+
+  useEffect(() => {
+    if (ref.current) ref.current.tasks = tasks;
+  }, [tasks]);
+
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+
+    const listener = (event: Event) => onTaskChange(event as TaskChangeEvent);
+    element.addEventListener('kb-task-change', listener);
+    return () => element.removeEventListener('kb-task-change', listener);
+  }, [onTaskChange]);
+
+  return <kb-task-board ref={ref} />;
+}
+```
+
+Wrapper không đổi component model; nó chỉ dịch React props/callbacks sang DOM
+property/event. Nếu team dùng trực tiếp JSX event props, vẫn phải có một type
+augmentation được test với đúng React version. Đừng khẳng định “framework
+agnostic” chỉ vì element render được; hãy chạy fixture thực.
+
+---
+
+## 9. Consumer fixture 3 — Vue
+
+Với Vue + Vite, báo cho template compiler rằng prefix `kb-` là custom element:
+
+```ts
+// vite.config.ts
+import { defineConfig } from 'vite';
+import vue from '@vitejs/plugin-vue';
+
+export default defineConfig({
+  plugins: [
+    vue({
+      template: {
+        compilerOptions: {
+          isCustomElement: (tag) => tag.startsWith('kb-'),
+        },
+      },
+    }),
+  ],
+});
+```
+
+Sau đó dùng native property/event/slot:
+
+```vue
+<script setup lang="ts">
+import '@acme/kb-elements/kb-task-board.js';
+import type { Task, TaskChangeEvent } from '@acme/kb-elements';
+
+defineProps<{ tasks: Task[] }>();
+
+function onTaskChange(event: TaskChangeEvent) {
+  console.log(event.detail);
+}
+</script>
+
+<template>
+  <kb-task-board
+    :tasks.prop="tasks"
+    @kb-task-change="onTaskChange"
+  ></kb-task-board>
+</template>
+```
+
+Vue thường tự chọn property khi field tồn tại trên element; `.prop` ở fixture
+làm ý định với object rõ ràng và bảo vệ regression nếu API class đổi. Named slot
+dùng attribute `slot` gốc, không phải scoped slot của Vue.
+
+---
+
+## 10. Release artifact phải được cài, không chỉ được build
+
+`npm pack` cho ta đúng tarball sẽ publish. Release candidate cần đi qua:
+
+```bash
+npm run clean
+npm run build
+npm run test
+npm pack --dry-run
+npm pack
+```
+
+Kiểm tra danh sách từ `--dry-run`:
+
+- có `dist/*.js`, `.d.ts`, source map nếu đã hứa;
+- có README, LICENSE và manifest;
+- không có test fixture, secret, cache hay source asset không cần thiết;
+- export map không trỏ tới file bị thiếu.
+
+Sau đó cài tarball vào từng consumer fixture sạch:
+
+```bash
+npm install ../kb-elements/acme-kb-elements-1.0.0.tgz
+npm run build
+npm run test
+```
+
+Một workspace import thẳng source có thể vô tình nhờ path alias, hoisted
+dependency hoặc TypeScript config của library. Tarball consumer loại bỏ các
+“đặc quyền” đó.
+
+---
+
+## 11. Release gate: bằng chứng trước version number
+
+Một pipeline tối thiểu:
+
+```text
+typecheck + lint
+        │
+        ▼
+browser contract tests
+Chrome + Firefox + WebKit
+        │
+        ▼
+build ESM + .d.ts + manifest
+        │
+        ▼
+npm pack
+        │
+        ├── vanilla consumer
+        ├── React consumer
+        └── Vue consumer
+        │
+        ▼
+API/manifest diff + SemVer review
+```
+
+Checklist release:
+
+- [ ] Mỗi tag chỉ có một canonical definition.
+- [ ] Import một subpath không kéo các element không dùng.
+- [ ] Không bundle Lit và không import polyfill trong library.
+- [ ] `HTMLElementTagNameMap` và event detail có type.
+- [ ] Attribute/property/event/slot/part/token khớp README và manifest.
+- [ ] Test keyboard, focus, label, form reset/disabled/restore chạy trên browser thật.
+- [ ] DSD/SSR path, nếu bật, có fixture không JavaScript và hydration test riêng.
+- [ ] Không có consumer nào query private shadow markup.
+- [ ] Tarball cài được trong project sạch.
+- [ ] API diff được phân loại patch/minor/major trước khi publish.
+
+---
+
+## Bài tập capstone
+
+1. **Contract inventory:** lập bảng toàn bộ attribute, property, method, event,
+   slot, part, token và behavior của năm `kb-*` element. Đánh dấu mục nào chưa có
+   test.
+2. **Pre-upgrade test:** set `tasks` trước khi import module, sau đó xác nhận
+   element upgrade mà không mất object.
+3. **Tree-shaking test:** build hai fixture — một import root, một chỉ import
+   `kb-task-card.js` — rồi so sánh module graph thay vì chỉ so file source.
+4. **Breaking-change drill:** đổi `kb-task-change` thành `kb-task-updated`. Liệt kê
+   test, type, manifest, docs và fixture nào phải fail; quyết định version.
+5. **Artifact audit:** chạy `npm pack --dry-run` và giải thích vai trò của từng
+   file được publish.
+6. **Interop proof:** cùng một array `Task[]` phải render và cùng event detail
+   phải được nhận trong vanilla, React và Vue.
+
+---
+
+## Điều cốt lõi của cả series
+
+Custom Elements định nghĩa **identity và lifecycle**. Shadow DOM định nghĩa
+**implementation boundary**. Slots, events, properties, parts và CSS variables
+định nghĩa **public contract**. ElementInternals nối component với semantics,
+accessibility và form của platform. Lit không thay các khái niệm đó; Lit làm
+việc render và reactive update ngắn hơn, nhất quán hơn.
+
+Một component library production không được đánh giá bằng việc demo đẹp đến
+đâu. Nó được đánh giá bằng việc consumer có thể dùng mà không biết nội bộ,
+contract có test trên browser thật, artifact cài được ở project sạch và mỗi lần
+nâng version đều nói thật về mức độ thay đổi.
+
+Đến đây Mini Kanban không còn là một tập class trong source tree. Nó là một
+package có boundary, tài liệu máy đọc được, release gate và bằng chứng interop —
+đủ để sống qua lần đổi framework tiếp theo.
+
+---
+
+## Nguồn chính thức
+
+- [Lit — Publishing](https://lit.dev/docs/tools/publishing/)
+- [Lit — Requirements](https://lit.dev/docs/tools/requirements/)
+- [React — Custom HTML elements](https://react.dev/reference/react-dom/components#custom-html-elements)
+- [Vue — Vue and Web Components](https://vuejs.org/guide/extras/web-components.html)
+- [Custom Elements Manifest](https://custom-elements-manifest.open-wc.org/)
+- [WHATWG HTML — Custom elements](https://html.spec.whatwg.org/multipage/custom-elements.html)
+- [npm — npm pack](https://docs.npmjs.com/cli/commands/npm-pack)
+- [Semantic Versioning](https://semver.org/)

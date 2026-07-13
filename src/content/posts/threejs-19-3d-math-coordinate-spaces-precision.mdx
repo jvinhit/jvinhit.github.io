@@ -1,0 +1,331 @@
+---
+title: 'Three.js from Zero to Senior · Part 19 — Toán 3D, Coordinate Spaces & Precision'
+description: 'Làm chủ point/vector/direction, dot/cross, chuỗi local→screen, matrix và normal matrix, quaternion/slerp, project/unproject, depth precision, floating origin và reversed depth.'
+pubDate: 2026-07-12
+tags: [threejs, 3d, math, rendering, architecture]
+series: threejs
+seriesOrder: 19
+lang: vi
+draft: false
+---
+
+import DemoEmbed from '~/components/blog/DemoEmbed.astro';
+
+Một bug 3D thường không bắt đầu ở API. Nó bắt đầu bằng một câu hỏi chưa được trả lời: **con số này đang ở không gian nào, và nó biểu diễn điểm hay hướng?**
+
+`(1, 0, 0)` có thể là vị trí cách gốc một mét, một hướng sang phải, vận tốc một mét mỗi giây, hoặc normal của bề mặt. Ba số giống nhau nhưng quy tắc biến đổi khác nhau. Nếu contract đó chỉ tồn tại trong đầu người viết code, scene càng lớn thì bug càng khó truy vết.
+
+Lab dưới đây cho bạn theo dõi một điểm qua toàn bộ pipeline, so sánh Euler với quaternion slerp, click để `unproject` ngược từ màn hình xuống sàn, và quan sát khi toạ độ lớn bắt đầu mất chi tiết trong `Float32`.
+
+<DemoEmbed
+  slug="threejs-spatial-math-lab"
+  title="Three.js spatial math, coordinate spaces and precision lab"
+  height="920px"
+/>
+
+## Point, vector và direction: cùng ba số, khác semantics
+
+Ta thường dùng `Vector3` cho cả ba, nhưng nên giữ khác biệt trong mental model:
+
+- **Point** là một vị trí. Dịch object đi thì point đi theo.
+- **Vector displacement** là độ lệch từ point A tới point B. Nó có độ dài và hướng.
+- **Direction** chỉ giữ hướng, thường được chuẩn hoá về độ dài `1`. Phép tịnh tiến không được tác động lên nó.
+
+Trong homogeneous coordinates, khác biệt này hiện ra bằng thành phần `w`:
+
+```text
+point      = (x, y, z, 1)  → chịu translation
+direction  = (x, y, z, 0)  → bỏ qua translation
+```
+
+Three.js giấu `w` trong hầu hết API, nhưng quy tắc vẫn còn đó:
+
+```js
+const localPoint = new THREE.Vector3(0.8, 0.6, 0.2);
+const worldPoint = object.localToWorld(localPoint.clone());
+
+const localDirection = new THREE.Vector3(1, 0, 0);
+const worldDirection = localDirection
+  .clone()
+  .transformDirection(object.matrixWorld); // bỏ translation, normalize kết quả
+```
+
+Đừng lấy direction bằng `localToWorld()` trực tiếp. Nếu cần biến hai point thành một displacement, hãy trừ chúng **sau khi cả hai đã ở cùng coordinate space**:
+
+```js
+const deltaWorld = targetWorld.clone().sub(originWorld);
+const distance = deltaWorld.length();
+const direction = deltaWorld.normalize();
+```
+
+Một convention đáng tiền trong codebase là đưa space vào tên: `hitPointWorld`, `velocityLocal`, `normalView`, `pointerNDC`. TypeScript vẫn thấy tất cả là `Vector3`; tên biến giúp reviewer thấy lỗi trước runtime.
+
+## Dot và cross: hai phép toán, rất nhiều quyết định
+
+### Dot product — “hai hướng đồng thuận tới đâu?”
+
+Với hai vector đã normalize, `a.dot(b)` trả về cosine của góc giữa chúng:
+
+- gần `1`: cùng hướng;
+- gần `0`: vuông góc;
+- gần `-1`: ngược hướng.
+
+```js
+const toTarget = targetWorld.clone().sub(objectWorld).normalize();
+const forward = new THREE.Vector3(0, 0, 1).transformDirection(
+  object.matrixWorld
+);
+
+const facing = forward.dot(toTarget);
+if (facing > Math.cos(THREE.MathUtils.degToRad(30))) {
+  // target nằm trong cone 30° phía trước
+}
+```
+
+Dot product cũng chiếu một vector lên trục, tính diffuse lighting, hoặc kiểm tra point nằm phía nào của plane. Luôn xác định hai operand có cùng space và có cần normalize hay không; nếu không normalize, độ dài cũng tham gia kết quả.
+
+### Cross product — dựng trục vuông góc có orientation
+
+`a.cross(b)` trả về vector vuông góc với cả `a` và `b`, theo right-hand rule. Nó hữu ích để dựng camera basis, tangent frame hay hướng quay:
+
+```js
+const forward = target.clone().sub(eye).normalize();
+const right = forward.clone().cross(up).normalize();
+const correctedUp = right.clone().cross(forward).normalize();
+```
+
+Thứ tự quan trọng: `a × b = -(b × a)`. Nếu camera lật hoặc normal quay vào trong, kiểm tra operand order trước khi thêm một dấu trừ “cho chạy”.
+
+## Chuỗi local → world → view → clip → NDC → screen
+
+Một vertex không nhảy thẳng từ mesh lên pixel. Với column-vector convention của shader Three.js, pipeline có thể đọc như sau:
+
+```text
+p_world = M_model · p_local
+p_view  = M_view  · p_world
+p_clip  = M_proj  · p_view
+p_ndc   = p_clip.xyz / p_clip.w
+p_css   = viewportTransform(p_ndc)
+```
+
+Hay gộp lại:
+
+```text
+p_clip = Projection · View · Model · p_local
+```
+
+Các chặng có contract riêng:
+
+1. **Local/object space** — toạ độ do geometry author tạo quanh origin của mesh.
+2. **World space** — sau transform của object và toàn bộ ancestor trong scene graph.
+3. **View/camera space** — world được nhìn từ camera; camera trở thành origin của hệ này.
+4. **Clip space** — projection đã áp nhưng **chưa chia `w`**. Frustum clipping diễn ra ở đây.
+5. **NDC** — sau perspective divide. Với `WebGLRenderer`, vùng nhìn thấy dùng `x/y/z` trong `[-1, 1]`.
+6. **Screen/CSS pixels** — NDC được map vào viewport của canvas; `y` phải đảo vì CSS tăng từ trên xuống.
+
+```js
+object.updateWorldMatrix(true, false);
+camera.updateWorldMatrix(true, false);
+
+const world = object.localToWorld(local.clone());
+const view = world.clone().applyMatrix4(camera.matrixWorldInverse);
+
+const clip = new THREE.Vector4(world.x, world.y, world.z, 1)
+  .applyMatrix4(camera.matrixWorldInverse)
+  .applyMatrix4(camera.projectionMatrix);
+
+const ndc = new THREE.Vector3(
+  clip.x / clip.w,
+  clip.y / clip.w,
+  clip.z / clip.w
+);
+
+const rect = renderer.domElement.getBoundingClientRect();
+const screen = {
+  x: (ndc.x * 0.5 + 0.5) * rect.width,
+  y: (-ndc.y * 0.5 + 0.5) * rect.height,
+};
+```
+
+Hai lỗi hay gặp ở code production:
+
+- Đọc `matrixWorld` trước khi parent chain được cập nhật. Khi tính ngoài render loop, gọi `updateWorldMatrix()` có chủ đích.
+- Dùng drawing-buffer pixels (`canvas.width`) để đặt DOM overlay. Overlay CSS cần `getBoundingClientRect()`; drawing buffer còn nhân DPR.
+
+## `project()` và `unproject()`: hai chiều của cùng pipeline
+
+Three.js có shortcut an toàn cho phép chiếu point:
+
+```js
+const ndc = worldPoint.clone().project(camera);
+```
+
+Chiều ngược không trả về “point trong thế giới” duy nhất. Một pixel đại diện cho **một ray** đi qua frustum. Ta unproject một điểm trên ray, rồi cắt ray với plane hoặc geometry:
+
+```js
+const pointerNDC = new THREE.Vector3(nx, ny, 0.5);
+const through = pointerNDC.unproject(camera);
+const direction = through.sub(camera.position).normalize();
+const ray = new THREE.Ray(camera.position.clone(), direction);
+
+const floor = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const hitWorld = ray.intersectPlane(floor, new THREE.Vector3());
+```
+
+Nếu camera có parent, lấy origin bằng `camera.getWorldPosition()` thay vì `camera.position`. Nếu cần hit geometry thật, `Raycaster.setFromCamera()` gói pipeline này và thêm intersection test.
+
+## Matrix composition và normal matrix
+
+`Object3D` giữ `position`, `quaternion`, `scale`, rồi compose chúng thành local matrix. `matrixWorld` tiếp tục nhân transform từ ancestor:
+
+```text
+matrix      = compose(position, quaternion, scale)
+matrixWorld = parent.matrixWorld · matrix
+```
+
+Matrix multiplication không giao hoán. “Scale rồi rotate” và “rotate rồi scale” có thể tạo kết quả khác; đó là lý do hierarchy và pivot là quyết định thiết kế, không chỉ là cách tổ chức code.
+
+### Vì sao normal không dùng cùng matrix với position?
+
+Normal phải tiếp tục vuông góc với bề mặt. Khi có non-uniform scale, nhân normal bằng model matrix sẽ phá điều kiện đó. Phép đúng là **inverse-transpose** của phần `3×3`:
+
+```js
+const normalMatrixWorld = new THREE.Matrix3().getNormalMatrix(
+  object.matrixWorld
+);
+
+const normalWorld = normalLocal
+  .clone()
+  .applyMatrix3(normalMatrixWorld)
+  .normalize();
+```
+
+Trong shader built-in, `normalMatrix` thường đưa normal sang view space và được Three.js cấp sẵn. Nếu custom shader biến dạng vertex, bạn phải bảo đảm normal được biến đổi tương ứng; nếu không, geometry đúng nhưng ánh sáng sai.
+
+## Euler để author, quaternion để compose và interpolate
+
+Euler dễ đọc: “xoay Y 45°”. Nhưng Euler phụ thuộc rotation order, có singularity/gimbal lock, và nội suy từng component không đảm bảo tốc độ góc đều hay đường quay ngắn nhất.
+
+Quaternion khó đọc hơn nhưng phù hợp để:
+
+- compose nhiều rotation;
+- quay từ hướng A sang B;
+- nội suy orientation bằng spherical interpolation;
+- tránh singularity của representation Euler.
+
+```js
+const qStart = new THREE.Quaternion().setFromEuler(
+  new THREE.Euler(0, 0, 0, 'YXZ')
+);
+const qEnd = new THREE.Quaternion().setFromEuler(
+  new THREE.Euler(1.1, 2.5, 1.8, 'YXZ')
+);
+
+object.quaternion.slerpQuaternions(qStart, qEnd, t);
+```
+
+`rotation` và `quaternion` của `Object3D` được đồng bộ, nhưng đừng để hai subsystem cùng ghi vào hai representation mỗi frame. Chọn một owner cho orientation; chuyển sang Euler chỉ ở biên UI/debug nếu cần.
+
+Slerp cũng không tự định nghĩa easing. Thường ta ease `t` trước, rồi slerp orientation:
+
+```js
+const eased = THREE.MathUtils.smoothstep(t, 0, 1);
+object.quaternion.slerpQuaternions(qStart, qEnd, eased);
+```
+
+## Hai bài toán precision khác nhau
+
+“Scene rung ở toạ độ lớn” và “hai mặt chớp nháy ở xa” nhìn giống nhau nhưng nằm ở hai tầng khác nhau.
+
+### 1. World-position precision
+
+JavaScript tính bằng double, nhưng vertex attributes, matrices và nhiều phép tính GPU thường dùng `Float32`. Khoảng cách giữa hai số biểu diễn được tăng theo độ lớn của số. Ở toạ độ rất lớn, một thay đổi nhỏ có thể biến mất khi upload lên GPU.
+
+**Floating origin** giải quyết bằng cách giữ render world gần `(0,0,0)`:
+
+```js
+// Authoritative coordinates có thể giữ ở hệ double/geospatial riêng.
+const renderPosition = absolutePosition.clone().sub(renderOrigin);
+mesh.position.copy(renderPosition);
+
+// Khi camera đi quá xa, dịch origin và rebuild render transforms theo một boundary rõ ràng.
+```
+
+Không nên âm thầm trừ camera ở khắp nơi. Hãy coi `renderOrigin` là một service có version/event, rồi cập nhật physics, particles, trails, audio và cache spatial theo cùng transaction.
+
+### 2. Depth-buffer precision
+
+Perspective depth không phân bố tuyến tính; precision tập trung gần `near`. Đẩy `near` từ `0.1` xuống `0.0001` để “chắc chắn thấy mọi thứ” có thể làm z-fighting tệ đi trên phần còn lại của scene.
+
+Thứ tự quyết định thực dụng:
+
+| Tình huống                    | Lựa chọn đầu tiên                                           | Vì sao                                                       |
+| ----------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------ |
+| Scene thông thường            | Siết `near`/`far` theo nội dung                             | Không thêm shader/backend constraint                         |
+| Decal/coplanar surfaces       | Sửa geometry, separation hoặc `polygonOffset` có kiểm chứng | Đây không hẳn là bài toán world scale                        |
+| Scene có dải depth cực lớn    | Đánh giá `reversedDepthBuffer`                              | Precision tốt hơn khi `EXT_clip_control` khả dụng            |
+| Không thể dùng reversed depth | Cân nhắc logarithmic depth sau profiling                    | Dùng `gl_FragDepth`, có thể làm mất early depth optimization |
+| Toạ độ tuyệt đối rất lớn      | Floating origin/camera-relative rendering                   | Reversed depth không sửa position precision                  |
+
+`reversedDepthBuffer` là constructor option và chỉ hoạt động khi context có `EXT_clip_control`:
+
+```js
+const renderer = new THREE.WebGLRenderer({
+  canvas,
+  reversedDepthBuffer: true,
+});
+
+console.log(renderer.capabilities.reversedDepthBuffer);
+```
+
+Đây là architectural decision: test material custom, post-processing, depth texture, device matrix và fallback. Nó không phải toggle để bật giữa một frame đang chạy.
+
+## Contract kiến trúc cho math code
+
+Ở quy mô team, giá trị của toán 3D nằm ở invariant có thể review:
+
+1. **Space nằm trong tên/API.** Hàm nhận `PointWorld` không nhận tuỳ tiện local point.
+2. **Ownership rõ.** Camera system sở hữu view/projection; interaction system chỉ đọc snapshot đã cập nhật.
+3. **Update order cố định.** Input → simulation → animation → world matrices → picking/culling → render.
+4. **Scratch objects được tái dùng ở hot path.** `clone()` rất tiện trong command handler, nhưng allocation mỗi vertex/mỗi frame tạo GC pressure.
+5. **Boundary được test.** Round-trip `localToWorld` → `worldToLocal`, project → ray/plane, và rebase origin đều có deterministic fixtures.
+
+Ví dụ round-trip test đáng có:
+
+```js
+const local = new THREE.Vector3(0.25, -0.5, 1.5);
+object.updateWorldMatrix(true, false);
+
+const roundTrip = object.worldToLocal(object.localToWorld(local.clone()));
+expect(roundTrip.distanceTo(local)).toBeLessThan(1e-6);
+```
+
+## Debugging playbook: hỏi space trước khi hỏi API
+
+- **DOM label trôi khỏi object:** log world → NDC → CSS pixels; kiểm tra camera/world matrices và dùng CSS rect, không drawing buffer.
+- **Ray click lệch:** tính NDC từ bounding rect của đúng canvas; kiểm tra camera có parent và viewport/scissor.
+- **Normal sáng sai sau scale:** dùng normal matrix; tránh non-uniform scale trên skinned/physics hierarchy nếu pipeline không hỗ trợ tốt.
+- **Rotation lật giữa hai keyframe:** kiểm tra Euler order và chuyển interpolation sang quaternion slerp.
+- **Vật rung ở toạ độ lớn:** đo `Math.fround(x + delta) === Math.fround(x)`; thiết kế floating origin.
+- **Z-fighting tăng khi hạ near:** thu hẹp frustum; đừng nhầm depth precision với clipping coverage.
+
+## Thực hành có tiêu chí hoàn thành
+
+1. Trong lab, đổi non-uniform scale và giải thích vì sao “naive normal” lệch khỏi normal-matrix result.
+2. Click ba vị trí trên canvas, ghi lại NDC và world hit trên `y = 0`; resize rồi xác nhận hit vẫn đúng.
+3. Đẩy magnitude lên `100,000,000`, quan sát một bước nhỏ mất trong `Float32`, rồi so với camera-relative value.
+4. Chọn một scene thật, ghi `near`, `far`, tỉ lệ của chúng và lý do có hoặc chưa cần reversed depth.
+
+## Phần tiếp theo
+
+Ta đã theo một point tới tận NDC. Nhưng một pixel chỉ xuất hiện sau khi renderer gom object thành render lists, chạy draw calls, depth test, blend và có thể đi qua nhiều render target. **Part 20** mở pipeline đó ra để xử lý z-fighting, transparency và post-processing bằng mô hình nguyên nhân–kết quả thay vì thử cờ ngẫu nhiên.
+
+## Tài liệu chính thức
+
+- [Three.js — Vector3](https://threejs.org/docs/pages/Vector3.html)
+- [Three.js — Matrix4](https://threejs.org/docs/pages/Matrix4.html)
+- [Three.js — Matrix3 và normal matrix](https://threejs.org/docs/pages/Matrix3.html)
+- [Three.js — Object3D transforms, localToWorld/worldToLocal](https://threejs.org/docs/pages/Object3D.html)
+- [Three.js — Quaternion](https://threejs.org/docs/pages/Quaternion.html)
+- [Three.js — PerspectiveCamera](https://threejs.org/docs/pages/PerspectiveCamera.html)
+- [Three.js — WebGLRenderer options và reversed depth](https://threejs.org/docs/pages/WebGLRenderer.html)

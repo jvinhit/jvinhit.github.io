@@ -1,0 +1,525 @@
+---
+title: 'Web Components · Phần 4 — Render, State, Template & Ranh giới bảo mật'
+description: 'Dùng template, state ownership và targeted DOM updates để kb-task-card render idempotent, giữ focus/node identity và không biến dữ liệu ngoài thành innerHTML gây XSS.'
+pubDate: 2026-07-12
+lang: vi
+tags: [web-components, custom-elements, rendering, xss, javascript]
+series: web-components
+seriesOrder: 4
+draft: false
+---
+
+Ở Phần 3, mỗi lần state đổi `<kb-task-card>` lại chạy nhiều `querySelector()` rồi
+sửa vài node. Một refactor “cho gọn” rất dễ biến nó thành:
+
+```js
+render() {
+  this.innerHTML = `<h3>${this.task.title}</h3>...`;
+}
+```
+
+Đoạn code ngắn hơn nhưng tạo hai lỗi production cùng lúc. Nó parse dữ liệu ngoài
+như HTML — một XSS sink — và thay toàn bộ subtree sau mỗi update. Checkbox đang
+focus bị thay bằng node mới, text selection mất, listener gắn trực tiếp biến
+mất, state riêng của child element cũng bị reset.
+
+Render đúng không đồng nghĩa “tạo lại toàn bộ HTML”:
+
+```text
+public input / user action
+          │
+          ▼
+  state có owner rõ ràng
+          │
+          ▼
+  schedule một lần / tick
+          │
+          ▼
+commit đúng property/text/attribute cần đổi trên node hiện có
+```
+
+Ta dùng `<template>` để **mount một lần**, sau đó update có mục tiêu. Đây là
+baseline nhỏ cho component vừa phải, không phải virtual DOM tự chế.
+
+---
+
+## 1. Render là phép chiếu từ state sang DOM
+
+Component nhận input từ nhiều nơi. Gom chúng về state/contract trước, rồi commit
+view tại một nơi:
+
+```text
+attributeChanged ─┐
+property setter ──┼──► state/contract ──► #requestCommit() ──► #commit()
+user input ───────┘
+```
+
+“State có owner rõ” không có nghĩa component phải sở hữu toàn bộ dữ liệu. Với
+Mini Kanban:
+
+| Dữ liệu                              | Owner                   | Card giữ gì?                              |
+| ------------------------------------ | ----------------------- | ----------------------------------------- |
+| Task từ server                       | list/application        | snapshot đã normalize qua `task` property |
+| `task-id`, `priority`, `completed`   | public element contract | reflected attribute/property              |
+| Node DOM nội bộ                      | card                    | reference ổn định sau mount               |
+| Focus, selection, checked live state | browser/user            | card không phá node khi commit            |
+
+List là source of truth dài hạn. Card render snapshot, phát event và không mutate
+object của parent.
+
+---
+
+## 2. Idempotent render nghĩa là gì?
+
+Một commit idempotent cho cùng state sẽ cho cùng observable UI dù gọi một hay
+nhiều lần:
+
+```js
+card.task = task;
+card.task = task;
+// UI không nhân đôi label, listener hoặc article.
+```
+
+Ba kỷ luật cần giữ:
+
+1. **Mount một lần:** tạo cấu trúc và cache node reference đúng một lần cho mỗi
+   instance.
+2. **Không gắn listener trong commit:** listener thuộc connection lifecycle,
+   không thuộc mỗi lần render.
+3. **Set giá trị cuối:** `textContent = value`, `input.checked = boolean`,
+   `toggleAttribute(name, force)`; không `append()` theo kiểu tích lũy.
+
+Ta vẫn batch nhiều thay đổi trong cùng microtask để tránh công việc thừa.
+
+---
+
+## 3. `<template>`: parse cấu trúc một lần, clone cho mỗi instance
+
+`HTMLTemplateElement` giữ content trong một `DocumentFragment` chưa render. Sau
+khi clone và chèn, các node mới trở thành subtree bình thường của document.
+
+Ta tạo template ở scope module:
+
+```js
+const cardTemplate = document.createElement('template');
+
+cardTemplate.innerHTML = `
+  <article data-ref="card">
+    <header>
+      <h3 data-ref="title"></h3>
+      <span data-ref="priority"></span>
+    </header>
+    <p data-ref="assignee"></p>
+    <p>Nhãn: <span data-ref="labels"></span></p>
+    <label>
+      <input data-ref="completed" type="checkbox" />
+      Hoàn thành
+    </label>
+  </article>
+`;
+```
+
+`innerHTML` chấp nhận được vì string là **hằng số do tác giả kiểm soát**. Template
+không phải sanitizer; chỉ một `${task.title}` cũng làm ranh giới này sai.
+Đây là kết luận về **injection**, không phải mặc định tuân thủ Trusted Types:
+với CSP `require-trusted-types-for 'script'`, gán plain string vào `innerHTML`
+vẫn có thể ném `TypeError`. Khi bật policy đó, tạo DOM bằng API hoặc đưa static
+markup qua Trusted Types policy đã được security review.
+
+Mỗi instance clone fragment:
+
+```js
+const fragment = cardTemplate.content.cloneNode(true);
+this.replaceChildren(fragment); // chỉ một lần trong #mount()
+```
+
+Dùng `data-ref` làm hook nội bộ để tránh ID trùng giữa các clone trong light DOM.
+
+---
+
+## 4. Mount một lần, commit có mục tiêu
+
+Đây là implementation tiếp nối public API ở Phần 3. Nó đọc progressive fallback
+một lần khi connected, thay subtree bằng template một lần, rồi giữ reference ổn
+định cho mọi update sau.
+
+```js
+/**
+ * @typedef {object} KbTaskData
+ * @property {string} title
+ * @property {string=} assignee
+ * @property {string[]=} labels
+ */
+
+const priorities = new Set(['low', 'medium', 'high']);
+const cardTemplate = document.createElement('template');
+
+// Trusted static markup: tuyệt đối không nội suy input vào string này.
+cardTemplate.innerHTML = `
+  <article data-ref="card">
+    <header>
+      <h3 data-ref="title"></h3>
+      <span data-ref="priority"></span>
+    </header>
+    <p data-ref="assignee"></p>
+    <p>Nhãn: <span data-ref="labels"></span></p>
+    <label>
+      <input data-ref="completed" type="checkbox" />
+      Hoàn thành
+    </label>
+  </article>
+`;
+
+class KbTaskCard extends HTMLElement {
+  static observedAttributes = ['task-id', 'priority', 'completed'];
+
+  /** @type {Readonly<KbTaskData> | null} */
+  #task = null;
+  #refs;
+  #mounted = false;
+  #commitQueued = false;
+  #connectionController;
+  #replayedPreUpgradeProperties = false;
+
+  connectedCallback() {
+    this.#mount();
+
+    if (!this.#replayedPreUpgradeProperties) {
+      for (const name of ['task', 'taskId', 'priority', 'completed']) {
+        this.#upgradeProperty(name);
+      }
+      this.#replayedPreUpgradeProperties = true;
+    }
+
+    if (!this.#connectionController) {
+      const controller = new AbortController();
+      this.#connectionController = controller;
+      this.addEventListener('change', this.#onChange, {
+        signal: controller.signal,
+      });
+    }
+
+    this.#requestCommit();
+  }
+
+  disconnectedCallback() {
+    this.#connectionController?.abort();
+    this.#connectionController = undefined;
+  }
+
+  attributeChangedCallback(_name, oldValue, newValue) {
+    if (oldValue !== newValue) this.#requestCommit();
+  }
+
+  get taskId() {
+    return this.getAttribute('task-id') ?? '';
+  }
+
+  set taskId(value) {
+    const next = String(value).trim();
+    if (next) this.setAttribute('task-id', next);
+    else this.removeAttribute('task-id');
+  }
+
+  get priority() {
+    const value = this.getAttribute('priority');
+    return priorities.has(value) ? value : 'medium';
+  }
+
+  set priority(value) {
+    const next = String(value);
+    if (!priorities.has(next)) {
+      throw new RangeError(`Unsupported priority: ${next}`);
+    }
+    if (this.getAttribute('priority') !== next) {
+      this.setAttribute('priority', next);
+    }
+  }
+
+  get completed() {
+    return this.hasAttribute('completed');
+  }
+
+  set completed(value) {
+    this.toggleAttribute('completed', Boolean(value));
+  }
+
+  get task() {
+    return this.#task;
+  }
+
+  set task(value) {
+    if (!value || typeof value !== 'object') {
+      throw new TypeError('task must be an object');
+    }
+
+    const title = String(value.title ?? '').trim();
+    if (!title) throw new TypeError('task.title is required');
+
+    this.#task = Object.freeze({
+      title,
+      assignee: value.assignee ? String(value.assignee) : '',
+      labels: Object.freeze(
+        Array.isArray(value.labels) ? value.labels.map(String) : []
+      ),
+    });
+    this.#requestCommit();
+  }
+
+  focusPrimaryAction(options) {
+    this.#refs?.completed.focus(options);
+  }
+
+  #mount() {
+    if (this.#mounted) return;
+
+    // Progressive fallback là input khởi tạo, không phải subtree ta tiếp tục vá.
+    if (!this.#task) {
+      const fallbackTitle = this.querySelector('[data-title]')?.textContent;
+      const fallbackAssignee =
+        this.querySelector('[data-assignee]')?.textContent;
+
+      this.#task = Object.freeze({
+        title: fallbackTitle?.trim() || 'Task chưa có tiêu đề',
+        assignee: fallbackAssignee?.trim() || '',
+        labels: Object.freeze([]),
+      });
+    }
+
+    const fragment = cardTemplate.content.cloneNode(true);
+    this.replaceChildren(fragment);
+
+    this.#refs = {
+      card: this.querySelector('[data-ref="card"]'),
+      title: this.querySelector('[data-ref="title"]'),
+      priority: this.querySelector('[data-ref="priority"]'),
+      assignee: this.querySelector('[data-ref="assignee"]'),
+      labels: this.querySelector('[data-ref="labels"]'),
+      completed: this.querySelector('[data-ref="completed"]'),
+    };
+    this.#mounted = true;
+  }
+
+  #requestCommit() {
+    if (!this.#mounted || this.#commitQueued) return;
+    this.#commitQueued = true;
+
+    queueMicrotask(() => {
+      this.#commitQueued = false;
+      if (this.isConnected) this.#commit();
+    });
+  }
+
+  #commit() {
+    const task = this.#task;
+    if (!task) return;
+
+    // Dynamic text đi qua textContent, không qua HTML parser.
+    this.#refs.title.textContent = task.title;
+    this.#refs.assignee.textContent = task.assignee
+      ? `Người thực hiện: ${task.assignee}`
+      : 'Chưa giao người thực hiện';
+    this.#refs.labels.textContent = task.labels.join(', ') || '—';
+
+    const priority = this.priority;
+    this.#refs.priority.textContent = priority;
+    this.#refs.priority.dataset.level = priority;
+
+    // Với form control, property là live state; attribute chỉ là default.
+    this.#refs.completed.checked = this.completed;
+    this.#refs.card.toggleAttribute('data-completed', this.completed);
+  }
+
+  #onChange = (event) => {
+    if (event.target !== this.#refs.completed) return;
+
+    this.completed = this.#refs.completed.checked;
+    this.dispatchEvent(
+      new CustomEvent('kb-task-toggle', {
+        detail: Object.freeze({
+          taskId: this.taskId,
+          completed: this.completed,
+        }),
+        bubbles: true,
+        composed: true,
+      })
+    );
+  };
+
+  #upgradeProperty(name) {
+    if (!Object.prototype.hasOwnProperty.call(this, name)) return;
+    const value = this[name];
+    delete this[name];
+    this[name] = value;
+  }
+}
+
+customElements.define('kb-task-card', KbTaskCard);
+```
+
+Progressive markup và dữ liệu nâng cấp:
+
+```html
+<kb-task-card task-id="KB-101" priority="high">
+  <article>
+    <h3 data-title>Viết chiến lược render</h3>
+    <p data-assignee>An</p>
+  </article>
+</kb-task-card>
+
+<script type="module">
+  await customElements.whenDefined('kb-task-card');
+  const card = document.querySelector('kb-task-card');
+  card.task = {
+    title: 'Viết chiến lược render',
+    assignee: 'An',
+    labels: ['web-components', 'security'],
+  };
+</script>
+```
+
+`replaceChildren()` chỉ chạy ở lần mount đầu. Nếu phải giữ node server-rendered,
+hãy hydrate: validate và cache `data-ref` sẵn có, chỉ clone khi markup thiếu.
+Baseline này giữ progressive **content**; identity được cam kết sau mount.
+Primary control đổi implementation từ button sang checkbox, nhưng public method
+`focusPrimaryAction()` của Phần 3 vẫn giữ nguyên outcome và che selector mới.
+
+---
+
+## 5. Vì sao targeted update giữ focus và identity?
+
+`#commit()` không tạo lại checkbox. Nó chỉ gán live property `.checked`; vì vậy
+focus, selection và listener của chính node vẫn tồn tại.
+
+Bạn có thể kiểm bằng một probe:
+
+```js
+const card = document.querySelector('kb-task-card');
+await Promise.resolve(); // chờ commit đầu
+
+const checkboxBefore = card.querySelector('[data-ref="completed"]');
+checkboxBefore.focus();
+
+card.task = {
+  title: 'Tiêu đề mới',
+  assignee: 'Bình',
+  labels: ['updated'],
+};
+await Promise.resolve();
+
+const checkboxAfter = card.querySelector('[data-ref="completed"]');
+console.assert(checkboxBefore === checkboxAfter);
+console.assert(document.activeElement === checkboxAfter);
+```
+
+Thay subtree còn có thể chạy lifecycle của custom element con, hủy playback,
+scroll position hoặc editor state. Targeted update dài hơn nhưng dễ dự đoán.
+
+`queueMicrotask()` gom nhiều setter/attribute changes đồng bộ vào một commit. Nếu
+manual mapping quá lớn, Lit ở phần sau cung cấp template diffing và lifecycle.
+
+---
+
+## 6. `innerHTML` là parser boundary và XSS sink
+
+Giả sử API trả title:
+
+```text
+Sửa bug <img src=x onerror="stealSession()">
+```
+
+Code nguy hiểm:
+
+```js
+this.#refs.title.innerHTML = task.title;
+```
+
+Browser không biết đây là “text title”; nó parse string như markup. Event handler,
+URL nguy hiểm hoặc cấu trúc HTML ngoài ý muốn có thể đi vào document tùy CSP và
+ngữ cảnh. `insertAdjacentHTML()` và string đưa qua các HTML parser khác có cùng
+loại ranh giới.
+
+Code đúng cho plain text:
+
+```js
+this.#refs.title.textContent = task.title;
+```
+
+`textContent` tạo text, nên ký tự `<` hiển thị như ký tự, không thành element.
+Đây vừa an toàn hơn vừa làm contract rõ: title là text, không phải rich HTML.
+
+Nếu thật sự cần rich content, tách thành API nói rõ độ tin cậy, dùng sanitizer
+allowlist, kiểm URL protocol và áp CSP/Trusted Types khi phù hợp.
+
+DOM API không tự an toàn cho mọi context: `link.href = userValue` vẫn cần policy
+protocol/origin. Trong Kanban, task là text và template chỉ chứa static markup.
+
+### `<template>` không phải sanitizer
+
+Nội dung template inert trước khi chèn, nhưng markup độc hại không trở thành vô
+hại chỉ vì từng nằm trong `template.content`. Khi clone và insert, nó trở thành
+DOM thật. Security đến từ **nguồn string đáng tin + API đúng context**, không từ
+việc trì hoãn insertion.
+
+---
+
+## Failure modes
+
+- Gọi `innerHTML = ...` mỗi update: mất identity/focus và mở parser boundary.
+- Nội suy input vào static template: template không còn static hay trusted.
+- Gắn listener trong `#commit()`: mỗi state change nhân thêm handler.
+- Dùng `setAttribute('checked', ...)` để sync checkbox đang chạy: attribute mô tả
+  default, `.checked` mới là live property.
+- `append()` label ở mỗi commit: render không idempotent, nội dung tích lũy.
+- State nằm đồng thời trong object parent, private field và DOM mà không có owner.
+- Dùng ID giống nhau cho mọi clone trong light DOM.
+- Commit response async cũ sau response mới: render đúng DOM nhưng state sai thứ
+  tự; cần request token/AbortController như Phần 2.
+
+---
+
+## Bài tập: chứng minh render không phá UI
+
+1. Thêm ô sửa title vào template. Focus nó, đặt caret giữa chuỗi, rồi đổi
+   `priority`; xác nhận node và selection không bị thay.
+2. Thêm counter tạm trong `#commit()`. Gán `task`, `priority`, `completed` trong
+   cùng call stack và xác nhận chỉ commit một lần.
+3. Gán title là `<img src=x onerror="alert(1)">`; xác nhận nó hiển thị dưới dạng
+   text và document không có node `img` mới.
+4. Gọi cùng setter hai lần; xác nhận không có label/card/listener bị nhân đôi.
+5. Viết nhánh hydrate: nếu đủ `[data-ref]` thì cache node server-rendered, nếu
+   thiếu mới clone template.
+6. Thêm link task với allowlist `https:` và viết test từ chối `javascript:`.
+
+**Hoàn thành khi:** update giữ node checkbox, focus không nhảy, dữ liệu task
+không đi qua HTML parser và nhiều thay đổi đồng bộ chỉ tạo một commit.
+
+---
+
+## Checklist cốt lõi
+
+- Mọi input hội tụ về state/contract trước khi sửa view.
+- Mount cấu trúc một lần; commit chỉ set giá trị cuối trên node ổn định.
+- Listener thuộc connection lifecycle, không thuộc render cycle.
+- Batch được phép nhưng phải giữ thứ tự state đúng và commit khi connected.
+- Dùng property cho live state của form control.
+- `textContent` cho plain text; không nội suy dữ liệu ngoài vào `innerHTML`.
+- Template inert không phải sanitizer hay security boundary.
+- Full subtree replacement cần lý do rõ và test focus/lifecycle.
+- Khi hydration quan trọng, reuse SSR node thay vì replace mù quáng.
+
+Ở **Phần 5**, ta chuyển implementation của card vào Shadow DOM. Khi đó các
+quyết định hôm nay tiếp tục phát huy tác dụng: public API không đổi, static
+template được clone vào shadow root, targeted update vẫn giữ identity. Phần mới
+sẽ tập trung vào encapsulation thực sự — open/closed root, style boundary và
+những thứ Shadow DOM **không** cô lập.
+
+## Nguồn chính thức
+
+- [HTML Living Standard — The `template` element](https://html.spec.whatwg.org/multipage/scripting.html#the-template-element)
+- [MDN — `<template>`](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/template)
+- [MDN — `Node.textContent`](https://developer.mozilla.org/en-US/docs/Web/API/Node/textContent)
+- [MDN — `Element.innerHTML`](https://developer.mozilla.org/en-US/docs/Web/API/Element/innerHTML)
+- [MDN — `DocumentFragment`](https://developer.mozilla.org/en-US/docs/Web/API/DocumentFragment)
+- [MDN — Trusted Types API](https://developer.mozilla.org/en-US/docs/Web/API/Trusted_Types_API)
+- [W3C — Content Security Policy Level 3](https://www.w3.org/TR/CSP3/)

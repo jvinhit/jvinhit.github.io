@@ -1,29 +1,29 @@
 ---
 title: 'Three.js from Zero to Senior · Part 8 — Performance & Instancing'
-description: 'Think like a profiler: why draw calls are the real budget, InstancedMesh for thousands of objects, geometry merging, frustum culling and LOD, disposing GPU memory, and reading renderer.info — with a live instanced-vs-separate benchmark.'
+description: 'Build a first performance model: draw calls, triangles, pixels, instancing, merging, culling, LOD and resource ownership — then measure before choosing an optimization.'
 pubDate: 2026-06-09
-tags: [threejs, 3d, performance, threejs_10]
+updatedDate: 2026-07-12
+tags: [threejs, 3d, performance]
 series: threejs
 seriesOrder: 8
+lang: vi
 draft: false
 ---
+
+import DemoEmbed from '~/components/blog/DemoEmbed.astro';
 
 Ai cũng làm được scene mười vật thể chạy 60 fps. Senior làm được scene *mười nghìn* vật thể chạy 60 fps — và kỹ năng phân biệt là hiểu **frame thật sự đi đâu**.
 
 Demo vẽ cùng hàng nghìn khối theo hai cách. Đổi giữa `InstancedMesh` và mesh riêng, tăng số lượng, và xem draw call với FPS kể hai câu chuyện hoàn toàn khác.
 
-<iframe
-  src="/tools/threejs-instancing-demo/"
+<DemoEmbed
+  slug="threejs-instancing-demo"
   title="Three.js instancing and performance benchmark demo"
-  loading="lazy"
-  style="width:100%;height:760px;border:1px solid var(--color-border);border-radius:8px;background:#0a0a0a;"
-></iframe>
+/>
 
-Mở demo đầy đủ:
+## Draw call — một ngân sách, không phải ngân sách duy nhất
 
-## Draw call — ngân sách thật sự quan trọng
-
-Bản năng là đổ lỗi cho số tam giác, nhưng trên GPU hiện đại điểm nghẽn thường là **draw call**: mỗi `mesh` là một lệnh CPU gửi cho GPU ("đặt geometry này, material này, vẽ"). Một nghìn mesh riêng = một nghìn lệnh mỗi frame, và CPU dành hết thời gian *nói* thay vì GPU *vẽ*.
+Mỗi `mesh`/material group thường tạo một lệnh CPU gửi cho GPU: “dùng pipeline và resource này, vẽ geometry kia”. Một nghìn mesh riêng có thể khiến CPU tốn phần lớn frame để duyệt scene, sort và submit. Nhưng scene khác có thể nghẽn vertex, fragment/fill-rate, bandwidth, texture upload, shader compile hoặc JavaScript update. Draw call là **một giả thuyết cần đo**, không phải đáp án mặc định.
 
 Bạn đọc được số liệu trực tiếp bất cứ lúc nào:
 
@@ -33,7 +33,16 @@ console.log(renderer.info.render.triangles);  // triangles this frame
 console.log(renderer.info.memory.geometries, renderer.info.memory.textures);
 ```
 
-`renderer.info` là profiler của bạn. Nếu `calls` lên hàng trăm hay nghìn, đó là vấn đề — không phải số polygon.
+`renderer.info` là bộ đếm hữu ích, **không phải CPU/GPU profiler** và không cho VRAM chính xác. Với composer hoặc nhiều render pass, đặt `autoReset = false`, cộng cả frame rồi reset sau pass cuối; nếu không bạn có thể chỉ thấy pass cuối:
+
+```js
+renderer.info.autoReset = false;
+renderShadowAndSceneAndPost();
+readHud(renderer.info); // counters của toàn frame
+renderer.info.reset();
+```
+
+Calls cao làm CPU submission trở thành nghi phạm. Triangles cao gợi ý vertex cost; drawing-buffer pixels × overdraw × shader complexity gợi ý fragment cost. Part 22 biến các tín hiệu này thành quy trình chẩn đoán CPU/GPU đầy đủ.
 
 ## InstancedMesh — hàng nghìn vật thể, một draw call
 
@@ -56,7 +65,15 @@ scene.add(mesh);
 
 Nếu bạn animate instance mỗi frame, đặt `setUsage(THREE.DynamicDrawUsage)` để GPU biết sẽ cập nhật thường xuyên. Đánh đổi: mọi instance dùng chung một material, nên không thể có shader khác nhau — chỉ khác transform và màu (instance).
 
-Trong demo, 5.000 khối là một `InstancedMesh` = **1 draw call**; cũng 5.000 đó dạng mesh riêng = **5.000 draw call** và giật do nghẽn CPU.
+Trong pass màu của demo, 5.000 khối dùng chung geometry/material có thể thành **một draw call**; 5.000 mesh riêng tiến gần N calls. Shadow map, depth prepass hay post pipeline có thể vẽ lại và nhân chi phí — đừng biến “một instance mesh” thành lời hứa “một call cho cả frame”.
+
+Nếu transform instance thay đổi, cập nhật attribute **và** bounding volume dùng cho culling:
+
+```js
+mesh.instanceMatrix.needsUpdate = true;
+mesh.computeBoundingBox();
+mesh.computeBoundingSphere();
+```
 
 ## Gộp geometry tĩnh
 
@@ -64,11 +81,17 @@ Với vật thể không bao giờ di chuyển, dùng chung material nhưng *kh�
 
 ```js
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
-const merged = mergeGeometries([wallGeo, floorGeo, pillarGeo]);
+
+wall.updateMatrix(); floor.updateMatrix(); pillar.updateMatrix();
+const merged = mergeGeometries([
+  wallGeo.clone().applyMatrix4(wall.matrix),
+  floorGeo.clone().applyMatrix4(floor.matrix),
+  pillarGeo.clone().applyMatrix4(pillar.matrix),
+]);
 scene.add(new THREE.Mesh(merged, sharedMaterial)); // 1 draw call for the lot
 ```
 
-Instancing dành cho *cùng hình, nhiều transform*; gộp dành cho *khác hình, bố cục tĩnh*. Cả hai gom nhiều draw call thành một.
+Instancing dành cho *cùng hình, nhiều transform*; gộp dành cho *geometry tương thích, bố cục tĩnh*. Phải bake local transform trước khi merge, nếu không mọi hình chồng tại origin. Gộp còn làm culling thô hơn vì nhiều vật dùng chung một bounding volume — giảm calls nhưng có thể tăng số tam giác phải vẽ.
 
 ## Culling và mức chi tiết
 
@@ -89,7 +112,8 @@ scene.add(lod);                    // Three.js picks the level by camera distanc
 Tài nguyên GPU (geometry, material, texture, render target) **không** được thu gom rác khi bạn `scene.remove()` một vật thể. Bạn phải dispose tường minh, nếu không VRAM tăng dần tới khi tab sập — nhất là trong SPA mount/unmount scene:
 
 ```js
-function disposeMesh(mesh) {
+// Chỉ gọi khi scope này sở hữu độc quyền các resource dưới đây.
+function disposeOwnedMesh(mesh) {
   mesh.geometry.dispose();
   const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
   for (const m of mats) {
@@ -99,20 +123,20 @@ function disposeMesh(mesh) {
 }
 ```
 
-Theo dõi `renderer.info.memory.geometries` theo thời gian — nếu nó chỉ tăng, bạn có rò rỉ.
+Đoạn trên **không an toàn cho resource dùng chung**: dispose texture của một mesh có thể phá mesh khác. Production cần asset cache/ref-count hoặc resource scope biết ai sở hữu gì (Part 21). Theo dõi `renderer.info.memory.geometries/textures` qua cùng một chu kỳ mount → use → unmount; xu hướng tăng lặp lại là tín hiệu điều tra, không tự nó chứng minh số byte VRAM bị leak.
 
 ## Checklist hiệu năng của senior
 
 - **Tái dùng** geometry và material — không tạo trong loop hay mỗi frame.
 - **Instance** vật lặp; **gộp** vật tĩnh.
-- **Giới hạn pixel ratio** ~2; độ phân giải là sát thủ frame thầm lặng trên mobile.
+- **Đặt pixel-ratio cap theo quality tier**; 2 không phải con số đúng cho mọi viewport/device.
 - **Dùng LOD** và để frustum culling làm việc.
 - **Dispose** mọi thứ bạn gỡ.
-- **Đo bằng `renderer.info`** trước khi tối ưu — đo, đừng đoán.
+- **Đo nhiều lớp** — `renderer.info` cho counter; DevTools/frame capture/GPU timer cho thời gian.
 
 ## Lời cảnh báo của sư phụ
 
-- **FPS thấp với geometry đơn giản?** Là draw call, không phải tam giác.
+- **FPS thấp với geometry đơn giản?** Giảm object count để kiểm tra giả thuyết CPU submission; đừng kết luận trước khi tách CPU/GPU.
 - **Instance dồn hết ở gốc?** Bạn quên `instanceMatrix.needsUpdate = true`.
 - **Bộ nhớ tăng dần?** Bạn gỡ vật thể mà không dispose tài nguyên GPU.
 - **Instancing không giúp?** Vật thể của bạn khác material — instancing cần một material chung.
@@ -120,7 +144,7 @@ Theo dõi `renderer.info.memory.geometries` theo thời gian — nếu nó chỉ
 ## Luyện tập, không thì coi như chưa học
 
 1. Tìm vách: chế độ separate — tăng số lượng tới khi FPS dưới 30, ghi lại, rồi đổi sang instanced cùng số lượng.
-2. Đọc profiler: log `renderer.info.render.calls` ở cả hai chế độ và xác nhận 1 và N.
+2. Đọc counter: log `renderer.info.render.calls` ở cả hai chế độ, rồi bật shadow/post pass và quan sát vì sao tổng frame không còn chỉ là 1 và N.
 3. Săn rò rỉ: dựng lại scene liên tục mà không dispose và xem `memory.geometries` leo.
 
 ## Phần tiếp theo

@@ -1,0 +1,443 @@
+---
+title: 'TypeScript Production · Phần 7 — Mapped Types, Key Remapping & Schema-Derived APIs'
+description: 'Làm chủ mapped type nâng cao: homomorphic mapping, modifiers, key remapping/filtering, string-number-symbol keys và API sinh từ schema mà vẫn giữ contract dễ kiểm thử.'
+pubDate: 2026-07-12
+updatedDate: 2026-07-12
+lang: vi
+tags: [typescript, mapped-types, key-remapping, api-design]
+series: typescript
+seriesOrder: 7
+draft: false
+---
+
+Mapped type thường được giới thiệu bằng `Partial<T>` rồi dừng lại. Ở codebase
+lớn, giá trị thật của nó nằm ở chỗ khác: **giữ một source of truth và chiếu nó
+thành nhiều contract có quan hệ** — model, patch, client method, event hook hay
+permission map.
+
+Nhưng một mapped type production phải trả lời rõ:
+
+- key đến từ đâu, gồm `string`, `number`, `symbol` nào;
+- optional/readonly được giữ, thêm hay xóa;
+- key nào bị đổi tên, key nào bị lọc;
+- collision được xử lý ra sao;
+- type-level derivation có khớp runtime implementation không;
+- chi phí compiler và diagnostic có đáng với lượng duplication loại bỏ không.
+
+Bài này xây xuyên suốt một schema cho SDK. Mục tiêu là derive API đủ chính xác
+nhưng vẫn để runtime validation, test và boundary chịu trách nhiệm đúng chỗ.
+
+## Mental model: lặp qua một tập key
+
+Mapped type có key iterator và value expression:
+
+```ts
+type Transform<T> = {
+  [K in keyof T]: T[K];
+  // ^key iterator   ^value expression
+};
+```
+
+Đọc là "với mỗi `K` trong `keyof T`, tạo `output[K]` từ `T[K]`". Nó không tạo
+object runtime; nó tạo object type. Khi source thêm key, projection tự đổi —
+invariant giúp hai contract không drift vì copy-paste.
+
+## Homomorphic mapped type: chiếu mà giữ hình dạng
+
+Dạng canonical sau map trực tiếp qua `keyof T`:
+
+```ts
+type Identity<T> = {
+  [K in keyof T]: T[K];
+};
+```
+
+Compiler nhận ra đây là phép chiếu theo source type. Optional và readonly của
+từng property được giữ:
+
+```ts
+type Account = {
+  readonly id: string;
+  displayName?: string;
+  active: boolean;
+};
+```
+
+`Identity<Account>` vẫn có readonly `id`, optional `displayName` và required
+`active`. Kiểu chiếu giữ cấu trúc này được gọi là **homomorphic**: modifier có
+source property để được bảo toàn.
+
+Nếu tập key được dựng độc lập, compiler không có source property tương ứng để
+"copy" modifier:
+
+```ts
+type Status = { [K in 'idle' | 'loading' | 'failed']: boolean };
+```
+
+`Status` là object mới; mọi property required và mutable theo chính mapping.
+
+## Mapping modifiers: thêm và xóa có chủ đích
+
+Mapped type có thể điều khiển `readonly` và `?` bằng `+`/`-`. Dấu `+` là mặc
+định nên thường được bỏ qua.
+
+```ts
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+type RequiredSnapshot<T> = { readonly [K in keyof T]-?: T[K] };
+```
+
+`Mutable<Account>` xóa readonly nhưng giữ optional. `RequiredSnapshot<Account>`
+thêm readonly và xóa optional.
+
+Policy phải rõ: không ghi modifier để preserve, dùng `readonly`/`?` để thêm,
+`-readonly`/`-?` để xóa. Tránh `Normalize<T>` âm thầm làm mọi field required.
+
+## Key remapping với `as`
+
+TypeScript cho phép tính output key riêng với source key:
+
+```ts
+type Getters<T> = {
+  [K in keyof T as K extends string
+    ? `get${Capitalize<K>}`
+    : never]: () => T[K];
+};
+```
+
+`K in keyof T` chọn source property, expression sau `as` tạo output key, còn
+`T[K]` vẫn đọc value bằng source key.
+
+`K extends string` là policy: template literal key chỉ áp dụng cho string. Nhánh
+`never` loại numeric/symbol key khỏi output.
+
+## Filter key bằng `never`
+
+Trong vị trí key remapping, `never` có nghĩa "không emit property này":
+
+```ts
+type Without<T, Key> = {
+  [K in keyof T as K extends Key ? never : K]: T[K];
+};
+type EventPayload = Without<
+  { kind: 'user.created'; id: string; at: string },
+  'kind'
+>;
+```
+
+```ts
+type FunctionKeys<T> = {
+  [K in keyof T]-?: NonNullable<T[K]> extends (...args: never[]) => unknown
+    ? K
+    : never;
+}[keyof T];
+
+type MethodsOnly<T> = Pick<T, FunctionKeys<T>>;
+```
+
+`-?` ngăn key union lẫn thêm `undefined`; `NonNullable` nói rằng optional method
+vẫn là method khi tồn tại. Policy khác có thể bỏ nó — predicate phải phản ánh
+domain question, không chỉ làm test xanh.
+
+## Giữ optional/readonly khi filter
+
+Tính tập key rồi `Pick` từ source làm preservation dễ review:
+
+```ts
+type KeysMatching<T, Value> = {
+  [K in keyof T]-?: NonNullable<T[K]> extends Value ? K : never;
+}[keyof T];
+
+type PickMatching<T, Value> = Pick<T, KeysMatching<T, Value>>;
+```
+
+Với public utility mà preservation là contract quan trọng, bản hai bước thường
+dễ review hơn: `Pick` nói rõ output là một subset của source, nên readonly và
+optional phải được giữ.
+
+```ts
+type Profile = {
+  readonly id: string;
+  nickname?: string;
+  age: number;
+};
+
+type TextFields = PickMatching<Profile, string>;
+declare const text: TextFields;
+// @ts-expect-error — id vẫn readonly
+text.id = 'other';
+const nickname: string | undefined = text.nickname;
+```
+
+`Pick` nói rõ output là subset của source, nên readonly/optional được giữ. Khóa
+contract bằng assignment test và `@ts-expect-error`, không chỉ nhìn hover.
+
+## String, number và symbol key: chọn preserve hay drop
+
+Giả sử domain type có cả ba loại key:
+
+```ts
+declare const trace: unique symbol;
+type Resource = {
+  readonly [trace]: { traceId: string };
+  0: string;
+  displayName?: string;
+};
+```
+
+Nếu chỉ muốn prefix string key nhưng giữ nguyên key còn lại:
+
+```ts
+type PrefixStringKeys<T> = {
+  [K in keyof T as K extends string ? `api_${K}` : K]: T[K];
+};
+
+type ApiResource = PrefixStringKeys<Resource>;
+// giữ [trace] và 0; đổi displayName -> api_displayName
+```
+
+Nếu JSON contract chỉ chấp nhận string, nhánh non-string có thể trả `never`.
+Encode policy bằng conditional branch rõ; `Capitalize<string & K>` ngắn nhưng
+dễ che việc number/symbol bị loại.
+
+## Production case: schema field làm source of truth
+
+Ta dùng parser interface tối giản. Mỗi parser vừa validate runtime input, vừa
+mang output type:
+
+```ts
+interface Parser<Output> {
+  parse(input: unknown): Output;
+}
+
+type UserId = string & { readonly __userId: unique symbol };
+type OutputOf<P> = P extends Parser<infer Output> ? Output : never;
+
+type FieldSpec = {
+  parser: Parser<unknown>;
+  optional?: boolean;
+  readonly?: boolean;
+};
+
+type ObjectSchema = Record<PropertyKey, FieldSpec>;
+```
+
+Các parser thật có thể đến từ thư viện schema hoặc adapter nội bộ:
+
+```ts
+declare const userIdParser: Parser<UserId>;
+declare const stringParser: Parser<string>;
+declare const planParser: Parser<'free' | 'pro'>;
+declare const dateParser: Parser<Date>;
+
+const userSchema = {
+  id: { parser: userIdParser, readonly: true },
+  displayName: { parser: stringParser },
+  nickname: { parser: stringParser, optional: true },
+  plan: { parser: planParser },
+  createdAt: { parser: dateParser, readonly: true },
+} as const satisfies ObjectSchema;
+```
+
+`satisfies` kiểm shape nhưng vẫn giữ literal `true` cho metadata. Nếu annotate
+thẳng `: ObjectSchema`, các key và literal flag có thể bị widen, làm derivation
+mất độ chính xác.
+
+`ModelOf` không parse dữ liệu; parser runtime mới tạo bằng chứng từ `unknown`.
+
+## Tính key set từ metadata
+
+Tách việc chọn key khỏi việc dựng object:
+
+```ts
+type KeysWithFlag<
+  S extends ObjectSchema,
+  Flag extends 'optional' | 'readonly',
+> = {
+  [K in keyof S]-?: S[K] extends Record<Flag, true> ? K : never;
+}[keyof S];
+
+type OptionalKeys<S extends ObjectSchema> = KeysWithFlag<S, 'optional'>;
+type ReadonlyKeys<S extends ObjectSchema> = KeysWithFlag<S, 'readonly'>;
+type RequiredKeys<S extends ObjectSchema> = Exclude<keyof S, OptionalKeys<S>>;
+type MutableKeys<S extends ObjectSchema> = Exclude<keyof S, ReadonlyKeys<S>>;
+```
+
+`-?` giữ union key không lẫn `undefined`. Các alias có tên cho reviewer thấy
+policy, đồng thời cho type checker cơ hội cache thay vì lặp biểu thức anonymous.
+
+## Derive model mà giữ modifier
+
+Ta tạo bốn quadrant rồi intersect:
+
+```ts
+type ValueAt<S extends ObjectSchema, K extends keyof S> = OutputOf<
+  S[K]['parser']
+>;
+
+type ModelOf<S extends ObjectSchema> = {
+  readonly [K in Extract<RequiredKeys<S>, ReadonlyKeys<S>>]: ValueAt<S, K>;
+} & {
+  [K in Extract<RequiredKeys<S>, MutableKeys<S>>]: ValueAt<S, K>;
+} & {
+  readonly [K in Extract<OptionalKeys<S>, ReadonlyKeys<S>>]?: ValueAt<S, K>;
+} & {
+  [K in Extract<OptionalKeys<S>, MutableKeys<S>>]?: ValueAt<S, K>;
+};
+
+type User = ModelOf<typeof userSchema>;
+```
+
+Kết quả về semantics:
+
+```ts
+declare const user: User;
+user.displayName = 'Ada';
+// @ts-expect-error — id đến từ readonly field
+user.id = user.id;
+const maybeNickname: string | undefined = user.nickname;
+```
+
+`Prettify<T>` có thể làm hover phẳng hơn nhưng không xóa chi phí phép tính gốc.
+Public alias có tên và type tests quan trọng hơn hover đẹp.
+
+## Derive SDK methods từ operation schema
+
+Cùng pattern áp dụng cho operation registry:
+
+```ts
+type Operation<Input, Output> = {
+  input: Parser<Input>;
+  output: Parser<Output>;
+};
+
+type OperationMap = Record<string, Operation<unknown, unknown>>;
+type InputOfOperation<T> = T extends Operation<infer I, unknown> ? I : never;
+type OutputOfOperation<T> = T extends Operation<unknown, infer O> ? O : never;
+```
+
+```ts
+type ClientFor<Ops extends OperationMap> = {
+  [K in keyof Ops]: (
+    input: InputOfOperation<Ops[K]>,
+    options?: { signal?: AbortSignal }
+  ) => Promise<OutputOfOperation<Ops[K]>>;
+};
+type SuccessHooks<Ops extends OperationMap> = {
+  [K in keyof Ops as K extends string ? `on${Capitalize<K>}Success` : never]?: (
+    output: OutputOfOperation<Ops[K]>
+  ) => void;
+};
+```
+
+Registry là source of truth cho method, input, output và hook. Runtime factory
+vẫn phải tạo đủ method, gọi transport và parse response; type test không thay
+integration test.
+
+## Type tests cho schema-derived API
+
+```ts
+type Compare<T> = <Candidate>() => Candidate extends T ? 1 : 2;
+type Equal<A, B> = Compare<A> extends Compare<B> ? true : false;
+type Expect<T extends true> = T;
+type _Optional = Expect<Equal<OptionalKeys<typeof userSchema>, 'nickname'>>;
+type _Readonly = Expect<
+  Equal<ReadonlyKeys<typeof userSchema>, 'id' | 'createdAt'>
+>;
+type _Nickname = Expect<Equal<User['nickname'], string | undefined>>;
+```
+
+Thêm assignment tests cho modifier, call-site tests cho generated client và
+negative tests cho key không tồn tại.
+
+```ts
+type MyOperations = { getUser: Operation<{ id: string }, User> };
+declare const client: ClientFor<MyOperations>;
+await client.getUser({ id: 'usr_1' });
+// @ts-expect-error — operation không có trong registry
+await client.removeEverything({});
+```
+
+Khi schema thay đổi, test phải cho biết đó là thay đổi có chủ đích hay accidental
+type-semver break.
+
+## Failure modes thường gặp
+
+- **`Record` không giữ modifier:** dùng `Pick` cho subset hoặc map trực tiếp qua
+  `keyof T` khi cần preserve source shape.
+- **String transform drop number/symbol:** branch rõ non-string key; preserve,
+  reject hay drop phải khớp runtime.
+- **Optional field lẫn `undefined`:** chọn có chủ đích giữa `NonNullable<T[K]>`,
+  `Required<T>[K]` và việc loại field.
+- **Key collision:** case conversion có thể dồn hai key thành một; validate schema
+  lúc khởi tạo và throw thay vì chọn winner ngầm.
+- **Type nói nhiều hơn runtime:** factory cast `ClientFor<Ops>` vẫn có thể thiếu
+  method; test keys và gọi từng method với fixture transport.
+- **Leak implementation:** export `Client`/`UserPatch`, giữ machinery private nếu
+  không cam kết type-semver cho nó.
+
+## Chi phí compiler và boundary
+
+Mapped type một tầng qua vài chục key thường rẻ. Chi phí tăng khi:
+
+- mỗi key chạy conditional phân phối trên union lớn;
+- remap tạo template literal cross-product;
+- recursion thiếu điểm dừng hoặc cùng biểu thức anonymous bị lặp nhiều lần;
+- intersection lớn tiếp tục bị map qua nhiều vòng.
+
+Guardrail production:
+
+- đặt tên cho intermediate key sets và output types;
+- derive một lần ở boundary, không transform lại ở mọi component;
+- tránh `DeepPartial`/`DeepReadonly` tổng quát nếu domain chỉ cần hai tầng;
+- không recurse ngoài ý muốn vào `Date`, `Map`, function hay branded primitive;
+- annotate public return bằng alias có tên;
+- đo `tsc --extendedDiagnostics` và trace khi editor lag;
+- giới hạn schema size hoặc chia registry theo bounded context.
+
+Mapped type tốt giảm duplication. Nếu nó làm diagnostic dài hơn code bị loại bỏ,
+boundary đã đi quá xa.
+
+## Decision rules
+
+- Map qua `keyof T` khi output là phép chiếu của source object.
+- Ghi modifier explicit khi policy thêm/xóa; đừng giấu trong tên chung chung.
+- Phân biệt optional property với value union `undefined`.
+- Dùng `as` để rename; dùng `never` để filter key.
+- Dùng `Pick<T, Keys>` khi subset phải giữ modifier một cách dễ review.
+- Viết branch rõ cho string/number/symbol key.
+- Ngăn key collision ở schema/runtime boundary.
+- Derive type từ runtime schema chỉ khi schema thật sự được runtime dùng.
+- Export contract có tên, giữ machinery private.
+- Test output, modifier, invalid key và runtime factory cùng nhau.
+- Đo compile/editor cost trước khi thêm recursive mapped type.
+
+## Lab
+
+Xây một schema-derived SDK cho ba resource: `user`, `invoice`, `auditEntry`.
+
+Yêu cầu:
+
+1. Mỗi field có parser, `optional`, `readonly`, và `writeOnly` metadata.
+2. Derive `ModelOf<S>`, `CreateInputOf<S>`, `PatchOf<S>`.
+3. `CreateInputOf` loại readonly field; `PatchOf` không cho sửa readonly và làm
+   field còn lại optional.
+4. Derive getter method chỉ cho string key, nhưng chứng minh symbol metadata không
+   vô tình xuất hiện trong JSON contract.
+5. Detect hai source field remap về cùng wire name và throw khi build schema.
+6. Viết type tests cho optional/readonly preservation và ít nhất sáu
+   `@ts-expect-error` cases.
+7. Viết runtime tests cho missing required field, unknown key, parser failure và
+   write-only serialization.
+8. Đo `tsc --extendedDiagnostics` trước/sau khi thêm resource thứ ba.
+
+**Done khi:** schema là source of truth thật ở cả runtime lẫn compile time,
+generated API không expose key sai, modifier được khóa bằng test, collision fail
+sớm, và helper type vẫn đọc được mà không cần giải mã một biểu thức lồng sâu.
+
+## Tài liệu chính thức
+
+- [Mapped Types — TypeScript Handbook](https://www.typescriptlang.org/docs/handbook/2/mapped-types.html)
+- [`keyof` Type Operator](https://www.typescriptlang.org/docs/handbook/2/keyof-types.html)
+- [Template Literal Types](https://www.typescriptlang.org/docs/handbook/2/template-literal-types.html)
+- [TypeScript 4.1: Key Remapping in Mapped Types](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-1.html#key-remapping-in-mapped-types)
+- [TypeScript Performance Wiki](https://github.com/microsoft/TypeScript/wiki/Performance)

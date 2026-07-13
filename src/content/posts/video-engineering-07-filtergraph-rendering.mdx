@@ -1,0 +1,240 @@
+---
+title: 'Video Engineering · Phần 7 — Filtergraph và video rendering với FFmpeg'
+description: 'Xây renderer bằng filtergraph: scale, crop, pad, overlay, drawtext, burn subtitle và mix audio; đồng thời quản lý pad, timestamp, aspect ratio và encoding đầu ra.'
+pubDate: 2026-07-12
+lang: vi
+tags:
+  [video-engineering, video, ffmpeg, filtergraph, video-rendering, audio-mixing]
+series: video-engineering
+seriesOrder: 7
+draft: false
+---
+
+Một renderer video không nhất thiết là ứng dụng có timeline kéo-thả. Cần phân
+biệt hai nghĩa trong series: **playback renderer/compositor** ở Phần 2 chọn
+frame đã decode để trình bày realtime; còn bài này xây một **offline render
+pipeline** nhận video, ảnh, chữ, subtitle và audio, compose theo timeline rồi
+encode thành file mới. FFmpeg filtergraph cho ta mô hình thứ hai bằng CLI.
+
+Bài này dựng một clip dọc 1080×1920 từ fixture ngang, thêm logo, text, subtitle và nhạc nền. Quan trọng hơn output cuối cùng là cách đọc graph: mỗi label là một pad có loại dữ liệu và timeline cụ thể.
+
+---
+
+## 1. Chuẩn bị fixture cục bộ
+
+Tạo clip chính 12 giây có video test và âm thanh 440 Hz:
+
+```bash
+ffmpeg -hide_banner -y -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=12" -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=12" -map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 20 -c:a aac -b:a 128k scene.mp4
+```
+
+Tạo một ảnh logo màu xanh có alpha:
+
+```bash
+ffmpeg -hide_banner -y -f lavfi -i "color=c=0x22c55e@0.85:s=240x80:d=1,format=rgba" -frames:v 1 -update 1 logo.png
+```
+
+Tạo subtitle SRT mà không cần editor:
+
+```bash
+printf '%s\n' '1' '00:00:00,500 --> 00:00:04,000' 'Renderer là một media graph' '' '2' '00:00:05,000 --> 00:00:09,000' 'Mỗi label là một pad dữ liệu' '' > ve07-captions.srt
+```
+
+Ta sẽ tạo nhạc nền bằng `lavfi` ngay trong lệnh render, nên không cần thêm file. Kiểm tra các filter có trong build:
+
+```bash
+ffmpeg -hide_banner -filters
+```
+
+`drawtext` thường cần FreeType/fontconfig; `subtitles` cần libass. Nếu build thiếu chúng, FFmpeg sẽ báo “No such filter”. Đây là khác biệt build-time, không phải lỗi cú pháp graph.
+
+---
+
+## 2. Filter đơn giản và filter phức tạp
+
+`-vf` mô tả một video filterchain có một input và một output:
+
+```bash
+ffmpeg -hide_banner -y -i scene.mp4 -vf "scale=640:360,format=yuv420p" -c:v libx264 -crf 21 -preset medium -c:a copy scaled.mp4
+```
+
+Dấu phẩy nối filter **tuần tự**: frame đi qua `scale`, rồi `format`. `-af` làm điều tương tự cho audio.
+
+Khi có nhiều input, nhiều nhánh hoặc nhiều output pad, dùng `-filter_complex`. Cú pháp khái niệm:
+
+```text
+[input pad] filter,filter [named pad];
+[another input] filter [another pad];
+[named pad][another pad] combining-filter [output pad]
+```
+
+Input pad như `[0:v]` nghĩa là video từ input 0. Label như `[base]` do ta đặt, không phải tên đặc biệt. `-map "[vout]"` nối pad cuối tới output file.
+
+---
+
+## 3. Fit bằng scale + pad
+
+Muốn đưa video 16:9 vào canvas dọc mà không cắt nội dung:
+
+```bash
+ffmpeg -hide_banner -y -i scene.mp4 -vf "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1" -c:v libx264 -crf 21 -preset medium -pix_fmt yuv420p -c:a copy portrait-fit.mp4
+```
+
+`scale` thu/phóng tới kích thước lớn nhất vẫn nằm trong 1080×1920. `pad` tạo canvas đúng kích thước và đặt hình vào giữa. `setsar=1` chuẩn hóa sample aspect ratio để pixel vuông; nó không thay đổi display aspect bằng cách kéo giãn frame.
+
+Với input ngang, kết quả có vùng trống lớn trên/dưới. Đó là lựa chọn “fit”: giữ toàn bộ nội dung.
+
+---
+
+## 4. Fill bằng scale + crop
+
+Muốn lấp kín canvas và chấp nhận cắt hai bên:
+
+```bash
+ffmpeg -hide_banner -y -i scene.mp4 -vf "scale=w=1080:h=1920:force_original_aspect_ratio=increase:force_divisible_by=2,crop=1080:1920:(iw-ow)/2:(ih-oh)/2,setsar=1" -c:v libx264 -crf 21 -preset medium -pix_fmt yuv420p -c:a copy portrait-fill.mp4
+```
+
+`increase` bảo đảm cả hai chiều sau scale không nhỏ hơn canvas; `crop` lấy vùng giữa. Đây là “center crop”, chưa phải smart crop. Với phỏng vấn, chủ thể lệch trái có thể bị cắt mất; renderer production cần focal point từ người dùng, face tracking hoặc metadata vùng quan tâm.
+
+Đừng viết `scale=1080:1920` trực tiếp nếu mục tiêu là giữ tỉ lệ. Cách đó ép mọi input thành 9:16 và làm mặt người méo.
+
+---
+
+## 5. Overlay và framesync
+
+`overlay` nhận hai video input: base và lớp phủ. Ví dụ nhanh:
+
+```bash
+ffmpeg -hide_banner -y -i scene.mp4 -loop 1 -i logo.png -filter_complex "[0:v][1:v]overlay=x=W-w-32:y=32:shortest=1[v]" -map "[v]" -map 0:a:0 -c:v libx264 -crf 21 -preset medium -pix_fmt yuv420p -c:a copy with-logo.mp4
+```
+
+`-loop 1` là input option của ảnh, nên đứng trước `-i logo.png`. Biến `W/H` là kích thước main input; `w/h` là kích thước overlay. `shortest=1` kết thúc output overlay khi input ngắn nhất kết thúc. Nếu ảnh không loop, nó chỉ có một frame; tùy timestamp và framesync option, logo có thể biến mất hoặc graph kết thúc sớm.
+
+Khi input có timestamp bắt đầu khác 0, chuẩn hóa trước:
+
+```text
+[0:v]setpts=PTS-STARTPTS[base];
+[1:v]setpts=PTS-STARTPTS[logo];
+[base][logo]overlay=32:32[vout]
+```
+
+`setpts` không “sửa mọi lỗi sync”; nó cố ý đặt lại gốc timeline. Chỉ dùng khi semantics của composition thực sự muốn các nguồn cùng bắt đầu tại 0.
+
+---
+
+## 6. Drawtext và subtitle là hai bài toán khác nhau
+
+`drawtext` phù hợp với title, watermark, timecode hoặc dữ liệu động:
+
+```bash
+ffmpeg -hide_banner -y -i scene.mp4 -vf "drawtext=font='Sans':text='Video Engineering':x=48:y=h-th-48:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=16" -c:v libx264 -crf 21 -preset medium -pix_fmt yuv420p -c:a copy title-card.mp4
+```
+
+Ví dụ dùng tên font generic để ngắn gọn, nhưng renderer production nên đóng gói font có license và truyền `fontfile` rõ ràng. Font fallback khác nhau có thể thay đổi kích thước chữ, line break và cả glyph tiếng Việt.
+
+`subtitles` parse SRT/ASS qua libass và **burn** chữ vào pixel:
+
+```bash
+ffmpeg -hide_banner -y -i scene.mp4 -vf "subtitles=filename='ve07-captions.srt':force_style='FontName=Sans,FontSize=22,Outline=1'" -c:v libx264 -crf 21 -preset medium -pix_fmt yuv420p -c:a copy burned-subtitles.mp4
+```
+
+Sau khi burn, subtitle không còn là track có thể bật/tắt. Nếu cần accessibility, localization hoặc nhiều ngôn ngữ, hãy giữ subtitle mềm trong container/player; Phần 8 xử lý trường hợp đó.
+
+Đường dẫn chứa dấu nháy, dấu hai chấm hoặc backslash cần escape ở cả tầng shell và tầng filter parser. Cách ít lỗi nhất là dùng tên file tương đối đơn giản hoặc sinh filter script riêng cho graph lớn.
+
+---
+
+## 7. Mix audio có chủ đích
+
+Audio mix không nên chỉ cộng hai tín hiệu ở full volume vì dễ clipping. Ví dụ trộn audio gốc với tone nền nhỏ:
+
+```bash
+ffmpeg -hide_banner -y -i scene.mp4 -f lavfi -i "sine=frequency=220:sample_rate=48000:duration=12" -filter_complex "[0:a]volume=1.0[main];[1:a]volume=0.10[music];[main][music]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.95[aout]" -map 0:v:0 -map "[aout]" -c:v copy -c:a aac -b:a 160k mixed-audio.mp4
+```
+
+Video được copy, audio được decode → filter → encode. `duration=first` lấy thời lượng audio chính làm chuẩn; `alimiter` hạn chế peak sau mix. Đây chưa phải loudness mastering. Với nội dung xuất bản, đo LUFS bằng `loudnorm` và dùng quy trình two-pass nếu cần loudness nhất quán.
+
+Muốn duck nhạc theo lời nói cần sidechain compression, không phải một `volume=0.1` cố định. Bắt đầu bằng mix đơn giản để graph đúng trước, rồi mới thêm dynamics processing.
+
+---
+
+## 8. Ghép renderer hoàn chỉnh
+
+Lệnh sau kết nối tất cả node. Chuỗi `-filter_complex` được đặt trong một cặp nháy kép; newline bên trong vẫn là một argument shell:
+
+```bash
+ffmpeg -hide_banner -y -i scene.mp4 -loop 1 -i logo.png -f lavfi -i "sine=frequency=220:sample_rate=48000:duration=12" -filter_complex "
+[0:v]scale=w=1080:h=1920:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x111827,setsar=1[base];
+[1:v]format=rgba,colorchannelmixer=aa=0.85[logo];
+[base][logo]overlay=x=W-w-48:y=48:shortest=1,drawtext=font='Sans':text='Video Engineering':x=48:y=h-th-56:fontsize=44:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=14,subtitles=filename='ve07-captions.srt':force_style='FontName=Sans,FontSize=18'[vout];
+[0:a]volume=1.0[main];
+[2:a]volume=0.10[music];
+[main][music]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.95[aout]
+" -map "[vout]" -map "[aout]" -c:v libx264 -preset medium -crf 21 -pix_fmt yuv420p -c:a aac -b:a 160k -movflags +faststart -shortest rendered.mp4
+```
+
+Đọc graph theo năm bước:
+
+1. `[0:v]` thành canvas `[base]`.
+2. `[1:v]` chuẩn hóa alpha thành `[logo]`.
+3. Base + logo → drawtext → subtitles → `[vout]`.
+4. Audio chính và nhạc được gain, mix, limit → `[aout]`.
+5. Hai pad cuối được map, encode và mux vào MP4.
+
+Renderer production thường tách graph thành các phase: normalize input, timeline edit, visual composition, audio mix, output encode và verification. Tách tư duy như vậy giúp tìm lỗi nhanh hơn một chuỗi filter khổng lồ.
+
+---
+
+## 9. Chất lượng và hiệu năng
+
+- Scale về kích thước làm việc sớm nếu các overlay sau không cần full resolution.
+- Tránh đổi RGB ↔ YUV hoặc 8-bit ↔ 10-bit nhiều lần; xác định pixel/color pipeline trước.
+- Hardware decoder không đảm bảo toàn graph ở GPU. Một software-only filter có thể kéo frame về RAM, làm mất lợi ích.
+- `-preset` đổi trade-off tốc độ/nén của encoder, không sửa graph sai.
+- Luôn probe output và xem vài frame ở đầu, giữa, cuối. Kiểm tra cả audio peak, subtitle glyph và duration.
+
+Để render một đoạn ngắn khi lặp graph, dùng input nhỏ hoặc giới hạn output bằng `-t`. Tối ưu sau khi kết quả đúng và có benchmark, không dựa trên cảm giác.
+
+---
+
+## Failure checklist
+
+- [ ] Scale ép thẳng 1080×1920 làm méo aspect ratio.
+- [ ] Quên `setsar=1` sau normalize kích thước.
+- [ ] Nhầm fit/pad với fill/crop.
+- [ ] Không loop ảnh hoặc không hiểu `shortest` của framesync.
+- [ ] Các input có timestamp gốc khác nhau nhưng overlay như cùng timeline.
+- [ ] Dùng font phụ thuộc máy và bỏ sót glyph tiếng Việt.
+- [ ] Burn subtitle dù sản phẩm cần bật/tắt hay đổi ngôn ngữ.
+- [ ] Mix hai audio ở full volume gây clipping.
+- [ ] Dùng `-c copy` cho stream đã đi qua filter.
+- [ ] Không map pad cuối hoặc map nhầm audio/video input.
+- [ ] Chuyển hardware frame về CPU qua filter mà không đo chi phí.
+
+---
+
+## Bài tập
+
+**1.** Tạo hai output dọc từ `scene.mp4`: một bản fit có nền xanh đậm, một bản fill center-crop. Chụp frame giữa và giải thích phần nội dung bị giữ/cắt.
+
+**2.** Di chuyển logo qua bốn góc bằng biểu thức `W`, `H`, `w`, `h`. Thử bỏ `-loop 1` để quan sát framesync.
+
+**3.** Đổi audio nền thành 0.5 rồi bỏ limiter. Dùng `astats` hoặc meter phù hợp để kiểm tra peak; không chỉ nghe bằng tai.
+
+**Nâng cao:** thêm một input portrait khác, chuẩn hóa timestamp bằng `setpts`, rồi dùng `enable='between(t,3,7)'` để overlay nó trong bốn giây. Viết graph ra giấy trước khi gõ lệnh.
+
+---
+
+## Đọc thêm
+
+- [Tài liệu FFmpeg Filters chính thức](https://ffmpeg.org/ffmpeg-filters.html)
+- [Cú pháp filtergraph](https://ffmpeg.org/ffmpeg-filters.html#Filtergraph-syntax-1)
+- [Video filter overlay](https://ffmpeg.org/ffmpeg-filters.html#overlay-1)
+- [Audio filter amix](https://ffmpeg.org/ffmpeg-filters.html#amix)
+- [Tài liệu ffmpeg CLI](https://ffmpeg.org/ffmpeg.html)
+
+---
+
+## Bài kế tiếp
+
+[Phần 8 — Cắt, nối video và quản lý audio/subtitle đúng cách](/blog/video-engineering-08-cut-concat-audio-subtitle/)

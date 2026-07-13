@@ -1,0 +1,322 @@
+---
+title: 'Video Engineering · Phần 9 — HTML video, progressive download và HTTP Range'
+description: 'Theo một file MP4 từ server vào thẻ video: moov/mdat, faststart, byte-range, MIME, CORS, autoplay, buffered/seekable và quy trình debug progressive playback.'
+pubDate: 2026-07-12
+lang: vi
+tags: [video-engineering, video, web-media, html-video, mp4, http-range, cors]
+series: video-engineering
+seriesOrder: 9
+draft: false
+---
+
+Một file MP4 mở được trên máy chưa chắc phát tốt trên web. Player có thể đợi tải gần hết file, seek quay về đầu, chạy trên Chrome nhưng màn hình đen ở Safari, hoặc phát được mà canvas không đọc nổi pixel. Những lỗi này thường không nằm ở một chỗ: container, codec, cách đặt metadata trong file, HTTP response và policy của browser cùng tham gia.
+
+Bài này bắt đầu chặng **video trong trình duyệt** bằng đường đi đơn giản nhất: một URL file media gắn trực tiếp vào `<video>`. Khi hiểu progressive download, ta mới thấy rõ HLS và MSE giải quyết thêm vấn đề gì.
+
+## 1. Mental model: browser không “mở MP4” trong một bước
+
+```text
+<video src="movie.mp4">
+        │
+        ├─ HTTP: status, Range, cache, CORS
+        ▼
+  MP4 demuxer: moov + sample tables + mdat
+        │
+        ├─ encoded video packets ─► video decoder ─► frames
+        └─ encoded audio packets ─► audio decoder ─► samples
+                                      │
+                            media clock + A/V sync
+                                      │
+                              compositor / speaker
+```
+
+**MP4 là container**, không phải codec. Hai file cùng đuôi `.mp4` có thể chứa H.264, HEVC, AV1, AAC hoặc codec khác. Browser quyết định hỗ trợ dựa trên cả container, codec/profile/level, hệ điều hành, phần cứng và build của browser; đừng suy ra chỉ từ extension.
+
+Kiểm tra sơ bộ bằng MIME cộng codec string:
+
+```js
+const video = document.createElement('video');
+
+console.log(video.canPlayType('video/mp4; codecs="avc1.64001f, mp4a.40.2"'));
+// "probably", "maybe" hoặc "" — không phải cam kết playback sẽ luôn mượt.
+```
+
+`canPlayType()` trả khả năng decode cơ bản. Nếu phải chọn rendition theo độ mượt và hiệu quả năng lượng, xem thêm `navigator.mediaCapabilities.decodingInfo()`.
+
+## 2. Tạo fixture web-friendly hoàn toàn cục bộ
+
+Ta tạo video 20 giây, có timecode và âm thanh tổng hợp, không cần tải asset bên ngoài:
+
+```bash
+ffmpeg \
+  -f lavfi -i "testsrc2=size=1280x720:rate=30" \
+  -f lavfi -i "sine=frequency=880:sample_rate=48000" \
+  -t 20 \
+  -c:v libx264 -preset medium -crf 23 \
+  -profile:v high -level:v 3.1 \
+  -pix_fmt yuv420p -g 60 -keyint_min 60 -sc_threshold 0 \
+  -c:a aac -b:a 128k \
+  -movflags +faststart \
+  progressive.mp4
+```
+
+`-movflags +faststart` di chuyển metadata `moov` lên đầu file sau khi mux. Với MP4 không fragmented, `moov` chứa sample table giúp demuxer biết sample nằm ở byte nào và timestamp nào. Nếu `moov` ở cuối, client có thể phải request phần cuối trước hoặc chờ thêm dữ liệu rồi mới khởi động.
+
+Kiểm tra vị trí tương đối mà không cần tool MP4 chuyên dụng:
+
+```bash
+grep -aob -m1 'moov' progressive.mp4
+grep -aob -m1 'mdat' progressive.mp4
+```
+
+Đây chỉ là kiểm tra nhanh chuỗi box type, không thay cho parser ISO BMFF. Dùng `ffprobe` để xác nhận stream:
+
+```bash
+ffprobe -v error \
+  -show_entries format=format_name,duration,size,bit_rate \
+  -show_entries stream=index,codec_type,codec_name,profile,width,height,pix_fmt \
+  -of json progressive.mp4
+```
+
+## 3. HTTP Range là nền cho seek và tải có chọn lọc
+
+Khi biết vị trí sample, browser không nhất thiết tải từ byte 0 tới cuối. Nó có thể gửi:
+
+```http
+GET /progressive.mp4 HTTP/1.1
+Range: bytes=1048576-2097151
+```
+
+Server hỗ trợ range trả:
+
+```http
+HTTP/1.1 206 Partial Content
+Accept-Ranges: bytes
+Content-Range: bytes 1048576-2097151/9428134
+Content-Length: 1048576
+Content-Type: video/mp4
+```
+
+Để lab tái lập được, lưu server tối thiểu sau thành `range_server.py`. Nó chỉ
+phục vụ một file và một byte range mỗi request; đây là fixture kiểm thử, không
+phải static server production:
+
+```python
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ASSET = Path("progressive.mp4")
+
+class Handler(BaseHTTPRequestHandler):
+    def serve_asset(self, include_body):
+        if self.path.split("?", 1)[0] != "/progressive.mp4":
+            self.send_error(404)
+            return
+
+        size = ASSET.stat().st_size
+        start, end, status = 0, size - 1, 200
+        value = self.headers.get("Range")
+
+        if value:
+            try:
+                unit, spec = value.split("=", 1)
+                first, last = spec.split("-", 1)
+                if unit != "bytes" or "," in spec:
+                    raise ValueError
+                if first:
+                    start = int(first)
+                    end = int(last) if last else size - 1
+                else:
+                    length = int(last)
+                    start = max(0, size - length)
+                    end = size - 1
+                if start < 0 or start >= size or end < start:
+                    raise ValueError
+                end = min(end, size - 1)
+                status = 206
+            except (ValueError, TypeError):
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+
+        if include_body:
+            with ASSET.open("rb") as source:
+                source.seek(start)
+                remaining = length
+                while remaining:
+                    chunk = source.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+
+    def do_GET(self):
+        self.serve_asset(include_body=True)
+
+    def do_HEAD(self):
+        self.serve_asset(include_body=False)
+
+ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
+```
+
+Chạy server rồi kiểm tra bằng `curl`:
+
+```bash
+python3 range_server.py
+
+# Chạy hai lệnh dưới ở terminal khác.
+curl -I http://localhost:8080/progressive.mp4
+curl -sS -D - -o /dev/null \
+  -H 'Range: bytes=0-1023' \
+  http://localhost:8080/progressive.mp4
+```
+
+Request thứ hai nên nhận `206` cùng `Content-Range`. `200` không tự động nghĩa là file không phát, nhưng server bỏ qua Range có thể làm seek tốn kém hoặc không hoạt động như mong đợi. `416 Range Not Satisfiable` thường báo range sai hoặc proxy/origin bất đồng về kích thước file.
+
+> Đừng bật compression động cho MP4 một cách máy móc. Range được tính trên representation thực tế; proxy biến đổi body nhưng giữ header cũ có thể tạo lỗi khó đoán. MP4 vốn đã chứa dữ liệu nén.
+
+## 4. Thẻ `<video>` tối thiểu nhưng production-friendly
+
+```html
+<video
+  id="player"
+  controls
+  playsinline
+  preload="metadata"
+  poster="/poster.webp"
+  width="1280"
+  height="720"
+>
+  <source
+    src="/progressive.mp4"
+    type='video/mp4; codecs="avc1.64001f, mp4a.40.2"'
+  />
+  Trình duyệt của bạn không phát được video này.
+</video>
+```
+
+- `controls`: dùng UI native trước khi tự xây player.
+- `playsinline`: đặc biệt quan trọng với hành vi phát inline trên thiết bị di động.
+- `preload="metadata"`: là **hint**, browser vẫn có quyền chọn chiến lược riêng.
+- `poster`, `width`, `height`: cho giao diện ổn định trước frame đầu.
+- `type` giúp browser bỏ qua source không hỗ trợ mà không phải tải thử toàn bộ.
+
+Autoplay có policy theo browser và ngữ cảnh. Luôn xử lý promise từ `play()`:
+
+```js
+const player = document.querySelector('#player');
+
+async function start() {
+  try {
+    await player.play();
+  } catch (error) {
+    console.info('Cần user gesture hoặc playback chưa sẵn sàng', error);
+  }
+}
+```
+
+Series đã có một lab riêng về [`playsinline`, autoplay và promise của `play()`](/blog/ios-video-playback-playsinline-autoplay/); bài này tập trung vào data path.
+
+## 5. Quan sát state thay vì đoán
+
+```js
+const names = [
+  'loadstart',
+  'loadedmetadata',
+  'loadeddata',
+  'canplay',
+  'playing',
+  'waiting',
+  'stalled',
+  'seeking',
+  'seeked',
+  'error',
+];
+
+for (const name of names) {
+  player.addEventListener(name, () => {
+    console.table({
+      event: name,
+      currentTime: player.currentTime,
+      readyState: player.readyState,
+      networkState: player.networkState,
+      errorCode: player.error?.code ?? null,
+    });
+  });
+}
+```
+
+`readyState` cho biết browser có metadata/data hiện tại và ước lượng phát tiếp được tới đâu. Nó không phải progress phần trăm. `networkState` cho biết element đang rỗng, idle, loading hay không tìm được source.
+
+In các khoảng thời gian:
+
+```js
+function ranges(value) {
+  return Array.from({ length: value.length }, (_, i) => [
+    value.start(i),
+    value.end(i),
+  ]);
+}
+
+console.table({
+  buffered: JSON.stringify(ranges(player.buffered)),
+  seekable: JSON.stringify(ranges(player.seekable)),
+  played: JSON.stringify(ranges(player.played)),
+});
+```
+
+`buffered` có thể gồm nhiều range rời nhau. `seekable` có thể dài hơn vùng đã tải nếu server/container cho phép browser seek bằng Range.
+
+## 6. CORS có hai mức ảnh hưởng khác nhau
+
+Một video cross-origin có thể **phát** mà JavaScript không được đọc pixel từ canvas. Nếu cần thumbnail, computer vision hoặc export frame:
+
+```html
+<video crossorigin="anonymous" src="https://media.example/video.mp4"></video>
+```
+
+Origin media phải trả header phù hợp, ví dụ:
+
+```http
+Access-Control-Allow-Origin: https://app.example
+```
+
+Nếu thiếu, `drawImage(video, ...)` có thể vẽ nhưng canvas bị taint; `getImageData()` hoặc `toBlob()` sẽ ném `SecurityError`. Với fetch/MSE ở bài sau, CORS còn quyết định JavaScript có đọc được response hay không.
+
+## 7. Failure checklist
+
+- File có đúng container **và** codec/profile browser hỗ trợ không?
+- `ffprobe` có thấy video/audio stream mong đợi không?
+- `moov` ở đầu file hay server có Range tốt để đọc cuối file?
+- Response có đúng `Content-Type: video/mp4`, `Content-Length` và cache header không?
+- Range request có trả `206` cùng `Content-Range` hợp lệ không?
+- `video.error`, `readyState`, event cuối cùng trước khi dừng là gì?
+- Autoplay có bị chặn vì thiếu user gesture/muted không?
+- CORS có đủ cho fetch/canvas, không chỉ đủ để element phát không?
+- Có Service Worker/CDN trả bản cũ hoặc response không hỗ trợ Range không?
+
+## Bài tập
+
+1. Tạo hai file cùng nội dung: một file có `+faststart`, một file không có. Dùng Network panel so thứ tự Range request và thời điểm `loadedmetadata`.
+2. Viết UI in `buffered`, `seekable` mỗi giây; seek tới giây 15 khi mới tải trang.
+3. Cấu hình một server cố tình bỏ qua `Range`, ghi lại hành vi khác nhau thay vì chỉ kết luận “không chạy”.
+4. Vẽ frame video lên canvas với và không có CORS header; giải thích vì sao playback và pixel access là hai quyền khác nhau.
+
+## Đọc thêm
+
+- [WHATWG HTML — media elements](https://html.spec.whatwg.org/multipage/media.html)
+- [MDN — HTTP range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Range_requests)
+- [MDN — `canPlayType()`](https://developer.mozilla.org/en-US/docs/Web/API/HTMLMediaElement/canPlayType)
+- [FFmpeg formats documentation](https://ffmpeg.org/ffmpeg-formats.html)
+
+**Phần tiếp theo:** [HLS, playlist, segment và adaptive bitrate](/blog/video-engineering-10-hls-adaptive-streaming/) — khi một URL file không còn đủ cho nhiều băng thông, live stream và đổi chất lượng động.

@@ -1,0 +1,271 @@
+---
+title: 'Video Engineering · Phần 4 — Metadata, màu sắc và audio layout'
+description: 'Phân tầng format/stream/frame metadata; đọc rotation, SAR/DAR, color tags, audio layout, language và disposition bằng fixture FFmpeg có hai audio track.'
+pubDate: 2026-07-12
+lang: vi
+tags: [video-engineering, video, ffmpeg, metadata, color-management, audio]
+series: video-engineering
+seriesOrder: 4
+draft: false
+---
+
+Video có thể decode không lỗi nhưng vẫn xoay sai, bị kéo méo, màu nhạt hoặc chọn nhầm commentary. Bug thường nằm ở thông tin mô tả cách **diễn giải** pixel và stream.
+
+Metadata trong media không phải một túi key/value duy nhất. Ta cần phân ít nhất ba tầng:
+
+```text
+FORMAT / CONTAINER
+  ├─ global tags: title, artist, creation_time…
+  └─ danh sách stream, duration/index ở mức file
+
+STREAM
+  ├─ codec parameters: size, pixel format, sample rate, channel layout…
+  ├─ tags: language, handler name…
+  ├─ disposition: default, forced, commentary…
+  └─ side data: display matrix/rotation…
+
+FRAME / PACKET
+  ├─ timestamp, keyframe, picture type
+  ├─ color properties có thể thay đổi theo frame
+  └─ side data: HDR mastering/content light/dynamic metadata tùy codec
+```
+
+Container không lưu được mọi field và player có thể diễn giải metadata khác nhau. “Đã set tag” chưa chứng minh output đúng; phải probe file cuối và test player mục tiêu.
+
+## Fixture: aspect, màu, rotation và hai audio track
+
+Ta sẽ tạo sáu giây video 720×576, pixel không vuông để hiển thị 4:3, gắn color tags BT.709 và hai tone audio stereo mang ngôn ngữ khác nhau.
+
+```bash
+ffmpeg -hide_banner -y \
+  -f lavfi -i "testsrc2=size=720x576:rate=25:duration=6" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=6" \
+  -f lavfi -i "sine=frequency=660:sample_rate=48000:duration=6" \
+  -map 0:v:0 -map 1:a:0 -map 2:a:0 \
+  -vf "setsar=16/15,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709" \
+  -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+  -c:a aac -b:a 128k -ac:a 2 \
+  -metadata title="Video Engineering metadata lab" \
+  -metadata:s:v:0 handler_name="Main picture" \
+  -metadata:s:a:0 language=vie \
+  -metadata:s:a:0 handler_name="Vietnamese tone" \
+  -metadata:s:a:1 language=eng \
+  -metadata:s:a:1 handler_name="English tone" \
+  -disposition:a:0 default -disposition:a:1 0 \
+  -shortest \
+  ve04-base.mp4
+```
+
+`setparams` chỉ **gắn thuộc tính màu**, không biến đổi pixel sang BT.709. Fixture tổng hợp dùng để học metadata; retag footage BT.601/BT.2020/PQ/HLG thành BT.709 không phải color conversion.
+
+Thêm display rotation 90° bằng stream copy. `-display_rotation` là input option nên phải đứng trước `-i`:
+
+```bash
+ffmpeg -hide_banner -y \
+  -display_rotation:v:0 90 \
+  -i ve04-base.mp4 \
+  -map 0 -c copy \
+  ve04-metadata.mp4
+```
+
+Theo tài liệu FFmpeg, giá trị này mô tả góc quay ngược chiều kim đồng hồ cần áp dụng khi hiển thị. Khi stream copy và muxer hỗ trợ, thông tin được ghi thành display transform/side data; pixel H.264 không bị encode lại.
+
+## Probe theo tầng, không đọc một blob khổng lồ
+
+Lần đầu có thể xem toàn bộ format và stream dưới dạng JSON:
+
+```bash
+ffprobe -v error \
+  -show_format -show_streams \
+  -of json \
+  ve04-metadata.mp4
+```
+
+Sau đó thu hẹp theo câu hỏi. Xem container và global tags:
+
+```bash
+ffprobe -v error \
+  -show_entries format=format_name,duration,size:format_tags \
+  -of json \
+  ve04-metadata.mp4
+```
+
+Xem stream video, aspect, màu và display matrix:
+
+```bash
+ffprobe -v error \
+  -select_streams v:0 \
+  -show_streams \
+  -show_entries stream=index,codec_name,width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio,color_range,color_space,color_transfer,color_primaries:stream_tags:stream_side_data \
+  -of json \
+  ve04-metadata.mp4
+```
+
+Xem hai audio stream, language và disposition:
+
+```bash
+ffprobe -v error \
+  -select_streams a \
+  -show_streams \
+  -show_entries stream=index,codec_name,sample_fmt,sample_rate,channels,channel_layout:stream_tags:stream_disposition \
+  -of json \
+  ve04-metadata.mp4
+```
+
+Cuối cùng, decode đúng một frame để xem thuộc tính ở tầng frame:
+
+```bash
+ffprobe -v error \
+  -select_streams v:0 \
+  -read_intervals "%+#1" \
+  -show_frames \
+  -show_entries frame=pts_time,width,height,pix_fmt,color_range,color_space,color_transfer,color_primaries:frame_side_data \
+  -of json \
+  ve04-metadata.mp4
+```
+
+`N/A`, `unknown` hoặc field vắng mặt nghĩa pipeline **không có bằng chứng**. Đừng tự điền BT.709 vì video là HD, hay stereo vì nghe có hai loa.
+
+## Rotation: transform hiển thị khác pixel đã xoay
+
+Điện thoại có thể giữ pixel theo một orientation rồi thêm display matrix. `width=720`, `height=576` vẫn là coded frame; side data báo `rotation=90`. Player tôn trọng matrix hiện portrait, tool bỏ qua có thể hiện landscape.
+
+Hai chiến lược khác nhau:
+
+1. **Giữ metadata:** stream copy nhanh nhưng phụ thuộc container/player hiểu transform.
+2. **Bake vào pixel:** decode, rotate, encode lại; tương thích hơn nhưng tốn compute và có thể thêm loss.
+
+Với FFmpeg hiện đại, autorotate mặc định có thể áp dụng display transform khi transcoding. Lệnh sau encode lại video, chỉ giữ audio đầu tiên:
+
+```bash
+ffmpeg -hide_banner -y \
+  -i ve04-metadata.mp4 \
+  -map 0:v:0 -map 0:a:0 \
+  -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+  -c:a copy \
+  ve04-rotation-baked.mp4
+```
+
+Probe output: fixture sẽ thành 576×720, DAR 3:4 và không cần matrix cũ. Đừng thêm `transpose` khi autorotate vẫn bật vì có thể xoay hai lần. Muốn kiểm soát tay, đọc `-autorotate`/`-noautorotate` và test marker bất đối xứng.
+
+## SAR và DAR: pixel không phải lúc nào cũng vuông
+
+Ba đại lượng dễ bị trộn:
+
+- **coded width/height:** số sample theo hai chiều trong frame;
+- **SAR — Sample Aspect Ratio:** tỉ lệ rộng/cao của một pixel mẫu;
+- **DAR — Display Aspect Ratio:** tỉ lệ khung hình khi hiển thị.
+
+Công thức mental model:
+
+```text
+DAR = (width / height) × SAR
+```
+
+Fixture dùng `720/576 × 16/15 = 4/3`. Nếu player bỏ SAR và coi pixel vuông, hình sẽ thành 5:4 và trông bị bóp.
+
+`setsar`/`setdar` đổi thông tin aspect, không resize pixel. Muốn pixel vuông mà vẫn 4:3, scale sang 768×576 rồi set SAR 1:1:
+
+```bash
+ffmpeg -hide_banner -y \
+  -i ve04-base.mp4 \
+  -map 0:v:0 -map 0:a:0 \
+  -vf "scale=768:576,setsar=1" \
+  -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+  -c:a copy \
+  ve04-square-pixels.mp4
+```
+
+Nếu chỉ set `setsar=1` trên 720×576, bạn đã đổi ý nghĩa hiển thị thành 5:4 chứ chưa “sửa” hình.
+
+## Color metadata: bốn câu hỏi, không phải một nhãn
+
+Một mô tả màu video thường cần ít nhất:
+
+| Field             | Câu hỏi nó trả lời                                        |
+| ----------------- | --------------------------------------------------------- |
+| `color_primaries` | Tọa độ chromaticity của các màu cơ bản/white point là gì? |
+| `color_transfer`  | Tín hiệu mã hóa ánh sáng theo transfer function nào?      |
+| `color_space`     | Ma trận chuyển giữa luma/chroma và RGB là gì?             |
+| `color_range`     | Giá trị dùng full range hay limited/TV range?             |
+
+BT.709 có thể xuất hiện ở nhiều field nhưng chúng không phải cùng một khái niệm. HDR còn có thể mang mastering display, content light level hoặc dynamic metadata ở stream/frame side data.
+
+Cạm bẫy lớn nhất là **retag thay vì convert**. `setparams` đổi cách diễn giải; `colorspace`/`zscale` với input/output đúng mới biến đổi giá trị. Nếu nguồn gắn nhãn sai, phải xác định màu nguồn bằng tài liệu hoặc reference đáng tin.
+
+Khi màu chỉ sai trên một player, probe stream/frame, so cùng frame và display, rồi kiểm tra tone mapping, range và color management. Tạo conversion có chủ đích; đừng thử tag ngẫu nhiên tới khi “trông ổn”.
+
+## Audio: codec chưa đủ, phải biết layout và vai trò
+
+Audio stream có sample format, sample rate, số channel và **channel layout**. `channels=6` không tự nói rõ thứ tự/ý nghĩa sáu kênh; layout như `5.1` mới cung cấp semantic cần cho mapping/downmix. Mất layout có thể làm center/dialogue yếu hoặc kênh surround đi sai chỗ.
+
+Fixture có hai track stereo:
+
+- stream đầu: `language=vie`, disposition `default=1`, tone 440 Hz;
+- stream sau: `language=eng`, không default, tone 660 Hz.
+
+Player dùng language preference, disposition, thứ tự và policy riêng. “Default” là tín hiệu, không phải mệnh lệnh tuyệt đối.
+
+Chọn rõ audio tiếng Việt khi remux:
+
+```bash
+ffmpeg -hide_banner -y \
+  -i ve04-metadata.mp4 \
+  -map 0:v:0 -map 0:m:language:vie \
+  -c copy \
+  ve04-vie-only.mp4
+```
+
+Đặt audio thứ hai làm default mà không encode lại:
+
+```bash
+ffmpeg -hide_banner -y \
+  -i ve04-metadata.mp4 \
+  -map 0 -c copy \
+  -disposition:a:0 0 -disposition:a:1 default \
+  ve04-english-default.mp4
+```
+
+Ngôn ngữ thường dùng mã ba chữ phù hợp container, như `vie` và `eng`. Tên track dành cho người đọc không thay thế language/disposition; ghi cả hai nếu delivery system hỗ trợ.
+
+## Metadata copy cũng là một quyết định
+
+FFmpeg có thể map metadata tự động, nhưng filter graph, stream mapping và container đích có thể làm tag/side data biến mất. Với job production, khai intent:
+
+```bash
+ffmpeg -hide_banner -y \
+  -i ve04-metadata.mp4 \
+  -map 0 -map_metadata 0 -c copy \
+  -metadata title="Reviewed metadata lab" \
+  ve04-remux-reviewed.mkv
+```
+
+Sau đó probe output. `-map_metadata 0` không hứa Matroska biểu diễn mọi cấu trúc MP4 y hệt; bitstream, tag và side data vẫn là các lớp khác nhau.
+
+## Failure checklist
+
+- Đã probe **output cuối**, không chỉ source?
+- Rotation là display matrix hay pixel đã xoay? Có nguy cơ autorotate + transpose hai lần?
+- Coded width/height, SAR và DAR có thỏa công thức mong đợi?
+- Bạn đang retag màu hay thực sự convert pixel values?
+- `color_primaries`, transfer, matrix và range có đầy đủ hay đang `unknown`?
+- Audio có đúng sample rate, channel layout, language và disposition?
+- Auto stream selection có chọn commentary/track sai không?
+- Container đích có hỗ trợ tag, side data và codec đang copy không?
+
+## Bài tập thực hành
+
+1. Tạo fixture và vẽ bảng format/stream/frame từ ba lệnh `ffprobe`; mỗi field thuộc đúng một tầng.
+2. So `ve04-base.mp4`, `ve04-metadata.mp4` và `ve04-rotation-baked.mp4`: codec, coded size, DAR, rotation side data và thời gian encode.
+3. Xóa `setsar=16/15`, tạo lại fixture rồi giải thích vì sao 720×576 đổi hình hiển thị.
+4. Đổi default audio, mở bằng hai player và ghi nhận policy chọn track. Nếu khác nhau, đó là bằng chứng disposition không phải mệnh lệnh tuyệt đối.
+
+## Đọc thêm
+
+- [ffprobe — format, stream, frame, tags và side data](https://ffmpeg.org/ffprobe.html)
+- [FFmpeg — metadata, mapping, disposition và display rotation](https://ffmpeg.org/ffmpeg.html)
+- [FFmpeg Formats — metadata và khả năng của container](https://ffmpeg.org/ffmpeg-formats.html)
+- [FFmpeg Filters — `setsar`, `setdar`, `setparams` và `colorspace`](https://ffmpeg.org/ffmpeg-filters.html)
+- [MDN — Media formats và codec trên web](https://developer.mozilla.org/en-US/docs/Web/Media/Guides/Formats)
+
+**Phần tiếp theo:** [ffprobe như kính hiển vi — điều tra một file media có hệ thống](/blog/video-engineering-05-ffprobe-inspection-workflow/) — ta sẽ biến các lệnh probe rời rạc thành một workflow forensic lặp lại được trước khi chạm vào encoder.

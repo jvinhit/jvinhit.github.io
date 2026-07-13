@@ -1,15 +1,30 @@
 ---
-title: 'TypeScript Production · Phần 9 — Architecture & Type Boundaries'
+title: 'TypeScript Production · Phần 17 — Architecture & Type Boundaries'
 description: 'Dùng TypeScript để bảo vệ dependency direction: domain, ports/adapters, capability interfaces, composition root, anti-corruption layer và compile-time architecture tests.'
 pubDate: 2026-07-05
+updatedDate: 2026-07-12
 lang: vi
 tags: [typescript, architecture, dependency-inversion, domain-modeling]
 series: typescript
-seriesOrder: 9
+seriesOrder: 17
 draft: false
 ---
 
 Type-safe từng function không cứu được dependency graph rối. Ở cấp staff, TypeScript là công cụ để làm **boundary và ownership có thể nhìn thấy, kiểm tra và thay đổi độc lập**.
+
+Một incident kiến trúc thường bắt đầu rất nhỏ: domain import DTO từ SDK vendor,
+use case gọi thẳng ORM model, UI deep-import helper nội bộ vì “chỉ cần một
+type”. Sáu tháng sau, đổi database làm 40 package compile fail dù business rule
+không đổi.
+
+Mục tiêu bài này không phải vẽ nhiều layer. Mục tiêu là biến các invariant sau
+thành thứ compiler, module resolver và CI có thể kiểm:
+
+- domain không phụ thuộc transport, framework hay persistence;
+- external data được parse/map trước khi thành domain value;
+- feature khác chỉ thấy public surface đã cam kết;
+- adapter có thể thay ở composition root mà use case không đổi;
+- type-only edge vẫn được tính là coupling và ownership.
 
 ## Bắt đầu từ dependency direction
 
@@ -124,16 +139,555 @@ TypeScript không tự cấm import ngược. Kết hợp:
 - CI dependency-cycle check;
 - contract tests cho adapter.
 
+Mỗi lớp bảo vệ một failure khác nhau. Một sơ đồ trong README không chặn được
+import; một interface cũng không chặn deep path; project reference không tự
+chứng minh adapter giữ semantics domain.
+
+## Boundary phải tồn tại ở cả source, type và artifact
+
+Một boundary production có ba mặt:
+
+```text
+source graph       ai được import ai
+type surface       consumer được phép biết contract nào
+runtime artifact   package thực sự export module nào
+```
+
+Chỉ tách folder giải quyết rất ít. Nếu `../../billing/internal/repository` vẫn
+resolve, boundary chỉ là convention.
+
+Ví dụ package feature:
+
+```text
+packages/billing/
+  src/
+    domain/
+      invoice.ts
+      money.ts
+    application/
+      issue-invoice.ts
+    adapters/
+      postgres-invoice-repository.ts
+    public.ts
+  package.json
+  tsconfig.json
+```
+
+`public.ts` re-export contract được sở hữu:
+
+```ts
+export type { Invoice, InvoiceId, Money } from './domain/invoice.js';
+export type {
+  IssueInvoice,
+  IssueInvoiceCommand,
+  IssueInvoiceError,
+} from './application/issue-invoice.js';
+export { makeIssueInvoice } from './application/issue-invoice.js';
+```
+
+Không export adapter nếu consumer chỉ cần use case. “Có thể export” không đồng
+nghĩa “nên biến thành compatibility promise”.
+
+Package `exports` thu hẹp runtime/public subpath:
+
+```json
+{
+  "name": "@acme/billing",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/public.d.ts",
+      "import": "./dist/public.js"
+    }
+  }
+}
+```
+
+Consumer có thể import `@acme/billing`, nhưng
+`@acme/billing/dist/adapters/postgres...` không phải public contract.
+
+Hai caveat:
+
+- `exports` bảo vệ package consumer; relative import bên trong cùng package vẫn
+  cần lint/import-graph rule;
+- editor/tsconfig/module resolution phải dùng mode hiểu `exports`, nếu không
+  source và artifact có thể cho kết quả khác nhau.
+
+## Project references encode build direction, không tự tạo architecture
+
+Tách project theo ownership lớn giúp compiler nhìn thấy build graph:
+
+```json
+// packages/billing/domain/tsconfig.json
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}
+```
+
+Domain không có reference tới adapter. Application chỉ reference domain; adapter
+reference application/domain; composition root reference tất cả:
+
+```json
+{
+  "files": [],
+  "references": [
+    { "path": "./domain" },
+    { "path": "./application" },
+    { "path": "./adapters" },
+    { "path": "./app" }
+  ]
+}
+```
+
+Project reference có giá trị khi boundary có ownership/build/cache riêng. Tách
+mỗi folder thành một project tạo config, declaration và graph overhead mà không
+tạo thêm invariant.
+
+Alias `paths` cũng không phải firewall:
+
+```json
+{
+  "compilerOptions": {
+    "paths": {
+      "@billing/*": ["packages/billing/src/*"]
+    }
+  }
+}
+```
+
+Nó làm import ngắn hơn nhưng còn mở mọi deep path, và không tự rewrite specifier
+cho runtime. Boundary phải dựa trên exports, graph rule và artifact consumer test,
+không dựa vào vẻ đẹp của alias.
+
+## Type-only import vẫn là một dependency thật
+
+`import type` biến mất sau emit, nhưng nó vẫn:
+
+- buộc consumer compile khi declaration thay đổi;
+- kéo symbol vào language-service graph;
+- tạo ownership/semver coupling;
+- có thể tạo type cycle và declaration leak.
+
+```ts
+// domain không nên làm việc này dù không có runtime import
+import type { Prisma } from '@prisma/client';
+
+export type User = Prisma.UserGetPayload<{
+  include: { roles: true };
+}>;
+```
+
+Domain giờ bị định nghĩa bởi schema/utility của ORM. Thay bằng domain-owned type
+và mapper tại adapter:
+
+```ts
+type UserRow = {
+  id: string;
+  status: string;
+  created_at: Date;
+};
+
+function toUser(row: UserRow): User {
+  return User.restore({
+    id: parseUserId(row.id),
+    status: parseUserStatus(row.status),
+    createdAt: row.created_at,
+  });
+}
+```
+
+Mapper là chỗ duplication có chủ đích: nó ngăn storage shape trở thành public
+domain ABI.
+
+## Port nên mô tả capability, không mô phỏng vendor
+
+Generic repository nghe reusable:
+
+```ts
+interface Repository<Entity, Id> {
+  find(id: Id): Promise<Entity | null>;
+  save(entity: Entity): Promise<void>;
+  delete(id: Id): Promise<void>;
+}
+```
+
+Nhưng nó thường đẩy query semantics sang caller, không mô tả consistency,
+transaction hay business intent. Capability domain hẹp dễ thay và test hơn:
+
+```ts
+interface Invoices {
+  findDraft(id: InvoiceId): Promise<InvoiceDraft | null>;
+  reserveNumber(year: number): Promise<InvoiceNumber>;
+  saveIssued(invoice: IssuedInvoice): Promise<void>;
+}
+```
+
+Review port bằng bốn câu hỏi:
+
+1. Tên method nói ngôn ngữ domain hay ngôn ngữ vendor?
+2. Input/output có leak DTO, query builder, transaction object không?
+3. Error nào thuộc contract và error nào phải map ở adapter?
+4. Consumer thật sự cần toàn bộ method hay chỉ một capability nhỏ?
+
+### Error cũng có ownership
+
+Adapter không nên làm domain xử lý `PrismaClientKnownRequestError` hay status
+code `409`:
+
+```ts
+type SaveInvoiceError =
+  | { kind: 'number-conflict' }
+  | { kind: 'storage-unavailable'; retryable: boolean };
+
+interface Invoices {
+  saveIssued(invoice: IssuedInvoice): Promise<Result<void, SaveInvoiceError>>;
+}
+```
+
+Adapter map vendor error vào vocabulary của port. Telemetry vẫn giữ `cause` nội
+bộ, nhưng domain branching không phụ thuộc class lỗi bên thứ ba.
+
+## Capability accumulation thay cho service locator
+
+Service locator/global container làm dependency ẩn:
+
+```ts
+// khó biết use case cần gì, test có thể đọc global state
+const db = container.resolve('database');
+```
+
+Factory parameter làm capability explicit và cho `satisfies` kiểm composition:
+
+```ts
+type IssueInvoiceDeps = {
+  invoices: Invoices;
+  clock: Clock;
+  ids: IdGenerator;
+  audit: AuditLog;
+};
+
+const billingDeps = {
+  invoices: new PostgresInvoices(pool),
+  clock: systemClock,
+  ids: cryptoIds,
+  audit: structuredAudit,
+} satisfies IssueInvoiceDeps;
+
+const issueInvoice = makeIssueInvoice(billingDeps);
+```
+
+`satisfies` bắt dependency thiếu/thừa trên literal mà vẫn giữ concrete type cho
+composition root. Business code chỉ nhận port type; root được phép biết concrete
+adapter.
+
+Với request-scoped dependency, lifetime cũng là contract runtime. TypeScript
+không chứng minh singleton/request/transaction lifetime; container test và load
+test vẫn cần.
+
+## Transaction boundary thuộc use case
+
+Nếu từng repository tự commit, use case nhiều bước không còn atomic. Nhưng đưa
+ORM transaction object vào domain lại leak infrastructure.
+
+Một port có thể mô tả unit of work bằng capability:
+
+```ts
+type TransactionPorts = {
+  invoices: Invoices;
+  outbox: Outbox;
+};
+
+interface UnitOfWork {
+  run<Result>(
+    work: (ports: TransactionPorts) => Promise<Result>
+  ): Promise<Result>;
+}
+```
+
+Application quyết định thao tác nào cùng transaction; adapter quyết định cách
+map thành transaction database. Cần runtime test cho rollback, retry và callback
+không được dùng ports sau khi transaction đóng—type không tự chứng minh lifetime.
+
+## Anti-corruption layer phải parse trước khi map
+
+Ví dụ ban đầu nhận `VendorCustomer` typed sẵn, nhưng network trả dữ liệu không
+tin cậy. Pipeline đúng:
+
+```text
+unknown response
+  → parse VendorCustomerV1 | VendorCustomerV2
+  → map vendor vocabulary
+  → enforce domain invariant
+  → Customer
+```
+
+```ts
+type VendorCustomerV1 = {
+  version: 1;
+  customer_id: string;
+  status: 'A' | 'S' | 'D';
+};
+
+type VendorCustomerV2 = {
+  version: 2;
+  id: string;
+  state: 'active' | 'suspended' | 'deleted';
+};
+
+function normalizeVendorCustomer(
+  dto: VendorCustomerV1 | VendorCustomerV2
+): Customer {
+  switch (dto.version) {
+    case 1:
+      return toCustomerV1(dto);
+    case 2:
+      return toCustomerV2(dto);
+  }
+}
+```
+
+Parser/decoder sống trong adapter. Mapper không nhận `unknown`; nó nhận DTO đã
+được runtime chứng minh. Khi vendor thêm version, exhaustive switch và parser
+tests dẫn team tới đúng blast radius.
+
+## Correlation giữa command và handler không nên bị tách
+
+Một registry kiểu này mất quan hệ:
+
+```ts
+type CommandName = 'issue-invoice' | 'void-invoice';
+type AnyCommand = IssueInvoiceCommand | VoidInvoiceCommand;
+
+type BrokenRegistry = Record<
+  CommandName,
+  (command: AnyCommand) => Promise<unknown>
+>;
+```
+
+Map contract giữ key/input/output cùng source:
+
+```ts
+type BillingCommands = {
+  'issue-invoice': {
+    input: IssueInvoiceCommand;
+    output: IssuedInvoice;
+  };
+  'void-invoice': {
+    input: VoidInvoiceCommand;
+    output: VoidedInvoice;
+  };
+};
+
+type CommandHandlers<
+  Catalog extends Record<string, { input: unknown; output: unknown }>,
+> = {
+  [K in keyof Catalog]: (
+    command: Catalog[K]['input']
+  ) => Promise<Catalog[K]['output']>;
+};
+```
+
+Đây là use case hợp lý cho mapped type vì nó enforce completeness và
+correlation ở composition boundary. Đừng expose machinery sâu nếu consumer chỉ
+cần named `BillingHandlers`.
+
+## Public type surface là một compatibility contract
+
+Một function không annotation có thể emit return type chứa internal helper,
+conditional/intersection lớn hoặc type từ dependency:
+
+```ts
+// public boundary: annotation có tên, ổn định
+export function issueInvoice(
+  command: IssueInvoiceCommand
+): Promise<Result<IssuedInvoice, IssueInvoiceError>> {
+  return internalIssueInvoice(command);
+}
+```
+
+Review `.d.ts` như review API:
+
+- internal module/type có leak không;
+- consumer cần import dependency chỉ để đọc signature không;
+- rename/refactor implementation có đổi inferred public type không;
+- union thêm member có buộc consumer exhaustive switch không;
+- optional/readonly/inference có thay đổi dù runtime giữ nguyên không.
+
+Type-only breaking change vẫn là breaking change với consumer TypeScript.
+
+## Architecture tests phải có negative fixture
+
+Unit test happy path không chứng minh import bất hợp lệ bị chặn. Thêm consumer
+fixtures:
+
+```text
+fixtures/
+  public-consumer/       # phải compile
+  illegal-deep-import/   # phải fail resolution/graph rule
+  adapter-contract/      # runtime suite cho từng adapter
+```
+
+Public consumer import package đã build, không import `src`:
+
+```ts
+import { makeIssueInvoice } from '@acme/billing';
+import type { IssueInvoiceCommand } from '@acme/billing';
+```
+
+Illegal fixture cố import subpath không export. CI command phải assert process
+thất bại vì đúng diagnostic; chỉ chạy `tsc` rồi thấy đỏ không đủ cho một negative
+suite tự động.
+
+Graph test cần cover cả `import` lẫn `import type`, dynamic import và generated
+code. Runtime contract test cần chạy cùng behavior suite trên fake/in-memory và
+adapter thật:
+
+```ts
+export function invoiceRepositoryContract(create: () => Promise<Invoices>) {
+  // save/find semantics, conflict mapping, ordering, retry behavior
+}
+```
+
+Fake không nên “dễ tính” hơn production adapter. Nếu database enforce unique
+constraint hay transaction isolation, contract suite phải encode semantics đó.
+
+## Cycle: phân biệt runtime, type và ownership cycle
+
+- runtime cycle có thể tạo partially initialized module;
+- type-only cycle không emit import nhưng tăng compiler graph/coupling;
+- ownership cycle nói hai package không thể release/thay đổi độc lập.
+
+Tách một `shared-types` package thường chỉ dời cycle vào hub. Hãy tìm concept nào
+thật sự sở hữu contract, hoặc introduce port ở consumer và mapper ở adapter.
+
+Nếu hai feature luôn đổi cùng nhau và chia cùng owner/release, có thể boundary
+đang giả. Merge bounded context đôi khi tốt hơn thêm abstraction.
+
+## Migration bằng strangler boundary
+
+Không cần clean toàn codebase trước khi có giá trị. Chọn một use case và dựng
+seam quanh nó:
+
+1. inventory import/runtime data hiện tại;
+2. định nghĩa domain input/output và port tại consumer;
+3. bọc legacy module trong adapter giữ behavior;
+4. composition root chuyển traffic qua use case mới;
+5. thêm contract/architecture tests;
+6. migrate consumer kế tiếp; xóa deep import khi usage về zero.
+
+Adapter legacy được phép có assertion/`any` có audit, nhưng domain mới không
+được import ngược. Đây là strictness ratchet ở cấp architecture: vùng sạch chỉ
+mở rộng, không yêu cầu big-bang rewrite.
+
+Metrics hữu ích:
+
+- số deep imports còn lại theo feature;
+- số public exports và declaration size;
+- cycle count/runtime cycle incidents;
+- thời gian thay adapter/upgrade vendor;
+- escape hatch mới/cũ ở boundary.
+
+Đừng tối ưu một con số mù quáng. Ít export hơn không tự động tốt nếu team phải
+copy contract; zero cycle không có nghĩa ownership rõ.
+
+## Failure modes cấp Staff
+
+### Interface ở provider
+
+Adapter định nghĩa interface theo toàn bộ capability nó có, mọi consumer phụ
+thuộc một abstraction quá lớn. Đặt port ở nơi tiêu thụ.
+
+### Framework type đi xuyên core
+
+`Request`, ORM row, schema library error hoặc logger instance xuất hiện trong
+domain signature. Map ở adapter/composition root.
+
+### Barrel export mọi thứ
+
+Convenience index biến internal helper thành accidental API và dễ tạo cycle.
+Whitelist export, test từ built artifact.
+
+### `import type` được xem là miễn phí
+
+Runtime graph sạch nhưng compiler/ownership graph vẫn rối và type SemVer lan
+khắp monorepo.
+
+### Generic abstraction không có domain pressure
+
+`Repository<T>`, `Service<T>` và `Mapper<A, B>` tạo indirection nhưng không giữ
+invariant cụ thể.
+
+### Composition phân tán
+
+Feature tự resolve global singleton, làm lifetime/dependency ẩn và test không
+deterministic.
+
+### Architecture rule chỉ nằm trong wiki
+
+Rule bị vi phạm chính lúc deadline căng nhất. Enforce bằng resolver/exports,
+graph test và CI fixture.
+
+## Decision rules
+
+- Boundary theo ownership/change cadence, không theo danh từ kỹ thuật chung.
+- Port thuộc consumer và chỉ mô tả capability consumer cần.
+- DTO/parser/mapper/vendor error ở adapter; domain nhận value đã có bằng chứng.
+- `import type` vẫn được tính trong dependency review.
+- Public export là compatibility promise; default là private.
+- Project reference cho build/ownership boundary có giá trị, không cho từng folder.
+- Composition root là nơi duy nhất biết concrete adapter và lifetime.
+- Assertion/`any` nếu cần nằm trong legacy/external adapter, có owner và test.
+- Một abstraction không tạo test seam, dependency inversion hoặc stability thì
+  chưa có lý do tồn tại.
+- Nếu pure types không enforce được runtime/module graph, dùng exports, lint,
+  contract test hoặc code generation đúng tầng.
+
 ## Lab
 
-1. Chọn một use case import trực tiếp DB/API; trích capability interface ở consumer.
-2. Tạo fake in-memory và test use case không framework.
-3. Đặt vendor DTO trong adapter, map sang domain type.
-4. Thêm rule khiến domain import adapter fail CI.
+Xây boundary cho use case `issueInvoice` đang import trực tiếp ORM và payment
+SDK.
 
-**Done khi:** có thể thay adapter trong composition root mà domain/application không sửa; dependency graph phản ánh ownership mong muốn.
+1. Vẽ source/type/runtime graph hiện tại; đánh dấu owner từng edge.
+2. Định nghĩa `IssueInvoiceCommand`, result/error domain và bốn capability tối
+   thiểu ở application package.
+3. Parse payment response từ `unknown`; map DTO/version/vendor error trong
+   adapter.
+4. Đặt transaction boundary qua `UnitOfWork`, không leak transaction client.
+5. Tạo composition root dùng `satisfies` để wiring dependency.
+6. Whitelist public surface bằng `exports`; inspect declaration đã emit.
+7. Thêm public consumer fixture phải compile và deep-import fixture phải fail.
+8. Thêm graph rule cấm cả value/type import từ domain/application về adapter.
+9. Chạy cùng repository contract suite trên in-memory và database adapter.
+10. Ghi migration/rollback plan và metrics cho deep import còn lại.
+
+**Done khi:** thay Postgres adapter bằng in-memory/HTTP adapter chỉ sửa composition
+root; domain không import framework/vendor; payload sai bị chặn trước domain;
+illegal edge fail CI; built consumer chỉ thấy public contract; và team có seam
+để migrate phần legacy tiếp theo mà không đóng băng delivery.
+
+## Checklist review kiến trúc
+
+- Concept này do package/feature nào sở hữu?
+- Dependency direction có được tool enforce hay chỉ được vẽ?
+- Type-only import nào tạo coupling ngoài ý muốn?
+- Public `.d.ts` có leak implementation/dependency không?
+- External `unknown` được parse ở đâu và mapper sống ở đâu?
+- Port có nhỏ theo consumer hay phản chiếu provider?
+- Error, transaction và lifetime có semantics rõ không?
+- Fake và adapter thật có cùng contract suite không?
+- Boundary có giảm blast radius đo được không?
+- Nếu xóa abstraction này, invariant nào biến mất?
 
 ## Đọc tiếp
 
 - [Project References](https://www.typescriptlang.org/docs/handbook/project-references.html)
 - [Modules reference](https://www.typescriptlang.org/docs/handbook/modules/reference.html)
+- [Package `exports` — Node.js packages](https://nodejs.org/api/packages.html#package-entry-points)
+- [TypeScript Declaration Files](https://www.typescriptlang.org/docs/handbook/declaration-files/introduction.html)

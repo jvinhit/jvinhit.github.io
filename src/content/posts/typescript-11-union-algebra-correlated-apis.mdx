@@ -1,0 +1,445 @@
+---
+title: 'TypeScript Production · Phần 11 — Union Algebra & Correlated APIs'
+description: 'Dùng distributive conditional, mapped union và union-to-intersection để giữ correlation cho event/job API; tránh bẫy keyof union, union ordering và generic explosion.'
+pubDate: 2026-07-12
+updatedDate: 2026-07-12
+lang: vi
+tags: [typescript, union-types, api-design, type-system]
+series: typescript
+seriesOrder: 11
+draft: false
+---
+
+Union không chỉ là “A hoặc B”. Trong TypeScript production, union mô tả một tập trạng thái hữu hạn, rồi dùng compiler để map, filter, index và giữ
+quan hệ giữa discriminant với payload.
+
+Sai lầm nguy hiểm nhất không phải quên một utility type. Đó là vô tình tách
+hai dữ liệu vốn correlated thành hai union độc lập, khiến compiler chấp nhận
+tổ hợp mà runtime không biết xử lý.
+
+Bài này xây một job dispatcher làm production case xuyên suốt: mỗi `type` có
+input, output và error riêng; handler registry phải đầy đủ; call site phải suy
+ra đúng result; implementation unsafe nếu có phải nằm trong một adapter nhỏ.
+
+## Mental model: union là tập giá trị
+
+Đọc các operator như đại số trên tập:
+
+| Type expression       | Mental model                                     |
+| --------------------- | ------------------------------------------------ |
+| `A \| B`              | giá trị thuộc A hoặc B                           |
+| `A & B`               | giá trị thỏa cả contract A và B                  |
+| `never`               | tập rỗng                                         |
+| `unknown`             | tập mọi giá trị, nhưng chưa có bằng chứng để đọc |
+| `T extends U ? X : Y` | phân nhánh hoặc transform theo membership        |
+
+Conditional type có naked type parameter chạy trên từng member; nhánh trả
+`never` biến mất khỏi kết quả. Đây là nền của `Extract` và `Exclude`.
+
+## Distribution là feature, không phải chi tiết cú pháp
+
+Hai helper dưới khác semantics:
+
+```ts
+type WrapEach<T> = T extends unknown ? { item: T } : never;
+type WrapAll<T> = [T] extends [unknown] ? { item: T } : never;
+
+type Each = WrapEach<'queued' | 'running'>;
+//   ^? { item: 'queued' } | { item: 'running' }
+
+type All = WrapAll<'queued' | 'running'>;
+//   ^? { item: 'queued' | 'running' }
+```
+
+`Each` giữ từng member tách biệt. `All` tạo một object có property là union.
+Nếu object còn property correlated khác, chọn sai dạng sẽ tạo invalid state.
+
+Tuple wrapper `[T]` thường được gọi là “tắt distribution”, nhưng đừng dùng nó
+như mẹo performance mù quáng. Trước hết phải quyết định consumer cần xử lý
+từng member hay cả union như một khối.
+
+## Bẫy `keyof` trên union
+
+Giả sử command có field khác nhau ở top level:
+
+```ts
+type WorkerCommand =
+  | { type: 'email'; to: string; templateId: string }
+  | { type: 'image.resize'; source: URL; width: number }
+  | { type: 'cleanup'; bucket: string; olderThanDays: number };
+
+type CommonKeys = keyof WorkerCommand;
+//   ^? 'type'
+```
+
+`keyof (A | B)` chỉ chứa key có thể truy cập an toàn trên **mọi** member. Nó
+không phải `keyof A | keyof B`.
+
+Khi thật sự cần union của toàn bộ key, hãy phân phối:
+
+```ts
+type KeysOfUnion<T> = T extends unknown ? keyof T : never;
+
+type AllCommandKeys = KeysOfUnion<WorkerCommand>;
+//   ^? 'type' | 'to' | 'templateId' | 'source'
+//      | 'width' | 'bucket' | 'olderThanDays'
+```
+
+`KeysOfUnion` đúng cho tooling cần inspect mọi variant. Business code thường
+nên narrow bằng `type` thay vì truy cập một key chỉ tồn tại ở vài member.
+
+## Correlation bị mất như thế nào?
+
+Một map mô tả input theo job kind:
+
+```ts
+type JobInputMap = {
+  email: { to: string; templateId: string };
+  'image.resize': { source: URL; width: number };
+  cleanup: { bucket: string; olderThanDays: number };
+};
+```
+
+Cách model phẳng này sai:
+
+```ts
+type BadJob = {
+  type: keyof JobInputMap;
+  payload: JobInputMap[keyof JobInputMap];
+};
+
+const impossibleButAccepted: BadJob = {
+  type: 'email',
+  payload: { bucket: 'tmp', olderThanDays: 30 },
+};
+```
+
+`type` và `payload` là hai union độc lập. Compiler không còn biết payload
+cleanup không được đi với type email.
+
+Generic `K` cũng mất relation nếu caller truyền union key. Muốn giữ correlation,
+phải tạo **một object cho từng key**, rồi mới union các object đó.
+
+## Mapped union: map rồi index
+
+Pattern cốt lõi:
+
+```ts
+type JobFromMap<Map, K extends keyof Map = keyof Map> = {
+  [P in K]: {
+    type: P;
+    jobId: string;
+    payload: Map[P];
+  };
+}[K];
+
+type Job = JobFromMap<JobInputMap>;
+```
+
+Đọc theo hai bước:
+
+1. mapped type tạo object table với một member chính xác ở mỗi key;
+2. `[K]` index table để lấy union các value.
+
+Giờ mỗi member có literal `type` và đúng payload; object ghép chéo fail ngay
+tại field thay vì trôi tới worker runtime.
+
+Pattern “map rồi index” còn được gọi là distributive object type. Nó thường
+cho error gần key sai hơn một conditional type lồng nhiều tầng.
+
+## Production spec: input, output và error cùng một nguồn
+
+Ba map rời có thể lệch key. Gom contract của mỗi operation vào một entry:
+
+```ts
+type JobSpec = {
+  email: {
+    input: { to: string; templateId: string };
+    output: { messageId: string };
+    error: { code: 'MAIL_REJECTED'; retryable: boolean };
+  };
+  'image.resize': {
+    input: { source: URL; width: number };
+    output: { assetUrl: URL; bytes: number };
+    error: { code: 'INVALID_IMAGE' | 'STORAGE_ERROR'; retryable: boolean };
+  };
+  cleanup: {
+    input: { bucket: string; olderThanDays: number };
+    output: { deleted: number };
+    error: { code: 'BUCKET_UNAVAILABLE'; retryable: true };
+  };
+};
+
+type InputOf<Entry> = Entry extends { input: infer Input } ? Input : never;
+
+type OutputOf<Entry> = Entry extends { output: infer Output } ? Output : never;
+
+type ErrorOf<Entry> = Entry extends { error: infer Error } ? Error : never;
+```
+
+Derive job và handler result bằng mapped union:
+
+```ts
+type JobOf<Spec, K extends keyof Spec = keyof Spec> = {
+  [P in K]: {
+    type: P;
+    jobId: string;
+    payload: InputOf<Spec[P]>;
+  };
+}[K];
+
+type HandlerResult<Entry> =
+  | { ok: true; value: OutputOf<Entry> }
+  | { ok: false; error: ErrorOf<Entry> };
+
+type JobOutcomeOf<Spec, K extends keyof Spec = keyof Spec> = {
+  [P in K]:
+    | {
+        ok: true;
+        type: P;
+        jobId: string;
+        value: OutputOf<Spec[P]>;
+      }
+    | {
+        ok: false;
+        type: P;
+        jobId: string;
+        error: ErrorOf<Spec[P]>;
+      };
+}[K];
+
+type ProductionJob = JobOf<JobSpec>;
+type ProductionOutcome = JobOutcomeOf<JobSpec>;
+```
+
+Narrow `type` giữ cả payload, output và error đi cùng operation.
+
+## Handler map biến exhaustiveness thành object check
+
+```ts
+type JobContext = {
+  signal: AbortSignal;
+  attempt: number;
+};
+
+type HandlerMap<Spec> = {
+  [K in keyof Spec]: (
+    payload: InputOf<Spec[K]>,
+    context: JobContext
+  ) => Promise<HandlerResult<Spec[K]>>;
+};
+```
+
+`satisfies` kiểm đủ key và giữ contextual type cho từng payload:
+
+```ts
+declare const handlers: {
+  email: HandlerMap<JobSpec>['email'];
+  'image.resize': HandlerMap<JobSpec>['image.resize'];
+  cleanup: HandlerMap<JobSpec>['cleanup'];
+};
+
+handlers satisfies HandlerMap<JobSpec>;
+```
+
+Thêm key mới vào `JobSpec` khiến registry thiếu handler fail compile. Đổi output
+của một job khiến đúng handler và đúng consumer bị chỉ ra.
+
+Đây là exhaustiveness theo data table; không cần `switch` nếu runtime thật sự
+được tổ chức như registry.
+
+## Exhaustive switch vẫn là lựa chọn tốt cho union nhỏ
+
+Khi chỉ có vài operation và muốn implementation không assertion, switch rất
+rõ:
+
+```ts
+function assertNever(value: never): never {
+  throw new Error(`Unhandled variant: ${JSON.stringify(value)}`);
+}
+
+function route(job: ProductionJob): string {
+  switch (job.type) {
+    case 'email':
+      return job.payload.to;
+    case 'image.resize':
+      return `${job.payload.width}px`;
+    case 'cleanup':
+      return job.payload.bucket;
+    default:
+      return assertNever(job);
+  }
+}
+```
+
+Switch mua narrowing rõ, zero assertion và error tại case bị thiếu. Registry
+plugin động cần trade-off khác.
+
+## Generic dispatcher và unsafe adapter hẹp
+
+Public call signature cần giữ result theo input:
+
+```ts
+type Dispatcher<Spec> = <K extends keyof Spec>(
+  job: JobOf<Spec, K>
+) => Promise<JobOutcomeOf<Spec, K>>;
+```
+
+TypeScript không luôn giữ correlation khi một generic key được dùng để lookup
+dynamic registry rồi gọi function lấy ra. Đừng rải assertion ở từng handler;
+cô lập erasure vào factory và test contract hai phía.
+
+```ts
+type UnsafeHandlerResult =
+  | { ok: true; value: unknown }
+  | { ok: false; error: unknown };
+
+type UnsafeHandler = (
+  payload: unknown,
+  context: JobContext
+) => Promise<UnsafeHandlerResult>;
+
+function createDispatcher<Spec>(
+  typedHandlers: HandlerMap<Spec>,
+  context: JobContext
+): Dispatcher<Spec> {
+  const table = typedHandlers as unknown as Record<PropertyKey, UnsafeHandler>;
+
+  return async <K extends keyof Spec>(job: JobOf<Spec, K>) => {
+    const handler = table[job.type];
+    if (!handler) throw new Error(`Missing handler: ${String(job.type)}`);
+
+    const result = await handler(job.payload, context);
+    const outcome = result.ok
+      ? { ok: true, type: job.type, jobId: job.jobId, value: result.value }
+      : { ok: false, type: job.type, jobId: job.jobId, error: result.error };
+
+    return outcome as JobOutcomeOf<Spec, K>;
+  };
+}
+```
+
+Assertion không chứng minh runtime input. Queue payload phải được parse thành
+`ProductionJob` trước factory. Assertion này chỉ nối lại relation mà handler
+map đã kiểm tra tại compile time; runtime guard vẫn chặn key không tồn tại.
+
+Review factory như trust boundary: không export `UnsafeHandler`, khóa relation
+bằng type tests, chạy runtime test cho từng key và không cho plugin bypass parser.
+
+## Type tests khóa call-site UX
+
+```ts
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
+    ? true
+    : false;
+
+type Expect<T extends true> = T;
+
+type EmailJob = Extract<ProductionJob, { type: 'email' }>;
+type _emailPayload = Expect<
+  Equal<EmailJob['payload'], { to: string; templateId: string }>
+>;
+
+type EmailOutcome = JobOutcomeOf<JobSpec, 'email'>;
+type _emailSuccess = Expect<
+  Equal<Extract<EmailOutcome, { ok: true }>['value'], { messageId: string }>
+>;
+
+type _commonKeys = Expect<Equal<keyof WorkerCommand, 'type'>>;
+```
+
+Call test kiểm tra generic dispatcher:
+
+```ts
+declare const context: JobContext;
+const dispatch = createDispatcher(handlers, context);
+
+// @ts-expect-error — resize không nhận payload email
+dispatch({
+  type: 'image.resize',
+  jobId: 'job_4',
+  payload: { to: 'a@b.c', templateId: 'x' },
+});
+```
+
+Negative test đặc biệt quan trọng: nếu API vô tình widen thành `any` hoặc
+`unknown`, positive test có thể vẫn pass nhưng invalid combination sẽ lọt.
+
+## Union-to-intersection: hiểu cơ chế trước khi dùng
+
+Helper kinh điển:
+
+```ts
+type UnionToIntersection<U> = (
+  U extends unknown ? (value: U) => void : never
+) extends (value: infer Intersection) => void
+  ? Intersection
+  : never;
+
+type Combined = UnionToIntersection<
+  { traceId: string } | { signal: AbortSignal }
+>;
+//   ^? { traceId: string } & { signal: AbortSignal }
+```
+
+Distribution tạo union các function. Inference từ vị trí parameter cần một
+input dùng được cho mọi function, nên candidate hội tụ thành intersection.
+
+Intersection không merge runtime value. Nếu generic mapped API dễ đọc hơn,
+đừng dùng trick này chỉ để hover trông giống overload.
+
+## Union không có thứ tự ổn định
+
+Union là set-like, không phải array. `LastOfUnion`/`UnionToTuple` không được
+quyết định menu, migration, serialization, handler priority hay docs order.
+
+Nếu runtime cần thứ tự, giữ `const jobOrder = [...] as const` làm source of
+truth và test `Exclude<keyof JobSpec, typeof jobOrder[number]>` là `never`.
+Array quyết định order; compiler chỉ kiểm completeness.
+
+## Error quality và performance
+
+Union algebra vẫn đắt theo breadth: nested distribution tạo tích Descartes,
+union-to-intersection dựng signature lớn, `Extract` lặp ở nhiều call site và
+“god event map” buộc mọi feature instantiate mọi event.
+
+Decision rules:
+
+1. Đặt tên `JobOf`, `JobOutcomeOf`, `HandlerMap`; đừng inline graph ở public API.
+2. Chia spec theo bounded context rồi compose ở entry point.
+3. Map một lần theo discriminant thay vì lồng nhiều conditional tương đương.
+4. Giữ invalid-call test để không tối ưu bằng cách widen thành `any`.
+5. Đo `Types`, `Instantiations`, check time và editor completion trên union gần
+   kích thước production.
+6. Generate declaration khi spec hữu hạn đến từ schema và union quá lớn.
+
+Error message cũng là API. Một diagnostic trỏ vào `payload.width` hữu ích hơn
+mười màn hình conditional expansion dù hai type có precision giống nhau.
+
+## Lab
+
+1. Refactor event type đang có `name: EventName` và `payload: AllPayloads`
+   sang mapped union map-then-index.
+2. Derive `HandlerMap` và làm thiếu một handler để quan sát diagnostic.
+3. Viết exhaustive switch không `default`; thêm variant và ghi mọi nơi fail.
+4. Viết generic dispatcher với đúng một unsafe adapter; thêm runtime parse cho
+   input `unknown` trước khi dispatch.
+5. So sánh error của conditional type lồng nhau với mapped union có tên.
+6. Benchmark spec 20, 100 và 500 job kind; ghi budget trước khi chọn codegen.
+7. Tìm một `UnionToTuple` trong codebase; thay order ngầm bằng `as const` value.
+
+**Done khi:** invalid pair không biểu diễn được, registry thiếu key fail gần
+nguồn, call site suy đúng output/error, payload ngoại vi vẫn được parse, và
+compiler cost được đo trên union có kích thước giống production.
+
+Union algebra đáng học không phải để sưu tập trick. Nó cho phép bạn thiết kế
+API nơi compiler giữ đúng các quan hệ business, còn runtime vẫn có boundary,
+ownership và performance budget rõ ràng.
+
+## Đọc tiếp
+
+- [Unions and Exhaustiveness Checking](https://www.typescriptlang.org/docs/handbook/unions-and-intersections.html)
+- [Distributive Conditional Types](https://www.typescriptlang.org/docs/handbook/2/conditional-types.html#distributive-conditional-types)
+- [Mapped Types](https://www.typescriptlang.org/docs/handbook/2/mapped-types.html)
+- [`keyof` Type Operator](https://www.typescriptlang.org/docs/handbook/2/keyof-types.html)

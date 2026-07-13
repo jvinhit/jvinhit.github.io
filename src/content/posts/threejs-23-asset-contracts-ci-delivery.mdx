@@ -1,0 +1,355 @@
+---
+title: 'Three.js from Zero to Senior · Part 23 — Asset Contracts, CI Gates & Safe Delivery'
+description: 'Treat every glTF as a versioned production contract: coordinate and naming rules, slot-aware KTX2, tier budgets, CI validation, immutable delivery, race-safe loading and provenance.'
+pubDate: 2026-07-12
+lang: vi
+tags: [threejs, 3d, gltf, assets, performance, architecture, ci]
+series: threejs
+seriesOrder: 23
+draft: false
+---
+
+import DemoEmbed from '~/components/blog/DemoEmbed.astro';
+
+Một model đẹp trong Blender chưa phải là asset production. Nó chỉ trở thành **đầu vào đáng tin cậy của hệ thống** khi renderer, product code, CDN, CI và đội nội dung cùng hiểu chính xác một contract: đơn vị nào, trục nào là mặt trước, pivot ở đâu, node nào được phép gọi bằng tên, animation nào là public API, texture nào dùng codec gì, ngân sách của tier thiết bị là bao nhiêu, và byte này đến từ đâu.
+
+Nếu không có contract, mọi lỗi đều xuất hiện muộn: ghế quay ngược trong configurator, nhân vật cao 180 mét, code tìm `Wheel_FL` nhưng artist đổi thành `Cylinder.042`, texture normal bị nén thành một mảng màu bệt, hoặc CDN trả một file mới dưới URL cũ mà client vẫn giữ manifest cũ. Staff engineer không giải quyết từng triệu chứng bằng thêm một `if`; họ biến asset thành **artifact có version, policy và quality gate**.
+
+Lab dưới đây không tải model ngoài. Nó mô phỏng đúng phần thường bị bỏ quên: manifest, contract, budget theo device tier, policy KTX2 theo texture slot, hash, license và provenance. Đổi preset, phá từng invariant, rồi xem CI quyết định `PASS`, `WARN` hay `BLOCK`.
+
+<DemoEmbed
+  slug="threejs-asset-pipeline-lab"
+  title="Three.js asset manifest and CI budget gate lab"
+  height="980px"
+/>
+
+## Asset là một public contract, không phải một file
+
+[glTF 2.0](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html) là runtime delivery format: nó chuẩn hóa scene, node, mesh, material, animation và extension. Nhưng spec không biết domain của sản phẩm bạn. Nó không biết node `Seat` có phải selection target, clip `Idle` có bắt buộc, pivot của sofa phải nằm giữa chân, hay license có cho phép dùng trong quảng cáo.
+
+Vì vậy có hai tầng validation khác nhau:
+
+| Tầng                 | Câu hỏi                                                                                         | Owner                  |
+| -------------------- | ----------------------------------------------------------------------------------------------- | ---------------------- |
+| **Conformance**      | File có đúng glTF, accessor có hợp lệ, reference có tồn tại, extension có khai báo đúng?        | Khronos glTF Validator |
+| **Product contract** | Unit, orientation, pivot, naming, material slot, animation, license và budget có đúng use case? | Team sở hữu pipeline   |
+
+Một file có thể **valid nhưng không shippable**. Đó không phải mâu thuẫn; nó giống JSON hợp lệ nhưng không thỏa schema nghiệp vụ.
+
+### Contract tối thiểu cần khóa
+
+| Nhóm      | Contract nên ghi rõ                                           | Failure mode khi bỏ qua                          |
+| --------- | ------------------------------------------------------------- | ------------------------------------------------ |
+| Identity  | `assetId`, SemVer, content hash, source revision              | URL cũ trả byte mới; rollback không tái lập được |
+| Space     | metre, up axis, front axis, handedness                        | scale/rotation patch rải khắp product code       |
+| Pivot     | ground-center, hinge, wheel axle, grip point                  | rotate/placement trượt khỏi vị trí thật          |
+| Naming    | public node/material/clip names, regex cho private names      | refactor DCC làm hỏng selector runtime           |
+| Material  | slot semantics, alpha mode, sidedness, variant names          | draw call tăng, sorting sai, variant biến mất    |
+| Animation | required clips, loop mode, root-motion policy, duration range | state machine kẹt hoặc nhân vật trượt            |
+| Rights    | license SPDX, author/source, modification policy              | asset đúng kỹ thuật nhưng không được quyền ship  |
+| Delivery  | critical/optional, tier budgets, codecs, hash, cache policy   | LCP/scene-ready phụ thuộc asset trang trí        |
+
+`name` trong glTF hữu ích để debug, nhưng chỉ những tên được công bố trong manifest mới là **API ổn định**. Tên còn lại là implementation detail và artist được quyền đổi.
+
+## Một manifest có thể review và gate được
+
+Đừng nhét mọi thứ vào `extras` rồi hy vọng runtime tự hiểu. Giữ một manifest typed, versioned cạnh output đã tối ưu. Ví dụ rút gọn:
+
+```ts
+type TexturePolicy = {
+  slot: 'baseColor' | 'emissive' | 'normal' | 'metalRough' | 'occlusion';
+  codec: 'ktx2-etc1s' | 'ktx2-uastc' | 'webp' | 'png';
+  colorSpace: 'srgb' | 'linear-srgb' | 'none/data';
+  maxSize: 1024 | 2048 | 4096;
+};
+
+type AssetContract = {
+  schema: 'com.example.three.asset.v1';
+  assetId: string;
+  version: `${number}.${number}.${number}`;
+  uri: string; // content-addressed, never overwritten
+  sha256: `sha256:${string}`;
+  stage: 'critical' | 'optional';
+  coordinate: {
+    unitMeters: 1;
+    up: '+Y';
+    front: '+Z'; // product convention, written explicitly
+    pivot: 'ground-center' | 'hinge' | 'custom';
+  };
+  publicNodes: readonly string[];
+  requiredAnimations: readonly string[];
+  textures: readonly TexturePolicy[];
+  metrics: {
+    transferBytes: number;
+    triangles: number;
+    textures: number;
+    maxTextureSize: number;
+    expectedDrawCalls: number;
+  };
+  rights: {
+    licenseSpdx: string;
+    sourceUrl: string;
+    author: string;
+  };
+  provenance: {
+    sourceRevision: string;
+    pipelineVersion: string;
+    buildRun: string;
+  };
+};
+```
+
+Ba version khác nhau đang cùng tồn tại:
+
+1. **Contract version** (`schema`) đổi khi format manifest đổi.
+2. **Asset SemVer** đổi major khi phá public node/clip/material contract; minor khi thêm capability tương thích; patch khi sửa hình/texture mà contract giữ nguyên.
+3. **Content hash** đổi với mọi byte. Nó là identity triển khai, không phải thông điệp nghiệp vụ.
+
+SemVer giúp con người hiểu mức tương thích; hash giúp máy xác nhận chính xác artifact.
+
+## Validate trước, tối ưu sau, validate lại
+
+[Khronos glTF Validator](https://github.com/KhronosGroup/glTF-Validator) kiểm tra schema, reference, accessor, animation, image và extension; CLI trả exit code khác 0 khi có error. [`gltf-transform inspect`](https://gltf-transform.dev/) cho bảng scene, mesh, primitive, material, texture và animation hữu ích để xây budget.
+
+Pipeline đúng không phải “chạy optimize rồi upload” mà là một chuỗi có bằng chứng:
+
+```bash
+# 1. Source phải hợp lệ trước khi biến đổi.
+gltf_validator -a assets/source/hero.glb
+gltf-transform inspect assets/source/hero.glb
+
+# 2. Dọn cấu trúc bằng các bước không encode lại texture.
+# Giữ output trung gian để điều tra khi pipeline lỗi.
+gltf-transform dedup \
+  assets/source/hero.glb \
+  .artifacts/hero.dedup.glb
+
+gltf-transform prune \
+  .artifacts/hero.dedup.glb \
+  .artifacts/hero.cleaned.glb
+
+# 3. Texture policy theo slot, không một codec cho mọi ảnh.
+gltf-transform uastc \
+  .artifacts/hero.cleaned.glb \
+  .artifacts/hero.data-ktx2.glb \
+  --slots "{normalTexture,occlusionTexture,metallicRoughnessTexture}" \
+  --level 4 --rdo --zstd 18
+
+gltf-transform etc1s \
+  .artifacts/hero.data-ktx2.glb \
+  dist/hero.4f82c1.glb \
+  --slots "{baseColorTexture,emissiveTexture}" \
+  --quality 255
+
+# 4. Validate output thật sẽ ship và đo lại metrics từ output đó.
+gltf_validator -a dist/hero.4f82c1.glb
+gltf-transform inspect dist/hero.4f82c1.glb
+node scripts/gate-asset.mjs dist/hero.manifest.json
+```
+
+Lệnh cụ thể phải pin theo version CLI trong lockfile và được thử trên fixture của repo. Không copy một pipeline “tối ưu tất cả” vào production mà không visual-diff output: quantization, simplification và texture compression đều có thể làm hỏng normal, UV seam, morph target hoặc animation.
+
+## KTX2 là policy theo slot
+
+[`KTX2Loader.detectSupport(renderer)`](https://threejs.org/docs/pages/KTX2Loader.html) chọn compressed target mà GPU hiện tại hỗ trợ; nó phải chạy trước khi load. Nhưng quyết định **encode** thuộc pipeline, và phải dựa trên ý nghĩa texture.
+
+| Slot                             | Three.js color space | Default policy                      | Lý do / ngoại lệ                                                    |
+| -------------------------------- | -------------------- | ----------------------------------- | ------------------------------------------------------------------- |
+| `baseColor`, `emissive`          | `SRGBColorSpace`     | ETC1S khi chất lượng đạt            | Nhỏ, hợp với nội dung màu; dùng UASTC nếu gradient/logo lộ artifact |
+| `normal`                         | `NoColorSpace`       | UASTC                               | Là vector data, không được áp color-space conversion                |
+| packed `metalRough`, `occlusion` | `NoColorSpace`       | UASTC                               | Mỗi channel là dữ liệu; cross-channel/block error có ý nghĩa vật lý |
+| mask alpha sắc nét               | `NoColorSpace`       | UASTC hoặc lossless                 | ETC1S có thể làm viền rung và alpha-test mất ổn định                |
+| UI/decal chữ                     | `SRGBColorSpace`     | lossless/WebP/UASTC sau visual test | “Nhỏ nhất” không quan trọng bằng đọc được                           |
+
+`LinearSRGBColorSpace` chỉ dành cho **tín hiệu màu** đã ở linear-sRGB. Normal/ORM/mask là dữ liệu nên dùng `NoColorSpace`; gọi chung chúng là “linear texture” dễ khiến contract bị map sai khi vào Three.js.
+
+ETC1S và UASTC đều nằm trong KTX2/Basis workflow, nhưng chúng không hoán đổi vô điều kiện. “Normal luôn UASTC, color thường ETC1S” là **điểm bắt đầu**, không phải luật miễn kiểm thử. Luôn đánh giá ở khoảng cách camera thật, trên tier GPU thật.
+
+Ở runtime, loader cần đủ decoder cho chính các extension manifest khai báo. [Three.js `GLTFLoader`](https://threejs.org/docs/pages/GLTFLoader.html) yêu cầu gắn `DRACOLoader`, `KTX2Loader` hoặc Meshopt decoder tương ứng; thiếu decoder phải fail thành error state có thể quan sát, không để canvas trắng.
+
+## Budget theo device tier và stage
+
+Không tồn tại một con số “chuẩn Three.js” cho mọi sản phẩm. Budget phải suy ra từ SLO, camera, mức tương tác, network cohort và thiết bị hỗ trợ. Bảng sau là **baseline khởi đầu cho một product viewer**, không phải tiêu chuẩn ngành:
+
+| Tier              | Critical bytes | Full scene bytes | Visible triangles | Textures / max edge | Draw calls |
+| ----------------- | -------------: | ---------------: | ----------------: | ------------------: | ---------: |
+| Entry mobile      |          2 MiB |            5 MiB |              120k |             12 / 2K |         35 |
+| Mid mobile/laptop |          4 MiB |            9 MiB |              250k |             20 / 4K |         70 |
+| High desktop      |          8 MiB |           18 MiB |              500k |             32 / 4K |        120 |
+
+Các cột đo những bottleneck khác nhau:
+
+- **Byte** ảnh hưởng transfer và decode startup.
+- **Triangle** ảnh hưởng vertex work nhưng không nói gì về fill-rate.
+- **Texture count/kích thước** là proxy cho memory; không phải số VRAM chính xác.
+- **Draw call** là property của scene sau batching/instancing, không chỉ của file.
+
+Gate cả asset riêng và **representative assembled scene**. Một chiếc ghế 4 draw call có thể ổn, nhưng 100 chiếc ghế không instance sẽ phá budget scene.
+
+### Critical trước, optional sau
+
+Loading screen không nên đợi mọi thứ. Chia dependency graph:
+
+```ts
+const critical = manifest.assets.filter((asset) => asset.stage === 'critical');
+const optional = manifest.assets.filter((asset) => asset.stage === 'optional');
+
+await Promise.all(critical.map(loadVerified));
+app.revealInteractiveScene();
+
+for (const asset of optional) {
+  scheduler.enqueue(() => loadVerified(asset).catch(showLocalFallback));
+}
+```
+
+Critical là thứ cần để người dùng hoàn thành intent đầu tiên, không phải thứ art director thấy đẹp. Environment phụ, decal, animation emote và LOD gần thường có thể vào optional stage.
+
+## Load có abort, integrity và race guard
+
+`AbortController` chỉ dừng `fetch`; nó không hứa hủy một decoder/parse đã bắt đầu. Vì vậy race-safe loader cần **cả abort lẫn generation token**:
+
+```ts
+class AssetSlot {
+  #generation = 0;
+  #controller?: AbortController;
+
+  async replace(entry: AssetContract) {
+    const generation = ++this.#generation;
+    this.#controller?.abort();
+    this.#controller = new AbortController();
+
+    const response = await fetch(entry.uri, {
+      signal: this.#controller.signal,
+      credentials: 'omit',
+    });
+    if (!response.ok) throw new Error(`asset_http_${response.status}`);
+
+    const bytes = await response.arrayBuffer();
+    await assertSha256(bytes, entry.sha256);
+    const gltf = await loader.parseAsync(bytes, new URL('.', entry.uri).href);
+
+    // Parse có thể hoàn thành sau một replace mới hơn.
+    if (generation !== this.#generation) {
+      disposeGltf(gltf);
+      return { committed: false as const, reason: 'stale' as const };
+    }
+
+    this.commit(gltf, entry);
+    return { committed: true as const };
+  }
+
+  cancel() {
+    ++this.#generation;
+    this.#controller?.abort();
+  }
+}
+```
+
+Invariant quan trọng: **response cũ không bao giờ được commit lên slot mới**, kể cả khi nó thành công. Test Part 24 sẽ cố tình tạo race này.
+
+## Hash, CDN và cache không được mâu thuẫn
+
+Artifact có hash trong tên có thể cache lâu vì URL mới đồng nghĩa byte mới:
+
+```http
+# /assets/hero.4f82c1.glb
+Cache-Control: public, max-age=31536000, immutable, no-transform
+Content-Type: model/gltf-binary
+
+# /assets/scene-manifest.v23.json
+Cache-Control: no-cache
+```
+
+[`RFC 9111`](https://www.rfc-editor.org/rfc/rfc9111.html) định nghĩa HTTP caching; `immutable` được chuẩn hóa trong [`RFC 8246`](https://www.rfc-editor.org/rfc/rfc8246.html). Manifest phải được revalidate vì nó là pointer tới version hiện tại; artifact content-addressed không bị overwrite. Rollback chỉ là trỏ manifest về hash trước, không upload lại byte dưới cùng URL.
+
+Hash trong manifest còn giải quyết một giới hạn thực tế: SRI truyền thống chủ yếu gắn với `script`/`link`, không tự xác minh `fetch()` model. Với GLB, app đọc `ArrayBuffer`, tính `crypto.subtle.digest('SHA-256', bytes)`, rồi mới parse. Hash không thay TLS hay authorization; nó khóa **identity của content**.
+
+## CI gate phải trả lời bằng machine-readable evidence
+
+Một gate tốt không chỉ log “file too big”. Nó xuất report có rule, expected, actual, severity và asset identity:
+
+```json
+{
+  "schema": "com.example.asset-gate.v1",
+  "assetId": "catalog/chair-oak",
+  "version": "2.1.3",
+  "decision": "block",
+  "violations": [
+    {
+      "rule": "entry.criticalBytes",
+      "expectedMax": 2097152,
+      "actual": 2834018,
+      "severity": "error"
+    },
+    {
+      "rule": "texture.normal.codec",
+      "expected": "ktx2-uastc",
+      "actual": "ktx2-etc1s",
+      "severity": "error"
+    }
+  ]
+}
+```
+
+Policy nên phân ba mức:
+
+- **Error / block:** invalid glTF, thiếu license/hash/provenance, phá public contract, decoder bắt buộc không được runtime hỗ trợ, vượt hard budget.
+- **Warning:** sát budget, optional asset vượt soft target, naming private chưa đẹp.
+- **Info:** thống kê thay đổi byte/triangle/texture so với release trước.
+
+Budget exception phải có owner, lý do và ngày hết hạn. Một file `allow-over-budget: true` vĩnh viễn chỉ là xóa gate bằng YAML.
+
+## Provenance và security của asset supply chain
+
+glTF là data, nhưng “data” không có nghĩa vô hại. Asset không tin cậy có thể trỏ tới resource ngoài, khai báo allocation khổng lồ, ép decoder làm việc nặng, hoặc khai thác bug trong image/mesh decoder. Với upload từ vendor/user:
+
+1. Giới hạn compressed bytes, resource count và kích thước giải nén **trước** parse đầy đủ.
+2. Chỉ cho phép extension/runtime feature trong allowlist; reject URI scheme lạ và external origin ngoài policy.
+3. Validate trong worker/process cô lập với timeout và memory limit.
+4. Re-encode image/asset qua pipeline sở hữu; không serve nguyên upload.
+5. Lưu source URI, author, license, source digest, pipeline image/version và build run.
+6. Quét dependency/decoder và pin toolchain; output production chỉ đến từ CI identity được phép.
+
+[GitHub artifact attestations](https://docs.github.com/en/actions/concepts/security/artifact-attestations) là một cách gắn build artifact với repository, workflow và commit đã tạo nó. Attestation không thay license review hay content validation; nó trả lời câu hỏi khác: **artifact này được build ở đâu, từ revision nào, bởi identity nào?**
+
+Không thu thập asset từ marketplace rồi bỏ link nguồn. License là một field bắt buộc của contract và phải theo artifact qua mọi bước biến đổi.
+
+## Failure modes ở cấp hệ thống
+
+| Triệu chứng                                | Nguyên nhân gốc thường gặp              | Guardrail                                         |
+| ------------------------------------------ | --------------------------------------- | ------------------------------------------------- |
+| Model đúng hôm qua, sai hôm nay            | CDN URL mutable                         | content hash + immutable URL                      |
+| Scene hiện asset cũ sau thao tác nhanh     | response race                           | abort + generation token + dispose stale result   |
+| Mobile trắng, desktop chạy                 | KTX2 target/decoder hoặc extension khác | capability matrix + real-device smoke test        |
+| Normal “chảy”, kim loại loang              | ETC1S áp cho data map                   | slot-aware UASTC policy + visual diff             |
+| CI pass nhưng product không chọn được part | chỉ chạy conformance                    | product contract gate cho public names            |
+| Rollback vẫn lỗi                           | overwrite cùng URL, cache không tái lập | manifest pointer về content-addressed artifact cũ |
+| Memory tăng khi đổi variant                | stale/old glTF không dispose            | explicit ownership + lifecycle test               |
+| Không biết asset từ đâu                    | mất metadata khi optimize               | provenance manifest + attestation                 |
+
+## Definition of Done cho một asset production
+
+- glTF Validator không có error; warning đã triage.
+- Source và output đều được `inspect`; diff metrics có trong PR.
+- Unit, up/front axis, pivot và bounding box khớp contract.
+- Public node/material/animation names có contract test.
+- Texture slot đúng color space, codec và max dimension.
+- Asset và representative scene qua budget của tier hỗ trợ.
+- Critical/optional stage được khai báo theo user intent.
+- URL content-addressed; SHA-256 trong manifest khớp output.
+- Runtime decoder matrix có test; loader xử lý abort, stale và error fallback.
+- License, source, author, pipeline version và build provenance đầy đủ.
+- Có bản source không nén để tái build; production output được xem là disposable artifact.
+
+## Nguồn chính
+
+- [Khronos glTF 2.0 Specification](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html)
+- [Khronos glTF Validator](https://github.com/KhronosGroup/glTF-Validator)
+- [glTF Transform documentation](https://gltf-transform.dev/)
+- [Three.js GLTFLoader](https://threejs.org/docs/pages/GLTFLoader.html) và [KTX2Loader](https://threejs.org/docs/pages/KTX2Loader.html)
+- [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html)
+- [GitHub Artifact Attestations](https://docs.github.com/en/actions/concepts/security/artifact-attestations)
+
+## Tiếp theo
+
+CI làm giảm xác suất ship asset xấu; nó không chứng minh runtime sẽ sống sót trước browser, GPU, network và input thật. Part 24 xây testing pyramid deterministic, inject network/decode/context failure, định nghĩa telemetry không biến thành fingerprinting, và làm canvas có semantic twin để người dùng keyboard hoặc screen reader không bị đứng ngoài sản phẩm 3D.

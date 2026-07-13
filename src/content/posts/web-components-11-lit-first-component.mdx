@@ -1,0 +1,648 @@
+---
+title: 'Web Components · Phần 11 — Lit 3 và component đầu tiên'
+description: 'Hiểu Lit 3 như lớp render và reactivity trên Web Components; viết lại kb-task-card mà vẫn giữ nguyên public contract, accessibility và contract test.'
+pubDate: 2026-07-12
+lang: vi
+tags: [web-components, lit, typescript, custom-elements, shadow-dom, frontend]
+series: web-components
+seriesOrder: 11
+draft: false
+---
+
+Ở Phần 10, cùng một contract test đã mô tả `<kb-task-card>` bằng những gì
+consumer quan sát được: attribute, property, event và keyboard behavior.
+Test không quan tâm component gọi `innerHTML`, clone `<template>` hay kế thừa
+`LitElement`. Đó chính là điều kiện tốt nhất để đổi implementation.
+
+Phiên bản native giúp ta hiểu platform, nhưng khi số state và nhánh giao diện
+tăng, việc tự so sánh dữ liệu, cập nhật từng node và giữ listener đồng bộ trở
+thành công việc lặp. Phần này viết lại task card bằng **Lit 3**, nhưng không đổi
+một dòng API phía consumer. Mục tiêu không phải “thoát khỏi Web Components”; Lit
+là lớp mỏng giúp ta viết một Web Component dễ dự đoán hơn.
+
+---
+
+## 1. Mental model: Lit không tạo một loại component mới
+
+Một class Lit vẫn đi qua custom element registry và vẫn là `HTMLElement`:
+
+```text
+HTMLElement
+  └─ ReactiveElement   → reactive properties + update scheduler
+       └─ LitElement   → render() + template + scoped styles
+            └─ KbTaskCard
+```
+
+Browser vẫn chịu trách nhiệm cho:
+
+- tên thẻ và quá trình upgrade qua `customElements`;
+- lifecycle kết nối/ngắt kết nối;
+- attribute, property và DOM event;
+- Shadow DOM, slot, focus và accessibility tree.
+
+Lit bổ sung ba tiện ích chính: mô tả giao diện bằng tagged template `html`, lên
+lịch update khi reactive state đổi, và tái sử dụng DOM ổn định giữa các lần
+render. Vì thế mọi nguyên tắc đã học về constructor, lifecycle, event
+`bubbles/composed`, slot và public contract vẫn còn nguyên.
+
+Một cách kiểm tra mental model rất thực dụng:
+
+```js
+const card = document.createElement('kb-task-card');
+
+card instanceof HTMLElement; // true
+card instanceof Element; // true
+```
+
+Nếu xóa Lit khỏi implementation nhưng giữ được contract, consumer không cần
+biết sự thay đổi đó.
+
+## 2. Thiết lập Lit 3 và TypeScript decorators
+
+Trong package component, cài Lit 3 và TypeScript:
+
+```bash
+npm install lit@^3.3
+npm install --save-dev typescript
+```
+
+Series dùng Lit 3.3+ vì property option `useDefault` xuất hiện từ nhánh này.
+Lit hỗ trợ cả decorators chuẩn mới lẫn decorators kiểu TypeScript cũ. Tài liệu
+Lit hiện vẫn khuyến nghị **experimental decorators** cho code production vì
+output gọn và ổn định. Cấu hình tối thiểu trong `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2021",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2021", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false,
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts"]
+}
+```
+
+Hai dòng cuối liên quan decorator phải đi cùng nhau. Nếu dự án chọn decorators
+chuẩn, hãy theo đúng cấu hình riêng trong tài liệu Lit và khai báo field bằng
+`accessor`; đừng trộn hai mode theo từng file. Series dùng experimental
+decorators để ví dụ ngắn và nhất quán.
+
+Lit xuất ESM. App nên import entry module của component, còn bundler hoặc server
+chịu trách nhiệm phân giải package và phát JavaScript phù hợp browser mục tiêu.
+Package component không nên tự nhúng một bản Lit riêng vào từng element.
+
+## 3. Viết lại `<kb-task-card>` nhưng giữ nguyên contract
+
+Tạo `src/kb-task-card.ts`:
+
+```ts
+import { LitElement, css, html, isServer } from 'lit';
+import { customElement, property, state } from 'lit/decorators.js';
+
+type Priority = 'low' | 'medium' | 'high';
+type TaskStatus = 'todo' | 'doing' | 'done';
+
+interface TaskData {
+  readonly title: string;
+  readonly assignee?: string;
+  readonly labels?: readonly string[];
+}
+
+const DEFAULT_TASK: Readonly<Required<TaskData>> = Object.freeze({
+  title: 'Task chưa đặt tên',
+  assignee: '',
+  labels: Object.freeze([]),
+});
+
+@customElement('kb-task-card')
+export class KbTaskCard extends LitElement {
+  #internals = isServer ? undefined : this.attachInternals();
+
+  constructor() {
+    super();
+    if (this.#internals) this.#internals.role = 'article';
+  }
+
+  @property({
+    attribute: 'task-id',
+    reflect: true,
+    useDefault: true,
+  })
+  taskId = '';
+
+  #priority: Priority = 'medium';
+
+  @property({
+    reflect: true,
+    useDefault: true,
+    converter: {
+      fromAttribute: (value) =>
+        value === 'low' || value === 'high' ? value : 'medium',
+      toAttribute: (value) => value,
+    },
+  })
+  set priority(value: Priority) {
+    const next = String(value);
+    if (next !== 'low' && next !== 'medium' && next !== 'high') {
+      throw new RangeError(`Unsupported priority: ${next}`);
+    }
+    this.#priority = next;
+  }
+
+  get priority(): Priority {
+    return this.#priority;
+  }
+
+  #status: TaskStatus = 'todo';
+
+  @property({
+    reflect: true,
+    useDefault: true,
+    converter: {
+      fromAttribute: (value) =>
+        value === 'doing' || value === 'done' ? value : 'todo',
+      toAttribute: (value) => value,
+    },
+  })
+  set status(value: TaskStatus) {
+    const next = String(value);
+    if (next !== 'todo' && next !== 'doing' && next !== 'done') {
+      throw new RangeError(`Unsupported status: ${next}`);
+    }
+    this.#status = next;
+  }
+
+  get status(): TaskStatus {
+    return this.#status;
+  }
+
+  @property({ type: Boolean, reflect: true, useDefault: true })
+  completed = false;
+
+  @state()
+  private interactive = false;
+
+  #task = DEFAULT_TASK;
+
+  @property({ attribute: false })
+  set task(value: TaskData) {
+    if (!value || typeof value !== 'object') {
+      throw new TypeError('task must be an object');
+    }
+
+    const title = String(value.title ?? '').trim();
+    if (!title) throw new TypeError('task.title is required');
+
+    this.#task = Object.freeze({
+      title,
+      assignee: value.assignee ? String(value.assignee) : '',
+      labels: Object.freeze(
+        Array.isArray(value.labels) ? value.labels.map(String) : []
+      ),
+    });
+  }
+
+  get task(): Readonly<Required<TaskData>> {
+    return this.#task;
+  }
+
+  static styles = css`
+    :host {
+      display: block;
+      color: var(--kb-card-color, #202124);
+      font:
+        1rem/1.45 system-ui,
+        sans-serif;
+    }
+
+    .surface {
+      display: grid;
+      gap: 0.75rem;
+      padding: 1rem;
+      border: 1px solid var(--kb-card-border, #c7c9cc);
+      border-radius: 0.75rem;
+      background: var(--kb-card-surface, white);
+    }
+
+    :host([completed]) h3 {
+      text-decoration: line-through;
+    }
+
+    h3,
+    p {
+      margin: 0;
+    }
+
+    ul {
+      display: flex;
+      gap: 0.375rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    button {
+      justify-self: start;
+      min-block-size: 2.75rem;
+    }
+
+    button:focus-visible {
+      outline: 3px solid var(--kb-focus, #2563eb);
+      outline-offset: 2px;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+  `;
+
+  willUpdate() {
+    if (this.#internals) {
+      this.#internals.ariaLabel = `Task: ${this.task.title}${
+        this.completed ? ', đã hoàn thành' : ''
+      }`;
+    }
+  }
+
+  firstUpdated() {
+    this.interactive = true;
+  }
+
+  render() {
+    return html`
+      <div
+        class="surface"
+        part="surface"
+        data-priority=${this.priority}
+        data-status=${this.status}
+        @keydown=${this.#handleKeydown}
+      >
+        <h3>${this.task.title}</h3>
+        <p>Ưu tiên: ${this.priority}</p>
+
+        <ul aria-label="Nhãn">
+          ${this.task.labels.map((label) => html`<li>${label}</li>`)}
+        </ul>
+
+        <p>Người thực hiện: ${this.task.assignee || 'Chưa giao'}</p>
+
+        <div class="actions">
+          <button
+            type="button"
+            data-action="toggle"
+            .value=${this.taskId}
+            aria-pressed=${String(this.completed)}
+            ?disabled=${!this.interactive}
+            @click=${this.#toggle}
+          >
+            Hoàn thành
+          </button>
+          <button
+            type="button"
+            data-action="move-left"
+            ?disabled=${!this.interactive || this.status === 'todo'}
+            @click=${() => this.#move(-1)}
+          >
+            Sang trái
+          </button>
+          <button
+            type="button"
+            data-action="move-right"
+            ?disabled=${!this.interactive || this.status === 'done'}
+            @click=${() => this.#move(1)}
+          >
+            Sang phải
+          </button>
+        </div>
+
+        ${!this.interactive
+          ? html`<p role="status">
+              Chế độ chỉ đọc; tương tác khả dụng sau khi component được kích
+              hoạt.
+            </p>`
+          : null}
+      </div>
+    `;
+  }
+
+  focusPrimaryAction(options?: FocusOptions) {
+    this.renderRoot
+      .querySelector<HTMLButtonElement>('[data-action="toggle"]')
+      ?.focus(options);
+  }
+
+  #toggle() {
+    this.completed = !this.completed;
+
+    this.dispatchEvent(
+      new CustomEvent('kb-task-toggle', {
+        detail: Object.freeze({
+          taskId: this.taskId,
+          completed: this.completed,
+        }),
+        bubbles: true,
+        composed: true,
+      })
+    );
+  }
+
+  #handleKeydown(event: KeyboardEvent) {
+    if (!event.altKey || event.defaultPrevented) return;
+    const offset =
+      event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowRight' ? 1 : 0;
+    if (offset === 0) return;
+    event.preventDefault();
+    this.#move(offset);
+  }
+
+  #move(offset: -1 | 1) {
+    const statuses: readonly TaskStatus[] = ['todo', 'doing', 'done'];
+    const toStatus = statuses[statuses.indexOf(this.status) + offset];
+    if (!toStatus) return;
+
+    this.dispatchEvent(
+      new CustomEvent('kb-task-move', {
+        detail: Object.freeze({ taskId: this.taskId, toStatus }),
+        bubbles: true,
+        composed: true,
+      })
+    );
+  }
+}
+
+declare global {
+  interface HTMLElementTagNameMap {
+    'kb-task-card': KbTaskCard;
+  }
+}
+```
+
+Đây vẫn là một custom element autonomous. Decorator `@customElement` gọi
+`customElements.define()` thay ta. `render()` tạo shadow root mở theo mặc định,
+`static styles` được scope vào shadow tree. Property `task`, status, priority,
+keyboard controls và hai event intent vẫn giữ contract của bản native.
+
+Bốn quyết định giữ contract đáng chú ý:
+
+1. Tên camelCase `taskId` ánh xạ rõ sang attribute `task-id`.
+2. `completed`, `priority` và `status` hữu ích cho HTML/CSS nên phản chiếu ra
+   attribute; object `task` chỉ đi qua property và được normalize thành bản sao.
+3. `kb-task-toggle` và `kb-task-move` vẫn bubble + composed để board nghe ở một
+   boundary. Payload chỉ chứa intent, không lộ chi tiết DOM bên trong card.
+4. `ElementInternals` giữ default role `article` và accessible name trên host;
+   author vẫn có thể override semantics công khai mà không tạo nested article.
+
+`isServer` giữ class chạy được trong DOM shim của Lit SSR, nơi
+`attachInternals()` chưa tồn tại. Nhánh browser vẫn gắn semantics bằng
+ElementInternals; output SSR phải tự có semantic HTML phù hợp cho thời điểm chưa
+upgrade, như Phần 14 sẽ làm rõ. Reactive state `interactive` bắt đầu `false` ở
+cả server lẫn first render của client, nên template hydration khớp: ba button
+disabled kèm trạng thái read-only. `firstUpdated()` chỉ chạy ở browser, chuyển
+state sang `true` và mở interaction mà không tạo server/client branch khác cấu
+trúc.
+
+`useDefault: true` ngăn giá trị mặc định `false` tự tạo attribute lúc khởi tạo;
+sau đó property và attribute vẫn đồng bộ. Reflection nên là quyết định API, không
+phải mặc định cho mọi state.
+
+## 4. Chạy component trong một trang thật
+
+Consumer chỉ cần import module rồi dùng HTML bình thường:
+
+```html
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <title>Lit task card</title>
+    <script type="module" src="/dist/kb-task-card.js"></script>
+  </head>
+  <body>
+    <kb-task-card
+      task-id="KB-101"
+      priority="high"
+      status="doing"
+    ></kb-task-card>
+
+    <script type="module">
+      const card = document.querySelector('kb-task-card');
+      card.task = {
+        title: 'Viết contract test',
+        assignee: 'An',
+        labels: ['a11y', 'testing'],
+      };
+
+      card.addEventListener('kb-task-toggle', (event) => {
+        console.log(event.detail);
+      });
+    </script>
+  </body>
+</html>
+```
+
+HTML chỉ truyền dữ liệu string/boolean đơn giản. Object `task` được gán bằng
+property; Lit capture và replay property được set trước upgrade. Contract test
+Phần 10 giữ hành vi này không bị mất khi implementation đổi.
+
+## 5. Năm kiểu expression phải phân biệt
+
+Trong template Lit, vị trí của expression quyết định thao tác DOM. Một board
+render card có thể dùng đủ năm loại:
+
+```ts
+renderTask(task: Task) {
+  return html`
+    <section>
+      <p>Người thực hiện: ${task.assignee}</p>
+      <kb-task-card
+        task-id=${task.id}
+        priority=${task.priority}
+        status=${task.status}
+        ?completed=${task.completed}
+        .task=${task}
+        @kb-task-toggle=${this.onTaskToggle}
+      ></kb-task-card>
+    </section>
+  `;
+}
+```
+
+| Cú pháp            | Lit cập nhật gì?    | Ví dụ             |
+| ------------------ | ------------------- | ----------------- |
+| `${value}`         | child/text part     | tên assignee      |
+| `name=${value}`    | attribute string    | `priority`        |
+| `?name=${boolean}` | boolean attribute   | `?completed`      |
+| `.name=${value}`   | JavaScript property | `.task`           |
+| `@name=${handler}` | event listener      | `@kb-task-toggle` |
+
+Lỗi phổ biến nhất là bỏ dấu chấm trước dữ liệu phức tạp. `task=${object}` biến
+object thành chuỗi `"[object Object]"`; `.task=${object}` giữ đúng type.
+Ngược lại, attribute hữu ích khi cần declarative HTML, CSS selector hoặc
+serialization. Chọn bề mặt theo contract, không theo cú pháp ngắn hơn.
+
+Tagged template `html` cũng không phải phép nối chuỗi rồi gán `innerHTML`. Lit
+giữ các phần tĩnh, đặt marker cho expression và chỉ cập nhật phần thay đổi. Giá
+trị text như `task.title` được xử lý thành text node, không được hiểu như HTML.
+Đó là nền tảng cho cả hiệu năng lẫn an toàn; đừng phá nó bằng một unsafe
+directive chỉ để render chuỗi người dùng.
+
+## 6. Reactive update là bất đồng bộ
+
+Khi `this.completed` đổi, setter reactive yêu cầu một update. Lit gom nhiều thay
+đổi trong cùng lượt JavaScript rồi render ở microtask kế tiếp:
+
+```ts
+card.completed = true;
+card.task = { ...card.task, title: 'Đã cập nhật' };
+
+await card.updateComplete;
+// shadow DOM của chính card đã phản ánh cả hai thay đổi
+```
+
+Vì vậy event handler có thể đổi state một cách khai báo; không cần đồng thời tìm
+button, sửa `aria-pressed`, thay text và toggle class. `render()` là phép chiếu
+từ state sang UI. Contract test nên chờ `updateComplete` trước khi đọc shadow
+DOM, đúng như helper ở Phần 10.
+
+Không gọi `render()` trực tiếp và không viết side effect trong `render()`. Fetch,
+analytics hay dispatch event thuộc event handler/lifecycle phù hợp. Phần 13 sẽ
+mổ xẻ toàn bộ update cycle và giới hạn của `updateComplete`.
+
+## 7. Không dùng decorator? Có `static properties`
+
+Lit không bắt buộc TypeScript hoặc decorators. Đoạn JavaScript rút gọn dưới đây
+chỉ minh họa cách khai báo metadata tĩnh; nó **không** phải implementation
+contract-complete thay cho class ở trên:
+
+```js
+import { LitElement, html } from 'lit';
+
+export class KbTaskCard extends LitElement {
+  static properties = {
+    taskId: { attribute: 'task-id', reflect: true, useDefault: true },
+    task: { attribute: false },
+    priority: { reflect: true, useDefault: true },
+    status: { reflect: true, useDefault: true },
+    completed: { type: Boolean, reflect: true, useDefault: true },
+  };
+
+  constructor() {
+    super();
+    this.taskId = '';
+    this.task = { title: 'Task chưa đặt tên', assignee: '', labels: [] };
+    this.priority = 'medium';
+    this.status = 'todo';
+    this.completed = false;
+  }
+
+  render() {
+    return html`<h3>${this.task.title}</h3>`;
+  }
+}
+
+customElements.define('kb-task-card', KbTaskCard);
+```
+
+Với `static properties`, hãy khởi tạo giá trị trong constructor. Một public
+JavaScript class field cùng tên có thể tạo own property che accessor reactive
+trên prototype, khiến thay đổi không lên lịch update. Đây là lỗi khó thấy vì
+property vẫn đọc/ghi được nhưng UI không render lại.
+
+Trong code production, bản không decorator vẫn phải mang sang đầy đủ converter,
+normalize/copy của `task`, ElementInternals, keyboard, methods và hai event.
+Contract suite Phần 10 sẽ bắt phần nào bị bỏ quên; hai cú pháp khai báo property
+tương đương về khả năng của Lit, không khiến hai đoạn class rút gọn tự nhiên có
+cùng behavior.
+
+## 8. Chạy lại contract, không viết test “Lit-specific”
+
+Adapter đã chuẩn bị ở Phần 10 chỉ cần import class mới:
+
+```js
+import { KbTaskCard } from '../src/kb-task-card.js';
+import { taskCardContract } from './task-card.contract.js';
+
+taskCardContract({
+  tagName: 'kb-task-card-lit-test',
+  elementClass: KbTaskCard,
+});
+```
+
+Suite phải tiếp tục pass ở Chromium, Firefox và WebKit: property/attribute đồng
+bộ, `task` không thành attribute, toggle/move event giữ payload, reconnect không
+nhân listener và property pre-upgrade không mất. Ta có thể thêm
+unit test cho hàm thuần, nhưng đừng thay contract browser bằng assertion rằng
+`render()` trả về một object nội bộ nào đó của Lit.
+
+## 9. Failure modes và decision rules
+
+**Trộn decorator mode.** Chọn một cấu hình TypeScript cho package. Với cấu hình
+trong bài, giữ `experimentalDecorators: true` và
+`useDefineForClassFields: false`; với standard decorators, dùng `accessor` theo
+tài liệu phiên bản Lit đang cài.
+
+**Phản chiếu mọi property.** Chỉ reflect primitive cần quan sát từ HTML/CSS.
+Object, array, service và callback nên là property-only; state nội bộ không cần
+thành public attribute.
+
+**Tự mutate DOM Lit quản lý.** Đừng `querySelector()` rồi thay text sau mỗi state
+change. Sửa state và để template mô tả kết quả. Chỉ thao tác imperative với API
+không thể biểu diễn declaratively, chẳng hạn focus một control.
+
+**Event mắc trong shadow root.** Event public phải có tên/payload ổn định và,
+nếu board cần nghe bên ngoài, phải `bubbles` + `composed`. Event implementation
+nội bộ không nhất thiết thoát boundary.
+
+**Đăng ký cùng tên hai lần.** Custom element registry không cho redefine. Entry
+module nên có một nơi đăng ký tên production; test dùng tag riêng hoặc kiểm tra
+`customElements.get()`.
+
+**Dùng chuỗi HTML như dữ liệu.** Expression text mặc định là lựa chọn an toàn.
+Chỉ dùng unsafe directives với nội dung developer kiểm soát và đã được đánh giá
+như một security boundary; Phần 14 sẽ xây threat model rõ hơn.
+
+Decision rule gọn nhất: **API vẫn là DOM contract; Lit chỉ sở hữu cách render
+bên trong**. Nếu một refactor Lit buộc mọi consumer đổi attribute, event hoặc
+keyboard behavior, đó là thay đổi contract chứ không còn là refactor.
+
+## 10. Bài tập và checklist checkpoint
+
+1. Chạy contract suite Phần 10 cho cả class native và Lit trong ba browser.
+2. Thêm property-only `dueDate: Date | null`; render bằng text nhưng xác nhận
+   không sinh attribute `dueDate="..."`.
+3. Thêm event `kb-task-open` từ một button thật, rồi kiểm thử bằng keyboard.
+4. Viết một bản không decorator bằng `static properties`; cố tình thêm class
+   field che accessor, quan sát test fail, sau đó chuyển khởi tạo vào constructor.
+
+Trước khi sang phần tiếp theo, tự kiểm tra:
+
+- [ ] Tôi giải thích được vì sao Lit component vẫn là Custom Element.
+- [ ] Năm binding text/attribute/boolean/property/event được dùng đúng loại.
+- [ ] Object và array đi qua property, không qua attribute.
+- [ ] Public event có payload, bubbling và composition được thiết kế rõ.
+- [ ] `render()` không chứa fetch, dispatch event hoặc DOM mutation tùy ý.
+- [ ] Contract test cũ pass mà không phụ thuộc cấu trúc DOM nội bộ.
+
+## 11. Bridge sang Phần 12
+
+Task card hiện đã nhỏ gọn, nhưng board thật sẽ cần render danh sách có identity,
+nhánh loading/error, fallback và nội dung lặp. Phần 12 sẽ đi sâu vào template và
+directive đúng nơi chúng giải quyết bài toán DOM cụ thể. Sau đó Phần 13 quay lại
+câu hỏi lớn hơn: state thuộc về component nào và async work sống ở đâu.
+
+## Nguồn chính thức
+
+- [Lit: What is Lit?](https://lit.dev/docs/)
+- [Lit: Defining a component](https://lit.dev/docs/components/defining/)
+- [Lit: Reactive properties](https://lit.dev/docs/components/properties/)
+- [Lit: Templates and expressions](https://lit.dev/docs/templates/expressions/)
+- [Lit: Decorators](https://lit.dev/docs/components/decorators/)
+- [MDN: Using custom elements](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_custom_elements)

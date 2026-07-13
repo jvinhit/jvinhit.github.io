@@ -1,125 +1,507 @@
 ---
-title: 'TypeScript Production · Phần 7 — ESM, CJS & Module Resolution'
+title: 'TypeScript Production · Phần 15 — ESM, CJS & Module Resolution'
 description: 'Hiểu runtime module trước compiler: NodeNext vs Bundler, package type/exports, import type, file extension, dual-package hazard và cách debug resolution.'
 pubDate: 2026-07-01
+updatedDate: 2026-07-12
 lang: vi
 tags: [typescript, esm, nodejs, modules]
 series: typescript
-seriesOrder: 7
+seriesOrder: 15
 draft: false
 ---
 
-Nhiều “TypeScript error” thực ra là ba hệ thống bất đồng: editor resolve một đường, bundler resolve đường khác, Node runtime chạy đường thứ ba.
+Nhiều “TypeScript error” thực ra là bốn hệ thống đang trả lời bốn câu hỏi
+khác nhau. Editor tìm thấy declaration không có nghĩa Node sẽ tìm thấy JavaScript;
+bundler build được không có nghĩa consumer chạy package trực tiếp được.
 
-## TypeScript không định nghĩa runtime module
+Ở cấp production, module config không bắt đầu bằng việc copy một `tsconfig`.
+Nó bắt đầu bằng **runtime nào sẽ thực thi specifier nào trong artifact nào**.
 
-Hãy chốt theo thứ tự:
+## Tách bốn lớp trước khi debug
 
-1. Runtime là browser qua bundler, Node ESM, Node CJS hay runtime khác?
-2. Ai emit/bundle JavaScript?
-3. Package được publish với entry points nào?
-4. Sau đó mới chọn `module` và `moduleResolution`.
+| Lớp        | Câu hỏi                                                     | Chủ thể quyết định                     |
+| ---------- | ----------------------------------------------------------- | -------------------------------------- |
+| Syntax     | File viết `import`, `export`, `require` hay `import()`?     | source code                            |
+| Resolution | Specifier trỏ tới file/entry nào?                           | TypeScript, Node, bundler, test runner |
+| Emit       | Syntax nào còn lại trong JavaScript output?                 | `tsc`, transpiler, bundler             |
+| Runtime    | File được hiểu là ESM hay CJS và loader có load được không? | Node/browser/runtime                   |
 
-## Hai baseline phổ biến
+Ví dụ này có thể type-check nhưng chết ở runtime:
 
-App do bundler xử lý:
-
-```json
-{
-  "compilerOptions": {
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "verbatimModuleSyntax": true,
-    "noEmit": true
-  }
-}
+```ts
+import { loadConfig } from '@/config';
 ```
 
-Node library/app chạy output trực tiếp:
+- `paths` giúp TypeScript tìm `src/config.ts`.
+- `tsc` giữ nguyên specifier `@/config`.
+- Node không biết alias đó nếu runtime loader không được cấu hình.
+
+Đừng sửa lỗi lớp runtime bằng assertion type, và đừng sửa lỗi declaration
+bằng cách đổi extension ngẫu nhiên. Trước hết ghi rõ lớp nào đang sai.
+
+## `module` và `moduleResolution` là một contract
+
+`module` không chỉ là “format emit”. Trong mode hiện đại, nó còn cho compiler
+biết import hiện tại sẽ trở thành `import` hay `require`; thông tin đó quyết
+định condition nào được chọn trong package `exports`.
+
+### App hoặc library chạy trực tiếp bằng Node
 
 ```json
 {
   "compilerOptions": {
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "verbatimModuleSyntax": true,
     "rootDir": "src",
-    "outDir": "dist"
+    "outDir": "dist",
+    "verbatimModuleSyntax": true,
+    "strict": true
   }
 }
 ```
 
-`Bundler` cho phép một số resolution mà Node trực tiếp không cho. Đừng dùng nó để type-check package rồi chạy unbundled bằng Node.
+`NodeNext` mô hình hóa dual module system của Node. Nó không có nghĩa “mọi file
+đều là ESM”: format của từng file còn phụ thuộc extension và nearest
+`package.json`. Nó cũng là moving target theo Node stable; library cần test
+trên minimum Node version thật, không chỉ current Node của maintainer.
 
-## Extension trong Node ESM
+### App được bundler xử lý
+
+```json
+{
+  "compilerOptions": {
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true
+  }
+}
+```
+
+`Bundler` cho phép extensionless relative import và directory module theo hành
+vi phổ biến của bundler, đồng thời hiểu `exports`/`imports`. `module: Preserve`
+giữ mỗi `import`/`require` theo syntax source, phù hợp khi tool khác xử lý raw
+TypeScript. Nếu toolchain yêu cầu, `ESNext` + `Bundler` cũng là baseline hợp lệ.
+
+### Decision rule
+
+- JavaScript output chạy trực tiếp trong Node: dùng Node mode.
+- Source được bundle hoàn toàn trước runtime: dùng Bundler mode.
+- Library bundle code mình nhưng externalize dependency: một compilation không
+  mô hình hóa hoàn hảo cả hai phía; thêm consumer fixture NodeNext cho output.
+- Test runner resolve khác production: xem nó là runtime thứ ba, có config và
+  smoke test riêng.
+
+`Bundler` không phải phiên bản “dễ hơn” của `NodeNext`. Chọn sai mode có thể
+cho compiler chấp nhận specifier mà artifact externalized không chạy được.
+
+## Package `type` và extension quyết định format file
+
+Trong Node và TypeScript Node modes:
+
+| Source/declaration         | Runtime/declaration format         |
+| -------------------------- | ---------------------------------- |
+| `.mts` / `.mjs` / `.d.mts` | luôn ESM                           |
+| `.cts` / `.cjs` / `.d.cts` | luôn CommonJS                      |
+| `.ts` / `.js` / `.d.ts`    | theo nearest `package.json` `type` |
+
+Baseline ESM rõ ràng:
+
+```json
+{
+  "name": "@acme/sdk",
+  "type": "module"
+}
+```
+
+Trong package đó, `.js` được hiểu là ESM; file legacy cụ thể có thể dùng `.cjs`.
+Trong package `type: commonjs`, `.js` là CJS và file ESM cụ thể dùng `.mjs`.
+
+Luôn khai báo `type` explicit, kể cả khi runtime hiện tại có syntax detection.
+Tool cũ, test runner và consumer có thể không dùng cùng heuristic. Một
+`package.json` lồng trong monorepo cũng có thể đổi format cho subtree của nó.
+
+## Node ESM cần extension đầy đủ
+
+Relative ESM specifier trong Node phải có extension runtime:
 
 ```ts
-// src/index.ts
+// src/index.ts trong package type: module
 export { parse } from './parse.js';
 ```
 
-Viết `.js` vì specifier đó tồn tại ở runtime sau emit. TypeScript map ngược sang `parse.ts` khi type-check. Đây không phải typo.
+TypeScript resolve `./parse.js` ngược về `src/parse.ts` để type-check; emit giữ
+`./parse.js`, đúng tên file sau build.
+
+```ts
+// Không dùng cho output chạy trực tiếp bằng Node ESM
+export { parse } from './parse';
+
+// Không dùng nếu runtime không chạy TypeScript source
+export { parse } from './parse.ts';
+```
+
+Specifier mô tả **artifact runtime**, không mô tả extension source bạn đang
+nhìn. Nếu dùng loader chạy `.ts` trực tiếp hoặc option rewrite extension, hãy
+ghi đó là contract riêng và vẫn test output cuối cùng.
+
+Bare package specifier như `@acme/sdk/testing` được giải qua `exports`, nên
+không áp cùng luật relative extension; public subpath phải được package khai báo.
 
 ## Type-only import là contract emit
 
 ```ts
-import type { User } from './types.js';
-import { createUser } from './create-user.js';
+import type { User, UserId } from './types.js';
+import { createUser, type CreateUserOptions } from './create-user.js';
+
+export type { User } from './types.js';
+export { createUser } from './create-user.js';
 ```
 
-Với `verbatimModuleSyntax`, import không có `type` được giữ theo đúng ý nghĩa runtime. Điều này làm side effect và ESM/CJS mismatch lộ rõ hơn.
+`import type` và `export type` chắc chắn bị xóa khỏi JavaScript. Với
+`verbatimModuleSyntax`, import/export không có `type` được giữ theo đúng syntax
+thay vì bị compiler tự suy đoán và elide.
+
+Điều này làm hai bug lộ sớm:
+
+1. import type bị viết như value import, tạo runtime edge hoặc side effect;
+2. file bị nhận là CJS nhưng lại dùng ESM syntax mà trước đây compiler âm thầm
+   rewrite thành `require`.
+
+```ts
+// side effect phải explicit
+import './register-instrumentation.js';
+```
+
+Đừng dùng import type để “tối ưu” module có side effect cần chạy. Type-only
+import không tồn tại ở runtime.
 
 ## `exports` là public firewall
+
+Package ESM một implementation:
 
 ```json
 {
   "name": "@acme/sdk",
   "type": "module",
+  "files": ["dist"],
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     },
     "./testing": {
       "types": "./dist/testing.d.ts",
-      "import": "./dist/testing.js"
+      "import": "./dist/testing.js",
+      "default": "./dist/testing.js"
     }
-  },
-  "types": "./dist/index.d.ts"
+  }
 }
 ```
 
-Chỉ expose subpath bạn cam kết semver. Consumer import `@acme/sdk/dist/internal.js` là coupling vào layout build; `exports` nên chặn nó.
+Khi `exports` tồn tại, deep import không được khai báo sẽ bị chặn:
 
-Condition order có ý nghĩa. `types` nên đứng trước condition runtime trong cùng object để TypeScript tìm declaration tương ứng.
+```ts
+import { createClient } from '@acme/sdk'; // public
+import { fakeClock } from '@acme/sdk/testing'; // public subpath
 
-## Dual package hazard
-
-Nếu cùng package có CJS và ESM implementation riêng, process có thể load hai instance — singleton, class identity và cache tách đôi. Giảm rủi ro bằng một implementation chung với wrapper mỏng, hoặc chỉ ship ESM nếu consumer matrix cho phép.
-
-## Alias không tự tồn tại ở runtime
-
-`paths` chủ yếu báo cho TypeScript cách resolve; nó không rewrite import trong output. Bundler/runtime/test runner cũng phải biết alias. Với package nội bộ, workspace package hoặc package `imports` thường rõ hơn alias ảo.
-
-## Debug theo evidence
-
-```bash
-tsc --traceResolution -p tsconfig.json
-node --input-type=module -e "import('@acme/sdk').then(console.log)"
+// phải fail ở consumer fixture
+import '@acme/sdk/dist/internal/http.js';
 ```
 
-Kiểm tra package `type`, extension, exports condition, output thật và consumer matrix. Không sửa bằng cách bật ngẫu nhiên `esModuleInterop`.
+Thêm `exports` vào package cũ có thể là breaking change vì consumer từng deep
+import file bất kỳ. Inventory subpath đang được dùng trước khi khóa firewall.
+
+## Condition order có ý nghĩa
+
+Node xét condition object theo thứ tự key, từ specific tới general. TypeScript
+nhận biết condition `types`; đặt nó trước `default` trong nhánh phù hợp.
+
+Dual-format package cần declaration khớp từng runtime branch:
+
+```json
+{
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.mts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.cts",
+        "default": "./dist/cjs/index.cjs"
+      }
+    }
+  }
+}
+```
+
+Đừng đặt `default` trước `types` trong cùng condition object; match sớm có thể
+che nhánh type. Đừng trỏ cả `import` và `require` vào hai implementation stateful
+khác nhau nếu chưa chấp nhận dual-package hazard.
+
+Custom conditions như `development`, `browser` hay `react-server` chỉ có giá
+trị khi TypeScript, bundler, test runner và runtime cùng chọn chúng. Ghi condition
+matrix, không giả định tên condition tự có semantics toàn cầu.
+
+## `imports` cho alias nội bộ có runtime contract
+
+Package có thể khai báo private specifier bắt đầu bằng `#`:
+
+```json
+{
+  "type": "module",
+  "imports": {
+    "#internal/*": "./dist/internal/*.js"
+  }
+}
+```
+
+Source:
+
+```ts
+import { request } from '#internal/http';
+```
+
+Trong local project, TypeScript có thể map output path về source dựa trên
+`rootDir`/`outDir`; Node runtime dùng mapping tới `dist`. Vì vậy package dùng
+`imports` nên đặt `rootDir` rõ và test artifact, không chỉ editor.
+
+Self-name import (`@acme/sdk/testing` từ chính package) đi qua `exports` và hữu
+ích để giữ source tuân theo public boundary.
+
+## `paths` không rewrite JavaScript
+
+```json
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+```
+
+```ts
+import { logger } from '@/infra/logger';
+```
+
+`tsc` dùng mapping để tìm type nhưng emit vẫn chứa `@/infra/logger`. Chỉ dùng
+`paths` khi bundler/runtime/test runner đã có cùng mapping. Với package nội bộ,
+ưu tiên workspace package + `exports`; với alias private Node, cân nhắc `imports`.
+
+Một alias chạy trong Vitest nhưng chết trong production không phải TypeScript
+bug. Hai resolver đang có config khác nhau.
+
+## Declaration cũng có module format
+
+Mỗi declaration file đại diện cho đúng một JavaScript module. Format declaration
+sai có thể khiến consumer hiểu import/export khác runtime.
+
+- `.d.mts` luôn mô tả ESM module.
+- `.d.cts` luôn mô tả CommonJS module.
+- `.d.ts` theo nearest package `type` trong Node modes.
+- source `.mts` emit `.mjs` + `.d.mts`; `.cts` emit `.cjs` + `.d.cts`.
+
+Dual package không nên dùng một `.d.ts` mơ hồ cho hai branch có shape hoặc
+interop khác nhau. Nested `types` condition trong ví dụ trên ghép đúng
+`.d.mts` với `import` và `.d.cts` với `require`.
+
+Fixture phải kiểm declaration từ tarball. Workspace source redirect có thể che
+việc declaration import nhầm extension, kéo private file hoặc trỏ tới dependency
+không được publish.
+
+## CJS interop: compiler có thể lạc quan hơn runtime
+
+ESM import CommonJS:
+
+```ts
+import cjsDefault from 'legacy-cjs';
+import { maybeDetected } from 'legacy-cjs';
+```
+
+`module.exports` có thể được lấy ổn định qua default import. Named export từ CJS
+phụ thuộc static analysis của Node; TypeScript không luôn biết analysis đó có
+thành công và có thể chấp nhận import rồi runtime báo thiếu export.
+
+Khi package CJS mutate export động, ưu tiên default/namespace import rồi đọc
+property có guard:
+
+```ts
+import legacy from 'legacy-cjs';
+
+if (typeof legacy.parse !== 'function') {
+  throw new Error('legacy-cjs.parse is unavailable');
+}
+```
+
+CJS có thể dùng `import()` để load ESM bất đồng bộ. Khả năng `require()` load
+ESM phụ thuộc Node version và synchronous graph; top-level `await` trong graph
+có thể làm runtime throw mà TypeScript không phát hiện. Minimum Node matrix là
+phần của contract.
+
+`esModuleInterop` giúp emit/type-check tương thích nhiều CJS pattern; nó không
+sửa package publish sai condition hay bảo đảm named export tồn tại ở Node.
+
+## Dual-package hazard
+
+Nếu một process load `import` branch ESM và `require` branch CJS như hai
+implementation riêng, nó có thể có hai:
+
+- singleton registry;
+- cache;
+- class identity (`instanceof` khác nhau);
+- telemetry buffer;
+- global configuration snapshot.
+
+Giảm rủi ro bằng một implementation chung với wrapper mỏng, hoặc ship ESM-only
+nếu consumer matrix cho phép. Nếu buộc dual implementation, tránh mutable
+module-level state và test một process dùng cả `import` lẫn `require`.
+
+## Matrix: compiler nào, resolver nào, runtime nào?
+
+| Target            | Type-check contract             | Resolver/runtime thật          | Gate bắt buộc                   |
+| ----------------- | ------------------------------- | ------------------------------ | ------------------------------- |
+| Node ESM app      | `NodeNext`                      | Node ESM loader                | chạy `dist`, không chạy source  |
+| Node CJS consumer | `NodeNext` fixture `.cts`       | `require` / dynamic `import()` | root + subpath + TLA case       |
+| Browser app       | `Bundler`                       | Vite/Webpack/Rollup + browser  | production bundle smoke         |
+| Test runner       | config riêng                    | runner transformer/resolver    | test output/alias/conditions    |
+| Published library | build config + consumer configs | runtime của consumer           | tarball fixtures, không symlink |
+
+Không dùng một job `tsc --noEmit` để đại diện cho cả matrix. Mỗi row có thể
+chọn condition khác và nhìn thấy artifact khác.
+
+## Những case “types xanh, runtime đỏ”
+
+1. `Bundler` chấp nhận `./feature`, output externalized chạy Node ESM thiếu `.js`.
+2. `paths` tìm được `@/config`, Node không biết alias.
+3. `types` trỏ file có thật nhưng JavaScript entry không nằm trong tarball.
+4. Declaration hứa named CJS export mà Node static analysis không tìm thấy.
+5. `import` condition và `require` condition export shape khác nhau.
+6. Test runner mock source path, production import package export path.
+7. Deep import pass trong workspace vì symlink nhưng bị `exports` chặn sau pack.
+8. CJS `require()` ESM graph có top-level `await` trên một Node version cụ thể.
+9. Casing import pass trên filesystem không phân biệt hoa thường, fail trên Linux.
+10. Type-only import bị dùng để kích hoạt side effect nên runtime registration mất.
+
+Mỗi case cần artifact/runtime test; type annotation không thể chứng minh loader
+đã tìm và thực thi đúng file.
+
+## Debug resolution theo evidence
+
+Bắt đầu bằng config thực và trace đúng specifier:
+
+```bash
+tsc --showConfig -p tsconfig.json
+tsc --traceResolution -p tsconfig.json
+tsc --explainFiles -p tsconfig.json
+```
+
+Trong `traceResolution`, tìm exact specifier rồi đọc:
+
+1. importing file được coi là ESM hay CJS;
+2. resolution mode dùng `import` hay `require`;
+3. conditions đang active (`types`, `node`, `import`, `require`, custom);
+4. package.json nào được đọc;
+5. candidate nào bị reject và vì sao;
+6. declaration/file cuối cùng được chọn.
+
+Trace chỉ mô tả TypeScript. Đối chiếu runtime riêng:
+
+```bash
+node --input-type=module -e "import('@acme/sdk').then(console.log)"
+node -e "console.log(require.resolve('@acme/sdk'))"
+npm pack --dry-run
+```
+
+Với ESM, `import.meta.resolve()` trong fixture giúp quan sát URL Node chọn.
+Mở tarball manifest và `dist` thật; đừng debug package qua workspace symlink.
+
+## Artifact fixtures tối thiểu
+
+```text
+fixtures/
+  node-esm/       package.json type=module, tsconfig NodeNext
+  node-cjs/       index.cts, tsconfig NodeNext
+  bundler/        production build + browser smoke
+  test-runner/    config giống CI
+```
+
+Mỗi fixture cài tarball vừa pack và kiểm:
+
+- root import;
+- public subpath import;
+- deep import nội bộ phải fail;
+- type-check declaration;
+- chạy JavaScript output;
+- condition import/require trả API tương thích;
+- source map/stack trace trỏ được nơi hữu ích;
+- dependency type được khai báo đúng `dependencies`/`peerDependencies`.
+
+Fixture không được import `../../src`. Nếu nó cần source monorepo để xanh, bạn
+đang test workspace, không test sản phẩm publish.
+
+## Migration ESM có canary và rollback
+
+Migration an toàn theo vertical slice:
+
+1. Inventory runtime, minimum Node, bundler, test runner, CLI và consumers CJS.
+2. Chụp resolution matrix hiện tại: entry, subpath, deep import, side effect.
+3. Chọn leaf package; khai báo `type` explicit và NodeNext.
+4. Sửa relative source import thành runtime `.js` specifier.
+5. Đánh dấu type-only import; thay `__dirname`, `require.resolve` theo runtime mới.
+6. Emit và inspect JS + declaration, không dừng ở source type-check.
+7. Thêm `exports` tương thích với subpath đã cam kết.
+8. Pack tarball; chạy Node ESM, CJS nếu support, bundler và test runner fixtures.
+9. Canary một service/package, theo dõi startup/import error và duplicate state.
+10. Mở rộng theo dependency direction, không flip cả monorepo cùng lúc.
+
+Rollback không phải xóa vội `"type": "module"` trên cùng artifact; thao tác đó
+có thể đổi nghĩa mọi `.js`. Giữ artifact/version CJS đã biết tốt, feature flag
+entry integration nếu phù hợp, và tiêu chí rollback trước canary.
+
+## Failure modes cần review
+
+- Chọn `Bundler` vì nó làm error biến mất dù output chạy trực tiếp bằng Node.
+- Viết relative import không extension trong Node ESM.
+- Import `.ts` nhưng publish chỉ `.js`.
+- Dùng `paths` mà không có runtime rewriter/resolver.
+- `default` đứng trước condition cụ thể và che branch sau.
+- Export declaration nhưng quên runtime file, hoặc ngược lại.
+- Dùng `.d.ts` CJS để mô tả ESM branch hay một declaration cho hai shape khác.
+- Tin named import từ CJS mà không smoke-test runtime.
+- Ship hai implementation stateful cho `import` và `require`.
+- Test qua source/workspace symlink thay vì tarball.
+- Thêm `exports` mà không inventory deep import cũ.
+- Migrate package root trước leaf, làm blast radius không kiểm soát được.
 
 ## Lab
 
-1. Vẽ resolution path của một import từ source tới file runtime.
-2. Thêm `exports` chặn deep import, rồi viết consumer test.
-3. Tạo test Node ESM chạy từ tarball package, không chạy từ source workspace.
-4. Audit mọi `paths`: tool nào chịu trách nhiệm resolve ở runtime?
+1. Tạo package ESM `NodeNext` hai file; chứng minh source `./parse.js` resolve
+   tới `.ts` và output chạy bằng Node.
+2. Thêm subpath `./testing`, rồi viết negative fixture cho deep import.
+3. Tạo CJS dependency export động; so sánh named import với default import.
+4. Thêm alias `paths`, inspect emit, sau đó thay bằng package `imports` hoặc
+   cấu hình runtime tương ứng.
+5. Build cặp `.mts`/`.cts`; kiểm `.mjs`/`.cjs` và `.d.mts`/`.d.cts`.
+6. Dùng `--traceResolution` giải thích condition được chọn cho cùng package từ
+   consumer `.mts` và `.cts`.
+7. Pack package, cài vào Node ESM/CJS và bundler fixtures, rồi chạy thật.
+8. Viết migration plan có canary metric, rollback artifact và owner.
 
-**Done khi:** editor, test, build và production resolve cùng public entry point; package không cần consumer biết layout `dist`.
+**Done khi:** editor, `tsc`, test runner, bundler và runtime resolve cùng public
+contract cho từng target; declaration khớp JavaScript branch; artifact chạy
+ngoài monorepo; deep import bị chặn có chủ đích; migration có rollback đã thử.
 
 ## Tài liệu chính thức
 
-- [Modules reference](https://www.typescriptlang.org/docs/handbook/modules/reference.html)
-- [Modules theory](https://www.typescriptlang.org/docs/handbook/modules/theory.html)
+- [TypeScript Modules Reference](https://www.typescriptlang.org/docs/handbook/modules/reference.html)
+- [TypeScript Modules Theory](https://www.typescriptlang.org/docs/handbook/modules/theory.html)
+- [Choosing compiler options](https://www.typescriptlang.org/docs/handbook/modules/guides/choosing-compiler-options.html)
+- [TSConfig `paths`](https://www.typescriptlang.org/tsconfig/paths.html)
+- [Node.js ECMAScript modules](https://nodejs.org/api/esm.html)
+- [Node.js packages and conditional exports](https://nodejs.org/api/packages.html)

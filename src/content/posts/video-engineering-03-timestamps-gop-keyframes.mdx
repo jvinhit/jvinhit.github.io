@@ -1,0 +1,235 @@
+---
+title: 'Video Engineering · Phần 3 — Timestamp, GOP và keyframe: thời gian thật của video'
+description: 'Hiểu time base, PTS/DTS, CFR/VFR, GOP, I/P/B-frame, seek và A/V sync; tự tạo fixture có B-frame và VFR rồi đọc timeline bằng ffprobe.'
+pubDate: 2026-07-12
+lang: vi
+tags: [video-engineering, video, ffmpeg, timestamps, keyframes, gop]
+series: video-engineering
+seriesOrder: 3
+draft: false
+---
+
+Video 30 fps không có nghĩa frame 300 luôn ở đúng giây thứ 10. Stream-copy từ `00:04.200` cũng không đảm bảo output có hình độc lập tại 4,2 giây. Với B-frame, thứ tự decode còn có thể khác thứ tự trình bày.
+
+Nếu Phần 1 cho ta bản đồ không gian — container, packet, frame — thì bài này thêm trục thời gian. Ba thứ phải giữ riêng trong đầu là:
+
+```text
+time base  = kích thước một tick
+PTS        = lúc frame/packet được trình bày
+DTS        = lúc packet cần được decode
+```
+
+GOP và keyframe quyết định decoder có thể bắt đầu từ đâu. Timestamp quyết định bắt đầu đó nằm ở đâu trên timeline.
+
+## Time base: timestamp là số nguyên có đơn vị
+
+Media system tránh lưu mọi thời điểm bằng số thực tùy ý. Thay vào đó, timestamp thường là một số nguyên tính theo **time base** hữu tỉ:
+
+```text
+thời gian tính bằng giây = timestamp × time_base
+```
+
+Ví dụ stream có `time_base=1/30000`. Một frame ở PTS `90090` được trình bày tại:
+
+```text
+90090 × 1/30000 = 3.003 giây
+```
+
+Với video `30000/1001` fps, thời lượng danh nghĩa mỗi frame là `1001/30000` giây. Time base `1/30000` cho phép biểu diễn bước đó bằng 1001 tick nguyên.
+
+FFmpeg có thể rescale timestamp khi packet/frame đi qua demuxer, filter, encoder và muxer. Log `pts=90090` vô nghĩa nếu thiếu time base; dùng `pts_time` để đọc bằng giây, giữ giá trị hữu tỉ khi cần tính chính xác.
+
+Audio thường có time base liên hệ sample rate, chẳng hạn `1/48000`: 1024 samples AAC tương ứng khoảng `1024/48000 ≈ 21,33 ms`. Video và audio có time base khác nhau nhưng vẫn chia sẻ một timeline trình bày sau khi được rescale.
+
+## PTS và DTS: trình bày không nhất thiết theo thứ tự decode
+
+**PTS — Presentation Timestamp** trả lời: frame này nên xuất hiện lúc nào.
+
+**DTS — Decoding Timestamp** trả lời: packet này cần được đưa vào decoder lúc nào.
+
+Với chuỗi chỉ I/P-frame, hai thứ tự có thể gần nhau. B-frame có thể tham chiếu cả hình trước và hình sau theo thứ tự trình bày, nên decoder cần nhận một reference tương lai trước khi dựng B-frame. Kết quả là packet order có thể như sau:
+
+```text
+Thứ tự trình bày: I0  B1  B2  P3
+Thứ tự decode:    I0  P3  B1  B2
+```
+
+Open/closed GOP và codec có thể tạo cấu trúc phức tạp hơn; pattern trên chỉ là mental model. Bằng chứng nằm trong PTS/DTS thật.
+
+Tạo fixture tám giây, 29,97 fps, GOP 60 frame và tối đa hai B-frame:
+
+```bash
+ffmpeg -hide_banner -y \
+  -f lavfi -i "testsrc2=size=640x360:rate=30000/1001:duration=8" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=8" \
+  -map 0:v:0 -map 1:a:0 \
+  -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+  -g 60 -keyint_min 60 -sc_threshold 0 -bf 2 \
+  -c:a aac -b:a 128k -shortest \
+  ve03-gop.mp4
+```
+
+`-g 60` đặt khoảng keyframe tối đa; `-sc_threshold 0` tắt keyframe theo scene cut để fixture dễ quan sát. Đây là cấu hình lab, không phải preset production chung.
+
+Probe time base và hai biểu diễn frame rate:
+
+```bash
+ffprobe -v error \
+  -select_streams v:0 \
+  -show_entries stream=time_base,r_frame_rate,avg_frame_rate,start_time,duration,nb_frames \
+  -of default=noprint_wrappers=1 \
+  ve03-gop.mp4
+```
+
+Đọc packet đầu tiên:
+
+```bash
+ffprobe -v error \
+  -select_streams v:0 \
+  -read_intervals "%+0.3" \
+  -show_packets \
+  -show_entries packet=pts_time,dts_time,duration_time,size,flags \
+  -of compact \
+  ve03-gop.mp4
+```
+
+Packet đầu có thể có DTS âm trong khi PTS bằng 0 do reorder; riêng dấu hiệu đó chưa chứng minh file hỏng.
+
+Đọc frame đã decode để so kiểu hình:
+
+```bash
+ffprobe -v error \
+  -select_streams v:0 \
+  -read_intervals "%+#12" \
+  -show_frames \
+  -show_entries frame=key_frame,pts_time,pkt_dts_time,pict_type \
+  -of compact \
+  ve03-gop.mp4
+```
+
+Frame output được liệt kê theo timeline trình bày, trong khi packet ở lệnh trước cho thấy thứ tự demux/decode. Đừng trộn hai bảng rồi kết luận timestamp “nhảy lung tung”.
+
+## GOP, I/P/B-frame và random access
+
+**GOP — Group of Pictures** là một nhóm hình có quan hệ dự đoán. Một cách nhìn đơn giản:
+
+- **I-frame** mã hóa hình mà không dự đoán từ frame video khác;
+- **P-frame** dự đoán từ reference đã có;
+- **B-frame** có thể dùng reference ở hai phía của thứ tự trình bày.
+
+Keyframe/random access point là nơi decoder có thể bắt đầu chuỗi decode hợp lệ. Đồng nhất I-frame với keyframe đủ cho mental model ban đầu nhưng không an toàn cho tool: IDR/CRA và open GOP tạo thêm dependency. Hãy dùng cờ keyframe/index và hiểu codec, không chỉ kiểm tra `pict_type=I`.
+
+Liệt kê các frame được đánh dấu keyframe:
+
+```bash
+ffprobe -v error \
+  -select_streams v:0 \
+  -skip_frame nokey \
+  -show_frames \
+  -show_entries frame=key_frame,pts_time,pict_type \
+  -of csv=p=0 \
+  ve03-gop.mp4
+```
+
+GOP ngắn cho nhiều điểm random access hơn nhưng thường tăng overhead ở cùng mục tiêu chất lượng. GOP dài có thể nén hiệu quả hơn nhưng tăng quãng decode khi seek. Không có một GOP tốt cho mọi use case.
+
+## FPS: rate khai báo không phải toàn bộ timeline
+
+**CFR — Constant Frame Rate** có khoảng thời gian frame đều theo rate mục tiêu. **VFR — Variable Frame Rate** cho phép khoảng PTS giữa các frame thay đổi. Screen recording, camera mobile hoặc pipeline drop frame có thể tạo VFR.
+
+`r_frame_rate` và `avg_frame_rate` hữu ích nhưng không đủ chứng minh CFR; chúng có thể là rate cơ sở hoặc trung bình suy ra. Muốn biết timeline thật, xem delta PTS của frame.
+
+Tạo một fixture VFR: ba giây đầu giữ mỗi frame chẵn, ba giây sau giữ mọi frame. `-fps_mode vfr` yêu cầu không tự nhân frame để ép CFR:
+
+```bash
+ffmpeg -hide_banner -y \
+  -f lavfi -i "testsrc2=size=640x360:rate=30:duration=6" \
+  -vf "select='if(lt(t,3),not(mod(n,2)),1)'" \
+  -fps_mode vfr \
+  -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+  -an \
+  ve03-vfr.mkv
+```
+
+In toàn bộ PTS rồi quan sát bước thời gian trước và sau mốc ba giây:
+
+```bash
+ffprobe -v error \
+  -select_streams v:0 \
+  -show_frames \
+  -show_entries frame=pts_time,duration_time,pict_type \
+  -of csv=p=0 \
+  ve03-vfr.mkv
+```
+
+Đầu đoạn, delta PTS xấp xỉ `0,0667 s`; cuối đoạn xấp xỉ `0,0333 s`. `duration_time` không phải lúc nào cũng có, nên hãy kiểm tra PTS của hai frame liên tiếp.
+
+Nếu vô tình ép VFR sang CFR, FFmpeg có thể duplicate/drop frame theo `-fps_mode` và rate output. Đó là một phép biến đổi timeline, không chỉ thay metadata.
+
+## Vì sao seek và cut không luôn chính xác
+
+Demuxer thường dùng index để nhảy tới random access point gần thời điểm yêu cầu, rồi decoder đi tiếp tới frame mục tiêu. Với stream copy, FFmpeg không tạo keyframe mới vì không encode lại:
+
+```bash
+ffmpeg -hide_banner -y \
+  -ss 4.2 -i ve03-gop.mp4 -t 1 \
+  -map 0:v:0 -map 0:a:0 \
+  -c copy \
+  ve03-cut-copy.mp4
+```
+
+Lệnh nhanh và không encode lại, nhưng điểm bắt đầu bị ràng buộc bởi keyframe/dependency và cách container biểu diễn pre-roll. Luôn probe output thay vì hứa “frame-accurate copy”.
+
+Cắt và encode lại cho phép decode từ điểm seek rồi tạo bitstream mới bắt đầu gần mục tiêu:
+
+```bash
+ffmpeg -hide_banner -y \
+  -ss 4.2 -i ve03-gop.mp4 -t 1 \
+  -map 0:v:0 -map 0:a:0 \
+  -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+  -c:a aac -b:a 128k \
+  ve03-cut-accurate.mp4
+```
+
+Khi transcoding, accurate seek mặc định có thể decode rồi bỏ phần trước vị trí yêu cầu. Format và option timestamp vẫn ảnh hưởng; hãy kiểm chứng frame/audio đầu thay vì dựa vào folklore về vị trí `-ss`.
+
+## A/V sync: đồng bộ timeline, không đồng bộ số frame
+
+Audio chạy theo samples, video theo frame timestamps; player map cả hai vào media clock. Timestamp sai, sample rate bị hiểu nhầm hoặc capture clock trôi đều có thể gây lệch dù codec decode được.
+
+Debug sync theo thứ tự:
+
+1. Probe `start_time`, `time_base`, packet PTS/DTS của cả audio và video.
+2. Xác định lệch **hằng số** ngay từ đầu hay **drift tăng dần** theo thời gian.
+3. Kiểm tra capture/source clock và bước resample/frame-rate conversion.
+4. Chỉ sau đó mới cân nhắc offset, `aresample=async`, drop/duplicate hoặc viết lại PTS.
+
+Offset hằng có thể cần dịch timeline; drift thường báo hiệu rate/clock mismatch. Dùng một option “sync” ngẫu nhiên có thể che triệu chứng và làm duration sai hơn.
+
+## Failure checklist
+
+- Đã ghi time base cùng timestamp, hay chỉ log số tick trần?
+- Đang nhìn packet order hay decoded frame order?
+- File được xác nhận CFR bằng delta PTS hay chỉ bằng tên field `r_frame_rate`?
+- Stream copy cut có bắt đầu trên keyframe phù hợp?
+- Output có negative/non-monotonic DTS do input hay do bước nối/cắt viết lại timestamp?
+- Lệch A/V là offset cố định hay drift theo thời lượng?
+- Có vô tình ép VFR sang CFR, tạo duplicate/drop frame?
+- Đã probe output cuối cùng, không chỉ input và command line?
+
+## Bài tập thực hành
+
+1. Tạo `ve03-gop.mp4`, tìm PTS của ba keyframe đầu. So khoảng thời gian thực với giả định “60 frame = đúng 2 giây”.
+2. Từ packet đầu, tính `pts_time` bằng PTS tick × time base và đối chiếu ffprobe.
+3. So `ve03-cut-copy.mp4` và `ve03-cut-accurate.mp4`: frame đầu, duration, size và thời gian xử lý.
+4. Probe fixture VFR, tính năm delta PTS ở mỗi nửa. Sau đó encode lại với `-r 30 -fps_mode cfr` và quan sát duplicate/drop trong log.
+
+## Đọc thêm
+
+- [FFmpeg — `-ss`, timestamp và `-fps_mode`](https://ffmpeg.org/ffmpeg.html)
+- [ffprobe — packet, frame, interval và timecode](https://ffmpeg.org/ffprobe.html)
+- [FFmpeg Filters — `select`, `setpts`, `fps` và `aresample`](https://ffmpeg.org/ffmpeg-filters.html)
+- [FFmpeg Utilities — cú pháp duration và time base liên quan](https://ffmpeg.org/ffmpeg-utils.html)
+- [MDN — Video processing concepts](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API/Video_processing_concepts)
+
+**Phần tiếp theo:** [Metadata, màu sắc và audio layout — những byte nhỏ làm video hiển thị sai](/blog/video-engineering-04-metadata-color-audio/) — ta sẽ phân tầng format/stream/frame metadata, rotation, SAR/DAR, color tags và chọn audio track đúng cách.

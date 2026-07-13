@@ -1,0 +1,437 @@
+---
+title: 'TypeScript Production · Phần 5 — Conditional Types, Distribution & Correlation'
+description: 'Dùng conditional type như type function: kiểm soát distribution, never/any/unknown, Extract/Exclude, giữ correlation cho event và SDK mà không làm type checker quá tải.'
+pubDate: 2026-07-12
+updatedDate: 2026-07-12
+lang: vi
+tags: [typescript, conditional-types, type-system, sdk]
+series: typescript
+seriesOrder: 5
+draft: false
+---
+
+Conditional type không chỉ là cú pháp `if` ở tầng type. Trong code production,
+nó là công cụ **biến đổi một tập type thành tập type khác** và mô tả quan hệ
+giữa input với output.
+
+Sức mạnh đó đi kèm ba bẫy lớn:
+
+- union có thể bị phân phối mà bạn không nhận ra;
+- `never`, `any`, `unknown` không hành xử như ba type bình thường;
+- public signature có thể rất chính xác nhưng implementation lại không narrow
+  generic theo cách bạn kỳ vọng.
+
+Bài này dùng xuyên suốt một SDK xử lý command. Mục tiêu không phải tạo type
+"thông minh" nhất, mà tạo contract **đúng, đọc được, test được và có chi phí
+compiler chấp nhận được**.
+
+## Mental model: conditional type là type function
+
+Một conditional type nhận type đầu vào và trả type đầu ra:
+
+```ts
+type ResponseFor<T> = T extends { op: 'user.get' }
+  ? User
+  : T extends { op: 'user.delete' }
+    ? DeleteReceipt
+    : never;
+```
+
+Đọc nó như một function thuần:
+
+```text
+ResponseFor(Request) -> Response
+```
+
+`extends` trong biểu thức này hỏi về **assignability**, không hỏi hai type có
+bằng nhau tuyệt đối hay không. Một object có thêm field vẫn có thể assignable
+vào shape nhỏ hơn.
+
+```ts
+type HasId<T> = T extends { id: string } ? true : false;
+
+type A = HasId<{ id: string; name: string }>;
+//   ^? true
+```
+
+Khi `T` còn generic, compiler thường chưa chọn nhánh ngay. Nó giữ phép tính đó
+để evaluate sau khi biết type argument tại call site. Vì vậy conditional type
+có thể mô tả correlation mà một union output phẳng không thể mô tả.
+
+## Production case: protocol của một SDK
+
+Ta bắt đầu bằng protocol đóng, dùng discriminated union:
+
+```ts
+declare const userIdBrand: unique symbol;
+type UserId = string & { readonly [userIdBrand]: 'UserId' };
+
+type User = {
+  id: UserId;
+  name: string;
+  plan: 'free' | 'pro';
+};
+
+type DeleteReceipt = {
+  deleted: true;
+  at: string;
+};
+
+type AuditPage = {
+  items: readonly { at: string; action: string }[];
+  nextCursor?: string;
+};
+
+type SdkRequest =
+  | { op: 'user.get'; input: { id: UserId } }
+  | { op: 'user.delete'; input: { id: UserId; reason: string } }
+  | { op: 'audit.list'; input: { cursor?: string; limit: number } };
+```
+
+Ta có thể viết output là `User | DeleteReceipt | AuditPage`, nhưng như vậy
+quan hệ với request đã mất. Conditional type giữ quan hệ đó:
+
+```ts
+type ResponseFor<R extends SdkRequest> = R extends { op: 'user.get' }
+  ? User
+  : R extends { op: 'user.delete' }
+    ? DeleteReceipt
+    : R extends { op: 'audit.list' }
+      ? AuditPage
+      : never;
+
+declare function execute<const R extends SdkRequest>(
+  request: R,
+  options?: { signal?: AbortSignal }
+): Promise<ResponseFor<R>>;
+```
+
+Call site nhận đúng output từ chính input:
+
+```ts
+declare const id: UserId;
+
+const user = await execute({ op: 'user.get', input: { id } });
+//    ^? User
+
+const receipt = await execute({
+  op: 'user.delete',
+  input: { id, reason: 'duplicate account' },
+});
+//    ^? DeleteReceipt
+```
+
+Đây là use case production hợp lý: conditional type encode một quan hệ hữu ích,
+caller không phải truyền type argument, và hover vẫn có tên domain rõ ràng.
+
+## Naked type parameter và distribution
+
+Conditional type có dạng sau sẽ **phân phối qua union**:
+
+```ts
+type ToArray<T> = T extends unknown ? T[] : never;
+```
+
+`T` đứng trực tiếp bên trái `extends`; tài liệu thường gọi đây là một naked type
+parameter. Với union, compiler áp dụng function cho từng member:
+
+```ts
+type Distributed = ToArray<string | number>;
+//   ^? string[] | number[]
+```
+
+Mental expansion:
+
+```ts
+type Expanded = ToArray<string> | ToArray<number>;
+```
+
+Distribution không có nghĩa "conditional type nào gặp union cũng distribute".
+Nó phụ thuộc vào **vị trí checked type**:
+
+```ts
+type IsText<T> = T extends string ? true : false;
+type A = IsText<'ready' | 404>;
+//   ^? true | false
+
+type IsWholeUnionText<T> = [T] extends [string] ? true : false;
+type B = IsWholeUnionText<'ready' | 404>;
+//   ^? false
+```
+
+Câu hỏi thiết kế phải được nói thành lời trước:
+
+- "Member nào trong union là string?" → cần distribution.
+- "Toàn bộ union có assignable vào string không?" → tắt distribution.
+
+Nếu không viết được câu hỏi bằng lời, type alias đó chưa sẵn sàng để thành public
+API.
+
+## Tắt distribution bằng tuple wrapper
+
+Bọc hai phía trong tuple để checked type không còn naked. Ví dụ, policy chỉ đúng
+khi **toàn bộ** event union có actor:
+
+```ts
+type ToArrayWhole<T> = [T] extends [unknown] ? T[] : never;
+type AllHaveActor<T> = [T] extends [{ actorId: UserId }] ? true : false;
+type DomainEvent =
+  | { type: 'user.created'; actorId: UserId }
+  | { type: 'user.deleted'; actorId: UserId };
+type SafeForAudit = AllHaveActor<DomainEvent>; // true
+```
+
+Tuple chỉ đổi phép so sánh của checker, không tồn tại ở runtime. Bản distributive
+trả lời từng member; tuple wrapper trả lời invariant của toàn union.
+
+## Distribution như phép filter
+
+Vì `never` biến mất trong union, distribution có thể dùng như filter:
+
+```ts
+type OnlyWithOp<T, Op> = T extends { op: Op } ? T : never;
+
+type DeleteRequest = OnlyWithOp<SdkRequest, 'user.delete'>;
+//   ^? { op: 'user.delete'; input: { id: UserId; reason: string } }
+```
+
+Hai utility type built-in quan trọng cũng dùng đúng algebra này:
+
+```ts
+type MyExclude<T, U> = T extends U ? never : T;
+type MyExtract<T, U> = T extends U ? T : never;
+```
+
+Ưu tiên `Extract`/`Exclude` built-in khi chúng diễn đạt đúng ý định. Alias tự
+viết chỉ đáng có khi tên domain làm contract dễ đọc hơn.
+
+```ts
+type RequestFor<Op extends SdkRequest['op']> = Extract<SdkRequest, { op: Op }>;
+
+type InputFor<Op extends SdkRequest['op']> = RequestFor<Op>['input'];
+```
+
+## Algebra của `never`
+
+`never` đại diện tập giá trị rỗng. Một vài luật cần thuộc vì chúng giải thích
+phần lớn kết quả "bí ẩn":
+
+```ts
+type UnionIdentity = string | never;
+//   ^? string
+
+type IntersectionAbsorbs = string & never;
+//   ^? never
+```
+
+Với conditional type distributive, input `never` không có member nào để chạy:
+
+```ts
+type IsNeverBroken<T> = T extends never ? true : false;
+type Surprise = IsNeverBroken<never>;
+//   ^? never, không phải true
+```
+
+Muốn kiểm tra toàn bộ type có phải `never`, tắt distribution:
+
+```ts
+type IsNever<T> = [T] extends [never] ? true : false;
+
+type A = IsNever<never>;
+//   ^? true
+type B = IsNever<string | never>;
+//   ^? false
+```
+
+Decision rule: nếu `never` là một **tín hiệu kết quả** của filter, distribution
+thường đúng. Nếu `never` là một **giá trị cần phát hiện**, hãy dùng non-
+distributive check.
+
+## `any` làm nhiễm phép tính type
+
+`any` vừa có thể nhận gần như mọi giá trị, vừa có thể được dùng như gần như mọi
+type. Conditional type đi qua `any` thường không còn cho một câu trả lời chắc
+chắn:
+
+```ts
+type Classify<T> = T extends string ? 'text' : 'other';
+
+type FromAny = Classify<any>;
+//   ^? 'text' | 'other'
+type FromUnknown = Classify<unknown>;
+//   ^? 'other'
+```
+
+`unknown` buộc code chứng minh trước khi sử dụng; `any` cho phép cả hai nhánh.
+Vì thế generic public API nên dùng constraint/`unknown`, không dùng `any` như
+wildcard mặc định.
+
+Khi thật sự cần quarantine `any`, có thể detect bằng helper có chủ đích rồi trả
+`unknown` thay vì một proof giả:
+
+```ts
+type IsAny<T> = 0 extends 1 & T ? true : false;
+```
+
+Đây là guardrail ở boundary, không phải lời mời rải `IsAny` khắp domain. Cách
+tốt hơn vẫn là loại `any` tại nguồn và bật lint rule phù hợp.
+
+## Giữ correlation bằng phân phối
+
+Distribution không chỉ filter; nó có thể biến mỗi union member thành một cặp
+correlated:
+
+```ts
+type Exchange<R extends SdkRequest> = R extends unknown
+  ? readonly [request: R, response: ResponseFor<R>]
+  : never;
+
+type AnyExchange = Exchange<SdkRequest>;
+```
+
+`AnyExchange` là union của ba tuple request/response đúng. So sánh với tuple của
+hai union độc lập:
+
+```ts
+type BrokenExchange = readonly [
+  request: SdkRequest,
+  response: User | DeleteReceipt | AuditPage,
+];
+```
+
+`BrokenExchange` cho phép request `user.get` đi cùng `DeleteReceipt`. Ta đã tạo
+tích Descartes thay vì giữ quan hệ từng cặp.
+
+Rule tổng quát: nếu mỗi member của union có output riêng, hãy **distribute trước
+rồi bọc**, không bọc union trước rồi mới biến đổi.
+
+## Correlation có thể mất tại function boundary
+
+Signature sau rất đẹp ở call site:
+
+```ts
+declare function execute<const R extends SdkRequest>(
+  request: R
+): Promise<ResponseFor<R>>;
+```
+
+Nhưng implementation generic không tự narrow `R` thành từng instantiation chỉ
+vì runtime check `request.op`. Đây là giới hạn chứng minh. Ba lựa chọn production:
+
+1. dùng overload/public interface chính xác và implementation signature rộng;
+2. dispatch qua registry được type-check rồi cô lập một cast tại adapter;
+3. nhận/trả discriminated union trực tiếp nếu caller không cần conditional
+   return.
+
+Assertion chỉ chấp nhận được khi nằm ở một bridge hẹp, có runtime test cho mọi
+operation và có type test cho public contract.
+
+## Type tests: kiểm cả kết quả lẫn failure
+
+Một bộ assertion type tối giản:
+
+```ts
+type Compare<T> = <Candidate>() => Candidate extends T ? 1 : 2;
+type Equal<A, B> = Compare<A> extends Compare<B> ? true : false;
+type Expect<T extends true> = T;
+```
+
+Test distribution, non-distribution và `never` riêng:
+
+```ts
+type _Distribution = Expect<Equal<ToArray<'a' | 1>, 'a'[] | 1[]>>;
+
+type _WholeUnion = Expect<Equal<ToArrayWhole<'a' | 1>, ('a' | 1)[]>>;
+
+type _Never = Expect<Equal<IsNever<never>, true>>;
+type _GetResponse = Expect<Equal<ResponseFor<RequestFor<'user.get'>>, User>>;
+```
+
+Với public function, thêm call-site tests và `@ts-expect-error`. Negative test
+quan trọng vì refactor có thể làm API rộng ra mà positive test vẫn pass.
+
+## Failure modes thường gặp
+
+- **Distribution quá rộng:** predicate trên union trả `true | false` trong khi
+  policy cần một verdict; dùng tuple wrapper cho whole-union check.
+- **`never` bị hiểu là `false`:** conditional distributive trên `never` không
+  chạy nhánh nào; luôn có test riêng cho empty set.
+- **`any` làm cả hai nhánh sống:** không xem kết quả đó là bằng chứng; trả
+  `unknown`, parse tại boundary hoặc chặn `any` bằng lint.
+- **Structural match quá rộng:** filter `{ input: { id: UserId } }` giữ cả
+  `user.get` và `user.delete`; ưu tiên discriminator domain.
+- **API có quá nhiều mode:** nếu cần tám nhánh để giải thích một function, tách
+  function thay vì che complexity bằng conditional type.
+
+## Chi phí compiler và giới hạn thiết kế
+
+Distribution nhân công việc theo số union member. Hai phép phân phối lồng nhau có
+thể tạo tích số nhánh; recursion thêm depth và số instantiation.
+
+```ts
+type PairEvery<A, B> = A extends unknown
+  ? B extends unknown
+    ? readonly [A, B]
+    : never
+  : never;
+
+type Pairs = PairEvery<'a' | 'b' | 'c', 1 | 2 | 3>;
+// 9 tuple members
+```
+
+Trong production:
+
+- đặt tên cho conditional type phức tạp để compiler có cơ hội cache;
+- filter union sớm trước khi biến đổi sâu;
+- tránh phân phối hai chiều nếu quan hệ thật sự chỉ cần một chiều;
+- đặt return annotation có tên tại public boundary;
+- đo bằng `tsc --extendedDiagnostics` và performance trace trước khi tối ưu;
+- xem hover/diagnostic readability là một phần performance của con người.
+
+Đừng dùng `Simplify<T>` như thuốc chữa mặc định. Nó có thể làm hover phẳng hơn
+nhưng không nhất thiết giảm phép tính gốc, đôi khi còn tạo mapped type mới.
+
+## Decision rules
+
+- Dùng conditional type khi output thật sự phụ thuộc vào input type.
+- Dùng distribution để map/filter **từng union member**.
+- Dùng tuple wrapper khi policy nói về **toàn bộ union**.
+- Dùng `Extract`/`Exclude` cho filter chuẩn; thêm alias domain để tăng ý nghĩa.
+- Xem `never` là empty set, không mặc định xem nó là `false`.
+- Không cho `any` đi qua type-level proof rồi gọi kết quả là an toàn.
+- Giữ discriminator và payload trong cùng object khi có thể.
+- Cô lập assertion ở runtime adapter; test cả hai phía của bridge.
+- Tách API thay vì thêm conditional branch khi UX đã khó giải thích.
+- Đo compiler trước khi tối ưu type-level code.
+
+## Lab
+
+Xây một SDK command dispatcher với bốn operation:
+
+1. `user.get` nhận branded `UserId`, trả `User`.
+2. `user.update` nhận patch không rỗng, trả `User` mới.
+3. `invoice.issue` nhận line items, trả `Invoice`.
+4. `audit.list` nhận cursor, trả page.
+
+Yêu cầu:
+
+- model request bằng discriminated union;
+- viết `RequestFor<Op>`, `InputFor<Op>`, `ResponseFor<Request>`;
+- chứng minh distribution giữ đúng từng cặp request/response;
+- viết `AllRetryable<Union>` dạng non-distributive cho policy toàn protocol;
+- test riêng `never`, `any`, `unknown`;
+- thêm ít nhất bốn negative tests bằng `@ts-expect-error`;
+- implementation chỉ được có tối đa một assertion tại dispatch adapter;
+- chạy `tsc --extendedDiagnostics`, ghi baseline và so sánh sau khi thêm một
+  operation mới.
+
+**Done khi:** caller không truyền generic argument, request sai fail ngay tại
+input, response được infer chính xác, union input không tạo output bất hợp lệ,
+và type tests khóa được cả happy path lẫn failure path.
+
+## Tài liệu chính thức
+
+- [Conditional Types — TypeScript Handbook](https://www.typescriptlang.org/docs/handbook/2/conditional-types.html)
+- [Utility Types: `Exclude` và `Extract`](https://www.typescriptlang.org/docs/handbook/utility-types.html)
+- [`unknown` trong TypeScript 3.0](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-3-0.html#new-unknown-top-type)
+- [TypeScript Performance Wiki](https://github.com/microsoft/TypeScript/wiki/Performance)
