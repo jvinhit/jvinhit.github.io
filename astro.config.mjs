@@ -175,7 +175,10 @@ export default defineConfig({
   integrations: [
     mdx(),
     sitemap({
-      filter: (page) => !page.includes('/drafts/'),
+      filter: (page) =>
+        !page.includes('/drafts/') &&
+        !page.endsWith('/series/ts-challenges/') &&
+        !page.endsWith('/series/ts-pattern/'),
     }),
     // Phải đặt SAU `sitemap()` để hook `astro:build:done` chạy sau khi
     // file `sitemap-index.xml` đã tồn tại trong `dist/`.

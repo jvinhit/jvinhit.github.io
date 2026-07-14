@@ -226,11 +226,11 @@ export const SERIES: Record<string, SeriesMeta> = {
       'Series tiếng Việt giúp bạn chuyển từ VSCode sang Neovim một cách thực dụng, theo chuẩn 2025-2026: modal editing, Lua config, lazy.nvim, native LSP mới với vim.lsp.config/vim.lsp.enable, completion, formatter/linter, Treesitter, fuzzy finder, Git, terminal, debug/test, dotfiles và một capstone cấu hình hoàn chỉnh. Mỗi phần có cheatsheet, bài tập và checklist để luyện thành phản xạ thật.',
   },
   typescript: {
-    title: 'TypeScript Production Engineering — từ Senior đến Staff',
+    title: 'TypeScript Engineering — từ Type System đến Production',
     description:
-      'Lộ trình TypeScript 20 phần từ nền tảng soundness tới conditional types, infer, mapped types, recursive types, type-level DSL, runtime contract và kiến trúc codebase lớn.',
+      'Lộ trình TypeScript 42 phần từ type system, production engineering và typed SDK tới type challenges cùng các design pattern thực chiến.',
     blurb:
-      'Core series tiếng Việt 20 phần dành cho developer đã biết cú pháp TypeScript nhưng muốn dùng compiler như một công cụ thiết kế hệ thống. Bốn phần đầu dựng mental model về soundness, strict config, control-flow analysis và inference. Tám phần chuyên sâu tiếp theo đi thẳng vào conditional types, distributivity, infer và candidate resolution, mapped types với key remapping, variadic tuples, template-literal DSL, recursive types có giới hạn, union algebra và kỹ thuật điều khiển inference cho library API. Nửa sau đưa các công cụ đó qua runtime boundary, async contract, ESM, declaration và Type SemVer, kiến trúc, monorepo, compiler performance, migration/governance, rồi kết bằng capstone typed SDK production. Mỗi bài ưu tiên use case thật, failure mode, type test, performance budget và decision rule — không biến type-level programming thành trò giải đố.',
+      'Lộ trình tiếng Việt 42 phần gom toàn bộ nội dung TypeScript của blog vào một series duy nhất. Chặng Production Engineering dựng mental model về soundness, strict config, narrowing và inference; đào sâu conditional types, infer, mapped types, tuple, template-literal DSL, recursion và union algebra; rồi đưa chúng qua runtime boundary, async contract, module, declaration, kiến trúc, monorepo, migration và capstone typed SDK. Chặng Type Challenges gồm 12 bài luyện type-level programming từ năm khối nền tảng tới parser, state machine và typed path utility. Chặng cuối áp dụng TypeScript vào 10 design pattern thực chiến như Factory, Builder, Strategy, Observer, Decorator, Adapter, Command, State, Proxy và Dependency Injection.',
     lang: 'vi',
     sections: [
       {
@@ -261,18 +261,22 @@ export const SERIES: Record<string, SeriesMeta> = {
         from: 17,
         to: 20,
       },
+      {
+        title: 'Type Challenges — từ nền tảng đến type wizard',
+        description:
+          'Luyện mapped type, conditional type, infer, recursion, union, template literal, type-level arithmetic và parser qua challenge có lời giải.',
+        from: 21,
+        to: 32,
+      },
+      {
+        title: 'Design Patterns trong TypeScript',
+        description:
+          'Áp dụng các pattern tạo object, thay đổi hành vi, giao tiếp, state và dependency boundary vào code TypeScript thực tế.',
+        from: 33,
+        to: 42,
+      },
     ],
     pin: 6,
-  },
-  'ts-pattern': {
-    title: 'Design Patterns in TypeScript',
-    blurb:
-      'The classic design patterns every senior web engineer should have at hand, explained with runnable TypeScript.',
-  },
-  'ts-challenges': {
-    title: 'TypeScript Type Challenges — Zero to Type Wizard',
-    blurb:
-      'Master type-level programming by solving the famous type-challenges, one concept at a time. Start with the five building blocks and a guided tour, then go deep on mapped types, conditional types and distribution, infer, recursion over tuples, union manipulation, template-literal string math, type-level arithmetic, the hard utility types, parsers and state machines, and a few extreme challenges — finishing with a capstone that turns it all into a reusable typed library. Every challenge shows the goal first, hides the answer behind a toggle, then explains the solution step by step. Solutions follow the canonical community approaches from the MIT-licensed type-challenges project.',
   },
   'web-security': {
     title: 'Web Security for Frontend Devs',
