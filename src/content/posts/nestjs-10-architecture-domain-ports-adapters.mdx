@@ -1,0 +1,400 @@
+---
+title: 'NestJS Zero to Hero 10 — Kiến trúc Domain, Use Case và Ports & Adapters'
+description: 'Đưa business rule ra khỏi Nest/Prisma, thiết kế domain model và application use case, map adapter ở composition root, giữ modular monolith dễ test.'
+pubDate: 2026-07-17
+lang: vi
+tags:
+  [
+    nestjs,
+    clean-architecture,
+    hexagonal-architecture,
+    domain-driven-design,
+    modular-monolith,
+  ]
+series: nestjs-zero-to-hero
+seriesOrder: 10
+draft: false
+---
+
+Nest cho convention tổ chức object; nó không quyết định business logic phải ở
+đâu. Nếu domain import `@nestjs/common` và Prisma type ở mọi file, đổi transport
+hoặc test use case đều phải kéo framework/database theo.
+
+Mục tiêu không phải “Clean Architecture đủ vòng tròn”. Mục tiêu là dependency
+direction rõ, business rule có thể chạy bằng TypeScript thuần, và abstraction
+chỉ xuất hiện tại boundary có lý do.
+
+Sau bài này, bạn có thể:
+
+- chia domain/application/adapter/composition theo trách nhiệm;
+- xây aggregate giữ invariant transition;
+- dùng input/output port có ngôn ngữ nghiệp vụ;
+- map domain error sang HTTP ở outer layer;
+- chọn modular monolith trước khi tách microservice.
+
+---
+
+## 1. Dependency hướng vào trong
+
+```text
+HTTP controller ─┐
+GraphQL resolver ├─> application use case ─> domain
+queue consumer  ─┘          │
+                            └─> output ports
+                                  ↑
+                     Prisma / Redis / email adapters
+
+Nest module = composition root nối tất cả
+```
+
+Inner layer không biết outer layer:
+
+- domain: entity/value object/invariant/domain error/event;
+- application: command/query, authorization input, transaction orchestration;
+- adapters: HTTP, Prisma, Redis, BullMQ, external SDK;
+- module: chọn implementation và lifecycle.
+
+Không biến mọi function thành class/interface. Pure formatter có thể là function.
+Port cần khi application phải gọi thứ ở ngoài và có lý do thay/test.
+
+---
+
+## 2. Domain model giữ invariant
+
+Task không chỉ là data bag. Transition hợp lệ là business rule:
+
+```ts
+// src/tasks/domain/task.ts
+export type TaskStatus = 'OPEN' | 'IN_PROGRESS' | 'DONE';
+
+export class InvalidTaskTransitionError extends Error {
+  constructor(
+    readonly from: TaskStatus,
+    readonly to: TaskStatus
+  ) {
+    super(`Cannot transition task from ${from} to ${to}`);
+  }
+}
+
+export interface TaskState {
+  id: string;
+  workspaceId: string;
+  title: string;
+  status: TaskStatus;
+  version: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const transitions: Record<TaskStatus, readonly TaskStatus[]> = {
+  OPEN: ['IN_PROGRESS'],
+  IN_PROGRESS: ['OPEN', 'DONE'],
+  DONE: [],
+};
+
+export class Task {
+  private constructor(private state: TaskState) {}
+
+  static rehydrate(state: TaskState): Task {
+    return new Task(structuredClone(state));
+  }
+
+  static create(input: {
+    id: string;
+    workspaceId: string;
+    title: string;
+    now: Date;
+  }): Task {
+    const title = input.title.trim();
+    if (title.length < 3 || title.length > 120) {
+      throw new InvalidTaskTitleError();
+    }
+    return new Task({
+      ...input,
+      title,
+      status: 'OPEN',
+      version: 0,
+      createdAt: input.now,
+      updatedAt: input.now,
+    });
+  }
+
+  transitionTo(next: TaskStatus, now: Date): void {
+    if (!transitions[this.state.status].includes(next)) {
+      throw new InvalidTaskTransitionError(this.state.status, next);
+    }
+    this.state.status = next;
+    this.state.version += 1;
+    this.state.updatedAt = now;
+  }
+
+  snapshot(): Readonly<TaskState> {
+    return Object.freeze(structuredClone(this.state));
+  }
+}
+```
+
+Domain không import Nest, Prisma, HTTP status hoặc class-validator. DTO validation
+cho feedback sớm; domain validation bảo vệ mọi entry point, kể cả queue/GraphQL.
+Hai lớp có thể trùng một số rule vì threat model khác nhau.
+
+`rehydrate()` tin dữ liệu persistence đã hợp lệ; nếu cần migration/defense, kiểm
+tra invariant có kiểm soát thay vì chạy side effect.
+
+---
+
+## 3. Use case điều phối, không chứa transport
+
+Ports:
+
+```ts
+export interface TaskRepository {
+  insert(task: Task): Promise<void>;
+  findById(taskId: string): Promise<Task | null>;
+  update(task: Task, expectedVersion: number): Promise<boolean>;
+}
+
+export interface WorkspaceQueries {
+  isActive(workspaceId: string, tenantId: string): Promise<boolean>;
+}
+```
+
+Command là type nội bộ đã qua transport validation:
+
+```ts
+export interface CreateTaskCommand {
+  tenantId: string;
+  actorId: string;
+  workspaceId: string;
+  title: string;
+}
+```
+
+Use case:
+
+```ts
+@Injectable()
+export class CreateTask {
+  constructor(
+    @Inject(TASK_REPOSITORY) private readonly tasks: TaskRepository,
+    @Inject(WORKSPACE_QUERIES) private readonly workspaces: WorkspaceQueries,
+    @Inject(CLOCK) private readonly clock: Clock,
+    @Inject(ID_GENERATOR) private readonly ids: IdGenerator
+  ) {}
+
+  async execute(command: CreateTaskCommand): Promise<TaskView> {
+    const active = await this.workspaces.isActive(
+      command.workspaceId,
+      command.tenantId
+    );
+    if (!active) throw new WorkspaceUnavailableError(command.workspaceId);
+
+    const task = Task.create({
+      id: this.ids.next(),
+      workspaceId: command.workspaceId,
+      title: command.title,
+      now: this.clock.now(),
+    });
+
+    await this.tasks.insert(task);
+    return task.snapshot();
+  }
+}
+```
+
+`@Injectable()` là outer wiring metadata duy nhất còn trên use case. Nếu muốn
+application hoàn toàn framework-free, bỏ decorator và đăng ký `useFactory` ở
+module; trade-off là nhiều composition boilerplate. Cả hai hợp lệ. Quan trọng là
+business method không nhận Request/Response/Prisma.
+
+---
+
+## 4. Controller adapter rất mỏng
+
+```ts
+@Controller({ path: 'tasks', version: '1' })
+export class TasksController {
+  constructor(private readonly createTask: CreateTask) {}
+
+  @Post()
+  async create(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: CreateTaskDto,
+    @Res({ passthrough: true }) response: Response
+  ): Promise<TaskResponseDto> {
+    const task = await this.createTask.execute({
+      tenantId: principal.tenantId,
+      actorId: principal.userId,
+      workspaceId: dto.workspaceId,
+      title: dto.title,
+    });
+    response.location(`/api/v1/tasks/${task.id}`);
+    return presentTask(task);
+  }
+}
+```
+
+Identity đến từ authenticated principal, không từ body. Controller explicit map
+DTO → command và view → response. Dòng map có vẻ lặp nhưng là anti-corruption
+boundary: field transport đổi không tự làm domain đổi.
+
+---
+
+## 5. Domain error được map một lần
+
+```ts
+const mappings: Array<{
+  matches: (error: unknown) => boolean;
+  status: number;
+  code: string;
+}> = [
+  {
+    matches: (e) => e instanceof TaskNotFoundError,
+    status: 404,
+    code: 'TASK_NOT_FOUND',
+  },
+  {
+    matches: (e) => e instanceof InvalidTaskTransitionError,
+    status: 409,
+    code: 'INVALID_TASK_TRANSITION',
+  },
+  {
+    matches: (e) => e instanceof ConcurrentTaskUpdateError,
+    status: 409,
+    code: 'TASK_VERSION_CONFLICT',
+  },
+];
+```
+
+Exception filter lookup mapping và tạo API envelope. GraphQL adapter map cùng
+domain error sang extension code; queue consumer quyết định retry/dead-letter.
+Domain không cần biết ba transport này.
+
+Không dùng message string để phân loại; dùng error class/stable property.
+
+---
+
+## 6. Command và query có thể khác model
+
+Write side cần aggregate/invariant. Read side có thể query projection thẳng từ
+database qua `TaskQueries` port:
+
+```ts
+export interface TaskListItem {
+  id: string;
+  title: string;
+  status: TaskStatus;
+  assigneeName: string | null;
+}
+
+export interface TaskQueries {
+  list(input: ListTasksQuery): Promise<CursorPage<TaskListItem>>;
+}
+```
+
+Không cần rehydrate 100 aggregate chỉ để render dashboard. Đây là CQRS ở mức
+nhẹ: tách shape/optimization của read và invariant của write, chưa cần hai
+database hay event sourcing.
+
+[Nest CQRS package](https://docs.nestjs.com/recipes/cqrs) hữu ích khi command,
+event, saga nhiều và team cần bus convention. Đừng thêm package chỉ để đổi gọi
+method thành `commandBus.execute()`.
+
+---
+
+## 7. Module composition
+
+```ts
+@Module({
+  imports: [DatabaseModule, WorkspacesModule],
+  controllers: [TasksController],
+  providers: [
+    CreateTask,
+    UpdateTaskStatus,
+    ListTasks,
+    PrismaTaskRepository,
+    { provide: TASK_REPOSITORY, useExisting: PrismaTaskRepository },
+    PrismaTaskQueries,
+    { provide: TASK_QUERIES, useExisting: PrismaTaskQueries },
+  ],
+  exports: [ListTasks],
+})
+export class TasksModule {}
+```
+
+Composition root được phép biết concrete class. Domain/application chỉ biết port.
+Mỗi provider có ownership; repository không export nếu capability khác không cần.
+
+---
+
+## 8. Modular monolith là default mạnh
+
+Một deployable với module boundary cho:
+
+- transaction đơn database;
+- call in-process type-safe;
+- refactor và debug đơn giản;
+- test nhanh;
+- ít operational surface.
+
+Tách microservice khi có bằng chứng: independent scaling/deployment, ownership
+team rõ, isolation/failure domain cần thiết, hoặc workload/runtime khác. Nếu
+module graph đang circular và schema ownership mơ hồ, network chỉ biến coupling
+thành distributed coupling.
+
+Ghi Architectural Decision Record theo template:
+
+```text
+Context → Decision → Alternatives → Consequences → Revisit signals
+```
+
+[MADR](https://adr.github.io/madr/) là một format ADR ngắn gọn. Quyết định đáng
+ghi: Prisma, cursor pagination, modular monolith, OCC, outbox.
+
+---
+
+## 9. Test theo boundary
+
+- domain unit: transition table, không Nest/database;
+- use-case unit: fake ports, clock/ID deterministic;
+- adapter integration: Prisma repository + PostgreSQL thật;
+- module integration: token wiring/import/export;
+- E2E: HTTP contract qua full pipeline.
+
+Nếu mọi test đều boot toàn app, feedback chậm và failure khó định vị. Nếu mọi test
+đều mock, migration/module graph có thể hỏng mà suite vẫn xanh. Bài 13 sẽ dựng
+pyramid đầy đủ.
+
+---
+
+## Bài tập bắt buộc
+
+1. Tạo `Task` aggregate và table-driven test cho mọi transition.
+2. Refactor `CreateTask`/`UpdateTaskStatus` theo port; không import Prisma/HTTP.
+3. Tạo read-model query riêng cho list endpoint.
+4. Map ba domain error sang HTTP stable code trong một filter.
+5. Viết import rule chặn `domain → @nestjs|prisma|infrastructure`.
+6. Viết ADR cho modular monolith và điều kiện xem xét microservice.
+
+### Acceptance criteria
+
+- Domain test chạy không tạo Nest TestingModule.
+- Controller không chứa invariant/query ORM.
+- Application phụ thuộc port có ngôn ngữ use case, không generic repository thừa.
+- ORM/generated type dừng ở infrastructure.
+- Public error code ổn định, domain không biết HTTP.
+- Module boundary và source import direction đều có guardrail.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Modules](https://docs.nestjs.com/modules)
+- [NestJS — CQRS](https://docs.nestjs.com/recipes/cqrs)
+- [Alistair Cockburn — Hexagonal Architecture](https://alistair.cockburn.us/hexagonal-architecture/)
+- [Martin Fowler — Data Mapper](https://martinfowler.com/eaaCatalog/dataMapper.html)
+- [Martin Fowler — CQRS](https://martinfowler.com/bliki/CQRS.html)
+- [Domain-Driven Design Reference](https://www.domainlanguage.com/ddd/reference/)
+
+Chặng REST/data kết thúc. Phần 11 thêm identity đúng cách: password, access token,
+refresh rotation và session state là các contract khác nhau.

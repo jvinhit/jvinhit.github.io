@@ -1,0 +1,358 @@
+---
+title: 'NestJS Zero to Hero 04 — Module Graph, Boundary và Dynamic Module'
+description: 'Dùng module như public API của capability, kiểm soát provider visibility, tránh global/circular dependency và tạo dynamic module cấu hình rõ ràng.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, modules, architecture, dependency-injection, modular-monolith]
+series: nestjs-zero-to-hero
+seriesOrder: 4
+draft: false
+---
+
+`@Module()` thường bị xem như nơi “nhét controller và provider để Nest hết báo
+lỗi”. Cách nhìn đó bỏ qua công cụ kiến trúc quan trọng nhất của framework.
+Module quyết định capability nào sở hữu object nào, dependency nào được nhìn
+thấy và public API nào được phép đi qua boundary.
+
+Sau bài này, bạn có thể:
+
+- đọc `imports/providers/controllers/exports` như một graph;
+- thiết kế feature module theo capability thay vì loại file;
+- chỉ export public application API, giữ adapter private;
+- nhận diện và refactor circular dependency;
+- viết dynamic module theo convention `register()`/`registerAsync()`.
+
+---
+
+## 1. Module tạo scope hiển thị
+
+```ts
+@Module({
+  imports: [],
+  controllers: [],
+  providers: [],
+  exports: [],
+})
+export class TasksModule {}
+```
+
+| Field         | Ý nghĩa                                          |
+| ------------- | ------------------------------------------------ |
+| `providers`   | token mà module sở hữu/đăng ký                   |
+| `controllers` | HTTP entry point thuộc module                    |
+| `imports`     | module có public provider mà module hiện tại cần |
+| `exports`     | subset public cho module consumer                |
+
+Provider mặc định bị encapsulate. `TasksModule` có `TaskRepository` không có
+nghĩa `ReportsModule` được inject repository đó. Chỉ token được export và module
+được import mới đi qua boundary.
+
+```text
+ReportsModule --imports--> TasksModule
+                            ├─ public: TaskQueries
+                            └─ private: PrismaTaskRepository
+```
+
+Đây là compile-time architecture guard ở mức framework: consumer dùng API truy
+vấn task, không chạm adapter lưu trữ của capability khác.
+
+---
+
+## 2. Chia theo capability, không chia theo technical layer toàn app
+
+Cấu trúc khó scale:
+
+```text
+src/
+├─ controllers/   # mọi controller
+├─ services/      # mọi service
+├─ repositories/  # mọi repository
+└─ dto/           # mọi DTO
+```
+
+Đổi một feature phải đi qua bốn thư mục và boundary chỉ tồn tại trong trí nhớ.
+Ưu tiên vertical slice:
+
+```text
+src/
+├─ tasks/
+│  ├─ application/
+│  ├─ domain/
+│  ├─ infrastructure/
+│  ├─ presentation/
+│  └─ tasks.module.ts
+├─ workspaces/
+│  └─ workspaces.module.ts
+├─ identity/
+│  └─ identity.module.ts
+└─ app.module.ts
+```
+
+Project nhỏ có thể đặt file phẳng trong `tasks/`; chỉ thêm layer folder khi số
+file đủ lớn. Điều quan trọng là ownership theo business capability.
+
+### TasksModule có public API hẹp
+
+```ts
+@Module({
+  controllers: [TasksController],
+  providers: [
+    CreateTask,
+    GetTask,
+    ListTasks,
+    { provide: TASK_REPOSITORY, useClass: InMemoryTaskRepository },
+    { provide: CLOCK, useClass: SystemClock },
+    { provide: ID_GENERATOR, useClass: UuidGenerator },
+  ],
+  exports: [GetTask, ListTasks],
+})
+export class TasksModule {}
+```
+
+Không export repository. Nếu `ReportsModule` cần danh sách task, nó inject
+`ListTasks` — một query application service có contract ổn định. Database schema
+và Prisma API không rò sang capability khác.
+
+---
+
+## 3. Root module là composition root, không phải god module
+
+```ts
+@Module({
+  imports: [
+    ConfigurationModule,
+    DatabaseModule,
+    IdentityModule,
+    WorkspacesModule,
+    TasksModule,
+  ],
+})
+export class AppModule {}
+```
+
+`AppModule` lắp các capability cấp process. Nó không nên đăng ký lại provider
+của từng feature, chứa controller nghiệp vụ hoặc export mọi thứ.
+
+Nếu một class xuất hiện trong `providers` của cả `AppModule` và `TasksModule`,
+Nest có thể tạo hai instance trong hai context. Với repository in-memory, bạn sẽ
+thấy hai tập dữ liệu; với SDK client, bạn có thể tạo hai pool/socket.
+
+Quy tắc ownership: **mỗi token có một module chủ sở hữu**. Consumer import module,
+không copy provider definition.
+
+---
+
+## 4. Global module là hidden dependency
+
+`@Global()` cho phép module export provider mà consumer không cần import rõ:
+
+```ts
+@Global()
+@Module({
+  providers: [AppLogger],
+  exports: [AppLogger],
+})
+export class LoggingModule {}
+```
+
+Hợp lý cho hạ tầng thật sự toàn process như config/logger đã chuẩn hóa. Nhưng
+global module làm dependency biến mất khỏi `imports`, khiến test module và graph
+khó đọc. Không biến `DatabaseModule`, `UsersModule` hay `CommonModule` khổng lồ
+thành global chỉ để bớt một dòng import.
+
+Một “CommonModule” chứa 30 helper thường là bãi đỗ không ownership. Helper thuần
+không cần DI có thể export bằng TypeScript module bình thường; không phải file
+nào cũng cần Nest module.
+
+---
+
+## 5. Circular dependency là tín hiệu thiết kế
+
+Giả sử:
+
+```text
+TasksModule → WorkspacesModule (kiểm tra workspace)
+WorkspacesModule → TasksModule (đếm task khi archive)
+```
+
+[Nest `forwardRef()`](https://docs.nestjs.com/fundamentals/circular-dependency) có
+thể trì hoãn việc resolve reference, nhưng không xóa coupling. Thứ tự tạo object
+còn có thể không xác định; request-scoped graph càng rủi ro.
+
+Hỏi ba câu trước khi dùng `forwardRef()`:
+
+1. Một capability có đang lấy dữ liệu nội bộ của capability kia thay vì gọi
+   public query không?
+2. Workflow có thuộc application service cấp cao hơn không?
+3. Side effect có thể đi qua domain event/outbox không?
+
+Ví dụ refactor orchestration:
+
+```ts
+@Injectable()
+export class ArchiveWorkspace {
+  constructor(
+    private readonly getWorkspace: GetWorkspace,
+    private readonly countOpenTasks: CountOpenTasks,
+    private readonly workspaces: WorkspaceCommands
+  ) {}
+
+  async execute(workspaceId: string): Promise<void> {
+    await this.getWorkspace.execute(workspaceId);
+    const openTasks = await this.countOpenTasks.execute(workspaceId);
+    if (openTasks > 0) throw new WorkspaceHasOpenTasksError();
+    await this.workspaces.archive(workspaceId);
+  }
+}
+```
+
+Đặt use case này ở module workflow/application phù hợp. Hai feature không cần
+import ngược nhau; orchestrator phụ thuộc public API của cả hai.
+
+Tránh barrel `index.ts` giữa provider/module cùng feature nếu nó tạo TypeScript
+file cycle. Circular import ở JavaScript và circular DI là hai lỗi khác nhau,
+nhưng có thể cho thông báo giống nhau.
+
+---
+
+## 6. Dynamic module là module factory
+
+Library module đôi khi cần options khác nhau theo app. Dynamic module trả metadata
+tại runtime:
+
+```ts
+// src/infrastructure/id/id.module.ts
+import { DynamicModule, Module } from '@nestjs/common';
+
+export interface IdModuleOptions {
+  prefix: string;
+}
+
+export const ID_OPTIONS = Symbol('ID_OPTIONS');
+
+@Module({})
+export class IdModule {
+  static register(options: IdModuleOptions): DynamicModule {
+    return {
+      module: IdModule,
+      providers: [
+        { provide: ID_OPTIONS, useValue: Object.freeze(options) },
+        PrefixedUuidGenerator,
+        { provide: ID_GENERATOR, useExisting: PrefixedUuidGenerator },
+      ],
+      exports: [ID_GENERATOR],
+    };
+  }
+}
+```
+
+Consumer:
+
+```ts
+imports: [IdModule.register({ prefix: 'tsk' })];
+```
+
+Convention phổ biến:
+
+- `register()`/`forRoot()`: config một lần, synchronous.
+- `registerAsync()`/`forRootAsync()`: options cần inject ConfigService/secret.
+- `forFeature()`: đăng ký subset resource cho feature.
+
+Tên không tạo semantics đặc biệt; đây là convention. Với module tái sử dụng,
+[ConfigurableModuleBuilder](https://docs.nestjs.com/fundamentals/dynamic-modules#configurable-module-builder)
+giảm boilerplate và sinh `MODULE_OPTIONS_TOKEN` type-safe.
+
+### Async options
+
+```ts
+IdModule.registerAsync({
+  inject: [ConfigService],
+  useFactory: (config: ConfigService): IdModuleOptions => ({
+    prefix: config.getOrThrow('TASK_ID_PREFIX'),
+  }),
+});
+```
+
+Nếu viết API này, hỗ trợ các pattern `useFactory`, `useClass`, `useExisting` khi
+thực sự cần. Đừng xây mini-framework cho module chỉ được dùng một lần trong app.
+
+---
+
+## 7. Lab: WorkspacesModule và dependency direction
+
+Tạo `WorkspacesModule` có:
+
+- `CreateWorkspace` command;
+- `GetWorkspace` query được export;
+- repository in-memory private;
+- `WorkspacesController` private entry point của module.
+
+`CreateTask` phải kiểm tra workspace tồn tại bằng `GetWorkspace`:
+
+```ts
+@Module({
+  imports: [WorkspacesModule],
+  providers: [CreateTask],
+})
+export class TasksModule {}
+```
+
+Không inject `WorkspaceRepository` vào Tasks. Vẽ module graph trong README:
+
+```text
+AppModule
+├─ WorkspacesModule
+└─ TasksModule ──uses──> WorkspacesModule.GetWorkspace
+```
+
+Sau đó cố tình bỏ `exports: [GetWorkspace]`. Đọc lỗi và sửa đúng tại public API,
+không đăng ký `GetWorkspace` lần hai trong TasksModule.
+
+---
+
+## Architecture tests bằng inspection
+
+Ở quy mô lớn, thêm rule bằng [dependency-cruiser](https://github.com/sverweij/dependency-cruiser)
+hoặc [eslint-plugin-boundaries](https://github.com/javierbrea/eslint-plugin-boundaries):
+
+```text
+domain         không import @nestjs/* hoặc infrastructure/*
+application    chỉ import domain và port
+presentation   gọi application public API
+infrastructure implement port, không chứa business rule
+feature A      không import internal path của feature B
+```
+
+Nest module boundary là runtime visibility; lint rule bảo vệ source import ở
+compile time. Cần cả hai khi codebase lớn.
+
+---
+
+## Bài tập bắt buộc
+
+1. Tạo WorkspacesModule theo lab và thêm `workspaceId` vào task.
+2. Chỉ export `GetWorkspace`; chứng minh repository không inject được từ Tasks.
+3. Tạo một circular dependency có chủ đích, sau đó refactor bằng orchestrator.
+4. Viết `IdModule.register()` và test hai application context có prefix khác.
+5. Lập bảng ownership: token, owning module, public/private, scope.
+
+### Acceptance criteria
+
+- Root module chỉ composition; không đăng ký provider nghiệp vụ lặp lại.
+- Feature module export use case/query, không export repository adapter.
+- Không có `forwardRef()` trong graph sau refactor.
+- Import direction được vẽ và có ít nhất một rule tự động bảo vệ.
+- Dynamic module options immutable và token không dùng string chung chung.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Modules](https://docs.nestjs.com/modules)
+- [NestJS — Dynamic modules](https://docs.nestjs.com/fundamentals/dynamic-modules)
+- [NestJS — Circular dependency](https://docs.nestjs.com/fundamentals/circular-dependency)
+- [NestJS — ConfigurableModuleBuilder](https://docs.nestjs.com/fundamentals/dynamic-modules#configurable-module-builder)
+- [NestJS Devtools — Graph visualizer](https://docs.nestjs.com/devtools/overview)
+
+Phần 5 chuyển từ startup graph sang request graph: thứ tự middleware, guard,
+interceptor, pipe, controller và filter quyết định concern phải nằm ở đâu.

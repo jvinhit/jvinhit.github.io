@@ -1,0 +1,414 @@
+---
+title: 'NestJS Zero to Hero 03 — Providers và Dependency Injection sâu'
+description: 'Làm chủ provider token, custom provider, useClass/useValue/useFactory/useExisting, scope và cách thiết kế dependency có thể thay thế, kiểm thử.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, dependency-injection, providers, architecture, typescript]
+series: nestjs-zero-to-hero
+seriesOrder: 3
+draft: false
+---
+
+Dependency Injection (DI) không phải để khỏi viết `new`. Giá trị thật của nó là
+tách **chính sách sử dụng dependency** khỏi **cách dependency được tạo và nối**.
+Use case cần lưu task, nhưng không cần biết storage là `Map`, PostgreSQL hay fake
+trong test.
+
+Sau bài này, bạn có thể:
+
+- giải thích token, provider definition và instance khác nhau thế nào;
+- dùng bốn loại custom provider đúng trường hợp;
+- inject interface qua symbol token;
+- chọn singleton/request/transient dựa trên lifetime;
+- đọc dependency-resolution error theo module context.
+
+---
+
+## 1. Container là map từ token tới công thức tạo object
+
+Khai báo ngắn:
+
+```ts
+providers: [TasksService];
+```
+
+tương đương:
+
+```ts
+providers: [
+  {
+    provide: TasksService,
+    useClass: TasksService,
+  },
+];
+```
+
+`TasksService` ở vị trí `provide` là **token**; `useClass` là **recipe**. Container
+resolve token, tạo instance theo recipe, cache instance theo scope rồi inject nó.
+
+```text
+consumer asks token
+       ↓
+module-visible provider definition
+       ↓
+resolve dependencies recursively
+       ↓
+create/reuse instance according to scope
+       ↓
+inject into constructor
+```
+
+Class là token tiện dụng vì tồn tại ở runtime. TypeScript interface bị xóa sau
+compile, nên interface không thể tự làm token.
+
+---
+
+## 2. Tách repository contract khỏi implementation
+
+Tạo port thuần TypeScript:
+
+```ts
+// src/tasks/task.repository.ts
+import type { Task, TaskStatus } from './tasks.service';
+
+export interface TaskRepository {
+  save(task: Task): Promise<void>;
+  findById(taskId: string): Promise<Task | null>;
+  findAll(status?: TaskStatus): Promise<Task[]>;
+  delete(taskId: string): Promise<boolean>;
+}
+
+export const TASK_REPOSITORY = Symbol('TASK_REPOSITORY');
+```
+
+Symbol tránh collision với string token. Port không import Nest. Implementation
+in-memory là adapter:
+
+```ts
+// src/tasks/in-memory-task.repository.ts
+import { Injectable } from '@nestjs/common';
+import type { TaskRepository } from './task.repository';
+import type { Task, TaskStatus } from './tasks.service';
+
+@Injectable()
+export class InMemoryTaskRepository implements TaskRepository {
+  private readonly data = new Map<string, Task>();
+
+  async save(task: Task): Promise<void> {
+    this.data.set(task.id, structuredClone(task));
+  }
+
+  async findById(taskId: string): Promise<Task | null> {
+    const task = this.data.get(taskId);
+    return task ? structuredClone(task) : null;
+  }
+
+  async findAll(status?: TaskStatus): Promise<Task[]> {
+    return [...this.data.values()]
+      .filter((task) => !status || task.status === status)
+      .map((task) => structuredClone(task));
+  }
+
+  async delete(taskId: string): Promise<boolean> {
+    return this.data.delete(taskId);
+  }
+}
+```
+
+Inject token vào service:
+
+```ts
+import { Inject, Injectable } from '@nestjs/common';
+import { TASK_REPOSITORY, type TaskRepository } from './task.repository';
+
+@Injectable()
+export class TasksService {
+  constructor(
+    @Inject(TASK_REPOSITORY)
+    private readonly repository: TaskRepository
+  ) {}
+
+  // Các method giờ await repository thay vì chạm Map.
+}
+```
+
+Đăng ký recipe trong module:
+
+```ts
+@Module({
+  controllers: [TasksController],
+  providers: [
+    TasksService,
+    {
+      provide: TASK_REPOSITORY,
+      useClass: InMemoryTaskRepository,
+    },
+  ],
+})
+export class TasksModule {}
+```
+
+Use case biết contract, composition root chọn adapter. Đây là Dependency
+Inversion Principle, không phải “thêm abstraction cho đẹp”. Port đáng tồn tại vì
+ta biết storage sẽ đổi và test cần fake.
+
+---
+
+## 3. Bốn recipe của custom provider
+
+### `useValue`: object đã tồn tại
+
+Phù hợp config bất biến, fake hoặc SDK object đã khởi tạo:
+
+```ts
+const fixedClock = {
+  now: () => new Date('2026-07-17T00:00:00.000Z'),
+};
+
+{
+  provide: CLOCK,
+  useValue: fixedClock,
+}
+```
+
+Không đặt mutable global object rồi để mọi service sửa. `useValue` chia sẻ cùng
+reference theo application context.
+
+### `useClass`: container tạo class
+
+```ts
+{
+  provide: TASK_REPOSITORY,
+  useClass: InMemoryTaskRepository,
+}
+```
+
+Chọn implementation theo environment cũng có thể làm ở composition root,
+nhưng đừng rải `if (NODE_ENV)` trong business code.
+
+### `useFactory`: tạo từ dependency khác
+
+```ts
+{
+  provide: ID_GENERATOR,
+  inject: [ConfigService],
+  useFactory: (config: ConfigService): IdGenerator => {
+    const prefix = config.getOrThrow<string>('ID_PREFIX');
+    return new PrefixedUuidGenerator(prefix);
+  },
+}
+```
+
+Factory có thể `async`; Nest đợi promise trước khi hoàn tất bootstrap. Không mở
+connection mới trong mỗi method nếu client có lifecycle dài — factory nên tạo
+một singleton client và lifecycle hook nên đóng nó.
+
+### `useExisting`: alias cùng instance
+
+```ts
+@Injectable()
+class SystemClock implements Clock, TimestampProvider {
+  now(): Date {
+    return new Date();
+  }
+}
+
+providers: [
+  SystemClock,
+  { provide: CLOCK, useExisting: SystemClock },
+  { provide: TIMESTAMP_PROVIDER, useExisting: SystemClock },
+];
+```
+
+`useClass: SystemClock` ở cả ba chỗ có thể tạo nhiều provider registration và
+instance khác nhau. `useExisting` nói rõ đây là alias của cùng singleton.
+
+---
+
+## 4. Scope là lifetime, không phải visibility
+
+[Nest injection scopes](https://docs.nestjs.com/fundamentals/injection-scopes) có
+ba lựa chọn chính:
+
+| Scope     | Số instance                      | Dùng khi                               |
+| --------- | -------------------------------- | -------------------------------------- |
+| default   | một instance/application context | service stateless, DB pool, SDK client |
+| request   | một instance/request             | state thật sự gắn với request          |
+| transient | một instance/consumer            | helper có state riêng cho consumer     |
+
+Singleton an toàn khi service không lưu dữ liệu riêng của từng request trên
+property. Node xử lý nhiều request xen kẽ trên cùng process, nên code này sai:
+
+```ts
+@Injectable()
+export class CurrentUserService {
+  userId?: string; // ❌ request A có thể bị request B ghi đè
+}
+```
+
+Đừng phản xạ sửa bằng `Scope.REQUEST` cho toàn graph. Request scope “bubble” lên
+consumer và tạo object graph mới mỗi request, tăng allocation/latency. Với
+identity, truyền `principal` vào use case hoặc dùng AsyncLocalStorage có kiểm
+soát ở bài observability.
+
+Request scope hợp lý khi lifetime thật sự là request và cost đã được đo. Gateway
+WebSocket, Passport strategy và connection pool phải là singleton theo hướng dẫn
+của Nest.
+
+---
+
+## 5. Constructor injection giúp dependency hiện rõ
+
+Ưu tiên:
+
+```ts
+constructor(
+  @Inject(TASK_REPOSITORY) private readonly tasks: TaskRepository,
+  @Inject(CLOCK) private readonly clock: Clock,
+) {}
+```
+
+Khi class có 8–10 dependency, đó thường là tín hiệu nó có quá nhiều trách nhiệm.
+Service locator qua `ModuleRef.get()` che dependency khỏi constructor và làm test
+khó đọc. [ModuleRef](https://docs.nestjs.com/fundamentals/module-ref) dành cho
+dynamic resolution/lifecycle đặc biệt, không phải đường tắt mặc định.
+
+Property injection cũng che contract và tạo object không hoàn chỉnh giữa
+constructor với property assignment. Constructor injection làm invalid state
+khó biểu diễn hơn.
+
+---
+
+## 6. Đọc lỗi DI theo một thuật toán
+
+Thông báo điển hình:
+
+```text
+Nest can't resolve dependencies of the TasksService (?).
+Please make sure that the argument Symbol(TASK_REPOSITORY) at index [0]
+is available in the TasksModule context.
+```
+
+Đọc theo thứ tự:
+
+1. **Consumer** nào không tạo được? `TasksService`.
+2. **Parameter index** nào? `0`, tức parameter đầu constructor.
+3. **Token** nào thiếu? `TASK_REPOSITORY`.
+4. **Context module** nào đang resolve? `TasksModule`.
+5. Token có nằm trong `providers` của module đó, hoặc được export từ module đã
+   import không?
+
+Đừng thêm provider bừa vào root module. Provider visibility theo module sẽ là
+chủ đề phần 4.
+
+Có thể bật log graph chi tiết khi debug:
+
+```bash
+NEST_DEBUG=1 pnpm start:dev
+```
+
+---
+
+## 7. Lab: Clock và ID generator có thể kiểm soát
+
+Tạo hai port:
+
+```ts
+export interface Clock {
+  now(): Date;
+}
+export const CLOCK = Symbol('CLOCK');
+
+export interface IdGenerator {
+  next(): string;
+}
+export const ID_GENERATOR = Symbol('ID_GENERATOR');
+```
+
+Production adapter dùng `new Date()` và `randomUUID()`. `TasksService.create()`
+không được gọi trực tiếp hai API này nữa:
+
+```ts
+const now = this.clock.now();
+const task: Task = {
+  id: this.ids.next(),
+  title: input.title.trim(),
+  status: 'OPEN',
+  createdAt: now.toISOString(),
+};
+```
+
+Trong unit test, inject fixed clock và sequence ID. Test sẽ deterministic, không
+cần regex UUID hay fake timer toàn process.
+
+### Test class không cần boot Nest
+
+```ts
+const repository = new InMemoryTaskRepository();
+const clock: Clock = {
+  now: () => new Date('2026-07-17T00:00:00.000Z'),
+};
+const ids: IdGenerator = { next: () => 'tsk_001' };
+
+const service = new TasksService(repository, clock, ids);
+const task = await service.create({ title: '  Learn DI  ' });
+
+expect(task).toEqual({
+  id: 'tsk_001',
+  title: 'Learn DI',
+  status: 'OPEN',
+  createdAt: '2026-07-17T00:00:00.000Z',
+});
+```
+
+DI là pattern độc lập với Nest. Test business object trực tiếp thường nhanh và
+rõ hơn boot `TestingModule`; dùng container test khi chính wiring là thứ cần
+chứng minh.
+
+---
+
+## Failure modes
+
+- **Duplicate provider**: đăng ký cùng class ở nhiều feature module tạo nhiều
+  instance, đặc biệt nguy hiểm với in-memory state hoặc client connection.
+- **String token collision**: hai package cùng dùng `'CONFIG'`; ưu tiên symbol
+  hoặc class token export từ một file contract.
+- **Request-scope contagion**: một dependency request-scoped kéo controller và
+  graph phía trên thành request-scoped.
+- **Factory làm I/O nhưng không fail-fast**: app listen trước khi dependency
+  sẵn sàng; async factory phải resolve hoặc reject lúc bootstrap.
+- **Interface không khớp runtime**: type import đúng nhưng token registration
+  trỏ nhầm implementation; thêm integration test cho module graph.
+
+---
+
+## Bài tập bắt buộc
+
+1. Refactor toàn bộ `TasksService` sang `TaskRepository`, `Clock`, `IdGenerator`.
+2. Dùng `useExisting` để cùng `SystemClock` phục vụ hai token.
+3. Viết `FakeTaskRepository` có thể ép `save()` lỗi; kiểm tra service không nuốt
+   exception.
+4. Cố tình bỏ provider rồi chụp lại cách bạn suy luận từ error message.
+5. Kiểm tra không provider nào dùng request scope nếu chưa có benchmark và lý do.
+
+### Acceptance criteria
+
+- `TasksService` không import implementation class.
+- Test create task không phụ thuộc thời gian/UUID thật.
+- Symbol token được định nghĩa cạnh interface và export có chủ đích.
+- Mỗi long-lived client chỉ có một instance/application context.
+- Bạn phân biệt được provider visibility (module) với provider lifetime (scope).
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Providers](https://docs.nestjs.com/providers)
+- [NestJS — Custom providers](https://docs.nestjs.com/fundamentals/custom-providers)
+- [NestJS — Injection scopes](https://docs.nestjs.com/fundamentals/injection-scopes)
+- [NestJS — Module reference](https://docs.nestjs.com/fundamentals/module-ref)
+- [NestJS — Common dependency errors](https://docs.nestjs.com/faq/common-errors)
+- [TypeScript — Symbols](https://www.typescriptlang.org/docs/handbook/symbols.html)
+
+Phần 4 tổ chức những provider này thành module boundary: import/export sẽ trở
+thành public API của capability, không chỉ là cấu hình để hết lỗi DI.

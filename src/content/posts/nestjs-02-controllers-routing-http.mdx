@@ -1,0 +1,352 @@
+---
+title: 'NestJS Zero to Hero 02 — Controllers, Routing và HTTP Contract'
+description: 'Thiết kế controller mỏng, route REST có chủ đích, status/header/query/param đúng ngữ nghĩa và xây Tasks API in-memory có thể kiểm thử bằng curl.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, controllers, http, rest-api, typescript]
+series: nestjs-zero-to-hero
+seriesOrder: 2
+draft: false
+---
+
+Controller là cửa vào của ứng dụng, không phải ứng dụng. Nó nên dịch ngôn ngữ
+HTTP — route, parameter, header, status và body — sang lời gọi use case. Khi
+controller tự quyết định quy tắc nghiệp vụ, cùng quy tắc đó sẽ phải copy sang
+GraphQL resolver, queue consumer hoặc CLI.
+
+Sau bài này, bạn sẽ:
+
+- ghép route từ controller prefix và method path;
+- phân biệt path param, query, body và header;
+- chọn status code theo semantics thay vì mặc định của framework;
+- tạo Tasks API in-memory với controller mỏng;
+- nhận ra chỗ nào thuộc transport, chỗ nào thuộc application.
+
+---
+
+## 1. Router được tạo từ metadata
+
+```ts
+import { Controller, Get, Param } from '@nestjs/common';
+
+@Controller('tasks')
+export class TasksController {
+  @Get(':taskId')
+  findOne(@Param('taskId') taskId: string) {
+    return { taskId };
+  }
+}
+```
+
+Nest ghép `tasks` và `:taskId` thành `GET /tasks/:taskId`. `@Controller()` xác
+định nhóm resource; `@Get()` xác định method + path; `@Param()` lấy dữ liệu từ
+request object của adapter.
+
+Đặt global prefix trong `main.ts`:
+
+```ts
+app.setGlobalPrefix('api');
+```
+
+Route lúc này là `GET /api/tasks/:taskId`. Prefix thường dành cho namespace kỹ
+thuật; API versioning sẽ xử lý riêng ở bài 7.
+
+> NestJS 11 dùng Express 5 mặc định. Wildcard route phải có tên như
+> `files/*path`; xem [NestJS 11 migration guide](https://docs.nestjs.com/migration-guide)
+> và [path-to-regexp](https://github.com/pillarjs/path-to-regexp).
+
+---
+
+## 2. Chọn đúng kênh của HTTP
+
+Một request có nhiều vùng, mỗi vùng có nghĩa khác nhau:
+
+| Vùng   | Dùng cho                             | Ví dụ                       |
+| ------ | ------------------------------------ | --------------------------- |
+| path   | định danh resource                   | `/tasks/tsk_123`            |
+| query  | filter, sort, pagination, projection | `?status=OPEN&limit=20`     |
+| header | metadata của request/representation  | `Authorization`, `If-Match` |
+| body   | representation hoặc command payload  | title, assigneeId           |
+
+Trong Nest:
+
+```ts
+@Get(':taskId')
+findOne(
+  @Param('taskId') taskId: string,
+  @Query('include') include?: string,
+  @Headers('if-none-match') etag?: string,
+) {}
+
+@Post()
+create(@Body() body: unknown) {}
+```
+
+Đừng đưa `userId` vào body nếu identity đã đến từ access token; client có thể
+giả mạo body. Đừng dùng path cho filter tùy chọn. Đừng trả HTTP 200 cho mọi kết
+quả rồi nhét `{ success: false }` vào JSON; status code tồn tại để proxy, client
+và monitoring hiểu outcome.
+
+### Status code tối thiểu cần nắm
+
+- `200 OK`: đọc/cập nhật có response body.
+- `201 Created`: tạo resource; nên kèm `Location`.
+- `204 No Content`: command thành công và không trả body.
+- `400 Bad Request`: cú pháp/shape request không hợp lệ.
+- `401 Unauthorized`: chưa có hoặc credential không hợp lệ.
+- `403 Forbidden`: đã xác thực nhưng không được phép.
+- `404 Not Found`: resource không tồn tại hoặc cố ý che resource.
+- `409 Conflict`: state hiện tại xung đột command.
+- `422 Unprocessable Content`: request có cấu trúc đúng nhưng semantic sai;
+  hãy thống nhất convention trong team.
+
+Xem registry chuẩn tại [MDN HTTP response status codes](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status).
+
+---
+
+## 3. Tạo feature Tasks
+
+Dùng CLI để sinh boilerplate:
+
+```bash
+pnpm nest generate module tasks
+pnpm nest generate controller tasks --no-spec
+pnpm nest generate service tasks --no-spec
+```
+
+Trong bài này repository là `Map`; bài 8 sẽ thay bằng PostgreSQL mà không đổi
+HTTP contract.
+
+```ts
+// src/tasks/tasks.service.ts
+import { Injectable, NotFoundException } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+
+export type TaskStatus = 'OPEN' | 'IN_PROGRESS' | 'DONE';
+
+export interface Task {
+  id: string;
+  title: string;
+  status: TaskStatus;
+  createdAt: string;
+}
+
+export interface CreateTaskInput {
+  title: string;
+}
+
+@Injectable()
+export class TasksService {
+  private readonly tasks = new Map<string, Task>();
+
+  create(input: CreateTaskInput): Task {
+    const task: Task = {
+      id: randomUUID(),
+      title: input.title.trim(),
+      status: 'OPEN',
+      createdAt: new Date().toISOString(),
+    };
+    this.tasks.set(task.id, task);
+    return task;
+  }
+
+  findAll(status?: TaskStatus): Task[] {
+    return [...this.tasks.values()].filter(
+      (task) => status === undefined || task.status === status
+    );
+  }
+
+  findOne(taskId: string): Task {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new NotFoundException('Task not found');
+    return task;
+  }
+
+  remove(taskId: string): void {
+    if (!this.tasks.delete(taskId)) {
+      throw new NotFoundException('Task not found');
+    }
+  }
+}
+```
+
+Service trên vẫn trộn business và HTTP exception. Ta chấp nhận tạm thời để học
+transport; bài 10 sẽ chuyển domain error thành HTTP ở boundary.
+
+Controller chỉ dịch dữ liệu:
+
+```ts
+// src/tasks/tasks.controller.ts
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Header,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Post,
+  Query,
+  Res,
+} from '@nestjs/common';
+import type { Response } from 'express';
+import {
+  type CreateTaskInput,
+  type TaskStatus,
+  TasksService,
+} from './tasks.service';
+
+@Controller('tasks')
+export class TasksController {
+  constructor(private readonly tasks: TasksService) {}
+
+  @Post()
+  create(
+    @Body() input: CreateTaskInput,
+    @Res({ passthrough: true }) res: Response
+  ) {
+    const task = this.tasks.create(input);
+    res.location(`/api/tasks/${task.id}`);
+    return task;
+  }
+
+  @Get()
+  @Header('Cache-Control', 'no-store')
+  findAll(@Query('status') status?: TaskStatus) {
+    return { items: this.tasks.findAll(status) };
+  }
+
+  @Get(':taskId')
+  findOne(@Param('taskId') taskId: string) {
+    return this.tasks.findOne(taskId);
+  }
+
+  @Delete(':taskId')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  remove(@Param('taskId') taskId: string): void {
+    this.tasks.remove(taskId);
+  }
+}
+```
+
+Nest mặc định trả `201` cho `@Post()` và `200` cho các handler khác. Vì DELETE
+không có representation, ta chọn `204` bằng `@HttpCode()`.
+
+`@Res({ passthrough: true })` cho phép đặt `Location` nhưng vẫn để Nest serialize
+return value. Nếu inject `@Res()` không có `passthrough`, bạn nhận trách nhiệm
+gọi `res.json()`/`res.end()` và làm code phụ thuộc adapter. Chỉ dùng library-specific
+response khi thực sự cần streaming hoặc API riêng của adapter.
+
+### Một bẫy TypeScript quan trọng
+
+`CreateTaskInput` chỉ là interface. Payload sau vẫn lọt vào runtime:
+
+```json
+{ "title": 42, "isAdmin": true }
+```
+
+TypeScript biến mất sau compile. `@Body() input: CreateTaskInput` không parse,
+validate hay strip field. Bài 7 sẽ dùng class DTO và `ValidationPipe`; hiện tại
+hãy ghi nhận lỗ hổng thay vì tưởng type annotation là bảo mật.
+
+---
+
+## 4. Chạy một flow hoàn chỉnh
+
+Khởi động app rồi tạo task:
+
+```bash
+curl -i -X POST http://localhost:3000/api/tasks \
+  -H 'content-type: application/json' \
+  -d '{"title":"Write API contract"}'
+```
+
+Copy `id`, sau đó:
+
+```bash
+curl -i http://localhost:3000/api/tasks
+curl -i http://localhost:3000/api/tasks/TASK_ID
+curl -i -X DELETE http://localhost:3000/api/tasks/TASK_ID
+curl -i http://localhost:3000/api/tasks/TASK_ID
+```
+
+Kiểm tra bốn thứ, không chỉ body: status, header, JSON shape và side effect.
+
+```text
+POST   /api/tasks       → 201 + Location + task
+GET    /api/tasks       → 200 + { items: [...] }
+DELETE /api/tasks/:id   → 204 + empty body
+GET    /api/tasks/:id   → 404
+```
+
+State biến mất khi restart vì `Map` nằm trong process. Đây là behavior đúng của
+fixture học tập, không phải persistence.
+
+---
+
+## 5. Controller mỏng đến mức nào?
+
+Controller nên làm:
+
+- đọc và validate transport input;
+- lấy authenticated principal từ request context;
+- gọi đúng use case;
+- map output/error sang HTTP representation.
+
+Controller không nên:
+
+- query database trực tiếp;
+- quyết định task có được chuyển từ `DONE` về `OPEN`;
+- hash password, gửi email hoặc publish event;
+- mở transaction;
+- chứa workflow nhiều nhánh.
+
+Rule of thumb: nếu logic cũng cần khi command đến từ queue hoặc GraphQL, nó
+không thuộc controller.
+
+---
+
+## Failure modes cần tự nhận ra
+
+| Triệu chứng            | Nguyên nhân thường gặp                         | Cách kiểm tra                           |
+| ---------------------- | ---------------------------------------------- | --------------------------------------- |
+| 404 mọi route          | controller chưa nằm trong module graph         | xem `controllers` và module import      |
+| body là `undefined`    | thiếu content-type hoặc body parser không nhận | xem request headers/raw payload         |
+| DELETE bị treo         | dùng `@Res()` nhưng không `end()`              | bỏ response mode hoặc kết thúc response |
+| filter nhận giá trị lạ | TypeScript không validate runtime              | thêm pipe/DTO ở bài 7                   |
+| hai task trùng state   | in-memory singleton và test dùng chung app     | reset fixture giữa test                 |
+
+---
+
+## Bài tập bắt buộc
+
+1. Thêm `PATCH /api/tasks/:taskId/status` nhận status mới.
+2. Chỉ cho phép `OPEN → IN_PROGRESS → DONE`; tạm ném `ConflictException` nếu
+   transition sai.
+3. Thêm query `q` để tìm title không phân biệt hoa thường.
+4. Không trả mảng trần: response list phải có `items` và `total` để sau này thêm
+   pagination mà không đổi từ array sang object.
+5. Viết shell flow chứng minh `Location`, `204` empty body và `409` transition.
+
+### Acceptance criteria
+
+- Mỗi route có method, path, success status và error status được ghi rõ.
+- Controller không truy cập `Map` và không tự tạo ID.
+- Không dùng `@Res()` full-response mode.
+- Unknown task luôn có cùng error contract do Nest tạo ở giai đoạn này.
+- Bạn giải thích được vì sao interface không bảo vệ runtime input.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Controllers](https://docs.nestjs.com/controllers)
+- [NestJS — Routing](https://docs.nestjs.com/controllers#routing)
+- [NestJS — Library-specific approach](https://docs.nestjs.com/controllers#library-specific-approach)
+- [NestJS — Exception filters](https://docs.nestjs.com/exception-filters)
+- [MDN — HTTP semantics](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Overview)
+- [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110)
+
+Phần 3 mở container ra xem: provider token là gì, Nest resolve dependency ra
+sao và vì sao singleton là mặc định đúng cho phần lớn back-end Node.js.

@@ -1,0 +1,375 @@
+---
+title: 'NestJS Zero to Hero 18 — Microservices, Messaging và gRPC Contract'
+description: 'Tách Notification service có lý do, dùng RabbitMQ event at-least-once và gRPC nội bộ có deadline, version contract, idempotency, tracing và ownership dữ liệu.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, microservices, grpc, rabbitmq, distributed-systems]
+series: nestjs-zero-to-hero
+seriesOrder: 18
+draft: false
+---
+
+Microservice không phải module có URL riêng. Network boundary thêm latency,
+partial failure, serialization, authentication, version skew, retry và vận hành.
+Nếu module boundary chưa rõ, tách process chỉ tạo distributed monolith.
+
+Bài này tách Notifications vì nó có workload, failure và deployment khác API:
+nó consume committed event, gọi email provider và scale theo backlog. Task data
+vẫn thuộc TaskFlow API; Notification service sở hữu delivery data riêng.
+
+Sau bài này, bạn có thể:
+
+- quyết định khi nào nên giữ modular monolith;
+- phân biệt RPC command/query với async event;
+- consume RabbitMQ at-least-once có manual ack/idempotency;
+- định nghĩa gRPC contract compatible và deadline-aware;
+- thiết kế ownership, service identity và observability qua boundary.
+
+---
+
+## 1. Extraction gate
+
+Chỉ tách khi có ít nhất một lực rõ:
+
+- team sở hữu/deploy độc lập;
+- workload cần scale/capacity khác;
+- failure cần cô lập;
+- compliance/data boundary;
+- runtime/region khác;
+- release cadence khác.
+
+Không tách vì “code có nhiều folder” hoặc để CV có microservice. Cost phải được
+chấp nhận: broker, schema registry/proto, service discovery, mTLS, distributed
+tracing, runbook, on-call và backward compatibility.
+
+```text
+TaskFlow API (owns tasks/workspaces)
+  └─ outbox: task.assigned.v1
+       ↓ RabbitMQ
+Notification Service (owns notification deliveries/preferences)
+  ├─ consumer → email provider
+  └─ gRPC GetDelivery (internal admin query)
+```
+
+Không share database schema. Service khác không query table TaskFlow trực tiếp;
+nó nhận event/contract. Shared DB làm deploy không độc lập và ownership giả.
+
+---
+
+## 2. RPC và message có semantics khác
+
+| Kiểu          | Coupling thời gian                   | Kết quả                | Dùng cho                       |
+| ------------- | ------------------------------------ | ---------------------- | ------------------------------ |
+| gRPC/HTTP RPC | caller chờ callee                    | success/error/deadline | query/command cần kết quả ngay |
+| broker event  | producer không chờ consumer business | accepted/published     | fact, fan-out, async workflow  |
+| queue command | producer giao một việc               | completion async       | background task một owner      |
+
+Đừng biến mọi function call thành RPC. `CreateTask` không nên gọi đồng bộ
+Notification service; email outage không được chặn task commit. Event qua outbox
+là boundary đúng.
+
+RPC “nhanh” vẫn có partial failure: timeout không nói callee chưa thực hiện. Command
+RPC cần idempotency/deadline/reconciliation như HTTP.
+
+---
+
+## 3. RabbitMQ transport trong Nest
+
+Cài:
+
+```bash
+pnpm add @nestjs/microservices amqplib amqp-connection-manager
+```
+
+Notification process:
+
+```ts
+const app = await NestFactory.createMicroservice<MicroserviceOptions>(
+  NotificationsModule,
+  {
+    transport: Transport.RMQ,
+    options: {
+      urls: [config.getOrThrow('RABBITMQ_URL')],
+      queue: 'taskflow.notifications.v1',
+      queueOptions: { durable: true },
+      noAck: false,
+      prefetchCount: 20,
+      persistent: true,
+    },
+  }
+);
+
+app.enableShutdownHooks();
+await app.listen();
+```
+
+Queue/exchange/dead-letter topology nên được khai báo bằng IaC/broker setup có
+version, không phụ thuộc chỉ vào app startup side effect. Durable queue + persistent
+message vẫn cần RabbitMQ durability/quorum/backup policy phù hợp.
+
+Consumer:
+
+```ts
+@Controller()
+export class TaskAssignedConsumer {
+  constructor(private readonly handler: HandleTaskAssigned) {}
+
+  @EventPattern('task.assigned.v1')
+  async handle(
+    @Payload() raw: unknown,
+    @Ctx() context: RmqContext
+  ): Promise<void> {
+    const channel = context.getChannelRef();
+    const message = context.getMessage();
+
+    try {
+      const event = taskAssignedV1Schema.parse(raw);
+      await this.handler.execute(event); // idempotent by messageId
+      channel.ack(message);
+    } catch (error: unknown) {
+      if (isTransient(error)) {
+        channel.nack(message, false, false); // route qua DLX/retry topology
+      } else {
+        channel.reject(message, false);
+      }
+      throw error;
+    }
+  }
+}
+```
+
+Không `requeue=true` vô hạn; poison message sẽ hot-loop. Dùng bounded retry queues
+với TTL/backoff rồi DLQ, hoặc application retry topology được vận hành rõ. Ack chỉ
+sau durable/idempotent effect.
+
+[Nest RabbitMQ transporter](https://docs.nestjs.com/microservices/rabbitmq) cung
+cấp context/ack mechanics; delivery guarantee cuối cùng phụ thuộc broker config +
+consumer design.
+
+---
+
+## 4. Event envelope và compatibility
+
+```ts
+interface IntegrationEvent<T> {
+  specVersion: '1.0';
+  id: string;
+  type: string;
+  source: 'taskflow-api';
+  subject: string;
+  time: string;
+  tenantId: string;
+  correlationId: string;
+  causationId?: string;
+  traceparent?: string;
+  data: T;
+}
+```
+
+Envelope gần [CloudEvents](https://cloudevents.io/) giúp tooling/correlation;
+không bắt buộc dùng toàn spec nếu không có lợi. `data` versioned và runtime
+validated.
+
+Compatible evolution:
+
+- thêm optional field có default;
+- consumer ignore unknown field;
+- không đổi nghĩa/type field;
+- breaking → event type/version mới, dual publish/consume;
+- contract test producer fixture với consumer parser.
+
+Event là fact, không query ngược producer trong hot path để hoàn thành mọi field;
+nếu notification cần email/locale, event có thể chứa snapshot tối thiểu theo privacy,
+hoặc Notification service sở hữu preference/user-contact projection được cập nhật
+bằng event khác.
+
+---
+
+## 5. Publisher adapter từ outbox
+
+TaskFlow API không import `ClientProxy` trong use case. Adapter:
+
+```ts
+@Injectable()
+export class RmqEventPublisher implements EventPublisher {
+  constructor(
+    @Inject('INTEGRATION_BUS') private readonly client: ClientProxy
+  ) {}
+
+  async publish(event: IntegrationEvent<unknown>): Promise<void> {
+    await firstValueFrom(
+      this.client.emit(event.type, event).pipe(timeout(2_000))
+    );
+  }
+}
+```
+
+Outbox dispatcher gọi port. `emit()` trả Observable; phải subscribe/await để biết
+transport accepted hoặc lỗi. Broker confirm/ClientProxy semantics cần kiểm tra
+cho adapter cụ thể; mark outbox published chỉ sau publish contract thành công.
+
+Timeout/retry publisher có thể duplicate, vì consumer idempotent.
+
+---
+
+## 6. gRPC cho internal query
+
+Notification service expose delivery status cho admin backend. Cài:
+
+```bash
+pnpm add @grpc/grpc-js @grpc/proto-loader
+```
+
+`proto/notifications/v1/notifications.proto`:
+
+```proto
+syntax = "proto3";
+
+package taskflow.notifications.v1;
+
+service NotificationQueries {
+  rpc GetDelivery(GetDeliveryRequest) returns (GetDeliveryResponse);
+}
+
+message GetDeliveryRequest {
+  string tenant_id = 1;
+  string delivery_id = 2;
+}
+
+message GetDeliveryResponse {
+  string delivery_id = 1;
+  string status = 2;
+  string updated_at = 3;
+}
+```
+
+Rules protobuf:
+
+- field number là wire identity; không đổi/reuse;
+- xóa field thì `reserved` number/name;
+- thêm field mới với backward-compatible default;
+- enum có `UNSPECIFIED = 0` và handle unknown;
+- package/version trong namespace;
+- không dùng `string` cho mọi thứ nếu timestamp/well-known type phù hợp, nhưng
+  mapping/client ergonomics phải được thống nhất.
+
+Server:
+
+```ts
+@Controller()
+export class NotificationQueriesGrpcController {
+  constructor(private readonly getDelivery: GetDelivery) {}
+
+  @GrpcMethod('NotificationQueries', 'GetDelivery')
+  async get(request: {
+    tenantId: string;
+    deliveryId: string;
+  }): Promise<GetDeliveryResponse> {
+    return this.getDelivery.execute(request);
+  }
+}
+```
+
+Bootstrap bằng `Transport.GRPC` và `protoPath/package/url`; xem
+[Nest gRPC](https://docs.nestjs.com/microservices/grpc). Trong một process có thể
+`connectMicroservice()` nhiều transport rồi `startAllMicroservices()`, nhưng tách
+process nếu lifecycle/scale/failure khác.
+
+---
+
+## 7. Deadline, retry và error mapping
+
+Mọi RPC có deadline nhỏ hơn caller request budget:
+
+```text
+HTTP request budget 1000 ms
+  └─ gRPC deadline 300 ms
+      └─ DB query budget 150 ms
+```
+
+Không để default vô hạn. Propagate cancellation nếu library hỗ trợ. Retry chỉ
+idempotent method/transient status (`UNAVAILABLE`) với budget + backoff/jitter;
+không retry `INVALID_ARGUMENT`, `PERMISSION_DENIED`, `NOT_FOUND`.
+
+Map domain → canonical gRPC status, không ném raw SQL/Nest HTTP exception.
+Timeout không chứng minh command chưa chạy; use idempotency key cho mutation RPC.
+
+Circuit breaker/load shedding có thể ngăn cascade, nhưng phải có metric và half-open
+policy. Fallback không được trả dữ liệu cross-tenant/stale vượt policy.
+
+---
+
+## 8. Service identity và user context
+
+Network nội bộ không tự trusted. Dùng TLS/mTLS hoặc workload identity; authorize
+service caller theo method. User context được forward tối thiểu và có integrity:
+
+- signed access/delegation token với audience đúng service;
+- hoặc trusted gateway claims qua authenticated channel;
+- không nhận `x-user-id` plain từ bất kỳ client.
+
+Service vẫn enforce tenant/resource scope trên data mình sở hữu. mTLS xác thực
+service, không tự authorize end user.
+
+Secret/certificate rotation và clock skew là operational requirements.
+
+---
+
+## 9. Distributed observability
+
+Propagate `traceparent`, correlation/causation/message ID qua outbox và gRPC
+metadata. Tạo span producer/consumer, metric message lag/attempt/DLQ và RPC
+duration/status.
+
+Không dùng message ID/user ID làm metric label. Log chúng như searchable field.
+Consumer span cần link/parent theo semantics async; bài 19 cấu hình OpenTelemetry.
+
+---
+
+## 10. Contract và chaos tests
+
+- producer event fixture parse được bởi consumer current và previous;
+- proto breaking-change check bằng [Buf](https://buf.build/docs/);
+- duplicate/out-of-order/redelivery;
+- broker disconnect/reconnect, DLQ/replay;
+- gRPC deadline, service unavailable, version skew;
+- service identity/tenant negative tests;
+- rolling deploy consumer trước producer cho additive change.
+
+Không cần “chaos platform” để bắt đầu: kill consumer giữa DB commit và ack, tắt
+broker, delay gRPC vượt deadline và quan sát recovery.
+
+---
+
+## Bài tập bắt buộc
+
+1. Viết extraction ADR với forces/cost/revisit; service không share TaskFlow DB.
+2. Consume `task.assigned.v1` qua RMQ manual ack + bounded retry/DLQ.
+3. Contract test event versions và duplicate idempotency.
+4. Expose gRPC `GetDelivery`, proto versioned và Buf breaking check.
+5. Thêm deadline/retry budget + service identity/tenant auth.
+6. Test kill-after-effect-before-ack và rolling version skew.
+
+### Acceptance criteria
+
+- Boundary có ownership/team/workload lý do rõ, không chỉ kỹ thuật.
+- Async event đi qua outbox và at-least-once consumer idempotent.
+- Không infinite requeue; DLQ/replay có runbook.
+- RPC deadline/cancellation/retry/error contract explicit.
+- Event/proto compatible và được diff trong CI.
+- Mỗi service sở hữu data, credential, telemetry và on-call surface.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Microservices basics](https://docs.nestjs.com/microservices/basics)
+- [NestJS — RabbitMQ](https://docs.nestjs.com/microservices/rabbitmq)
+- [NestJS — gRPC](https://docs.nestjs.com/microservices/grpc)
+- [gRPC — Deadlines](https://grpc.io/docs/guides/deadlines/)
+- [Protocol Buffers — Updating a message type](https://protobuf.dev/programming-guides/proto3/#updating)
+- [RabbitMQ — Consumer acknowledgements](https://www.rabbitmq.com/docs/confirms)
+- [CloudEvents Specification](https://github.com/cloudevents/spec)
+
+Phần 19 làm hệ thống nhìn thấy được và dừng đúng: traces/metrics/logs, readiness,
+liveness, graceful drain và runbook là phần của correctness production.

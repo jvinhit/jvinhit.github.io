@@ -1,0 +1,329 @@
+---
+title: 'NestJS Zero to Hero 16 — Realtime với WebSocket và Server-Sent Events'
+description: 'Chọn SSE hay WebSocket, xác thực connection, authorize room theo tenant, xử lý reconnect/replay/backpressure và broadcast qua nhiều Nest replica.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, websocket, socket-io, server-sent-events, realtime]
+series: nestjs-zero-to-hero
+seriesOrder: 16
+draft: false
+---
+
+Realtime không chỉ là `server.emit()`. Connection sống lâu hơn HTTP request,
+access token có thể hết hạn, client mất mạng và reconnect, event có thể bị bỏ lỡ,
+nhiều replica không cùng memory, consumer chậm có thể tạo backlog.
+
+Sau bài này, bạn có thể:
+
+- chọn polling, SSE hay WebSocket theo traffic direction;
+- authenticate handshake và authorize subscription/room;
+- phát event chỉ sau commit qua outbox/broker;
+- thiết kế event ID, replay/resync và backpressure;
+- scale Socket.IO qua nhiều replica bằng shared adapter.
+
+---
+
+## 1. Chọn primitive nhỏ nhất đủ dùng
+
+| Cách      | Direction           | Tự reconnect     | Hợp với                                             |
+| --------- | ------------------- | ---------------- | --------------------------------------------------- |
+| polling   | client → server lặp | do client        | update thưa, đơn giản/cacheable                     |
+| SSE       | server → client     | có `EventSource` | feed/progress/notification một chiều                |
+| WebSocket | hai chiều           | app/library      | presence, collaboration, chat, command tần suất cao |
+
+SSE chạy trên HTTP `text/event-stream`, đơn giản qua proxy và có `Last-Event-ID`.
+Native `EventSource` không cho set arbitrary Authorization header; same-site
+cookie hoặc client/polyfill khác có security trade-off.
+
+WebSocket là duplex connection; [Socket.IO](https://socket.io/docs/v4/) thêm
+fallback, rooms, ack và reconnect protocol nhưng không phải raw WebSocket wire
+protocol. Nest hỗ trợ Socket.IO và `ws` qua adapter.
+
+Nếu update mỗi phút, polling conditional request có thể đáng tin và rẻ hơn một
+connection dài cho mọi user.
+
+---
+
+## 2. Event realtime phải đến sau commit
+
+Không emit trong transaction trước commit:
+
+```text
+emit task.updated
+transaction rollback
+client đã thấy state không tồn tại
+```
+
+Flow đúng:
+
+```text
+use case transaction → task + outbox commit
+outbox dispatcher     → broker/queue
+realtime projector    → authorize channel → broadcast event
+```
+
+Envelope:
+
+```ts
+export interface TaskUpdatedV1 {
+  id: string; // monotonic-ish/event ID dùng replay
+  type: 'task.updated.v1';
+  occurredAt: string;
+  tenantId: string;
+  workspaceId: string;
+  taskId: string;
+  version: number;
+  changes: readonly ['status' | 'title' | 'assigneeId'][];
+}
+```
+
+Không broadcast full private entity. Client có thể invalidate/refetch REST/GraphQL
+source of truth. Event version giúp bỏ update cũ/out-of-order.
+
+---
+
+## 3. Socket.IO gateway
+
+Cài:
+
+```bash
+pnpm add @nestjs/websockets @nestjs/platform-socket.io socket.io
+```
+
+```ts
+@WebSocketGateway({
+  namespace: '/task-events',
+  cors: { origin: ['https://app.taskflow.example'], credentials: true },
+  transports: ['websocket'],
+})
+export class TaskEventsGateway
+  implements OnGatewayConnection, OnGatewayDisconnect
+{
+  @WebSocketServer()
+  server!: Namespace;
+
+  constructor(
+    private readonly tokens: AccessTokenVerifier,
+    private readonly memberships: MembershipQueries
+  ) {}
+
+  async handleConnection(socket: Socket): Promise<void> {
+    try {
+      const token = extractHandshakeToken(socket.handshake);
+      const principal = await this.tokens.verify(token);
+      socket.data.principal = principal;
+    } catch {
+      socket.disconnect(true);
+    }
+  }
+
+  handleDisconnect(socket: Socket): void {
+    // metric/cleanup only; durable state không chỉ nằm trong memory socket map.
+  }
+}
+```
+
+Tránh token trong query URL vì proxy/log/history có thể ghi. Ưu tiên secure
+cookie hoặc Socket.IO `auth` payload qua TLS, rồi redaction. CORS của WebSocket
+handshake không thay auth.
+
+Gateway là singleton; không inject request-scoped provider. Connection context
+nằm trên socket hoặc dedicated registry bounded, cleanup khi disconnect.
+
+---
+
+## 4. Subscribe room phải authorize
+
+```ts
+class SubscribeWorkspaceDto {
+  @IsUUID('4')
+  workspaceId!: string;
+}
+
+@UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+@SubscribeMessage('workspace.subscribe.v1')
+async subscribe(
+  @ConnectedSocket() socket: Socket,
+  @MessageBody() dto: SubscribeWorkspaceDto,
+): Promise<{ ok: true; workspaceId: string }> {
+  const principal = socket.data.principal as Principal;
+  const allowed = await this.memberships.canRead({
+    userId: principal.userId,
+    tenantId: principal.tenantId,
+    workspaceId: dto.workspaceId,
+  });
+  if (!allowed) throw new WsException('FORBIDDEN');
+
+  await socket.join(roomName(principal.tenantId, dto.workspaceId));
+  return { ok: true, workspaceId: dto.workspaceId };
+}
+```
+
+Room name luôn namespace tenant. Không join dựa trên client ID mà không lookup.
+Authz có thể thay đổi khi connection còn sống; membership revoke event phải kick
+socket/leave room hoặc mỗi sensitive command recheck current policy. Access token
+expiry cần policy: disconnect/re-auth trước expiry hoặc session revocation signal.
+
+Incoming WebSocket command phải gọi cùng application use case, không sửa DB trong
+gateway. Guard/pipes/interceptors của WebSocket dùng `ExecutionContext` khác HTTP;
+không cast `switchToHttp()`.
+
+---
+
+## 5. Broadcast qua event consumer
+
+```ts
+@Injectable()
+export class TaskRealtimePublisher {
+  constructor(private readonly gateway: TaskEventsGateway) {}
+
+  publish(event: TaskUpdatedV1): void {
+    this.gateway.server
+      .to(roomName(event.tenantId, event.workspaceId))
+      .emit('task.updated.v1', {
+        id: event.id,
+        taskId: event.taskId,
+        version: event.version,
+        changes: event.changes,
+        occurredAt: event.occurredAt,
+      });
+  }
+}
+```
+
+Publisher nhận committed event từ broker/outbox consumer, không từ controller.
+Payload allowlist không chứa tenant/user detail không cần.
+
+Ack chỉ xác nhận client/library nhận handler call, không chứng minh user đã nhìn
+hay durable processing. Nếu cần delivery guarantee, lưu cursor/event log và cho
+client replay.
+
+---
+
+## 6. Reconnect, ordering và replay
+
+Connection có thể mất giữa event 41 và 45. Client giữ `lastEventId/version`:
+
+```text
+connect(lastSeen=41)
+server checks retention
+  → replay 42..current nếu còn
+  → hoặc resync_required nếu gap quá cũ
+client GET snapshot + reset cursor
+```
+
+Global strictly monotonic sequence khó ở distributed system. Có thể order theo
+aggregate `(taskId, version)`; client bỏ event version nhỏ hơn/equal local version.
+Event ID riêng dùng cursor trong durable event table/stream.
+
+Presence/typing là ephemeral và có thể mất. Task state update là durable, phải có
+snapshot/resync. Phân loại trước khi chọn reliability cost.
+
+---
+
+## 7. SSE endpoint
+
+[Nest SSE](https://docs.nestjs.com/techniques/server-sent-events) yêu cầu
+`Observable<MessageEvent>`:
+
+```ts
+@Sse('workspaces/:workspaceId/events')
+stream(
+  @CurrentPrincipal() principal: Principal,
+  @Param('workspaceId', ParseUUIDPipe) workspaceId: string,
+  @Headers('last-event-id') lastEventId?: string,
+): Observable<MessageEvent> {
+  return this.events.subscribe({ principal, workspaceId, lastEventId }).pipe(
+    map((event) => ({
+      id: event.id,
+      type: event.type,
+      data: presentRealtimeEvent(event),
+      retry: 3_000,
+    })),
+    finalize(() => this.events.release(principal.userId, workspaceId)),
+  );
+}
+```
+
+Authorize **trước** mở stream và cleanup trong `finalize`. Gửi heartbeat comment/
+event nhỏ dưới idle timeout proxy. Configure reverse proxy không buffer SSE và
+connection/drain timeout phù hợp.
+
+`Last-Event-ID` chỉ hữu ích nếu server có durable replay store. Nếu không, nói rõ
+client phải refetch snapshot on reconnect.
+
+---
+
+## 8. Multi-replica topology
+
+Socket ở replica A; event consumer ở B. In-memory emit B không tới client A.
+Socket.IO cần shared adapter như Redis:
+
+```text
+broker event
+  → any realtime replica
+  → Socket.IO Redis adapter pub/sub
+  → replica owning socket
+  → client
+```
+
+Xem [Nest WebSocket adapters](https://docs.nestjs.com/websockets/adapter). Nếu bật
+Socket.IO long polling, load balancer thường cần sticky session; WebSocket-only
+có topology khác. Test rolling deploy, reconnect storm và Redis outage.
+
+SSE cũng cần mỗi replica subscribe shared broker/event source; không dựa EventEmitter
+in-process. Load balancer giữ TCP connection nhưng reconnect có thể vào replica khác.
+
+---
+
+## 9. Backpressure và limits
+
+Bound:
+
+- connections/principal/tenant/IP;
+- subscriptions/socket;
+- incoming message size/rate;
+- outbound buffer;
+- replay batch/window;
+- heartbeat/idle timeout.
+
+Consumer chậm: coalesce ephemeral updates, drop presence, hoặc disconnect/resync;
+không buffer vô hạn. Durable business event không được silently drop khỏi source
+of truth; client snapshot/replay sửa gap.
+
+Metrics: active connections, connect/auth failure, rooms/subscriptions, messages,
+outbound buffer/drop, reconnect rate, event-to-client lag.
+
+---
+
+## Bài tập bắt buộc
+
+1. Implement WebSocket handshake verify và tenant-scoped subscribe room.
+2. Publish `task.updated.v1` từ outbox consumer, không từ controller.
+3. Client bỏ event stale theo task version và refetch khi `resync_required`.
+4. Implement SSE alternative có Last-Event-ID, heartbeat và cleanup.
+5. Chạy hai app replica + shared adapter; client ở A nhận event publish từ B.
+6. Test membership revoke, token expiry, reconnect storm và slow client.
+
+### Acceptance criteria
+
+- Mỗi connection/subscription được authn + authz, room bao gồm tenant.
+- Realtime event chỉ phát sau commit và có schema/version/ID.
+- Client có replay hoặc explicit snapshot-resync contract.
+- Multi-replica không phụ thuộc in-process memory/event emitter.
+- Connection/message/buffer đều bounded và observable.
+- Rolling shutdown không để connection treo vô hạn.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — WebSocket gateways](https://docs.nestjs.com/websockets/gateways)
+- [NestJS — WebSocket guards](https://docs.nestjs.com/websockets/guards)
+- [NestJS — WebSocket adapters](https://docs.nestjs.com/websockets/adapter)
+- [NestJS — Server-Sent Events](https://docs.nestjs.com/techniques/server-sent-events)
+- [Socket.IO — Delivery guarantees](https://socket.io/docs/v4/delivery-guarantees)
+- [MDN — Server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+
+Phần 17 thêm GraphQL như một inbound adapter mới. Domain/use case không đổi;
+thách thức nằm ở N+1, query cost, field-level auth và public schema evolution.

@@ -1,0 +1,318 @@
+---
+title: 'NestJS Zero to Hero 13 — Testing từ Domain tới E2E với PostgreSQL thật'
+description: 'Xây testing pyramid cho domain/use case/module/Prisma/HTTP, dùng Nest TestingModule, Supertest và Testcontainers, giữ test deterministic và cô lập.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, testing, jest, testcontainers, supertest]
+series: nestjs-zero-to-hero
+seriesOrder: 13
+draft: false
+---
+
+Một test tốt nói rõ boundary nào đang được chứng minh. Mock mọi thứ chỉ chứng minh
+mock gọi mock; boot full app cho mọi rule làm suite chậm và failure khó định vị.
+TaskFlow cần nhiều lớp test vì mỗi lớp bắt một loại lỗi khác.
+
+Sau bài này, bạn có thể:
+
+- thiết kế test pyramid theo risk;
+- test domain/use case không boot Nest;
+- dùng `TestingModule` để test wiring và override token;
+- chạy Prisma integration trên PostgreSQL disposable;
+- E2E qua global pipeline giống production;
+- giữ clock, ID, DB và test parallel deterministic.
+
+---
+
+## 1. Test map theo boundary
+
+| Loại                | Chứng minh                                       | Không chứng minh               |
+| ------------------- | ------------------------------------------------ | ------------------------------ |
+| domain unit         | invariant/transition thuần                       | DI, SQL, HTTP                  |
+| use-case unit       | orchestration qua port                           | adapter/wiring thật            |
+| module integration  | token/import/export/metadata                     | database semantics nếu fake    |
+| adapter integration | SQL, migration, constraint, mapping              | HTTP pipeline                  |
+| E2E                 | route/auth/pipe/filter/serialization + deps chọn | mọi failure hạ tầng production |
+| contract            | OpenAPI/backward compatibility                   | implementation correctness     |
+
+Nhiều unit test nhanh, ít integration/E2E có giá trị cao. Tỉ lệ không phải giáo
+điều; auth, transaction và multi-tenancy cần integration nhiều hơn pure formatter.
+
+---
+
+## 2. Domain test là table, không là framework
+
+```ts
+describe('Task transitions', () => {
+  it.each([
+    ['OPEN', 'IN_PROGRESS', true],
+    ['OPEN', 'DONE', false],
+    ['IN_PROGRESS', 'OPEN', true],
+    ['IN_PROGRESS', 'DONE', true],
+    ['DONE', 'OPEN', false],
+  ] as const)('%s → %s allowed=%s', (from, to, allowed) => {
+    const task = rehydrateTask({ status: from, version: 4 });
+
+    if (allowed) {
+      task.transitionTo(to, FIXED_NOW);
+      expect(task.snapshot()).toMatchObject({ status: to, version: 5 });
+    } else {
+      expect(() => task.transitionTo(to, FIXED_NOW)).toThrow(
+        InvalidTaskTransitionError
+      );
+    }
+  });
+});
+```
+
+Không mock private method. Test observable state/error. Mutation ở test này sẽ
+giúp đánh giá assertion có thật sự bắt rule; có thể dùng
+[StrykerJS](https://stryker-mutator.io/docs/stryker-js/introduction/) khi domain
+critical.
+
+---
+
+## 3. Use-case unit với hand-written fake
+
+```ts
+class FakeTaskRepository implements TaskRepository {
+  readonly data = new Map<string, Task>();
+  insertError?: Error;
+
+  async insert(task: Task): Promise<void> {
+    if (this.insertError) throw this.insertError;
+    this.data.set(task.snapshot().id, task);
+  }
+}
+```
+
+```ts
+it('does not persist when workspace is inactive', async () => {
+  const tasks = new FakeTaskRepository();
+  const useCase = new CreateTask(
+    tasks,
+    { isActive: async () => false },
+    { now: () => FIXED_NOW },
+    { next: () => '00000000-0000-4000-8000-000000000001' }
+  );
+
+  await expect(useCase.execute(command)).rejects.toBeInstanceOf(
+    WorkspaceUnavailableError
+  );
+  expect(tasks.data.size).toBe(0);
+});
+```
+
+Fake có behavior, mock có expectation call. Ưu tiên assert outcome/state; chỉ
+assert interaction khi interaction chính là contract (email/outbox gọi một lần).
+
+---
+
+## 4. TestingModule cho Nest wiring
+
+[Nest testing utilities](https://docs.nestjs.com/fundamentals/testing):
+
+```ts
+const repository: TaskRepository = new FakeTaskRepository();
+
+const moduleRef = await Test.createTestingModule({
+  imports: [TasksModule],
+})
+  .overrideProvider(TASK_REPOSITORY)
+  .useValue(repository)
+  .overrideProvider(CLOCK)
+  .useValue({ now: () => FIXED_NOW })
+  .compile();
+
+const createTask = moduleRef.get(CreateTask);
+```
+
+Test này bắt module visibility/token mismatch nhưng chậm hơn `new CreateTask()`.
+Dùng một vài module smoke tests thay vì lặp cho mọi branch logic.
+
+`overrideGuard`, `overrideInterceptor`, `overrideFilter`, `overridePipe` tồn tại,
+nhưng bypass auth trong mọi E2E sẽ bỏ mất lớp quan trọng. Có suite authenticated
+thật; fake identity chỉ dành test không nhắm auth và vẫn truyền principal rõ.
+
+---
+
+## 5. PostgreSQL disposable bằng Testcontainers
+
+Cài [Testcontainers for Node.js](https://node.testcontainers.org/):
+
+```bash
+pnpm add -D testcontainers @testcontainers/postgresql
+```
+
+Setup suite:
+
+```ts
+const postgres = await new PostgreSqlContainer('postgres:17-alpine')
+  .withDatabase('taskflow_test')
+  .withUsername('taskflow')
+  .withPassword('taskflow')
+  .start();
+
+process.env.DATABASE_URL = postgres.getConnectionUri();
+// Chạy `prisma migrate deploy` cho disposable database trước khi compile app.
+```
+
+Container chứng minh behavior PostgreSQL thật: UUID, foreign key, unique,
+isolation, locking, index/migration. SQLite fake không chứng minh cùng semantics.
+
+Chiến lược isolation:
+
+- một container/test worker, migrate một lần;
+- truncate table giữa tests theo dependency order, hoặc schema/database riêng;
+- fixture builder tạo chỉ dữ liệu cần;
+- không share mutable entity giữa test;
+- parallel chỉ khi namespace/cleanup không đụng nhau.
+
+Transaction rollback quanh test có thể nhanh nhưng app code dùng connection khác
+không thấy transaction test; đừng áp dụng nếu không kiểm soát cùng client/context.
+
+`afterAll` luôn `app.close()`, `$disconnect()` và `postgres.stop()` để Jest không
+báo open handle.
+
+---
+
+## 6. Production và E2E dùng cùng app configuration
+
+Tách global setup:
+
+```ts
+export function configureApp(app: INestApplication): void {
+  app.setGlobalPrefix('api');
+  app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' });
+  app.useGlobalPipes(createValidationPipe());
+}
+```
+
+Production:
+
+```ts
+const app = await NestFactory.create(AppModule, { bufferLogs: true });
+configureApp(app);
+await app.listen(port);
+```
+
+E2E:
+
+```ts
+const moduleRef = await Test.createTestingModule({
+  imports: [AppModule],
+}).compile();
+
+app = moduleRef.createNestApplication();
+configureApp(app);
+await app.init();
+```
+
+Nếu test quên global pipe/filter/prefix, suite xanh nhưng production khác. Shared
+function xóa configuration drift.
+
+Supertest:
+
+```ts
+await request(app.getHttpServer())
+  .post('/api/v1/tasks')
+  .set('authorization', `Bearer ${accessToken}`)
+  .set('idempotency-key', randomUUID())
+  .send({ workspaceId, title: 'Integration test' })
+  .expect(201)
+  .expect('location', /\/api\/v1\/tasks\//)
+  .expect(({ body }) => {
+    expect(body).toMatchObject({ title: 'Integration test', status: 'OPEN' });
+    expect(body.internalNote).toBeUndefined();
+  });
+```
+
+Assert status, header, public body, database effect và audit/outbox khi relevant.
+
+---
+
+## 7. High-value E2E matrix
+
+Đừng test mọi decorator permutation. Ưu tiên risk:
+
+```text
+anonymous → protected route                       401
+valid user tenant A → task tenant B                404/no leak
+viewer → update task                               403
+unknown DTO field                                  400 stable error
+same idempotency key 10 concurrent requests        one task
+same version two updates                           one success, one 409
+unhandled exception                                500 no stack
+refresh rotated token replay                       family revoked
+```
+
+Security negative tests thường có giá trị hơn một happy path thứ 20.
+
+---
+
+## 8. Determinism và anti-pattern
+
+Inject clock/ID, không mock global `Date`/UUID nếu có thể. Không dùng `sleep(500)`
+để đợi eventual result; poll với deadline và diagnostic. Không phụ thuộc test
+order. Seed dữ liệu explicit. Freeze locale/timezone hoặc assert ISO instant.
+
+Tránh:
+
+- mock Prisma chain implementation detail;
+- snapshot toàn error/response thay semantic assertion;
+- test private method;
+- dùng production/shared developer database;
+- disable auth globally trong E2E;
+- coverage 100% làm mục tiêu thay risk.
+
+Coverage chỉ nói dòng chạy qua, không nói assertion đúng. Đặt threshold hợp lý
+và review uncovered critical branch.
+
+---
+
+## 9. CI test stages
+
+```text
+fast: lint → typecheck → unit
+integration: disposable PostgreSQL → migrate deploy → adapter/module tests
+e2e: full app → HTTP/security/concurrency
+contract: generate OpenAPI → validate/diff
+build: production compilation/image smoke
+```
+
+Fail-fast nhưng lưu artifact: test report, container logs khi fail, OpenAPI diff.
+Không in secret/env dump.
+
+---
+
+## Bài tập bắt buộc
+
+1. Viết transition table và CreateTask use-case tests không Nest.
+2. Thêm module smoke test override symbol token.
+3. Dùng disposable PostgreSQL, chạy migration rồi test repository constraints.
+4. Shared `configureApp()` cho production/E2E.
+5. Implement high-value matrix phía trên, gồm race test thật.
+6. Thêm OpenAPI diff và test no-secret-in-log.
+
+### Acceptance criteria
+
+- Unit suite chạy nhanh, không network/container.
+- Adapter integration dùng đúng engine production.
+- E2E dùng global pipeline giống production.
+- Test độc lập order/time/UUID và cleanup handle.
+- Authz cross-tenant, OCC/idempotency và refresh replay có regression test.
+- CI phân tầng và lưu diagnostic hữu ích.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Testing](https://docs.nestjs.com/fundamentals/testing)
+- [Jest — Documentation](https://jestjs.io/docs/getting-started)
+- [Supertest](https://github.com/ladjs/supertest)
+- [Testcontainers for Node.js](https://node.testcontainers.org/)
+- [Prisma — Integration testing](https://www.prisma.io/docs/orm/prisma-client/testing/integration-testing)
+- [OWASP — Web Security Testing Guide](https://owasp.org/www-project-web-security-testing-guide/)
+
+Phần 14 đo hệ thống trước khi tối ưu: latency thường nằm ở query/I/O/cache key,
+không nằm ở số decorator. Ta benchmark Express/Fastify bằng cùng workload.

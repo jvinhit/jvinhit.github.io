@@ -1,0 +1,378 @@
+---
+title: 'NestJS Zero to Hero 06 — Configuration, Logging và Bootstrap an toàn'
+description: 'Validate environment lúc startup, chia config theo namespace, bảo vệ secret, chuẩn hóa structured logging và biến main.ts thành bootstrap có thể kiểm thử.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, configuration, logging, environment-variables, production]
+series: nestjs-zero-to-hero
+seriesOrder: 6
+draft: false
+---
+
+Config sai nên làm process **không khởi động**, thay vì chờ request đầu tiên rồi
+trả 500. Logging nên tạo dữ liệu có cấu trúc để tìm kiếm, không phải những câu
+văn ghép string thiếu context. Hai nguyên tắc này biến bootstrap từ boilerplate
+thành production gate đầu tiên.
+
+Sau bài này, bạn có thể:
+
+- phân biệt build-time config, runtime config và secret;
+- validate/coerce environment đúng một lần;
+- chia config theo namespace có ownership;
+- bootstrap qua một function testable và buffer startup log;
+- thiết kế log event có request context nhưng không lộ dữ liệu nhạy cảm.
+
+---
+
+## 1. Environment variable là input không tin cậy
+
+`process.env` có type `string | undefined`. Chuỗi `'false'` là truthy; `'3000'`
+không tự thành number; URL có thể sai. Đọc env rải rác tạo nhiều cách parse:
+
+```ts
+// ❌ ba module có thể hiểu ba kiểu khác nhau
+const enabled = Boolean(process.env.CACHE_ENABLED);
+const port = Number(process.env.PORT);
+```
+
+Thay vào đó:
+
+```text
+raw environment
+  → validate + coerce once
+  → immutable typed configuration
+  → inject by ownership
+```
+
+Cài [Nest Config](https://docs.nestjs.com/techniques/configuration) và
+[Zod](https://zod.dev/):
+
+```bash
+pnpm add @nestjs/config zod
+```
+
+Schema startup:
+
+```ts
+// src/config/environment.ts
+import { z } from 'zod';
+
+const booleanString = z
+  .enum(['true', 'false'])
+  .transform((value) => value === 'true');
+
+const environmentSchema = z.object({
+  NODE_ENV: z
+    .enum(['development', 'test', 'production'])
+    .default('development'),
+  PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+  DATABASE_URL: z.string().url(),
+  LOG_LEVEL: z
+    .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace'])
+    .default('info'),
+  CORS_ENABLED: booleanString.default('false'),
+  JWT_ACCESS_SECRET: z.string().min(32),
+});
+
+export type Environment = z.infer<typeof environmentSchema>;
+
+export function validateEnvironment(raw: Record<string, unknown>): Environment {
+  const result = environmentSchema.safeParse(raw);
+  if (!result.success) {
+    const message = result.error.issues
+      .map((issue) => `${issue.path.join('.')}: ${issue.message}`)
+      .join('; ');
+    throw new Error(`Invalid environment: ${message}`);
+  }
+  return Object.freeze(result.data);
+}
+```
+
+Không log `raw` hoặc secret khi validation lỗi. Message chỉ nói key và rule.
+
+Đăng ký ở root:
+
+```ts
+@Module({
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+      cache: true,
+      validate: validateEnvironment,
+      envFilePath: ['.env.local', '.env'],
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+`.env` dành cho local convenience, không commit secret. Production platform nên
+inject runtime env/secret. Xem [Twelve-Factor Config](https://12factor.net/config)
+cho nguyên tắc tách config khỏi code.
+
+---
+
+## 2. Namespaced config tạo ownership
+
+Đừng để mọi class gọi `config.get('ANY_KEY')`. Gom theo capability:
+
+```ts
+// src/config/http.config.ts
+import { registerAs } from '@nestjs/config';
+
+export const httpConfig = registerAs('http', () => ({
+  port: Number(process.env.PORT ?? 3000),
+  corsEnabled: process.env.CORS_ENABLED === 'true',
+}));
+```
+
+```ts
+// src/config/database.config.ts
+import { registerAs } from '@nestjs/config';
+
+export const databaseConfig = registerAs('database', () => ({
+  url: process.env.DATABASE_URL,
+}));
+```
+
+Nạp sau khi raw env đã được validate:
+
+```ts
+ConfigModule.forRoot({
+  isGlobal: true,
+  validate: validateEnvironment,
+  load: [httpConfig, databaseConfig],
+});
+```
+
+Inject namespace có type:
+
+```ts
+@Injectable()
+export class DatabaseClient {
+  constructor(
+    @Inject(databaseConfig.KEY)
+    private readonly config: ConfigType<typeof databaseConfig>
+  ) {}
+}
+```
+
+`ConfigService.getOrThrow()` phù hợp ở composition code. Với feature phức tạp,
+inject typed namespace/option token làm dependency hẹp hơn và test dễ hơn.
+
+### Config không phải feature flag runtime
+
+Environment thường được đọc lúc startup. Nếu cần đổi flag không restart, audit
+targeting và fallback, dùng một feature-flag system có lifecycle riêng. Đừng đọc
+`process.env` mỗi request; OS env không phải dynamic database.
+
+---
+
+## 3. Secret có lifecycle riêng
+
+Secret không nên:
+
+- nằm trong Git hoặc Docker image layer;
+- xuất hiện trong log/error/telemetry attribute;
+- trả qua config/debug endpoint;
+- dùng chung giữa access token, refresh token và encryption;
+- sống vô hạn không có rotation plan.
+
+Local tạo `.env.example` chỉ có placeholder:
+
+```dotenv
+NODE_ENV=development
+PORT=3000
+DATABASE_URL=postgresql://taskflow:taskflow@localhost:5432/taskflow
+LOG_LEVEL=debug
+CORS_ENABLED=false
+JWT_ACCESS_SECRET=replace-with-at-least-32-random-characters
+```
+
+`.env.example` là contract cho developer; schema Zod mới là executable contract.
+CI nên chạy một startup smoke test với test secrets để phát hiện key mới thiếu.
+
+---
+
+## 4. Bootstrap thành function có contract
+
+Tách tạo app khỏi `listen()`:
+
+```ts
+// src/bootstrap.ts
+import { Logger, VersioningType } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { NestFactory } from '@nestjs/core';
+import type { INestApplication } from '@nestjs/common';
+import { AppModule } from './app.module';
+
+export async function createApp(): Promise<INestApplication> {
+  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+
+  app.setGlobalPrefix('api');
+  app.enableVersioning({ type: VersioningType.URI });
+  app.flushLogs();
+
+  return app;
+}
+
+export async function start(): Promise<void> {
+  const app = await createApp();
+  const config = app.get(ConfigService);
+  const port = config.getOrThrow<number>('PORT');
+
+  await app.listen(port);
+  Logger.log({ event: 'application_started', port }, 'Bootstrap');
+}
+```
+
+```ts
+// src/main.ts
+import { start } from './bootstrap';
+
+void start();
+```
+
+E2E test gọi `createApp()` rồi `app.init()` trên ephemeral server, không mở port
+cố định. `bufferLogs` giữ log bootstrap đến khi custom logger được gắn; nếu dùng
+built-in Logger, `flushLogs()` đẩy buffer.
+
+Không `catch` startup error rồi tiếp tục. Nếu catch để log, đặt `process.exitCode`
+và đảm bảo promise không bị nuốt:
+
+```ts
+void start().catch((error: unknown) => {
+  console.error('Bootstrap failed', error);
+  process.exitCode = 1;
+});
+```
+
+Tránh log nguyên error nếu error chứa connection URL có password; logger
+production cần redaction.
+
+---
+
+## 5. Log là event data
+
+Log hữu ích trả lời: chuyện gì xảy ra, ở đâu, outcome, duration, correlation.
+
+```ts
+this.logger.log({
+  event: 'task_created',
+  taskId: task.id,
+  workspaceId: task.workspaceId,
+  actorId: principal.userId,
+});
+```
+
+Ưu tiên field ổn định:
+
+```text
+timestamp, level, service, environment, event,
+requestId, traceId, route, method, statusCode, durationMs,
+actorId/tenantId (khi chính sách privacy cho phép)
+```
+
+Không log:
+
+- Authorization/Cookie header;
+- password, refresh token, API key;
+- request/response body mặc định;
+- full database URL;
+- PII không cần thiết.
+
+Built-in [Nest Logger](https://docs.nestjs.com/techniques/logger) tốt cho bắt đầu.
+Production có thể dùng [Pino](https://getpino.io/) qua
+[nestjs-pino](https://github.com/iamolegga/nestjs-pino) để JSON log, request
+context và redaction hiệu quả. Chọn library không thay nguyên tắc schema-first.
+
+### Log level có ý nghĩa
+
+- `fatal`: process không thể tiếp tục.
+- `error`: operation thất bại ngoài kỳ vọng/cần điều tra.
+- `warn`: degradation hoặc tình trạng cần chú ý.
+- `info`: lifecycle/business event quan trọng, không phải mọi dòng code.
+- `debug`/`trace`: chi tiết chẩn đoán, tắt hoặc sampling ở production.
+
+404 do client hỏi ID không tồn tại thường không phải server `error`. 500 unknown
+mới là error. Nếu mọi thứ là error, alert không còn tín hiệu.
+
+---
+
+## 6. Configuration test
+
+Unit test validator bằng table:
+
+```ts
+describe('validateEnvironment', () => {
+  const base = {
+    DATABASE_URL: 'postgresql://user:pass@localhost:5432/taskflow',
+    JWT_ACCESS_SECRET: 'x'.repeat(32),
+  };
+
+  it.each([
+    ['PORT', '0'],
+    ['PORT', 'abc'],
+    ['NODE_ENV', 'staging'],
+    ['DATABASE_URL', 'not-a-url'],
+  ])('rejects invalid %s', (key, value) => {
+    expect(() => validateEnvironment({ ...base, [key]: value })).toThrow();
+  });
+
+  it('coerces validated values', () => {
+    expect(validateEnvironment({ ...base, PORT: '4000' }).PORT).toBe(4000);
+  });
+});
+```
+
+Integration test tạo `TestingModule` với `ConfigModule.forRoot` và xác nhận
+typed namespace inject được. Không mutate `process.env` giữa test chạy song song;
+isolate test process hoặc truyền raw object trực tiếp cho validator.
+
+---
+
+## Failure modes
+
+| Failure                  | Hậu quả                        | Guardrail                      |
+| ------------------------ | ------------------------------ | ------------------------------ |
+| `Boolean('false')`       | feature vô tình bật            | enum + transform explicit      |
+| optional secret          | lỗi ở request đầu tiên         | min length + fail-fast         |
+| config đọc rải rác       | parse không nhất quán          | schema + namespace             |
+| log full request         | lộ credential/PII              | allowlist field + redact       |
+| log string tự do         | không query/aggregate được     | stable event schema            |
+| catch bootstrap rồi nuốt | process sống nhưng không ready | reject startup + non-zero exit |
+
+---
+
+## Bài tập bắt buộc
+
+1. Thêm schema đầy đủ và `.env.example`; `.env` phải nằm trong `.gitignore`.
+2. Tạo `httpConfig`, `databaseConfig`, `authConfig` và chỉ inject namespace cần.
+3. Refactor `createApp()`/`start()`; E2E test dùng cùng `createApp()` để không lệch
+   global config.
+4. Chuẩn hóa ba log event: startup, request completed, task created.
+5. Viết test chứng minh invalid port/URL/secret làm bootstrap fail trước listen.
+6. Lập redaction list và thêm regression test không log access/refresh token.
+
+### Acceptance criteria
+
+- Không còn `process.env` ngoài config/bootstrap layer.
+- Config được validate/coerce một lần và object kết quả immutable.
+- Production secret không nằm trong repo/image/log.
+- Startup lỗi trả exit code khác 0; app chưa mở socket.
+- Log là JSON/event fields ổn định và có correlation ID.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Configuration](https://docs.nestjs.com/techniques/configuration)
+- [NestJS — Logger](https://docs.nestjs.com/techniques/logger)
+- [NestJS — Lifecycle events](https://docs.nestjs.com/fundamentals/lifecycle-events)
+- [Zod — Documentation](https://zod.dev/)
+- [Node.js — Environment variables](https://nodejs.org/api/environment_variables.html)
+- [OWASP — Logging cheat sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
+- [Twelve-Factor App — Config](https://12factor.net/config)
+
+Chặng nền tảng kết thúc ở đây. Phần 7 biến Tasks API thành contract public có
+DTO runtime, validation, serialization, pagination, versioning và OpenAPI.

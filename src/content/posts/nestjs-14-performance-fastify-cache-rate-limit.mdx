@@ -1,0 +1,309 @@
+---
+title: 'NestJS Zero to Hero 14 — Performance, Fastify, Cache và Load Test'
+description: 'Đo p95/p99, event loop, query và memory; thử Fastify đúng cách, thiết kế cache tenant-aware/invalidation và bảo vệ hệ thống khỏi overload.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, performance, fastify, caching, load-testing]
+series: nestjs-zero-to-hero
+seriesOrder: 14
+draft: false
+---
+
+“Fastify nhanh hơn” không phải performance plan. API production thường chậm vì
+query thiếu index, external I/O, JSON quá lớn, connection pool hoặc event loop bị
+chặn. Đổi adapter có thể không thay bottleneck nào.
+
+Sau bài này, bạn có thể:
+
+- lập latency/throughput/error/memory baseline;
+- benchmark có warm-up, concurrency và percentile;
+- phân loại CPU, event-loop, database, network, allocation bottleneck;
+- chuyển Express sang Fastify và test compatibility;
+- thiết kế cache key/invalidation theo tenant;
+- dùng limit/backpressure/rate limit để bảo vệ capacity.
+
+---
+
+## 1. Performance là SLO dưới workload
+
+Định nghĩa trước:
+
+```text
+workload: 80% GET list, 15% create, 5% update
+dataset: 100 tenants × 10k tasks
+concurrency: 50, 200, 500
+SLO: p95 < 200 ms, p99 < 500 ms, error < 0.1%
+resource: 1 vCPU, 512 MiB, DB pool 10
+```
+
+Average che tail latency. Luôn xem p50/p95/p99, throughput, error và saturation.
+Load test trên build production, log level giống production, database có data
+shape thật và dependency không nằm trên laptop ngẫu nhiên.
+
+[autocannon](https://github.com/mcollina/autocannon) tiện local:
+
+```bash
+pnpm dlx autocannon -c 50 -d 30 -p 10 \
+  -H 'authorization=Bearer TEST_TOKEN' \
+  http://127.0.0.1:3000/api/v1/tasks?workspaceId=WORKSPACE_ID
+```
+
+[k6](https://grafana.com/docs/k6/latest/) phù hợp scenario/ramp/threshold. Không
+load-test production nếu chưa có phê duyệt, traffic isolation và stop condition.
+
+Warm-up V8, connection pool và cache; chạy nhiều sample; ghi commit/config/data.
+
+---
+
+## 2. Lập latency budget
+
+```text
+total p95 200 ms
+├─ gateway/network       20
+├─ Nest pipeline/JSON    15
+├─ auth/permission       15
+├─ PostgreSQL queries   100
+├─ external dependency  30
+└─ headroom              20
+```
+
+Nếu DB chiếm 100 ms, tối ưu decorator 1 ms không có ý nghĩa. Instrument từng
+dependency và query count. Dùng `EXPLAIN (ANALYZE, BUFFERS)` cho slow query, không
+đoán index.
+
+Kiểm tra:
+
+- connection pool wait/timeout;
+- query duration/count/rows scanned;
+- event-loop utilization/delay;
+- CPU profile/flame graph;
+- heap/RSS/GC/allocation;
+- payload bytes và serialization;
+- external client timeout/retry.
+
+Node có [performance hooks](https://nodejs.org/api/perf_hooks.html) và
+[diagnostic reports](https://nodejs.org/api/report.html). Profile với traffic đại
+diện; profiler cũng có overhead.
+
+---
+
+## 3. Event loop không thích CPU dài
+
+Password hashing, image/PDF, compression lớn hoặc loop JSON nặng có thể chặn
+request khác. Argon2 chạy native worker pool nhưng vẫn dùng CPU/memory; concurrency
+login cần limit. Pure JS CPU task nên chuyển worker thread/queue service khi đo
+thấy ảnh hưởng.
+
+Monitor event-loop delay:
+
+```ts
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+const histogram = monitorEventLoopDelay({ resolution: 20 });
+histogram.enable();
+
+setInterval(() => {
+  logger.debug({
+    event: 'event_loop_delay',
+    p99Ms: histogram.percentile(99) / 1e6,
+  });
+  histogram.reset();
+}, 10_000).unref();
+```
+
+Production export metric thay `setInterval` tùy tiện trong business module. Một
+timer phải cleanup/unref và không tạo high-cardinality labels.
+
+---
+
+## 4. Thử Fastify qua adapter boundary
+
+Cài:
+
+```bash
+pnpm add @nestjs/platform-fastify
+```
+
+Bootstrap:
+
+```ts
+import {
+  FastifyAdapter,
+  type NestFastifyApplication,
+} from '@nestjs/platform-fastify';
+
+const app = await NestFactory.create<NestFastifyApplication>(
+  AppModule,
+  new FastifyAdapter({ bodyLimit: 1_048_576 }),
+  { bufferLogs: true }
+);
+configureApp(app);
+await app.listen({ port, host: '0.0.0.0' });
+```
+
+Fastify mặc định bind localhost; container cần `0.0.0.0`. Middleware/plugin
+Express không tự tương thích. Nếu controller đã inject `express.Response`, test
+sẽ chỉ ra platform leak; dùng standard Nest response hoặc Fastify equivalent.
+
+E2E Fastify cần ready:
+
+```ts
+await app.init();
+await app.getHttpAdapter().getInstance().ready();
+```
+
+Benchmark Express và Fastify cùng build/workload/resource. Giữ Fastify nếu gain
+đáng kể sau khi tính migration/plugin ecosystem; không đổi chỉ vì microbenchmark
+hello-world. Xem [Nest Fastify performance](https://docs.nestjs.com/techniques/performance).
+
+---
+
+## 5. Cache là bản sao có freshness contract
+
+Cài Nest cache:
+
+```bash
+pnpm add @nestjs/cache-manager cache-manager
+```
+
+```ts
+CacheModule.register({
+  ttl: 5_000, // milliseconds
+  isGlobal: false,
+});
+```
+
+`CacheInterceptor` chỉ auto-cache GET và mặc định track theo URL. Với multi-tenant
+authenticated data, URL có thể không chứa identity/permission, nên global auto
+cache có nguy cơ leak. Ưu tiên explicit application cache port:
+
+```ts
+const key = [
+  'task-list',
+  'v2',
+  principal.tenantId,
+  principal.userId,
+  query.workspaceId,
+  query.status ?? 'all',
+  query.cursor ?? 'first',
+  query.limit,
+].join(':');
+
+const cached = await cache.get<TaskPage>(key);
+if (cached) return cached;
+const page = await taskQueries.list(scope, query);
+await cache.set(key, page, 5_000);
+return page;
+```
+
+Key phải gồm mọi dimension ảnh hưởng output: tenant, permission/principal nếu
+representation khác, filter, cursor, version. Hash key nếu quá dài; không đặt
+token/raw PII trong key/log.
+
+TTL là fallback, không phải invalidation strategy. Sau update:
+
+- cache-aside + delete relevant keys;
+- version namespace (`workspaceVersion`) để key cũ tự unreachable;
+- event-driven invalidation;
+- TTL ngắn khi stale chấp nhận được.
+
+List cache invalidation khó hơn item cache. Đừng cache trước khi đo query và định
+nghĩa “stale tối đa bao lâu”. Tránh cache stampede bằng single-flight/locking hoặc
+stale-while-revalidate.
+
+Multi-replica cần shared store như Redis. Nest hiện hỗ trợ Keyv store, ví dụ
+[`@keyv/redis`](https://docs.nestjs.com/techniques/caching#using-alternative-cache-stores).
+In-memory cache chỉ từng process, mất khi restart và phải có size/LRU limit.
+
+---
+
+## 6. Backpressure và capacity protection
+
+Rate limit kiểm số request theo window; concurrency limit kiểm số công việc đang
+chạy; timeout/circuit breaker ngăn dependency chậm giữ tài nguyên mãi; queue làm
+buffer có giới hạn.
+
+```text
+incoming
+ → edge/app rate limit
+ → body/timeout/concurrency limit
+ → bounded DB/HTTP pools
+ → dependency timeout + controlled retry
+ → 429/503 nhanh khi vượt capacity
+```
+
+Queue vô hạn không phải backpressure; nó chỉ chuyển outage thành backlog/memory.
+Trả `429` với retry guidance khi client vượt policy, `503` khi capacity tạm thời
+không sẵn. Retry có exponential backoff + jitter và budget toàn request.
+
+[Nest Throttler](https://docs.nestjs.com/security/rate-limiting) dùng TTL
+milliseconds. Đừng để retry của client nhân với retry server tạo retry storm.
+
+---
+
+## 7. Memory và payload
+
+Unbounded `findMany`, `Promise.all` trên hàng chục nghìn item và buffer file lớn
+giữ memory. Dùng pagination/stream, giới hạn concurrency và select field cần.
+
+`process.memoryUsage()` phân biệt heap/RSS/external nhưng snapshot đơn lẻ chưa
+chứng minh leak. Chạy soak test, quan sát sau GC qua nhiều chu kỳ và so heap
+snapshot/retainer. Request-scoped graph, unbounded Map/cache/listener là suspects.
+
+Không gọi `global.gc()` trong production path. Heap limit cao hơn chỉ trì hoãn
+OOM nếu leak thật.
+
+---
+
+## 8. Lab đo–đổi–đo lại
+
+1. Seed 1 triệu task phân bố theo tenant/status.
+2. Benchmark list endpoint Express, ghi p50/p95/p99/RPS/CPU/RSS/query plan.
+3. Thêm index đúng query và đo lại.
+4. Thử Fastify, giữ mọi thứ khác cố định.
+5. Thêm Redis cache cho một query có read/write ratio rõ; test cross-tenant leak
+   và invalidation.
+6. Soak 15 phút; quan sát pool wait, event-loop delay, heap và error.
+
+Viết report:
+
+```text
+hypothesis → change → environment → result → trade-off → decision
+```
+
+Không chỉ ghi “nhanh hơn 30%”; ghi percentile, confidence/run count và resource.
+
+---
+
+## Bài tập bắt buộc
+
+1. Đặt SLO/workload/dataset/resource budget cho ba endpoint chính.
+2. Instrument request/query/pool/event-loop/payload trước benchmark.
+3. Chạy Express vs Fastify compatibility + load test.
+4. Implement tenant-aware cache key, invalidation và stampede control.
+5. Thiết lập body/query/concurrency/rate/timeout limits.
+6. Tạo performance regression threshold đủ ổn định cho CI hoặc scheduled lab.
+
+### Acceptance criteria
+
+- Tối ưu bắt đầu từ measurement/profile, không từ framework folklore.
+- Benchmark có percentile, error, resource và production build.
+- Fastify migration không để Express-specific path chưa test.
+- Cache không cross-tenant, có TTL + invalidation + size policy.
+- Pool/queue/concurrency đều bounded.
+- Report chứng minh before/after và nêu cost.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Performance/Fastify](https://docs.nestjs.com/techniques/performance)
+- [NestJS — Caching](https://docs.nestjs.com/techniques/caching)
+- [NestJS — Compression](https://docs.nestjs.com/techniques/compression)
+- [Node.js — Performance hooks](https://nodejs.org/api/perf_hooks.html)
+- [Node.js — Flame graphs](https://nodejs.org/en/learn/diagnostics/flame-graphs)
+- [PostgreSQL — EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html)
+- [k6 — Documentation](https://grafana.com/docs/k6/latest/)
+
+Chặng quality kết thúc. Phần 15 đưa side effect chậm ra khỏi request bằng BullMQ,
+nhưng giữ delivery semantics đúng qua idempotent job và transactional outbox.

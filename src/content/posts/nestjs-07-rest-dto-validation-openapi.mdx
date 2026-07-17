@@ -1,0 +1,386 @@
+---
+title: 'NestJS Zero to Hero 07 — REST Contract, DTO, Validation và OpenAPI'
+description: 'Thiết kế API contract có runtime validation, response serialization, pagination, versioning, stable error và OpenAPI để client có thể tích hợp an toàn.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, rest-api, validation, openapi, dto]
+series: nestjs-zero-to-hero
+seriesOrder: 7
+draft: false
+---
+
+Public API là contract sống lâu hơn implementation. Đổi `Map` thành PostgreSQL
+không nên làm client thay request; đổi tên một field JSON lại là breaking change.
+Bài này khóa HTTP boundary trước khi thêm database.
+
+Sau bài này, bạn có thể:
+
+- phân biệt TypeScript type với runtime DTO;
+- cấu hình `ValidationPipe` an toàn và coercion có chủ đích;
+- serialize output theo allowlist;
+- thiết kế pagination, error và versioning;
+- sinh/kiểm tra OpenAPI như một build artifact.
+
+---
+
+## 1. JSON là `unknown` ở runtime
+
+Request sau không quan tâm annotation TypeScript của controller:
+
+```json
+{
+  "title": 42,
+  "status": "SUPER_DONE",
+  "workspaceId": "not-a-uuid",
+  "role": "ADMIN"
+}
+```
+
+Interface bị xóa sau compile. Nest validation thường dùng class DTO vì decorator
+metadata tồn tại ở runtime. Cài:
+
+```bash
+pnpm add class-validator class-transformer
+```
+
+DTO tạo task:
+
+```ts
+import { Transform } from 'class-transformer';
+import { IsString, IsUUID, Length } from 'class-validator';
+
+export class CreateTaskDto {
+  @IsUUID('4')
+  workspaceId!: string;
+
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @Length(3, 120)
+  title!: string;
+}
+```
+
+Global pipe trong `createApp()`:
+
+```ts
+app.useGlobalPipes(
+  new ValidationPipe({
+    transform: true,
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    forbidUnknownValues: true,
+    transformOptions: {
+      enableImplicitConversion: false,
+    },
+  })
+);
+```
+
+Ý nghĩa:
+
+- `transform`: plain object thành DTO instance, chạy transform.
+- `whitelist`: chỉ property có validation decorator được giữ.
+- `forbidNonWhitelisted`: field lạ bị reject thay vì im lặng strip.
+- `forbidUnknownValues`: từ chối object gốc không hợp lệ.
+- tắt implicit conversion: không tự biến mọi string theo reflected type.
+
+Explicit conversion dễ audit hơn. Query number dùng `@Type(() => Number)` hoặc
+built-in `ParseIntPipe`, sau đó vẫn validate range.
+
+> `whitelist` không phải mass-assignment protection duy nhất. Application layer
+> vẫn phải tạo command allowlist; đừng spread DTO thẳng vào ORM `data` nếu model
+> có field `role`, `tenantId`, `createdBy` do server sở hữu.
+
+---
+
+## 2. Query DTO và pagination có giới hạn
+
+Offset pagination phù hợp danh sách nhỏ/admin; cursor ổn định hơn cho feed thay
+đổi liên tục. TaskFlow bắt đầu bằng cursor:
+
+```ts
+import { Type } from 'class-transformer';
+import { IsEnum, IsOptional, IsUUID, Max, Min } from 'class-validator';
+
+export enum TaskStatusDto {
+  OPEN = 'OPEN',
+  IN_PROGRESS = 'IN_PROGRESS',
+  DONE = 'DONE',
+}
+
+export class ListTasksQueryDto {
+  @IsOptional()
+  @IsUUID('4')
+  workspaceId?: string;
+
+  @IsOptional()
+  @IsEnum(TaskStatusDto)
+  status?: TaskStatusDto;
+
+  @IsOptional()
+  @IsUUID('4')
+  cursor?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @Min(1)
+  @Max(100)
+  limit = 20;
+}
+```
+
+Response:
+
+```ts
+export interface CursorPage<T> {
+  items: T[];
+  pageInfo: {
+    nextCursor: string | null;
+    hasNextPage: boolean;
+  };
+}
+```
+
+Query `limit + 1` item. Nếu có item thứ 21, bỏ nó khỏi response và dùng ID item
+thứ 20 làm `nextCursor`. Sort phải deterministic, ví dụ `createdAt DESC, id DESC`;
+cursor production nên encode cả hai giá trị. Cursor không phải secret, nhưng phải
+validate và không ghép vào raw SQL.
+
+Luôn cap `limit`. Endpoint không giới hạn là lời mời làm cạn memory/database.
+
+---
+
+## 3. Input DTO không phải response DTO
+
+Database entity có thể chứa `passwordHash`, internal note, deletedAt. Trả object
+ORM trực tiếp tạo data leak khi schema thêm field.
+
+Response DTO dùng allowlist:
+
+```ts
+import { Expose } from 'class-transformer';
+
+export class TaskResponseDto {
+  @Expose()
+  id!: string;
+
+  @Expose()
+  workspaceId!: string;
+
+  @Expose()
+  title!: string;
+
+  @Expose()
+  status!: string;
+
+  @Expose()
+  version!: number;
+
+  @Expose()
+  createdAt!: string;
+}
+```
+
+Bind [ClassSerializerInterceptor](https://docs.nestjs.com/techniques/serialization):
+
+```ts
+@UseInterceptors(ClassSerializerInterceptor)
+@SerializeOptions({ excludeExtraneousValues: true })
+@Controller({ path: 'tasks', version: '1' })
+export class TasksController {}
+```
+
+Hoặc viết presenter function thuần, thường explicit hơn:
+
+```ts
+export function presentTask(task: TaskView): TaskResponseDto {
+  return {
+    id: task.id,
+    workspaceId: task.workspaceId,
+    title: task.title,
+    status: task.status,
+    version: task.version,
+    createdAt: task.createdAt.toISOString(),
+  };
+}
+```
+
+Presenter allowlist là lựa chọn của series. Decorator serialization vẫn hữu ích
+cho class object phức tạp; đừng dựa vào `@Exclude()` blacklist vì field mới có
+thể vô tình public.
+
+---
+
+## 4. Stable error contract
+
+Validation mặc định trả shape gắn với framework. Chuẩn hóa để client xử lý bằng
+code, không parse message:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_FAILED",
+    "message": "Request validation failed",
+    "requestId": "req_...",
+    "details": [{ "field": "title", "rules": ["length"] }]
+  }
+}
+```
+
+Custom `exceptionFactory`:
+
+```ts
+new ValidationPipe({
+  whitelist: true,
+  forbidNonWhitelisted: true,
+  transform: true,
+  exceptionFactory: (errors) =>
+    new BadRequestException({
+      code: 'VALIDATION_FAILED',
+      message: 'Request validation failed',
+      details: errors.map((error) => ({
+        field: error.property,
+        rules: Object.keys(error.constraints ?? {}),
+      })),
+    }),
+});
+```
+
+Không trả value bị reject; nó có thể là password/token. Với nested DTO, viết
+flattener có test thay vì chỉ lấy level đầu.
+
+Phân biệt:
+
+- transport validation: field/type/format/range;
+- business invariant: transition, quota, ownership;
+- persistence conflict: unique/version/foreign key.
+
+Đừng ép business rule vào decorator DTO.
+
+---
+
+## 5. Versioning có chủ đích
+
+Enable URI versioning:
+
+```ts
+app.enableVersioning({
+  type: VersioningType.URI,
+  defaultVersion: '1',
+});
+```
+
+Controller:
+
+```ts
+@Controller({ path: 'tasks', version: '1' })
+```
+
+Route thành `/api/v1/tasks`. URI dễ nhìn và cache/debug. Header/media-type
+versioning có trade-off khác; xem [Nest versioning](https://docs.nestjs.com/techniques/versioning).
+
+Không tạo v2 cho mọi thay đổi. Thêm optional response field thường backward
+compatible; đổi nghĩa/xóa/đổi type mới cần migration/version. Ghi deprecation
+policy, thời hạn và telemetry usage trước khi xóa v1.
+
+---
+
+## 6. OpenAPI là executable contract
+
+Cài [Nest Swagger](https://docs.nestjs.com/openapi/introduction):
+
+```bash
+pnpm add @nestjs/swagger
+```
+
+Bootstrap chỉ mở UI theo config phù hợp; JSON spec có thể dùng trong CI:
+
+```ts
+const swaggerConfig = new DocumentBuilder()
+  .setTitle('TaskFlow API')
+  .setDescription('TaskFlow public HTTP API')
+  .setVersion('1.0.0')
+  .addBearerAuth()
+  .build();
+
+const document = SwaggerModule.createDocument(app, swaggerConfig);
+SwaggerModule.setup('api/docs', app, document);
+```
+
+Annotate contract nơi inference chưa đủ:
+
+```ts
+@ApiTags('tasks')
+@ApiCreatedResponse({ type: TaskResponseDto })
+@ApiBadRequestResponse({ description: 'Validation failed' })
+@Post()
+create(@Body() dto: CreateTaskDto): Promise<TaskResponseDto> {}
+```
+
+Nest Swagger CLI plugin có thể infer metadata từ type/decorator và giảm lặp;
+xem [CLI plugin](https://docs.nestjs.com/openapi/cli-plugin). Dù dùng plugin,
+response/error/example cần review như API design, không phải generated truth.
+
+CI nên:
+
+1. boot app context;
+2. tạo `openapi.json`;
+3. validate spec;
+4. diff với base branch bằng tool như
+   [oasdiff](https://github.com/Tufin/oasdiff);
+5. fail khi có breaking change chưa được duyệt/version.
+
+---
+
+## Lab contract tests
+
+Viết E2E cases cho matrix:
+
+```text
+POST /api/v1/tasks
+├─ valid                  → 201 + Location + response allowlist
+├─ missing title          → 400 VALIDATION_FAILED
+├─ title too short        → 400 VALIDATION_FAILED
+├─ unknown field role     → 400 VALIDATION_FAILED
+├─ invalid workspace UUID → 400 VALIDATION_FAILED
+└─ content-type wrong     → 4xx theo contract
+```
+
+List endpoint test `limit=0`, `limit=101`, invalid cursor, stable order và
+`nextCursor`. Snapshot toàn response dễ brittle; assert semantic field/status,
+và snapshot OpenAPI artifact riêng.
+
+---
+
+## Bài tập bắt buộc
+
+1. Viết DTO cho create, update status và list query; không dùng một DTO cho cả ba.
+2. Chặn unknown field, implicit conversion và unbounded limit.
+3. Tạo presenter allowlist; thêm field `internalNote` vào entity và chứng minh nó
+   không xuất hiện trong API.
+4. Chuẩn hóa error validation có request ID.
+5. Enable `/api/v1`, sinh OpenAPI JSON và thêm breaking-change check vào CI draft.
+6. Viết consumer example bằng `curl` và một TypeScript `fetch` client.
+
+### Acceptance criteria
+
+- Mọi external input được coi là unknown cho tới khi validate.
+- DTO transport không được truyền nguyên object vào ORM.
+- List response có giới hạn, stable order và pagination metadata.
+- Response không rò internal field khi model thay đổi.
+- OpenAPI mô tả đủ success/error/auth và được kiểm trong build.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Validation](https://docs.nestjs.com/techniques/validation)
+- [NestJS — Serialization](https://docs.nestjs.com/techniques/serialization)
+- [NestJS — Versioning](https://docs.nestjs.com/techniques/versioning)
+- [NestJS — OpenAPI](https://docs.nestjs.com/openapi/introduction)
+- [class-validator](https://github.com/typestack/class-validator)
+- [class-transformer](https://github.com/typestack/class-transformer)
+- [OpenAPI Specification](https://spec.openapis.org/oas/latest.html)
+
+Phần 8 thay repository in-memory bằng PostgreSQL + Prisma 7, giữ nguyên public
+contract để thấy giá trị của port và controller boundary.

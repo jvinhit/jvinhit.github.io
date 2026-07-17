@@ -1,0 +1,356 @@
+---
+title: 'NestJS Zero to Hero 17 — GraphQL Code-first, DataLoader và Query Safety'
+description: 'Thêm GraphQL adapter lên cùng use case, thiết kế schema/pagination/error/auth, giải N+1 bằng DataLoader và giới hạn depth/complexity/operation.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, graphql, apollo, dataloader, api-design]
+series: nestjs-zero-to-hero
+seriesOrder: 17
+draft: false
+---
+
+GraphQL cho client chọn field và nối graph qua một endpoint. Quyền biểu đạt đó
+chuyển cost control sang server: một query hợp lệ về type vẫn có thể tạo N+1,
+traverse sâu hoặc yêu cầu hàng triệu node.
+
+Ta thêm GraphQL như **presentation adapter**, dùng lại `CreateTask`, `ListTasks`,
+`TaskPolicy`; không tạo business layer thứ hai.
+
+Sau bài này, bạn có thể:
+
+- cấu hình Nest GraphQL code-first;
+- tách GraphQL type/input khỏi domain/Prisma;
+- viết resolver mỏng gọi use case;
+- đưa principal/auth guard vào GraphQL context;
+- batch N+1 bằng request-scoped DataLoader;
+- giới hạn pagination, depth, complexity và schema breaking change.
+
+---
+
+## 1. GraphQL có phù hợp không?
+
+Phù hợp khi nhiều client cần projection/graph khác nhau, UI composition nhanh và
+team quản schema/cost tốt. REST có lợi khi HTTP cache, endpoint semantics, file/
+stream, public simplicity hoặc operation rõ quan trọng hơn.
+
+Không cần chọn độc quyền. TaskFlow giữ REST cho public commands/automation và
+thêm GraphQL cho dashboard query. Cả hai gọi application layer.
+
+---
+
+## 2. Cấu hình code-first
+
+Với Apollo driver:
+
+```bash
+pnpm add @nestjs/graphql @nestjs/apollo @apollo/server graphql
+```
+
+```ts
+@Module({
+  imports: [
+    GraphQLModule.forRoot<ApolloDriverConfig>({
+      driver: ApolloDriver,
+      autoSchemaFile:
+        process.env.NODE_ENV === 'production'
+          ? true
+          : join(process.cwd(), 'schema.gql'),
+      sortSchema: true,
+      playground: false,
+      introspection: process.env.NODE_ENV !== 'production',
+      context: ({ req, res }) => ({ req, res }),
+    }),
+  ],
+})
+export class GraphqlApiModule {}
+```
+
+Production dùng `true` để giữ schema trong memory, phù hợp read-only filesystem;
+CI/dev sinh `schema.gql` để commit/diff như contract artifact. Introspection không
+tự là lỗ hổng nhưng tắt public production khi policy yêu cầu; security thực nằm
+ở auth, cost limit, validation và resolver.
+
+Xem [Nest GraphQL quick start](https://docs.nestjs.com/graphql/quick-start) để
+chọn Apollo/Mercurius và code-first/schema-first theo stack.
+
+---
+
+## 3. GraphQL type không phải domain entity
+
+```ts
+@ObjectType('Task')
+export class TaskGraphqlType {
+  @Field(() => ID)
+  id!: string;
+
+  @Field(() => ID)
+  workspaceId!: string;
+
+  @Field()
+  title!: string;
+
+  @Field(() => TaskStatusGraphql)
+  status!: TaskStatus;
+
+  @Field(() => Int)
+  version!: number;
+
+  @Field(() => GraphQLISODateTime)
+  createdAt!: Date;
+}
+
+@InputType()
+export class CreateTaskGraphqlInput {
+  @Field(() => ID)
+  @IsUUID('4')
+  workspaceId!: string;
+
+  @Field()
+  @Length(3, 120)
+  title!: string;
+}
+```
+
+Type GraphQL mô tả public schema; input DTO validate transport; domain giữ
+invariant; Prisma record giữ storage. Có mapping rõ giúp `passwordHash`/internal
+field không tự thành field GraphQL.
+
+GraphQL non-null là backward-compatibility commitment. Thêm non-null field khi
+existing data/old resolver chưa đảm bảo sẽ phá runtime; migration theo nullable
+→ backfill → resolver → non-null.
+
+---
+
+## 4. Resolver mỏng
+
+```ts
+@Resolver(() => TaskGraphqlType)
+export class TasksResolver {
+  constructor(
+    private readonly createTask: CreateTask,
+    private readonly listTasks: ListTasks
+  ) {}
+
+  @Mutation(() => TaskGraphqlType)
+  async createTaskMutation(
+    @CurrentGraphqlPrincipal() principal: Principal,
+    @Args('input') input: CreateTaskGraphqlInput
+  ): Promise<TaskGraphqlType> {
+    const task = await this.createTask.execute({
+      actorId: principal.userId,
+      tenantId: principal.tenantId,
+      workspaceId: input.workspaceId,
+      title: input.title,
+    });
+    return presentTaskGraphql(task);
+  }
+}
+```
+
+Resolver không inject Prisma. REST controller và resolver có thể khác presenter,
+nhưng dùng chung command/use case/error semantics.
+
+GraphQL query `200 OK` vẫn có `errors`; monitoring phải nhìn GraphQL operation
+outcome, không chỉ HTTP status.
+
+---
+
+## 5. Auth guard cho GqlExecutionContext
+
+HTTP guard `switchToHttp()` không lấy GraphQL request đúng. Adapter:
+
+```ts
+@Injectable()
+export class GqlJwtAuthGuard extends AuthGuard('jwt') {
+  getRequest(context: ExecutionContext): Request {
+    return GqlExecutionContext.create(context).getContext().req;
+  }
+}
+```
+
+Principal decorator:
+
+```ts
+export const CurrentGraphqlPrincipal = createParamDecorator(
+  (_data: unknown, context: ExecutionContext): Principal =>
+    GqlExecutionContext.create(context).getContext().req.user
+);
+```
+
+Authn ở operation; authz vẫn ở use case/resource policy. Field resolver nhạy cảm
+như `Task.privateNotes` cần field-level policy hoặc không có trong schema. Đừng
+chỉ hide UI.
+
+Context được tạo mỗi request, nơi phù hợp chứa DataLoader. Subscription connection
+có auth lifecycle riêng như bài realtime.
+
+---
+
+## 6. N+1 và DataLoader
+
+Query:
+
+```graphql
+query Tasks {
+  tasks(first: 20) {
+    nodes {
+      id
+      assignee {
+        id
+        displayName
+      }
+    }
+  }
+}
+```
+
+Resolver `assignee` gọi DB từng task tạo 1 + 20 query. [DataLoader](https://github.com/graphql/dataloader)
+batch ID trong một tick và cache trong **một GraphQL request**:
+
+```ts
+export function createUserByIdLoader(users: UserQueries) {
+  return new DataLoader<string, UserView | null>(async (ids) => {
+    const rows = await users.findManyByIds([...ids]);
+    const byId = new Map(rows.map((user) => [user.id, user]));
+    return ids.map((id) => byId.get(id) ?? null); // giữ đúng order/length
+  });
+}
+```
+
+Context factory tạo loader mới/request:
+
+```ts
+context: ({ req, res }) => ({
+  req,
+  res,
+  loaders: createLoaders(appServices),
+}),
+```
+
+Không singleton DataLoader: cache cross-request/user có thể leak authorization và
+stale data. Batch query phải tenant/access-scoped; ID list không đủ nếu user chỉ
+được thấy subset.
+
+Integration test đếm query, không chỉ body đúng.
+
+---
+
+## 7. Cursor connection
+
+GraphQL convention:
+
+```graphql
+type TaskEdge {
+  cursor: String!
+  node: Task!
+}
+type TaskConnection {
+  edges: [TaskEdge!]!
+  pageInfo: PageInfo!
+}
+```
+
+Args `first` cap 100; cursor opaque encode sort tuple. `totalCount` có thể đắt,
+chỉ expose nếu product cần và query/index chịu được. Empty list là `[]`, không
+`null` nếu schema cam kết.
+
+Reuse application `ListTasks`, không viết pagination khác cho GraphQL và REST.
+
+---
+
+## 8. Query safety
+
+Controls cần phối hợp:
+
+- max request body/document size;
+- parse/validation cache hoặc persisted operations;
+- max aliases/root fields;
+- depth limit;
+- complexity/cost theo field + pagination args;
+- timeout/budget;
+- rate limit theo principal + operation/cost;
+- disable batched operations nếu không cần;
+- resolver pagination bắt buộc.
+
+Depth đơn thuần không chặn 100 aliases ở depth 2. Complexity cần nhân `first` và
+child cost. Nest có [GraphQL complexity](https://docs.nestjs.com/graphql/complexity);
+calibrate bằng query thực và log operation name/hash, không raw variables chứa PII.
+
+Persisted operation allowlist phù hợp first-party client: production nhận hash đã
+đăng ký, giảm arbitrary query surface. Vẫn authorize/limit variables.
+
+---
+
+## 9. Error và schema evolution
+
+Map domain error sang GraphQL extensions:
+
+```json
+{
+  "errors": [
+    {
+      "message": "Task not found",
+      "extensions": {
+        "code": "TASK_NOT_FOUND",
+        "requestId": "..."
+      }
+    }
+  ]
+}
+```
+
+Unknown error trả generic message/code, log internal detail. Validation error có
+field path hữu ích nhưng không echo secret.
+
+Breaking changes: remove/rename field/enum value, nullable → non-null, change
+semantics. Dùng deprecation directive + usage telemetry + deadline. Diff schema
+bằng [GraphQL Inspector](https://the-guild.dev/graphql/inspector/docs) trong CI.
+
+---
+
+## 10. Tests
+
+- schema snapshot/diff riêng;
+- resolver unit rất ít, chủ yếu use case đã test;
+- E2E query/mutation auth + error + pagination;
+- N+1 test query count;
+- query-cost negative tests (deep/alias/large first);
+- cross-tenant field access;
+- operation compatibility với generated client.
+
+Không snapshot toàn introspection response mỗi test; schema artifact đã đảm nhận.
+
+---
+
+## Bài tập bắt buộc
+
+1. Thêm code-first schema cho Task query/create/status mutation.
+2. Reuse application use cases và presenter riêng; resolver không Prisma.
+3. Implement GraphQL auth context/guard và cross-tenant policy tests.
+4. Tạo request-scoped, tenant-aware User DataLoader; query count cố định.
+5. Bắt buộc cursor pagination, depth/complexity/rate limits.
+6. Commit `schema.gql`, CI diff và deprecate một field demo.
+
+### Acceptance criteria
+
+- GraphQL là adapter, không có business implementation song song REST.
+- Public type/input không reuse Prisma entity.
+- N+1 được đo và batch; loader không cross request/tenant.
+- Query cost/size/depth/alias/pagination đều bounded.
+- Error extensions stable, unknown detail không leak.
+- Schema breaking change có diff, deprecation và migration policy.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — GraphQL quick start](https://docs.nestjs.com/graphql/quick-start)
+- [NestJS — Resolvers](https://docs.nestjs.com/graphql/resolvers)
+- [NestJS — GraphQL complexity](https://docs.nestjs.com/graphql/complexity)
+- [GraphQL Specification](https://spec.graphql.org/)
+- [DataLoader](https://github.com/graphql/dataloader)
+- [GraphQL over HTTP](https://graphql.github.io/graphql-over-http/draft/)
+- [GraphQL Inspector](https://the-guild.dev/graphql/inspector/docs)
+
+Phần 18 đặt network boundary thật: message/RPC không còn là function call, nên
+deadline, schema compatibility, partial failure và at-least-once trở thành API.

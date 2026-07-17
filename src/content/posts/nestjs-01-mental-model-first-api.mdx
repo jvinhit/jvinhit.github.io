@@ -1,0 +1,360 @@
+---
+title: 'NestJS Zero to Hero 01 — Mental Model, Setup và API đầu tiên'
+description: 'Hiểu NestJS giải quyết bài toán gì, dựng TaskFlow API bằng NestJS 11 và TypeScript strict, rồi lần theo một request từ bootstrap tới controller.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, typescript, backend, nodejs, rest-api]
+series: nestjs-zero-to-hero
+seriesOrder: 1
+draft: false
+---
+
+NestJS rất dễ tạo cảm giác “đã biết” sau năm phút: chạy CLI, thêm `@Get()`, trả
+về một object và API hoạt động. Nhưng biết decorator nào để copy chưa phải là
+biết framework. Khi dependency không resolve, guard không chạy, DTO bị lọt field
+lạ hoặc app không shutdown được, ta cần một mental model sâu hơn.
+
+Series này xây **TaskFlow**, API quản lý workspace và task cho nhiều tenant. Sau
+20 phần, project có REST, PostgreSQL, transaction, authentication,
+authorization, test, cache, queue, realtime, GraphQL, microservice,
+observability và pipeline deploy. Mỗi phần thêm đúng một lát cắt và luôn có tiêu
+chí để tự kiểm chứng.
+
+Sau bài đầu tiên, bạn có thể:
+
+- giải thích Nest khác Express ở đâu mà không gọi nó là “magic”;
+- đọc được vai trò của `main.ts`, root module và controller;
+- tạo project NestJS 11 với TypeScript strict;
+- lần theo một HTTP request từ adapter tới handler;
+- chạy test và tự chẩn đoán ba lỗi bootstrap cơ bản.
+
+> Baseline của series: [NestJS 11](https://docs.nestjs.com/), Node.js 24 LTS,
+> TypeScript strict, pnpm và PostgreSQL. NestJS 11 yêu cầu Node.js 20 trở lên và
+> mặc định dùng Express 5; xem [migration guide](https://docs.nestjs.com/migration-guide).
+
+---
+
+## 1. NestJS thực sự cung cấp gì?
+
+[Node.js](https://nodejs.org/en/learn/getting-started/introduction-to-nodejs) có
+HTTP server; [Express](https://expressjs.com/) và
+[Fastify](https://fastify.dev/) giúp route request. Nest đặt thêm một
+**application runtime** lên trên HTTP adapter:
+
+```text
+code của bạn
+  ├─ modules      → boundary và dependency graph
+  ├─ controllers  → transport adapter
+  ├─ providers    → use case, repository, gateway, policy...
+  └─ enhancers    → middleware, guard, interceptor, pipe, filter
+          │
+Nest application context + DI container
+          │
+Express hoặc Fastify adapter
+          │
+Node.js HTTP server
+```
+
+Nest sở hữu ba việc quan trọng:
+
+1. **Wiring**: đọc metadata của module, tạo provider và inject dependency.
+2. **Lifecycle**: bootstrap, xử lý request, gọi hook và shutdown.
+3. **Convention**: thống nhất nơi đặt transport, business service và
+   cross-cutting concern.
+
+Framework không tự tìm business rule, transaction boundary hay bounded context.
+Nếu controller chứa mọi logic thì ứng dụng Nest vẫn có thể là một “big ball of
+mud” được trang trí đẹp.
+
+### “Magic” chỉ là metadata + graph + function call
+
+Decorator như `@Controller('tasks')` gắn metadata lên class.
+`@Module()` khai báo node và edge của dependency graph. Khi bootstrap, Nest đọc
+metadata, tạo object theo thứ tự dependency và đăng ký route với adapter. Khi có
+request, adapter gọi pipeline rồi handler.
+
+```text
+@Module metadata → dependency graph → object instances
+@Controller/@Get metadata → route table → handler invocation
+```
+
+Ta chưa cần thuộc implementation. Chỉ cần nhớ: nếu một thứ không được framework
+“nhìn thấy” qua module/metadata, Nest không thể tự động quản lý nó.
+
+---
+
+## 2. Chuẩn bị môi trường
+
+Kiểm tra runtime:
+
+```bash
+node --version
+pnpm --version
+```
+
+Nếu máy chưa có pnpm, dùng [Corepack](https://nodejs.org/api/corepack.html) đi
+kèm Node:
+
+```bash
+corepack enable
+corepack prepare pnpm@latest --activate
+```
+
+Tạo project bằng [Nest CLI](https://docs.nestjs.com/cli/overview):
+
+```bash
+pnpm dlx @nestjs/cli@11 new taskflow-api \
+  --package-manager pnpm \
+  --strict
+cd taskflow-api
+pnpm start:dev
+```
+
+Mở terminal khác:
+
+```bash
+curl -i http://localhost:3000
+```
+
+Bạn phải nhận `HTTP/1.1 200 OK` và `Hello World!`. `start:dev` chạy compiler ở
+watch mode; khi file thay đổi, process được restart.
+
+> Đừng cài Nest CLI global nếu không cần. `pnpm dlx @nestjs/cli@11` làm version
+> major của generator hiện rõ trong lệnh và tránh một CLI cũ nằm lâu trên máy.
+
+---
+
+## 3. Đọc project vừa sinh
+
+Các file cốt lõi:
+
+```text
+taskflow-api/
+├─ src/
+│  ├─ main.ts                 # composition/bootstrap của process
+│  ├─ app.module.ts           # root của module graph
+│  ├─ app.controller.ts       # HTTP transport
+│  └─ app.service.ts          # provider được inject
+├─ test/                      # E2E test
+├─ nest-cli.json
+├─ tsconfig.json
+└─ package.json
+```
+
+`main.ts` tạo application:
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+
+async function bootstrap(): Promise<void> {
+  const app = await NestFactory.create(AppModule);
+  await app.listen(process.env.PORT ?? 3000);
+}
+
+void bootstrap();
+```
+
+`NestFactory.create(AppModule)` chưa chỉ tạo HTTP server. Nó scan `AppModule`,
+compile module graph, resolve provider graph, tạo singleton và gắn route. Chỉ
+sau khi graph hợp lệ, `listen()` mới mở socket.
+
+Root module là điểm bắt đầu của graph:
+
+```ts
+import { Module } from '@nestjs/common';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+
+@Module({
+  imports: [],
+  controllers: [AppController],
+  providers: [AppService],
+})
+export class AppModule {}
+```
+
+Controller nhận provider qua constructor:
+
+```ts
+import { Controller, Get } from '@nestjs/common';
+import { AppService } from './app.service';
+
+@Controller()
+export class AppController {
+  constructor(private readonly appService: AppService) {}
+
+  @Get()
+  getHello(): string {
+    return this.appService.getHello();
+  }
+}
+```
+
+`private readonly appService: AppService` vừa là parameter vừa tạo property của
+class theo cú pháp [parameter properties](https://www.typescriptlang.org/docs/handbook/2/classes.html#parameter-properties).
+Nest đọc type metadata để tìm instance `AppService` trong container.
+
+---
+
+## 4. Endpoint đầu tiên của TaskFlow
+
+Xóa `AppService`, vì health endpoint ban đầu không cần dependency. Thay
+`src/app.controller.ts`:
+
+```ts
+import { Controller, Get } from '@nestjs/common';
+
+interface ServiceInfo {
+  name: string;
+  status: 'ok';
+  timestamp: string;
+}
+
+@Controller()
+export class AppController {
+  @Get()
+  getServiceInfo(): ServiceInfo {
+    return {
+      name: 'taskflow-api',
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+    };
+  }
+}
+```
+
+Và cập nhật module:
+
+```ts
+import { Module } from '@nestjs/common';
+import { AppController } from './app.controller';
+
+@Module({
+  controllers: [AppController],
+})
+export class AppModule {}
+```
+
+Kiểm tra:
+
+```bash
+curl -s http://localhost:3000
+```
+
+Kết quả có dạng:
+
+```json
+{
+  "name": "taskflow-api",
+  "status": "ok",
+  "timestamp": "2026-07-17T08:00:00.000Z"
+}
+```
+
+Nest dùng `JSON.stringify()` qua HTTP adapter để serialize object. Nếu handler
+trả `Promise<ServiceInfo>`, Nest đợi promise. Nếu trả
+[Observable](https://rxjs.dev/guide/observable), Nest subscribe và lấy giá trị
+cuối khi stream hoàn tất. Phần lớn endpoint CRUD nên dùng `async`/`await`; đừng
+đưa RxJS vào chỉ vì framework hỗ trợ.
+
+### Một request đã đi qua những gì?
+
+Ở thời điểm này pipeline ngắn:
+
+```text
+GET /
+  → Node HTTP server
+  → Express adapter tìm route
+  → AppController.getServiceInfo()
+  → object
+  → JSON response 200
+```
+
+Các bài sau sẽ chèn middleware, guard, interceptor, pipe và exception filter
+vào đúng vị trí của pipeline.
+
+---
+
+## 5. TypeScript config không phải đồ trang trí
+
+Mở `tsconfig.json` và xác nhận ít nhất:
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
+  }
+}
+```
+
+Nest 11 vẫn dùng decorator/metadata model mà TypeScript hỗ trợ qua hai flag trên.
+`strict` buộc nullable state, input/output và dependency được mô tả rõ hơn; nó
+không validate JSON ở runtime. Bài 7 sẽ thêm runtime validation.
+
+Không bật `strictPropertyInitialization: false` toàn project chỉ để DTO dễ
+viết. Khi một framework gán property sau constructor, dùng definite assignment
+có chủ đích (`name!: string`) tại boundary đó; giữ strictness cho phần còn lại.
+
+---
+
+## 6. Lab tự phá rồi sửa
+
+### Thí nghiệm A — controller biến mất
+
+Xóa `AppController` khỏi `controllers` của module nhưng giữ file. App vẫn
+bootstrap, còn `GET /` trả 404. Kết luận: tồn tại trong filesystem không đồng
+nghĩa tồn tại trong application graph.
+
+### Thí nghiệm B — dependency không đăng ký
+
+Khôi phục `AppService` trong constructor controller nhưng không thêm nó vào
+`providers`. App dừng ngay lúc bootstrap với thông báo không resolve dependency.
+Đọc error từ tên provider, index parameter và module scope; đừng sửa bằng cách
+đăng ký provider ở mọi module.
+
+### Thí nghiệm C — port đã bị chiếm
+
+Chạy hai process cùng port. Process thứ hai nhận `EADDRINUSE`. Kiểm tra socket:
+
+```bash
+lsof -nP -iTCP:3000 -sTCP:LISTEN
+```
+
+Đây là lỗi operating system trước khi là lỗi Nest. Khả năng phân loại tầng lỗi
+giúp debugging nhanh hơn.
+
+---
+
+## Bài tập bắt buộc
+
+1. Thêm `GET /health/live` trả `{ "status": "up" }`; giữ `/` là service info.
+2. Đọc port từ `PORT`, chuyển thành number và từ chối giá trị không hợp lệ ngay
+   lúc bootstrap. Tạm dùng function thuần; bài 6 sẽ thay bằng ConfigModule.
+3. Thêm script `typecheck` chạy `tsc --noEmit`.
+4. Viết một test cho `AppController` và giải thích vì sao test này chưa chứng
+   minh route HTTP đã được gắn.
+
+### Acceptance criteria
+
+- `pnpm start:dev` bootstrap không warning và không dùng `any`.
+- `curl -i /` và `/health/live` trả status/content-type đúng.
+- `PORT=abc pnpm start` fail-fast với message hữu ích.
+- `pnpm test`, `pnpm test:e2e` và `pnpm run typecheck` đều xanh.
+- Bạn tự vẽ lại được `module metadata → graph → instance → route → response`.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — First steps](https://docs.nestjs.com/first-steps)
+- [NestJS — Controllers](https://docs.nestjs.com/controllers)
+- [NestJS — Providers](https://docs.nestjs.com/providers)
+- [NestJS — Modules](https://docs.nestjs.com/modules)
+- [NestJS — Platform agnosticism](https://docs.nestjs.com/faq/http-adapter)
+- [TypeScript — Decorators](https://www.typescriptlang.org/docs/handbook/decorators.html)
+
+Phần 2 biến endpoint demo thành REST resource đầu tiên và làm rõ một nguyên tắc
+quan trọng: controller dịch HTTP, không sở hữu business rule.

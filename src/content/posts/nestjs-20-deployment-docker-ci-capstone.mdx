@@ -1,0 +1,464 @@
+---
+title: 'NestJS Zero to Hero 20 — Docker, CI/CD và Production Capstone'
+description: 'Đóng gói NestJS thành image tối thiểu, chạy migration/release an toàn, dựng CI/CD quality gates, rollout/rollback và hoàn thiện TaskFlow portfolio capstone.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, docker, ci-cd, deployment, capstone]
+series: nestjs-zero-to-hero
+seriesOrder: 20
+draft: false
+---
+
+Code build được chưa phải release được. Production artifact phải reproducible,
+không chứa dev secret, chạy non-root, nhận signal đúng, migrate tương thích với
+version cũ/mới và có rollback dựa trên telemetry.
+
+Phần cuối không thêm decorator. Nó biến TaskFlow thành một hệ thống có bằng chứng:
+test, threat model, OpenAPI/schema/proto, load report, dashboard, alert, runbook và
+release procedure. Đó là phần tạo **kinh nghiệm thực hành**, không chỉ kiến thức.
+
+Sau bài này, bạn có thể:
+
+- build multi-stage Docker image với lockfile/Prisma generate;
+- tách migration job khỏi app replicas;
+- thiết kế CI quality/security/contract gates;
+- rollout backward-compatible và rollback có điều kiện;
+- tự review capstone theo checklist production;
+- trình bày quyết định/trade-off như một back-end engineer.
+
+---
+
+## 1. Production artifact là compiled JavaScript + runtime deps
+
+Local `nest start --watch` cần TypeScript/compiler/dev deps. Production chỉ chạy
+build output:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm prisma generate
+pnpm build
+NODE_ENV=production node --require ./dist/instrumentation.js ./dist/main.js
+```
+
+Không compile lúc mỗi container start. Một image digest đi qua staging → production;
+config/secret inject runtime.
+
+Kiểm tra entrypoint thật vì `rootDir`/generated files có thể làm path là
+`dist/src/main.js`. Test image, đừng đoán.
+
+---
+
+## 2. Multi-stage Dockerfile
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+FROM node:24-bookworm-slim AS build
+
+ENV PNPM_HOME=/pnpm
+ENV PATH=$PNPM_HOME:$PATH
+WORKDIR /app
+
+RUN corepack enable
+
+COPY package.json pnpm-lock.yaml ./
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
+    pnpm install --frozen-lockfile
+
+COPY nest-cli.json tsconfig*.json prisma.config.ts ./
+COPY prisma ./prisma
+COPY src ./src
+
+RUN pnpm prisma generate
+RUN pnpm build
+RUN pnpm prune --prod
+
+FROM node:24-bookworm-slim AS runtime
+
+ENV NODE_ENV=production
+ENV PORT=3000
+WORKDIR /app
+
+COPY --from=build --chown=node:node /app/package.json ./package.json
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/dist ./dist
+
+USER node
+EXPOSE 3000
+
+CMD ["node", "--require", "./dist/instrumentation.js", "./dist/main.js"]
+```
+
+Điều chỉnh file copy/entrypoint theo repo thật. Debian slim thường dễ tương thích
+native `argon2`/OpenSSL hơn Alpine musl; nếu chọn Alpine, build/test native addon
+trên đúng image architecture. Pin digest trong supply-chain policy, dùng tool tự
+động cập nhật security patch.
+
+Runtime không có source/dev tool/`.env`. Chạy non-root và ưu tiên read-only root
+filesystem; app ghi temp vào volume/tmp được cấp. Secret không dùng Docker `ARG`
+hoặc `COPY .env`, vì image layer/cache lưu lịch sử.
+
+`.dockerignore`:
+
+```text
+.git
+.env*
+!.env.example
+node_modules
+dist
+coverage
+test-results
+*.log
+```
+
+Build:
+
+```bash
+docker build -t taskflow-api:local .
+docker run --rm -p 3000:3000 \
+  --env-file .env.local \
+  taskflow-api:local
+```
+
+Không dùng local env secret thật trong shared CI logs.
+
+---
+
+## 3. Container contract
+
+Một container TaskFlow cần:
+
+- bind `0.0.0.0:$PORT`;
+- log stdout/stderr JSON, không ghi file trong image;
+- liveness/readiness endpoints;
+- SIGTERM drain trong grace period;
+- resource requests/limits dựa load test;
+- không cần root;
+- không chạy migration từ mỗi replica;
+- ephemeral local filesystem;
+- immutable app version/digest trong telemetry.
+
+Docker `HEALTHCHECK` có thể hữu ích local, nhưng orchestrator probe là source of
+truth production. Probe không cần curl nếu runtime image không có; platform gọi
+HTTP trực tiếp.
+
+Node là process PID 1 và nhận signal trực tiếp vì exec-form `CMD`. Nếu wrapper
+shell cần thiết, dùng init như `tini` và test signal propagation.
+
+---
+
+## 4. Migration là release step một lần
+
+Sai:
+
+```text
+10 replicas start → cả 10 chạy prisma migrate deploy → race/startup coupling
+```
+
+Đúng:
+
+```text
+build immutable image
+  → pre-deploy migration job (same image/tooling, one execution)
+  → deploy compatible app replicas
+  → verify readiness/SLO
+```
+
+Prisma CLI là devDependency đã bị prune trong runtime image trên. Có hai lựa chọn
+rõ:
+
+1. tạo migration image/stage có Prisma CLI;
+2. giữ CLI cần thiết trong release image riêng.
+
+Không cài package từ internet lúc deploy. Migration artifact phải cùng source/
+lockfile với app.
+
+### Expand → migrate/backfill → contract
+
+Đổi tên field không làm một release destructive:
+
+1. **expand**: thêm column/table/index compatible;
+2. deploy code dual-read/write nếu cần;
+3. backfill bounded/observable/resumable;
+4. switch read, verify;
+5. **contract**: xóa old field ở release sau khi mọi version cũ hết traffic.
+
+Index lớn dùng online/concurrent strategy PostgreSQL phù hợp; Prisma migration có
+thể cần custom SQL review. Backup chưa đủ — restore drill mới chứng minh RPO/RTO.
+
+Rollback app không luôn rollback schema/data. Migration thường forward-fix;
+document irreversible step và stop condition.
+
+---
+
+## 5. CI quality gates
+
+GitHub Actions skeleton:
+
+```yaml
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: taskflow
+          POSTGRES_PASSWORD: taskflow
+          POSTGRES_DB: taskflow_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U taskflow -d taskflow_test"
+          --health-interval 2s --health-timeout 2s --health-retries 20
+      redis:
+        image: redis:8-alpine
+        ports: ['6379:6379']
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://taskflow:taskflow@localhost:5432/taskflow_test
+      REDIS_URL: redis://localhost:6379
+      JWT_ACCESS_SECRET: ci-only-secret-at-least-32-characters
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm prisma generate
+      - run: pnpm prisma migrate deploy
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test --runInBand
+      - run: pnpm test:integration
+      - run: pnpm test:e2e
+      - run: pnpm contract:check
+      - run: pnpm build
+      - run: docker build -t taskflow-api:ci .
+```
+
+Pin third-party action commit SHA theo supply-chain policy; version tag ở trên để
+dễ đọc. Least-privilege permissions, fork PR không nhận deployment secret.
+
+Tách fast/unit và integration job để parallel khi suite lớn. Cache package store,
+không cache `node_modules` tùy tiện. Upload test/OpenAPI/schema/proto/load artifacts
+không chứa secret.
+
+Gates nên có:
+
+- format/lint/typecheck;
+- unit/integration/E2E/security negative/concurrency;
+- migration apply trên DB rỗng và upgrade snapshot nếu critical;
+- OpenAPI/GraphQL/proto/event breaking diff;
+- dependency/license/vulnerability scan có triage policy;
+- secret scan;
+- image scan, SBOM/provenance/attestation;
+- production image smoke + health + SIGTERM.
+
+[GitHub artifact attestations](https://docs.github.com/en/actions/concepts/security/artifact-attestations)
+có thể nối artifact với source/build workflow; nó không thay review/dependency
+security.
+
+---
+
+## 6. CD: rollout dựa trên health và SLO
+
+Pipeline khái niệm:
+
+```text
+merge main
+ → build once + scan + sign/attest
+ → deploy staging by digest
+ → migration + smoke/E2E synthetic
+ → canary small traffic
+ → compare error/latency/saturation/business metrics
+ → progressive rollout
+ → promote or rollback app
+```
+
+Không dùng “pod ready” là điều kiện duy nhất. Canary có thể ready nhưng trả sai
+permission hoặc latency p99 tăng. Release annotation nối deploy với dashboard/
+trace.
+
+Rollback trigger: error-budget burn, 5xx, auth failure bất thường, queue/outbox
+lag, DB saturation, business invariant alarm. Rollback cũng là operation được test.
+
+Feature flag tách deploy khỏi release, nhưng flag cần owner, expiry, audit và test
+cả hai nhánh. Flag không thay backward-compatible database contract.
+
+---
+
+## 7. Production topology tối thiểu
+
+```text
+Internet
+  → CDN/WAF/Load Balancer (TLS, coarse rate limit)
+  → TaskFlow API replicas (stateless)
+       ├─ PostgreSQL (source of truth, backup/PITR)
+       ├─ Redis (cache/BullMQ/rate limit, tách workload khi cần)
+       ├─ RabbitMQ (integration events nếu đã tách service)
+       └─ OTel Collector → telemetry backends
+
+Worker replicas
+  → Redis/BullMQ → email provider
+
+Notification service
+  → RabbitMQ + own database + gRPC internal
+```
+
+“Stateless API” không nghĩa hệ thống không state; state được đưa vào managed
+dependencies có durability/capacity/backup. Redis dùng cache và durable-ish queue
+có policy khác; cân nhắc instance/eviction tách để cache eviction không phá queue.
+
+Mỗi dependency có timeout, pool, TLS, credential rotation, health, SLO, backup/
+restore và ownership.
+
+---
+
+## 8. Capstone: Definition of Done
+
+### Product flow
+
+- user đăng ký/login/logout, refresh rotation và revoke device;
+- tenant/workspace membership với role/policy;
+- CRUD task, transition invariant, cursor pagination và OCC;
+- create idempotent, audit + outbox atomic;
+- notification async/retry/idempotent;
+- realtime update với reconnect/resync;
+- REST/OpenAPI và GraphQL cùng application layer;
+- optional Notification microservice event/gRPC boundary.
+
+### Correctness/security
+
+- strict TypeScript, runtime DTO/message validation;
+- tenant scoped query, cross-tenant negative tests;
+- password Argon2id, token verify đầy đủ, no-secret logs;
+- Helmet/CORS/CSRF/rate/body limits theo threat model;
+- transaction/OCC/idempotency/outbox race tests;
+- stable public error codes;
+- supply-chain/config/secret scan.
+
+### Operability
+
+- structured logs + trace correlation;
+- RED/saturation/business metrics;
+- liveness/readiness/startup + graceful drain;
+- queue/outbox lag dashboards;
+- SLO + burn alerts + runbooks;
+- load/soak/failure drill reports;
+- backup restore and deploy rollback drill.
+
+### Delivery
+
+- lockfile, reproducible build, non-root image;
+- migration job + expand/contract policy;
+- CI unit/integration/E2E/contract/build/image gates;
+- immutable digest rollout/canary/rollback;
+- release/version metadata in telemetry.
+
+---
+
+## 9. Portfolio evidence — thứ biến tutorial thành kinh nghiệm
+
+Repo capstone nên có:
+
+```text
+README.md                    problem, local run, trade-offs
+docs/architecture.md         context/container/module diagrams
+docs/adr/*.md                Prisma, modular monolith, OCC, outbox...
+docs/threat-model.md         assets, actors, trust boundaries, mitigations
+docs/api/openapi.json        REST contract
+schema.gql                   GraphQL contract
+proto/                       gRPC contract
+docs/performance-report.md   workload, before/after, p95/p99/resources
+docs/runbooks/               DB unavailable, queue lag, auth incident, rollback
+dashboards/alerts/           code/config hoặc screenshots + query
+compose.yml                  reproducible local dependencies
+```
+
+Viết một incident drill:
+
+```text
+Symptom → Detection → Hypotheses → Evidence → Mitigation
+→ Root cause → Corrective action → Regression guard
+```
+
+Khi phỏng vấn/review, trình bày “vì sao + failure mode + bằng chứng”, không chỉ
+liệt kê thư viện.
+
+---
+
+## Bài tập bắt buộc — final lab release 1.0.0
+
+1. Tạo clean checkout; một lệnh dựng dependency/migrate/seed/app.
+2. Chạy toàn CI từ DB rỗng; lưu artifacts.
+3. Build image cho amd64/arm64 nếu platform cần; scan/SBOM.
+4. Deploy staging bằng digest, chạy smoke/security/concurrency/load subset.
+5. Inject SIGTERM, DB/Redis/provider outage và xác minh runbook.
+6. Chạy migration expand + version N/N-1 cùng lúc để test rolling compatibility.
+7. Canary release, xem SLO/queue/outbox/business metrics rồi promote.
+8. Thực hành rollback app và forward-fix migration.
+9. Tag `v1.0.0`, viết changelog/deprecation/support policy.
+10. Tự chấm Definition of Done; item chưa có bằng chứng chưa được đánh dấu xong.
+
+### Acceptance criteria
+
+- Clean checkout dựng được local stack, migration, seed và app theo README.
+- CI chạy đủ unit/integration/E2E/contract/build/image gates từ database rỗng.
+- Image chạy non-root, không có secret/dev source và xử lý SIGTERM đúng deadline.
+- Migration tương thích rolling version N/N-1 và có forward-fix/rollback runbook.
+- Canary decision dựa trên SLO, queue/outbox lag và business correctness.
+- Mọi item capstone được chứng minh bằng test, report, dashboard hoặc drill artifact.
+
+---
+
+## Checklist tự đánh giá sau series
+
+Bạn đạt mục tiêu khi có thể, không nhìn bài mẫu:
+
+- vẽ module/provider/request/process graph và debug đúng tầng;
+- thêm feature qua controller/resolver → use case → domain → port → adapter;
+- thiết kế transaction/concurrency/idempotency cho race;
+- threat-model authn/authz/tenant/session;
+- chọn sync/queue/event/realtime/RPC theo coupling/failure;
+- viết test chứng minh boundary thật;
+- đo p99/query/pool/event loop trước tối ưu;
+- trace một operation xuyên service và vận hành backlog;
+- release schema/code backward-compatible và rollback có kiểm chứng;
+- giải thích trade-off/alternative/revisit signal bằng ADR.
+
+Hoàn thành code nhưng chưa chạy race/load/failure/deploy drill thì bạn có kiến
+thức. Hoàn thành cả bằng chứng và tự sửa lỗi phát hiện trong drill mới tạo trải
+nghiệm gần với công việc production.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Deployment](https://docs.nestjs.com/deployment)
+- [Docker — Multi-stage builds](https://docs.docker.com/build/building/multi-stage/)
+- [Docker — Build secrets](https://docs.docker.com/build/building/secrets/)
+- [Prisma — Deploying database changes](https://www.prisma.io/docs/orm/prisma-migrate/workflows/development-and-production)
+- [GitHub Actions — Node.js](https://docs.github.com/en/actions/use-cases-and-examples/building-and-testing/building-and-testing-nodejs)
+- [SLSA — Supply-chain Levels for Software Artifacts](https://slsa.dev/)
+- [Kubernetes — Pod lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+- [OWASP — Docker Security](https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html)
+
+Series kết thúc ở release 1.0.0, nhưng back-end engineering không kết thúc. Hãy
+giữ vòng lặp: **đặt giả thuyết → thiết kế contract → code → test race/failure →
+đo → vận hành → ghi lại quyết định**. Đó là cách kiến thức NestJS trở thành kinh
+nghiệm có thể dùng cho hệ thống tiếp theo.

@@ -1,0 +1,359 @@
+---
+title: 'NestJS Zero to Hero 15 — BullMQ, Idempotent Job và Transactional Outbox'
+description: 'Đưa tác vụ chậm sang BullMQ/Redis, thiết kế retry/backoff/dead letter, xử lý job idempotent và nối PostgreSQL transaction với queue qua outbox.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, bullmq, redis, queues, transactional-outbox]
+series: nestjs-zero-to-hero
+seriesOrder: 15
+draft: false
+---
+
+Queue giảm latency request và hấp thụ burst, nhưng thêm delivery bất đồng bộ:
+job có thể chạy trễ, chạy lại, chạy sai thứ tự hoặc worker chết giữa side effect.
+“Đã add vào queue” không đồng nghĩa “đúng một lần”.
+
+Sau bài này, bạn có thể:
+
+- chọn việc nào nên synchronous, job hay event;
+- cấu hình BullMQ producer/worker bằng Nest;
+- thiết kế payload versioned và idempotent consumer;
+- đặt attempts/backoff/timeout/concurrency theo failure mode;
+- dùng transactional outbox để không mất event giữa PostgreSQL và Redis.
+
+---
+
+## 1. Command job, domain event và cron khác nhau
+
+| Loại        | Ý nghĩa                          | Ví dụ                      |
+| ----------- | -------------------------------- | -------------------------- |
+| job/command | một worker phải làm việc này     | `send-task-assigned-email` |
+| event       | sự kiện đã xảy ra, 0..n consumer | `task.assigned.v1`         |
+| schedule    | kích hoạt theo thời gian         | cleanup idempotency record |
+
+Không dùng queue cho việc client cần biết ngay để xác nhận invariant. Tạo task và
+authorize phải synchronous trong DB transaction; gửi email/search indexing có
+thể async.
+
+Event đặt tên quá khứ, immutable. Job đặt tên imperative. Một message không nên
+vừa là “facts” vừa yêu cầu đúng một consumer.
+
+---
+
+## 2. Redis + BullMQ local
+
+Thêm Redis vào `compose.yml`:
+
+```yaml
+redis:
+  image: redis:8-alpine
+  command: ['redis-server', '--appendonly', 'yes']
+  ports:
+    - '6379:6379'
+  volumes:
+    - taskflow_redis:/data
+  healthcheck:
+    test: ['CMD', 'redis-cli', 'ping']
+    interval: 2s
+    timeout: 2s
+    retries: 20
+```
+
+Cài [Nest BullMQ](https://docs.nestjs.com/techniques/queues):
+
+```bash
+pnpm add @nestjs/bullmq bullmq
+```
+
+Module:
+
+```ts
+@Module({
+  imports: [
+    BullModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => {
+        const redisUrl = new URL(config.getOrThrow<string>('REDIS_URL'));
+        return {
+          connection: {
+            host: redisUrl.hostname,
+            port: Number(redisUrl.port || 6379),
+            username: redisUrl.username || undefined,
+            password: redisUrl.password || undefined,
+            tls: redisUrl.protocol === 'rediss:' ? {} : undefined,
+            maxRetriesPerRequest: null,
+          },
+          prefix: 'taskflow',
+        };
+      },
+    }),
+    BullModule.registerQueue({ name: 'notifications' }),
+  ],
+  providers: [NotificationJobs, NotificationWorker],
+  exports: [NotificationJobs],
+})
+export class NotificationsModule {}
+```
+
+Kiểm tra option connection theo [BullMQ connections](https://docs.bullmq.io/guide/connections)
+và client version đang dùng. API/worker có nhu cầu retry connection khác nhau;
+producer trong request nên fail trong budget thay vì treo vô hạn.
+
+---
+
+## 3. Payload là public contract nhỏ, versioned
+
+```ts
+export interface TaskAssignedV1 {
+  schemaVersion: 1;
+  messageId: string;
+  occurredAt: string;
+  tenantId: string;
+  taskId: string;
+  assigneeId: string;
+  traceparent?: string;
+}
+```
+
+Đưa ID + fact cần thiết, không dump Prisma entity/password/token. Payload phải
+JSON-serializable và có size limit. Consumer validate runtime bằng schema trước
+xử lý; TypeScript type không bảo vệ data cũ trong Redis.
+
+Version trong name (`task.assigned.v1`) hoặc envelope. Khi đổi breaking, producer
+dual-publish/consumer dual-read trong migration window; không silently đổi nghĩa
+field cùng version.
+
+---
+
+## 4. Producer và job options
+
+```ts
+@Injectable()
+export class NotificationJobs {
+  constructor(
+    @InjectQueue('notifications')
+    private readonly queue: Queue
+  ) {}
+
+  async enqueueTaskAssigned(event: TaskAssignedV1): Promise<void> {
+    await this.queue.add('task-assigned.v1', event, {
+      jobId: event.messageId,
+      attempts: 5,
+      backoff: { type: 'exponential', delay: 1_000 },
+      removeOnComplete: { age: 86_400, count: 10_000 },
+      removeOnFail: { age: 7 * 86_400, count: 50_000 },
+    });
+  }
+}
+```
+
+`jobId` giúp deduplicate khi job còn tồn tại, nhưng không phải exactly-once: job
+có thể đã bị remove, hoặc worker crash sau effect trước completion. Consumer vẫn
+phải idempotent.
+
+Không retry mọi lỗi:
+
+- transient provider timeout/429/5xx: retry với backoff + jitter/provider hint;
+- invalid payload/unknown version: fail non-retryable, alert/dead letter;
+- user/email không tồn tại theo expected state: business outcome, không loop;
+- auth/config bug: fail-fast, pause worker/alert.
+
+---
+
+## 5. WorkerHost và dispatch theo job name
+
+BullMQ integration dùng một `process()` và dispatch theo name:
+
+```ts
+@Processor('notifications', { concurrency: 10 })
+export class NotificationWorker extends WorkerHost {
+  constructor(private readonly sendTaskAssigned: SendTaskAssignedEmail) {
+    super();
+  }
+
+  async process(job: Job<unknown, void, string>): Promise<void> {
+    switch (job.name) {
+      case 'task-assigned.v1': {
+        const message = taskAssignedV1Schema.parse(job.data);
+        await this.sendTaskAssigned.execute(message);
+        return;
+      }
+      default:
+        throw new UnrecoverableError(`Unsupported job: ${job.name}`);
+    }
+  }
+
+  @OnWorkerEvent('failed')
+  onFailed(job: Job | undefined, error: Error): void {
+    // Log messageId/jobId/name/attempt; không log raw payload nhạy cảm.
+  }
+}
+```
+
+Concurrency dựa trên dependency capacity, không CPU count tùy tiện. Email API
+limit 20 concurrent thì 10 × 5 worker replicas có thể đã quá tải. Tính global
+concurrency/rate limiter.
+
+Tách API producer và worker thành hai process/deployment dùng cùng code/module:
+API không xử lý job, worker không mở public HTTP ngoài health/admin cần thiết.
+Điều này cho phép scale/rollback độc lập và shutdown drain đúng workload.
+
+---
+
+## 6. Idempotent consumer
+
+Thêm inbox marker:
+
+```prisma
+model ProcessedMessage {
+  consumer  String   @db.VarChar(100)
+  messageId String   @map("message_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([consumer, messageId])
+  @@map("processed_messages")
+}
+```
+
+Nếu side effect nằm trong cùng database:
+
+```text
+BEGIN
+  INSERT processed_messages (consumer, messageId)  -- unique
+  apply business change
+COMMIT
+duplicate unique conflict → success/no-op
+```
+
+Marker và effect phải cùng transaction. Check marker rồi effect ngoài transaction
+vẫn race.
+
+Email là external side effect, không atomic với DB. Các lựa chọn:
+
+- provider hỗ trợ idempotency key = messageId;
+- notification delivery row/state machine, provider reference và reconciliation;
+- chấp nhận at-least-once, template nói rõ và đo duplicate risk.
+
+Không tuyên bố exactly-once nếu không chứng minh end-to-end. Phần lớn hệ thống
+đạt **at-least-once delivery + idempotent effect**.
+
+---
+
+## 7. Transactional outbox khép dual-write gap
+
+Sai:
+
+```text
+COMMIT task
+process crash
+queue.add(event) chưa chạy → event mất
+```
+
+Hoặc add trước rồi transaction rollback → event ma. Outbox ghi event cùng
+transaction với task:
+
+```prisma
+model OutboxMessage {
+  id          String    @id @db.Uuid
+  topic       String    @db.VarChar(120)
+  payload     Json
+  occurredAt  DateTime  @map("occurred_at")
+  publishedAt DateTime? @map("published_at")
+  attempts    Int       @default(0)
+  lastError   String?   @map("last_error")
+
+  @@index([publishedAt, occurredAt])
+  @@map("outbox_messages")
+}
+```
+
+Use case transaction:
+
+```ts
+await tx.task.create({ data: taskRecord });
+await tx.outboxMessage.create({
+  data: {
+    id: event.messageId,
+    topic: 'task.assigned.v1',
+    payload: event,
+    occurredAt: new Date(event.occurredAt),
+  },
+});
+```
+
+Dispatcher loop lấy batch bằng PostgreSQL `FOR UPDATE SKIP LOCKED`, publish BullMQ
+job với `messageId`, rồi mark `publishedAt`. Nếu crash sau publish trước mark,
+message được publish lại: consumer idempotency xử lý duplicate.
+
+```text
+DB transaction: business + outbox (atomic)
+                ↓
+dispatcher: unpublished → queue → mark published
+                ↓                  crash gap = duplicate, không mất
+worker: validate → idempotency → effect
+```
+
+Polling interval tạo latency; logical decoding/CDC có trade-off vận hành khác.
+Poller nhiều replica cần row locking/lease. Cleanup/archive outbox theo retention.
+
+---
+
+## 8. Schedule và nhiều replica
+
+[Nest Schedule](https://docs.nestjs.com/techniques/task-scheduling) chạy cron ở
+mỗi process có module. Ba replica có thể chạy cleanup ba lần. Job idempotent vẫn
+tốt, nhưng singleton scheduling cần leader/distributed lock hoặc external
+scheduler enqueue một job có deterministic ID.
+
+Không dùng `@Cron()` trong mọi API replica cho billing/critical workflow mà không
+có ownership, lock, timezone và catch-up policy.
+
+---
+
+## 9. Operate queue như một subsystem
+
+Metrics:
+
+- waiting/active/delayed/failed count;
+- oldest job age/lag (quan trọng hơn queue length);
+- processing duration và attempts;
+- completion/failure by job name/reason class;
+- worker concurrency/utilization;
+- outbox unpublished age/count.
+
+Alert backlog age vượt SLO, poison message loop, Redis connection failure và
+outbox stuck. Dead-letter/retry tooling cần audit + quyền; replay job phải an toàn
+và có dry-run/filter.
+
+---
+
+## Bài tập bắt buộc
+
+1. Thêm Redis/BullMQ và worker process riêng cho notification.
+2. Tạo schema runtime cho `task.assigned.v1`, reject unknown version.
+3. Ghi Task + OutboxMessage cùng transaction; viết dispatcher batch/lock.
+4. Implement idempotency marker và test duplicate job 10 lần.
+5. Test crash gap bằng publish thành công nhưng chưa mark; effect vẫn một lần.
+6. Viết retry/DLQ/replay runbook và dashboard backlog age.
+
+### Acceptance criteria
+
+- Request commit không phụ thuộc email provider.
+- Không có DB + queue dual-write trực tiếp trong use case.
+- Payload nhỏ, versioned, validated, không secret.
+- Worker retry chỉ transient failure và effect idempotent.
+- Nhiều dispatcher/worker replica không mất message.
+- Queue/outbox có SLO, metric, retention và replay procedure.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Queues](https://docs.nestjs.com/techniques/queues)
+- [BullMQ — Documentation](https://docs.bullmq.io/)
+- [NestJS — Task scheduling](https://docs.nestjs.com/techniques/task-scheduling)
+- [Microsoft — Transactional outbox pattern](https://learn.microsoft.com/en-us/azure/architecture/databases/guide/transactional-outbox-cosmos)
+- [PostgreSQL — SKIP LOCKED](https://www.postgresql.org/docs/current/sql-select.html)
+
+Phần 16 dùng committed event để cập nhật UI realtime qua SSE/WebSocket. Realtime
+không được bypass authorization, replay hoặc multi-replica topology.

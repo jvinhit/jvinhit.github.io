@@ -1,0 +1,405 @@
+---
+title: 'NestJS Zero to Hero 11 — Authentication, JWT và Refresh Token Rotation'
+description: 'Xây password login an toàn, access JWT có issuer/audience, global Passport guard, refresh session rotation/reuse detection và logout/revoke có state.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, authentication, jwt, passport, security]
+series: nestjs-zero-to-hero
+seriesOrder: 11
+draft: false
+---
+
+Authentication trả lời **“ai đang gọi?”**. JWT chỉ là một format token; nó không
+tự tạo login an toàn, session revocation hay authorization. Một access token ký
+đúng nhưng sai audience/tenant vẫn không nên được chấp nhận.
+
+Bài này xây identity cho TaskFlow theo flow email/password để học mechanics.
+Production có thể giao việc đăng nhập/MFA/social/enterprise federation cho một
+[OpenID Connect](https://openid.net/developers/how-connect-works/) Identity
+Provider; resource server vẫn phải verify token và authorize request.
+
+Sau bài này, bạn có thể:
+
+- hash password bằng Argon2id và chống user enumeration;
+- phân biệt access token, refresh token và server session;
+- verify JWT signature + algorithm + issuer + audience + expiry;
+- dùng Passport strategy/global guard với public metadata;
+- rotate refresh token và phát hiện token family bị replay.
+
+> Đây là security-sensitive code. Dùng threat model, test, secret rotation và
+> security review; không copy demo thành production mà không điều chỉnh policy.
+
+---
+
+## 1. Ba credential, ba lifecycle
+
+```text
+password
+  └─ chỉ gửi lúc đăng nhập/đổi mật khẩu
+     server lưu slow password hash
+
+access token (JWT, 5–15 phút)
+  └─ bearer credential gọi API
+     resource server verify cục bộ
+
+refresh token (opaque random, ngày/tuần)
+  └─ chỉ gửi tới refresh endpoint
+     server lưu hash + session family để rotate/revoke
+```
+
+Access token ngắn giảm cửa sổ khi bị lộ nhưng khó revoke tức thì nếu hoàn toàn
+stateless. Refresh session có state để logout, revoke thiết bị và reuse detection.
+
+Không đặt password/token/API key trong URL. Không log credential. Với browser
+same-site, refresh token thường ở cookie `HttpOnly; Secure; SameSite`; access
+token có thể giữ trong memory. Không lưu credential dài hạn trong
+`localStorage`; JavaScript/XSS đọc được nó. Xem
+[OWASP Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html).
+
+---
+
+## 2. User và refresh-session schema
+
+```prisma
+model User {
+  id           String           @id @db.Uuid
+  email        String           @unique @db.VarChar(254)
+  passwordHash String           @map("password_hash")
+  disabledAt   DateTime?        @map("disabled_at")
+  sessions     RefreshSession[]
+  createdAt    DateTime         @default(now()) @map("created_at")
+
+  @@map("users")
+}
+
+model RefreshSession {
+  id            String    @id @db.Uuid
+  familyId      String    @map("family_id") @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  tenantId      String    @map("tenant_id") @db.Uuid
+  tokenHash     String    @unique @map("token_hash") @db.Char(64)
+  expiresAt     DateTime  @map("expires_at")
+  rotatedAt     DateTime? @map("rotated_at")
+  revokedAt     DateTime? @map("revoked_at")
+  replacedById  String?   @map("replaced_by_id") @db.Uuid
+  createdAt     DateTime  @default(now()) @map("created_at")
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+  @@index([userId, revokedAt])
+  @@map("refresh_sessions")
+}
+```
+
+Mỗi refresh tạo row/token mới, đánh dấu row cũ đã rotated và nối family. Nếu row
+cũ xuất hiện lần nữa, có replay: revoke cả family.
+
+---
+
+## 3. Password hashing
+
+Cài [argon2](https://github.com/ranisalt/node-argon2):
+
+```bash
+pnpm add argon2
+```
+
+Port:
+
+```ts
+export interface PasswordHasher {
+  hash(password: string): Promise<string>;
+  verify(hash: string, password: string): Promise<boolean>;
+}
+```
+
+Adapter:
+
+```ts
+import argon2 from 'argon2';
+
+@Injectable()
+export class ArgonPasswordHasher implements PasswordHasher {
+  hash(password: string): Promise<string> {
+    return argon2.hash(password, {
+      type: argon2.argon2id,
+      memoryCost: 19 * 1024,
+      timeCost: 2,
+      parallelism: 1,
+    });
+  }
+
+  verify(hash: string, password: string): Promise<boolean> {
+    return argon2.verify(hash, password);
+  }
+}
+```
+
+Thông số là điểm khởi đầu theo
+[OWASP Password Storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html);
+benchmark trên hardware production để đạt cost chấp nhận được và chống DoS bằng
+rate limit. Argon2 tự tạo salt. Không dùng SHA-256 cho password; nó quá nhanh.
+
+Password policy ưu tiên length, breached-password check và MFA thay vì bắt pattern
+rối. Có maximum byte length để tránh abuse, nhưng không silently truncate.
+
+Login luôn trả một lỗi chung:
+
+```ts
+const user = await users.findByNormalizedEmail(email);
+const valid = user
+  ? await passwords.verify(user.passwordHash, password)
+  : await passwords.verify(DUMMY_HASH, password);
+
+if (!user || !valid || user.disabledAt) {
+  throw new InvalidCredentialsError();
+}
+```
+
+Dummy hash giảm timing difference giữa user tồn tại/không tồn tại. Response vẫn
+là `401 INVALID_CREDENTIALS`, không nói email nào đúng.
+
+---
+
+## 4. Access JWT là claim set tối thiểu
+
+Cài Nest JWT + Passport:
+
+```bash
+pnpm add @nestjs/jwt @nestjs/passport passport passport-jwt
+pnpm add -D @types/passport-jwt
+```
+
+Payload:
+
+```ts
+export interface AccessClaims {
+  sub: string; // user ID
+  sid: string; // session ID
+  tenantId: string;
+  type: 'access';
+}
+```
+
+Registered claims `iss`, `aud`, `iat`, `exp`, `jti` do token service thêm. Không
+đặt password hash/secret/PII không cần thiết; JWT thường chỉ base64url-encoded,
+không encrypted.
+
+Ký:
+
+```ts
+await this.jwt.signAsync<AccessClaims>(
+  { sub: userId, sid: sessionId, tenantId, type: 'access' },
+  {
+    secret: config.accessSecret,
+    algorithm: 'HS256',
+    issuer: 'https://auth.taskflow.example',
+    audience: 'taskflow-api',
+    expiresIn: '10m',
+    jwtid: ids.next(),
+  }
+);
+```
+
+Một monolith có thể dùng HMAC secret đủ mạnh. Khi nhiều service chỉ cần verify,
+asymmetric signing giúp resource server giữ public key thay vì signing secret;
+quản lý `kid`/JWKS và rotation. Không chấp nhận algorithm từ token mà không
+allowlist.
+
+---
+
+## 5. Passport JWT strategy và principal
+
+```ts
+import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { PassportStrategy } from '@nestjs/passport';
+import { ExtractJwt, Strategy } from 'passport-jwt';
+import { z } from 'zod';
+
+const accessClaimsSchema = z.object({
+  sub: z.string().uuid(),
+  sid: z.string().uuid(),
+  tenantId: z.string().uuid(),
+  type: z.literal('access'),
+});
+
+export interface Principal {
+  userId: string;
+  sessionId: string;
+  tenantId: string;
+}
+
+@Injectable()
+export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
+  constructor(config: ConfigService) {
+    super({
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      secretOrKey: config.getOrThrow('JWT_ACCESS_SECRET'),
+      algorithms: ['HS256'],
+      issuer: 'https://auth.taskflow.example',
+      audience: 'taskflow-api',
+      ignoreExpiration: false,
+    });
+  }
+
+  validate(payload: unknown): Principal {
+    const result = accessClaimsSchema.safeParse(payload);
+    if (!result.success) throw new UnauthorizedException();
+    const claims = result.data;
+    return {
+      userId: claims.sub,
+      sessionId: claims.sid,
+      tenantId: claims.tenantId,
+    };
+  }
+}
+```
+
+`accessClaimsSchema` là Zod schema kiểm `sub`/`sid`/`tenantId` là UUID và
+`type === 'access'`; annotation TypeScript một mình không validate JWT payload.
+Passport gắn giá trị trả từ `validate()` vào `request.user`. Custom decorator:
+
+```ts
+export const CurrentPrincipal = createParamDecorator(
+  (_data: unknown, context: ExecutionContext): Principal =>
+    context.switchToHttp().getRequest<Request & { user: Principal }>().user
+);
+```
+
+Global guard secure-by-default:
+
+```ts
+@Injectable()
+export class JwtAuthGuard extends AuthGuard('jwt') {
+  constructor(private readonly reflector: Reflector) {
+    super();
+  }
+
+  canActivate(context: ExecutionContext) {
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    return isPublic ? true : super.canActivate(context);
+  }
+}
+```
+
+Register `APP_GUARD`; chỉ login/refresh/liveness có `@Public()`. Swagger docs
+không nên tự động public trong production.
+
+---
+
+## 6. Opaque refresh token và rotation
+
+Tạo 32 random bytes, encode base64url:
+
+```ts
+const refreshToken = randomBytes(32).toString('base64url');
+const tokenHash = createHash('sha256').update(refreshToken).digest('hex');
+```
+
+SHA-256 phù hợp để index token ngẫu nhiên entropy cao; không phù hợp password.
+Chỉ raw token rời server trong response/cookie, database lưu hash.
+
+Rotation transaction:
+
+```text
+hash presented token
+BEGIN
+  find session by tokenHash
+  reject expired/revoked
+  if rotatedAt exists:
+      revoke every row in family  ← replay detected
+      COMMIT + reject 401
+  create replacement session + new random token hash
+  mark old rotatedAt/replacedById
+COMMIT
+issue new access token + return new refresh token
+```
+
+Hai refresh song song cùng token: chỉ một được thắng. Dùng conditional update
+`where rotatedAt IS NULL`/row lock trong transaction; nếu update count là 0,
+đi theo reuse path. Rotation phải atomic.
+
+[OAuth 2.0 Security BCP RFC 9700](https://www.rfc-editor.org/rfc/rfc9700)
+khuyến nghị sender-constrained token hoặc rotation cho public clients và mô tả
+family revocation khi replay.
+
+Logout thu hồi session/family. Password change, user disable, incident hoặc
+tenant membership revoke phải có policy thu hồi. Access JWT đã phát còn sống tới
+expiry nếu không có denylist/introspection; chọn TTL dựa trên risk.
+
+---
+
+## 7. Cookie và CSRF
+
+Same-site browser có thể nhận refresh cookie:
+
+```ts
+response.cookie('taskflow_refresh', refreshToken, {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'lax',
+  path: '/api/v1/auth/refresh',
+  maxAge: refreshTtlMs,
+});
+```
+
+Cookie tự được browser gửi, nên refresh/logout endpoint cần CSRF threat model.
+`SameSite` giúp nhưng không thay mọi control; kiểm Origin và dùng CSRF token khi
+cross-site/use case yêu cầu. CORS không phải CSRF protection. Bài 12 hoàn thiện.
+
+Native client lưu refresh token trong OS secure storage, không cookie. Đừng tạo
+một flow “universal” mà bỏ qua client type.
+
+---
+
+## 8. Security tests
+
+Test matrix:
+
+```text
+login: correct / wrong password / unknown / disabled / rate-limited
+access: missing / malformed / expired / wrong signature / iss / aud / alg / type
+refresh: valid / expired / revoked / rotated replay / same token concurrent
+logout: current session revoked; other device behavior theo contract
+```
+
+Không snapshot raw token. Decode claim để assert rồi verify bằng public contract.
+Test log redaction: password, access token, refresh token không xuất hiện.
+
+---
+
+## Bài tập bắt buộc
+
+1. Thêm User/RefreshSession migrations và Argon2id adapter.
+2. Implement login với generic 401 + dummy hash và login rate limit.
+3. Ký/verify access JWT đủ `alg/iss/aud/exp/type`; global guard + `@Public()`.
+4. Implement refresh rotation atomically và family reuse detection.
+5. Implement logout current session và revoke all sessions.
+6. Viết threat model: XSS, CSRF, token theft, DB leak, replay, brute force.
+
+### Acceptance criteria
+
+- Không plaintext password/token trong database/log.
+- Unknown email và wrong password cùng public response.
+- Access token ngắn hạn, verify đầy đủ claim/algorithm.
+- Refresh token opaque, hash at rest, rotate mỗi lần dùng.
+- Replay token cũ revoke family và phát security event.
+- Protected-by-default; public route có metadata explicit.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Authentication](https://docs.nestjs.com/security/authentication)
+- [NestJS — Passport recipe](https://docs.nestjs.com/recipes/passport)
+- [NestJS JWT](https://github.com/nestjs/jwt)
+- [RFC 7519 — JSON Web Token](https://www.rfc-editor.org/rfc/rfc7519)
+- [RFC 9700 — OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700)
+- [OWASP — Password Storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
+- [OWASP — Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
+
+Phần 12 tách authorization khỏi authentication: role chỉ là coarse-grained,
+resource ownership và tenant isolation mới chặn IDOR/cross-tenant leak.

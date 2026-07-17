@@ -313,6 +313,45 @@ export const SERIES: Record<string, SeriesMeta> = {
       'Lộ trình tiếng Việt gồm 20 phần dành cho kỹ sư muốn hiểu Node.js như một nền tảng production, không chỉ như công cụ dựng API. Series đi từ V8, libuv, event loop, HTTP và Express 5 đến data layer, authentication, testing, performance, delivery và kiến trúc modular monolith; sau đó đào sâu PostgreSQL, Prisma, Redis, NestJS, message queue, GraphQL, gRPC, realtime và observability với OpenTelemetry. Mỗi phần dùng TypeScript, giải thích mental model trước API, phân tích trade-off và failure mode, kèm tiêu chí vận hành, bài tập và tài liệu chính thức để người đọc có thể biến kiến thức thành quyết định kỹ thuật.',
     pin: 5,
   },
+  'nestjs-zero-to-hero': {
+    title: 'NestJS Zero to Hero — Modern TypeScript Back-end Development',
+    description:
+      'Series NestJS 11 gồm 20 bài thực hành: REST API, DI, PostgreSQL, Prisma, auth, testing, queue, realtime, GraphQL, microservices, observability và deployment.',
+    blurb:
+      'Lộ trình tiếng Việt 20 phần biến một project TaskFlow từ HTTP API đầu tiên thành back-end production bằng NestJS 11 và TypeScript strict. Chặng nền tảng giải thích controller, provider, dependency injection, module graph, request lifecycle, config và logging bằng mental model có thể debug. Chặng REST và data thiết kế contract, validation, OpenAPI, PostgreSQL, Prisma, transaction, concurrency, idempotency cùng kiến trúc ports-and-adapters. Chặng chất lượng hoàn thiện authentication, refresh-token rotation, authorization theo policy và tenant, security baseline, testing nhiều tầng, profiling, Fastify, cache và rate limit. Chặng cuối thêm BullMQ, outbox, WebSocket/SSE, GraphQL, microservices/gRPC, OpenTelemetry, health check, graceful shutdown, Docker và CI/CD. Mỗi bài có lab tiếp nối, lệnh chạy, test, failure mode, bài tập và acceptance criteria; capstone cuối series tạo trải nghiệm triển khai một hệ thống NestJS hoàn chỉnh thay vì chỉ học decorator rời rạc.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Nền tảng NestJS và runtime',
+        description:
+          'Tạo TaskFlow API, hiểu controller, provider, DI, module graph, request pipeline, configuration và bootstrap có kiểm soát.',
+        from: 1,
+        to: 6,
+      },
+      {
+        title: 'REST, dữ liệu và kiến trúc',
+        description:
+          'Thiết kế HTTP contract, kết nối PostgreSQL/Prisma, xử lý transaction và đưa business rule vào boundary có thể test.',
+        from: 7,
+        to: 10,
+      },
+      {
+        title: 'Bảo mật, chất lượng và hiệu năng',
+        description:
+          'Xây authentication/authorization đúng nghĩa, khóa hành vi bằng test và đo trước khi tối ưu cache hoặc adapter.',
+        from: 11,
+        to: 14,
+      },
+      {
+        title: 'Async, phân tán và production',
+        description:
+          'Thêm queue, realtime, GraphQL, messaging/gRPC, observability, graceful shutdown và delivery pipeline cho capstone.',
+        from: 15,
+        to: 20,
+      },
+    ],
+    pin: 8,
+  },
   eng: {
     title: 'Practical English for Work',
     blurb:

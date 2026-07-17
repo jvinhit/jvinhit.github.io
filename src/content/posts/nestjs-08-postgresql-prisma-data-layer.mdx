@@ -1,0 +1,376 @@
+---
+title: 'NestJS Zero to Hero 08 — PostgreSQL và Prisma 7 Data Layer'
+description: 'Kết nối PostgreSQL bằng Prisma 7 driver adapter, quản lý schema/migration/client lifecycle và implement repository mà không để ORM rò vào domain.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, postgresql, prisma, database, repository-pattern]
+series: nestjs-zero-to-hero
+seriesOrder: 8
+draft: false
+---
+
+ORM làm query type-safe hơn; ORM không tự thiết kế data model, index, transaction
+hay ownership. Bài này đưa TaskFlow sang PostgreSQL nhưng giữ HTTP/application
+contract ổn định qua `TaskRepository`.
+
+Sau bài này, bạn có thể:
+
+- chạy PostgreSQL local có health check;
+- cấu hình Prisma ORM 7 với `pg` driver adapter;
+- hiểu migration, generated client và pool lifecycle;
+- map database record sang domain model;
+- tránh N+1, unbounded query và nhiều PrismaClient/process.
+
+---
+
+## 1. Chạy PostgreSQL local
+
+Tạo `compose.yml` trong companion TaskFlow project:
+
+```yaml
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: taskflow
+      POSTGRES_PASSWORD: taskflow
+      POSTGRES_DB: taskflow
+    ports:
+      - '5432:5432'
+    volumes:
+      - taskflow_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U taskflow -d taskflow']
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+volumes:
+  taskflow_pg:
+```
+
+```bash
+docker compose up -d postgres
+docker compose ps
+```
+
+`.env.local`:
+
+```dotenv
+DATABASE_URL=postgresql://taskflow:taskflow@localhost:5432/taskflow
+```
+
+Container port chỉ dành local. Production credential, TLS, backup và connection
+pool phải do platform/secret manager quản lý. Xem
+[PostgreSQL documentation](https://www.postgresql.org/docs/current/).
+
+---
+
+## 2. Prisma 7 setup
+
+Cài packages:
+
+```bash
+pnpm add @prisma/client @prisma/adapter-pg pg
+pnpm add -D prisma
+pnpm prisma init --datasource-provider postgresql \
+  --output ../src/generated/prisma
+```
+
+Prisma 7 dùng generator mới và yêu cầu driver adapter cho relational database.
+Nest CLI project mặc định build CommonJS, vì vậy generator cần `moduleFormat`:
+
+```prisma
+// prisma/schema.prisma
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+```
+
+Connection URL của CLI nằm trong `prisma.config.ts`:
+
+```ts
+import 'dotenv/config';
+import { defineConfig, env } from 'prisma/config';
+
+export default defineConfig({
+  schema: 'prisma/schema.prisma',
+  migrations: { path: 'prisma/migrations' },
+  datasource: { url: env('DATABASE_URL') },
+});
+```
+
+Đây là thay đổi quan trọng của [Prisma ORM 7](https://www.prisma.io/docs/guides/upgrade-prisma-orm/v7).
+
+---
+
+## 3. Data model đầu tiên
+
+```prisma
+enum TaskStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+}
+
+model Workspace {
+  id        String   @id @db.Uuid
+  name      String   @db.VarChar(100)
+  tasks     Task[]
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("workspaces")
+}
+
+model Task {
+  id          String     @id @db.Uuid
+  workspaceId String     @map("workspace_id") @db.Uuid
+  title       String     @db.VarChar(120)
+  status      TaskStatus @default(OPEN)
+  version     Int        @default(0)
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+  workspace   Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, status, createdAt(sort: Desc), id(sort: Desc)])
+  @@map("tasks")
+}
+```
+
+Quyết định đáng chú ý:
+
+- UUID do application tạo, dùng được trước insert/outbox.
+- `varchar` length khớp transport/domain nhưng database vẫn là lớp bảo vệ cuối.
+- foreign key bảo vệ task không trỏ workspace ma.
+- index bắt đầu bằng filter phổ biến `workspaceId, status`, rồi sort.
+- `version` dành optimistic concurrency ở phần 9.
+
+Đừng thêm index theo cảm giác. Dùng query thật và `EXPLAIN (ANALYZE, BUFFERS)` để
+kiểm chứng; index tăng write/storage cost.
+
+Tạo migration:
+
+```bash
+pnpm prisma format
+pnpm prisma migrate dev --name init_taskflow
+pnpm prisma generate
+```
+
+Review SQL trong `prisma/migrations/**/migration.sql` trước commit. Production
+chạy `prisma migrate deploy`, không chạy `migrate dev` và không dùng `db push`
+thay migration history.
+
+---
+
+## 4. Một PrismaService cho mỗi process
+
+```ts
+// src/database/prisma.service.ts
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { PrismaClient } from '../generated/prisma/client';
+
+@Injectable()
+export class PrismaService
+  extends PrismaClient
+  implements OnModuleInit, OnModuleDestroy
+{
+  constructor(config: ConfigService) {
+    const connectionString = config.getOrThrow<string>('DATABASE_URL');
+    const adapter = new PrismaPg({ connectionString });
+    super({ adapter });
+  }
+
+  async onModuleInit(): Promise<void> {
+    await this.$connect();
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.$disconnect();
+  }
+}
+```
+
+Module hạ tầng:
+
+```ts
+@Module({
+  providers: [PrismaService],
+  exports: [PrismaService],
+})
+export class DatabaseModule {}
+```
+
+Import `DatabaseModule` ở module sở hữu adapter. Không tạo `new PrismaClient()`
+trong repository/controller. Prisma 7 để pool cho underlying `pg` driver; timeout
+và pool size cần cấu hình theo số process/container × connection budget, không
+copy default từ Prisma 6. Xem
+[Prisma PostgreSQL connector](https://www.prisma.io/docs/orm/core-concepts/supported-databases/postgresql).
+
+---
+
+## 5. Repository adapter giữ ORM ở infrastructure
+
+```ts
+// src/tasks/infrastructure/prisma-task.repository.ts
+import { Injectable } from '@nestjs/common';
+import type { Task as TaskRecord } from '../../generated/prisma/client';
+import { PrismaService } from '../../database/prisma.service';
+import type { Task, TaskStatus } from '../domain/task';
+import type { TaskRepository } from '../application/task.repository';
+
+function toDomain(record: TaskRecord): Task {
+  return {
+    id: record.id,
+    workspaceId: record.workspaceId,
+    title: record.title,
+    status: record.status,
+    version: record.version,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  };
+}
+
+@Injectable()
+export class PrismaTaskRepository implements TaskRepository {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async save(task: Task): Promise<void> {
+    await this.prisma.task.upsert({
+      where: { id: task.id },
+      create: {
+        id: task.id,
+        workspaceId: task.workspaceId,
+        title: task.title,
+        status: task.status,
+        version: task.version,
+      },
+      update: {
+        title: task.title,
+        status: task.status,
+        version: task.version,
+      },
+    });
+  }
+
+  async findById(id: string): Promise<Task | null> {
+    const record = await this.prisma.task.findUnique({ where: { id } });
+    return record ? toDomain(record) : null;
+  }
+
+  async list(input: {
+    workspaceId: string;
+    status?: TaskStatus;
+    cursor?: string;
+    limit: number;
+  }): Promise<Task[]> {
+    const records = await this.prisma.task.findMany({
+      where: { workspaceId: input.workspaceId, status: input.status },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      cursor: input.cursor ? { id: input.cursor } : undefined,
+      skip: input.cursor ? 1 : 0,
+      take: input.limit + 1,
+    });
+    return records.map(toDomain);
+  }
+}
+```
+
+Không trả generated Prisma type khỏi adapter. Nếu schema đổi tên/mapping, domain
+không nên recompile theo mọi chi tiết persistence.
+
+`upsert` tiện nhưng có thể che semantic create/update và overwrite concurrent
+state. Phần 9 sẽ tách method + version check. Hiện tại nó giúp migration từ
+in-memory mà chưa đổi use case.
+
+---
+
+## 6. Query shape và N+1
+
+Chỉ chọn field cần:
+
+```ts
+await prisma.task.findMany({
+  where: { workspaceId },
+  select: {
+    id: true,
+    title: true,
+    status: true,
+    createdAt: true,
+  },
+  take: 21,
+});
+```
+
+N+1 xuất hiện khi list 20 task rồi query assignee 20 lần. Prisma hỗ trợ relation
+query/include/batching, nhưng giải pháp đúng phụ thuộc response shape. Log query
+ở development/test, đo số query trong integration test và thiết kế read query
+cho use case thay vì gọi repository trong loop.
+
+Không `include` toàn graph theo thói quen; payload và join/memory có thể lớn.
+
+---
+
+## 7. Mapping database error
+
+Prisma có error code như unique conflict (`P2002`) và foreign-key conflict.
+Infrastructure adapter nên map known persistence failure sang application error:
+
+```ts
+try {
+  await this.prisma.task.create({ data });
+} catch (error: unknown) {
+  if (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === 'P2002'
+  ) {
+    throw new TaskAlreadyExistsError(data.id);
+  }
+  throw error;
+}
+```
+
+Không trả Prisma error trực tiếp qua HTTP; message có schema/table detail. Unknown
+error đi tới filter, được log server-side và trả `INTERNAL_ERROR`.
+
+---
+
+## Bài tập bắt buộc — lab migration
+
+1. Tạo workspace seed và ba task bằng `prisma/seed.ts` hoặc test fixture.
+2. Restart Nest app; task vẫn tồn tại.
+3. Chuyển binding `TASK_REPOSITORY` từ in-memory sang Prisma adapter; controller
+   và use case không đổi.
+4. Bật query log ở local, xác nhận list endpoint có số query cố định.
+5. Xóa workspace và xác minh cascade behavior là điều bạn thực sự muốn.
+
+### Acceptance criteria
+
+- Migration SQL được review/commit; production command là `migrate deploy`.
+- Một PrismaService/process, connect startup và disconnect shutdown.
+- Pool/timeouts có budget theo số replica.
+- Domain/application không import generated Prisma client.
+- Mọi list query có filter/index/order/limit rõ.
+- Database error không rò qua public API.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Prisma recipe](https://docs.nestjs.com/recipes/prisma)
+- [Prisma ORM 7 upgrade guide](https://www.prisma.io/docs/guides/upgrade-prisma-orm/v7)
+- [Prisma — PostgreSQL](https://www.prisma.io/docs/orm/core-concepts/supported-databases/postgresql)
+- [Prisma Migrate](https://www.prisma.io/docs/orm/prisma-migrate)
+- [Prisma — CRUD](https://www.prisma.io/docs/orm/prisma-client/queries/crud)
+- [PostgreSQL — Indexes](https://www.postgresql.org/docs/current/indexes.html)
+- [PostgreSQL — EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html)
+
+Phần 9 xử lý điều happy-path CRUD bỏ qua: hai request cùng sửa, retry tạo dữ
+liệu trùng, transaction giữ lock quá lâu và side effect không atomic.

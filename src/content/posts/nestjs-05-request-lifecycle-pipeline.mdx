@@ -1,0 +1,393 @@
+---
+title: 'NestJS Zero to Hero 05 — Request Lifecycle và Execution Pipeline'
+description: 'Lần theo middleware, guard, interceptor, pipe, controller và exception filter; đặt auth, validation, logging và error mapping đúng tầng.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, middleware, guards, interceptors, pipes, exception-filters]
+series: nestjs-zero-to-hero
+seriesOrder: 5
+draft: false
+---
+
+Nest có nhiều “điểm móc”: middleware, guard, interceptor, pipe và exception
+filter. Chúng không phải năm cách tương đương để chạy code trước controller.
+Mỗi loại nhìn thấy context khác nhau, có nhiệm vụ và thứ tự riêng.
+
+Sau bài này, bạn có thể:
+
+- vẽ đúng request lifecycle hai chiều;
+- chọn enhancer theo câu hỏi cần trả lời;
+- hiểu global/controller/route binding và thứ tự thực thi;
+- tạo request ID, authorization guard, timing interceptor và error envelope;
+- tránh logic nghiệp vụ trong cross-cutting pipeline.
+
+---
+
+## 1. Bản đồ lifecycle
+
+Với HTTP request thành công:
+
+```text
+request
+  → middleware (global → module)
+  → guards     (global → controller → route)
+  → interceptors.before (global → controller → route)
+  → pipes      (global → controller → route → parameter)
+  → controller handler
+  → service/use case
+  → interceptors.after  (route → controller → global)
+  → response
+```
+
+Khi exception thoát ra, exception filter phù hợp gần nhất xử lý nó. Interceptor
+có thể quan sát/transform cả success lẫn error qua RxJS stream.
+
+Mental model theo câu hỏi:
+
+| Thành phần  | Câu hỏi chính                                              |
+| ----------- | ---------------------------------------------------------- |
+| middleware  | request thô cần enrich/normalize gì trước routing context? |
+| guard       | request này có được vào handler không?                     |
+| interceptor | bao quanh invocation để đo, transform, cache, timeout?     |
+| pipe        | argument này có hợp lệ và cần transform thế nào?           |
+| filter      | exception này map thành transport response nào?            |
+
+[Request lifecycle chính thức](https://docs.nestjs.com/faq/request-lifecycle) là
+trang nên bookmark; đoán thứ tự là nguồn bug rất phổ biến.
+
+---
+
+## 2. Middleware: làm việc với request/response thô
+
+Tạo request ID sớm để mọi log sau đó dùng được:
+
+```ts
+// src/common/http/request-id.middleware.ts
+import { randomUUID } from 'node:crypto';
+import type { NextFunction, Request, Response } from 'express';
+
+export function requestId(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  const incoming = req.header('x-request-id');
+  const id =
+    incoming && /^[a-zA-Z0-9_-]{8,64}$/.test(incoming)
+      ? incoming
+      : randomUUID();
+
+  res.setHeader('x-request-id', id);
+  Reflect.set(req, 'requestId', id);
+  next();
+}
+```
+
+Đăng ký functional middleware trong root module:
+
+```ts
+import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
+
+@Module({ imports: [TasksModule] })
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(requestId).forRoutes('{*splat}');
+  }
+}
+```
+
+`{*splat}` là syntax Express 5 khớp cả root. Middleware phù hợp request ID,
+cookie parser, raw-body capture cho webhook signature. Nó chưa có
+`ExecutionContext` giàu metadata, nên authorization theo handler không thuộc đây.
+
+Luôn gọi `next()` hoặc kết thúc response. Quên cả hai làm request treo.
+
+---
+
+## 3. Guard: quyết định admission
+
+Guard nhận `ExecutionContext`, biết handler và controller đang chạy. Tạm tạo API
+key guard để học mechanics; production auth sẽ ở bài 11.
+
+```ts
+import {
+  CanActivate,
+  ExecutionContext,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
+import type { Request } from 'express';
+
+@Injectable()
+export class ApiKeyGuard implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    const request = context.switchToHttp().getRequest<Request>();
+    const key = request.header('x-api-key');
+    if (key !== process.env.DEV_API_KEY) {
+      throw new UnauthorizedException('Invalid API key');
+    }
+    return true;
+  }
+}
+```
+
+Bind route/controller bằng `@UseGuards(ApiKeyGuard)`, hoặc global qua DI:
+
+```ts
+import { APP_GUARD } from '@nestjs/core';
+
+providers: [ApiKeyGuard, { provide: APP_GUARD, useExisting: ApiKeyGuard }];
+```
+
+Đăng ký global enhancer bằng `APP_GUARD` cho phép guard inject dependency.
+`app.useGlobalGuards(new ApiKeyGuard())` tự `new` có thể bỏ qua container.
+
+Guard trả `false` thường tạo 403; khi credential thiếu/sai, ném 401 có chủ đích.
+Guard nên quyết định quyền dựa trên principal/policy, không đổi task state.
+
+---
+
+## 4. Pipe: validate/transform argument
+
+Built-in `ParseUUIDPipe` từ chối ID sai trước handler:
+
+```ts
+@Get(':taskId')
+findOne(
+  @Param('taskId', new ParseUUIDPipe({ version: '4' })) taskId: string,
+) {
+  return this.getTask.execute(taskId);
+}
+```
+
+Pipe chạy cho parameter đã được route extraction. Nó phù hợp:
+
+- parse string thành integer/boolean/array;
+- validate DTO body/query;
+- normalize một argument có contract rõ.
+
+Không query database trong pipe để “kiểm tra task tồn tại”. Việc đó biến
+validation thành I/O ẩn, khó kiểm soát transaction và có race condition giữa
+check với use case. Use case/repository phải sở hữu existence rule.
+
+Built-in pipes gồm [ParseIntPipe, ParseBoolPipe, ParseArrayPipe và ParseUUIDPipe](https://docs.nestjs.com/pipes#built-in-pipes).
+Validation DTO toàn cục sẽ được hoàn thiện ở bài 7.
+
+---
+
+## 5. Interceptor: bao quanh handler
+
+Interceptor nhận `CallHandler`; `next.handle()` trả Observable. Đo latency:
+
+```ts
+import {
+  CallHandler,
+  ExecutionContext,
+  Injectable,
+  Logger,
+  NestInterceptor,
+} from '@nestjs/common';
+import type { Observable } from 'rxjs';
+import { finalize } from 'rxjs/operators';
+
+@Injectable()
+export class TimingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(TimingInterceptor.name);
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const startedAt = performance.now();
+    const handler = context.getHandler().name;
+    const controller = context.getClass().name;
+
+    return next.handle().pipe(
+      finalize(() => {
+        this.logger.log({
+          event: 'request_completed',
+          controller,
+          handler,
+          durationMs: Number((performance.now() - startedAt).toFixed(2)),
+        });
+      })
+    );
+  }
+}
+```
+
+`finalize()` chạy cả success và error. Không log raw body/token/password. Không
+dùng raw URL có ID làm metric label — cardinality sẽ bùng nổ; observability bài
+19 sẽ dùng route template.
+
+Interceptor cũng có thể:
+
+- map response envelope;
+- timeout handler;
+- cache representation;
+- attach tracing span;
+- bỏ field nhạy cảm qua serialization.
+
+Không dùng interceptor để tự mở transaction chung cho mọi route: transaction
+boundary thuộc use case và không phải request nào cũng cần DB.
+
+---
+
+## 6. Exception filter: map error ở transport boundary
+
+Nest xử lý `HttpException` sẵn. Ta cần stable error contract cho domain error và
+unknown exception:
+
+```ts
+export interface ApiErrorBody {
+  error: {
+    code: string;
+    message: string;
+    requestId?: string;
+  };
+}
+```
+
+Filter toàn cục:
+
+```ts
+import {
+  ArgumentsHost,
+  Catch,
+  ExceptionFilter,
+  HttpException,
+  HttpStatus,
+  Logger,
+} from '@nestjs/common';
+import type { Request, Response } from 'express';
+
+@Catch()
+export class ApiExceptionFilter implements ExceptionFilter {
+  private readonly logger = new Logger(ApiExceptionFilter.name);
+
+  catch(exception: unknown, host: ArgumentsHost): void {
+    const http = host.switchToHttp();
+    const req = http.getRequest<Request>();
+    const res = http.getResponse<Response>();
+    const known = exception instanceof HttpException;
+    const status = known
+      ? exception.getStatus()
+      : HttpStatus.INTERNAL_SERVER_ERROR;
+
+    if (!known) {
+      this.logger.error('Unhandled request error', exception);
+    }
+
+    res.status(status).json({
+      error: {
+        code: known ? `HTTP_${status}` : 'INTERNAL_ERROR',
+        message: known ? exception.message : 'Internal server error',
+        requestId: Reflect.get(req, 'requestId') as string | undefined,
+      },
+    } satisfies ApiErrorBody);
+  }
+}
+```
+
+Đăng ký bằng `APP_FILTER` để filter do DI quản lý. Production không trả stack,
+SQL, path nội bộ hoặc message của unknown error. Log chi tiết ở server với
+request/trace ID; client nhận code ổn định.
+
+Ở bài 10, filter sẽ map `TaskNotFoundError`/`InvalidTransitionError`, để domain
+không import `@nestjs/common`.
+
+---
+
+## 7. Binding scope và thứ tự
+
+Enhancer có thể bind global, controller hoặc route:
+
+```ts
+@UseGuards(WorkspaceMemberGuard)
+@UseInterceptors(TaskSerializationInterceptor)
+@Controller('tasks')
+export class TasksController {
+  @UseGuards(TaskEditorGuard)
+  @Patch(':taskId')
+  update() {}
+}
+```
+
+Incoming guard chạy global → controller → route. Interceptor outgoing unwind
+ngược lại như nested function:
+
+```text
+Global.before
+  Controller.before
+    Route.before
+      handler
+    Route.after
+  Controller.after
+Global.after
+```
+
+Đừng phụ thuộc ngầm vào thứ tự hai global enhancer đăng ký rải rác. Gom
+cross-cutting registration ở một module và viết integration test cho behavior.
+
+---
+
+## Lab quan sát pipeline
+
+Tạo một mảng event chỉ dùng trong test, thêm marker ở mỗi enhancer và handler:
+
+```text
+middleware
+guard:global
+guard:controller
+interceptor:global:before
+interceptor:route:before
+pipe
+handler
+interceptor:route:after
+interceptor:global:after
+```
+
+Gọi route success rồi route ném error. So sánh event. Đây là cách biến lifecycle
+từ kiến thức thuộc lòng thành bằng chứng.
+
+Sau đó thêm endpoint public qua metadata:
+
+```ts
+export const IS_PUBLIC = Symbol('IS_PUBLIC');
+export const Public = () => SetMetadata(IS_PUBLIC, true);
+```
+
+Global guard dùng `Reflector.getAllAndOverride()` trên handler/controller để bỏ
+qua auth. Pattern metadata này sẽ được tái dùng cho permission ở bài 12.
+
+---
+
+## Bài tập bắt buộc
+
+1. Thêm request-ID middleware, trả ID trong success header và error body.
+2. Bind `ApiKeyGuard` global bằng `APP_GUARD`; `/health/live` phải public qua
+   metadata, không hard-code path trong guard.
+3. Thêm timing interceptor; xác minh nó log cả 2xx và 5xx.
+4. Dùng `ParseUUIDPipe` cho mọi task/workspace ID.
+5. Viết E2E test chứng minh pipeline order và unknown error không lộ stack.
+
+### Acceptance criteria
+
+- Mỗi concern được đặt đúng enhancer và có một câu giải thích “vì sao”.
+- Global enhancer được container quản lý, không tự `new` dependency graph.
+- Guard trả đúng 401/403; validation lỗi trước handler.
+- Error body có stable code + request ID, không lộ internal detail.
+- Log không chứa credential/body nhạy cảm.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Request lifecycle](https://docs.nestjs.com/faq/request-lifecycle)
+- [NestJS — Middleware](https://docs.nestjs.com/middleware)
+- [NestJS — Guards](https://docs.nestjs.com/guards)
+- [NestJS — Interceptors](https://docs.nestjs.com/interceptors)
+- [NestJS — Pipes](https://docs.nestjs.com/pipes)
+- [NestJS — Exception filters](https://docs.nestjs.com/exception-filters)
+- [NestJS — Execution context](https://docs.nestjs.com/fundamentals/execution-context)
+- [NestJS — Reflection and metadata](https://docs.nestjs.com/fundamentals/execution-context#reflection-and-metadata)
+
+Phần 6 khóa bootstrap bằng config đã validate và structured logging: app phải
+fail trước khi listen nếu environment sai, không fail ở request đầu tiên.

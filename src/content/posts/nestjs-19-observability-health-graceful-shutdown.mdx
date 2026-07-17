@@ -1,0 +1,355 @@
+---
+title: 'NestJS Zero to Hero 19 — OpenTelemetry, Health Check và Graceful Shutdown'
+description: 'Instrument traces/metrics/logs bằng OpenTelemetry, thiết kế low-cardinality RED metrics, liveness/readiness và shutdown drain HTTP/DB/queue an toàn.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, opentelemetry, observability, health-checks, graceful-shutdown]
+series: nestjs-zero-to-hero
+seriesOrder: 19
+draft: false
+---
+
+Monitoring nói “có vấn đề”; observability giúp hỏi tiếp “vấn đề nằm ở request,
+query, job hay dependency nào?”. Health check nói với orchestrator khi nào route
+traffic; graceful shutdown bảo vệ request/job khi replica bị thay.
+
+Sau bài này, bạn có thể:
+
+- phân biệt log, metric, trace và profile;
+- boot OpenTelemetry trước instrumented library;
+- thiết kế RED/saturation metrics low-cardinality;
+- tách liveness, readiness và startup semantics;
+- drain traffic/worker rồi đóng resource theo thứ tự;
+- viết alert/runbook theo SLO thay vì theo mọi error log.
+
+---
+
+## 1. Bốn tín hiệu, bốn câu hỏi
+
+| Signal   | Trả lời tốt                                                  |
+| -------- | ------------------------------------------------------------ |
+| metrics  | hệ thống có vấn đề bao nhiêu, xu hướng/SLO?                  |
+| traces   | một request/message đã đi qua đâu, mất thời gian ở span nào? |
+| logs     | event/detail cụ thể để điều tra?                             |
+| profiles | CPU/allocation nằm ở function nào theo thời gian?            |
+
+Chúng liên kết bằng `service.name`, environment, trace/span ID, request/message ID.
+Không cố nhét mọi detail vào metric label; cardinality giết time-series backend.
+
+---
+
+## 2. RED + saturation
+
+Cho mỗi route template/operation/job:
+
+- **Rate**: requests/jobs mỗi giây;
+- **Errors**: outcome/status class/error category;
+- **Duration**: histogram bucket phục vụ percentile;
+- **Saturation**: event loop, CPU, memory, DB pool wait, queue lag/concurrency.
+
+Label tốt:
+
+```text
+http.route=/api/v1/tasks/:taskId
+http.request.method=PATCH
+http.response.status_code=409
+deployment.environment=production
+```
+
+Label xấu: raw URL, task ID, user ID, message ID, error message. Những field đó
+ở log/trace attribute có sampling/privacy policy, không ở metric dimension.
+
+Business metrics có ownership: `tasks_created`, `refresh_reuse_detected`,
+`notification_delivery`. Không dùng số business làm security/privacy leak.
+
+---
+
+## 3. OpenTelemetry phải khởi tạo trước Nest/HTTP
+
+[OpenTelemetry](https://opentelemetry.io/docs/) là vendor-neutral API/SDK/
+protocol. JavaScript traces và metrics stable; log signal còn development theo
+status hiện hành, nên structured logger vẫn là đường chính.
+
+Cài bộ tối thiểu theo exporter/instrumentation bạn chọn:
+
+```bash
+pnpm add @opentelemetry/api @opentelemetry/sdk-node \
+  @opentelemetry/auto-instrumentations-node \
+  @opentelemetry/exporter-trace-otlp-proto \
+  @opentelemetry/exporter-metrics-otlp-proto \
+  @opentelemetry/sdk-metrics @opentelemetry/resources \
+  @opentelemetry/semantic-conventions
+```
+
+`src/instrumentation.ts`:
+
+```ts
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-proto';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import { resourceFromAttributes } from '@opentelemetry/resources';
+import { PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import {
+  ATTR_SERVICE_NAME,
+  ATTR_SERVICE_VERSION,
+} from '@opentelemetry/semantic-conventions';
+
+export const telemetrySdk = new NodeSDK({
+  resource: resourceFromAttributes({
+    [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME ?? 'taskflow-api',
+    [ATTR_SERVICE_VERSION]: process.env.APP_VERSION ?? 'dev',
+  }),
+  traceExporter: new OTLPTraceExporter(),
+  metricReader: new PeriodicExportingMetricReader({
+    exporter: new OTLPMetricExporter(),
+  }),
+  instrumentations: [
+    getNodeAutoInstrumentations({
+      '@opentelemetry/instrumentation-fs': { enabled: false },
+    }),
+  ],
+});
+
+telemetrySdk.start();
+```
+
+Load file **trước** app imports, ví dụ CommonJS production:
+
+```bash
+node --require ./dist/instrumentation.js ./dist/main.js
+```
+
+Hoặc import đầu entrypoint nhưng không import instrumented library trước đó. ESM
+loader khác; theo [OTel JS instrumentation libraries](https://opentelemetry.io/docs/languages/js/libraries/)
+cho module format đang build. Auto-instrumentation cần filter sensitive headers/
+URLs và sampling; không bật mọi instrumentation vô điều kiện.
+
+Exporter gửi tới local [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/),
+không hard-code vendor endpoint/API key.
+
+---
+
+## 4. Manual span tại business boundary
+
+Auto spans cho HTTP/DB không biết `CreateTask`. Thêm span có giá trị:
+
+```ts
+const tracer = trace.getTracer('taskflow.tasks');
+
+return tracer.startActiveSpan('CreateTask', async (span) => {
+  try {
+    span.setAttribute('taskflow.tenant_tier', principal.tenantTier);
+    const result = await this.executeCommand(command);
+    span.setStatus({ code: SpanStatusCode.OK });
+    return result;
+  } catch (error: unknown) {
+    span.recordException(asError(error));
+    span.setStatus({ code: SpanStatusCode.ERROR });
+    throw error;
+  } finally {
+    span.end();
+  }
+});
+```
+
+Không attach tenant/user/task ID nếu backend/privacy policy không cho phép; đặc
+biệt không attach payload/token/password. Attribute low-cardinality như tenant
+tier có thể dùng, nhưng review.
+
+Propagate trace context qua HTTP, gRPC và message envelope. Async consumer span
+có thể link producer context nếu processing không cùng synchronous parent tree.
+
+---
+
+## 5. Correlate log với trace
+
+Logger lấy active context:
+
+```ts
+const span = trace.getActiveSpan();
+const spanContext = span?.spanContext();
+
+logger.info({
+  event: 'task_created',
+  traceId: spanContext?.traceId,
+  spanId: spanContext?.spanId,
+  requestId,
+  taskId,
+});
+```
+
+Request context có thể dùng [AsyncLocalStorage](https://nodejs.org/api/async_context.html)
+hoặc logger integration; test propagation qua promise/queue boundary. Không làm
+mọi provider request-scoped chỉ để có request ID.
+
+Log once at ownership boundary; một error không cần 8 stack trace ở mỗi layer.
+Record expected 4xx là outcome/metric, unknown 5xx mới error log. Sampling high-
+volume success logs nhưng không sample security audit theo cùng rule.
+
+---
+
+## 6. Liveness không hỏi database
+
+Cài [Nest Terminus](https://docs.nestjs.com/recipes/terminus):
+
+```bash
+pnpm add @nestjs/terminus
+```
+
+Endpoints:
+
+```text
+/health/live   process/event loop có sống? không gọi dependency
+/health/ready  replica có nhận traffic được? dependency critical trong budget
+/health/start  optional: startup/migration/warmup đã xong?
+```
+
+Nếu liveness gọi DB, DB outage làm orchestrator restart mọi app, tăng connection
+storm và không sửa DB. Readiness mới kiểm PostgreSQL/Redis/broker cần cho route.
+
+```ts
+@Public()
+@Controller('health')
+export class HealthController {
+  constructor(
+    private readonly health: HealthCheckService,
+    private readonly prisma: PrismaHealthIndicator,
+    private readonly readiness: ReadinessState
+  ) {}
+
+  @Get('live')
+  live() {
+    return { status: 'up' };
+  }
+
+  @Get('ready')
+  @HealthCheck()
+  ready() {
+    if (!this.readiness.acceptingTraffic) {
+      throw new ServiceUnavailableException();
+    }
+    return this.health.check([
+      () => this.prisma.pingCheck('database', this.prismaService),
+    ]);
+  }
+}
+```
+
+Mỗi check có timeout ngắn/cached phù hợp; probe mỗi giây không được thành load
+test dependency. Response public không lộ hostname/credential/schema detail.
+
+---
+
+## 7. Graceful shutdown là một sequence
+
+Khi SIGTERM:
+
+```text
+1. mark readiness false
+2. load balancer ngừng gửi traffic mới (có propagation delay)
+3. stop accepting new HTTP/queue work
+4. wait in-flight trong deadline
+5. flush bounded telemetry/outbox state
+6. close worker/broker/Redis/Prisma/HTTP
+7. exit 0; hard deadline → force terminate và alert
+```
+
+Enable Nest hooks:
+
+```ts
+app.enableShutdownHooks(['SIGTERM', 'SIGINT']);
+```
+
+Provider lifecycle:
+
+```ts
+@Injectable()
+export class ReadinessState implements BeforeApplicationShutdown {
+  acceptingTraffic = true;
+
+  beforeApplicationShutdown(): void {
+    this.acceptingTraffic = false;
+  }
+}
+```
+
+`onModuleDestroy`, `beforeApplicationShutdown`, `onApplicationShutdown` có thứ
+tự theo [Nest lifecycle events](https://docs.nestjs.com/fundamentals/lifecycle-events).
+Hooks chỉ chạy khi app đóng/shutdown signal đã enable; `process.exit()` cưỡng bức
+bỏ qua async cleanup.
+
+Worker cần pause intake rồi chờ active job; HTTP server cần drain keep-alive theo
+platform/orchestrator. Shutdown deadline phải nhỏ hơn platform termination grace.
+Telemetry shutdown:
+
+```ts
+await telemetrySdk.shutdown();
+```
+
+Nhưng đặt timeout; exporter outage không được giữ process vô hạn.
+
+---
+
+## 8. Alert từ SLO, không từ tiếng ồn
+
+Alert ví dụ:
+
+- error-budget burn rate nhanh/chậm;
+- p99 vượt SLO đủ window + traffic tối thiểu;
+- readiness replica tụt/capacity thiếu;
+- DB pool wait/timeout;
+- outbox/queue oldest age;
+- refresh replay spike;
+- process restart/OOM.
+
+Mỗi alert có runbook: impact, dashboard/query, recent deploy/config, dependencies,
+mitigation/rollback, escalation và verification. Không alert từng 404 hay một job
+retry đầu tiên.
+
+Dashboard đi từ service overview → route/operation → dependency → trace/log.
+
+---
+
+## 9. Failure drills
+
+1. Tắt PostgreSQL: readiness fail, liveness vẫn up, app không restart loop.
+2. Tắt collector: request vẫn phục vụ trong telemetry backpressure budget.
+3. SIGTERM giữa HTTP request chậm: request hoàn tất hoặc deadline outcome rõ.
+4. SIGTERM worker đang job: job hoàn tất/được redeliver idempotently.
+5. Tạo high-cardinality raw URL: dashboard phát hiện series growth và rule chặn.
+6. Trace HTTP → DB → outbox → consumer → email call bằng cùng correlation.
+
+---
+
+## Bài tập bắt buộc
+
+1. Chạy Collector local, export HTTP/DB traces và service metrics qua OTLP.
+2. Thêm manual spans CreateTask/outbox/notification, propagate message context.
+3. Correlate JSON log với trace/span/request/message ID.
+4. Implement liveness/readiness tách biệt và readiness state khi drain.
+5. Test SIGTERM cho API + worker trong termination deadline.
+6. Tạo SLO dashboard, burn-rate alerts và hai runbook.
+
+### Acceptance criteria
+
+- Telemetry init trước instrumented modules và outage không chặn app vô hạn.
+- Metric label low-cardinality, không secret/ID thô.
+- Trace nối HTTP, SQL, outbox, broker, worker, external call.
+- Liveness độc lập dependency; readiness phản ánh traffic capability.
+- Shutdown ngừng intake, drain bounded, đóng resource đúng thứ tự.
+- Alert gắn SLO/impact và có runbook kiểm chứng recovery.
+
+---
+
+## Tài liệu tham chiếu
+
+- [OpenTelemetry JavaScript](https://opentelemetry.io/docs/languages/js/)
+- [OpenTelemetry JS exporters](https://opentelemetry.io/docs/languages/js/exporters/)
+- [OpenTelemetry Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/)
+- [NestJS — Terminus health checks](https://docs.nestjs.com/recipes/terminus)
+- [NestJS — Lifecycle events](https://docs.nestjs.com/fundamentals/lifecycle-events)
+- [Google SRE — Monitoring distributed systems](https://sre.google/sre-book/monitoring-distributed-systems/)
+
+Phần cuối đóng gói và phát hành TaskFlow: image bất biến, migration an toàn,
+quality gates, rollout/rollback và capstone review biến 19 bài thành kinh nghiệm.

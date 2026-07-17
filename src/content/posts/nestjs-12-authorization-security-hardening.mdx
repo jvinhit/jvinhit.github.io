@@ -1,0 +1,358 @@
+---
+title: 'NestJS Zero to Hero 12 — Authorization, Multi-tenancy và Security Hardening'
+description: 'Thiết kế permission/policy/resource authorization, tenant isolation, chống IDOR và cấu hình Helmet, CORS, CSRF, rate limit, audit log đúng threat model.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, authorization, multi-tenancy, security, owasp]
+series: nestjs-zero-to-hero
+seriesOrder: 12
+draft: false
+---
+
+Token hợp lệ chỉ chứng minh caller đã được xác thực. Nó không chứng minh caller
+được sửa task cụ thể. Lỗi phổ biến nhất trong SaaS là kiểm role ở controller
+nhưng query resource chỉ bằng `id`, khiến user tenant A đọc ID của tenant B.
+
+Sau bài này, bạn có thể:
+
+- phân biệt RBAC, permission, ABAC/resource policy;
+- dùng metadata + guard cho coarse-grained authorization;
+- enforce tenant/ownership trong use case và query;
+- chặn IDOR bằng scoped lookup;
+- cấu hình security header, CORS, CSRF và rate limit có chủ đích.
+
+---
+
+## 1. Authorization có nhiều tầng
+
+```text
+authenticated principal
+  → membership active in tenant?
+  → has coarse permission task:update?
+  → resource belongs to tenant?
+  → policy allows this actor on this task now?
+  → domain invariant allows transition?
+```
+
+Đừng gộp:
+
+- **RBAC**: role `OWNER`, `ADMIN`, `MEMBER` gom permission.
+- **Permission**: action ổn định như `task:read`, `task:update`.
+- **ABAC/policy**: actor/resource/context, ví dụ assignee chỉ đổi status.
+- **Invariant**: `DONE` không mở lại; đây là domain rule, không permission.
+
+Role dễ quản trị ban đầu, policy/resource check cần cho multi-tenant thực tế.
+Tham khảo [OWASP Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html).
+
+---
+
+## 2. Membership là nguồn quyền, không phải client header
+
+```prisma
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+model WorkspaceMember {
+  workspaceId String        @map("workspace_id") @db.Uuid
+  userId      String        @map("user_id") @db.Uuid
+  role        WorkspaceRole
+  revokedAt   DateTime?     @map("revoked_at")
+
+  @@id([workspaceId, userId])
+  @@map("workspace_members")
+}
+```
+
+Access claim `tenantId` cho biết context được cấp lúc token phát. Resource server
+vẫn phải chắc membership/permission chưa bị revoke theo policy freshness. Với
+quyền nhạy cảm, query state hiện tại hoặc dùng permission version/session revoke;
+không tin role nằm trong JWT dài hạn vô điều kiện.
+
+Tenant ID trong header/body chỉ là requested context, không là bằng chứng. Nó
+phải khớp principal/membership.
+
+---
+
+## 3. Coarse permission qua metadata + guard
+
+```ts
+export const REQUIRED_PERMISSIONS = Symbol('REQUIRED_PERMISSIONS');
+
+export const RequirePermissions = (...permissions: Permission[]) =>
+  SetMetadata(REQUIRED_PERMISSIONS, permissions);
+```
+
+```ts
+@Injectable()
+export class PermissionsGuard implements CanActivate {
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly permissions: PermissionQueries
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const required =
+      this.reflector.getAllAndOverride<Permission[]>(REQUIRED_PERMISSIONS, [
+        context.getHandler(),
+        context.getClass(),
+      ]) ?? [];
+
+    if (required.length === 0) return true;
+    const request = context
+      .switchToHttp()
+      .getRequest<Request & { user: Principal }>();
+    const granted = await this.permissions.forPrincipal(request.user);
+    const allowed = required.every((permission) => granted.has(permission));
+    if (!allowed) throw new ForbiddenException();
+    return true;
+  }
+}
+```
+
+Controller:
+
+```ts
+@RequirePermissions('task:update')
+@Patch(':taskId/status')
+updateStatus() {}
+```
+
+Guard là coarse gate. Nó không nên load mọi resource rồi chứa policy phức tạp;
+use case phải kiểm resource-specific rule trong transaction/snapshot phù hợp.
+
+Cache permission cần key gồm user + tenant + permission version và invalidation
+khi membership đổi. Cache global theo user ID thôi có thể trộn tenant.
+
+---
+
+## 4. Scoped lookup chặn IDOR
+
+Sai:
+
+```ts
+const task = await prisma.task.findUnique({ where: { id: taskId } });
+if (!task) throw new TaskNotFoundError();
+// kiểm tenant sau hoặc quên kiểm
+```
+
+Đúng hơn: tenant là phần của lookup:
+
+```ts
+const task = await prisma.task.findFirst({
+  where: {
+    id: taskId,
+    workspace: {
+      tenantId: principal.tenantId,
+      members: {
+        some: { userId: principal.userId, revokedAt: null },
+      },
+    },
+  },
+});
+
+if (!task) throw new TaskNotFoundError(taskId);
+```
+
+Trả 404 cho resource ngoài scope giảm khả năng enumerate. 403 hợp lý khi resource
+được biết nhưng action bị cấm. Chọn convention và test, đừng để mỗi endpoint tự
+quyết định.
+
+Repository port nên bắt buộc scope:
+
+```ts
+findAccessibleById(input: {
+  taskId: string;
+  tenantId: string;
+  actorId: string;
+}): Promise<Task | null>;
+```
+
+API khó gọi sai tốt hơn comment “nhớ filter tenant”. Với shared DB, cân nhắc
+[PostgreSQL Row-Level Security](https://www.postgresql.org/docs/current/ddl-rowsecurity.html)
+như defense-in-depth; nó cần transaction/session context, pool hygiene và test
+cẩn thận, không thay application authorization.
+
+---
+
+## 5. Policy object cho resource action
+
+```ts
+export interface TaskPolicyInput {
+  role: WorkspaceRole;
+  actorId: string;
+  task: Readonly<TaskState>;
+}
+
+export class TaskPolicy {
+  canUpdateStatus(input: TaskPolicyInput): boolean {
+    if (input.role === 'OWNER' || input.role === 'ADMIN') return true;
+    if (input.role === 'MEMBER') {
+      return input.task.assigneeId === input.actorId;
+    }
+    return false;
+  }
+}
+```
+
+Use case:
+
+```ts
+const access = await this.tasks.findAccessibleById(scope);
+if (!access) throw new TaskNotFoundError(command.taskId);
+if (
+  !this.policy.canUpdateStatus({
+    role: access.membership.role,
+    actorId: command.actorId,
+    task: access.task.snapshot(),
+  })
+) {
+  throw new TaskActionForbiddenError();
+}
+access.task.transitionTo(command.status, this.clock.now());
+```
+
+Policy pure function/class có table-driven test. Enforcement vẫn ở use case để
+mọi transport dùng chung.
+
+---
+
+## 6. HTTP security baseline
+
+### Helmet
+
+[Helmet](https://helmetjs.github.io/) đặt security headers:
+
+```bash
+pnpm add helmet
+```
+
+```ts
+import helmet from 'helmet';
+app.use(helmet());
+```
+
+API JSON vẫn hưởng lợi từ headers; Content Security Policy quan trọng hơn nếu
+app phục vụ HTML/Swagger UI. Cấu hình theo resource thật, không copy header rồi
+làm hỏng docs.
+
+### CORS
+
+CORS là browser read policy, không phải authentication/firewall:
+
+```ts
+app.enableCors({
+  origin: ['https://app.taskflow.example'],
+  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+  allowedHeaders: ['content-type', 'authorization', 'idempotency-key'],
+  credentials: true,
+  maxAge: 600,
+});
+```
+
+Không kết hợp wildcard origin với credentials. CLI/curl không bị CORS chặn, nên
+endpoint vẫn phải auth/authz. Xem [Nest CORS](https://docs.nestjs.com/security/cors).
+
+### CSRF
+
+Nếu authentication dùng cookie tự động gửi, state-changing request cần CSRF
+control: SameSite phù hợp, Origin/Referer validation, anti-CSRF token. Bearer
+token trong Authorization header do JavaScript thêm không tự động bị CSRF như
+cookie, nhưng XSS vẫn đánh cắp/use token.
+
+Theo [OWASP CSRF Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html),
+không coi CORS là biện pháp duy nhất.
+
+### Body/content limits
+
+Giới hạn JSON body, file size, query complexity và timeout. Với webhook signature,
+cần raw body đúng byte; Nest có [rawBody option](https://docs.nestjs.com/faq/raw-body).
+Chỉ nhận content type endpoint hỗ trợ, trả safe `application/json`.
+
+---
+
+## 7. Rate limit theo risk và distributed state
+
+Cài [Nest Throttler](https://docs.nestjs.com/security/rate-limiting):
+
+```bash
+pnpm add @nestjs/throttler
+```
+
+```ts
+ThrottlerModule.forRoot([
+  { name: 'short', ttl: 1_000, limit: 5 },
+  { name: 'minute', ttl: 60_000, limit: 100 },
+]);
+```
+
+Bind `ThrottlerGuard` global. Login/forgot-password/refresh có limit riêng theo
+IP + account/session và progressive delay. API authenticated có key theo tenant
+
+- principal để một NAT không khóa cả văn phòng.
+
+In-memory storage chỉ giới hạn từng replica. Multi-replica cần shared Redis store
+hoặc rate limit ở gateway plus app-level high-risk limiter. `X-Forwarded-For` chỉ
+đáng tin khi proxy chain được cấu hình; nếu trust proxy sai, attacker giả IP.
+
+Rate limiting giảm abuse, không thay quota. Quota là business rule atomic theo
+tenant và billing period.
+
+---
+
+## 8. Audit log khác application log
+
+Security-sensitive event:
+
+```text
+who: actorId/sessionId/tenantId
+what: permission/member/task action
+target: resource type + ID
+outcome: allow/deny + reason code
+when: server timestamp
+correlation: requestId/traceId
+source: trusted client/IP metadata theo privacy policy
+```
+
+Audit trail cần append-only/tamper resistance, retention và access control. Không
+ghi secret/body nhạy cảm. Denied authorization có metric/audit sampling phù hợp
+để phát hiện enumeration mà không tạo log DoS.
+
+---
+
+## Bài tập bắt buộc
+
+1. Tạo membership/role/permission map và `RequirePermissions` guard.
+2. Implement TaskPolicy, test matrix role × assignee × action.
+3. Refactor mọi query task thành tenant-scoped lookup; thêm cross-tenant E2E test.
+4. Bật Helmet, exact CORS allowlist, body limit và CSRF control theo client flow.
+5. Rate-limit login/refresh/API bằng key strategy có tài liệu proxy assumptions.
+6. Ghi audit allow/deny cho member management và task delete.
+
+### Acceptance criteria
+
+- Authenticated user không tự động authorized.
+- Tenant/resource scope nằm trong query, không chỉ check sau fetch.
+- Policy áp dụng ở use case cho mọi transport.
+- Cross-tenant ID trả contract không leak và có regression test.
+- CORS/CSRF/rate limit được thiết kế theo browser/proxy/deployment thật.
+- Audit log có actor/action/target/outcome/correlation, không có credential.
+
+---
+
+## Tài liệu tham chiếu
+
+- [NestJS — Authorization](https://docs.nestjs.com/security/authorization)
+- [NestJS — Helmet](https://docs.nestjs.com/security/helmet)
+- [NestJS — CORS](https://docs.nestjs.com/security/cors)
+- [NestJS — CSRF protection](https://docs.nestjs.com/security/csrf)
+- [NestJS — Rate limiting](https://docs.nestjs.com/security/rate-limiting)
+- [OWASP — Authorization](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html)
+- [OWASP — Multi-tenant Security](https://cheatsheetseries.owasp.org/cheatsheets/Multi_Tenant_Security_Cheat_Sheet.html)
+- [OWASP — REST Security](https://cheatsheetseries.owasp.org/cheatsheets/REST_Security_Cheat_Sheet.html)
+
+Phần 13 biến security/correctness thành bằng chứng lặp lại: unit, integration,
+module, E2E, contract và concurrent test mỗi loại bảo vệ một boundary khác nhau.

@@ -1,0 +1,333 @@
+---
+title: 'NestJS Zero to Hero 09 — Transaction, Concurrency và Idempotency'
+description: 'Thiết kế transaction boundary, optimistic concurrency, idempotency key và retry an toàn để TaskFlow đúng khi nhiều request chạy đồng thời.'
+pubDate: 2026-07-17
+lang: vi
+tags: [nestjs, transactions, concurrency, idempotency, postgresql]
+series: nestjs-zero-to-hero
+seriesOrder: 9
+draft: false
+---
+
+Code chạy đúng một request không chứng minh nó đúng. Production có retry từ
+client/load balancer, hai người sửa cùng task, process chết giữa hai write và
+database deadlock. Correctness phải được thiết kế cho interleaving.
+
+Sau bài này, bạn có thể:
+
+- đặt transaction boundary theo use case;
+- phân biệt atomicity, isolation và idempotency;
+- dùng version token cho optimistic concurrency control (OCC);
+- chống duplicate create bằng idempotency key;
+- không giữ database transaction qua network side effect.
+
+---
+
+## 1. Transaction bảo vệ invariant nào?
+
+Transaction là nhóm database operation cùng commit hoặc rollback. Nó không làm
+HTTP call, email hay queue ngoài database trở nên atomic.
+
+Ví dụ `CreateTask` cần:
+
+1. kiểm workspace tồn tại và chưa archive;
+2. insert task;
+3. increment task counter;
+4. ghi audit/outbox.
+
+Nếu bốn write thuộc cùng invariant, chúng cần một transaction. Controller không
+mở transaction vì controller không hiểu toàn use case; repository method đơn lẻ
+cũng không nhìn thấy workflow. Application service sở hữu boundary, còn
+infrastructure cung cấp transaction abstraction.
+
+Prisma interactive transaction:
+
+```ts
+await this.prisma.$transaction(
+  async (tx) => {
+    const workspace = await tx.workspace.findUnique({
+      where: { id: input.workspaceId },
+    });
+    if (!workspace || workspace.archivedAt) {
+      throw new WorkspaceUnavailableError();
+    }
+
+    await tx.task.create({ data: input.task });
+    await tx.workspace.update({
+      where: { id: input.workspaceId },
+      data: { taskCount: { increment: 1 } },
+    });
+    await tx.outboxMessage.create({ data: input.event });
+  },
+  {
+    maxWait: 2_000,
+    timeout: 5_000,
+  }
+);
+```
+
+Transaction phải ngắn. Không gửi email, gọi payment, sleep hoặc chờ third-party
+API bên trong callback; bạn giữ connection/lock trong khi chờ mạng. Ghi outbox
+trong transaction rồi worker publish sau ở bài 15.
+
+---
+
+## 2. Isolation không đồng nghĩa serial execution
+
+Hai transaction vẫn chạy xen kẽ. [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html)
+có các level và anomaly khác nhau. `Read Committed` mặc định phù hợp nhiều CRUD,
+nhưng read-then-write có thể lost update nếu không lock/version.
+
+Timeline:
+
+```text
+T1 read task version=3, status=OPEN
+T2 read task version=3, status=OPEN
+T1 write IN_PROGRESS, version=4
+T2 write DONE,        version=4  ← ghi đè mà không biết
+```
+
+Transaction riêng của T1/T2 không tự ngăn lost update. Cần pessimistic lock hoặc
+optimistic concurrency.
+
+---
+
+## 3. Optimistic concurrency bằng version
+
+Client nhận task version 3 và gửi command kèm expected version:
+
+```json
+{
+  "status": "IN_PROGRESS",
+  "expectedVersion": 3
+}
+```
+
+Repository update có condition:
+
+```ts
+const result = await this.prisma.task.updateMany({
+  where: {
+    id: input.taskId,
+    version: input.expectedVersion,
+  },
+  data: {
+    status: input.status,
+    version: { increment: 1 },
+  },
+});
+
+if (result.count === 0) {
+  const exists = await this.prisma.task.count({ where: { id: input.taskId } });
+  if (exists === 0) throw new TaskNotFoundError(input.taskId);
+  throw new ConcurrentTaskUpdateError(input.taskId);
+}
+```
+
+Map concurrent error thành `409 Conflict`. Có thể dùng HTTP `ETag`/`If-Match`
+thay body version; semantics của [conditional requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Conditional_requests)
+rất phù hợp update resource.
+
+Không retry conflict mù quáng nếu command dựa trên state user đã đọc. Trả state
+mới để client/user quyết định. Retry tự động chỉ hợp lý khi operation có thể
+recompute an toàn.
+
+OCC phù hợp khi conflict hiếm. Với resource tranh chấp cao, cân nhắc atomic SQL,
+row lock hoặc serialize qua queue; đo contention trước.
+
+---
+
+## 4. Idempotency khác optimistic concurrency
+
+- OCC hỏi: “state có đổi từ lúc tôi đọc không?”
+- Idempotency hỏi: “request này có phải retry của operation đã xử lý không?”
+
+POST tạo task không idempotent theo mặc định. Client timeout sau server commit rồi
+retry có thể tạo hai task. Nhận `Idempotency-Key` cho operation tạo:
+
+```text
+POST /api/v1/tasks
+Idempotency-Key: 7b85...
+```
+
+Data model:
+
+```prisma
+model IdempotencyRecord {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  operation   String   @db.VarChar(80)
+  key         String   @db.VarChar(100)
+  requestHash String   @map("request_hash") @db.Char(64)
+  statusCode  Int?     @map("status_code")
+  response    Json?
+  createdAt   DateTime @default(now()) @map("created_at")
+  expiresAt   DateTime @map("expires_at")
+
+  @@unique([tenantId, operation, key])
+  @@index([expiresAt])
+  @@map("idempotency_records")
+}
+```
+
+Algorithm:
+
+```text
+normalize + hash relevant request
+BEGIN
+  INSERT idempotency record (unique tenant, operation, key)
+  execute business writes
+  store status + response snapshot
+COMMIT
+return response
+
+unique conflict on insert
+  → load committed record
+  → same request hash? return saved response
+  → different hash? 409 IDEMPOTENCY_KEY_REUSED
+```
+
+Unique constraint là arbiter; check-then-insert ngoài transaction có race.
+
+Code rút gọn:
+
+```ts
+try {
+  return await this.prisma.$transaction(async (tx) => {
+    await tx.idempotencyRecord.create({ data: reservation });
+    const task = await createTaskWithTx(tx, command);
+    const response = presentTask(task);
+    await tx.idempotencyRecord.update({
+      where: { tenantId_operation_key: uniqueKey },
+      data: { statusCode: 201, response },
+    });
+    return response;
+  });
+} catch (error: unknown) {
+  if (!isUniqueConflict(error)) throw error;
+  const record = await this.prisma.idempotencyRecord.findUniqueOrThrow({
+    where: { tenantId_operation_key: uniqueKey },
+  });
+  if (record.requestHash !== requestHash) {
+    throw new IdempotencyKeyReusedError();
+  }
+  return parseStoredResponse(record.response);
+}
+```
+
+Concurrent duplicate có thể chờ transaction đầu commit rồi nhận unique conflict,
+tùy database isolation/locking. Đặt timeout và contract rõ cho trạng thái đang xử
+lý. Record cần TTL cleanup nhưng TTL không được ngắn hơn retry window.
+
+Key phải scoped theo authenticated tenant + operation. Không dùng key global do
+client chọn để cross-tenant collision/leak.
+
+---
+
+## 5. Retry chỉ cho transient failure và operation an toàn
+
+Retry database deadlock/serialization failure có jitter + cap, nhưng toàn callback
+phải idempotent. Không retry:
+
+- validation/business conflict;
+- unique conflict mang nghĩa domain;
+- authentication/authorization error;
+- unknown failure không phân loại;
+- transaction đã gọi external side effect.
+
+Pseudo helper:
+
+```ts
+for (let attempt = 1; attempt <= 3; attempt += 1) {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!isRetryableTransactionError(error) || attempt === 3) throw error;
+    await delay(withJitter(20 * 2 ** (attempt - 1)));
+  }
+}
+```
+
+Metrics phải đếm retry/conflict; retry ẩn có thể biến database overload thành
+retry storm.
+
+---
+
+## 6. Transaction abstraction không rò Prisma vào use case
+
+Application port:
+
+```ts
+export interface UnitOfWork {
+  execute<T>(work: (ports: TransactionPorts) => Promise<T>): Promise<T>;
+}
+
+export interface TransactionPorts {
+  tasks: TaskRepository;
+  workspaces: WorkspaceRepository;
+  outbox: OutboxRepository;
+}
+```
+
+Prisma adapter tạo các repository dùng transaction client. Use case không import
+`Prisma.TransactionClient`. Đây là thêm abstraction có cost; chỉ dùng cho workflow
+nhiều repository. Với use case nhỏ, một application-specific repository method
+như `createTaskAtomically(command)` đôi khi đơn giản hơn.
+
+Tránh “generic repository + generic unit of work” che mọi khả năng database.
+Port nên nói ngôn ngữ use case.
+
+---
+
+## 7. Tests phải tạo race thật
+
+Unit test không chứng minh unique constraint/locking. Integration test với
+PostgreSQL thật:
+
+```ts
+const attempts = await Promise.allSettled([
+  updateStatus({ taskId, expectedVersion: 0, status: 'IN_PROGRESS' }),
+  updateStatus({ taskId, expectedVersion: 0, status: 'DONE' }),
+]);
+
+expect(attempts.filter((x) => x.status === 'fulfilled')).toHaveLength(1);
+expect(attempts.filter((x) => x.status === 'rejected')).toHaveLength(1);
+```
+
+Idempotency test bắn 10 POST song song cùng key + payload; database phải chỉ có
+một task và mọi successful response cùng ID. Sau đó dùng cùng key khác payload,
+phải nhận 409.
+
+---
+
+## Bài tập bắt buộc
+
+1. Implement update status bằng version condition và map 409.
+2. Expose version qua ETag hoặc response field; viết client retry flow đúng.
+3. Thêm IdempotencyRecord, request hash và TTL cleanup job draft.
+4. Tạo use case ghi task + outbox trong cùng transaction; chưa publish event.
+5. Viết concurrent integration tests cho OCC và idempotency.
+6. Ghi transaction budget: maxWait, timeout, retry count và metric.
+
+### Acceptance criteria
+
+- Transaction boundary nằm ở use case, không ở controller/global interceptor.
+- Không external I/O bên trong DB transaction.
+- Concurrent update không lost update.
+- Retry POST cùng key/payload tạo đúng một effect.
+- Cùng key khác payload bị reject; key scoped tenant + operation.
+- Conflict/retry/transaction duration có metric plan.
+
+---
+
+## Tài liệu tham chiếu
+
+- [Prisma — Transactions](https://www.prisma.io/docs/orm/prisma-client/queries/transactions)
+- [PostgreSQL — Transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html)
+- [PostgreSQL — Explicit locking](https://www.postgresql.org/docs/current/explicit-locking.html)
+- [MDN — Idempotent HTTP methods](https://developer.mozilla.org/en-US/docs/Glossary/Idempotent)
+- [IETF — Idempotency-Key HTTP Header](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)
+- [MDN — Conditional requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Conditional_requests)
+
+Phần 10 gom các quyết định thành kiến trúc ports-and-adapters vừa đủ: domain
+giữ invariant, application điều phối, Nest chỉ ở outer layer.
