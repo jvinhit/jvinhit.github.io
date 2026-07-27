@@ -1,0 +1,688 @@
+---
+title: 'Node.js Production Engineering 26 — Production Game Day Capstone'
+description: 'Ghép toàn series thành Order Platform thực tế: invariant, API, PostgreSQL, payment webhook, outbox, stream export, overload, observability, rollout và incident drills.'
+pubDate: 2026-07-25
+lang: vi
+tags:
+  [
+    nodejs,
+    capstone,
+    system-design,
+    incident-response,
+    reliability,
+    production-engineering,
+  ]
+series: nodejs
+seriesOrder: 26
+draft: false
+---
+
+14:00, release mới đạt canary 10%. 14:07, payment sandbox tăng latency. Client
+mobile retry `POST /orders`. Webhook `payment.succeeded` đến hai lần và trước event
+`processing`. Cùng lúc, một tenant chạy export 8 triệu dòng. 14:10, Kubernetes gửi
+`SIGTERM` cho pod cũ.
+
+Hệ thống của bạn sẽ:
+
+- tạo một hay ba order?
+- charge một hay hai lần?
+- giữ checkout hay để export chiếm hết pool?
+- mất webhook/job nào khi shutdown?
+- alert theo user impact hay chỉ báo CPU đỏ?
+- rollback được khi database schema đã thay đổi?
+
+Capstone này không thưởng cho số package đã cài. Nó đánh giá khả năng giữ
+**business invariant dưới concurrency, partial failure và thay đổi production**.
+
+Sau bài này, bạn sẽ có một blueprint để:
+
+- dựng Order Platform dạng modular monolith + worker;
+- nối HTTP, PostgreSQL, Redis/queue, payment webhook, SSE và object storage;
+- định nghĩa SLO, telemetry, readiness và release contract;
+- chạy sáu game day có expected behavior;
+- tạo portfolio artifact chứng minh tư duy back-end production.
+
+---
+
+## 1. Sản phẩm: Atlas Order Platform
+
+Atlas phục vụ nhiều merchant (tenant):
+
+1. user tạo order từ cart;
+2. hệ thống reserve inventory và tạo payment attempt;
+3. provider gửi webhook cập nhật payment;
+4. order chuyển trạng thái, phát realtime update;
+5. email receipt chạy background;
+6. merchant export order theo thời gian.
+
+Scope cố ý không làm catalog UI, recommendation hay full accounting. Một capstone
+tốt có ít feature nhưng nhiều failure mode được kiểm soát.
+
+### User journeys và SLO
+
+| Journey            | SLI                                                      | SLO minh họa        |
+| ------------------ | -------------------------------------------------------- | ------------------- |
+| create order       | request hợp lệ tạo đúng một order hoặc trả kết quả đã có | 99,9% trong 30 ngày |
+| payment reflection | payment thành công ở provider xuất hiện đúng trong Atlas | 99,95% dưới 2 phút  |
+| order status       | client thấy state mới sau reconnect                      | 99% dưới 5 giây     |
+| export             | job hợp lệ tạo file đầy đủ, không partial public         | 99% dưới 30 phút    |
+
+Các con số chỉ là target lab. Trong sản phẩm thật, chọn theo user need, volume,
+cost và error-budget policy.
+
+## 2. Kiến trúc: boundary rõ trước khi tách service
+
+```text
+                       ┌──────────────────────────┐
+Client ── HTTP/SSE ──▶ │ API process              │
+                       │ identity / ordering      │
+Payment provider ────▶ │ webhook ingress          │
+                       └──────────┬───────────────┘
+                                  │ transaction
+                                  ▼
+                       ┌──────────────────────────┐
+                       │ PostgreSQL               │
+                       │ domain + inbox + outbox  │
+                       └──────────┬───────────────┘
+                                  │ relay/claim
+                   ┌──────────────┴──────────────┐
+                   ▼                             ▼
+          ┌─────────────────┐          ┌──────────────────┐
+          │ Worker process  │          │ Realtime adapter │
+          │ payment/email   │          │ SSE recovery     │
+          │ export/reconcile│          └──────────────────┘
+          └───────┬─────────┘
+                  ▼
+          object storage / email / provider API
+```
+
+API và worker có thể build từ cùng repo/image nhưng chạy entrypoint/resource
+budget khác. Đây vẫn là modular monolith:
+
+- một model domain;
+- module boundary/port rõ;
+- một database ownership;
+- hai process profile vì HTTP và background workload có lifecycle/capacity khác.
+
+Không tách microservice chỉ để capstone trông “senior”.
+
+## 3. Repository layout
+
+```text
+src/
+  domain/
+    ordering/
+      order.ts
+      payment.ts
+      events.ts
+  application/
+    create-order.ts
+    apply-payment-event.ts
+    request-export.ts
+  ports/
+    order-repository.ts
+    payment-provider.ts
+    object-store.ts
+  adapters/
+    http/
+    postgres/
+    payment/
+    queue/
+    storage/
+    telemetry/
+  entrypoints/
+    api.ts
+    worker.ts
+  bootstrap/
+    config.ts
+    container.ts
+    shutdown.ts
+```
+
+Dependency rule:
+
+```text
+entrypoint/adapters → application → domain
+                ports ←───────────┘
+```
+
+Domain không import Express, Prisma, payment SDK hoặc OpenTelemetry. Composition
+root tạo adapter và inject port.
+
+## 4. Viết invariant trước schema và endpoint
+
+| Invariant                                           | Lớp bảo vệ                                        |
+| --------------------------------------------------- | ------------------------------------------------- |
+| một logical create request tạo tối đa một order     | idempotency row + unique constraint + transaction |
+| order chỉ chứa item/inventory của cùng tenant       | tenant context + composite FK/RLS                 |
+| amount/currency gửi provider khớp order server-side | domain validation + persisted attempt             |
+| một payment success chỉ ghi ledger credit một lần   | unique business key                               |
+| webhook duplicate không lặp side effect             | inbox PK + idempotent transition + outbox         |
+| export partial không public                         | temp object + metadata commit + publish protocol  |
+| một tenant không chiếm hết checkout capacity        | workload/tenant concurrency budget                |
+| deploy không nhận traffic trước khi ready           | startup/readiness/release contract                |
+
+Nếu invariant chỉ tồn tại trong README mà schema/test không giữ nó, đó là mong
+muốn, chưa phải thiết kế.
+
+## 5. State machine của Order và Payment
+
+```text
+Order:
+draft → pending_payment → confirmed → fulfillment → completed
+   └───────────────▶ canceled
+
+Payment:
+created → requires_action → processing → succeeded
+   └───────────────▶ failed/canceled
+succeeded → refund_pending → partially_refunded → refunded
+```
+
+Không để mọi event tùy ý set status:
+
+```ts
+class Order {
+  confirm(payment: SettledPayment): DomainEvent[] {
+    if (this.status === 'confirmed') return [];
+    if (this.status !== 'pending_payment') {
+      throw new InvalidOrderTransition(this.status, 'confirmed');
+    }
+    if (payment.orderId !== this.id || !payment.amount.equals(this.total)) {
+      throw new PaymentMismatch();
+    }
+
+    this.status = 'confirmed';
+    return [
+      new OrderConfirmed({
+        tenantId: this.tenantId,
+        orderId: this.id,
+      }),
+    ];
+  }
+}
+```
+
+Idempotent transition có thể no-op khi cùng outcome đã áp dụng. Transition ngược/
+mismatch phải thành anomaly hoặc reconciliation, không silently overwrite.
+
+## 6. API contract
+
+### Tạo order
+
+```http
+POST /v1/tenants/{tenantId}/orders
+Idempotency-Key: 8ee8...
+Content-Type: application/json
+```
+
+```json
+{
+  "cartId": "cart_123",
+  "paymentMethodId": "pm_opaque"
+}
+```
+
+Server tự đọc price/currency/tenant từ source of truth. Response:
+
+```http
+201 Created
+Location: /v1/tenants/.../orders/order_456
+```
+
+Retry cùng key + cùng canonical request trả representation/order cũ. Cùng key +
+payload khác trả `409 IDEMPOTENCY_CONFLICT`.
+
+### Webhook
+
+```http
+POST /webhooks/payment
+Payment-Signature: ...
+```
+
+Raw-body verify → durable inbox → `204`. Không cần tenant path vì tenant được map
+từ provider account/payment object đã verify.
+
+### Export
+
+```http
+POST /v1/tenants/{tenantId}/order-exports
+```
+
+Trả `202 Accepted`:
+
+```json
+{
+  "exportId": "exp_789",
+  "statusUrl": "/v1/tenants/.../order-exports/exp_789"
+}
+```
+
+Tác vụ dài không giữ HTTP connection. Download URL chỉ sinh sau authorization và
+có expiry ngắn.
+
+## 7. Transaction boundaries
+
+### Create order
+
+```text
+BEGIN
+  claim/create idempotency record
+  lock/read cart + inventory snapshot
+  validate price/tenant/stock
+  create order pending_payment
+  create payment_attempt(operation_key, request_hash)
+  write outbox PaymentRequested
+  store idempotency response reference
+COMMIT
+```
+
+Không gọi payment provider trong transaction dài. Worker đọc outbox, gọi provider
+với persisted idempotency key rồi lưu provider ID. Nếu business bắt buộc synchronous
+payment handoff, transaction vẫn đóng trước network call và state machine phải
+xử lý ambiguous result.
+
+### Apply payment webhook
+
+```text
+BEGIN
+  lock inbox/payment/order
+  verify provider object ↔ tenant/order/amount/currency
+  apply guarded transition
+  insert unique ledger entry
+  write OrderConfirmed + ReceiptRequested outbox
+  mark inbox processed
+COMMIT
+```
+
+Email và realtime không nằm trong transaction. Outbox relay khiến chúng được
+delivery at-least-once; consumer idempotent.
+
+## 8. PostgreSQL schema tối thiểu
+
+Không cần copy toàn DDL, nhưng các constraint này là cốt lõi:
+
+```sql
+CREATE TABLE orders (
+  tenant_id uuid NOT NULL,
+  id uuid NOT NULL,
+  status text NOT NULL,
+  total_minor bigint NOT NULL CHECK (total_minor >= 0),
+  currency text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, id)
+);
+
+CREATE TABLE idempotency_records (
+  tenant_id uuid NOT NULL,
+  operation text NOT NULL,
+  key text NOT NULL,
+  request_hash text NOT NULL,
+  resource_id uuid,
+  status text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  PRIMARY KEY (tenant_id, operation, key)
+);
+
+CREATE TABLE outbox_events (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL,
+  aggregate_type text NOT NULL,
+  aggregate_id uuid NOT NULL,
+  type text NOT NULL,
+  version integer NOT NULL,
+  payload jsonb NOT NULL,
+  occurred_at timestamptz NOT NULL,
+  published_at timestamptz
+);
+```
+
+Thêm RLS, composite FK, payment inbox/attempt/ledger và export metadata như Phần
+24–25. Status dùng `CHECK`/reference phù hợp migration strategy; database enum có
+trade-off khi thêm state.
+
+Index theo query/claim:
+
+```sql
+CREATE INDEX outbox_unpublished_idx
+ON outbox_events (occurred_at, id)
+WHERE published_at IS NULL;
+```
+
+Load test và `EXPLAIN` claim query ở backlog thật; partial index không tự giải mọi
+contention.
+
+## 9. Capacity budget
+
+Ví dụ cho một API replica:
+
+```text
+HTTP in-flight total             200
+checkout lane                     80
+read lane                        100
+admin/export request lane         20
+Postgres pool                     30
+  reserved health/control          2
+  interactive                     23
+  worker/export                     5 (worker process có pool riêng tốt hơn)
+```
+
+Worker:
+
+```text
+payment calls concurrency         20
+email concurrency                 50
+export jobs per instance           2
+DB batch size                    500
+object upload parts in-flight      4
+```
+
+Con số đến từ load/capacity test, không từ blog. Ghi owner và metric cho từng
+budget. Khi bão hòa:
+
+- checkout hết lane → `503` sớm, client retry cùng idempotency key;
+- tenant vượt quota → `429`;
+- export nằm queue, không mượn checkout DB pool;
+- webhook chưa lưu inbox → `503` để provider retry;
+- webhook đã lưu → `204`, worker có thể backlog trong SLA.
+
+## 10. Observability contract
+
+### Trace
+
+```text
+POST /orders
+  → idempotency.claim
+  → postgres transaction
+  → outbox append
+
+worker payment.request
+  link(outbox event context)
+  → provider.create_payment
+
+POST /webhooks/payment
+  → signature.verify
+  → inbox.accept
+
+worker webhook.process
+  link(provider event / ingress trace)
+  → order.confirm
+  → ledger.append
+  → outbox append
+```
+
+Async work dùng span link khi thời gian chờ dài; trace không thay audit.
+
+### Metrics
+
+- SLI good/bad events;
+- HTTP RED theo route template;
+- admission active/queued/rejected;
+- DB pool wait + transaction conflict;
+- outbox/inbox oldest age;
+- payment attempts ambiguous/reconciled;
+- export queue age/throughput/temp object age;
+- SSE recovery success;
+- event-loop delay, heap/RSS/external;
+- shutdown drain/forced count.
+
+### Log/audit
+
+Structured log có `traceId`, order/payment/event reference; redact token, raw
+webhook và PII. Immutable audit ghi actor chain, tenant, action, resource,
+decision/reason. Không dùng log sampling cho financial audit record.
+
+## 11. Health và shutdown
+
+```text
+startup: config/schema/runtime prerequisites đã sẵn sàng?
+liveness: process còn tiến bộ hay deadlock?
+readiness: instance có nên nhận traffic mới?
+```
+
+Readiness không gọi mọi dependency qua network ở mỗi probe. Nó phản ánh local
+ability/admission và critical initialization với timeout/cache phù hợp.
+
+Shutdown API:
+
+1. readiness false;
+2. stop new HTTP, drain request/SSE;
+3. finish/cancel theo operation semantics;
+4. close DB/cache;
+5. flush telemetry trong budget.
+
+Shutdown worker:
+
+1. stop claiming inbox/outbox/job mới;
+2. extend/finish hoặc release lease;
+3. abort export temp upload nếu không thể hoàn tất;
+4. close dependency/telemetry.
+
+Test signal khi đang ở từng điểm transaction/network call. “Chạy local rồi Ctrl+C
+không lỗi” chưa phải shutdown test.
+
+## 12. Delivery: expand–migrate–contract
+
+Release ví dụ thêm `payment_attempts.provider_account_id`:
+
+1. expand nullable column + index non-blocking strategy;
+2. deploy code ghi field mới, vẫn đọc compatible;
+3. backfill có checkpoint/rate limit;
+4. verify coverage/constraint;
+5. deploy code yêu cầu field;
+6. contract `NOT NULL` theo safe migration;
+7. xóa compatibility path ở release sau.
+
+Canary:
+
+- 5% traffic/tenant cohort có thể so sánh;
+- version attribute trong metrics/traces;
+- automated check SLO/error/pool wait/memory slope;
+- rollback application không yêu cầu rollback destructive schema;
+- stop rollout khi evidence vượt threshold.
+
+Build một image, promote digest qua environment. Migration là release job một lần,
+không chạy từ mọi replica startup.
+
+## 13. Game Day 1 — dependency chậm
+
+**Inject:** payment API từ 100 ms thành 4 giây, 5% `503`.
+
+**Expected:**
+
+- deadline/cancellation có budget;
+- payment worker concurrency hữu hạn;
+- retry chỉ transient, có jitter và persisted idempotency key;
+- circuit mở theo operation sau threshold;
+- checkout HTTP không cạn pool vì payment async;
+- queue age tăng nhưng trong SLO hoặc alert;
+- dependency hồi phục không có retry storm.
+
+**Fail nếu:** heap/in-flight tăng không giới hạn, tạo duplicate payment, hoặc phải
+restart toàn fleet mới hồi.
+
+## 14. Game Day 2 — duplicate và out-of-order webhook
+
+**Inject:**
+
+- gửi cùng event 20 lần đồng thời;
+- gửi `succeeded` trước `processing`;
+- gửi cùng event ID nhưng đổi một byte payload;
+- worker crash sau ledger insert trước khi process kết thúc.
+
+**Expected:**
+
+- inbox nhận một row cho duplicate cùng hash;
+- một ledger success/OrderConfirmed/receipt;
+- invalid transition được ignore/reconcile có audit;
+- payload mismatch tạo security alert;
+- restart worker hội tụ đúng state.
+
+Đếm side effect ở database/email fake, không chỉ assert HTTP `204`.
+
+## 15. Game Day 3 — noisy tenant và pool saturation
+
+**Inject:** tenant A tạo 50 export lớn; tenant B checkout bình thường.
+
+**Expected:**
+
+- A bị quota/queue;
+- export worker dùng pool/budget riêng;
+- B checkout giữ SLO mục tiêu;
+- query timeout và cancel giải phóng connection;
+- dashboard chỉ ra tenant/workload gây saturation mà không dùng tenant ID làm
+  metric cardinality vô hạn.
+
+**Fail nếu:** scale API replica làm database tệ hơn vì tổng pool vượt limit.
+
+## 16. Game Day 4 — stream abort và memory
+
+**Inject:** export dữ liệu lớn hơn heap nhiều lần, object sink chậm, cancel giữa
+chừng.
+
+**Expected:**
+
+- backpressure giữ RSS plateau;
+- cursor/upload nhận abort;
+- temp object không public và được cleanup/sweeper bắt;
+- export state retry/canceled rõ;
+- không ảnh hưởng event-loop p99 của API process.
+
+Chụp memory time series. “Process không crash trong 5 phút” là tiêu chí quá yếu.
+
+## 17. Game Day 5 — rolling deploy + SIGTERM
+
+**Inject:** deploy giữa checkout, webhook processing, SSE connection và export.
+
+**Expected:**
+
+- readiness false trước khi drain;
+- HTTP request hợp lệ hoàn tất hoặc retry an toàn;
+- SSE client reconnect + recover bằng event ID;
+- worker không claim mới, lease/job không mất;
+- telemetry cuối được flush;
+- termination trong grace period, force-close metric bằng 0 hoặc giải thích được.
+
+Tiếp tục load trong lúc rollout để phát hiện reconnect storm/capacity dip.
+
+## 18. Game Day 6 — observability backend mất
+
+**Inject:** Collector/exporter không nhận dữ liệu 10 phút.
+
+**Expected:**
+
+- business request không block/fail vì telemetry;
+- queue/buffer telemetry hữu hạn, drop policy rõ;
+- có signal về telemetry loss từ đường độc lập nếu khả thi;
+- service memory không tăng vô hạn;
+- sau hồi phục không tạo export storm kéo p99 business.
+
+Observability là dependency cần reliability policy, không phải code “vô hình”.
+
+## 19. Test portfolio
+
+| Tầng                   | Evidence                                            |
+| ---------------------- | --------------------------------------------------- |
+| domain unit/property   | state transition, money, invariant                  |
+| repository integration | constraint, RLS, transaction/idempotency            |
+| API component          | auth, tenant, error/idempotency contract            |
+| webhook integration    | raw body/signature/inbox                            |
+| contract               | payment provider fake/schema/version                |
+| concurrency            | duplicate create/event, locking                     |
+| migration              | old/new app cùng schema                             |
+| load                   | SLO, capacity, slow dependency/sink                 |
+| recovery               | worker crash, reconcile, shutdown                   |
+| security               | cross-tenant, replay, admin audit, secret redaction |
+
+Test portfolio theo risk. Không cần mock mọi class hoặc đạt 100% line coverage.
+
+## 20. Production readiness review
+
+### Product và data
+
+- [ ] Journey/SLO/error semantics được product + engineering hiểu giống nhau.
+- [ ] Invariant có lớp bảo vệ domain + database + test.
+- [ ] Data ownership, retention, backup/restore và reconciliation rõ.
+
+### Security
+
+- [ ] Threat model cho identity, tenant, webhook, admin và file export.
+- [ ] Least privilege runtime/migration/admin role.
+- [ ] Secret/PII không vào code, image, log, trace hoặc temp public object.
+
+### Reliability
+
+- [ ] Deadline/cancel/concurrency/retry budget end-to-end.
+- [ ] Queue/cache/outbox/inbox có failure/recovery semantics.
+- [ ] Idempotency ở request, provider call và consumer side effect.
+
+### Delivery
+
+- [ ] Immutable artifact, migration compatible, canary/rollback threshold.
+- [ ] Readiness/liveness/startup và graceful shutdown đã test dưới tải.
+- [ ] Capacity tổng pool/worker/replica nằm trong dependency envelope.
+
+### Operations
+
+- [ ] Dashboard đi từ SLI tới dependency/resource.
+- [ ] Alert có owner, runbook, recent deploy và action.
+- [ ] Game day evidence, postmortem template và on-call access đã sẵn sàng.
+
+## 21. Portfolio artifacts đáng giá
+
+Đừng chỉ đưa GitHub repo. Tạo:
+
+1. architecture diagram + ADR “vì sao modular monolith”;
+2. invariant catalog và threat model;
+3. OpenAPI/webhook/event schema;
+4. migration/rollback plan;
+5. load report có workload, percentile, coordinated-omission note và capacity;
+6. dashboard screenshot với cardinality policy;
+7. một incident report từ game day gồm timeline, evidence, fix, verification;
+8. README chạy local bằng một lệnh và seed hai tenant.
+
+Khi phỏng vấn, giải thích một trade-off:
+
+> “Em tách API và worker process nhưng giữ một modular monolith vì workload
+> lifecycle khác, còn domain/data ownership chưa có lý do tách service. Export có
+> pool và concurrency riêng để tenant lớn không ảnh hưởng checkout.”
+
+Câu đó chứng minh judgment nhiều hơn “dùng microservices, Redis, Kafka”.
+
+## Nếu chỉ nhớ 7 điều
+
+1. Bắt đầu bằng user journey và invariant, không bằng stack.
+2. Exactly-once là outcome từ idempotency + transaction + constraint, không phải
+   thuộc tính kỳ diệu của transport.
+3. Mọi queue, pool, retry và buffer phải hữu hạn.
+4. Tenant isolation gồm cả dữ liệu lẫn capacity.
+5. Webhook cho tốc độ; reconciliation cho tính đầy đủ.
+6. Release chỉ an toàn khi schema, app cũ/mới, signal và rollback được test cùng
+   nhau.
+7. Production engineering là khả năng đưa ra bằng chứng khi hệ thống hỏng.
+
+## Tài liệu nền
+
+- [Node.js documentation — Node 24 LTS](https://nodejs.org/docs/latest-v24.x/api/)
+- [PostgreSQL documentation](https://www.postgresql.org/docs/current/)
+- [OpenTelemetry documentation](https://opentelemetry.io/docs/)
+- [OWASP API Security Top 10](https://owasp.org/API-Security/)
+- [Google SRE Workbook](https://sre.google/workbook/table-of-contents/)
+- [Kubernetes: Pods and containers](https://kubernetes.io/docs/concepts/workloads/pods/)
+
+## Kết thúc volume thực chiến
+
+Hai mươi phần đầu xây bản đồ; sáu phần cuối buộc bản đồ đi qua địa hình xấu. Bạn
+không hoàn thành series khi đã đọc hết 26 bài. Bạn hoàn thành khi có thể nhìn một
+failure mới và tự hỏi theo phản xạ:
+
+```text
+user outcome nào đang hỏng?
+invariant nào bị đe dọa?
+resource/boundary nào đã vượt budget?
+evidence nhỏ nhất nào phân biệt các hypothesis?
+mitigation nào reversible?
+test và guardrail nào ngăn sự cố lặp lại?
+```
+
+Framework sẽ đổi. Node.js sẽ thêm API. Provider và hạ tầng sẽ thay version. Chuỗi
+câu hỏi này bền hơn — và đó là năng lực thật sự của một production engineer.

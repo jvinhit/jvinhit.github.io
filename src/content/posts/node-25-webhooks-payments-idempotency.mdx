@@ -1,0 +1,576 @@
+---
+title: 'Node.js Production Engineering 25 — Webhook, Payment và Idempotency'
+description: 'Xử lý webhook đáng tin cậy: raw-body signature, replay defense, inbox, duplicate/out-of-order event, payment state machine, reconciliation và audit.'
+pubDate: 2026-07-25
+lang: vi
+tags:
+  [
+    nodejs,
+    webhooks,
+    payments,
+    idempotency,
+    distributed-systems,
+    production-engineering,
+  ]
+series: nodejs
+seriesOrder: 25
+draft: false
+---
+
+Khách hàng thanh toán một lần nhưng nhận hai email, hai dòng ledger và hai lần
+cộng credit. Log cho thấy payment provider “gọi webhook hai lần”. Team kết luận
+provider lỗi.
+
+Provider không hứa exactly-once. Endpoint lần đầu đã xử lý xong nhưng trả response
+muộn; provider không biết kết quả nên giao lại. Duplicate là hành vi bình thường
+của delivery đáng tin cậy. Bug nằm ở consumer đã biến event thành side effect
+không idempotent.
+
+Webhook production phải sống được với bốn sự thật:
+
+```text
+delivery có thể trùng
+delivery có thể trễ
+event có thể sai thứ tự
+response/request outbound có thể mất dù side effect đã xảy ra
+```
+
+Sau bài này, bạn có thể:
+
+- verify signature trên raw body và chống replay;
+- ingest nhanh vào durable inbox trước khi trả `2xx`;
+- xử lý duplicate/concurrency bằng unique constraint;
+- thiết kế payment state machine chịu out-of-order;
+- dùng idempotency key cho outbound payment request;
+- reconcile provider với ledger nội bộ và điều tra drift.
+
+> Bài dùng payment làm case study vì hậu quả rõ, không phải hướng dẫn tích hợp một
+> provider cụ thể. Tên event/API phải đối chiếu tài liệu và version của provider
+> bạn dùng.
+
+---
+
+## 1. Webhook là message delivery qua HTTP
+
+Đừng thiết kế webhook như controller CRUD bình thường:
+
+```text
+provider
+  → HTTP transport
+  → authenticity + replay check
+  → durable inbox
+  → acknowledge 2xx
+  → worker/state transition
+  → business outbox
+  → email/ledger/entitlement
+```
+
+HTTP chỉ là transport. Event processing vẫn cần các nguyên tắc message queue:
+at-least-once, idempotency, retry, poison message, ordering và observability.
+
+Không làm toàn bộ business flow trước khi trả `2xx`. Một email service chậm có
+thể khiến provider retry payment event dù payment đã được ghi. Ingest ngắn và
+durable tách provider delivery SLA khỏi processing SLA.
+
+## 2. Verify raw bytes trước khi parse
+
+Signature thường được tính trên **đúng byte payload**. Nếu JSON middleware parse
+rồi stringify lại, whitespace, order hoặc encoding có thể đổi và signature fail.
+
+Với Express, route webhook cần raw body trước JSON middleware chung:
+
+```ts
+import express from 'express';
+
+const app = express();
+
+app.post(
+  '/webhooks/payment',
+  express.raw({ type: 'application/json', limit: '1mb' }),
+  paymentWebhook
+);
+
+app.use(express.json({ limit: '256kb' }));
+```
+
+Handler:
+
+```ts
+async function paymentWebhook(req: express.Request, res: express.Response) {
+  const rawBody = req.body;
+  if (!Buffer.isBuffer(rawBody)) {
+    res.status(400).send('raw body required');
+    return;
+  }
+
+  const signature = req.get('payment-signature');
+  if (!signature) {
+    res.status(400).send('signature required');
+    return;
+  }
+
+  let event: PaymentEvent;
+  try {
+    event = verifier.verifyAndParse(rawBody, signature);
+  } catch {
+    res.status(400).send('invalid signature');
+    return;
+  }
+
+  await inbox.accept(event, rawBody);
+  res.status(204).end();
+}
+```
+
+Ưu tiên official SDK verifier. Tự viết HMAC dễ sai ở:
+
+- signed payload format;
+- nhiều signature/version trong cùng header;
+- timestamp tolerance;
+- constant-time comparison;
+- secret rotation;
+- encoding;
+- algorithm/version migration.
+
+Không log raw body/signature. Payment payload có thể chứa PII hoặc identifier
+nhạy cảm.
+
+## 3. Signature không tự chống replay
+
+Một request hợp lệ bị capture rồi gửi lại vẫn có signature hợp lệ. Defense:
+
+1. signature bao gồm timestamp do provider ký;
+2. reject timestamp ngoài tolerance hợp lý;
+3. unique event ID trong inbox;
+4. TLS và endpoint secret rotation;
+5. event retention đủ dài cho replay window/reconciliation.
+
+Server clock phải được đồng bộ. Tolerance quá rộng tăng replay window; quá hẹp làm
+delivery hợp lệ fail khi clock/network lệch.
+
+IP allowlist có thể là thêm một lớp nếu provider công bố range ổn định, nhưng
+không thay signature: proxy/CDN, range rotation và source spoofing assumptions
+làm IP policy dễ giòn.
+
+Khi rotate secret, có thể cần cửa sổ chấp nhận secret cũ + mới. Theo dõi
+`verified_with_secret_version`, không log secret.
+
+## 4. Durable inbox là điểm acknowledge
+
+Schema:
+
+```sql
+CREATE TABLE payment_webhook_inbox (
+  provider text NOT NULL,
+  event_id text NOT NULL,
+  event_type text NOT NULL,
+  provider_created_at timestamptz NOT NULL,
+  received_at timestamptz NOT NULL DEFAULT now(),
+  payload_hash text NOT NULL,
+  payload jsonb NOT NULL,
+  status text NOT NULL DEFAULT 'received',
+  attempts integer NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  last_error_code text,
+  processed_at timestamptz,
+  PRIMARY KEY (provider, event_id)
+);
+```
+
+Ingest transaction:
+
+```ts
+import { createHash } from 'node:crypto';
+
+type AcceptResult = 'accepted' | 'duplicate';
+
+async function accept(
+  event: PaymentEvent,
+  rawBody: Buffer
+): Promise<AcceptResult> {
+  const payloadHash = createHash('sha256').update(rawBody).digest('hex');
+
+  const inserted = await db.query(
+    `
+      INSERT INTO payment_webhook_inbox (
+        provider, event_id, event_type, provider_created_at,
+        payload_hash, payload
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (provider, event_id) DO NOTHING
+      RETURNING event_id
+    `,
+    [
+      event.provider,
+      event.id,
+      event.type,
+      event.createdAt,
+      payloadHash,
+      event.payload,
+    ]
+  );
+
+  if (inserted.rowCount === 1) return 'accepted';
+
+  const existing = await db.query(
+    `
+      SELECT payload_hash
+      FROM payment_webhook_inbox
+      WHERE provider = $1 AND event_id = $2
+    `,
+    [event.provider, event.id]
+  );
+
+  if (existing.rows[0]?.payload_hash !== payloadHash) {
+    throw new EventIdentityCollision(event.provider, event.id);
+  }
+
+  return 'duplicate';
+}
+```
+
+Duplicate hợp lệ nên trả `2xx`; trả lỗi làm provider giao lại vô ích.
+
+Nếu insert database thành công nhưng publish broker thất bại, đừng trả `2xx` rồi
+mất việc. Có ba lựa chọn:
+
+- worker poll/claim trực tiếp inbox;
+- cùng transaction ghi outbox để relay sang broker;
+- broker hỗ trợ contract phù hợp và hệ thống chấp nhận trade-off khác.
+
+Database inbox thường đơn giản và audit-friendly cho payment volume vừa phải.
+
+## 5. Claim và process đồng thời
+
+Nhiều worker có thể claim row bằng transaction/locking phù hợp:
+
+```sql
+WITH claimed AS (
+  SELECT provider, event_id
+  FROM payment_webhook_inbox
+  WHERE status IN ('received', 'retry')
+    AND next_attempt_at <= now()
+  ORDER BY received_at
+  FOR UPDATE SKIP LOCKED
+  LIMIT 100
+)
+UPDATE payment_webhook_inbox AS inbox
+SET status = 'processing',
+    attempts = attempts + 1
+FROM claimed
+WHERE inbox.provider = claimed.provider
+  AND inbox.event_id = claimed.event_id
+RETURNING inbox.*;
+```
+
+Đừng giữ database transaction mở trong lúc gọi provider/email. Claim có lease/
+timeout hoặc worker recovery để row `processing` không kẹt mãi sau crash.
+
+Business transaction nên gồm:
+
+```text
+lock/find payment aggregate
+  → apply event idempotently
+  → append immutable ledger/state transition
+  → write business outbox
+  → mark inbox processed
+COMMIT
+```
+
+Nếu gửi email trực tiếp trong transaction, DB rollback không thu hồi email. Ghi
+outbox rồi delivery riêng.
+
+## 6. Event ID dedupe chưa đủ
+
+Provider có thể phát hai event ID khác nhau cho cùng business outcome, hoặc team
+resend event theo công cụ khác. Side effect cũng cần business idempotency.
+
+Ví dụ ledger:
+
+```sql
+CREATE TABLE payment_ledger (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL,
+  order_id uuid NOT NULL,
+  provider_payment_id text NOT NULL,
+  kind text NOT NULL,
+  amount_minor bigint NOT NULL,
+  currency text NOT NULL,
+  source_event_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, provider_payment_id, kind)
+);
+```
+
+Unique business key ngăn hai `payment_succeeded` khác event ID cùng cộng tiền.
+Chọn key theo invariant thật; refund có thể nhiều phần nên key không thể chỉ là
+`payment_id + refunded`.
+
+Idempotent không có nghĩa “bỏ qua duplicate” trong mọi trường hợp. Duplicate có
+payload khác là anomaly cần alert/audit:
+
+```text
+same provider + event_id + same hash → duplicate bình thường
+same provider + event_id + different hash → security/data incident
+```
+
+## 7. Không giả định event đến đúng thứ tự
+
+Provider có thể retry event cũ trong khi event mới đã tới. Network path khác nhau
+và worker concurrency cũng đổi order.
+
+Sai:
+
+```ts
+payment.status = event.type.replace('payment.', '');
+```
+
+Đúng hơn là state machine có transition guard và source-of-truth fallback:
+
+```text
+created → requires_action → processing → succeeded
+   └──────────────▶ canceled
+processing/succeeded → refund_pending → partially_refunded → refunded
+```
+
+Không phải mọi state có total order. Chargeback/dispute có thể là state machine
+liên quan nhưng riêng.
+
+```ts
+function applyPaymentEvent(
+  payment: Payment,
+  event: PaymentEvent
+): TransitionResult {
+  const transition = paymentTransitions.find(
+    (candidate) =>
+      candidate.from.includes(payment.status) &&
+      candidate.eventType === event.type
+  );
+
+  if (!transition) {
+    return { kind: 'ignored_or_reconcile', reason: 'invalid_transition' };
+  }
+
+  return transition.apply(payment, event);
+}
+```
+
+Khi event thiếu prerequisite hoặc order không rõ, retrieve object hiện tại từ
+provider bằng authenticated API rồi reconcile. Không suy diễn subscription chỉ
+từ một event rời nếu provider docs yêu cầu lấy invoice/subscription liên quan.
+
+Lưu `provider_created_at`, `received_at`, `processed_at`; một timestamp không đủ
+để phân biệt event cũ, network delay và worker lag.
+
+## 8. Tiền dùng integer minor units và immutable ledger
+
+Không dùng floating point cho số tiền:
+
+```ts
+type Money = {
+  amountMinor: bigint;
+  currency: 'VND' | 'USD' | 'EUR';
+};
+```
+
+Số chữ số thập phân phụ thuộc currency/provider; đừng mặc định mọi currency có
+hai decimal. Kiểm amount/currency/order từ record server-side và provider object,
+không chỉ metadata do client điền.
+
+Payment status cho UX khác ledger cho accounting:
+
+- status là projection/state hiện tại;
+- ledger là append-only record của debit/credit/refund/fee;
+- sửa sai bằng compensating entry, không update lịch sử mất dấu;
+- mỗi entry liên kết provider object/event và actor/process.
+
+“Webhook succeeded” không tự đồng nghĩa tiền đã settled hoặc không thể dispute.
+Tên state phải theo business meaning, không rút gọn quá mức provider lifecycle.
+
+## 9. Outbound request cũng cần idempotency
+
+Client gọi `POST /orders/:id/pay`, service gọi provider tạo payment. Response từ
+provider bị mất sau khi provider đã tạo object. Retry không có key có thể tạo lần
+hai.
+
+Tạo idempotency key theo **logical operation**, không theo HTTP attempt:
+
+```text
+payment:create:{tenantId}:{orderId}:{paymentAttemptId}
+refund:create:{tenantId}:{refundId}
+```
+
+Persist trước khi gọi:
+
+```sql
+CREATE TABLE payment_attempts (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL,
+  order_id uuid NOT NULL,
+  operation_key text NOT NULL,
+  provider_payment_id text,
+  status text NOT NULL,
+  request_hash text NOT NULL,
+  UNIQUE (tenant_id, operation_key)
+);
+```
+
+Flow:
+
+1. transaction tạo/fetch attempt theo operation key;
+2. cùng key + request hash khác → `409 IDEMPOTENCY_CONFLICT`;
+3. gọi provider với idempotency key;
+4. timeout mơ hồ → query provider/attempt trước retry;
+5. lưu provider ID/result;
+6. webhook xác nhận state cuối và ledger.
+
+Không dùng random key mới cho mỗi retry; như vậy mất toàn bộ giá trị idempotency.
+Retention và semantics của provider idempotency key phải đọc theo docs/version;
+database nội bộ vẫn cần record dài hơn cho audit business.
+
+## 10. Response code là delivery control
+
+- `2xx`: endpoint đã **durably nhận** event, không nhất thiết hoàn thành mọi side
+  effect.
+- `4xx`: request/signature/schema không chấp nhận; provider có thể vẫn retry tùy
+  contract.
+- `5xx`/timeout: chưa durably nhận hoặc hệ thống tạm lỗi; expect retry.
+
+Poison event đã verify nhưng business schema/version chưa hỗ trợ không nên làm
+endpoint trả `500` vô hạn. Ingest vào trạng thái `blocked`, alert và có replay
+tool; quyết định `2xx` phụ thuộc việc durable capture có đủ để xử lý sau.
+
+Endpoint phải có body/time limit và concurrency admission. Nhưng shed webhook
+khác interactive API: trả `503` dựa vào provider retry contract; không acknowledge
+nếu chưa lưu durable.
+
+## 11. Reconciliation: webhook không phải source duy nhất
+
+Webhook có thể bị disable, secret sai, event retention hết hoặc bug consumer.
+Một scheduled reconciliation:
+
+```text
+internal payment attempts/ledger
+        ↕ compare by provider object id
+provider API/report
+        ↓
+drift record → auto-safe repair hoặc manual review
+```
+
+Kiểm:
+
+- attempt `pending` quá SLA nhưng provider đã succeeded;
+- provider succeeded nhưng ledger thiếu;
+- amount/currency/order mismatch;
+- refund/dispute chưa phản ánh;
+- inbox lag/blocked event;
+- webhook endpoint delivery failure.
+
+Reconcile job cũng idempotent, checkpoint và rate-limit theo provider. Auto-repair
+chỉ khi invariant rõ; money drift mơ hồ cần review/audit.
+
+Webhook là đường latency thấp. Reconciliation là đường completeness.
+
+## 12. Multi-tenant và provider account
+
+Nếu mỗi tenant có connected account/credential:
+
+- resolve account từ tenant placement server-side;
+- signature secret có thể theo endpoint/account, lookup không dựa payload chưa
+  verify một cách nguy hiểm;
+- inbox unique key gồm provider/account/event theo contract;
+- provider object phải map đúng tenant;
+- cache/credential encrypted, rotated và least privilege;
+- log account reference đã redact, không credential.
+
+Một event hợp lệ cho account A không được cập nhật order tenant B chỉ vì metadata
+chứa `tenantId=B`. Mapping provider account/payment ↔ tenant/order là invariant
+trong database.
+
+## 13. Observability và runbook
+
+Metrics:
+
+- webhook received/verified/rejected/duplicate;
+- ingest latency và HTTP response code;
+- oldest unprocessed age, processing latency, attempts;
+- blocked/dead-letter theo finite error code;
+- transition ignored/reconciled;
+- payment attempt ambiguous/pending;
+- reconciliation drift và repair outcome.
+
+Correlation:
+
+```text
+requestId
+providerEventId
+providerPaymentId
+paymentAttemptId
+orderId
+tenantId (theo telemetry policy)
+```
+
+Không đưa các ID high-cardinality vào metric label; dùng trace/log.
+
+Runbook “webhook lag”:
+
+1. xác nhận provider delivery health và signature failures;
+2. xem inbox receive rate/oldest age;
+3. phân biệt ingest bottleneck với worker bottleneck;
+4. kiểm poison event/retry storm/DB lock;
+5. scale/pause đúng stage, không replay toàn bộ mù;
+6. sau recovery chạy reconciliation.
+
+## 14. Test matrix
+
+- signature đúng/sai, raw body bị thay một byte;
+- timestamp cũ/replay;
+- cùng event gửi đồng thời 20 lần → một business transition;
+- cùng event ID nhưng payload hash khác → anomaly;
+- event `succeeded` đến trước `processing`;
+- worker crash sau ledger insert nhưng trước ack;
+- provider call timeout sau side effect → retry cùng key không tạo object mới;
+- inbox insert thành công, broker/email lỗi;
+- secret rotation cũ/mới;
+- reconciliation sửa/mở review cho drift;
+- tenant/account mapping bị giả trong metadata.
+
+Test bằng provider CLI/sandbox hữu ích, nhưng phải có integration test kiểm raw
+body qua đúng reverse proxy/framework middleware chain.
+
+## Checklist trước khi ship
+
+- [ ] Signature verify trên raw bytes bằng SDK/contract chính thức.
+- [ ] Timestamp tolerance + unique event ID chống replay.
+- [ ] `2xx` chỉ sau durable inbox; duplicate hợp lệ cũng `2xx`.
+- [ ] Inbox unique constraint và business side effect đều idempotent.
+- [ ] Không dual-write DB + broker/email trong handler.
+- [ ] Payment transition chịu duplicate/out-of-order và có reconcile path.
+- [ ] Money dùng minor unit + currency; ledger append-only.
+- [ ] Outbound operation có persisted idempotency key/request hash.
+- [ ] Webhook, provider account, order và tenant mapping được xác minh.
+- [ ] Có replay/reconcile/runbook và audit artifact.
+
+## Nếu chỉ nhớ 5 điều
+
+1. Webhook là at-least-once message delivery dùng HTTP.
+2. Verify raw body trước parse; signature không thay event dedupe.
+3. Acknowledge sau durable inbox, xử lý side effect ở worker.
+4. Event order không đáng tin; business state machine mới là authority nội bộ.
+5. Webhook cho tốc độ, reconciliation cho tính đầy đủ.
+
+## Tài liệu chính thức
+
+- [Stripe: Receive events in a webhook endpoint](https://docs.stripe.com/webhooks)
+- [Stripe: Webhook signatures](https://docs.stripe.com/webhooks/signature)
+- [Stripe: Idempotent requests](https://docs.stripe.com/api/idempotent_requests)
+- [Stripe: Event delivery behaviors](https://docs.stripe.com/webhooks#event-delivery-behaviors)
+- [Express: `express.raw`](https://expressjs.com/en/5x/api.html#express.raw)
+- [OWASP: Third Party Payment Gateway Integration](https://cheatsheetseries.owasp.org/cheatsheets/Third_Party_Payment_Gateway_Integration_Cheat_Sheet.html)
+
+## Phần tiếp theo
+
+Phần 26 là capstone: ghép Order API multi-tenant, PostgreSQL, payment webhook,
+outbox/worker, stream export, overload control và OpenTelemetry vào một production
+game day. Mục tiêu không phải thêm code, mà chứng minh hệ thống giữ invariant khi
+mọi thứ cùng hỏng.

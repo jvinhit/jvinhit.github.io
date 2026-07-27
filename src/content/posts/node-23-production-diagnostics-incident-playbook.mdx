@@ -1,0 +1,415 @@
+---
+title: 'Node.js Production Engineering 23 — Production Diagnostics và Incident Playbook'
+description: 'Điều tra Node.js bằng evidence: event-loop delay, CPU profile, heap snapshot, RSS/native memory, diagnostic report, trace correlation và controlled experiment.'
+pubDate: 2026-07-25
+lang: vi
+tags:
+  [
+    nodejs,
+    diagnostics,
+    performance,
+    memory-leak,
+    incident-response,
+    production-engineering,
+  ]
+series: nodejs
+seriesOrder: 23
+draft: false
+---
+
+Dashboard báo RSS tăng 20 MB mỗi giờ. Team lập tức chụp heap snapshot, pod đứng
+trong nhiều giây rồi bị OOMKill. Snapshot chưa kịp tải xuống; sự cố từ một pod
+thành cả deployment vì các pod còn lại nhận traffic dồn sang.
+
+Chẩn đoán production không chỉ là biết mở profiler. Đó là kỹ năng **thu bằng chứng
+đúng với rủi ro thấp nhất**, giữ timeline, kiểm hypothesis và dừng đúng lúc trước
+khi công cụ điều tra làm hệ thống tệ hơn.
+
+Sau bài này, bạn có thể:
+
+- phân loại symptom CPU, event loop, heap, RSS/native và dependency wait;
+- chọn metric, trace, CPU profile, diagnostic report hay heap snapshot đúng lúc;
+- đo event-loop delay/utilization mà không đọc sai;
+- điều tra memory tăng bằng slope, GC behavior và snapshot diff;
+- chạy controlled experiment/canary thay vì sửa theo cảm giác;
+- viết incident timeline và prevention action có thể kiểm chứng.
+
+---
+
+## 1. Mental model: symptom không phải nguyên nhân
+
+Những tín hiệu có thể trông giống nhau:
+
+| Symptom                        | Một số hypothesis                                             |
+| ------------------------------ | ------------------------------------------------------------- |
+| p99 tăng, CPU cao              | loop CPU, serialize payload lớn, regex, GC, traffic thật tăng |
+| p99 tăng, CPU thấp             | DB pool wait, lock, downstream chậm, socket/concurrency queue |
+| event-loop delay tăng          | sync code, callback dài, GC pause, CPU throttling             |
+| heapUsed tăng rồi giảm         | workload/batch bình thường, GC cadence                        |
+| heapUsed đáy tăng qua nhiều GC | object bị giữ, cache/closure/listener leak                    |
+| RSS tăng, heap ổn              | Buffer/native addon/thread stack/allocator fragmentation      |
+| chỉ một route chậm             | query shape, payload, tenant/data skew                        |
+| toàn pod chậm sau deploy       | code/config/runtime/resource limit thay đổi                   |
+
+Quy trình tốt đi từ rộng tới hẹp:
+
+```text
+user impact/SLO
+  → scope: route, tenant, region, version, instance
+  → resource/saturation class
+  → trace/profile/report/snapshot phù hợp
+  → hypothesis có prediction
+  → experiment hoặc mitigation
+  → verify SLI hồi phục
+```
+
+Đừng bắt đầu bằng “Node leak memory” hoặc “database chậm”. Bắt đầu bằng điều quan
+sát được, timestamp và cohort bị ảnh hưởng.
+
+## 2. Stabilize trước, investigate sau
+
+Trong incident, ưu tiên giảm user impact:
+
+- rollback/canary off nếu correlation với release mạnh;
+- giảm concurrency, pause batch/export, shed non-critical traffic;
+- route khỏi instance bất thường;
+- tăng replica chỉ khi bottleneck scale ngang được và dependency còn capacity;
+- giữ lại ít nhất một instance/evidence nếu an toàn.
+
+Một mitigation tốt có thể đồng thời là experiment. Pause export worker làm
+event-loop delay và RSS slope biến mất là evidence mạnh hơn một cuộc tranh luận.
+
+Ghi timeline UTC:
+
+```text
+02:03 alert checkout latency burn rate 12×
+02:05 scope: version v143, endpoint /orders/export
+02:08 pause export workers
+02:10 p99 + event-loop delay hồi phục
+02:14 giữ một canary v143 ngoài LB để profile workload replay
+```
+
+Không thay ba biến cùng lúc nếu chưa cần cứu hệ thống; bạn sẽ mất khả năng biết
+action nào có tác dụng.
+
+## 3. Event-loop delay và utilization trả lời hai câu khác nhau
+
+`monitorEventLoopDelay()` đo phân phối độ trễ event loop quan sát được.
+`performance.eventLoopUtilization()` ước lượng tỷ lệ thời gian loop active so với
+idle.
+
+```ts
+import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
+
+const delay = monitorEventLoopDelay({ resolution: 20 });
+delay.enable();
+
+let previous = performance.eventLoopUtilization();
+
+setInterval(() => {
+  const current = performance.eventLoopUtilization(previous);
+  previous = performance.eventLoopUtilization();
+
+  metrics.eventLoopDelay.record(delay.percentile(99) / 1e9);
+  metrics.eventLoopUtilization.record(current.utilization);
+
+  delay.reset();
+}, 10_000).unref();
+```
+
+Histogram trả nanosecond nên ví dụ đổi sang giây. Chọn resolution là trade-off
+overhead/độ phân giải và kiểm trên runtime thật.
+
+Cách đọc:
+
+- utilization cao + delay cao: JavaScript/GC/CPU contention đáng nghi;
+- utilization thấp + request chậm: operation có thể đang chờ dependency;
+- CPU throttling container có thể làm delay cao dù process “không dùng hết” host;
+- average đẹp không loại trừ callback stall hiếm; xem percentile/max có kiểm soát.
+
+Event-loop metric chỉ nói **có stall**, không nói function nào gây stall. CPU
+profile là bước tiếp theo khi hypothesis nghiêng về code path.
+
+## 4. CPU profile: lấy mẫu code path, không đếm log
+
+CPU profiler lấy sample stack theo thời gian, rồi flame graph cho biết code path
+nào chiếm nhiều sample.
+
+Một experiment local/staging gần production:
+
+```bash
+node --cpu-prof --cpu-prof-name=checkout.cpuprofile dist/server.js
+```
+
+Replay workload, dừng process có kiểm soát, mở `.cpuprofile` bằng Chrome DevTools.
+Ở production, dùng cơ chế profiler/observability platform đã được phê duyệt; mở
+inspector port public là security incident.
+
+Đọc profile:
+
+- **wide frame**: nhiều sample, đáng điều tra;
+- `JSON.stringify` rộng: payload/serialization;
+- regex/function domain rộng: algorithm/input skew;
+- GC rộng: allocation rate hoặc heap pressure, chưa chắc leak;
+- native frame: crypto/compression/addon hoặc symbolization thiếu.
+
+Profile cần cohort và workload. CPU profile 30 giây lúc service idle không giải
+thích spike 02:03. Gắn version, instance, traffic rate và route mix vào evidence.
+
+Đừng tối ưu function vì nó đứng đầu profile nếu nó chỉ rộng vì làm công việc hợp
+lệ. Hỏi: có thể giảm số lần gọi, giảm input, cache đúng hoặc chuyển CPU work sang
+worker pool hữu hạn không?
+
+## 5. Allocation pressure khác memory leak
+
+Memory API:
+
+```ts
+const memory = process.memoryUsage();
+
+logger.info({
+  rss: memory.rss,
+  heapTotal: memory.heapTotal,
+  heapUsed: memory.heapUsed,
+  external: memory.external,
+  arrayBuffers: memory.arrayBuffers,
+});
+```
+
+- `heapUsed`: object JavaScript đang dùng trong V8 heap;
+- `heapTotal`: heap V8 đã cấp;
+- `external`: memory của object C++ gắn với JS;
+- `arrayBuffers`: memory cho `ArrayBuffer`/`Buffer`, nằm trong external;
+- `rss`: resident set toàn process, gồm heap, code, native allocation, thread
+  stack và vùng khác.
+
+Một leak JavaScript thường thể hiện đáy `heapUsed` sau major GC tăng dần dưới
+workload ổn định. RSS tăng mà heap đáy ổn khiến ta kiểm Buffer, native addon,
+compression/TLS, worker/thread count hoặc allocator behavior.
+
+Đừng ép `global.gc()` trong production như một “fix”. Nếu chạy diagnostic với
+`--expose-gc` ở môi trường kiểm soát, nó chỉ giúp experiment; business code không
+nên phụ thuộc manual GC.
+
+## 6. Heap snapshot là thao tác rủi ro
+
+Heap snapshot lưu graph object và reference. So sánh hai snapshot sau cùng một
+workload có thể tìm constructor/retained path tăng.
+
+Nhưng Node.js cảnh báo rõ: tạo snapshot dừng main thread và có thể cần memory xấp
+xỉ gấp đôi heap, đủ làm process crash. Vì vậy:
+
+1. không chụp đồng loạt mọi pod;
+2. drain một canary khỏi load balancer nếu có thể;
+3. bảo đảm headroom/disk và đường lấy artifact;
+4. chấp nhận process có thể chết;
+5. snapshot không chứa secret/PII được xử lý như artifact nhạy cảm;
+6. ưu tiên reproduce trên workload gần production.
+
+Có thể khởi động process chẩn đoán với:
+
+```bash
+node --heapsnapshot-signal=SIGUSR2 dist/server.js
+```
+
+Gửi signal theo runbook platform để tạo snapshot. Không lấy PID bằng lệnh mơ hồ
+trên host nhiều process.
+
+### Snapshot diff có ý nghĩa khi workload có pha
+
+```text
+warm up → snapshot A
+run cùng workload N lần
+wait/observe GC quiescence
+snapshot B
+compare retained size + retaining path
+```
+
+Nếu B chụp ngay sau batch lớn còn đang xử lý, chênh lệch có thể là live working
+set bình thường.
+
+Các pattern thường gặp:
+
+- `Map` cache không eviction;
+- listener/subscriber không unsubscribe;
+- timer/closure giữ request context;
+- promise/task registry không xóa khi reject;
+- AsyncLocalStorage context gắn với resource sống quá lâu;
+- buffer/response giữ trong telemetry hoặc retry queue.
+
+Retained path quan trọng hơn constructor count. “Có nhiều object `Order`” không
+nói object nào đang giữ chúng sống.
+
+## 7. Diagnostic report: bản chụp process nhẹ hơn heap graph
+
+Diagnostic report chứa JavaScript/native stack, heap statistics, libuv handles,
+OS/resource information và command-line/runtime context. Nó hữu ích khi:
+
+- process treo hoặc có handle không đóng;
+- native crash/fatal error;
+- cần biết loaded library, thread, environment resource;
+- chưa cần graph object đầy đủ.
+
+Tạo programmatically:
+
+```ts
+import process from 'node:process';
+
+const filename = process.report.writeReport();
+logger.warn({ filename }, 'diagnostic report written');
+```
+
+Hoặc cấu hình report on signal/uncaught error theo Node CLI. File report có thể
+chứa path, environment metadata và stack; lưu vào volume/collector bảo mật, có
+retention và access control.
+
+Diagnostic report không thay core dump/native profiler khi lỗi ở addon sâu, nhưng
+là evidence rẻ hơn heap snapshot cho nhiều incident.
+
+## 8. Active handles và “process không chịu tắt”
+
+Shutdown treo thường do:
+
+- server/socket keep-alive;
+- database/message consumer chưa close;
+- interval còn referenced;
+- worker/subprocess;
+- telemetry exporter đang retry;
+- promise không settle vì adapter thiếu deadline.
+
+Diagnostic report hiển thị libuv handles. Trong test, có thể dùng test runner và
+resource-specific instrumentation. Tránh biến API internal như
+`process._getActiveHandles()` thành production contract.
+
+Fix đúng là lifecycle ownership:
+
+```text
+composition root creates resource
+  → module uses resource
+  → shutdown coordinator stops intake
+  → owner closes resource within deadline
+```
+
+Không gọi `process.exit()` ngay để “sửa” test treo; nó che resource leak và có thể
+cắt log/transaction.
+
+## 9. `diagnostics_channel`: instrumentation boundary có chi phí thấp
+
+`node:diagnostics_channel` cho phép library publish lifecycle event lên named
+channel mà không phụ thuộc trực tiếp telemetry vendor.
+
+```ts
+import diagnosticsChannel from 'node:diagnostics_channel';
+
+const checkoutChannel = diagnosticsChannel.channel('app.checkout.completed');
+
+checkoutChannel.publish({
+  orderId,
+  durationMs,
+  outcome: 'success',
+});
+```
+
+Subscriber có thể tạo metric/trace/log. Contract cần:
+
+- channel name ổn định;
+- payload nhỏ, không secret/PII;
+- subscriber không throw/block hot path;
+- benchmark overhead khi event volume lớn.
+
+Channel là hook quan sát trong process, không phải durable event bus hay audit log.
+
+## 10. Worker thread là isolate chẩn đoán riêng
+
+Mỗi worker có event loop và V8 isolate riêng. Main-thread event-loop healthy không
+chứng minh worker pool healthy.
+
+Theo dõi:
+
+- queue depth/age trước worker;
+- task duration/error/timeout;
+- worker restart và memory;
+- CPU profile đúng worker/workload;
+- transfer/copy size giữa thread;
+- unbounded result queue về main thread.
+
+Tăng số worker tới số core không tự tối ưu: container CPU quota, native thread
+pool và nhiều replica cùng cạnh tranh. Capacity test phải chạy trong resource
+limit giống production.
+
+## 11. Incident walkthrough: RSS tăng sau feature export
+
+**Symptom:** RSS tăng 20 MB/giờ trên version mới, heapUsed đáy gần ổn, p99 chưa
+vượt SLO.
+
+1. Scope theo version/route: chỉ pod có export traffic tăng.
+2. Tách heap vs external: `arrayBuffers` tăng cùng RSS.
+3. Trace cho thấy export bị client cancel nhưng job tiếp tục compress.
+4. Controlled experiment: abort 100 download; active pipeline không giảm.
+5. Diagnostic report cho thấy socket/stream handles còn sống.
+6. Code review tìm registry `Map<exportId, Pipeline>` chỉ delete ở success path.
+7. Fix bằng `finally`, truyền AbortSignal và cleanup idempotent.
+8. Regression test: 1.000 cancel; active pipeline về 0, RSS plateau.
+9. Canary 5%, theo dõi slope 60 phút, rồi rollout.
+
+Không cần heap snapshot vì evidence đã đủ và symptom nghiêng external Buffer.
+Chọn không dùng một công cụ cũng là quyết định chẩn đoán tốt.
+
+## 12. Evidence package cho postmortem
+
+Một postmortem hữu ích giữ:
+
+- impact theo user journey và khoảng thời gian;
+- timeline alert, deploy, mitigation, recovery;
+- contributing factors, không chỉ dòng code cuối;
+- graph/profile/report đã redact và cách tái tạo;
+- vì sao guardrail trước đó không bắt;
+- action có owner, deadline và verification.
+
+Action mạnh:
+
+- “test abort 1.000 pipeline, RSS plateau dưới X”;
+- “dashboard external/arrayBuffers + active export”;
+- “export registry có invariant cleanup trong `finally`”;
+- “canary analysis kiểm memory slope”.
+
+Action yếu: “team cẩn thận hơn” hoặc “monitor memory”.
+
+## Checklist production diagnostics
+
+- [ ] Bắt đầu từ SLO/user impact, timestamp và cohort.
+- [ ] Stabilize bằng action reversible; giữ evidence nếu an toàn.
+- [ ] Phân biệt CPU, event loop, dependency wait, heap và RSS/native.
+- [ ] Profile đúng version + workload + cửa sổ sự cố.
+- [ ] Heap snapshot chỉ theo runbook có headroom, isolation và artifact security.
+- [ ] Diagnostic report được thu/lưu với access và retention rõ.
+- [ ] Không mở inspector public hoặc log payload nhạy cảm.
+- [ ] Hypothesis ghi prediction có thể bác bỏ.
+- [ ] Fix có regression/load test và canary verification.
+- [ ] Postmortem action gắn với invariant/guardrail cụ thể.
+
+## Nếu chỉ nhớ 5 điều
+
+1. Metric cho biết loại triệu chứng; profile/snapshot/report trả lời câu hỏi khác
+   nhau.
+2. RSS không đồng nghĩa V8 heap.
+3. Heap snapshot có thể block và làm process hết memory.
+4. Profile không có workload/timestamp chỉ là một bức ảnh đẹp.
+5. Chẩn đoán kết thúc khi fix được khóa bằng test, metric và rollout evidence.
+
+## Tài liệu chính thức
+
+- [Node.js Diagnostics overview](https://nodejs.org/en/learn/diagnostics)
+- [Node.js Performance measurement APIs](https://nodejs.org/docs/latest-v24.x/api/perf_hooks.html)
+- [Node.js: Using heap snapshot](https://nodejs.org/en/learn/diagnostics/memory/using-heap-snapshot)
+- [Node.js: Flame graphs](https://nodejs.org/en/learn/diagnostics/flame-graphs)
+- [Node.js Diagnostic report](https://nodejs.org/docs/latest-v24.x/api/report.html)
+- [Node.js Diagnostics Channel](https://nodejs.org/docs/latest-v24.x/api/diagnostics_channel.html)
+- [Node.js Worker threads](https://nodejs.org/docs/latest-v24.x/api/worker_threads.html)
+
+## Phần tiếp theo
+
+Ba phần 21–23 củng cố runtime reliability. Phần 24 chuyển sang một bài toán sản
+phẩm rất thật: cùng một SaaS phục vụ hàng nghìn tổ chức nhưng không được để một
+query, cache key, queue hoặc bug authorization làm dữ liệu tenant A xuất hiện ở
+tenant B.

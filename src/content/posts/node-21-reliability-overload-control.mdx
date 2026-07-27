@@ -1,0 +1,477 @@
+---
+title: 'Node.js Production Engineering 21 — Reliability và Overload Control'
+description: 'Giữ service ổn định khi dependency chậm hoặc traffic tăng: deadline, cancellation, concurrency budget, load shedding, retry, circuit breaker và graceful shutdown.'
+pubDate: 2026-07-25
+lang: vi
+tags:
+  [
+    nodejs,
+    reliability,
+    resilience,
+    backpressure,
+    graceful-shutdown,
+    production-engineering,
+  ]
+series: nodejs
+seriesOrder: 21
+draft: false
+---
+
+11:58, một dependency bắt đầu chậm từ 80 ms lên 4 giây. Order API vẫn nhận request
+mới, vẫn retry và vẫn giữ connection database cho những request gần như chắc
+chắn sẽ timeout. Hai phút sau dependency hồi phục, nhưng Order API không hồi:
+queue nội bộ đã dài, pool đã kín và client retry tạo thêm traffic.
+
+Sự cố không còn là “dependency chậm”. Nó đã trở thành **overload do chính hệ
+thống khuếch đại**.
+
+Reliability không có nghĩa mọi request đều thành công. Khi demand vượt capacity,
+một service tốt phải bảo vệ phần công việc còn có thể hoàn tất: từ chối sớm, hủy
+công việc vô nghĩa, không retry mù và hồi phục nhanh sau khi áp lực giảm.
+
+Sau bài này, bạn có thể:
+
+- biến timeout rời rạc thành một deadline end-to-end;
+- truyền cancellation qua HTTP, database và queue boundary;
+- đặt concurrency budget thay vì mở Promise không giới hạn;
+- load shed bằng `429`/`503` trước khi resource cạn;
+- phối hợp retry, circuit breaker và bulkhead mà không tạo retry storm;
+- test graceful shutdown dưới tải bằng acceptance criteria rõ.
+
+---
+
+## 1. Mental model: service có một capacity envelope hữu hạn
+
+Mỗi request tiêu nhiều budget:
+
+```text
+request
+  ├─ 1 HTTP connection
+  ├─ 1 vị trí trong in-flight budget
+  ├─ 0..1 database connection
+  ├─ memory cho body/result/context
+  ├─ event-loop time
+  └─ downstream calls + retry
+```
+
+Capacity không chỉ là CPU. Một service dùng 25% CPU vẫn có thể bão hòa vì
+PostgreSQL pool kín, socket chờ upstream, heap tăng hoặc event loop bị giữ bởi
+serialization.
+
+Theo Little's Law, số công việc đang nằm trong hệ thống gần bằng throughput nhân
+thời gian ở lại:
+
+```text
+concurrency ≈ throughput × latency
+```
+
+Nếu traffic giữ 500 request/giây nhưng latency tăng từ 100 ms lên 4 giây,
+in-flight work tăng xấp xỉ từ 50 lên 2.000. Không cần traffic spike; **latency
+spike tự tạo concurrency spike**.
+
+Mục tiêu vì vậy không phải “queue mọi thứ”. Mục tiêu là giữ:
+
+```text
+admitted work ≤ capacity có thể hoàn tất trong deadline
+```
+
+## 2. Deadline khác timeout
+
+Timeout thường là giới hạn cục bộ: database query tối đa 500 ms. Deadline là thời
+điểm operation toàn bộ không còn giá trị.
+
+```text
+Client budget: 1.500 ms
+  gateway:       100 ms
+  order logic:   150 ms
+  inventory:     500 ms
+  payment:       500 ms
+  response:      100 ms
+  safety margin: 150 ms
+```
+
+Sai:
+
+```text
+gateway timeout 2 s
+  └─ order timeout 2 s
+       └─ payment timeout 2 s
+```
+
+Request đã hết budget ở gateway nhưng downstream vẫn làm việc thêm nhiều giây.
+Đúng hơn là truyền deadline còn lại và chừa budget để trả response/cleanup.
+
+```ts
+class Deadline {
+  constructor(readonly expiresAt: number) {}
+
+  remainingMs(): number {
+    return Math.max(0, this.expiresAt - Date.now());
+  }
+
+  signal(maxStepMs: number, parent?: AbortSignal): AbortSignal {
+    const stepBudget = Math.max(1, Math.min(maxStepMs, this.remainingMs()));
+    const timeout = AbortSignal.timeout(stepBudget);
+    return parent ? AbortSignal.any([parent, timeout]) : timeout;
+  }
+}
+```
+
+Đây là skeleton. Clock giữa service có thể lệch; internal protocol cần convention
+rõ: truyền absolute deadline với clock discipline, hoặc duration budget được trừ
+ở từng hop. Không tin một header deadline tùy ý từ public client để cấp resource
+vô hạn.
+
+## 3. Cancellation phải đi tới nơi đang giữ resource
+
+Trả `504` nhưng query vẫn chạy, upload vẫn đọc và job vẫn ghi dữ liệu không phải
+cancellation. Đó chỉ là **ngừng chờ kết quả**.
+
+Trong HTTP handler, nối client disconnect với operation signal:
+
+```ts
+function requestAbortSignal(
+  req: import('node:http').IncomingMessage,
+  res: import('node:http').ServerResponse
+): AbortSignal {
+  const controller = new AbortController();
+
+  req.once('aborted', () => controller.abort(new Error('request aborted')));
+  res.once('close', () => {
+    if (!res.writableEnded) {
+      controller.abort(new Error('client disconnected'));
+    }
+  });
+
+  return controller.signal;
+}
+```
+
+Sau đó truyền signal qua adapter nào hỗ trợ:
+
+```ts
+const requestSignal = requestAbortSignal(req, res);
+const deadline = new Deadline(Date.now() + 1_200);
+
+const response = await fetch(inventoryUrl, {
+  signal: deadline.signal(450, requestSignal),
+});
+```
+
+Không phải database driver nào cũng hỗ trợ `AbortSignal`. Khi không hỗ trợ, cần
+statement timeout phía database và connection/pool policy tương ứng. Hủy ở
+application mà server database vẫn chạy query đắt chỉ chuyển leak sang tầng khác.
+
+Sau khi side effect đã commit, client disconnect không được “rollback bằng hy
+vọng”. Operation tạo order/payment cần idempotency key để client có thể hỏi lại
+kết quả an toàn.
+
+## 4. Concurrency budget: queue hữu hạn trước dependency hữu hạn
+
+`Promise.all()` trên 10.000 item không tạo 10.000 CPU core. Nó tạo 10.000
+operation cạnh tranh socket, pool và memory.
+
+Đặt budget theo bottleneck:
+
+```text
+Postgres pool:                    30 connections
+reserved cho health/admin:        3
+long transaction allowance:       2
+query concurrency cho HTTP:      25
+```
+
+Một admission gate tối thiểu:
+
+```ts
+class ConcurrencyGate {
+  #active = 0;
+
+  constructor(private readonly limit: number) {}
+
+  tryEnter(): (() => void) | undefined {
+    if (this.#active >= this.limit) return undefined;
+
+    this.#active += 1;
+    let released = false;
+
+    return () => {
+      if (released) return;
+      released = true;
+      this.#active -= 1;
+    };
+  }
+
+  get active(): number {
+    return this.#active;
+  }
+}
+
+const checkoutGate = new ConcurrencyGate(80);
+
+async function checkout(req: Request, res: Response) {
+  const release = checkoutGate.tryEnter();
+  if (!release) {
+    res.set('Retry-After', '1').status(503).json({
+      code: 'CHECKOUT_OVERLOADED',
+      message: 'Checkout is temporarily busy. Retry safely.',
+    });
+    return;
+  }
+
+  try {
+    await handleCheckout(req, res);
+  } finally {
+    release();
+  }
+}
+```
+
+Production có thể cần queue ngắn thay vì chỉ `tryEnter`, nhưng queue phải có:
+
+- chiều dài tối đa;
+- thời gian chờ tối đa nhỏ hơn request deadline;
+- metric active/queued/rejected;
+- fairness/priority có chủ đích;
+- cancellation xóa waiter khỏi queue.
+
+Một queue không giới hạn chỉ đổi overload từ connection sang heap.
+
+## 5. Load shedding là hành vi đúng, không phải thất bại xấu hổ
+
+Từ chối 2% request sớm có thể giữ 98% còn lại dưới SLO. Nhận 100% rồi để 70%
+timeout chậm là kết quả tệ hơn cho user và hệ thống.
+
+Chọn tín hiệu admission có quan hệ nhân quả:
+
+| Tín hiệu                 | Có thể bảo vệ             |
+| ------------------------ | ------------------------- |
+| in-flight theo route     | handler/dependency budget |
+| DB pool wait             | data layer                |
+| queue age/depth          | worker throughput         |
+| event-loop delay         | JavaScript execution      |
+| RSS/heap pressure        | memory envelope           |
+| downstream circuit state | dependency failure domain |
+
+`429 Too Many Requests` phù hợp khi caller/tenant vượt quota. `503 Service
+Unavailable` phù hợp khi service tạm không có capacity. `Retry-After` chỉ hữu ích
+khi client thực sự tuân thủ và retry là an toàn.
+
+Đừng chỉ shed request rẻ và giữ request đắt. Có thể chia lane:
+
+```text
+critical checkout lane ── budget riêng ──▶ payment
+admin export lane      ── queue riêng  ──▶ worker
+analytics lane         ── drop/defer   ──▶ warehouse
+```
+
+Đó là bulkhead: một workload không dùng hết resource của workload quan trọng hơn.
+
+## 6. Retry có ba điều kiện
+
+Chỉ retry khi:
+
+1. lỗi có khả năng tạm thời;
+2. operation an toàn khi lặp hoặc có idempotency key;
+3. còn đủ deadline và retry budget.
+
+```ts
+import { setTimeout } from 'node:timers/promises';
+
+async function retryTransient<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  deadline: Deadline,
+  parent: AbortSignal
+): Promise<T> {
+  const backoffs = [40, 100];
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= backoffs.length; attempt += 1) {
+    if (deadline.remainingMs() < 120) break;
+
+    try {
+      return await operation(deadline.signal(400, parent));
+    } catch (error) {
+      lastError = error;
+      if (!isTransient(error) || attempt === backoffs.length) break;
+
+      const jitterMs = Math.random() * backoffs[attempt];
+      await setTimeout(backoffs[attempt] + jitterMs, undefined, {
+        signal: deadline.signal(backoffs[attempt] * 2, parent),
+      });
+    }
+  }
+
+  throw lastError;
+}
+```
+
+Ví dụ dùng `setTimeout` từ `node:timers/promises`; `isTransient` phải dựa vào error
+contract thật, không retry mọi `5xx`. `400`, authentication failure, validation
+error và invariant conflict thường không tự biến mất.
+
+Chỉ retry ở **một tầng sở hữu policy**. Nếu SDK retry 3 lần, service retry 3 lần
+và gateway retry 3 lần, một request có thể thành 27 attempts. Theo dõi
+`attempts_per_operation`, không chỉ request count.
+
+## 7. Circuit breaker không chữa dependency
+
+Circuit breaker ngừng gửi call khi xác suất thành công quá thấp:
+
+```text
+closed ── failure threshold ──▶ open
+  ▲                              │
+  └──── probe success ◀── half-open after cooldown
+```
+
+Nó bảo vệ caller khỏi chờ vô ích và cho dependency không gian hồi phục. Nhưng
+breaker cần scope đúng:
+
+- theo dependency/operation, không phải một global switch cho mọi endpoint;
+- volume tối thiểu để 2 lỗi đầu tiên không mở circuit;
+- half-open probe hữu hạn;
+- metric state transition/rejection;
+- fallback chỉ khi semantics cho phép.
+
+Trả giá cache cũ có gắn `stale` có thể hợp lệ. “Giả vờ payment thành công” không
+bao giờ là fallback.
+
+Circuit breaker, retry và timeout cùng dùng một budget. Thêm từng library riêng
+lẻ mà không có contract chung thường tạo state machine không ai hiểu khi incident.
+
+## 8. Graceful shutdown là overload control theo thời gian
+
+Khi nhận `SIGTERM`, instance phải:
+
+1. đổi readiness để ngừng traffic mới;
+2. ngừng nhận HTTP connection/request mới;
+3. ngừng lấy job mới;
+4. drain in-flight trong deadline;
+5. đóng dependency và flush telemetry;
+6. force-close khi budget hết.
+
+```ts
+let shuttingDown = false;
+
+async function shutdown(signal: NodeJS.Signals) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  readiness.set(false);
+
+  const forceTimer = setTimeout(() => {
+    server.closeAllConnections();
+    process.exit(1);
+  }, 25_000);
+  forceTimer.unref();
+
+  try {
+    await Promise.all([closeServer(server), workers.close()]);
+    await database.end();
+    await telemetrySdk.shutdown();
+  } finally {
+    clearTimeout(forceTimer);
+  }
+}
+
+process.once('SIGTERM', () => void shutdown('SIGTERM'));
+process.once('SIGINT', () => void shutdown('SIGINT'));
+```
+
+`server.close()` ngừng nhận connection mới và drain HTTP phù hợp, nhưng upgraded
+protocol như WebSocket cần tracking/close riêng. `closeAllConnections()` là force
+tool ở cuối budget, không phải bước đầu.
+
+Trong Kubernetes, `preStop` và shutdown cùng tiêu
+`terminationGracePeriodSeconds`; hook dài lấy mất thời gian drain. Readiness,
+EndpointSlice removal và load balancer propagation không tức thời, nên test luồng
+thật trên platform thay vì dựa vào một `sleep` truyền miệng.
+
+## 9. Observability cho overload
+
+Dashboard tối thiểu nối demand → saturation → outcome:
+
+- request rate, good/bad-event ratio, p50/p95/p99;
+- in-flight, queued, rejected theo operation/priority;
+- deadline exceeded và cancellation theo source;
+- retry attempts, circuit state/rejection;
+- DB pool active/wait duration;
+- event-loop delay/utilization, heap/RSS;
+- shutdown duration, forced connection/job count.
+
+Alert theo user impact/error-budget burn. Saturation signal giúp chẩn đoán và
+capacity planning; CPU 80% tự nó chưa nói user đang hỏng.
+
+Log rejection bằng reason có tập giá trị hữu hạn:
+
+```ts
+logger.warn(
+  {
+    event: 'admission.rejected',
+    operation: 'checkout',
+    reason: 'concurrency_limit',
+    active: checkoutGate.active,
+    limit: 80,
+  },
+  'checkout rejected before execution'
+);
+```
+
+Không log mỗi rejection ở traffic lớn nếu nó tạo log storm; dùng counter và log
+sampling.
+
+## 10. Game day: làm dependency chậm có kiểm soát
+
+Kịch bản:
+
+1. Baseline 300 RPS, payment p99 100 ms, checkout SLO dưới 800 ms.
+2. Proxy fault làm payment latency thành 3 giây trong 5 phút.
+3. So sánh hai bản: không admission/retry budget và có reliability policy.
+4. Xác minh bản có policy giữ heap, pool wait và in-flight trong envelope.
+5. Xác minh request bị từ chối sớm có error contract/idempotency instruction rõ.
+6. Hồi phục dependency; đo thời gian service trở lại SLO và kiểm retry storm.
+7. Gửi `SIGTERM` giữa bài test; kiểm traffic chuyển instance và job không duplicate.
+
+Acceptance criteria không phải “zero error”. Nó là:
+
+- resource không tăng không giới hạn;
+- critical journey giữ mục tiêu đã định hoặc fail nhanh;
+- không có side effect mồ côi/duplicate;
+- service hồi phục mà không restart cưỡng bức;
+- dashboard giải thích được admission decision.
+
+## 11. Checklist trước khi ship
+
+- [ ] Mỗi user journey có deadline end-to-end và safety margin.
+- [ ] Client disconnect/timeout hủy được công việc tới adapter có thể hủy.
+- [ ] Mỗi resource hữu hạn có concurrency/queue budget tương ứng.
+- [ ] Queue hữu hạn cả size và wait time; rejection có contract.
+- [ ] Retry chỉ cho transient + idempotent + còn budget, và chỉ một tầng sở hữu.
+- [ ] Circuit/fallback giữ đúng business semantics.
+- [ ] Workload quan trọng có bulkhead/priority riêng.
+- [ ] Shutdown đổi readiness, drain rồi mới đóng dependency/telemetry.
+- [ ] Có metric cho saturation, rejection, retry và recovery time.
+- [ ] Đã chạy slow-dependency + SIGTERM game day dưới tải.
+
+## Nếu chỉ nhớ 5 điều
+
+1. Latency tăng sẽ tự làm concurrency tăng dù traffic không đổi.
+2. Deadline là budget end-to-end; timeout cục bộ không đủ.
+3. Cancellation chỉ có thật khi resource bên dưới ngừng làm việc.
+4. Load shedding sớm bảo vệ phần traffic còn có thể hoàn tất.
+5. Retry, circuit breaker, bulkhead và shutdown phải dùng chung một reliability
+   contract.
+
+## Tài liệu chính thức
+
+- [Node.js HTTP API](https://nodejs.org/docs/latest-v24.x/api/http.html)
+- [Node.js globals: AbortController và AbortSignal](https://nodejs.org/docs/latest-v24.x/api/globals.html#class-abortcontroller)
+- [Node.js timers/promises](https://nodejs.org/docs/latest-v24.x/api/timers.html#timers-promises-api)
+- [Kubernetes: Pod lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+- [Kubernetes: Container lifecycle hooks](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)
+- [Kubernetes: Liveness, readiness và startup probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+- [Google SRE Book: Handling overload](https://sre.google/sre-book/handling-overload/)
+
+## Phần tiếp theo
+
+Overload control giữ số công việc trong capacity envelope. Phần 22 áp nguyên lý
+đó vào byte: xây upload, export và transform pipeline có backpressure để file 20 GB
+không biến thành 20 GB heap, đồng thời xử lý abort, partial failure và cleanup.

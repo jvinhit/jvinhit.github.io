@@ -1,0 +1,504 @@
+---
+title: 'Node.js Production Engineering 24 — Kiến trúc Multi-tenant SaaS'
+description: 'Cô lập tenant xuyên HTTP, PostgreSQL RLS, cache, queue và object storage; kiểm soát authorization, noisy neighbor, migration, audit và incident response.'
+pubDate: 2026-07-25
+lang: vi
+tags:
+  [
+    nodejs,
+    multi-tenancy,
+    postgresql,
+    authorization,
+    saas,
+    production-engineering,
+  ]
+series: nodejs
+seriesOrder: 24
+draft: false
+---
+
+Một khách hàng mở trang invoice và thấy tên dự án của công ty khác trong đúng
+200 ms trước khi UI tải lại. Không có SQL injection. Không có tài khoản bị chiếm.
+Cache key chỉ là `invoice:list`; developer quên thêm `tenantId`.
+
+Trong SaaS multi-tenant, bug isolation là bug bảo mật. Điều nguy hiểm là cùng một
+tenant boundary phải sống ở nhiều nơi: token, route, service, database, cache,
+event, job, file, search index, log và admin tooling. Một `WHERE tenant_id = ?`
+bị quên ở bất kỳ nơi nào có thể phá lời hứa quan trọng nhất của sản phẩm.
+
+Sau bài này, bạn có thể:
+
+- chọn shared table, schema-per-tenant, database-per-tenant hoặc hybrid;
+- resolve tenant từ identity/membership thay vì tin header;
+- giữ tenant context xuyên async boundary mà không biến context thành authorization;
+- dùng PostgreSQL RLS như defense-in-depth với connection pool an toàn;
+- tenant-scope unique key, cache, queue, object và telemetry;
+- test isolation bằng invariant thay vì vài happy-path example.
+
+---
+
+## 1. “Tenant” là security principal và resource boundary
+
+Tenant có thể là organization, workspace, shop hoặc customer account. Một user có
+thể thuộc nhiều tenant với role khác nhau:
+
+```text
+User U
+  ├─ member of Tenant A as admin
+  └─ member of Tenant B as viewer
+```
+
+Vì vậy `userId` không thay thế `tenantId`, và claim `role: admin` không đủ nếu
+không gắn role với tenant cụ thể.
+
+Một request hợp lệ cần trả lời:
+
+1. actor là ai?
+2. actor đang hành động trong tenant nào?
+3. membership/policy nào cho phép action này?
+4. resource có thật sự thuộc tenant đó không?
+
+```ts
+type TenantAccess = {
+  actorId: string;
+  tenantId: string;
+  membershipId: string;
+  permissions: ReadonlySet<string>;
+};
+```
+
+`tenantId` do client gửi chỉ là **requested context**. Server phải đối chiếu với
+membership đã xác thực.
+
+## 2. Bốn mô hình lưu trữ
+
+| Mô hình                    | Ưu điểm                                   | Chi phí/rủi ro                                         |
+| -------------------------- | ----------------------------------------- | ------------------------------------------------------ |
+| shared tables, `tenant_id` | đơn giản vận hành, tận dụng pool tốt      | isolation phụ thuộc policy/query, noisy neighbor       |
+| schema per tenant          | namespace tách hơn, custom migration được | nhiều schema/migration, search path và pool phức tạp   |
+| database per tenant        | isolation/backup/region mạnh              | connection fleet, migration, cost và observability lớn |
+| hybrid/tiered              | đặt tenant đặc biệt vào silo              | routing/control plane/rebalancing phức tạp             |
+
+Không có mô hình “enterprise” mặc định. Chọn theo:
+
+- compliance và data residency;
+- số tenant và phân phối kích thước;
+- backup/restore từng tenant;
+- custom schema/extension;
+- connection limit và cost;
+- khả năng vận hành migration hàng nghìn shard.
+
+Một thiết kế phổ biến bắt đầu shared table với isolation nghiêm, sau đó có
+**placement registry** để đưa tenant lớn/compliance cao sang database riêng mà
+business code vẫn dùng cùng repository contract.
+
+```text
+tenant_id → placement registry → shared cluster / dedicated cluster / region
+```
+
+Registry trở thành control-plane critical dependency: cache có TTL, version và
+fail-closed khi không xác định placement.
+
+## 3. Resolve tenant ở trust boundary
+
+Public route có thể mang tenant trong subdomain, path hoặc header:
+
+```text
+acme.example.com
+/tenants/acme/orders
+X-Tenant-Id: ...
+```
+
+Nhưng resolution phải đi qua authentication + membership:
+
+```ts
+async function resolveTenantAccess(
+  actor: AuthenticatedActor,
+  requestedTenantId: string
+): Promise<TenantAccess> {
+  const membership = await memberships.findActive(
+    actor.subject,
+    requestedTenantId
+  );
+
+  if (!membership) {
+    // Không tiết lộ tenant/resource có tồn tại hay không.
+    throw new ForbiddenError('TENANT_ACCESS_DENIED');
+  }
+
+  return {
+    actorId: actor.subject,
+    tenantId: membership.tenantId,
+    membershipId: membership.id,
+    permissions: new Set(membership.permissions),
+  };
+}
+```
+
+Không tin `tenantId` trong request body để ghi row. Application lấy tenant từ
+`TenantAccess`. DTO có field `tenantId` thường là mùi thiết kế ở endpoint đã nằm
+trong tenant scope.
+
+System-to-system/job path cũng cần principal: service identity, tenant scope,
+purpose và policy. “Internal” không có nghĩa được truy cập mọi tenant.
+
+## 4. AsyncLocalStorage giúp truyền context, không cấp quyền
+
+`AsyncLocalStorage` giảm việc truyền context qua mọi function:
+
+```ts
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+const tenantContext = new AsyncLocalStorage<TenantAccess>();
+
+app.use(async (req, res, next) => {
+  const access = await authenticateAndResolveTenant(req);
+  tenantContext.run(access, next);
+});
+
+export function requireTenantContext(): TenantAccess {
+  const context = tenantContext.getStore();
+  if (!context) throw new Error('TENANT_CONTEXT_MISSING');
+  return context;
+}
+```
+
+Nhưng context không phải authorization engine. Có `tenantId` không chứng minh
+actor được `invoice:refund`; policy vẫn kiểm action/resource.
+
+Không capture store vào object sống lâu, global cache hoặc job callback chạy sau
+request. Khi enqueue job, serialize envelope tối thiểu và worker **re-validate**
+principal/policy phù hợp với semantics job.
+
+## 5. Schema biến tenant thành một phần của identity
+
+Shared-table schema:
+
+```sql
+CREATE TABLE projects (
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  id uuid NOT NULL,
+  slug text NOT NULL,
+  name text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, id),
+  UNIQUE (tenant_id, slug)
+);
+
+CREATE TABLE tasks (
+  tenant_id uuid NOT NULL,
+  id uuid NOT NULL,
+  project_id uuid NOT NULL,
+  title text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects(tenant_id, id)
+);
+```
+
+Composite foreign key ngăn task tenant A tham chiếu project tenant B ngay cả khi
+application bug. Unique constraint thường là `(tenant_id, natural_key)`, không
+phải natural key global — trừ khi business thật sự yêu cầu global.
+
+Index bắt đầu bằng query shape. Nhiều query có:
+
+```sql
+WHERE tenant_id = $1
+  AND created_at < $2
+ORDER BY created_at DESC, id DESC
+```
+
+Index tương ứng có thể là `(tenant_id, created_at DESC, id DESC)`. Nhưng tenant
+lớn có data skew; đo `EXPLAIN (ANALYZE, BUFFERS)` với distribution thực, không chỉ
+database seed 100 row.
+
+## 6. PostgreSQL RLS là defense-in-depth
+
+Row-Level Security cho phép database tự áp policy:
+
+```sql
+ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE projects FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation_projects
+ON projects
+USING (
+  tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+)
+WITH CHECK (
+  tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+);
+```
+
+Khi RLS bật mà không có policy phù hợp, PostgreSQL dùng default-deny. Tuy nhiên:
+
+- table owner thường bypass RLS trừ khi `FORCE ROW LEVEL SECURITY`;
+- superuser và role có `BYPASSRLS` bypass policy;
+- application role không nên là owner/superuser;
+- migration/admin role phải tách khỏi runtime role;
+- RLS không tự bảo vệ cache, object storage hay log.
+
+`USING` kiểm row được nhìn/thao tác; `WITH CHECK` kiểm row mới/sau update. Cần cả
+hai để chặn đổi `tenant_id` sang tenant khác.
+
+### Connection pool: không để tenant context rò sang request sau
+
+Sai:
+
+```sql
+SET app.tenant_id = 'tenant-a';
+-- connection trả về pool với session state còn tenant-a
+```
+
+Đặt context transaction-local:
+
+```ts
+async function inTenantTransaction<T>(
+  access: TenantAccess,
+  work: (tx: TenantTx) => Promise<T>
+): Promise<T> {
+  return database.transaction(async (tx) => {
+    await tx.execute`
+      SELECT set_config('app.tenant_id', ${access.tenantId}, true)
+    `;
+    return work(tx);
+  });
+}
+```
+
+Tham số thứ ba `true` làm setting local trong transaction. Query tenant phải chạy
+trên **cùng connection/transaction** sau `set_config`; API ORM cụ thể phải được
+integration-test, không giả định callback transaction luôn giữ connection theo
+cách mình nghĩ.
+
+Repository không nhận raw client tùy ý:
+
+```ts
+await inTenantTransaction(access, async (tx) => {
+  const project = await tx.projects.findById(projectId);
+  if (!project) throw new NotFoundError('PROJECT_NOT_FOUND');
+  await policy.require(access, 'project:update', project);
+  await tx.projects.rename(projectId, name);
+});
+```
+
+RLS là lớp cuối nếu repository quên filter, không thay resource-level
+authorization.
+
+## 7. Cache key và invalidation đều tenant-scoped
+
+Sai:
+
+```text
+project:{projectId}
+invoice:list:{filtersHash}
+```
+
+Đúng:
+
+```text
+tenant:{tenantId}:project:{projectId}:v3
+tenant:{tenantId}:invoice-list:{filtersHash}:v2
+```
+
+Tenant prefix áp cho:
+
+- value key;
+- lock/single-flight key;
+- tag/invalidation channel;
+- rate-limit counter;
+- idempotency key;
+- search/document namespace.
+
+Không dùng `KEYS tenant:*` để xóa production cache lớn. Dùng version namespace,
+tag index hữu hạn hoặc event-driven invalidation có owner.
+
+Cache hit vẫn không được bypass authorization nếu value chứa dữ liệu mà permission
+khác nhau trong cùng tenant. Key có thể cần permission/view variant, hoặc cache
+domain object rồi authorize trước khi project response.
+
+## 8. Queue, event và object storage
+
+Event envelope:
+
+```ts
+type TenantEvent<T> = {
+  eventId: string;
+  tenantId: string;
+  actor: { type: 'user' | 'service'; id: string };
+  type: string;
+  version: number;
+  occurredAt: string;
+  data: T;
+};
+```
+
+Consumer:
+
+1. validate schema/version;
+2. resolve tenant placement;
+3. verify resource tenant từ source of truth;
+4. idempotency scope theo `tenantId + eventId`;
+5. apply tenant quota/concurrency;
+6. log/trace tenant bằng identifier đã policy cho phép.
+
+Không tin tenant chỉ vì producer đặt vào payload; boundary khác team/trust domain
+cần signature/authentication và validation.
+
+Object key nên khó đoán và tenant-scoped:
+
+```text
+tenants/{tenantId}/objects/{randomObjectId}
+```
+
+Nhưng prefix không phải authorization. Download đi qua policy hoặc signed URL
+ngắn hạn sinh sau khi kiểm membership. Storage IAM/policy là defense-in-depth.
+
+## 9. Noisy neighbor là isolation về capacity
+
+Tenant A không đọc được dữ liệu B nhưng có thể làm B timeout nếu chạy 50 export.
+Isolation cần cả confidentiality và availability.
+
+Controls:
+
+- rate limit theo tenant + operation, không chỉ IP;
+- concurrency gate riêng cho export/report;
+- queue fair scheduling hoặc weighted quota;
+- per-tenant storage/event throughput budget;
+- query timeout và result limit;
+- dedicated placement cho tenant lớn;
+- cost attribution/showback.
+
+```text
+global capacity
+  ├─ critical interactive pool
+  ├─ background pool
+  └─ per-tenant token/concurrency budget
+```
+
+Quota không nên nằm hoàn toàn trong một process nếu nhiều replica cần global
+limit. Dù dùng Redis/gateway, failure policy phải rõ: fail-open hay fail-closed
+cho từng operation.
+
+## 10. Admin và support là boundary nguy hiểm nhất
+
+Support tool thường cần cross-tenant lookup. Không tắt RLS cho toàn app để làm
+admin dễ hơn.
+
+Thiết kế:
+
+- deployment/service riêng hoặc role riêng;
+- just-in-time elevated access có expiry;
+- reason/ticket bắt buộc;
+- step-up authentication;
+- read-only mặc định, write cần approval với action quan trọng;
+- immutable audit event trước/sau;
+- UI luôn hiển thị tenant đang impersonate;
+- không cho cache/session admin rò sang user flow.
+
+“Impersonate user” phải tạo actor chain:
+
+```text
+real_actor=support-123
+effective_actor=user-456
+tenant=acme
+reason=INC-789
+expires_at=...
+```
+
+Audit không được chỉ ghi effective user rồi mất người thực hiện.
+
+## 11. Migration và tenant lifecycle
+
+Với shared table, một migration cho toàn fleet nhưng backfill phải tenant-aware:
+
+- checkpoint theo tenant + cursor;
+- concurrency/batch budget;
+- skip/pause tenant nóng;
+- progress/error metric;
+- compatible app trong suốt expand–migrate–contract.
+
+Với database/schema per tenant:
+
+- migration control plane theo version;
+- canary cohort;
+- resume/idempotency;
+- tenant ở nhiều version trong cửa sổ rollout;
+- backup/restore và rollback theo placement.
+
+Offboarding tenant không phải `DELETE FROM tenants`. Cần workflow:
+
+```text
+active → suspended → retention_hold/export → deletion_scheduled
+       → delete DB/cache/search/object/backup per policy → tombstoned
+```
+
+Legal hold, audit retention và backup expiry có thể khác nhau; ghi rõ policy và
+bằng chứng hoàn tất.
+
+## 12. Test isolation như một invariant
+
+Seed ít nhất hai tenant có ID/resource tương tự. Với mọi operation:
+
+```text
+actor A + resource A → allowed theo permission
+actor A + resource B → không đọc, sửa, suy ra existence
+actor không membership → denied
+missing tenant context → fail closed
+```
+
+Test:
+
+- repository bỏ `tenant_id` vẫn bị RLS chặn;
+- connection pool luân phiên A/B hàng nghìn lần không leak;
+- insert/update cross-tenant bị `WITH CHECK` chặn;
+- cache key/invalidation không đụng tenant khác;
+- job đổi `tenantId` trong payload không vượt source-of-truth check;
+- object URL tenant A không dùng cho B;
+- timing/error body không tiết lộ resource tồn tại;
+- admin access có audit actor chain.
+
+Property-based test có thể sinh actor/tenant/resource/action ngẫu nhiên và assert:
+
+```text
+returnedResource.tenantId === authorizedTenantId
+```
+
+Architecture test/lint có thể cấm repository public không nhận `TenantTx`, nhưng
+runtime integration test vẫn là bằng chứng cuối.
+
+## Checklist trước khi ship
+
+- [ ] Tenant model và placement strategy được ghi bằng ADR.
+- [ ] Requested tenant được đối chiếu membership, không tin header/body.
+- [ ] Permission gắn với tenant/resource; context không thay authorization.
+- [ ] Schema có tenant-scoped PK/FK/unique constraint.
+- [ ] App role không owner/superuser/BYPASSRLS; RLS có `WITH CHECK`.
+- [ ] Tenant DB setting dùng transaction-local trên cùng pooled connection.
+- [ ] Cache, lock, idempotency, search, event và object đều tenant-scoped.
+- [ ] Interactive/background/noisy tenant có capacity isolation.
+- [ ] Admin path tách quyền, có expiry/reason/audit actor chain.
+- [ ] Test hai tenant xuyên HTTP → DB → cache → queue → storage.
+
+## Nếu chỉ nhớ 5 điều
+
+1. Multi-tenancy là security boundary xuyên mọi adapter.
+2. Tenant client yêu cầu phải được resolve lại qua identity + membership.
+3. Composite constraint và RLS biến isolation thành database invariant.
+4. Connection pool làm session tenant context nguy hiểm; dùng transaction-local.
+5. Dữ liệu kín nhưng capacity dùng chung không kiểm soát vẫn chưa phải isolation.
+
+## Tài liệu chính thức và chuẩn
+
+- [PostgreSQL: Row security policies](https://www.postgresql.org/docs/current/ddl-rowsecurity.html)
+- [PostgreSQL: `CREATE POLICY`](https://www.postgresql.org/docs/current/sql-createpolicy.html)
+- [PostgreSQL: `set_config` và `current_setting`](https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SET)
+- [Node.js Async context tracking](https://nodejs.org/docs/latest-v24.x/api/async_context.html)
+- [OWASP Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html)
+- [OWASP REST Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/REST_Security_Cheat_Sheet.html)
+
+## Phần tiếp theo
+
+Tenant isolation giữ request nội bộ đúng boundary. Phần 25 xử lý boundary ít kiểm
+soát hơn: webhook từ payment provider có thể đến trùng, trễ, sai thứ tự hoặc bị
+giả mạo — nhưng business vẫn phải hội tụ về đúng trạng thái và reconcile được.

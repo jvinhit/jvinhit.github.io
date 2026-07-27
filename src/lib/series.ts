@@ -309,8 +309,55 @@ export const SERIES: Record<string, SeriesMeta> = {
   },
   nodejs: {
     title: 'Node.js Production Engineering — Từ Runtime đến Hệ thống phân tán',
+    description:
+      'Lộ trình Node.js 26 phần từ runtime, HTTP và data layer tới distributed systems, reliability, diagnostics và các case study production thực tế.',
     blurb:
-      'Lộ trình tiếng Việt gồm 20 phần dành cho kỹ sư muốn hiểu Node.js như một nền tảng production, không chỉ như công cụ dựng API. Series đi từ V8, libuv, event loop, HTTP và Express 5 đến data layer, authentication, testing, performance, delivery và kiến trúc modular monolith; sau đó đào sâu PostgreSQL, Prisma, Redis, NestJS, message queue, GraphQL, gRPC, realtime và observability với OpenTelemetry. Mỗi phần dùng TypeScript, giải thích mental model trước API, phân tích trade-off và failure mode, kèm tiêu chí vận hành, bài tập và tài liệu chính thức để người đọc có thể biến kiến thức thành quyết định kỹ thuật.',
+      'Lộ trình tiếng Việt gồm 26 phần dành cho kỹ sư muốn hiểu Node.js như một nền tảng production, không chỉ như công cụ dựng API. Series đi từ V8, libuv, event loop, HTTP và Express 5 đến data layer, security, testing, performance, delivery và modular monolith; đào sâu PostgreSQL, Prisma, Redis, NestJS, queue, GraphQL, gRPC, realtime và OpenTelemetry; rồi chuyển sang volume thực chiến về overload control, stream dữ liệu lớn, production diagnostics, multi-tenant SaaS, webhook/payment và một capstone game day. Mỗi phần dùng TypeScript, giải thích mental model trước API, phân tích trade-off và failure mode, kèm tiêu chí vận hành, bài tập cùng tài liệu chính thức để biến kiến thức thành quyết định kỹ thuật.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Runtime, API và trust boundary',
+        description:
+          'Hiểu Node.js từ event loop và HTTP tới Express, data layer, authentication và API security.',
+        from: 1,
+        to: 5,
+      },
+      {
+        title: 'Nền tảng production engineering',
+        description:
+          'Thiết kế codebase lớn, delivery, performance, test portfolio và kiến trúc có khả năng tiến hóa.',
+        from: 6,
+        to: 10,
+      },
+      {
+        title: 'Data, framework và identity chuyên sâu',
+        description:
+          'Đào sâu PostgreSQL, Prisma, Redis, NestJS và identity architecture bằng các invariant production.',
+        from: 11,
+        to: 15,
+      },
+      {
+        title: 'Async và distributed systems',
+        description:
+          'Xây queue, GraphQL, microservices/gRPC, realtime và observability theo user journey.',
+        from: 16,
+        to: 20,
+      },
+      {
+        title: 'Reliability và diagnostics',
+        description:
+          'Kiểm soát overload, stream dữ liệu lớn và điều tra CPU, event loop, heap cùng native memory.',
+        from: 21,
+        to: 23,
+      },
+      {
+        title: 'Case study production',
+        description:
+          'Giải bài toán multi-tenant SaaS, webhook/payment và hoàn thiện capstone bằng một production game day.',
+        from: 24,
+        to: 26,
+      },
+    ],
     pin: 5,
   },
   'nestjs-zero-to-hero': {

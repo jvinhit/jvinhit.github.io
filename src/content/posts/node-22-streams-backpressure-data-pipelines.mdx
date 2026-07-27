@@ -1,0 +1,453 @@
+---
+title: 'Node.js Production Engineering 22 — Streams, Backpressure và Data Pipelines'
+description: 'Xử lý upload, export và transform dữ liệu lớn với memory hữu hạn: stream.pipeline, highWaterMark, abort, size limit, integrity, cleanup và observability.'
+pubDate: 2026-07-25
+lang: vi
+tags:
+  [
+    nodejs,
+    streams,
+    backpressure,
+    file-upload,
+    data-pipeline,
+    production-engineering,
+  ]
+series: nodejs
+seriesOrder: 22
+draft: false
+---
+
+Một endpoint export chạy đúng với 1.000 dòng. Đến khách hàng thật có 8 triệu dòng,
+code đọc toàn bộ query vào array, `JSON.stringify`, rồi mới gửi response. Pod tăng
+từ 300 MB lên 3 GB, GC chạy liên tục và mọi request khác cùng chậm.
+
+Vấn đề không phải file “quá lớn”. Vấn đề là kiến trúc đã giả định **toàn bộ dữ
+liệu phải cùng tồn tại trong memory**.
+
+Stream cho phép mỗi thời điểm chỉ giữ một phần dữ liệu. Nhưng “đã dùng `.pipe()`”
+chưa đủ: pipeline production còn phải truyền backpressure, hủy khi client rời đi,
+giới hạn byte thật, dọn partial output và chứng minh memory không tăng theo kích
+thước file.
+
+Sau bài này, bạn có thể:
+
+- đọc đúng `Readable`, `Writable`, `Transform` và `highWaterMark`;
+- dùng `pipeline()` để truyền error/cancellation qua toàn graph;
+- thiết kế upload không buffer body và có giới hạn/integrity;
+- export hàng triệu record bằng cursor + batch + stream;
+- xử lý partial failure, temp object và cleanup idempotent;
+- load test pipeline bằng memory/backpressure acceptance criteria.
+
+---
+
+## 1. Mental model: pipeline là chuỗi buffer hữu hạn
+
+```text
+source ──▶ buffer ──▶ transform ──▶ buffer ──▶ sink
+             ▲                         │
+             └────── backpressure ◀────┘
+```
+
+- **Readable** tạo chunk: request body, file, database cursor.
+- **Writable** tiêu thụ chunk: response, file, object storage upload.
+- **Transform** vừa đọc vừa ghi: parse, validate, compress, encrypt.
+- **Duplex** có hai phía đọc/ghi có thể độc lập: socket.
+
+Sink thường chậm hơn source ở một thời điểm. Backpressure là tín hiệu yêu cầu
+source giảm/không đọc thêm cho tới khi downstream có chỗ.
+
+Không có backpressure:
+
+```text
+network 200 MB/s → compressor 40 MB/s
+phần chênh 160 MB/s → memory tăng cho tới OOM
+```
+
+Có backpressure, throughput toàn pipeline gần bottleneck 40 MB/s và memory dao
+động quanh tổng buffer đã cấu hình.
+
+## 2. `highWaterMark` là ngưỡng tín hiệu, không phải trần memory
+
+Khi internal buffer đạt `highWaterMark`, writable `.write()` trả `false` hoặc
+readable ngừng kéo thêm. Đây là ngưỡng bắt đầu backpressure, không phải cam kết
+RSS sẽ không vượt con số đó.
+
+Memory thật còn gồm:
+
+- buffer ở mọi stage;
+- chunk đang được transform;
+- native/zlib/TLS buffer;
+- queue của SDK object storage;
+- batch từ database;
+- object được giữ bởi closure/log/telemetry.
+
+Trong byte mode, `highWaterMark` tính theo byte gần đúng. Trong object mode, nó
+đếm **số object**; 16 object có thể là 16 row nhỏ hoặc 16 payload 50 MB.
+
+Đừng “tối ưu” bằng cách tăng mọi `highWaterMark`. Buffer lớn có thể tăng
+throughput cho I/O tuần tự, nhưng cũng tăng memory per connection và thời gian dữ
+liệu nằm trong pipeline. Đo với workload thật.
+
+## 3. Khi nào `.write()` trả `false`
+
+Nếu dùng API thấp:
+
+```ts
+import { once } from 'node:events';
+
+async function writeAll(
+  destination: NodeJS.WritableStream,
+  chunks: AsyncIterable<Buffer>
+) {
+  for await (const chunk of chunks) {
+    if (!destination.write(chunk)) {
+      await once(destination, 'drain');
+    }
+  }
+
+  destination.end();
+}
+```
+
+Bỏ qua giá trị `false` vẫn khiến Node nhận chunk mới; bạn đã vô hiệu hóa
+backpressure.
+
+Trong phần lớn application code, ưu tiên `stream/promises.pipeline()`. Nó nối
+backpressure, forward error, destroy các stream liên quan và trả Promise:
+
+```ts
+import { createReadStream, createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import { createGzip } from 'node:zlib';
+
+await pipeline(
+  createReadStream('orders.ndjson'),
+  createGzip(),
+  createWriteStream('orders.ndjson.gz'),
+  { signal: AbortSignal.timeout(60_000) }
+);
+```
+
+`pipeline` giảm nhiều edge case, không biến business workflow thành transaction.
+Nếu destination đã ghi 80% rồi source lỗi, 80% đó có thể đã tồn tại; bạn vẫn cần
+commit/cleanup protocol.
+
+## 4. Chunk không phải record
+
+Network/file stream chia dữ liệu theo lúc byte sẵn sàng, không theo newline, JSON
+object hay UTF-8 character. Một dòng có thể nằm trong ba chunk; một chunk có thể
+chứa 500 dòng.
+
+Một line splitter phải giữ phần dư:
+
+```ts
+import { Transform } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
+
+class LineSplitter extends Transform {
+  #decoder = new StringDecoder('utf8');
+  #remainder = '';
+
+  constructor() {
+    super({ readableObjectMode: true });
+  }
+
+  _transform(
+    chunk: Buffer,
+    _encoding: BufferEncoding,
+    callback: (error?: Error | null) => void
+  ) {
+    const text = this.#remainder + this.#decoder.write(chunk);
+    const lines = text.split('\n');
+    this.#remainder = lines.pop() ?? '';
+
+    for (const line of lines) this.push(line);
+    callback();
+  }
+
+  _flush(callback: (error?: Error | null) => void) {
+    const tail = this.#remainder + this.#decoder.end();
+    if (tail) this.push(tail);
+    callback();
+  }
+}
+```
+
+Production còn cần giới hạn độ dài một record. Nếu attacker gửi 2 GB không có
+newline, `#remainder` vẫn tăng vô hạn. Stream không tự đồng nghĩa an toàn.
+
+## 5. Upload: trust boundary bắt đầu trước parser
+
+Một upload flow an toàn:
+
+```text
+request byte stream
+  → transport/body size limit
+  → decode/decompress (nếu cho phép)
+  → post-decompression limit
+  → content sniff/format validation
+  → hash + malware policy
+  → temporary object
+  → metadata transaction
+  → publish/rename object
+```
+
+`Content-Length` là hint do client cung cấp, không phải bằng chứng. Vẫn đếm byte
+đã đọc và dừng ngay khi vượt limit.
+
+```ts
+import { Transform } from 'node:stream';
+
+class ByteLimit extends Transform {
+  #seen = 0;
+
+  constructor(private readonly maxBytes: number) {
+    super();
+  }
+
+  _transform(
+    chunk: Buffer,
+    _encoding: BufferEncoding,
+    callback: (error?: Error | null, data?: Buffer) => void
+  ) {
+    this.#seen += chunk.byteLength;
+
+    if (this.#seen > this.maxBytes) {
+      callback(new Error('UPLOAD_TOO_LARGE'));
+      return;
+    }
+
+    callback(null, chunk);
+  }
+}
+```
+
+Đặt limit ở đâu phụ thuộc threat model. Nếu nhận gzip, giới hạn compressed body
+không chặn decompression bomb; cần limit sau decompression và có thể giới hạn
+compression ratio/CPU time.
+
+Không tin extension hoặc `Content-Type` để quyết định nội dung. Kiểm magic bytes
+và parse bằng decoder an toàn; tên file từ client không được trở thành filesystem
+path.
+
+## 6. Atomic publish cho output không atomic
+
+Upload thẳng vào key public rồi metadata insert thất bại tạo orphan/partial
+object. Ghi database trước rồi upload thất bại tạo row trỏ vào thứ không tồn tại.
+
+Một protocol thực dụng:
+
+1. tạo `upload_id` và temporary key ngẫu nhiên;
+2. stream vào temp object, tính hash/size trong lúc truyền;
+3. object storage xác nhận hoàn tất;
+4. transaction ghi metadata trạng thái `ready`;
+5. publish bằng copy/rename semantics phù hợp provider;
+6. cleanup temp idempotent;
+7. sweeper xóa temp quá TTL và reconcile orphan.
+
+```text
+pending ── upload complete ──▶ verified ── metadata commit ──▶ ready
+   │                              │
+   └──── timeout/abort ───────────┴──────────────▶ cleanup_due
+```
+
+Object storage multipart upload cần abort khi thất bại; nếu không, uploaded parts
+có thể tiếp tục chiếm storage và chi phí. SDK thường có concurrency riêng — đặt
+part size và số part song song theo memory budget, không để default thay bạn quyết
+capacity.
+
+Hash xác minh integrity, không xác minh file “an toàn”. Malware/content policy là
+boundary khác và có thể chạy bất đồng bộ trước khi object được phát hành.
+
+## 7. Export lớn: cursor → batch → encode → response
+
+Sai:
+
+```ts
+const rows = await prisma.order.findMany();
+res.send(JSON.stringify(rows));
+```
+
+Đúng về kiến trúc:
+
+```text
+database cursor/keyset batches
+  → row mapper
+  → CSV/NDJSON encoder
+  → optional gzip
+  → HTTP response/object storage
+```
+
+Pseudo-code bằng async generator:
+
+```ts
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { createGzip } from 'node:zlib';
+
+async function* orderCsv(signal: AbortSignal) {
+  let cursor: { createdAt: Date; id: string } | undefined;
+
+  while (!signal.aborted) {
+    const rows = await orders.readBatch({ cursor, limit: 500, signal });
+    if (rows.length === 0) return;
+
+    for (const row of rows) {
+      yield encodeCsvRow(row);
+    }
+
+    const last = rows.at(-1)!;
+    cursor = { createdAt: last.createdAt, id: last.id };
+  }
+}
+
+await pipeline(Readable.from(orderCsv(signal)), createGzip(), res, { signal });
+```
+
+Repository phải dùng cursor ổn định có tie-breaker và snapshot/consistency contract
+rõ. Trong export kéo dài, dữ liệu có thể thay đổi giữa các batch:
+
+- cần snapshot chính xác: materialize job/snapshot có cost;
+- chấp nhận “as observed”: ghi rõ semantics;
+- export theo cutoff (`created_at < startedAt`) để tập hữu hạn;
+- ưu tiên background job + object storage nếu thời gian vượt HTTP deadline.
+
+CSV encoder phải escape quote/newline đúng và phòng spreadsheet formula injection
+nếu file được mở bằng Excel/Sheets. NDJSON thường dễ stream hơn một JSON array vì
+không cần quản lý dấu phẩy/mảng đóng khi lỗi giữa chừng.
+
+## 8. Client disconnect phải abort source
+
+Nếu browser đóng tab sau 10 giây nhưng database cursor chạy thêm 20 phút, pipeline
+đã mất lifecycle ownership.
+
+```ts
+const controller = new AbortController();
+
+res.once('close', () => {
+  if (!res.writableEnded) {
+    controller.abort(new Error('download client disconnected'));
+  }
+});
+
+await pipeline(Readable.from(orderCsv(controller.signal)), createGzip(), res, {
+  signal: controller.signal,
+});
+```
+
+Adapter database/object storage phải nhận hoặc ánh xạ signal thành cancel/close.
+Trong `finally`, đóng cursor, temp file, multipart upload và metric scope. Cleanup
+phải chạy được nhiều lần vì abort/error/shutdown có thể gặp nhau.
+
+## 9. Node streams và Web Streams
+
+Web `ReadableStream` xuất hiện trong Fetch API và runtime khác; Node streams phổ
+biến trong `fs`, `http`, `zlib` và ecosystem. Node cung cấp bridge
+`Readable.fromWeb()`/`Readable.toWeb()` và tương tự cho Writable.
+
+Interop không xóa khác biệt:
+
+- error/cancel propagation phải test;
+- object mode không có mapping trực tiếp như byte stream;
+- chunk type có thể là `Buffer` hoặc `Uint8Array`;
+- framework có thể sở hữu lifecycle response.
+
+Chuẩn hóa boundary ở adapter thay vì trộn hai abstraction xuyên business code.
+
+## 10. Failure modes thường gặp
+
+| Anti-pattern                        | Hậu quả                      | Thiết kế lại                  |
+| ----------------------------------- | ---------------------------- | ----------------------------- |
+| `Buffer.concat()` toàn body         | memory theo file size        | incremental parser/stream     |
+| bỏ qua `.write() === false`         | writable queue tăng          | đợi `drain` hoặc `pipeline`   |
+| parser giả định một chunk = một row | record vỡ/ngẫu nhiên         | framing + remainder limit     |
+| chỉ tin `Content-Length`            | bypass size limit            | đếm byte thực                 |
+| temp key public                     | đọc partial object           | private temp + atomic publish |
+| client rời nhưng source vẫn chạy    | query/CPU/storage leak       | propagation + cleanup         |
+| object-mode chứa object khổng lồ    | `highWaterMark` gây hiểu lầm | byte/record limit             |
+| stream HTTP tác vụ hàng giờ         | timeout/retry khó phục hồi   | background export job         |
+
+## 11. Observability và kiểm thử
+
+Metric:
+
+- bytes/chunks in-out, throughput và duration;
+- active pipeline theo type;
+- readable/writable buffer length nếu có giá trị chẩn đoán;
+- abort/error theo stage và reason;
+- upload temp age/orphan count;
+- export batch/query latency;
+- heap, RSS, event-loop delay khi chạy tải.
+
+Test quan trọng:
+
+1. chunk boundary ngẫu nhiên vẫn parse đúng Unicode/record;
+2. payload vượt limit dừng source và không publish object;
+3. sink chậm giữ RSS trong envelope;
+4. disconnect đóng cursor/multipart upload;
+5. transform lỗi giữa chừng không tạo file public;
+6. cleanup/reconcile chạy hai lần vẫn an toàn.
+
+Load test bằng file 10 MB chưa chứng minh memory bound. Dùng input lớn hơn nhiều
+lần heap target và sink cố ý chậm; tiêu chí là RSS đạt plateau hợp lý, không tăng
+tuyến tính theo tổng byte.
+
+## 12. Lab: import và export order
+
+Xây hai flow:
+
+**Import**
+
+- nhận NDJSON tối đa 5 GB;
+- limit mỗi record 256 KB và tổng byte;
+- validate từng record, ghi theo batch hữu hạn;
+- lỗi domain ghi rejection report, lỗi hệ thống abort;
+- idempotency theo `importId + rowId`;
+- resume từ checkpoint hoặc restart có semantics rõ.
+
+**Export**
+
+- request tạo background job và trả `202 + exportId`;
+- worker đọc keyset batch theo cutoff, encode CSV, gzip và upload temp object;
+- commit metadata rồi publish signed download URL ngắn hạn;
+- client cancel job, worker abort và cleanup;
+- sweeper reconcile pending/temp quá TTL.
+
+Bài đạt khi xử lý dataset lớn hơn heap nhiều lần, memory plateau, retry không
+duplicate row và không có object public ở trạng thái partial.
+
+## Checklist trước khi ship
+
+- [ ] Không stage nào cần toàn bộ payload trong memory.
+- [ ] Backpressure truyền từ sink tới source; queue/buffer đều hữu hạn.
+- [ ] Record framing không phụ thuộc chunk boundary.
+- [ ] Có limit tổng byte, record, thời gian và post-decompression.
+- [ ] Abort đi qua request, database, transform và destination.
+- [ ] Partial output ở temp/private state; publish có commit protocol.
+- [ ] Cleanup idempotent và có sweeper/reconciliation.
+- [ ] Export consistency/cutoff được ghi rõ.
+- [ ] Metric xác định stage chậm/lỗi; log không chứa raw sensitive payload.
+- [ ] Slow-sink load test chứng minh RSS không tăng theo file.
+
+## Nếu chỉ nhớ 5 điều
+
+1. Stream là chuỗi buffer hữu hạn, không chỉ là cú pháp `.pipe()`.
+2. `highWaterMark` phát tín hiệu backpressure; nó không phải trần memory.
+3. Chunk là byte tùy ý, không phải record.
+4. `pipeline()` lo plumbing; business vẫn phải lo atomic publish và cleanup.
+5. Test quan trọng nhất là sink chậm + input lớn + client abort.
+
+## Tài liệu chính thức
+
+- [Node.js Streams API](https://nodejs.org/docs/latest-v24.x/api/stream.html)
+- [Node.js: Backpressuring in streams](https://nodejs.org/en/learn/modules/backpressuring-in-streams)
+- [Node.js `stream.pipeline`](https://nodejs.org/docs/latest-v24.x/api/stream.html#streampipelinesource-transforms-destination-options)
+- [Node.js StringDecoder](https://nodejs.org/docs/latest-v24.x/api/string_decoder.html)
+- [Node.js Web Streams API](https://nodejs.org/docs/latest-v24.x/api/webstreams.html)
+- [OWASP: Unrestricted File Upload](https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload)
+
+## Phần tiếp theo
+
+Pipeline đã memory-bound vẫn có thể chậm vì CPU hotspot, event-loop stall, heap
+leak hoặc native memory. Phần 23 xây một playbook production diagnostics: bắt đầu
+từ symptom, chọn đúng evidence và tránh biến thao tác điều tra thành sự cố thứ hai.
