@@ -54,6 +54,16 @@ export interface ToolSection {
 
 const standaloneTools: Tool[] = [
   {
+    name: 'EN/30 — English for Work',
+    description:
+      'Lộ trình 30 ngày luyện tiếng Anh thực chiến cho công việc — hội thoại, cụm từ, ngữ pháp, quiz, ghi chú, ôn tập giãn cách và theo dõi tiến trình ngay trong trình duyệt.',
+    href: '/tools/en-30/',
+    icon: 'globe',
+    tags: ['english', 'learning', 'work', '30-day'],
+    app: true,
+    pinned: true,
+  },
+  {
     name: 'Three.js — Your First Scene',
     description:
       'Interactive first Three.js scene — orbit a live cube while the three pillars (Scene, Camera, Renderer) report draw calls, FOV, and FPS in real time. Toggle wireframe, axes, and grid helpers.',
