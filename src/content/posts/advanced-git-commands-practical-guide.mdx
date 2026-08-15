@@ -1,0 +1,756 @@
+---
+title: 'Git nâng cao thực dụng: switch, patch, worktree, reflog và bisect'
+description: 'Cẩm nang Git nâng cao theo tình huống thực tế: tách commit bằng patch, chuyển thay đổi, làm nhiều branch song song, tìm commit gây lỗi và phục hồi lịch sử an toàn.'
+pubDate: 2026-07-30
+lang: vi
+tags: [git, cli, terminal, workflow, debugging, productivity]
+draft: false
+---
+
+import GitDiagram from '../../components/blog/GitDiagram.astro';
+
+Bạn không cần thuộc hàng trăm lệnh Git để làm việc hiệu quả. Phần lớn thời gian,
+chỉ cần biết thêm một nhóm lệnh đúng chỗ là đủ giải quyết những tình huống vốn
+rất mất công:
+
+- một file chứa ba thay đổi nhưng bạn chỉ muốn commit một thay đổi;
+- cần chuyển bản sửa lỗi sang branch khác mà không muốn copy file thủ công;
+- đang làm feature thì phải mở hotfix ngay lập tức;
+- test bỗng hỏng nhưng không biết commit nào gây ra;
+- vừa rebase hoặc reset nhầm và tưởng đã mất commit.
+
+Bài này không đi theo kiểu liệt kê lệnh từ A đến Z. Chúng ta sẽ bắt đầu từ
+**vấn đề**, chọn công cụ phù hợp, rồi xem Git thực sự thay đổi vùng dữ liệu nào.
+
+> Nếu chưa quen với `status`, `diff`, staging area và commit, hãy đọc
+> [Git Commands Daily Workflow](/blog/dev-cli-05-git-daily-commands) trước.
+> Bài này giả định bạn đã dùng được workflow Git hằng ngày.
+
+---
+
+## Bản đồ an toàn trước khi đi sâu
+
+Git thường làm việc với bốn vùng:
+
+```text
+Working tree  →  Staging area  →  Local commits  →  Remote
+ file đang sửa      git add          git commit       git push
+```
+
+<GitDiagram
+  kind="workspace-pipeline"
+  caption="Mỗi lệnh Git tác động lên một vùng cụ thể; quan sát đúng vùng giúp tránh hoàn tác quá tay."
+/>
+
+Một lệnh đáng sợ hay không phụ thuộc vào **vùng nó tác động**:
+
+| Lệnh                          | Tác động chính              | Mức cần thận trọng |
+| ----------------------------- | --------------------------- | ------------------ |
+| `git status`, `git diff`      | chỉ đọc                     | thấp               |
+| `git add -p`                  | staging area                | thấp               |
+| `git switch`, `git worktree`  | working tree / branch       | vừa                |
+| `git restore -p`              | xóa một phần thay đổi local | cao                |
+| `git rebase`                  | viết lại commit local       | cao                |
+| `git push --force-with-lease` | cập nhật lịch sử remote     | rất cao            |
+
+Hai thói quen giúp giảm phần lớn tai nạn:
+
+```bash
+git status --short
+git diff
+```
+
+Chạy chúng trước một thao tác thay đổi dữ liệu. Sau thao tác, chạy lại để xác
+nhận kết quả đúng như mình nghĩ.
+
+---
+
+## 1. `git switch`: đổi branch mà không nhập nhằng
+
+Trước đây, `git checkout` làm quá nhiều việc: đổi branch, tạo branch, detach
+`HEAD`, thậm chí khôi phục file. `git switch` tách riêng nhóm thao tác liên quan
+đến branch nên câu lệnh dễ đọc và khó dùng nhầm hơn.
+
+### Đổi và tạo branch
+
+```bash
+git switch main
+git switch -c feature/payment-retry
+```
+
+`-c` là viết tắt của `--create`. Nếu muốn tạo branch từ một điểm cụ thể:
+
+```bash
+git switch -c hotfix/token-expiry origin/main
+```
+
+Quay lại branch vừa đứng trước đó:
+
+```bash
+git switch -
+```
+
+Đây là lệnh nhỏ nhưng rất tiện khi phải qua lại giữa feature và branch review.
+
+### Xem một commit mà không tạo branch
+
+```bash
+git switch --detach <commit>
+```
+
+Chế độ detached `HEAD` phù hợp để build hoặc kiểm tra một phiên bản cũ. Nếu sau
+đó bạn sửa code và muốn giữ lại công việc, hãy tạo branch **trước khi rời đi**:
+
+```bash
+git switch -c experiment/from-old-commit
+```
+
+### Bẫy cần nhớ
+
+Git có thể mang thay đổi chưa commit sang branch mới nếu chúng không xung đột.
+Điều đó hợp lệ nhưng dễ khiến bạn tưởng code thuộc branch kia. Vì vậy, luôn kiểm
+tra trước khi switch:
+
+```bash
+git status --short
+```
+
+Nếu thay đổi đang dở cần giữ lâu, một WIP commit trên branch riêng thường rõ ràng
+hơn stash. Nếu chỉ đổi ngữ cảnh vài phút, dùng:
+
+```bash
+git stash push -u -m "WIP payment retry"
+```
+
+`-u` đưa cả file chưa được track vào stash.
+
+---
+
+## 2. “Git patch” thực ra là gì?
+
+Git không có một lệnh tên là `git patch`. Trong thực tế, “dùng patch” có thể nói
+đến ba nhu cầu khác nhau:
+
+1. **chọn từng phần thay đổi** với `git add -p` hoặc `git restore -p`;
+2. **chuyển nội dung diff** bằng `git diff` và `git apply`;
+3. **chuyển nguyên commit** bằng `git format-patch` và `git am`.
+
+Chọn sai workflow có thể làm mất metadata commit hoặc mang theo nhiều thay đổi
+hơn mong muốn.
+
+<GitDiagram
+  kind="patch-decision"
+  caption="Chọn công cụ theo đơn vị cần di chuyển: hunk, diff thô, series commit hay một commit đã tồn tại."
+/>
+
+### Bảng chọn nhanh
+
+| Bạn muốn                                | Công cụ phù hợp               |
+| --------------------------------------- | ----------------------------- |
+| Tách một file thành nhiều commit        | `git add -p`                  |
+| Bỏ một vài hunk chưa commit             | `git restore -p`              |
+| Gửi phần nội dung sửa, không cần commit | `git diff` + `git apply`      |
+| Gửi commit kèm author và message        | `git format-patch` + `git am` |
+| Lấy một commit sang branch hiện tại     | `git cherry-pick`             |
+
+---
+
+## 3. `git add -p`: biến một working tree lộn xộn thành commit sạch
+
+Giả sử `src/auth.ts` đang chứa cả bugfix, refactor đổi tên và một dòng log debug.
+`git add src/auth.ts` sẽ đưa tất cả vào cùng một commit. Thay vào đó:
+
+```bash
+git add -p src/auth.ts
+```
+
+Git hiển thị từng **hunk** và hỏi bạn muốn làm gì:
+
+| Phím | Tác dụng                           |
+| ---- | ---------------------------------- |
+| `y`  | stage hunk hiện tại                |
+| `n`  | không stage hunk này               |
+| `s`  | chia hunk thành các phần nhỏ hơn   |
+| `e`  | sửa patch thủ công trước khi stage |
+| `j`  | chuyển đến hunk tiếp theo          |
+| `k`  | quay lại hunk trước                |
+| `q`  | thoát                              |
+| `?`  | xem trợ giúp đầy đủ                |
+
+Sau khi chọn:
+
+```bash
+git diff --staged
+git commit -m "Fix expired token handling"
+```
+
+Phần refactor và debug log vẫn ở working tree để bạn xử lý sau.
+
+### Khi `s` không chia nhỏ được
+
+Git chỉ split được khi giữa các nhóm thay đổi có đủ dòng context không đổi. Nếu
+hai thay đổi nằm sát nhau, thử `e`.
+
+Trong chế độ edit patch:
+
+- xóa dòng bắt đầu bằng `+` nếu không muốn stage dòng được thêm;
+- đổi dòng bắt đầu bằng `-` thành dòng context (dấu cách) nếu không muốn stage
+  việc xóa dòng đó;
+- không chỉnh nội dung code tùy ý như khi đang dùng editor thông thường.
+
+Nếu patch sau khi sửa không hợp lệ, Git sẽ từ chối thay vì âm thầm stage sai.
+Dù vậy, hãy luôn đọc lại bằng `git diff --staged`.
+
+### Các biến thể hữu ích
+
+Stage có chọn lọc mọi thay đổi, kể cả file mới:
+
+```bash
+git add -N path/to/new-file
+git add -p
+```
+
+`-N` đánh dấu “intent to add”, nhờ đó file mới xuất hiện trong patch mode.
+
+Bỏ stage một vài hunk nhưng giữ code:
+
+```bash
+git restore --staged -p
+```
+
+Bỏ một vài hunk khỏi working tree:
+
+```bash
+git restore -p
+```
+
+Lệnh cuối **xóa thay đổi chưa commit** ở những hunk bạn chọn. Hãy xem diff trước:
+
+```bash
+git diff -- path/to/file
+git restore -p -- path/to/file
+```
+
+---
+
+## 4. `git diff` + `git apply`: chuyển nội dung thay đổi
+
+Workflow này phù hợp khi người nhận chỉ cần phần code thay đổi, không cần giữ
+author, commit message hoặc cấu trúc commit.
+
+Tạo patch từ toàn bộ thay đổi so với `HEAD`, gồm cả phần đã stage và chưa stage:
+
+```bash
+git diff HEAD > changes.patch
+```
+
+Nếu patch có thay đổi binary:
+
+```bash
+git diff --binary HEAD > changes.patch
+```
+
+Ở working tree đích, kiểm tra trước khi áp dụng:
+
+```bash
+git apply --check changes.patch
+git apply changes.patch
+```
+
+`--check` chỉ xác nhận patch có áp dụng được hay không, chưa sửa file. Nếu code
+đích đã lệch nhẹ so với nơi tạo patch, thử three-way merge:
+
+```bash
+git apply --3way changes.patch
+```
+
+Với `git apply changes.patch`, thay đổi nằm trong working tree và **chưa được
+stage hoặc commit**. Riêng `--3way` có thể cập nhật cả index để Git quản lý
+three-way merge và conflict. Luôn kiểm tra trạng thái thay vì đoán:
+
+```bash
+git status --short
+git diff
+```
+
+### Hoàn tác một patch vừa apply
+
+Nếu working tree trước đó sạch và patch chưa bị sửa thêm:
+
+```bash
+git apply --check --reverse changes.patch
+git apply --reverse changes.patch
+```
+
+`--reverse` áp dụng diff theo chiều ngược lại. Đừng dùng một cách máy móc trên
+working tree đang có thay đổi khác; hãy đọc `git diff` trước.
+
+---
+
+## 5. `git format-patch` + `git am`: chuyển commit có đầy đủ lịch sử
+
+Khác với `git diff`, `git format-patch` tạo patch theo định dạng email và giữ
+thông tin commit như author, ngày, subject và message.
+
+Tạo patch cho các commit trên branch hiện tại chưa có trong `origin/main`:
+
+```bash
+git format-patch origin/main..HEAD
+```
+
+Git tạo một file cho mỗi commit:
+
+```text
+0001-Fix-token-expiry.patch
+0002-Add-regression-test.patch
+```
+
+Ở repository hoặc branch đích:
+
+```bash
+git am --3way 0001-Fix-token-expiry.patch
+git am --3way 0002-Add-regression-test.patch
+```
+
+Hoặc gom cả series vào một file:
+
+```bash
+git format-patch --stdout origin/main..HEAD > feature-series.patch
+git am --3way feature-series.patch
+```
+
+Nếu gặp conflict:
+
+```bash
+git status
+# sửa conflict
+git add path/to/resolved-file
+git am --continue
+```
+
+Hủy toàn bộ phiên `am`:
+
+```bash
+git am --abort
+```
+
+Quy tắc dễ nhớ:
+
+- `diff/apply` chuyển **nội dung**;
+- `format-patch/am` chuyển **commit**.
+
+---
+
+## 6. `git cherry-pick`: lấy commit mà không cần tạo file patch
+
+Khi commit đã có trong cùng repository hoặc remote đã fetch, `cherry-pick`
+thường ngắn gọn hơn `format-patch`.
+
+```bash
+git switch release/2.4
+git cherry-pick -x <commit>
+```
+
+`-x` thêm dòng tham chiếu đến commit gốc trong commit message. Dấu vết này hữu
+ích khi backport bugfix sang release branch.
+
+Muốn lấy nội dung của nhiều commit nhưng tự gom thành một commit mới:
+
+```bash
+git cherry-pick --no-commit <commit-1> <commit-2>
+git diff --staged
+git commit
+```
+
+Khi conflict:
+
+```bash
+git status
+# sửa conflict
+git add path/to/file
+git cherry-pick --continue
+```
+
+Hoặc quay về trạng thái trước khi bắt đầu:
+
+```bash
+git cherry-pick --abort
+```
+
+Không nên cherry-pick cả một branch dài rồi xem nó như chiến lược merge mặc
+định. Cherry-pick tạo commit mới với hash mới; nếu sau đó merge branch gốc, lịch
+sử sẽ khó đọc và conflict có thể lặp lại.
+
+---
+
+## 7. `git worktree`: làm nhiều branch song song, không cần stash
+
+Tình huống: bạn đang chạy dev server trên feature branch, nhưng production cần
+hotfix. Switch ngay trong thư mục hiện tại sẽ ngắt context, đổi dependency hoặc
+làm server reload hàng loạt.
+
+Tạo một working tree thứ hai:
+
+```bash
+git fetch origin
+git worktree add -b hotfix/login ../personal-blog-hotfix origin/main
+```
+
+Bây giờ bạn có:
+
+```text
+personal-blog/         → feature branch hiện tại
+personal-blog-hotfix/  → hotfix/login
+```
+
+Hai thư mục dùng chung object database và lịch sử Git, nhưng có working tree và
+index riêng. Bạn có thể mở hai editor, chạy hai dev server và commit độc lập.
+
+Các lệnh quản lý:
+
+```bash
+git worktree list
+git worktree remove ../personal-blog-hotfix
+git worktree prune
+```
+
+Chỉ remove khi thay đổi cần thiết đã được commit hoặc đẩy lên remote. Git thường
+từ chối xóa worktree bẩn, và đó là hàng rào an toàn đáng giữ.
+
+Một branch không thể được checkout đồng thời ở hai worktree. Nếu Git báo branch
+đang được dùng, chạy `git worktree list` để tìm vị trí của nó.
+
+---
+
+## 8. `git reflog`: phao cứu sinh sau reset, rebase hoặc xóa branch
+
+`git log` cho bạn lịch sử mà branch hiện tại còn trỏ tới. `git reflog` ghi lại
+các lần reference như `HEAD` hoặc branch đã di chuyển trong repository local.
+
+> Muốn hiểu sâu `HEAD` trỏ vào đâu, branch/ref di chuyển thế nào và cách chọn
+> giữa `reset`, `restore`, `revert`, hãy đọc
+> [Hiểu sâu Git HEAD, refs và reflog](/blog/git-head-refs-reflog-professional-workflow).
+
+```bash
+git reflog --date=local
+```
+
+Ví dụ:
+
+```text
+a81c2f1 HEAD@{0}: rebase (finish): returning to refs/heads/feature/auth
+54b90de HEAD@{1}: commit: Add token refresh test
+1c31a87 HEAD@{2}: switch: moving from main to feature/auth
+```
+
+Nếu commit `54b90de` biến mất khỏi `git log` sau một lần rebase nhầm, đừng reset
+thêm. Tạo branch cứu hộ:
+
+```bash
+git switch -c rescue/token-refresh 54b90de
+```
+
+Kiểm tra code và lịch sử:
+
+```bash
+git log --oneline --decorate -10
+git status
+```
+
+Sau đó bạn có thể cherry-pick commit cần thiết về branch đúng.
+
+### Giới hạn của reflog
+
+Reflog:
+
+- chủ yếu là dữ liệu local, không phải backup trên remote;
+- có thời hạn lưu và có thể bị dọn bởi garbage collection;
+- không cứu được nội dung chưa từng được commit, stash hoặc đưa vào object
+  database.
+
+Vì vậy, khi nhận ra sai, hãy dừng thao tác viết lịch sử và tạo branch cứu hộ càng
+sớm càng tốt.
+
+---
+
+## 9. `git bisect`: tìm commit gây lỗi bằng tìm kiếm nhị phân
+
+Giả sử test chạy đúng ở tag `v2.0.0` nhưng hỏng ở `HEAD`. Giữa hai mốc có 200
+commit. Kiểm tra lần lượt có thể cần 200 lần; `bisect` thường chỉ cần khoảng 8.
+
+Bắt đầu:
+
+```bash
+git bisect start
+git bisect bad HEAD
+git bisect good v2.0.0
+```
+
+Git checkout một commit ở giữa. Chạy test rồi đánh dấu:
+
+```bash
+git bisect good
+# hoặc
+git bisect bad
+```
+
+Lặp lại đến khi Git chỉ ra commit đầu tiên gây lỗi. Kết thúc:
+
+```bash
+git bisect reset
+```
+
+### Tự động hóa bisect
+
+Nếu có một test tái hiện lỗi ổn định:
+
+```bash
+git bisect start HEAD v2.0.0
+git bisect run npm test -- auth-refresh.test.ts
+```
+
+Script dùng cho `bisect run` phải trả exit code:
+
+- `0`: commit tốt;
+- `1` đến `127`, trừ `125`: commit lỗi;
+- `125`: bỏ qua commit vì không thể kiểm tra.
+
+Bisect chỉ đáng tin khi test deterministic. Nếu test lúc pass lúc fail hoặc mỗi
+commit cần setup thủ công khác nhau, kết luận có thể sai.
+
+---
+
+## 10. `git log -S`, `git log -G` và `git blame -L`: khảo cổ code
+
+Khi câu hỏi là “thay đổi này xuất hiện từ khi nào?”, tìm theo diff hiệu quả hơn
+tìm commit message.
+
+### Tìm lúc một chuỗi được thêm hoặc xóa
+
+```bash
+git log -S "refreshToken" --oneline -- src
+git log -S "refreshToken" -p -- src/auth
+```
+
+`-S` tìm commit làm **thay đổi số lần xuất hiện** của chuỗi.
+
+### Tìm diff khớp regular expression
+
+```bash
+git log -G "refresh(Token|Session)" -p -- src/auth
+```
+
+`-G` tìm commit có dòng được thêm hoặc xóa khớp regex. Đây là lựa chọn tốt khi
+tên hàm đã đổi nhưng vẫn có pattern chung.
+
+### Xem lịch sử một vùng nhỏ
+
+```bash
+git blame -L 40,80 src/auth/session.ts
+```
+
+`blame` không phải công cụ tìm người để trách. Nó là điểm bắt đầu để mở commit:
+
+```bash
+git show <commit>
+```
+
+Commit message, issue liên quan và các file đổi cùng lúc thường giải thích “vì
+sao” tốt hơn riêng dòng code hiện tại.
+
+---
+
+## 11. `git rebase --autosquash`: dọn branch trước khi review
+
+Bạn vừa push một feature để tự kiểm tra và phát hiện typo thuộc commit cũ:
+
+```bash
+git commit --fixup <commit-can-sua>
+```
+
+Git tạo commit có prefix `fixup!`. Khi branch sẵn sàng:
+
+```bash
+git branch feature-before-rebase
+git rebase -i --autosquash origin/main
+```
+
+Autosquash tự đặt fixup commit cạnh commit mục tiêu và đánh dấu để gộp. Sau khi
+review todo list, lưu lại và giải quyết conflict nếu có.
+
+So sánh series commit trước và sau rebase:
+
+```bash
+git range-diff origin/main..feature-before-rebase origin/main..HEAD
+```
+
+`range-diff` đặc biệt hữu ích khi review phiên bản mới của một branch đã rebase:
+nó cho biết commit nào tương ứng, commit nào đổi nội dung và commit nào mới.
+
+### Khi nào không nên rebase
+
+Rebase tạo commit mới với hash mới. Không rebase một branch chung khi người khác
+đang dựa trên lịch sử đó, trừ khi team đã thống nhất.
+
+Nếu cần cập nhật remote branch của chính bạn sau rebase:
+
+```bash
+git push --force-with-lease
+```
+
+`--force-with-lease` kiểm tra remote có còn ở trạng thái bạn dự kiến hay không.
+Nó an toàn hơn `--force`, nhưng vẫn là thao tác viết lại lịch sử remote. Hãy đọc:
+
+```bash
+git status
+git log --oneline --decorate --graph -15
+```
+
+trước khi push.
+
+---
+
+## 12. `git rerere`: đừng giải cùng một conflict hai lần
+
+`rerere` là viết tắt của **reuse recorded resolution**. Khi bật, Git ghi nhớ
+cách bạn đã giải một conflict và có thể áp dụng lại nếu cùng conflict xuất hiện
+trong rebase, merge hoặc cherry-pick sau này.
+
+Bật cho repository hiện tại:
+
+```bash
+git config rerere.enabled true
+```
+
+Sau đó xử lý conflict như bình thường:
+
+```bash
+git status
+# sửa file
+git add path/to/file
+git rebase --continue
+```
+
+Lần sau gặp lại cùng conflict, kiểm tra phần Git đã khôi phục:
+
+```bash
+git diff
+git status
+```
+
+Rerere tiết kiệm rất nhiều thời gian trên branch rebase thường xuyên, nhưng đừng
+bỏ qua review. Một resolution từng đúng có thể không còn đúng về mặt nghiệp vụ
+sau khi code xung quanh thay đổi.
+
+---
+
+## Ba workflow hoàn chỉnh
+
+### Workflow A: một file có bugfix và refactor
+
+```bash
+git status --short
+git diff -- src/auth.ts
+git add -p src/auth.ts
+git diff --staged
+git commit -m "Fix expired token handling"
+
+git add -p src/auth.ts
+git diff --staged
+git commit -m "Rename token parsing helpers"
+```
+
+Mỗi commit có một mục đích và có thể review hoặc revert độc lập.
+
+### Workflow B: backport hotfix sang release branch
+
+```bash
+git fetch origin
+git worktree add -b hotfix/token ../app-release origin/release/2.4
+cd ../app-release
+git cherry-pick -x <fix-commit>
+npm test
+git push -u origin hotfix/token
+```
+
+Feature branch và môi trường hiện tại không bị xáo trộn.
+
+### Workflow C: tìm và cứu commit sau rebase nhầm
+
+```bash
+git reflog --date=local
+git switch -c rescue/lost-work <commit-tu-reflog>
+git log --oneline --decorate -10
+
+git switch feature/auth
+git cherry-pick <commit-can-cuu>
+```
+
+Tạo nhánh cứu hộ trước, chỉnh lịch sử sau. Đó là thứ tự an toàn.
+
+---
+
+## Cheat sheet
+
+```bash
+# Branch
+git switch -
+git switch -c <branch> <start-point>
+git switch --detach <commit>
+
+# Chọn hunk
+git add -p
+git restore --staged -p
+git restore -p
+
+# Patch nội dung
+git diff HEAD > changes.patch
+git apply --check changes.patch
+git apply --3way changes.patch
+
+# Patch commit
+git format-patch origin/main..HEAD
+git am --3way <patch-file>
+
+# Chuyển commit
+git cherry-pick -x <commit>
+git cherry-pick --abort
+
+# Làm song song
+git worktree add -b <branch> <path> <start-point>
+git worktree list
+
+# Cứu hộ và debug
+git reflog --date=local
+git bisect start HEAD <good-commit>
+git bisect run <test-command>
+git bisect reset
+
+# Tìm lịch sử thay đổi
+git log -S "<text>" -p -- <path>
+git log -G "<regex>" -p -- <path>
+git blame -L <start>,<end> <file>
+
+# Dọn branch
+git commit --fixup <commit>
+git rebase -i --autosquash origin/main
+git range-diff <old-range> <new-range>
+```
+
+---
+
+## Điều cốt lõi
+
+Git nâng cao không có nghĩa là dùng lệnh phức tạp mọi lúc. Nó có nghĩa là biết
+**thay đổi đang nằm ở đâu**, **mình muốn di chuyển đơn vị nào** và **đường lui là
+gì**:
+
+- cần tách nội dung: dùng patch mode;
+- cần chuyển diff: dùng `apply`;
+- cần giữ commit: dùng `am` hoặc `cherry-pick`;
+- cần làm song song: dùng `worktree`;
+- cần tìm lỗi: dùng `bisect`;
+- cần cứu lịch sử local: bắt đầu bằng `reflog`.
+
+Trước thao tác, đọc `status` và `diff`. Sau thao tác, đọc lại. Chính vòng lặp nhỏ
+đó — không phải khả năng thuộc lệnh — mới là kỹ năng Git đáng giá nhất.

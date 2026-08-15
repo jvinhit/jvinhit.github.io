@@ -1,0 +1,534 @@
+---
+title: 'React 19 · Phần 01 — UI là value, không phải template'
+description: 'Xây mental model đầu tiên: component tạo React element, React giữ UI đồng bộ với state, còn DOM chỉ là output được commit vào browser.'
+pubDate: 2026-07-28
+lang: vi
+tags: [react, react-19, rendering, mental-model, react_28]
+series: react
+seriesOrder: 1
+draft: false
+---
+
+Một extension, analytics script hoặc đoạn code legacy sửa thẳng nội dung trong
+DOM. Màn hình trông đúng trong vài giây, nhưng khi người dùng chọn issue khác,
+đoạn text đó biến mất. Nếu chỉ nghĩ React là “template có state”, hành vi này
+trông như React tự ý phá công việc của bạn.
+
+Thực ra có hai writer đang tranh quyền sở hữu cùng một node. React không giữ
+template; nó tính một **description của UI** từ input hiện tại, rồi đưa DOM về
+description đó khi có commit liên quan.
+
+Phần này xây mental model nền cho toàn bộ series. Kết thúc bài, bạn sẽ phân biệt
+được component, React element và DOM node; biết value nào nên thuộc React, DOM
+hay server-state layer; và chẩn đoán được bốn failure mode xuất phát từ ownership
+sai.
+
+Code được kiểm tra với `react@19.2.8`, `react-dom@19.2.8` và TypeScript 5.9.3
+trong strict mode. Bạn chỉ cần biết JavaScript/TypeScript cơ bản và DOM. Nếu
+chưa có project React, phần [Vite mental model và project đầu tiên](/blog/vite-01-mental-model-first-project/)
+cung cấp setup đầy đủ; bài này không lặp lại toolchain.
+
+## 1. Từ symptom “DOM và state lệch nhau” tới một invariant
+
+Giả sử màn hình đang chọn issue `PAY-101`. Có ba representation liên quan:
+
+- `selectedId` trong React state là `PAY-101`;
+- React output mô tả title “Checkout không giữ mã giảm giá”;
+- DOM hiện chứa một `<p>` với title đó.
+
+Một script bên ngoài đổi `textContent` của `<p>`. Chỉ representation thứ ba
+thay đổi; state và React output vẫn giữ giá trị cũ. Hệ thống đã có hai source of
+truth:
+
+```text
+React state ──render──► expected UI
+     │                     │
+     │                     └──commit──► DOM
+     │                                    ▲
+     └──────── external script ────────────┘
+                         second writer
+```
+
+Invariant React cố giữ là:
+
+> Với một root do React quản lý, UI đã commit phải tương ứng với render output
+> mới nhất của root đó.
+
+Invariant này không nói mọi DOM mutation sẽ bị sửa ngay. React không theo dõi
+từng lệnh do code ngoài thực hiện. Nếu lần render sau cho cùng prop và
+reconciliation kết luận node không cần update, mutation ngoài có thể còn nằm
+đó. Nhưng khi một commit cần cập nhật chính node/prop ấy, React sẽ ghi output
+của nó và mutation ngoài biến mất.
+
+Đây là chi tiết quan trọng. Câu “React luôn ghi đè DOM ở lần render kế” vừa quá
+mạnh vừa khó kiểm chứng. Câu chính xác hơn là: **đừng để hai hệ thống cùng sở hữu
+một phần DOM; khi React commit thay đổi ở đó, output React là phía thắng**.
+
+Browser vẫn là nơi DOM thật tồn tại. Nếu muốn đi sâu từ HTML source tới cây
+`Document` sống trong bộ nhớ, đọc
+[HTML parsing và DOM](/blog/browser-internals-03-html-parsing-dom/). Trong bài
+này, DOM là host output; câu hỏi chính là React tạo output đó từ đâu.
+
+## 2. Mental model: UI = f(state), element là description
+
+Một component React nên được đọc như một phép tính:
+
+```text
+props + state + context
+          │
+          ▼
+   component render
+          │
+          ▼
+ React element tree
+   (description)
+          │
+          ▼
+ reconciliation
+          │
+          ▼
+     DOM commit
+```
+
+Ký hiệu quen thuộc là:
+
+```text
+UI = f(props, state, context)
+```
+
+Đây là mental model, không phải chữ ký API. “Cùng input, cùng output” cũng không
+có nghĩa hai lần render phải trả về cùng một object reference. Hai React element
+có thể là hai object khác nhau nhưng mô tả cùng UI. Điều cần giữ là component
+không làm thay đổi object/variable đã tồn tại trước render và không phụ thuộc
+vào input ẩn như clock hay counter global.
+
+React element là một value nhẹ mô tả điều React cần render. Ví dụ
+`<IssueBadge status="open" />` mô tả:
+
+- component type là `IssueBadge`;
+- prop `status` là `"open"`;
+- chưa có DOM `<span>` nào được tạo chỉ vì expression này tồn tại.
+
+Trong quá trình render, React gọi component để nhận description tiếp theo. Khi
+đi tới host element như `<span>`, description mới nói đến primitive mà React
+DOM có thể commit. API `createElement` trong tài liệu React gọi element là
+“lightweight description” và yêu cầu coi element cùng props là immutable.
+
+Tại sao cần purity nghiêm như vậy? Vì React có thể gọi render để tính toán mà
+chưa commit kết quả. Ở các phần sau, work còn có thể được restart hoặc bỏ nếu
+input mới ưu tiên hơn. Nếu render gửi request, tăng biến global hoặc sửa DOM,
+việc “tính thử” đã gây hậu quả mà React không thể rollback.
+
+Event handler thì khác. Click là một sự kiện đã xảy ra; handler có thể yêu cầu
+đổi state. State mới kích hoạt phép tính UI mới, rồi React quyết định thay đổi
+host output nào. Ranh giới này cho ta rule đầu tiên:
+
+> Render mô tả. Event handler yêu cầu thay đổi. Effect đồng bộ với external
+> system. Đừng trộn ba vai trò.
+
+Effects sẽ được mổ ở Phần 06. Hiện tại, chỉ cần nhận diện code trong component
+body phải là phép tính pure.
+
+## 3. Component, element tree và DOM tree là ba lớp khác nhau
+
+Ba lớp thường bị gọi chung là “component tree”, dẫn tới bug khi debug:
+
+| Lớp                | Nó chứa gì                                    | Ai tạo/quản lý            | Bạn dùng để làm gì                    |
+| ------------------ | --------------------------------------------- | ------------------------- | ------------------------------------- |
+| Component          | Function/type và boundary theo domain         | Application code + React  | Chia behavior và ownership            |
+| React element tree | Description: type, props, children, key       | Render output             | Nói UI mong muốn là gì                |
+| DOM tree           | `Document`, `Element`, `Text`, event listener | Browser; React DOM commit | Paint, focus, selection, platform API |
+
+Một component không nhất thiết tạo đúng một DOM node. Nó có thể trả fragment,
+`null`, một component khác hoặc cả subtree. Ngược lại, một DOM node không mang
+đầy đủ abstraction domain của component đã tạo ra nó.
+
+Phân lớp này cũng giải thích vì sao React không đồng nghĩa với DOM. Component
+và element model có thể được một renderer khác đưa tới host primitive khác;
+series này dùng React DOM vì target là web. Khi debug, hãy hỏi lỗi nằm ở
+description hay host output. Nếu title đã sai ngay trong render output, sửa
+state/props/calculation. Nếu description đúng nhưng focus, selection hoặc
+layout sai, điều tra commit và browser API. Trộn hai tầng thường tạo bản sửa
+“thêm state để ép DOM” dù nguồn lỗi thật là focus timing, hoặc “sửa textContent”
+dù source of truth thật nằm trong state.
+
+Element cũng không phải snapshot để application lưu rồi mutate dần như một
+template AST tự quản. Application tạo description mới từ input mới; React chịu
+trách nhiệm so nó với work trước. Contract đó cho phép component code tập trung
+vào **UI cần là gì**, nhưng đổi lại bạn không được lén thay input/output cũ sau
+khi đã đưa cho React.
+
+Running example bắt đầu bằng một dataset nhỏ. ID là domain identity; status là
+union đóng để compiler buộc ta xử lý đủ trường hợp.
+
+**`examples/react-19-lab/src/part-01/issues.ts`**
+
+```ts
+export type IssueStatus = 'open' | 'in-progress' | 'closed';
+
+export interface Issue {
+  id: string;
+  title: string;
+  status: IssueStatus;
+}
+
+export const initialIssues = [
+  {
+    id: 'PAY-101',
+    title: 'Checkout không giữ mã giảm giá',
+    status: 'open',
+  },
+  {
+    id: 'PAY-102',
+    title: 'Payment callback bị xử lý hai lần',
+    status: 'in-progress',
+  },
+  {
+    id: 'PAY-103',
+    title: 'Biên lai thiếu mã giao dịch',
+    status: 'closed',
+  },
+] as const satisfies readonly Issue[];
+```
+
+`IssueBadge` chỉ ánh xạ status sang label. `IssueList` nhận data, selection và
+capability `onSelect`; nó không tự phát minh thêm source of truth.
+
+**`examples/react-19-lab/src/part-01/IssueList.tsx`**
+
+```tsx
+import type { Issue, IssueStatus } from './issues';
+
+interface IssueBadgeProps {
+  status: IssueStatus;
+}
+
+const statusLabel = {
+  open: 'Mở',
+  'in-progress': 'Đang xử lý',
+  closed: 'Đã đóng',
+} as const satisfies Record<IssueStatus, string>;
+
+export function IssueBadge({ status }: IssueBadgeProps) {
+  return <span data-status={status}>{statusLabel[status]}</span>;
+}
+
+interface IssueListProps {
+  issues: readonly Issue[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+}
+
+export function IssueList({ issues, selectedId, onSelect }: IssueListProps) {
+  return (
+    <ul aria-label="Danh sách issue">
+      {issues.map((issue) => (
+        <li key={issue.id}>
+          <button
+            type="button"
+            aria-pressed={issue.id === selectedId}
+            onClick={() => onSelect(issue.id)}
+          >
+            <strong>{issue.id}</strong>
+            <span>{issue.title}</span>
+            <IssueBadge status={issue.status} />
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+Hãy đọc `IssueBadge` như công thức. Input `"open"` tạo description cho một
+`<span>` có label “Mở”. Component không tăng counter, không đọc `Date.now()`,
+không sửa `statusLabel`, không chạm DOM.
+
+`IssueList` cũng là phép tính, dù nó chứa event handler. Tạo function
+`() => onSelect(issue.id)` trong render không phải side effect: function mới chỉ
+là value được đặt trong description. Side effect chỉ xảy ra sau khi browser
+phát click và React gọi handler.
+
+`key={issue.id}` chưa được đào sâu ở đây. Phần 04 sẽ nối key với identity và
+state preservation. Phần
+[Diffing & Reconciliation](/blog/fe-algorithms-05-diffing-reconciliation/)
+đã giải thích thuật toán cây, nên series này sẽ tập trung vào contract của React
+thay vì viết lại toàn bộ keyed diff.
+
+## 4. Issue Triage v0: một writer cho vùng DOM thuộc React
+
+Component root sở hữu `selectedId`. `selectedIssue` không cần state riêng vì có
+thể derive từ `initialIssues` và `selectedId` trong render.
+
+**`examples/react-19-lab/src/part-01/IssueTriage.tsx`**
+
+```tsx
+import { useState } from 'react';
+import { IssueList } from './IssueList';
+import { initialIssues } from './issues';
+
+export function IssueTriage() {
+  const [selectedId, setSelectedId] = useState<string>(initialIssues[0].id);
+  const selectedIssue =
+    initialIssues.find((issue) => issue.id === selectedId) ?? initialIssues[0];
+
+  function tamperWithOwnedDOM() {
+    const title = document.querySelector<HTMLElement>(
+      '[data-selected-issue-title]'
+    );
+
+    if (title) {
+      title.textContent = 'DOM đã bị sửa bên ngoài React';
+    }
+  }
+
+  return (
+    <main>
+      <p className="eyebrow">Issue Triage · Part 01</p>
+      <h1>UI là kết quả của state hiện tại</h1>
+
+      <section className="panel" aria-labelledby="selected-heading">
+        <h2 id="selected-heading">Issue đang chọn</h2>
+        <p data-selected-issue-title>{selectedIssue.title}</p>
+        <p>
+          Source of truth: <code>{selectedId}</code>
+        </p>
+        <button type="button" onClick={tamperWithOwnedDOM}>
+          Phá DOM thủ công
+        </button>
+      </section>
+
+      <IssueList
+        issues={initialIssues}
+        selectedId={selectedId}
+        onSelect={setSelectedId}
+      />
+    </main>
+  );
+}
+```
+
+`tamperWithOwnedDOM` cố ý là code xấu để tạo failure. Sau khi bấm nút, text DOM
+đổi nhưng `selectedId` không đổi. Bấm `PAY-102` khiến handler gọi
+`setSelectedId`; render output mới mô tả title của `PAY-102`, và commit cập nhật
+node title.
+
+Test khóa behavior quan sát được, không kiểm tra field internal của element hay
+Fiber:
+
+**`examples/react-19-lab/src/part-01/IssueTriage.test.tsx`**
+
+```tsx
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, describe, expect, it } from 'vitest';
+import { IssueBadge } from './IssueList';
+import { IssueTriage } from './IssueTriage';
+
+afterEach(cleanup);
+
+describe('Part 01 — UI as value', () => {
+  it('giữ IssueBadge pure với cùng input', () => {
+    const first = render(<IssueBadge status="open" />);
+    const firstMarkup = first.container.innerHTML;
+    first.unmount();
+
+    const second = render(<IssueBadge status="open" />);
+
+    expect(second.container.innerHTML).toBe(firstMarkup);
+  });
+
+  it('đưa DOM về output thuộc React khi state đổi', () => {
+    render(<IssueTriage />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Phá DOM thủ công' }));
+    expect(screen.getByText('DOM đã bị sửa bên ngoài React')).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: /PAY-102 Payment callback bị xử lý hai lần/,
+      })
+    );
+
+    const selectedTitle = document.querySelector<HTMLElement>(
+      '[data-selected-issue-title]'
+    );
+    expect(selectedTitle?.textContent).toBe(
+      'Payment callback bị xử lý hai lần'
+    );
+  });
+});
+```
+
+Test đầu không chứng minh purity bằng toán học; nó là regression signal cho
+output quan sát được. Static rule, review và Strict Mode ở development vẫn cần
+để phát hiện mutation/side effect. Test thứ hai chứng minh claim hẹp hơn: khi
+state đổi làm title prop đổi, commit đưa node đó về output mới.
+
+Direct DOM API không bị cấm tuyệt đối. Focus, selection, measurement, media hay
+third-party widget đều cần bridge tới platform. Điều kiện là ownership rõ: dùng
+ref/Effect ở boundary, hoặc cho widget một container mà React không đồng thời
+quản lý children bên trong. Phần 11 và 06 sẽ xây hai escape hatch đó.
+
+## 5. Decision table: React state, DOM state hay server state
+
+“Đưa mọi thứ vào React state” cũng sai như “sửa DOM cho nhanh”. Mỗi value cần
+đúng owner:
+
+| Value                      | Owner mặc định                      | Lợi ích                          | Chi phí/rủi ro                             |
+| -------------------------- | ----------------------------------- | -------------------------------- | ------------------------------------------ |
+| Issue đang chọn            | React state                         | UI derive nhất quán, dễ test     | Update đi qua render/commit                |
+| Title hiển thị             | Derived trong render                | Không có state trùng             | Tính lại mỗi render                        |
+| Giá trị input uncontrolled | DOM/form                            | Ít state wiring                  | React không có current value mỗi keystroke |
+| Danh sách fetch từ API     | Server-state cache                  | Biết stale/retry/cache lifecycle | Thêm cache policy và async states          |
+| Focus/selection            | DOM qua ref                         | Dùng đúng platform capability    | Imperative, timing-sensitive               |
+| Third-party widget         | External owner trong boundary riêng | Widget tự quản lifecycle         | Cần adapter và cleanup                     |
+
+Với `IssueTriage`, chỉ `selectedId` là essential local state.
+`selectedIssue` và title được derive. Copy cả object đang chọn vào một state
+khác tạo duplication: khi dataset đổi title, selection object cũ có thể stale.
+
+Danh sách từ API là vấn đề khác. Server mới là authority; local component không
+tự biết data còn fresh, request nào thắng hay lúc nào retry. Bài
+[TanStack Query — Mental Model](/blog/tanstack-query-01-mental-model-setup/)
+đã phủ server state và cache lifecycle. Series này chỉ giữ ranh giới: React
+local state dành cho interaction/invariant thuộc client; remote data không nên
+bị biến thành `useState + useEffect` rải khắp component.
+
+React đem lại một data flow dễ suy luận, nhưng bạn trả giá bằng kỷ luật:
+
+- render phải pure;
+- state update phải đi qua owner;
+- imperative integration cần boundary;
+- abstraction không loại bỏ DOM/browser cost bên dưới.
+
+Nếu UI chỉ là một đoạn static HTML không thay đổi, React không tự tạo thêm giá
+trị. Nếu component cần encapsulate bằng browser primitive, Web Components cung
+cấp một ownership model khác. Quyết định dùng React bắt đầu từ
+change/interaction model, không từ việc JSX nhìn tiện.
+
+## 6. Failure modes: symptom → cause → fix → verify
+
+### 6.1 DOM hiển thị một giá trị, state giữ giá trị khác
+
+**Symptom:** script đổi title thành công, nhưng title biến mất khi chọn issue
+khác; hoặc UI giữ mutation lạ cho tới một update không đoán trước.
+
+**Root cause:** React và script ngoài cùng ghi vào node do React sở hữu. DOM đã
+trở thành source of truth thứ hai nhưng React không đọc nó trong render.
+
+**Fix:** state/props làm owner duy nhất cho content. Nếu cần third-party code,
+tách container ownership và đồng bộ qua adapter có lifecycle rõ.
+
+**Verify:** mutate node trong test, thực hiện state transition làm prop đổi, rồi
+assert output trở về canonical state. Đồng thời kiểm tra listener/widget được
+cleanup khi boundary unmount.
+
+### 6.2 Component cho output khác với cùng input
+
+**Symptom:** thứ tự label đổi khi unrelated component render; development log
+nhảy hai lần; server/client hoặc test output không ổn định.
+
+**Root cause:** render đọc `Date.now()`, `Math.random()` hoặc tăng/mutate biến
+ngoài component. Input thật lớn hơn props/state/context nhưng bị giấu.
+
+**Fix:** truyền value biến thiên thành prop nếu nó là dữ liệu; tạo nó trong
+event handler nếu nó gắn với action; đồng bộ external system trong Effect nếu
+thật sự cần.
+
+**Verify:** render cùng explicit input nhiều lần và so output quan sát được;
+bật Strict Mode để mutation trong render dễ lộ hơn. Không sửa bằng cách tắt
+Strict Mode.
+
+### 6.3 Giữ cả object derive và ID trong state
+
+**Symptom:** list hiển thị title mới nhưng panel selected vẫn giữ title cũ.
+
+**Root cause:** cùng fact được duplicate thành `issues` và `selectedIssue`.
+Update một bản không tự update bản còn lại.
+
+**Fix:** giữ `selectedId`; tìm object hiện tại từ dataset trong render. Nếu ID
+không còn tồn tại, định nghĩa fallback/reset semantics rõ.
+
+**Verify:** cập nhật title trong dataset và assert panel đổi theo mà không có
+Effect đồng bộ hai state.
+
+### 6.4 Nhầm React element với DOM node
+
+**Symptom:** gọi `.focus()`, đọc `.textContent` hoặc dùng `querySelector` trên
+value JSX rồi gặp type/runtime error.
+
+**Root cause:** `<IssueBadge />` tạo description cho React, không tạo
+`HTMLSpanElement` ngay tại expression.
+
+**Fix:** render element qua React; khi thật sự cần DOM capability, lấy node qua
+typed ref tại boundary. Không đọc cấu trúc private của React element để tìm DOM.
+
+**Verify:** TypeScript phân biệt `ReactElement` với `HTMLElement`; integration
+test focus/selection trên node đã commit, không trên element description.
+
+## Bài tập
+
+### Bài 1 — Thiết kế `PriorityBadge` như một phép tính pure
+
+Tạo union `IssuePriority = 'low' | 'medium' | 'high'` và component ánh xạ mỗi
+priority sang label cùng `data-priority`. Không đọc clock, random, DOM hoặc
+mutable module state trong render.
+
+**Definition of done:**
+
+- strict typecheck buộc mapping đủ ba priority;
+- cùng prop cho cùng accessible text/attribute;
+- test không phụ thuộc object reference của React element.
+
+**Hint:** dùng `satisfies Record<IssuePriority, string>` để compiler kiểm tra
+mapping, giống `statusLabel`.
+
+### Bài 2 — Lập ownership map trước khi thêm state
+
+Thêm search text, current page, fetched issue list, selected issue, input draft
+và focus target vào một bảng. Với mỗi value, ghi authority, lifetime, consumer,
+cách restore sau reload và owner đề xuất.
+
+**Definition of done:**
+
+- mỗi value có đúng một source of truth;
+- derived value không được lưu trùng nếu tính được trong render;
+- remote data không bị gắn nhãn local state chỉ vì component đang đọc nó;
+- focus được xem là DOM capability, không phải domain data.
+
+**Hint:** nếu hai nơi có quyền sửa cùng fact mà không có protocol đồng bộ, owner
+chưa được thiết kế xong.
+
+## Tiêu chí hoàn thành
+
+- [ ] Bạn giải thích được component, React element và DOM node là ba lớp khác
+      nhau.
+- [ ] Bạn mô tả được pipeline input → render description → reconciliation →
+      commit mà không gọi React là template engine.
+- [ ] Bạn nhận ra side effect trong render và chuyển nó về event/Effect boundary
+      phù hợp.
+- [ ] Bạn chọn một source of truth cho selection và derive object/title.
+- [ ] Bạn giải thích được vì sao direct DOM mutation có thể tồn tại tạm thời
+      nhưng vẫn không phải owner an toàn.
+- [ ] Bạn chọn React state, DOM state hay server-state layer bằng trade-off cụ
+      thể.
+
+## Phần tiếp theo
+
+Phần này cố ý coi JSX như hộp đen tạo description. Ở
+**Phần 02 — JSX → JSX runtime → element tree**, ta mở hộp đó: xem compiler phát
+gì, `type`/`props`/`children` nằm ở đâu, vì sao `key` là special và tại sao
+browser không thể chạy JSX trực tiếp.
+
+## Nguồn chính thức
+
+- [React 19.2 — Versions](https://react.dev/versions)
+- [React: Describing the UI](https://react.dev/learn/describing-the-ui)
+- [React: Understanding Your UI as a Tree](https://react.dev/learn/understanding-your-ui-as-a-tree)
+- [React: Keeping Components Pure](https://react.dev/learn/keeping-components-pure)
+- [React: Render and Commit](https://react.dev/learn/render-and-commit)
+- [React: `createElement`](https://react.dev/reference/react/createElement)
+- [React: Sharing State Between Components](https://react.dev/learn/sharing-state-between-components)
+- [React: Choosing the State Structure](https://react.dev/learn/choosing-the-state-structure)
+- [MDN: `Document.querySelector()`](https://developer.mozilla.org/en-US/docs/Web/API/Document/querySelector)
+- [MDN: `Node.textContent`](https://developer.mozilla.org/en-US/docs/Web/API/Node/textContent)

@@ -1,0 +1,937 @@
+---
+title: 'Hiểu sâu Git HEAD, refs và reflog — Workflow chuyên nghiệp, phục hồi tự tin'
+description: 'Mental model Git dành cho developer: HEAD và branch thực sự là gì, cách đọc revision, phân biệt reset/restore/revert, dùng reflog cứu lịch sử và workflow an toàn khi làm việc nhóm.'
+pubDate: 2026-07-30
+lang: vi
+tags: [git, cli, terminal, workflow, debugging, version-control]
+draft: false
+---
+
+import GitDiagram from '../../components/blog/GitDiagram.astro';
+
+Một developer dùng Git tốt không phải là người thuộc nhiều lệnh nhất. Đó là
+người có thể trả lời ba câu trước khi chạy lệnh:
+
+1. **Git đang trỏ vào commit nào?**
+2. **Lệnh sắp chạy sẽ di chuyển reference, staging area hay working tree?**
+3. **Nếu kết quả sai, đường lui là gì?**
+
+Khi chưa có mental model, `HEAD`, detached HEAD, `reset`, reflog và
+`origin/main` trông như những khái niệm rời rạc. Khi ghép chúng lại, Git trở
+thành một hệ thống khá logic: commit gần như bất biến, còn branch và `HEAD` chủ
+yếu là những con trỏ có thể di chuyển.
+
+> Bài này tập trung vào cách Git vận hành và workflow an toàn. Nếu cần cookbook
+> theo tình huống với patch, worktree, bisect và cherry-pick, hãy đọc
+> [Git nâng cao thực dụng](/blog/advanced-git-commands-practical-guide).
+
+---
+
+## 1. Mental model: Git lưu snapshot và di chuyển con trỏ
+
+Một commit chứa:
+
+- reference đến snapshot cây thư mục;
+- metadata như author, thời gian và message;
+- reference đến commit cha.
+
+Các commit tạo thành một đồ thị:
+
+```text
+A ← B ← C ← D
+            ↑
+          main
+            ↑
+           HEAD
+```
+
+Trong ví dụ này:
+
+- `D` là commit;
+- `main` là một **branch ref** đang trỏ tới `D`;
+- `HEAD` thường là một **symbolic ref** trỏ tới branch `main`;
+- vì `main` trỏ tới `D`, nên `HEAD` gián tiếp đại diện cho `D`.
+
+Khi bạn commit:
+
+```text
+A ← B ← C ← D ← E
+                ↑
+              main
+                ↑
+               HEAD
+```
+
+Git tạo commit `E`, rồi di chuyển `main` từ `D` sang `E`. `HEAD` vẫn trỏ tới
+`main`; nó không cần đổi tên hay trở thành một object mới.
+
+Đây là ý quan trọng nhất của cả bài:
+
+> Commit là dữ liệu trong graph. Branch là tên trỏ vào một commit. `HEAD` cho
+> biết vị trí hiện tại của bạn trong graph.
+
+<GitDiagram
+  kind="head-refs"
+  caption="Attached HEAD đi qua tên branch; detached HEAD trỏ thẳng vào commit trong khi branch đứng yên."
+/>
+
+---
+
+## 2. `HEAD` không có nghĩa là “commit mới nhất của repository”
+
+`HEAD` là vị trí hiện tại của **working tree này**. Nó có thể trỏ tới:
+
+- branch local như `main`;
+- một branch khác như `feature/auth`;
+- trực tiếp một commit trong trạng thái detached HEAD.
+
+Xem branch mà `HEAD` đang trỏ tới:
+
+```bash
+git symbolic-ref --short HEAD
+```
+
+Nếu đang detached HEAD, lệnh này trả exit code khác `0` vì `HEAD` không còn là
+symbolic ref. Khi đó, `git branch --show-current` cũng trả về chuỗi rỗng.
+
+Xem commit hiện tại:
+
+```bash
+git rev-parse --short HEAD
+git show --no-patch --decorate HEAD
+```
+
+Xem cả branch, upstream và trạng thái file:
+
+```bash
+git status --short --branch
+```
+
+Ví dụ:
+
+```text
+## feature/auth...origin/feature/auth [ahead 2, behind 1]
+ M src/auth/session.ts
+?? src/auth/session.test.ts
+```
+
+Bạn đang ở `feature/auth`, có hai commit local chưa có trên remote, thiếu một
+commit từ remote, một file đã sửa và một file mới chưa được track.
+
+### Khi switch branch, chuyện gì xảy ra?
+
+```bash
+git switch feature/auth
+```
+
+Git thực hiện ba việc liên quan:
+
+1. đổi `HEAD` để nó trỏ tới `feature/auth`;
+2. cập nhật index theo snapshot của branch đích;
+3. cập nhật working tree để khớp với index mới.
+
+Nếu thay đổi local sẽ bị ghi đè, Git thường từ chối switch. Nếu không xung đột,
+Git có thể mang thay đổi chưa commit sang branch mới. Vì vậy, “switch thành công”
+không có nghĩa working tree trước đó đã sạch.
+
+---
+
+## 3. Detached HEAD: hợp lệ, nhưng commit mới chưa có tên giữ lại
+
+Detached HEAD xuất hiện khi `HEAD` trỏ trực tiếp tới commit thay vì branch:
+
+```bash
+git switch --detach v2.4.0
+```
+
+```text
+A ← B ← C ← D
+        ↑     ↑
+       HEAD  main
+```
+
+Trạng thái này hữu ích để:
+
+- build một phiên bản cũ;
+- chạy test ở một commit lịch sử;
+- khảo sát code mà không di chuyển branch;
+- bắt đầu một experiment từ commit cũ.
+
+Bạn vẫn có thể tạo commit khi detached:
+
+```text
+          E ← F
+         /
+A ← B ← C ← D
+            ↑
+           main
+              F ← HEAD
+```
+
+Vấn đề là không có branch nào mang tên trỏ tới `F`. Nếu switch đi, commit vẫn có
+thể còn trong object database một thời gian nhưng dễ bị bỏ quên.
+
+Giữ lại công việc ngay khi nhận ra:
+
+```bash
+git switch -c experiment/from-v2.4
+```
+
+Nếu đã switch đi:
+
+```bash
+git reflog --date=local
+git switch -c rescue/detached-work <commit>
+```
+
+Không cần hoảng khi thấy detached HEAD. Chỉ cần nhớ: **tạo một branch trước khi
+rời đi nếu có commit muốn giữ**.
+
+---
+
+## 4. Refs: branch, tag và remote-tracking branch khác nhau thế nào?
+
+Git dùng tên dễ nhớ để trỏ tới object.
+
+```text
+refs/heads/main                  local branch
+refs/heads/feature/auth          local branch
+refs/remotes/origin/main         remote-tracking branch
+refs/tags/v2.4.0                 tag
+```
+
+Bạn thường không cần gõ tên đầy đủ. Git chấp nhận `main`, `origin/main` hoặc
+`v2.4.0`.
+
+### Local branch
+
+`main` là reference local và có thể di chuyển khi bạn commit, merge, reset hoặc
+rebase trên branch đó.
+
+### Remote-tracking branch
+
+`origin/main` không phải branch đang chạy trực tiếp trên GitHub hay GitLab. Nó là
+**snapshot local về trạng thái remote mà repository của bạn biết gần nhất**.
+
+```bash
+git fetch origin
+```
+
+Sau fetch, Git cập nhật `origin/main`. Nếu chưa fetch, `origin/main` có thể cũ dù
+đồng đội đã push thêm commit.
+
+### Tag
+
+Tag thường đánh dấu một commit phát hành. Branch được kỳ vọng sẽ tiếp tục di
+chuyển; tag thường được giữ ổn định.
+
+Xem các ref liên quan:
+
+```bash
+git branch --verbose --verbose
+git tag --list
+git show-ref --heads --tags
+```
+
+---
+
+## 5. Revision syntax: nói chính xác “commit nào”
+
+Git chấp nhận nhiều cách gọi một commit:
+
+```text
+HEAD
+main
+origin/main
+v2.4.0
+a81c2f1
+```
+
+Các toán tử revision giúp đi trong graph.
+
+### `^`: chọn parent
+
+```bash
+git show HEAD^
+```
+
+`HEAD^` là parent thứ nhất của `HEAD`. Với merge commit có nhiều parent:
+
+```bash
+git show HEAD^1
+git show HEAD^2
+```
+
+Parent thứ nhất thường là branch bạn đang đứng khi merge; parent thứ hai thường
+là branch được merge vào.
+
+### `~`: đi theo chuỗi first-parent
+
+```bash
+git show HEAD~1
+git show HEAD~3
+```
+
+`HEAD~3` đi ngược ba lần qua parent thứ nhất. Trên lịch sử tuyến tính,
+`HEAD^` và `HEAD~1` giống nhau; ở merge commit, `^2` mới cho phép chọn parent thứ
+hai.
+
+### `@{...}`: vị trí trong reflog hoặc upstream
+
+```bash
+git show HEAD@{1}
+git show main@{yesterday}
+git show @{upstream}
+git switch @{-1}
+```
+
+- `HEAD@{1}`: vị trí trước đó của `HEAD` trong reflog;
+- `main@{yesterday}`: nơi `main` trỏ tới vào khoảng hôm qua;
+- `@{upstream}` hoặc `@{u}`: upstream của branch hiện tại;
+- `@{-1}`: branch hoặc vị trí checkout trước đó.
+
+Các giá trị theo thời gian dùng parser ngày tương đối của Git, nên hãy xác nhận
+commit trước khi dùng trong lệnh ghi:
+
+```bash
+git show --no-patch --oneline main@{yesterday}
+```
+
+---
+
+## 6. `A..B`, `A...B` và merge-base
+
+Hai ký hiệu này rất hữu ích nhưng dễ bị hiểu sai.
+
+### Hai chấm: commit có ở B nhưng không có ở A
+
+```bash
+git log --oneline origin/main..HEAD
+```
+
+Câu hỏi được trả lời là:
+
+> Branch hiện tại có commit nào mà `origin/main` chưa có?
+
+Đây là lệnh tốt để review những commit sắp push hoặc đưa vào pull request.
+
+### Ba chấm với `git log`: symmetric difference
+
+```bash
+git log --left-right --oneline origin/main...HEAD
+```
+
+Nó hiển thị commit chỉ có ở một trong hai phía, bỏ phần lịch sử chung.
+
+### Ba chấm với `git diff`: từ merge-base đến phía bên phải
+
+```bash
+git diff origin/main...HEAD
+```
+
+Trong `git diff`, ba chấm không mang đúng nghĩa symmetric difference như
+`git log`. Nó tương đương việc so sánh merge-base của hai phía với `HEAD`:
+
+```bash
+git diff "$(git merge-base origin/main HEAD)" HEAD
+```
+
+Đây thường là diff gần với nội dung pull request.
+
+Tìm ancestor chung gần nhất:
+
+```bash
+git merge-base origin/main HEAD
+```
+
+---
+
+## 7. Reflog: nhật ký di chuyển của reference
+
+`git log` đi theo graph commit mà reference hiện tại còn truy cập được.
+`git reflog` trả lời câu hỏi khác:
+
+> `HEAD` hoặc branch này đã trỏ tới đâu trong repository local?
+
+<GitDiagram
+  kind="reflog-recovery"
+  caption="Workflow cứu hộ an toàn: dừng thao tác ghi, tìm commit trong reflog, rồi neo nó bằng rescue branch."
+/>
+
+Xem reflog của `HEAD`:
+
+```bash
+git reflog show HEAD --date=local
+```
+
+Xem riêng một branch:
+
+```bash
+git reflog show feature/auth --date=local
+```
+
+Xem dưới dạng log:
+
+```bash
+git log -g --oneline --decorate
+```
+
+Ví dụ:
+
+```text
+8e52a10 HEAD@{0}: rebase (finish): returning to refs/heads/feature/auth
+29ab431 HEAD@{1}: rebase (pick): Add refresh token test
+cc184f2 HEAD@{6}: commit: Add refresh token test
+7f813db HEAD@{7}: switch: moving from main to feature/auth
+```
+
+Sau rebase, commit cũ `cc184f2` không còn trong lịch sử branch mới, nhưng reflog
+vẫn ghi lại vị trí `HEAD` từng đi qua.
+
+### Quy trình cứu hộ chuẩn
+
+Đầu tiên, **dừng các lệnh tiếp tục viết lịch sử**. Sau đó:
+
+```bash
+git reflog --date=local
+git show --stat <commit-nghi-ngo>
+git switch -c rescue/auth-before-rebase <commit-nghi-ngo>
+```
+
+Tạo branch `rescue/...` biến commit thành một điểm có tên rõ ràng. Bây giờ bạn có
+thể kiểm tra, so sánh hoặc cherry-pick mà không vội reset branch chính.
+
+```bash
+git range-diff rescue/auth-before-rebase...feature/auth
+git diff rescue/auth-before-rebase feature/auth
+```
+
+### `ORIG_HEAD` có thay reflog được không?
+
+Một số thao tác như merge hoặc reset ghi vị trí trước đó vào `ORIG_HEAD`:
+
+```bash
+git show --no-patch ORIG_HEAD
+```
+
+Nó tiện cho việc hoàn tác ngay sau một thao tác, nhưng chỉ là một reference tạm
+và có thể bị lệnh tiếp theo ghi đè. Reflog cho bạn chuỗi lịch sử dài hơn.
+
+### Reflog không phải backup
+
+Reflog:
+
+- nằm chủ yếu ở repository local;
+- không được push như commit hoặc branch;
+- có thể hết hạn và bị garbage collection dọn;
+- không đảm bảo cứu được nội dung chưa từng được lưu thành Git object.
+
+Commit sớm trên branch cá nhân và push backup khi phù hợp vẫn tốt hơn phụ thuộc
+hoàn toàn vào reflog.
+
+---
+
+## 8. Ba vùng dữ liệu: chìa khóa để hiểu `reset`
+
+Trước khi chọn `reset`, cần phân biệt:
+
+```text
+HEAD / branch       Index                 Working tree
+commit hiện tại     nội dung sẽ commit    file đang nhìn và sửa
+```
+
+`git reset` có thể tác động một, hai hoặc cả ba vùng.
+
+| Chế độ              | Di chuyển branch/HEAD | Reset index | Reset working tree |
+| ------------------- | --------------------- | ----------- | ------------------ |
+| `git reset --soft`  | có                    | không       | không              |
+| `git reset --mixed` | có                    | có          | không              |
+| `git reset --hard`  | có                    | có          | có                 |
+
+`--mixed` là mặc định nếu không ghi mode.
+
+<GitDiagram
+  kind="reset-effects"
+  caption="Reset lùi reference về D với phạm vi tăng dần; revert giữ lịch sử và tạo commit hoàn tác F."
+/>
+
+### `--soft`: bỏ commit, giữ mọi thứ đã stage
+
+```bash
+git reset --soft HEAD^
+```
+
+Commit cuối bị branch bỏ trỏ tới, nhưng nội dung vẫn ở index. Phù hợp khi muốn
+commit lại với message khác hoặc gom commit local.
+
+### `--mixed`: bỏ commit và bỏ stage, vẫn giữ file
+
+```bash
+git reset HEAD^
+```
+
+Branch lùi một commit, index được reset, còn nội dung thay đổi vẫn trong working
+tree.
+
+### `--hard`: đồng bộ cả ba vùng
+
+```bash
+git reset --hard <commit>
+```
+
+Thay đổi tracked chưa commit trong index và working tree có thể bị xóa. Reflog
+có thể giúp tìm lại commit bị branch bỏ qua, nhưng không đảm bảo cứu được mọi
+chỉnh sửa chưa commit.
+
+Trước khi dùng `--hard`:
+
+```bash
+git status --short
+git diff
+git diff --staged
+```
+
+Nếu mục tiêu chỉ là bỏ stage hoặc khôi phục file, `restore` diễn đạt ý định rõ
+hơn và có phạm vi nhỏ hơn.
+
+---
+
+## 9. Chọn đúng `restore`, `reset` hay `revert`
+
+Ba lệnh thường bị dùng thay nhau dù chúng giải quyết ba vấn đề khác nhau.
+
+| Mục tiêu                                   | Lệnh nên nghĩ tới      |
+| ------------------------------------------ | ---------------------- |
+| Bỏ stage nhưng giữ file                    | `git restore --staged` |
+| Khôi phục nội dung file từ một commit      | `git restore --source` |
+| Di chuyển branch local và chỉnh index      | `git reset`            |
+| Hoàn tác commit đã chia sẻ bằng commit mới | `git revert`           |
+
+### Bỏ stage, giữ code
+
+```bash
+git restore --staged path/to/file
+```
+
+### Lấy một file từ commit hoặc branch khác
+
+```bash
+git restore --source=origin/main -- path/to/file
+git diff -- path/to/file
+```
+
+### Hoàn tác một commit đã push
+
+```bash
+git revert <commit>
+```
+
+`revert` tạo commit mới có thay đổi ngược lại. Lịch sử cũ vẫn tồn tại, nên đây
+thường là lựa chọn phù hợp trên branch chung.
+
+Quy tắc thực dụng:
+
+> Chưa chia sẻ lịch sử: có thể cân nhắc reset hoặc rebase. Đã chia sẻ lịch sử:
+> ưu tiên revert, trừ khi team đã thống nhất viết lại.
+
+---
+
+## 10. Những ca phục hồi thường gặp
+
+### Commit local cuối cùng có message sai
+
+Nếu chỉ cần sửa message và commit chưa được chia sẻ:
+
+```bash
+git commit --amend
+```
+
+Amend tạo commit mới với hash mới. Nếu commit đã push và người khác có thể đang
+dựa vào nó, cân nhắc giữ nguyên hoặc phối hợp trước khi rewrite.
+
+### Commit nhầm branch, chưa push
+
+Giả sử commit cuối thuộc về feature mới nhưng bạn đã commit trên `main`.
+
+Đầu tiên tạo branch giữ commit:
+
+```bash
+git status --short
+git branch feature/right-place HEAD
+```
+
+Khi đã chắc working tree sạch và branch mới trỏ đúng commit, đưa `main` về parent:
+
+```bash
+git reset --hard HEAD^
+git switch feature/right-place
+```
+
+Điểm an toàn nằm ở thứ tự: **tạo ref giữ commit trước, reset sau**.
+
+### Commit nhầm branch và đã push
+
+Không rewrite branch chung một cách đơn phương:
+
+```bash
+git switch feature/right-place
+git cherry-pick <commit>
+
+git switch main
+git revert <commit>
+```
+
+Hai branch đều có lịch sử giải thích được: feature nhận thay đổi, `main` có
+commit hoàn tác.
+
+### Mất branch sau khi xóa
+
+```bash
+git reflog --all --date=local
+git show --stat <commit-cuoi-cua-branch>
+git switch -c rescue/deleted-branch <commit-cuoi-cua-branch>
+```
+
+### Rebase sai
+
+Nếu rebase còn đang diễn ra:
+
+```bash
+git status
+git rebase --abort
+```
+
+Nếu rebase đã hoàn tất:
+
+```bash
+git reflog --date=local
+git switch -c rescue/before-rebase <commit-truoc-rebase>
+```
+
+Tạo rescue branch rồi mới quyết định reset, cherry-pick hay rebase lại.
+
+### Có commit trong detached HEAD
+
+Nếu vẫn đang đứng ở commit đó:
+
+```bash
+git switch -c feature/from-detached-head
+```
+
+Nếu đã rời đi, dùng reflog để tìm hash rồi tạo branch cứu hộ.
+
+---
+
+## 11. Upstream và remote: fetch trước, kết luận sau
+
+Xem branch local đang track gì:
+
+```bash
+git branch -vv
+```
+
+Đặt upstream khi push branch mới:
+
+```bash
+git push -u origin HEAD
+```
+
+Sau đó `@{upstream}` đại diện cho remote-tracking branch tương ứng:
+
+```bash
+git log --oneline @{upstream}..HEAD
+git diff @{upstream}...HEAD
+```
+
+Đếm commit lệch giữa local và upstream:
+
+```bash
+git rev-list --left-right --count HEAD...@{upstream}
+```
+
+Ví dụ:
+
+```text
+1  3
+```
+
+Theo thứ tự của lệnh trên, local có một commit riêng và upstream có ba commit
+riêng.
+
+### Không dùng `pull` như một nút “update” mù
+
+`git pull` về bản chất là fetch rồi tích hợp bằng merge hoặc rebase tùy config.
+Trước khi tích hợp, một workflow dễ quan sát hơn là:
+
+```bash
+git fetch --prune origin
+git status --short --branch
+git log --left-right --oneline HEAD...@{upstream}
+```
+
+Sau khi hiểu hai phía, chọn theo quy ước của team:
+
+```bash
+git merge --ff-only @{upstream}
+# hoặc
+git rebase @{upstream}
+```
+
+`--ff-only` từ chối tạo merge commit hoặc xử lý divergence ngoài ý muốn. Rebase
+phù hợp với branch cá nhân nếu team dùng lịch sử tuyến tính.
+
+---
+
+## 12. Rewrite lịch sử một cách có trách nhiệm
+
+Rebase, amend và reset không “sửa” commit cũ; chúng tạo graph mới rồi di chuyển
+reference.
+
+```text
+Trước: A ← B ← C
+
+Sau rebase:
+       ┌─ B ← C       lịch sử cũ
+A ← X └─ B' ← C'     lịch sử mới
+```
+
+Hash thay đổi vì parent hoặc nội dung commit thay đổi.
+
+### Dọn branch cá nhân
+
+Thêm fixup commit:
+
+```bash
+git commit --fixup <commit-muc-tieu>
+```
+
+Review phạm vi trước khi rebase:
+
+```bash
+git log --oneline origin/main..HEAD
+git branch backup/feature-before-rebase
+git rebase -i --autosquash origin/main
+```
+
+So sánh trước và sau:
+
+```bash
+git range-diff origin/main..backup/feature-before-rebase origin/main..HEAD
+```
+
+### Push sau rewrite
+
+Nếu branch remote chỉ thuộc workflow cá nhân và team cho phép rewrite:
+
+```bash
+git fetch origin
+git push --force-with-lease
+```
+
+`--force-with-lease` chỉ push khi remote-tracking ref vẫn khớp kỳ vọng local. Nó
+giảm nguy cơ ghi đè commit mới của người khác so với `--force`, nhưng không biến
+rewrite remote thành thao tác vô hại.
+
+Không force-push branch chung như `main` hoặc release branch nếu chưa có quy ước
+và phối hợp rõ ràng.
+
+---
+
+## 13. Conflict: đọc trạng thái, đừng đoán bước tiếp theo
+
+Khi merge, rebase hoặc cherry-pick dừng vì conflict:
+
+```bash
+git status
+git diff --name-only --diff-filter=U
+```
+
+Mở từng file, hiểu hai phía và sửa nội dung cuối cùng. Sau đó:
+
+```bash
+git add path/to/resolved-file
+git diff --cached --check
+git status
+```
+
+Tiếp tục đúng operation:
+
+```bash
+git rebase --continue
+git merge --continue
+git cherry-pick --continue
+```
+
+Hoặc quay về trạng thái trước operation:
+
+```bash
+git rebase --abort
+git merge --abort
+git cherry-pick --abort
+```
+
+Trong rebase, khái niệm “ours” và “theirs” có thể ngược trực giác vì Git đang
+replay commit lên base mới. Dùng `--ours` hoặc `--theirs` mà không xem nội dung
+là cách nhanh để giải conflict sai nhưng vẫn tạo ra code compile được.
+
+---
+
+## 14. Một vài config giúp workflow rõ ràng hơn
+
+Xem config đến từ file nào:
+
+```bash
+git config --show-origin --list
+```
+
+Các thiết lập đáng cân nhắc:
+
+```bash
+git config --global fetch.prune true
+git config --global rerere.enabled true
+git config --global rebase.autoSquash true
+git config --global merge.conflictStyle zdiff3
+```
+
+- `fetch.prune`: dọn remote-tracking branch đã bị xóa trên remote;
+- `rerere`: ghi nhớ cách giải conflict để tái sử dụng;
+- `rebase.autoSquash`: tự nhận `fixup!` khi interactive rebase;
+- `zdiff3`: hiển thị thêm base trong conflict để dễ hiểu nguồn gốc thay đổi.
+
+Không copy toàn bộ config từ dotfiles của người khác. Kiểm tra từng lựa chọn và
+tuân theo quy ước repository hoặc team.
+
+---
+
+## Workflow Git “pro” trong thực tế
+
+“Pro” không phải là luôn rebase, không bao giờ merge hoặc dùng alias thật ngắn.
+Một workflow tốt có bốn tính chất:
+
+1. **Quan sát được**: biết branch, upstream, diff và commit sắp chia sẻ.
+2. **Giới hạn phạm vi**: stage từng hunk, commit một ý, tránh lệnh tác động rộng.
+3. **Tôn trọng lịch sử chung**: không rewrite phần người khác đang dựa vào.
+4. **Phục hồi được**: tạo branch backup/rescue trước thao tác rủi ro.
+
+### Bắt đầu phiên làm việc
+
+```bash
+git status --short --branch
+git fetch --prune origin
+git branch -vv
+```
+
+### Tạo branch từ base đã xác nhận
+
+```bash
+git switch main
+git merge --ff-only origin/main
+git switch -c feature/token-refresh
+```
+
+### Tạo commit có thể review
+
+```bash
+git diff
+git add -p
+git diff --staged
+git commit
+```
+
+### Trước khi push
+
+```bash
+git status --short
+git log --oneline origin/main..HEAD
+git diff --check origin/main...HEAD
+git diff origin/main...HEAD
+npm test
+git push -u origin HEAD
+```
+
+### Khi nhận ra có vấn đề
+
+```bash
+git status
+git reflog --date=local
+git show --stat <commit-nghi-ngo>
+git switch -c rescue/before-fix <commit-an-toan>
+```
+
+Quan sát trước, tạo đường lui, rồi mới sửa reference chính.
+
+---
+
+## Decision table
+
+| Tình huống                                  | Lựa chọn đầu tiên                   |
+| ------------------------------------------- | ----------------------------------- |
+| Muốn biết đang ở đâu                        | `git status -sb`                    |
+| Muốn biết `HEAD` là commit nào              | `git show --no-patch HEAD`          |
+| Muốn biết branch track remote nào           | `git branch -vv`                    |
+| Muốn xem commit local chưa có trên upstream | `git log @{u}..HEAD`                |
+| Đang ở detached HEAD và muốn giữ commit     | `git switch -c <branch>`            |
+| Bỏ stage nhưng giữ code                     | `git restore --staged`              |
+| Bỏ commit local, giữ thay đổi staged        | `git reset --soft HEAD^`            |
+| Hoàn tác commit đã chia sẻ                  | `git revert <commit>`               |
+| Mất commit sau reset hoặc rebase            | `git reflog`, rồi tạo `rescue/...`  |
+| Rebase hoặc cherry-pick đang conflict       | `git status`, resolve, `--continue` |
+| Muốn hủy operation đang dở                  | lệnh tương ứng với `--abort`        |
+| Cần force-push branch cá nhân sau rebase    | `git push --force-with-lease`       |
+
+---
+
+## Cheat sheet về HEAD và refs
+
+```bash
+# Vị trí hiện tại
+git status --short --branch
+git symbolic-ref --short HEAD
+git rev-parse --short HEAD
+git show --no-patch --decorate HEAD
+
+# Đi trong graph
+git show HEAD^
+git show HEAD^2
+git show HEAD~3
+git merge-base origin/main HEAD
+
+# So sánh branch
+git log --oneline origin/main..HEAD
+git log --left-right --oneline origin/main...HEAD
+git diff origin/main...HEAD
+git rev-list --left-right --count HEAD...@{upstream}
+
+# Reflog và cứu hộ
+git reflog --date=local
+git reflog show <branch> --date=local
+git show <ref>@{1}
+git switch -c rescue/<name> <commit>
+
+# Ba loại hoàn tác
+git restore --staged <file>
+git reset --soft HEAD^
+git reset HEAD^
+git revert <commit>
+
+# Operation đang dở
+git status
+git rebase --abort
+git merge --abort
+git cherry-pick --abort
+```
+
+---
+
+## Điều cốt lõi
+
+Nếu chỉ nhớ năm ý sau, bạn đã tránh được phần lớn lỗi Git nghiêm trọng:
+
+1. `HEAD` là vị trí hiện tại, không phải “commit mới nhất ở mọi nơi”.
+2. Branch và remote-tracking branch là các reference local có thể di chuyển.
+3. `reset`, `restore` và `revert` tác động lên những vùng và lịch sử khác nhau.
+4. Reflog là bản ghi di chuyển local; hãy tạo rescue branch trước khi sửa tiếp.
+5. Lịch sử chưa chia sẻ và lịch sử chung cần hai cách xử lý khác nhau.
+
+Git chuyên nghiệp không nằm ở tốc độ gõ lệnh. Nó nằm ở khả năng dự đoán chính
+xác lệnh sẽ làm gì, thu hẹp phạm vi tác động và luôn giữ một đường phục hồi.
