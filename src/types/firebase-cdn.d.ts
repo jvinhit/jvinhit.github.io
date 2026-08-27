@@ -123,4 +123,11 @@ declare module 'https://www.gstatic.com/firebasejs/12.12.0/firebase-firestore.js
     error?: (err: Error) => void
   ): () => void;
   export function serverTimestamp(): unknown;
+  /**
+   * Sentinel cho update mảng (comment/reaction của spec 006) — SDK trả
+   * FieldValue opaque, Love Board chỉ nhét nó vào payload updateDoc nên
+   * khai `unknown` là đủ.
+   */
+  export function arrayUnion(...elements: unknown[]): unknown;
+  export function arrayRemove(...elements: unknown[]): unknown;
 }

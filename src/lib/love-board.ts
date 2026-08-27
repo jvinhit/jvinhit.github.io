@@ -36,6 +36,71 @@ export function daysTogether(
   return Math.max(0, Math.floor((today - start) / 86_400_000) + 1);
 }
 
+/**
+ * Một trả lời nằm trong mảng `comments` của document note/sticky (spec 006,
+ * hướng D1 — không mở collection mới để khỏi đổi security rules).
+ *
+ * Shape phải giữ ĐÚNG 4 field như lúc ghi: xóa comment dùng arrayRemove(),
+ * nó chỉ match phần tử bằng nhau tuyệt đối — parse mà thêm/bớt field là
+ * không xóa được nữa.
+ */
+export interface LoveComment {
+  id: string;
+  author: string;
+  text: string;
+  createdAtMs: number;
+}
+
+/**
+ * Một lượt thả cảm xúc trong mảng `reactions` — đúng cặp {emoji, author}
+ * (hướng R1). Toggle bằng arrayUnion/arrayRemove: hai người thả cùng emoji
+ * là hai phần tử khác nhau nên không đè nhau; cùng shape-nhạy-cảm với
+ * arrayRemove như LoveComment.
+ */
+export interface LoveReaction {
+  emoji: string;
+  author: string;
+}
+
+/** Parse tolerant mảng comments thô — phần tử rác bị bỏ, sort cũ→mới. */
+export function commentsFromRaw(raw: unknown): LoveComment[] {
+  if (!Array.isArray(raw)) return [];
+  const comments: LoveComment[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'object' || item === null) continue;
+    const { id, author, text, createdAtMs } = item as Record<string, unknown>;
+    if (
+      typeof id !== 'string' ||
+      typeof author !== 'string' ||
+      typeof text !== 'string' ||
+      typeof createdAtMs !== 'number'
+    ) {
+      continue;
+    }
+    comments.push({ id, author, text, createdAtMs });
+  }
+  // arrayUnion không bảo toàn thứ tự thời gian giữa hai máy — sort ở đây.
+  return comments.sort((a, b) => a.createdAtMs - b.createdAtMs);
+}
+
+/** Parse tolerant mảng reactions thô — phần tử rác bị bỏ. */
+export function reactionsFromRaw(raw: unknown): LoveReaction[] {
+  if (!Array.isArray(raw)) return [];
+  const reactions: LoveReaction[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'object' || item === null) continue;
+    const { emoji, author } = item as Record<string, unknown>;
+    if (typeof emoji !== 'string' || typeof author !== 'string') continue;
+    reactions.push({ emoji, author });
+  }
+  return reactions;
+}
+
+/** Nhãn đếm cho nút mở panel comment — screen reader đọc được. */
+export function commentCountLabel(count: number): string {
+  return `${count} trả lời`;
+}
+
 /** Một note trong collection `dailyNotes` (đã validate từ document thô). */
 export interface LoveNote {
   id: string;
@@ -54,6 +119,8 @@ export interface LoveNote {
    */
   createdAtMs: number;
   updatedAtMs?: number;
+  comments: LoveComment[];
+  reactions: LoveReaction[];
 }
 
 /** Parse + validate một document thô; document rác → null (bỏ qua). */
@@ -84,6 +151,8 @@ export function noteFromDoc(
         ? imageBase64
         : undefined,
     updatedAtMs: typeof updatedAtMs === 'number' ? updatedAtMs : undefined,
+    comments: commentsFromRaw(data.comments),
+    reactions: reactionsFromRaw(data.reactions),
   };
 }
 
@@ -109,6 +178,38 @@ export function groupByDate(notes: LoveNote[]): DayGroup[] {
   return groups;
 }
 
+/**
+ * Ngưỡng bật chế độ collapse timeline (spec 006): xét TỔNG số note đã
+ * validate — dưới/bằng ngưỡng thì giữ hành vi cũ (mọi ngày mở, không có
+ * control), vượt ngưỡng mới gấp các ngày cũ lại.
+ */
+export const COLLAPSE_THRESHOLD = 20;
+
+/** Xem COLLAPSE_THRESHOLD — tách hàm để page không tự so sánh lệch dấu. */
+export function isCollapseEnabled(totalNotes: number): boolean {
+  return totalNotes > COLLAPSE_THRESHOLD;
+}
+
+/**
+ * Ngày được mở sẵn khi collapse bật: hôm nay (giờ VN) nếu có note; hôm nay
+ * chưa viết gì thì lấy nhóm mới nhất — để board không bao giờ mở ra toàn
+ * dòng đóng kín (AC-5). `groups` đã sort mới→cũ nên phần tử đầu là nhóm
+ * gần nhất.
+ */
+export function defaultOpenDateKey(
+  groups: DayGroup[],
+  now: Date = new Date()
+): string | null {
+  const today = todayKeyVN(now);
+  if (groups.some((group) => group.dateKey === today)) return today;
+  return groups[0]?.dateKey ?? null;
+}
+
+/** Nhãn đếm cho header ngày đang gấp — screen reader đọc được, không chỉ là số. */
+export function noteCountLabel(count: number): string {
+  return `${count} ghi chú`;
+}
+
 /** Một mẩu giấy trên sticky board (collection `stickyNotes`). */
 export interface LoveSticky {
   id: string;
@@ -117,6 +218,8 @@ export interface LoveSticky {
   color: string;
   author: string;
   createdAtMs: number;
+  comments: LoveComment[];
+  reactions: LoveReaction[];
 }
 
 /** Parse + validate một document sticky thô; document rác → null. */
@@ -132,6 +235,8 @@ export function stickyFromDoc(
     createdAtMs,
     color: typeof color === 'string' ? color : 'rose',
     author: typeof author === 'string' ? author : 'p1',
+    comments: commentsFromRaw(data.comments),
+    reactions: reactionsFromRaw(data.reactions),
   };
 }
 

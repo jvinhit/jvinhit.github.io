@@ -177,17 +177,7 @@ const heartFavicon =
 
           <p class="love-error" data-love-note-error aria-live="polite"></p>
           <div class="love-composer-actions">
-            <button class="love-button" type="submit" data-love-note-submit>
-              Gửi thương 💌
-            </button>
-            <button
-              class="love-ghost-button"
-              type="button"
-              data-love-note-cancel
-              hidden
-            >
-              Thôi, không sửa nữa
-            </button>
+            <button class="love-button" type="submit">Gửi thương 💌</button>
           </div>
         </form>
 
@@ -270,20 +260,33 @@ const heartFavicon =
         type QuerySnapshot,
       } from '~/lib/love-firebase';
       import {
+        commentCountLabel,
         compressImage,
         daysTogether,
+        defaultOpenDateKey,
         formatDateHeading,
         formatTimeVN,
         groupByDate,
+        isCollapseEnabled,
         loginErrorMessage,
+        noteCountLabel,
         noteFromDoc,
         stickyFromDoc,
         todayKeyVN,
         writeErrorMessage,
         type DayGroup,
+        type LoveComment,
         type LoveNote,
+        type LoveReaction,
         type LoveSticky,
       } from '~/lib/love-board';
+
+      /**
+       * Bộ cảm xúc cố định cho reaction trên note/sticky (spec 006). Khai ở
+       * script (không phải frontmatter như MOODS) vì reaction bar do script
+       * dựng theo từng card, không có markup tĩnh để đọc lại data attribute.
+       */
+      const REACTIONS = ['❤️', '😂', '🥺', '😍', '👍'];
 
       /** querySelector bắt buộc — page tự sở hữu markup nên thiếu là bug. */
       function must<T extends HTMLElement>(selector: string): T {
@@ -305,8 +308,6 @@ const heartFavicon =
       const noteForm = must<HTMLFormElement>('[data-love-note-form]');
       const noteText = must<HTMLTextAreaElement>('#love-note-text');
       const noteError = must<HTMLParagraphElement>('[data-love-note-error]');
-      const noteSubmit = must<HTMLButtonElement>('[data-love-note-submit]');
-      const noteCancel = must<HTMLButtonElement>('[data-love-note-cancel]');
       const photoPick = must<HTMLButtonElement>('[data-love-photo-pick]');
       const photoInput = must<HTMLInputElement>('[data-love-photo-input]');
       const photoPreview = must<HTMLSpanElement>('[data-love-photo-preview]');
@@ -368,11 +369,44 @@ const heartFavicon =
         let activeProfile: string = LOVE_CONFIG.profiles[0].id;
         let activeMood = moodChips[0]?.dataset.loveMood ?? '🥰';
         let activeColor = colorChips[0]?.dataset.loveColor ?? 'rose';
-        let editingId: string | null = null;
-        /** Ảnh đang đính trong composer (từ nút 📷 hoặc từ note đang sửa). */
+        /** Ảnh đang đính trong composer (nút 📷) — composer giờ chỉ tạo mới. */
         let pendingImage: string | undefined;
+        /**
+         * Note đang sửa tại chỗ (spec 006, hướng E1). `draft` là nguồn sự
+         * thật của form inline: snapshot mới về thì redraw dựng lại form từ
+         * draft chứ không reset theo data — chữ đang gõ không mất. Chỉ một
+         * note ở mode sửa tại một thời điểm.
+         */
+        let editing: {
+          id: string;
+          draft: {
+            text: string;
+            mood: string;
+            author: string;
+            image: string | undefined;
+          };
+        } | null = null;
+        /** Notes của snapshot gần nhất — để redraw khi vào/ra mode sửa. */
+        let currentNotes: LoveNote[] = [];
+        /** Sticky của snapshot gần nhất — để redraw khi đổi profile. */
+        let currentStickies: LoveSticky[] = [];
         let notesUnsub: (() => void) | null = null;
         let stickyUnsub: (() => void) | null = null;
+        /**
+         * Toggle tay của user cho từng nhóm ngày (true = mở) — thắng mặc
+         * định "hôm nay mở, còn lại đóng". Sống trong closure chứ không
+         * trong DOM vì renderTimeline thay cả cây mỗi snapshot (AC-4);
+         * cố ý không persist qua reload (đã chốt ở requirement).
+         */
+        const openOverrides = new Map<string, boolean>();
+        /**
+         * Panel comment đang xòe (true) và text đang gõ dở trong ô trả lời —
+         * key `${coll}/${id}`. Cùng lý do sống-trong-closure với
+         * openOverrides: snapshot mới về không được đóng panel hay xóa chữ
+         * đang gõ của người dùng.
+         */
+        const commentOpen = new Map<string, boolean>();
+        const commentDrafts = new Map<string, string>();
 
         wireChips(profileChips, 'loveProfile', readSavedProfile(), (value) => {
           activeProfile = value;
@@ -381,6 +415,11 @@ const heartFavicon =
           } catch {
             // Safari private mode — picker vẫn chạy, chỉ không nhớ được.
           }
+          // Chip reaction render "của mình" theo activeProfile tại thời điểm
+          // render — đổi người thì phải dựng lại card, không thì nhãn/toggle
+          // tính theo người cũ (bấm sẽ thành no-op sai).
+          redrawTimeline();
+          redrawSticky();
         });
         wireChips(moodChips, 'loveMood', activeMood, (value) => {
           activeMood = value;
@@ -469,26 +508,102 @@ const heartFavicon =
         }
 
         function renderTimeline(snap: QuerySnapshot): void {
-          const notes = snap.docs
+          currentNotes = snap.docs
             .map((docSnap) => noteFromDoc(docSnap.id, docSnap.data()))
             .filter((note): note is LoveNote => note !== null);
-          emptyEl.hidden = notes.length > 0;
-          timeline.replaceChildren(...groupByDate(notes).map(renderGroup));
+          // Note đang sửa bị máy kia xóa → thoát edit, bỏ draft, báo nhẹ.
+          const editingNow = editing;
+          if (
+            editingNow &&
+            !currentNotes.some((note) => note.id === editingNow.id)
+          ) {
+            editing = null;
+            notesError.textContent =
+              'Note đang sửa vừa bị xóa ở máy bên kia rồi 🥺';
+          }
+          redrawTimeline();
         }
 
-        function renderGroup(group: DayGroup): HTMLElement {
+        /** Dựng lại cây timeline từ snapshot gần nhất + state trong closure. */
+        function redrawTimeline(): void {
+          emptyEl.hidden = currentNotes.length > 0;
+          const groups = groupByDate(currentNotes);
+          const collapsible = isCollapseEnabled(currentNotes.length);
+          const defaultOpen = defaultOpenDateKey(groups);
+          timeline.replaceChildren(
+            ...groups.map((group) =>
+              renderGroup(
+                group,
+                collapsible,
+                // Ưu tiên toggle tay; chưa toggle thì mở đúng ngày mặc định.
+                openOverrides.get(group.dateKey) ??
+                  group.dateKey === defaultOpen
+              )
+            )
+          );
+        }
+
+        function renderGroup(
+          group: DayGroup,
+          collapsible: boolean,
+          open: boolean
+        ): HTMLElement {
           const wrap = document.createElement('div');
           wrap.className = 'love-day';
           const heading = document.createElement('h3');
           heading.className = 'love-day-heading';
-          heading.textContent = formatDateHeading(group.dateKey);
-          wrap.append(heading, ...group.notes.map(renderNote));
+          const body = document.createElement('div');
+          body.className = 'love-day-notes';
+          body.append(...group.notes.map(renderNote));
+
+          // Dưới ngưỡng: heading text như cũ, không có control nào (AC-1).
+          if (!collapsible) {
+            heading.textContent = formatDateHeading(group.dateKey);
+            wrap.append(heading, body);
+            return wrap;
+          }
+
+          body.id = `love-day-${group.dateKey}`;
+          body.hidden = !open;
+
+          const toggle = document.createElement('button');
+          toggle.type = 'button';
+          toggle.className = 'love-day-toggle';
+          toggle.setAttribute('aria-expanded', String(open));
+          toggle.setAttribute('aria-controls', body.id);
+          const label = document.createElement('span');
+          label.className = 'love-day-label';
+          label.textContent = formatDateHeading(group.dateKey);
+          const count = document.createElement('span');
+          count.className = 'love-day-count';
+          count.textContent = noteCountLabel(group.notes.length);
+          const chevron = document.createElement('span');
+          chevron.className = 'love-day-chevron';
+          chevron.setAttribute('aria-hidden', 'true');
+          chevron.textContent = '▸';
+          toggle.append(label, count, chevron);
+
+          toggle.addEventListener('click', () => {
+            const nowOpen = body.hidden; // đang ẩn → click này mở ra
+            openOverrides.set(group.dateKey, nowOpen);
+            body.hidden = !nowOpen;
+            toggle.setAttribute('aria-expanded', String(nowOpen));
+          });
+
+          heading.append(toggle);
+          wrap.append(heading, body);
           return wrap;
         }
 
         // Toàn bộ nội dung note đi qua textContent — không innerHTML với
         // dữ liệu người dùng.
         function renderNote(note: LoveNote): HTMLElement {
+          // Note đang sửa render form inline thay thân card (AC-14);
+          // comment/reaction tạm ẩn theo tới khi Lưu/Hủy.
+          const editState = editing;
+          if (editState && editState.id === note.id) {
+            return renderNoteEditor(note, editState.draft);
+          }
           const card = document.createElement('article');
           card.className = `love-note love-note--${note.author}`;
 
@@ -524,16 +639,30 @@ const heartFavicon =
             card.append(img);
           }
 
+          card.append(
+            renderReactionCorner(
+              'dailyNotes',
+              note.id,
+              note.reactions,
+              notesError
+            )
+          );
+
           const foot = document.createElement('footer');
           foot.className = 'love-note-actions';
           const editBtn = iconButton('✏️', 'Sửa note này');
           editBtn.addEventListener('click', () => startEdit(note));
           const delBtn = iconButton('🗑️', 'Xóa note này');
           delBtn.addEventListener('click', () =>
-            askDelete(card, note.id, 'dailyNotes', notesError)
+            askConfirm(card, notesError, () =>
+              fb.dbApi.deleteDoc(fb.dbApi.doc(fb.db, 'dailyNotes', note.id))
+            )
           );
           foot.append(editBtn, delBtn);
           card.append(foot);
+          card.append(
+            renderCommentSection('dailyNotes', note.id, note.comments)
+          );
 
           return card;
         }
@@ -552,8 +681,6 @@ const heartFavicon =
           event.preventDefault();
           submitNote();
         });
-
-        noteCancel.addEventListener('click', () => stopEdit());
 
         // ---- đính ảnh (AC-9) --------------------------------------------------
         photoPick.addEventListener('click', () => photoInput.click());
@@ -586,6 +713,7 @@ const heartFavicon =
           else photoThumb.removeAttribute('src');
         }
 
+        // Composer giờ chỉ tạo note MỚI — sửa đi qua form inline (AC-15).
         function submitNote(): void {
           const text = noteText.value.trim();
           if (!text) {
@@ -593,80 +721,264 @@ const heartFavicon =
             return;
           }
           noteError.textContent = '';
-
-          const base = { author: activeProfile, mood: activeMood, text };
-          const wasEditing = editingId;
           const imageAtSubmit = pendingImage;
 
           // Latency compensation của Firestore cho note hiện trong timeline
           // ngay (kể cả offline) → dọn composer luôn; lỗi thật thì trả lại
           // nội dung (edge case "mất mạng, không mất chữ đang gõ").
-          const write = wasEditing
-            ? fb.dbApi.updateDoc(
-                fb.dbApi.doc(fb.db, 'dailyNotes', wasEditing),
-                {
-                  ...base,
-                  // '' = bỏ ảnh (updateDoc không xóa field khi thiếu deleteField)
-                  imageBase64: imageAtSubmit ?? '',
-                  updatedAtMs: Date.now(),
-                }
-              )
-            : fb.dbApi.addDoc(fb.dbApi.collection(fb.db, 'dailyNotes'), {
-                ...base,
-                ...(imageAtSubmit ? { imageBase64: imageAtSubmit } : {}),
-                dateKey: todayKeyVN(),
-                createdAtMs: Date.now(),
-              });
+          const write = fb.dbApi.addDoc(
+            fb.dbApi.collection(fb.db, 'dailyNotes'),
+            {
+              author: activeProfile,
+              mood: activeMood,
+              text,
+              ...(imageAtSubmit ? { imageBase64: imageAtSubmit } : {}),
+              dateKey: todayKeyVN(),
+              createdAtMs: Date.now(),
+            }
+          );
 
-          stopEdit();
+          setPhoto(undefined);
           noteText.value = '';
 
           write.catch((err: unknown) => {
             noteText.value = text;
             setPhoto(imageAtSubmit);
-            if (wasEditing) {
-              editingId = wasEditing;
-              setEditMode(true);
-            }
             noteError.textContent = writeErrorMessage(firebaseErrorCode(err));
           });
         }
 
+        // ---- sửa tại chỗ (AC-14..15) -------------------------------------------
         function startEdit(note: LoveNote): void {
-          editingId = note.id;
-          setPhoto(note.imageBase64);
-          noteText.value = note.text;
-          pickChip(profileChips, 'loveProfile', note.author);
-          activeProfile = note.author;
-          if (note.mood) {
-            pickChip(moodChips, 'loveMood', note.mood);
-            activeMood = note.mood;
+          // Đang sửa note khác thì draft cũ bỏ — một form sửa tại một thời điểm.
+          editing = {
+            id: note.id,
+            draft: {
+              text: note.text,
+              mood: note.mood || activeMood,
+              author: note.author,
+              image: note.imageBase64,
+            },
+          };
+          redrawTimeline();
+          // Chỉ focus ô text của form vừa dựng — không scrollIntoView cả
+          // trang (AC-14: viewport không nhảy; focus tự cuộn tối thiểu).
+          document.getElementById(`love-edit-text-${note.id}`)?.focus();
+        }
+
+        /** Dựng hàng chip chọn-một (aria-pressed) cho form sửa inline. */
+        function buildChipRow(
+          options: {
+            value: string;
+            label: string;
+            extraClass?: string;
+            ariaLabel?: string;
+          }[],
+          current: string,
+          groupLabel: string,
+          onPick: (value: string) => void
+        ): HTMLDivElement {
+          const row = document.createElement('div');
+          row.className = 'love-chip-row';
+          row.setAttribute('role', 'group');
+          row.setAttribute('aria-label', groupLabel);
+          const chips: HTMLButtonElement[] = [];
+          for (const option of options) {
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = option.extraClass
+              ? `love-chip ${option.extraClass}`
+              : 'love-chip';
+            chip.textContent = option.label;
+            if (option.ariaLabel) {
+              chip.setAttribute('aria-label', option.ariaLabel);
+            }
+            chip.setAttribute('aria-pressed', String(option.value === current));
+            chip.addEventListener('click', () => {
+              for (const other of chips) {
+                other.setAttribute('aria-pressed', String(other === chip));
+              }
+              onPick(option.value);
+            });
+            chips.push(chip);
+            row.append(chip);
           }
-          setEditMode(true);
-          noteForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          noteText.focus();
+          return row;
         }
 
-        function stopEdit(): void {
-          editingId = null;
-          setPhoto(undefined);
-          setEditMode(false);
+        /**
+         * Form sửa tại chỗ thay thân card note đang sửa (hướng E1). Mọi
+         * control ghi thẳng vào `draft` nên form sống qua redraw; lỗi lưu
+         * báo qua notesError vì error cục bộ của form không sống sót redraw.
+         * Mood list đọc lại từ chip tĩnh của composer — một nguồn duy nhất.
+         */
+        function renderNoteEditor(
+          note: LoveNote,
+          draft: NonNullable<typeof editing>['draft']
+        ): HTMLElement {
+          const form = document.createElement('form');
+          form.className = `love-note love-note--${draft.author} love-note-editor`;
+
+          const title = document.createElement('p');
+          title.className = 'love-note-author';
+          title.textContent = 'Sửa note ✏️';
+          form.append(title);
+
+          form.append(
+            buildChipRow(
+              LOVE_CONFIG.profiles.map((profile) => ({
+                value: profile.id,
+                label: `${profile.emoji} ${profile.name}`,
+              })),
+              draft.author,
+              'Ai đang viết?',
+              (value) => {
+                draft.author = value;
+              }
+            ),
+            buildChipRow(
+              moodChips.map((chip) => ({
+                value: chip.dataset.loveMood ?? '',
+                label: chip.dataset.loveMood ?? '',
+                extraClass: 'love-chip--mood',
+                ariaLabel: `Mood ${chip.dataset.loveMood ?? ''}`,
+              })),
+              draft.mood,
+              'Mood hôm nay',
+              (value) => {
+                draft.mood = value;
+              }
+            )
+          );
+
+          const label = document.createElement('label');
+          label.className = 'love-label';
+          const textId = `love-edit-text-${note.id}`;
+          label.htmlFor = textId;
+          label.textContent = 'Chuyện hôm nay 💬';
+          const textarea = document.createElement('textarea');
+          textarea.id = textId;
+          textarea.className = 'love-input love-textarea';
+          textarea.rows = 3;
+          textarea.value = draft.text;
+          textarea.addEventListener('input', () => {
+            draft.text = textarea.value;
+          });
+          form.append(label, textarea);
+
+          const photoRow = document.createElement('div');
+          photoRow.className = 'love-photo-row';
+          const pick = document.createElement('button');
+          pick.type = 'button';
+          pick.className = 'love-ghost-button';
+          const file = document.createElement('input');
+          file.type = 'file';
+          file.accept = 'image/*';
+          file.hidden = true;
+          const preview = document.createElement('span');
+          preview.className = 'love-photo-preview';
+          const thumb = document.createElement('img');
+          thumb.alt = '';
+          const drop = iconButton('✖', 'Bỏ ảnh của note');
+          preview.append(thumb, drop);
+          photoRow.append(pick, file, preview);
+
+          const errEl = document.createElement('p');
+          errEl.className = 'love-error';
+          errEl.setAttribute('aria-live', 'polite');
+
+          function syncPhoto(): void {
+            preview.hidden = !draft.image;
+            if (draft.image) thumb.src = draft.image;
+            else thumb.removeAttribute('src');
+            pick.textContent = draft.image ? '📷 Đổi ảnh' : '📷 Thêm ảnh';
+          }
+          syncPhoto();
+
+          pick.addEventListener('click', () => file.click());
+          file.addEventListener('change', () => {
+            const chosen = file.files?.[0];
+            file.value = '';
+            if (!chosen) return;
+            pick.disabled = true;
+            pick.textContent = 'Đang nén… 🍬';
+            void compressImage(chosen).then((dataUrl) => {
+              pick.disabled = false;
+              if (!dataUrl) {
+                errEl.textContent =
+                  'Ảnh nặng quá hoặc không đọc được — chọn ảnh khác nhé 🥺';
+                syncPhoto();
+                return;
+              }
+              errEl.textContent = '';
+              draft.image = dataUrl;
+              syncPhoto();
+            });
+          });
+          drop.addEventListener('click', () => {
+            draft.image = undefined;
+            syncPhoto();
+          });
+
+          const actions = document.createElement('div');
+          actions.className = 'love-composer-actions';
+          const save = document.createElement('button');
+          save.type = 'submit';
+          save.className = 'love-button';
+          save.textContent = 'Lưu lại 💾';
+          const cancel = document.createElement('button');
+          cancel.type = 'button';
+          cancel.className = 'love-ghost-button';
+          cancel.textContent = 'Thôi, không sửa nữa';
+          cancel.addEventListener('click', () => {
+            editing = null;
+            redrawTimeline();
+          });
+          actions.append(save, cancel);
+          form.append(photoRow, errEl, actions);
+
+          form.addEventListener('submit', (event) => {
+            event.preventDefault();
+            const text = draft.text.trim();
+            if (!text) {
+              errEl.textContent = 'Viết gì đó đã nè ✍️';
+              return;
+            }
+            // Latency compensation phản ánh bản sửa ngay → thoát edit trước;
+            // lỗi thật thì mở lại form với đúng draft (không mất chữ).
+            const saved = { ...draft, text };
+            editing = null;
+            redrawTimeline();
+            fb.dbApi
+              .updateDoc(fb.dbApi.doc(fb.db, 'dailyNotes', note.id), {
+                author: saved.author,
+                mood: saved.mood,
+                text: saved.text,
+                // '' = bỏ ảnh (updateDoc không xóa field khi thiếu deleteField)
+                imageBase64: saved.image ?? '',
+                updatedAtMs: Date.now(),
+              })
+              .catch((err: unknown) => {
+                editing = { id: note.id, draft: saved };
+                redrawTimeline();
+                notesError.textContent = writeErrorMessage(
+                  firebaseErrorCode(err)
+                );
+              });
+          });
+
+          return form;
         }
 
-        function setEditMode(editing: boolean): void {
-          noteSubmit.textContent = editing ? 'Lưu lại 💾' : 'Gửi thương 💌';
-          noteCancel.hidden = !editing;
-          if (!editing) noteText.value = '';
-        }
-
-        // Xác nhận xóa inline (AC-6) — dùng chung cho note và sticky.
-        function askDelete(
-          card: HTMLElement,
-          id: string,
-          coll: 'dailyNotes' | 'stickyNotes',
-          errEl: HTMLParagraphElement
+        // Xác nhận xóa inline (AC-6 spec 005) — nhận callback thay vì tự
+        // deleteDoc để dùng được cho cả note/sticky (deleteDoc) lẫn comment
+        // (updateDoc + arrayRemove).
+        function askConfirm(
+          host: HTMLElement,
+          errEl: HTMLParagraphElement,
+          run: () => Promise<void>
         ): void {
-          if (card.querySelector('.love-confirm')) return;
+          if (host.querySelector('.love-confirm')) return;
           const row = document.createElement('div');
           row.className = 'love-confirm';
           const msg = document.createElement('span');
@@ -677,11 +989,9 @@ const heartFavicon =
           yes.textContent = 'Xóa 💔';
           yes.addEventListener('click', () => {
             row.remove();
-            fb.dbApi
-              .deleteDoc(fb.dbApi.doc(fb.db, coll, id))
-              .catch((err: unknown) => {
-                errEl.textContent = writeErrorMessage(firebaseErrorCode(err));
-              });
+            run().catch((err: unknown) => {
+              errEl.textContent = writeErrorMessage(firebaseErrorCode(err));
+            });
           });
           const no = document.createElement('button');
           no.type = 'button';
@@ -689,7 +999,349 @@ const heartFavicon =
           no.textContent = 'Thôi';
           no.addEventListener('click', () => row.remove());
           row.append(msg, yes, no);
-          card.append(row);
+          host.append(row);
+        }
+
+        // ---- comment (AC-8..11) ------------------------------------------------
+        /**
+         * Khu comment cuối card note/sticky: nút "💬 N" + panel (list + ô
+         * trả lời + error riêng). Trạng thái xòe và draft giữ trong Map ở
+         * closure nên sống qua re-render snapshot.
+         */
+        function renderCommentSection(
+          coll: 'dailyNotes' | 'stickyNotes',
+          id: string,
+          comments: LoveComment[]
+        ): HTMLElement {
+          const key = `${coll}/${id}`;
+          const open = commentOpen.get(key) ?? false;
+
+          const section = document.createElement('div');
+          section.className = 'love-comments';
+
+          const toggle = document.createElement('button');
+          toggle.type = 'button';
+          toggle.className = 'love-comment-toggle';
+          toggle.textContent =
+            comments.length > 0 ? `💬 ${comments.length}` : '💬';
+          toggle.setAttribute('aria-expanded', String(open));
+          toggle.setAttribute(
+            'aria-label',
+            comments.length > 0
+              ? `${commentCountLabel(comments.length)}, bấm để xem`
+              : 'Trả lời'
+          );
+
+          const panel = document.createElement('div');
+          panel.className = 'love-comment-panel';
+          panel.id = `love-comments-${coll}-${id}`;
+          panel.hidden = !open;
+          toggle.setAttribute('aria-controls', panel.id);
+          toggle.addEventListener('click', () => {
+            const nowOpen = panel.hidden;
+            commentOpen.set(key, nowOpen);
+            panel.hidden = !nowOpen;
+            toggle.setAttribute('aria-expanded', String(nowOpen));
+          });
+
+          const errEl = document.createElement('p');
+          errEl.className = 'love-error';
+          errEl.setAttribute('aria-live', 'polite');
+
+          const list = document.createElement('div');
+          list.className = 'love-comment-list';
+          list.append(
+            ...comments.map((comment) =>
+              renderComment(coll, id, comment, errEl)
+            )
+          );
+
+          const form = document.createElement('form');
+          form.className = 'love-comment-form';
+          const label = document.createElement('label');
+          label.className = 'love-sr-only';
+          const inputId = `love-comment-input-${coll}-${id}`;
+          label.htmlFor = inputId;
+          label.textContent = 'Trả lời';
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.id = inputId;
+          input.className = 'love-input love-comment-input';
+          input.maxLength = 300;
+          input.placeholder = 'Trả lời nè…';
+          input.value = commentDrafts.get(key) ?? '';
+          input.addEventListener('input', () => {
+            commentDrafts.set(key, input.value);
+          });
+          const send = document.createElement('button');
+          send.type = 'submit';
+          send.className = 'love-comment-send';
+          send.textContent = 'Gửi 💌';
+          form.append(label, input, send);
+
+          form.addEventListener('submit', (event) => {
+            event.preventDefault();
+            const text = input.value.trim();
+            if (!text) {
+              errEl.textContent = 'Viết gì đó đã nè ✍️';
+              return;
+            }
+            errEl.textContent = '';
+            // Shape ghi = shape LoveComment, không field thừa — arrayRemove
+            // lúc xóa phải match từng field (xem comment trong love-board.ts).
+            const comment = {
+              id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+              author: activeProfile,
+              text,
+              createdAtMs: Date.now(),
+            };
+            // Dọn ô ngay (latency compensation hiện comment tức thì); lỗi
+            // thật thì trả chữ lại — cùng pattern với submitNote.
+            input.value = '';
+            commentDrafts.delete(key);
+            fb.dbApi
+              .updateDoc(fb.dbApi.doc(fb.db, coll, id), {
+                comments: fb.dbApi.arrayUnion(comment),
+              })
+              .catch((err: unknown) => {
+                input.value = text;
+                commentDrafts.set(key, text);
+                errEl.textContent = writeErrorMessage(firebaseErrorCode(err));
+              });
+          });
+
+          panel.append(list, form, errEl);
+          section.append(toggle, panel);
+          return section;
+        }
+
+        // ---- reaction (AC-12..13, hành vi Facebook) -----------------------------
+        /**
+         * Reaction gom về MỘT nút duy nhất dính góc dưới bubble/sticky
+         * (feedback lần 4 — nút ở action row và cluster hiển thị bị trùng):
+         * - Chưa ai thả: pill 🤍 nhỏ ở góc; có reaction: chính cụm
+         *   emoji + avatar từng người là nút.
+         * - BẤM nút xòe palette nổi; desktop hover cũng mở, phím mũi tên
+         *   cho bàn phím; Escape / click-ngoài / bấm lại để đóng.
+         * - Mỗi người ĐÚNG MỘT reaction — chọn emoji khác là THAY, chọn
+         *   lại emoji đang thả là BỎ.
+         * - Pill thấp hơn 44px nhưng vùng bấm được nới bằng ::after nên
+         *   touch target thật vẫn ≥44px.
+         */
+        function renderReactionCorner(
+          coll: 'dailyNotes' | 'stickyNotes',
+          id: string,
+          reactions: LoveReaction[],
+          errEl: HTMLParagraphElement
+        ): HTMLElement {
+          const wrap = document.createElement('span');
+          wrap.className = 'love-react-corner';
+
+          const mine = myReactions(reactions)[0];
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'love-react-corner-btn';
+          if (reactions.length === 0) {
+            btn.classList.add('love-react-corner-btn--empty');
+            const face = document.createElement('span');
+            face.setAttribute('aria-hidden', 'true');
+            face.textContent = '🤍';
+            btn.append(face);
+            btn.setAttribute('aria-label', 'Thả cảm xúc');
+          } else {
+            const parts: string[] = [];
+            for (const reaction of reactions) {
+              const profile = LOVE_CONFIG.profiles.find(
+                (p) => p.id === reaction.author
+              );
+              const pair = document.createElement('span');
+              pair.className = 'love-reaction-pair';
+              pair.setAttribute('aria-hidden', 'true');
+              const face = document.createElement('span');
+              face.className = 'love-rp-emoji';
+              face.textContent = reaction.emoji;
+              const who = document.createElement('span');
+              who.className = 'love-rp-who';
+              who.textContent = profile?.emoji ?? '💌';
+              pair.append(face, who);
+              btn.append(pair);
+              parts.push(
+                `${reaction.emoji} — ${profile?.name ?? reaction.author}`
+              );
+            }
+            btn.setAttribute(
+              'aria-label',
+              `Cảm xúc: ${parts.join('; ')}. Bấm để ${
+                mine ? 'đổi hoặc bỏ' : 'thả'
+              } của bạn`
+            );
+          }
+          btn.setAttribute('aria-haspopup', 'true');
+          btn.setAttribute('aria-expanded', 'false');
+
+          const palette = document.createElement('div');
+          palette.className = 'love-react-palette';
+          palette.hidden = true;
+
+          let closeTimer: number | undefined;
+          const onDocClick = (event: MouseEvent): void => {
+            if (!wrap.contains(event.target as Node)) close();
+          };
+          const onKey = (event: KeyboardEvent): void => {
+            if (event.key === 'Escape') {
+              close();
+              btn.focus();
+            }
+          };
+          function open(): void {
+            if (!palette.hidden) return;
+            palette.hidden = false;
+            // Nút ở góc PHẢI bubble → neo phải mặc định; tràn mép trái
+            // viewport (sticky cột trái trên mobile) thì lật neo trái.
+            // Đo bằng offsetWidth chứ KHÔNG getBoundingClientRect: animation
+            // pop đang scale nhỏ palette nên rect trả bề rộng thiếu.
+            palette.classList.remove('love-react-palette--flip');
+            const anchor = wrap.getBoundingClientRect();
+            if (anchor.right - palette.offsetWidth < 8) {
+              palette.classList.add('love-react-palette--flip');
+            }
+            btn.setAttribute('aria-expanded', 'true');
+            document.addEventListener('click', onDocClick);
+            document.addEventListener('keydown', onKey);
+          }
+          function close(): void {
+            if (palette.hidden) return;
+            palette.hidden = true;
+            btn.setAttribute('aria-expanded', 'false');
+            document.removeEventListener('click', onDocClick);
+            document.removeEventListener('keydown', onKey);
+          }
+
+          REACTIONS.forEach((emoji, index) => {
+            const isMine = mine?.emoji === emoji;
+            const pick = document.createElement('button');
+            pick.type = 'button';
+            pick.className = 'love-react-pick';
+            pick.textContent = emoji;
+            // Stagger từng emoji nhô lên lần lượt như palette của FB.
+            pick.style.animationDelay = `${index * 35}ms`;
+            pick.setAttribute('aria-pressed', String(isMine));
+            pick.setAttribute(
+              'aria-label',
+              isMine ? `Bỏ ${emoji} của bạn` : `Thả ${emoji}`
+            );
+            pick.addEventListener('click', () => {
+              close();
+              // Chọn lại emoji đang thả = bỏ; emoji khác = thay (FB).
+              setReaction(coll, id, reactions, isMine ? null : emoji, errEl);
+            });
+            palette.append(pick);
+          });
+
+          // Bấm nút là xòe palette ngay — long-press kiểu FB bị chê khó
+          // khám phá (feedback lần 3); mọi thao tác chọn/thay/bỏ nằm
+          // trong palette.
+          btn.addEventListener('click', (event) => {
+            // Đừng để onDocClick vừa gắn xong đã đóng lại vì chính click này.
+            event.stopPropagation();
+            if (palette.hidden) open();
+            else close();
+          });
+          // Bàn phím: mũi tên cũng mở và nhảy focus vào emoji đầu.
+          btn.addEventListener('keydown', (event) => {
+            if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+              event.preventDefault();
+              open();
+              palette.querySelector<HTMLButtonElement>('button')?.focus();
+            }
+          });
+          // Desktop trỏ chuột vào là xòe như Facebook; rời cả cụm 300ms thì
+          // cất. Chỉ gắn ở môi trường có hover thật để không phá touch.
+          if (window.matchMedia('(hover: hover)').matches) {
+            wrap.addEventListener('mouseenter', () => {
+              window.clearTimeout(closeTimer);
+              open();
+            });
+            wrap.addEventListener('mouseleave', () => {
+              closeTimer = window.setTimeout(close, 300);
+            });
+          }
+
+          wrap.append(btn, palette);
+          return wrap;
+        }
+
+        /** Mọi reaction của người đang chọn — data cũ có thể còn nhiều
+         * cái/người (mô hình bật/tắt trước đây), gom hết để lần ghi kế
+         * dọn về đúng một reaction/người như Facebook. */
+        function myReactions(reactions: LoveReaction[]): LoveReaction[] {
+          return reactions.filter((r) => r.author === activeProfile);
+        }
+
+        /**
+         * Đặt reaction của mình thành `emoji` (null = bỏ hẳn). Firestore
+         * không cho hai transform trên cùng field trong một updateDoc nên
+         * replace = gỡ hết của mình trước rồi union cái mới; mỗi bước vẫn
+         * atomic theo phần tử nên không đè reaction của người kia (AC-13).
+         */
+        function setReaction(
+          coll: 'dailyNotes' | 'stickyNotes',
+          id: string,
+          reactions: LoveReaction[],
+          emoji: string | null,
+          errEl: HTMLParagraphElement
+        ): void {
+          const ref = fb.dbApi.doc(fb.db, coll, id);
+          const mine = myReactions(reactions);
+          void (async () => {
+            if (mine.length > 0) {
+              await fb.dbApi.updateDoc(ref, {
+                reactions: fb.dbApi.arrayRemove(...mine),
+              });
+            }
+            if (emoji) {
+              await fb.dbApi.updateDoc(ref, {
+                reactions: fb.dbApi.arrayUnion({
+                  emoji,
+                  author: activeProfile,
+                }),
+              });
+            }
+          })().catch((err: unknown) => {
+            errEl.textContent = writeErrorMessage(firebaseErrorCode(err));
+          });
+        }
+
+        function renderComment(
+          coll: 'dailyNotes' | 'stickyNotes',
+          id: string,
+          comment: LoveComment,
+          errEl: HTMLParagraphElement
+        ): HTMLElement {
+          const row = document.createElement('div');
+          row.className = `love-comment love-comment--${comment.author}`;
+          const meta = document.createElement('span');
+          meta.className = 'love-comment-meta';
+          const profile = LOVE_CONFIG.profiles.find(
+            (p) => p.id === comment.author
+          );
+          meta.textContent = `${
+            profile ? `${profile.emoji} ${profile.name}` : comment.author
+          } · ${formatTimeVN(comment.createdAtMs)}`;
+          const text = document.createElement('p');
+          text.className = 'love-comment-text';
+          text.textContent = comment.text;
+          const del = iconButton('🗑️', 'Xóa trả lời này');
+          del.classList.add('love-comment-del');
+          del.addEventListener('click', () =>
+            askConfirm(row, errEl, () =>
+              fb.dbApi.updateDoc(fb.dbApi.doc(fb.db, coll, id), {
+                comments: fb.dbApi.arrayRemove(comment),
+              })
+            )
+          );
+          row.append(meta, text, del);
+          return row;
         }
 
         // ---- sticky board (AC-7) ---------------------------------------------
@@ -725,11 +1377,10 @@ const heartFavicon =
               fb.dbApi.orderBy('createdAtMs', 'desc')
             ),
             (snap) => {
-              const stickies = snap.docs
+              currentStickies = snap.docs
                 .map((docSnap) => stickyFromDoc(docSnap.id, docSnap.data()))
                 .filter((s): s is LoveSticky => s !== null);
-              stickyEmpty.hidden = stickies.length > 0;
-              stickyGrid.replaceChildren(...stickies.map(renderSticky));
+              redrawSticky();
             },
             (err) => {
               stickyError.textContent = writeErrorMessage(
@@ -737,6 +1388,12 @@ const heartFavicon =
               );
             }
           );
+        }
+
+        /** Dựng lại sticky grid từ snapshot gần nhất (đổi profile cũng gọi). */
+        function redrawSticky(): void {
+          stickyEmpty.hidden = currentStickies.length > 0;
+          stickyGrid.replaceChildren(...currentStickies.map(renderSticky));
         }
 
         function renderSticky(sticky: LoveSticky): HTMLElement {
@@ -754,10 +1411,24 @@ const heartFavicon =
           who.textContent = profile ? profile.emoji : '💌';
           const del = iconButton('🗑️', 'Gỡ mẩu giấy này');
           del.addEventListener('click', () =>
-            askDelete(card, sticky.id, 'stickyNotes', stickyError)
+            askConfirm(card, stickyError, () =>
+              fb.dbApi.deleteDoc(fb.dbApi.doc(fb.db, 'stickyNotes', sticky.id))
+            )
           );
           foot.append(who, del);
-          card.append(text, foot);
+          card.append(
+            renderReactionCorner(
+              'stickyNotes',
+              sticky.id,
+              sticky.reactions,
+              stickyError
+            ),
+            text,
+            foot
+          );
+          card.append(
+            renderCommentSection('stickyNotes', sticky.id, sticky.comments)
+          );
           return card;
         }
       }
@@ -795,19 +1466,6 @@ const heartFavicon =
         }
         set(initial);
       }
-
-      function pickChip(
-        chips: HTMLButtonElement[],
-        dataKey: 'loveProfile' | 'loveMood' | 'loveColor',
-        value: string
-      ): void {
-        for (const chip of chips) {
-          chip.setAttribute(
-            'aria-pressed',
-            String(chip.dataset[dataKey] === value)
-          );
-        }
-      }
     </script>
   </body>
 </html>
@@ -827,13 +1485,21 @@ const heartFavicon =
     /* Chữ/nền đều phải giữ contrast AA trên nền pastel — các màu "deep"
        được chọn đạt ≥4.5:1 với trắng (text nhỏ) hoặc làm nền cho chữ trắng. */
     --love-fg: #5b4049;
-    --love-fg-muted: #8a6575;
+    /* Đậm hơn bản cũ (#8a6575) để giữ ≥4.5:1 trên nền bubble tint. */
+    --love-fg-muted: #7d5966;
     --love-pink: #f472a8; /* decor: viền active, tim, selection */
     --love-pink-deep: #b23a6f; /* text nhỏ trên nền sáng + nền nút chữ trắng */
     --love-pink-darker: #9c2f60; /* hover của nút */
     --love-pink-fg: #ffffff;
     --love-p1: #f472a8;
     --love-p2: #7c5cba;
+    /* Bong bóng chat 2 phía (polish P2): nền tint + viền theo người viết.
+       Text trên tint phải giữ AA: fg 7.8:1, tên p1 4.9:1, tên p2 dùng
+       --love-p2-deep 5.6:1 (chính --love-p2 chỉ đạt 4.3:1 trên tint tím). */
+    --love-p1-soft: #ffe9f1;
+    --love-p2-soft: #efe9fb;
+    --love-p2-border: #ded1f5;
+    --love-p2-deep: #6a4ba8;
     --love-radius: 20px;
     --love-font:
       'Quicksand', ui-rounded, 'SF Pro Rounded', 'Segoe UI', system-ui,
@@ -887,10 +1553,18 @@ const heartFavicon =
     color: var(--love-pink-deep);
   }
 
+  /* Bộ đếm ngày thành pill nổi — điểm nhấn của header (polish P2). */
   .love-days {
-    margin-top: 0.75rem;
-    font-weight: 600;
-    color: var(--love-fg-muted);
+    display: inline-block;
+    margin-top: 0.875rem;
+    padding: 0.5rem 1.25rem;
+    border: 2px solid var(--love-border);
+    border-radius: 999px;
+    background: var(--love-card);
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--love-pink-deep);
+    box-shadow: 0 6px 18px rgb(214 77 135 / 0.1);
   }
 
   .love-card {
@@ -1002,9 +1676,19 @@ const heartFavicon =
   }
 
   .love-section-title {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
     font-size: 1.05rem;
     font-weight: 700;
     color: var(--love-pink-deep);
+  }
+
+  /* Đuôi divider chấm chấm sau tiêu đề section (polish P2). */
+  .love-section-title::after {
+    content: '';
+    flex: 1;
+    border-top: 2px dashed var(--love-border);
   }
 
   .love-chip-row {
@@ -1113,8 +1797,41 @@ const heartFavicon =
     color: var(--love-fg-muted);
   }
 
+  /* Rail nhật ký (polish P2): line dọc + chấm tròn mốc ngày bên trái. */
   .love-day {
+    position: relative;
     margin-top: 1.25rem;
+    padding-left: 1.125rem;
+  }
+
+  .love-day::before {
+    content: '';
+    position: absolute;
+    top: 1rem;
+    bottom: 0.25rem;
+    left: 0.3125rem;
+    width: 0;
+    border-left: 2px dashed var(--love-border);
+  }
+
+  .love-day::after {
+    content: '';
+    position: absolute;
+    top: 0.875rem;
+    left: 0;
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: 50%;
+    background: var(--love-pink);
+    box-shadow: 0 0 0 3px var(--love-bg);
+  }
+
+  .love-day-notes {
+    display: flex;
+    flex-direction: column;
+    /* Gap đủ rộng cho nút reaction dính góc lòi xuống dưới bubble. */
+    gap: 1.25rem;
+    margin-top: 0.375rem;
   }
 
   .love-day-heading {
@@ -1123,18 +1840,79 @@ const heartFavicon =
     color: var(--love-fg-muted);
   }
 
+  /* Header nhóm ngày khi collapse bật — cả dòng là một button toggle. */
+  .love-day-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    min-height: 2.75rem; /* ≥44px touch target (AC-12 spec 005) */
+    padding: 0.25rem 0.5rem;
+    border: none;
+    border-radius: 12px;
+    background: transparent;
+    color: var(--love-fg-muted);
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 700;
+    text-align: left;
+    cursor: pointer;
+    transition: background 150ms var(--ease-out-quad);
+  }
+
+  .love-day-toggle:hover {
+    background: var(--love-bg-accent);
+  }
+
+  .love-day-label {
+    margin-right: auto;
+  }
+
+  .love-day-count {
+    padding: 0.125rem 0.625rem;
+    border-radius: 999px;
+    background: var(--love-bg-accent);
+    color: var(--love-pink-deep);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .love-day-chevron {
+    transition: transform 150ms var(--ease-out-quad);
+  }
+
+  .love-day-toggle[aria-expanded='true'] .love-day-chevron {
+    transform: rotate(90deg);
+  }
+
+  /* Note là bong bóng chat 2 phía (polish P2): p1 trái/hồng, p2 phải/tím.
+     position: relative làm neo cho cluster reaction dính góc bubble. */
   .love-note {
-    background: var(--love-card);
+    position: relative;
+    max-width: 85%;
+    align-self: flex-start;
+    padding: 0.875rem 1rem;
     border: 2px solid var(--love-border);
-    border-left: 6px solid var(--love-p1);
-    border-radius: var(--love-radius);
-    padding: 1rem;
-    margin-top: 0.625rem;
-    box-shadow: 0 6px 18px rgb(214 77 135 / 0.06);
+    border-radius: 18px;
+    border-bottom-left-radius: 6px;
+    background: var(--love-p1-soft);
+    box-shadow: 0 6px 18px rgb(214 77 135 / 0.08);
   }
 
   .love-note--p2 {
-    border-left-color: var(--love-p2);
+    align-self: flex-end;
+    border-color: var(--love-p2-border);
+    border-radius: 18px;
+    border-bottom-right-radius: 6px;
+    background: var(--love-p2-soft);
+  }
+
+  /* Form sửa tại chỗ: vẫn là card trong dòng chảy nhưng chiếm trọn bề
+     ngang và nền trắng cho dễ thao tác control. */
+  .love-note-editor {
+    max-width: 100%;
+    align-self: stretch;
+    background: var(--love-card);
   }
 
   .love-note-head {
@@ -1150,7 +1928,7 @@ const heartFavicon =
   }
 
   .love-note--p2 .love-note-author {
-    color: var(--love-p2);
+    color: var(--love-p2-deep);
   }
 
   .love-note-meta {
@@ -1165,12 +1943,17 @@ const heartFavicon =
     overflow-wrap: anywhere;
   }
 
+  /* Ảnh đóng khung polaroid (polish P2) — viền dày dưới + xoay nhẹ. */
   .love-note-img {
     display: block;
     max-width: 100%;
     max-height: 320px;
     margin-top: 0.5rem;
-    border-radius: 12px;
+    border: 6px solid var(--love-card);
+    border-bottom-width: 1.5rem;
+    border-radius: 4px;
+    box-shadow: 0 6px 14px rgb(91 64 73 / 0.16);
+    transform: rotate(-1deg);
   }
 
   .love-note-actions {
@@ -1217,23 +2000,334 @@ const heartFavicon =
     cursor: pointer;
   }
 
+  /* ---- Reaction kiểu Facebook/Messenger (spec 006, AC-12..13) ----
+     MỘT nút duy nhất dính góc dưới-phải bubble/sticky: 🤍 khi trống,
+     cụm emoji + avatar khi đã có reaction; bấm/hover xòe palette nổi.
+     Không gì trong số này đẩy layout của card. */
+  .love-react-corner {
+    position: absolute;
+    right: 0.625rem;
+    bottom: -0.9375rem;
+    z-index: 2;
+    display: inline-flex;
+  }
+
+  .love-react-corner-btn {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.1875rem 0.5625rem 0.1875rem 0.4375rem;
+    border: 1px solid var(--love-border);
+    border-radius: 999px;
+    background: var(--love-card);
+    box-shadow: 0 4px 10px rgb(91 64 73 / 0.16);
+    font: inherit;
+    font-size: 0.95rem;
+    line-height: 1.2;
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    touch-action: manipulation;
+    /* Pop nhẹ khi xuất hiện (chạy lại lúc re-render snapshot — chấp
+       nhận, hiệu ứng ngắn và kín đáo). */
+    animation: love-cluster-in 200ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    transition:
+      transform 150ms cubic-bezier(0.34, 1.56, 0.64, 1),
+      border-color 150ms var(--ease-out-quad);
+  }
+
+  /* Pill thấp hơn 44px — nới vùng bấm ẩn cho đạt touch target. */
+  .love-react-corner-btn::after {
+    content: '';
+    position: absolute;
+    inset: -0.75rem;
+    border-radius: 999px;
+  }
+
+  .love-react-corner-btn:hover {
+    transform: scale(1.1);
+    border-color: var(--love-pink);
+  }
+
+  /* Nhún nhẹ khi bấm — feedback tức thì trước khi palette xòe. */
+  .love-react-corner-btn:active {
+    transform: scale(0.9);
+  }
+
+  .love-react-corner-btn[aria-expanded='true'] {
+    border-color: var(--love-pink);
+  }
+
+  .love-react-palette {
+    position: absolute;
+    bottom: calc(100% + 0.5rem);
+    right: 0;
+    z-index: 5;
+    display: flex;
+    /* Absolute trong wrap chỉ rộng ~2rem — không có width riêng thì
+       shrink-to-fit sẽ bóp palette thành cột dọc. */
+    width: max-content;
+    gap: 0.125rem;
+    padding: 0.3125rem 0.375rem;
+    border: 1px solid var(--love-border);
+    border-radius: 999px;
+    background: var(--love-card);
+    box-shadow:
+      0 12px 28px rgb(91 64 73 / 0.22),
+      0 2px 6px rgb(91 64 73 / 0.1);
+    transform-origin: calc(100% - 1.375rem) bottom;
+    animation: love-pop 220ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  /* display:flex thắng UA rule của [hidden] — phải tự tắt lại. */
+  .love-react-palette[hidden] {
+    display: none;
+  }
+
+  .love-react-palette--flip {
+    right: auto;
+    left: 0;
+    transform-origin: 1.375rem bottom;
+  }
+
+  @keyframes love-pop {
+    from {
+      opacity: 0;
+      transform: scale(0.6) translateY(0.375rem);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1) translateY(0);
+    }
+  }
+
+  .love-react-pick {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background: transparent;
+    font-size: 1.6rem;
+    line-height: 1;
+    cursor: pointer;
+    /* Mỗi emoji nhô lên lần lượt (delay inline theo index từ script). */
+    animation: love-pick-in 260ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    transition: transform 160ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  @keyframes love-pick-in {
+    from {
+      opacity: 0;
+      transform: translateY(0.625rem) scale(0.3);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  /* Emoji phồng lên khi trỏ vào — chất Facebook nằm ở đây. */
+  .love-react-pick:hover,
+  .love-react-pick:focus-visible {
+    transform: scale(1.45) translateY(-0.375rem);
+  }
+
+  .love-react-pick[aria-pressed='true'] {
+    border-color: var(--love-pink);
+    background: var(--love-bg-accent);
+  }
+
+  /* Màn hẹp: bóp gap/padding + pick 40px để palette (width: max-content)
+     sau khi flip vẫn nằm gọn trong viewport hẹp nhất. Phải đứng SAU rule
+     gốc của pick — cùng specificity, thứ tự quyết định. */
+  @media (max-width: 480px) {
+    .love-react-palette {
+      gap: 0;
+      padding: 0.125rem;
+    }
+
+    .love-react-pick {
+      min-width: 2.5rem;
+      min-height: 2.5rem;
+      font-size: 1.45rem;
+    }
+  }
+
+  @keyframes love-cluster-in {
+    from {
+      opacity: 0;
+      transform: scale(0.5) translateY(0.25rem);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1) translateY(0);
+    }
+  }
+
+  .love-reaction-pair {
+    position: relative;
+    display: inline-flex;
+  }
+
+  .love-rp-who {
+    position: absolute;
+    right: -0.375rem;
+    bottom: -0.1875rem;
+    font-size: 0.55rem;
+    /* Viền tròn trắng cho avatar nhỏ nổi trên emoji, kiểu badge FB. */
+    background: var(--love-card);
+    border-radius: 999px;
+    padding: 0.0625rem;
+    box-shadow: 0 1px 2px rgb(91 64 73 / 0.25);
+  }
+
+  .love-sticky .love-react-corner {
+    bottom: -0.75rem;
+    right: 0.375rem;
+  }
+
+  /* ---- Khu comment cuối card note/sticky (spec 006, AC-8..11) ---- */
+  .love-comments {
+    margin-top: 0.375rem;
+    padding-top: 0.25rem;
+    border-top: 1px dashed var(--love-border);
+  }
+
+  .love-comment-toggle {
+    min-height: 2.75rem;
+    padding: 0.25rem 0.75rem;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--love-pink-deep);
+    font: inherit;
+    font-size: 0.875rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background 150ms var(--ease-out-quad);
+  }
+
+  .love-comment-toggle:hover {
+    background: var(--love-bg-accent);
+  }
+
+  .love-comment-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+  }
+
+  .love-comment {
+    position: relative;
+    padding: 0.5rem 0.75rem;
+    border-radius: 12px;
+    background: var(--love-bg);
+    font-size: 0.9rem;
+  }
+
+  .love-comment-meta {
+    display: block;
+    /* chừa chỗ cho nút xóa absolute bên phải */
+    padding-right: 2.75rem;
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--love-fg-muted);
+  }
+
+  .love-comment-text {
+    margin-top: 0.125rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .love-comment .love-comment-del {
+    position: absolute;
+    top: 0;
+    right: 0;
+    font-size: 0.8rem;
+  }
+
+  .love-comment-form {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+  }
+
+  .love-comment-form .love-comment-input {
+    flex: 1;
+    min-width: 0;
+    margin-top: 0;
+    padding: 0.5rem 0.875rem;
+  }
+
+  .love-comment-send {
+    min-height: 2.75rem;
+    padding: 0.375rem 0.875rem;
+    border: none;
+    border-radius: 999px;
+    background: var(--love-pink-deep);
+    color: var(--love-pink-fg);
+    font: inherit;
+    font-weight: 700;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background 150ms var(--ease-out-quad);
+  }
+
+  .love-comment-send:hover {
+    background: var(--love-pink-darker);
+  }
+
+  /* Label chỉ dành cho screen reader (ô trả lời đã có placeholder). */
+  .love-sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
   #love-sticky-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 0.75rem;
+    /* Row gap rộng hơn cho nút reaction góc dưới sticky. */
+    gap: 1.125rem 0.75rem;
     margin-top: 0.75rem;
   }
 
   /* Mẩu giấy nhớ — bo góc lệch + xoay nhẹ cho cảm giác dán tay. */
   .love-sticky {
+    position: relative;
     display: flex;
     flex-direction: column;
     justify-content: space-between;
     min-height: 7rem;
-    padding: 0.875rem;
+    padding: 1.125rem 0.875rem 0.875rem;
     border-radius: 4px 14px 6px 16px;
     box-shadow: 0 6px 12px rgb(91 64 73 / 0.12);
     transform: rotate(-1.2deg);
+  }
+
+  /* Mẩu "băng keo" giả dán đầu giấy (polish P2). */
+  .love-sticky::before {
+    content: '';
+    position: absolute;
+    top: -0.5rem;
+    left: 50%;
+    width: 2.75rem;
+    height: 1rem;
+    transform: translateX(-50%) rotate(-2deg);
+    border: 1px solid rgb(91 64 73 / 0.08);
+    border-radius: 2px;
+    background: rgb(255 255 255 / 0.55);
   }
 
   #love-sticky-grid .love-sticky:nth-child(2n) {
@@ -1318,6 +2412,35 @@ const heartFavicon =
   @media (prefers-reduced-motion: reduce) {
     .love-hearts {
       display: none;
+    }
+
+    .love-day-chevron {
+      transition: none;
+    }
+
+    .love-note-img,
+    .love-sticky,
+    #love-sticky-grid .love-sticky:nth-child(2n),
+    #love-sticky-grid .love-sticky:nth-child(3n) {
+      transform: none;
+    }
+
+    .love-react-palette,
+    .love-react-pick,
+    .love-react-corner-btn {
+      animation: none;
+    }
+
+    .love-react-corner-btn,
+    .love-react-pick {
+      transition: none;
+    }
+
+    .love-react-corner-btn:hover,
+    .love-react-corner-btn:active,
+    .love-react-pick:hover,
+    .love-react-pick:focus-visible {
+      transform: none;
     }
   }
 
