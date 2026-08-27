@@ -177,6 +177,7 @@ export default defineConfig({
     sitemap({
       filter: (page) =>
         !page.includes('/drafts/') &&
+        !page.includes('/love-story-dotro/') &&
         !page.endsWith('/series/ts-challenges/') &&
         !page.endsWith('/series/ts-pattern/'),
     }),
@@ -200,11 +201,7 @@ export default defineConfig({
           server.middlewares.use(async (req, res, next) => {
             const url = req.url ?? '';
             if (url.endsWith('/') && !url.startsWith('/@')) {
-              const filePath = join(
-                server.config.publicDir,
-                url,
-                'index.html'
-              );
+              const filePath = join(server.config.publicDir, url, 'index.html');
               try {
                 await access(filePath);
                 req.url = `${url}index.html`;
