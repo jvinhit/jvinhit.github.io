@@ -177,6 +177,8 @@ export default defineConfig({
     sitemap({
       filter: (page) =>
         !page.includes('/drafts/') &&
+        // Route `/love-story-dotro/` hiện đang tắt (thư mục prefix `_` nên
+        // Astro không build). Giữ filter để bật lại route là an toàn ngay.
         !page.includes('/love-story-dotro/') &&
         !page.endsWith('/series/ts-challenges/') &&
         !page.endsWith('/series/ts-pattern/'),
