@@ -1,0 +1,419 @@
+---
+title: 'Claude Code từ zero đến thành thạo · Phần 17 — Agent team, nhắn tin giữa session và worktree'
+description: 'Agent team cho các phiên Claude nhắn tin trực tiếp và chia sẻ task list. Cross-session messaging nối các phiên bạn tự mở. Worktree cô lập file để chúng không ghi đè nhau — kèm bốn lớp cưỡng chế và cách dọn.'
+pubDate: 2026-09-19
+lang: vi
+tags: [claude-code, ai, agent, cli, productivity]
+series: claude-code
+seriesOrder: 17
+draft: false
+---
+
+Phần 16 nói về subagent — worker báo kết quả về một chỗ. Bài này nói về ba cơ chế cho **nhiều phiên độc lập**: **agent team** (Claude quản một nhóm), **cross-session messaging** (các phiên bạn tự mở nhắn tin cho nhau), và **worktree** (cô lập file để chúng không ghi đè nhau).
+
+Worktree là phần nền tảng nhất trong ba cái — nếu bạn chỉ đọc một mục của bài này, đọc mục đó.
+
+## Agent team
+
+Agent team cho bạn điều phối nhiều instance Claude Code làm việc cùng nhau. **Một phiên làm team lead**, điều phối công việc, phân task và tổng hợp kết quả. **Teammate làm việc độc lập**, mỗi cái trong context window riêng, và **nhắn tin trực tiếp cho nhau**.
+
+Khác subagent — vốn chỉ báo về agent chính — bạn còn **tương tác trực tiếp với từng teammate** mà không qua lead.
+
+> **Agent team là tính năng thử nghiệm và tắt mặc định.** Bật bằng cách đặt `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` thành `1`. Không có biến đó thì: không team nào được dựng lúc phiên bắt đầu, không thư mục team nào được ghi, và Claude không sinh cũng không đề xuất teammate.
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  }
+}
+```
+
+Sinh teammate còn **cần phiên tương tác**. Ở chế độ non-interactive với `-p`, kể cả phiên Agent SDK, Claude **không** sinh teammate.
+
+### Khi nào dùng
+
+Bốn use case mạnh nhất:
+
+- **Nghiên cứu và review** — nhiều teammate điều tra các mặt khác nhau của một vấn đề cùng lúc, rồi **chia sẻ và chất vấn phát hiện của nhau**
+- **Module hoặc feature mới** — mỗi teammate sở hữu một phần riêng, không đạp chân nhau
+- **Debug với nhiều giả thuyết cạnh tranh** — teammate kiểm các lý thuyết khác nhau song song rồi hội tụ về đáp án nhanh hơn
+- **Phối hợp xuyên tầng** — thay đổi trải trên frontend, backend và test, mỗi tầng một teammate
+
+Agent team **thêm chi phí điều phối và tốn nhiều token hơn hẳn một phiên đơn**. Với task tuần tự, sửa cùng file, hoặc việc có nhiều phụ thuộc, **một phiên đơn hoặc subagent hiệu quả hơn**.
+
+### Bắt đầu
+
+Mô tả task và các teammate bạn muốn bằng ngôn ngữ tự nhiên:
+
+```text
+I'm designing a CLI tool that helps developers track TODO comments across
+their codebase. Spawn three teammates to explore this from different angles:
+one on UX, one on technical architecture, one playing devil's advocate.
+```
+
+Ví dụ này hiệu quả vì **ba vai trò độc lập và khám phá được vấn đề mà không phải chờ nhau**.
+
+> Claude **có thể dùng subagent thay vì tạo team**. Subagent hiện trong cùng agent panel với teammate, nên **chỉ nhìn panel không xác nhận được team đã hình thành**. Nếu nó sinh subagent, hãy hỏi lại và **yêu cầu tường minh một agent team**.
+
+Terminal của lead liệt kê teammate ở agent panel dưới ô nhập. Trong panel: `↑`/`↓` chọn teammate, `Enter` mở transcript và nhắn tin trực tiếp cho nó, `Escape` ngắt lượt hiện tại của teammate đang chọn.
+
+Khi **hơn ba teammate rảnh cùng lúc**, các dòng từ thứ tư gập lại thành một dòng đếm, ví dụ `2 idle agents`. Dòng của teammate đang chạy, teammate fail, và teammate bạn đang xem thì **luôn giữ dòng riêng**.
+
+### Hai chế độ hiển thị
+
+- **In-process** (mặc định) — mọi teammate chạy trong terminal chính của bạn. Chạy được ở **mọi terminal**, không cần thiết lập gì.
+- **Split panes** — mỗi teammate một pane riêng, bạn thấy output của tất cả cùng lúc. **Cần tmux, hoặc iTerm2** kèm CLI `it2`.
+
+```json
+{
+  "teammateMode": "auto"
+}
+```
+
+Hoặc cho một phiên: `claude --teammate-mode auto`. Giá trị `"auto"` bật split pane khi bạn đã ở trong một phiên tmux hoặc dùng iTerm2 có `it2`, ngược lại lùi về in-process.
+
+> Split-pane mode **không hỗ trợ** terminal tích hợp của VS Code, Windows Terminal, hay Ghostty.
+
+### Chỉ định teammate và model
+
+```text
+Spawn 4 teammates to refactor these modules in parallel. Use Sonnet for
+each teammate.
+```
+
+Khi prompt của bạn **không nêu model**, Claude Code chạy teammate trên **model hiện tại của lead**, trừ khi `CLAUDE_CODE_SUBAGENT_MODEL` được đặt. Teammate **kế thừa effort level của lead**.
+
+**Model và fast mode của một teammate bị cố định lúc nó được sinh ra** — nên `/model` và `/fast` chỉ đổi thiết lập của lead. `/effort` thì vẫn áp cho các lượt sau của teammate đang xem.
+
+### Bắt teammate lập plan trước
+
+Với task phức tạp hoặc rủi ro, bạn yêu cầu teammate lập plan trước khi cài đặt. Teammate làm việc ở **plan mode chỉ đọc** tới khi lead duyệt:
+
+```text
+Spawn an architect teammate to refactor the authentication module.
+Require plan approval before they make any changes.
+```
+
+Teammate lập plan xong thì gửi yêu cầu duyệt cho lead. Lead xem rồi duyệt, hoặc từ chối kèm phản hồi — bị từ chối thì teammate **ở lại plan mode**, sửa theo phản hồi, và gửi lại.
+
+> **Lead tự quyết việc duyệt.** Muốn ảnh hưởng phán đoán của nó thì đưa tiêu chí vào prompt của bạn, ví dụ _"only approve plans that include test coverage"_ hoặc _"reject plans that modify the database schema"_.
+
+### Task list dùng chung
+
+Task có ba trạng thái: **pending, in progress, completed**. Task còn **phụ thuộc được vào task khác**: một task pending có phụ thuộc chưa giải quyết thì **không claim được** tới khi các phụ thuộc đó xong.
+
+Hai cách phân việc: **lead phân tường minh**, hoặc **teammate tự claim** — sau khi xong một task, nó tự nhận task chưa được phân và không bị chặn tiếp theo. Việc claim dùng **file locking** để chống race condition khi nhiều teammate cùng claim một task.
+
+Claude Code **tự quản phụ thuộc**: khi một teammate xong một task mà task khác phụ thuộc vào, nó **tự bỏ chặn** các task đó.
+
+### Kiến trúc
+
+| Thành phần    | Vai trò                                                        |
+| ------------- | -------------------------------------------------------------- |
+| **Team lead** | Phiên Claude Code chính, sinh teammate và điều phối công việc  |
+| **Teammate**  | Các instance Claude Code riêng, mỗi cái làm task được phân     |
+| **Task list** | Danh sách công việc dùng chung mà teammate claim và hoàn thành |
+| **Mailbox**   | Hệ thống nhắn tin giữa các agent                               |
+
+Mailbox của mỗi agent là một file JSON ở `~/.claude/teams/{team-name}/inboxes/{agent-name}.json`. Team và task lưu cục bộ dưới một tên **suy ra từ session**: `session-` cộng tám ký tự đầu của session ID.
+
+Thư mục config của team **bị xoá khi phiên kết thúc**. Thư mục task list thì **tồn tại cục bộ và không bao giờ được upload**, nên phiên resume giữ được task của nó.
+
+> **Đừng sửa tay file config của team.** Nó giữ trạng thái runtime như session ID và pane ID của tmux; thay đổi của bạn **bị ghi đè ở lần cập nhật trạng thái kế tiếp**.
+
+### Dùng định nghĩa subagent làm teammate
+
+Bạn tham chiếu được một loại subagent từ bất kỳ scope nào khi sinh teammate — nhờ đó **định nghĩa một vai trò một lần** rồi tái dùng cả như subagent lẫn như teammate:
+
+```text
+Spawn a teammate using the security-reviewer agent type to audit the auth module.
+```
+
+Teammate tôn trọng allowlist `tools` và `model` của định nghĩa đó, và **phần thân của định nghĩa được nối vào system prompt của teammate như chỉ dẫn bổ sung**, chứ không thay thế nó.
+
+> Nhưng hai trường **`skills` và `mcpServers` trong định nghĩa subagent KHÔNG được áp** khi định nghĩa đó chạy làm teammate. Teammate nạp skill và MCP server từ settings project và user của bạn, y như một phiên thường.
+
+### Permission và tin nhắn giữa các agent
+
+**Teammate khởi động với permission settings của lead.** Nếu lead chạy với `--dangerously-skip-permissions` thì mọi teammate cũng vậy. Sau khi sinh ra thì bạn đổi mode của từng teammate được, nhưng **không đặt được mode riêng cho từng teammate ngay lúc sinh**.
+
+**Prompt hỏi quyền của teammate hiện ở phiên lead** — bạn duyệt ở đó. Plan approval là ngoại lệ được thiết kế: lead cấp nó **không cần prompt riêng cho bạn**.
+
+Đây là phần bảo mật quan trọng nhất của bài:
+
+> Khi một agent gửi tin nhắn cho agent khác qua `SendMessage`, Claude Code **nói cho agent nhận biết tin nhắn đến từ một phiên Claude khác, không phải từ bạn**. Một teammate **không** duyệt được prompt hỏi quyền hay cung cấp sự đồng ý thay bạn, và **một teammate bị từ chối một hành động không chuyển tiếp nó sang teammate khác để lách kiểm tra được**.
+>
+> Ở **auto mode**, classifier áp hai kiểm tra lên tin nhắn giữa các agent: nó coi **lời khẳng định đã được duyệt do agent khác chuyển tiếp là input không tin cậy** chứ không phải xác nhận từ bạn; và nó **review từng tin nhắn trước khi Claude Code chuyển đi** — tin nhắn bị nó chặn **không bao giờ tới được người nhận**.
+
+### Ngữ cảnh của teammate
+
+Mỗi teammate có context window riêng. Lúc được sinh ra, nó nạp **cùng ngữ cảnh project như một phiên thường**: `CLAUDE.md`, MCP server, skill. Nó cũng nhận prompt sinh ra nó từ lead. **Lịch sử hội thoại của lead KHÔNG được mang sang.**
+
+Bốn cách teammate chia sẻ thông tin:
+
+- **Chuyển tin nhắn tự động** — lead không phải poll để lấy cập nhật
+- **Thông báo rảnh** — khi một teammate xong và dừng, nó tự báo lead. **Thông báo này không mang output của teammate**; teammate chia sẻ kết quả bằng cách nhắn tin cho lead hoặc cập nhật task list
+- **Task list dùng chung**
+- **Nhắn tin giữa teammate** — gửi cho **một** teammate cụ thể theo tên; muốn tới tất cả thì gửi từng tin một
+
+> **Lead đặt tên cho mọi teammate lúc sinh ra chúng.** Muốn có tên đoán trước được để nhắc trong các prompt sau thì **nói cho lead biết gọi mỗi teammate là gì** ngay trong chỉ dẫn sinh ra chúng.
+
+### Cưỡng chế cổng chất lượng bằng hook
+
+Ba hook riêng cho agent team, cả ba dùng **exit code 2 để chặn và gửi phản hồi**:
+
+- **`TeammateIdle`** — chạy khi một teammate sắp rảnh. Exit 2 để gửi phản hồi và **giữ teammate làm tiếp**
+- **`TaskCreated`** — chạy khi một task đang được tạo. Exit 2 để **ngăn việc tạo**
+- **`TaskCompleted`** — chạy khi một task đang được đánh dấu hoàn thành. Exit 2 để **ngăn việc hoàn thành**
+
+### Bảy best practice
+
+- **Cấp đủ ngữ cảnh cho teammate** — chúng nạp ngữ cảnh project nhưng **không kế thừa lịch sử hội thoại của lead**, nên đưa chi tiết riêng của task vào prompt sinh ra chúng.
+- **Chọn quy mô team hợp lý** — **bắt đầu với 3–5 teammate**. Chi phí token tăng tuyến tính, chi phí điều phối tăng, và có điểm mà thêm teammate không làm nhanh hơn tương ứng. _Ba teammate tập trung thường hơn năm teammate tản mạn._
+- **Chia task đúng kích thước** — quá nhỏ thì chi phí điều phối vượt lợi ích; quá lớn thì teammate làm quá lâu không có điểm kiểm, tăng nguy cơ công cốc. Vừa đúng là **một đơn vị tự chứa cho ra một sản phẩm rõ ràng**. Nhắm **5–6 task cho mỗi teammate**.
+- **Bắt lead chờ teammate** — đôi khi lead tự bắt tay cài đặt thay vì chờ. Nói: _"Wait for your teammates to complete their tasks before proceeding"_.
+- **Bắt đầu bằng nghiên cứu và review** — nếu bạn mới dùng, chọn task có ranh giới rõ và **không cần viết code**: review một PR, nghiên cứu một library, điều tra một bug.
+- **Tránh xung đột file** — hai teammate sửa cùng một file dẫn tới ghi đè. **Chia việc để mỗi teammate sở hữu một tập file khác nhau.** (Agent team **không** cô lập teammate trong worktree.)
+- **Theo dõi và lái** — để một team chạy không người trông quá lâu làm tăng nguy cơ công cốc.
+
+### Chín giới hạn
+
+- **Không resume được phiên có teammate in-process** — `/resume` và `/rewind` **không** khôi phục chúng. Sau khi resume, lead có thể cố nhắn tin cho teammate không còn tồn tại; khi đó bảo nó sinh teammate mới.
+- **Trạng thái task có thể trễ** — teammate đôi khi không đánh dấu task hoàn thành, làm chặn các task phụ thuộc.
+- **Tắt máy có thể chậm** — teammate hoàn thành request hoặc tool call hiện tại trước khi tắt.
+- **Một team cho mỗi phiên** — không tạo thêm team có tên hay chia sẻ team giữa các phiên được.
+- **Không có team lồng nhau** — teammate không sinh teammate của riêng nó; **chỉ lead quản team**.
+- **Teammate in-process không sinh được background subagent** — subagent của chúng chạy ở foreground; yêu cầu chạy nền trả về lỗi, vì việc nền của một teammate không sống lâu hơn tiến trình của lead.
+- **Lead là cố định** — không đề bạt teammate lên lead hay chuyển quyền lead được.
+- **Permission đặt lúc sinh** — xem ở trên.
+- **Split pane cần tmux hoặc iTerm2.**
+
+### Một cái bẫy đáng biết
+
+**Khi agent team đang bật, một subagent mà Claude tự đặt tên sẽ khởi động thành teammate** — và Claude tự đặt tên subagent được, nên **team hình thành cả khi bạn không yêu cầu**.
+
+Hệ quả: subagent và teammate **báo kết quả khác nhau**. Subagent — Claude nhận kết quả khi nó xong. Teammate — thông báo rảnh chỉ báo rằng teammate đã dừng, **không kèm output của nó**. Nên **một luồng điều phối chờ kết quả subagent có thể bị treo**.
+
+Muốn subagent có tên quay lại chạy như subagent thì đặt biến về `0`. Bạn **không cần mở phiên mới**: Claude Code áp lại giá trị `env` từ file settings vào phiên đang chạy khi bạn lưu, và đọc lại biến ở mỗi lần Claude sinh subagent.
+
+---
+
+## Cross-session messaging
+
+Cross-session messaging cho Claude **chuyển một tin nhắn từ một phiên Claude Code của bạn sang phiên khác**. Khi một thay đổi ở phiên này làm vỡ thứ phiên khác đang xây, Claude cảnh báo phiên đó **trước khi bạn kịp nhận ra**.
+
+> Một **tin nhắn** là một đoạn text mà Claude này viết cho Claude khác — **không bao giờ là lịch sử hội thoại hay file**. Muốn chuyển cả hội thoại hay ngữ cảnh của nó thì **resume phiên** thay vì nhắn tin.
+
+Cần Claude Code v2.1.224 trở lên, chạy trên **macOS và Linux** (kể cả Linux trong WSL 2), **không có trên Windows native**. Khi một phiên đủ điều kiện thì **messaging bật sẵn, không có gì phải kích hoạt**.
+
+### Bốn tình huống dùng
+
+- **Chuyển giao một phát hiện** — một phiên phát hiện breaking change hoặc ra một quyết định, Claude tóm tắt cho phiên đang làm vùng bị ảnh hưởng
+- **Phối hợp worktree song song** — các phiên làm cùng repo ở worktree riêng, Claude nói cho các phiên khác biết cái gì đã landed
+- **Lấy trạng thái việc chạy lâu** — bắt một migration hoặc lượt chạy test báo về phiên bạn đang xem
+- **Nhắn qua máy khác** — với tới một phiên của bạn ở máy khác hoặc trên web
+
+Bạn **không tự gọi tool nào**. Claude tìm đích bằng `ListAgents` và gửi bằng `SendMessage`:
+
+```text
+Ask the session running in my other terminal whether the migration finished
+```
+
+```text
+Explain what we just did to the session working on the payments API
+```
+
+Muốn tự chỉ định đích thì **mention phiên đó**: gõ `@` rồi vài chữ đầu của tên phiên và chọn từ typeahead:
+
+```text
+Let @api-worker know the schema migration finished
+```
+
+Chạy `/list-agents` (hoặc `/peers`) để xem Claude với tới được những phiên nào. Danh sách gồm: subagent trong phiên hiện tại; các phiên local khác của bạn (gồm cả phiên nền); phiên cloud của bạn (nhãn `cloud`, chỉ hiện khi phiên này đang nối Remote Control); và phiên Remote Control ở máy khác.
+
+### Tin nhắn đi đường nào
+
+| Phiên kia chạy ở đâu        | Tin nhắn đi thế nào                                                            |
+| --------------------------- | ------------------------------------------------------------------------------ |
+| **Trên máy này**            | Qua một socket riêng cho mỗi phiên, **không bao giờ qua server của Anthropic** |
+| Trên một máy khác của bạn   | **Qua server của Anthropic**, tới qua kết nối Remote Control của máy đó        |
+| Trên Claude Code on the web | **Qua server của Anthropic**, thẳng tới phiên cloud                            |
+
+Việc chuyển tin trên cùng một máy dựa trên **file trên đĩa**: mỗi phiên tự đăng ký và bind inbox socket ở đó. Nên **hai phiên chỉ với tới nhau khi chúng thấy cùng bộ file** — một container có filesystem riêng, nên **một phiên trong container và một phiên ở host không với tới nhau được**.
+
+### Phiên nhận xử lý tin nhắn thế nào
+
+Khi phiên A nhắn cho phiên B, Claude Code nói cho Claude của B biết tin nhắn đến từ **một phiên khác, không phải từ bạn**, và giới hạn thứ tin nhắn đó làm được:
+
+- **Nó không duyệt được gì** — tin nhắn từ phiên khác **không bao giờ tính là sự đồng ý của bạn**, nên nó không trả lời được một prompt hỏi quyền đang chờ thay bạn
+- **Nó không đổi được cấu hình** — Claude Code chỉ dẫn Claude nhận **không bao giờ** đổi permission settings, `CLAUDE.md`, hay cấu hình khác vì một phiên khác yêu cầu
+- **Lệnh không chạy** — một lệnh trong text tin nhắn, ví dụ `/compact`, tới dưới dạng **text thuần**. Claude Code **không bao giờ thực thi nó**
+- **Prompt hỏi quyền vẫn kích hoạt** — nếu hành động theo tin nhắn cần một quyền mà phiên nhận không có, bạn thấy đúng prompt như với mọi việc khác
+
+Ranh giới permission là **theo từng phiên**. Claude được chỉ dẫn **không bao giờ nhờ phiên khác làm một hành động đã bị từ chối hoặc bị chặn ở phiên của chính nó**, và **đẩy việc đó về cho bạn**.
+
+### Kiểm soát tin nhắn đến
+
+| Giá trị `crossSessionInbound` | Hành vi                                                                                                              |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `accept`                      | Chuyển mọi tin nhắn cho Claude                                                                                       |
+| `hold`                        | Hiện thông báo cho mỗi tin và **không chuyển**. Nếu sau đó một `accept` được áp thì các tin đang giữ được giải phóng |
+| `refuse`                      | **Bỏ** mọi tin nhắn, không chuyển gì                                                                                 |
+
+Khi **không có giá trị nào được áp**, Claude Code tự quyết theo permission mode của **hai** phiên. Nó gom các phiên bỏ qua prompt hỏi quyền vào một nhóm, phần còn lại vào nhóm kia:
+
+- **Phiên nhận có hỏi quyền** — chuyển mọi tin. Chỉ **giữ lại chờ bạn duyệt** khi phiên gửi tự khai là đang bỏ qua prompt hỏi quyền.
+- **Phiên nhận bỏ qua prompt hỏi quyền** — **giữ mọi tin chờ bạn duyệt**. Chỉ chuyển khi phiên gửi tự khai là cũng đang bỏ qua.
+
+Claude Code **giữ tối đa 100 tin nhắn**, và quá đó thì bỏ tin cũ nhất.
+
+### Hai cách thắt lại
+
+**Bắt buộc duyệt cho tin nhắn ra khỏi máy:**
+
+```json
+{
+  "isolatePeerMachines": true
+}
+```
+
+Với thiết lập này, Claude Code hỏi bạn trước khi tin nhắn tới một phiên ngoài máy này được gửi đi — **kể cả ở `bypassPermissions` mode**. Một giá trị `true` từ bất kỳ scope settings nào cũng có hiệu lực, nên **một file project đã commit bật được yêu cầu này nhưng không tắt được nó**.
+
+**Tắt hẳn** — gửi và nhận là hai điều khiển riêng:
+
+```json
+{
+  "permissions": {
+    "deny": ["SendMessage", "ListAgents"]
+  },
+  "crossSessionInbound": "refuse"
+}
+```
+
+> Deny `SendMessage` cũng **gỡ luôn việc nhắn tin cho subagent và teammate agent team**, vì cùng một tool phục vụ cả hai.
+
+**Vòng lặp tin nhắn được throttle:** Claude Code rate-limit tin nhắn lặp theo từng người gửi, bỏ các bản lặp y hệt tới trong một khoảng ngắn, và giới hạn tin nhắn đã nhận đang chờ Claude đọc ở **50 mỗi phiên**. Nên **một vòng lặp tin nhắn giữa hai phiên tự dừng**.
+
+---
+
+## Worktree
+
+Một **git worktree** là một thư mục làm việc riêng với file và branch riêng, **dùng chung lịch sử repository và remote** với checkout chính của bạn. Chạy mỗi phiên Claude Code trong worktree riêng nghĩa là **sửa đổi ở phiên này không bao giờ chạm file ở phiên kia**.
+
+### Bắt đầu
+
+```bash
+claude --worktree feature-auth
+```
+
+Mặc định worktree được tạo ở `.claude/worktrees/<name>/` tại gốc repository, trên một branch mới tên `worktree-<name>`. Chạy lại lệnh đó với tên khác ở terminal khác là có phiên cô lập thứ hai. Bỏ tên thì Claude tự sinh một cái, ví dụ `bright-running-fox`.
+
+> Thêm `.claude/worktrees/` vào `.gitignore` để nội dung worktree không hiện thành file untracked ở checkout chính.
+
+**Worktree là một checkout mới**, nên phải khởi tạo môi trường phát triển ở đó: bảo Claude cài dependency, hoặc tự chạy setup của project trong thư mục worktree.
+
+Bạn cũng **bảo Claude "work in a worktree"** giữa phiên được — nó tạo một cái bằng tool `EnterWorktree`.
+
+> Khi Claude vào một path **ngoài** thư mục `.claude/worktrees/` của repository, Claude Code **hỏi bạn duyệt trước** — vì việc chuyển đó mang theo thư mục làm việc, quyền ghi, và cấu hình project như `CLAUDE.md` và settings tới chỗ đó. Một permission rule `EnterWorktree` hay chọn "don't ask again" **không** dập được prompt này; chỉ `bypassPermissions` mode bỏ qua nó.
+
+### Bốn lớp cưỡng chế cô lập
+
+Đây là phần đáng đọc kỹ nhất, vì nó giải thích các lỗi "tool error" bạn sẽ gặp. Trong lúc một phiên bị cô lập trong worktree, Claude Code **chặn**:
+
+- **Sửa file** — chặn `Edit`, `Write`, `NotebookEdit` nhắm vào path trong **checkout chính**.
+- **Thư mục làm việc của lệnh** — chặn lệnh Bash, PowerShell, hoặc Monitor mà thư mục làm việc giải ra checkout chính, **hoặc không xác minh được là nằm ngoài nó**.
+- **Chuyển hướng git** — chặn lệnh chuyển hướng git vào checkout chính, qua `git -C`, `--git-dir`, biến `GIT_DIR`/`GIT_WORK_TREE`, hoặc một `cd` vào checkout chính trước khi chạy git.
+- **Hình dạng lệnh** — chặn lệnh mà **nó không xác minh được là nằm trong worktree**, kể cả khi lệnh chẳng chạy git nào. Nó từ chối các cấu trúc shell không truy vết tĩnh được, ví dụ **brace expansion** và **heredoc có delimiter không được quote**. Nó bảo Claude chia lệnh thành các lệnh phẳng, riêng biệt. **Kiểm tra này không tắt được.**
+
+Cùng bộ cưỡng chế này **phủ mọi subagent Claude sinh ra từ phiên bị cô lập**.
+
+### Cô lập subagent bằng worktree
+
+Bảo Claude _"use worktrees for your agents"_, hoặc làm nó cố định cho một subagent tuỳ biến bằng `isolation: worktree`:
+
+```markdown
+---
+name: refactorer
+description: Applies mechanical refactors across many files
+isolation: worktree
+---
+
+Apply the requested refactor across every affected file, then run the tests
+and report the results.
+```
+
+Mỗi subagent được một worktree tạm mà Claude Code **tự xoá khi subagent kết thúc mà không có thay đổi gì**; worktree có thay đổi thì **nằm lại trên đĩa** tới khi vòng dọn định kỳ xoá được nó mà không mất việc.
+
+### Dọn worktree
+
+Khi bạn thoát một phiên worktree tương tác, Claude kiểm worktree xem có việc gì mà việc xoá sẽ làm mất: file đã đổi hoặc untracked, và commit mới.
+
+- **Worktree sạch** — với phiên không đặt tên, Claude **tự xoá** worktree và branch của nó. Phiên **có tên** thì nó **hỏi bạn trước** để bạn giữ lại dùng sau.
+- **Worktree có việc trong đó** — Claude hỏi bạn giữ hay xoá. **Xoá là mất toàn bộ việc trong đó.**
+
+> **Lượt chạy non-interactive với `-p` không có prompt lúc thoát**, nên Claude **không dọn** worktree của chúng, và để nguyên cái lock nó đã đặt. Muốn xoá thì `git worktree remove`; nếu git từ chối vì worktree bị lock thì `git worktree unlock` trước.
+
+Một **vòng dọn định kỳ** xoá worktree mà Claude tạo cho subagent và phiên nền khi chúng cũ hơn `cleanupPeriodDays`. Vòng dọn **bỏ qua worktree còn giữ việc** — file đã đổi hoặc untracked, hoặc commit chưa push. Nó **không bao giờ xoá worktree bạn tạo bằng `--worktree`**.
+
+Trong lúc một agent đang chạy, Claude chạy `git worktree lock` trên worktree của nó để việc dọn đồng thời không xoá được. Vòng dọn cũng **giải phóng lock của một phiên mà tiến trình đã thoát**, nên một phiên nền bị kill không để lại worktree bị lock vĩnh viễn. Nó **không bao giờ giải phóng lock bạn tự đặt** bằng `git worktree lock`.
+
+### Tuỳ biến việc tạo worktree
+
+**Base branch** — worktree mới branch từ **default branch của repository**. Đặt `worktree.baseRef` để đổi:
+
+```json
+{
+  "worktree": {
+    "baseRef": "head"
+  }
+}
+```
+
+- `"fresh"` (mặc định) — branch từ default branch **trên remote**, thường là `main`, nên worktree bắt đầu từ một cây sạch khớp remote.
+- `"head"` — branch từ `HEAD` local hiện tại, nên worktree **mang theo commit chưa push và trạng thái feature branch** của bạn. Dùng khi cô lập subagent cần làm việc trên việc đang dở.
+
+**Branch từ một pull request** — truyền `--worktree` một số có tiền tố `#`, hoặc URL của PR/MR. Claude Code fetch commit head của thay đổi đó từ `origin` và tạo worktree ở `.claude/worktrees/pr-<number>`. **Nhớ quote để shell không coi `#` là mở đầu comment:**
+
+```bash
+claude --worktree "#1234"
+```
+
+**Copy file bị gitignore** — worktree là checkout mới nên file untracked như `.env` **không có mặt**. Thêm một file `.worktreeinclude` ở gốc project, dùng cú pháp `.gitignore`:
+
+```text
+.env
+.env.local
+config/secrets.json
+```
+
+**Chỉ file khớp pattern VÀ đồng thời bị gitignore mới được copy**, nên file được track không bao giờ bị nhân đôi.
+
+### Ba thứ worktree dùng chung với checkout chính
+
+- **Thư mục `.git` của repository** — lệnh git trong worktree ghi vào `.git` dùng chung của repo chính, và **sandbox cho phép các lần ghi đó**, nên `git commit` chạy được từ trong worktree khi sandbox bật.
+- **Plugin** — plugin cài ở **project scope** từ checkout chính cũng nạp trong worktree của cùng repository, nên **không phải cài lại cho từng worktree**.
+- **Phê duyệt permission** — chọn "Yes, and don't ask again" trong một phiên worktree **lưu rule vào `.claude/settings.local.json` của checkout chính**, nên nó áp ở checkout chính và ở mọi worktree khác, và **sống sót khi worktree bị xoá**.
+
+### Version control không phải git
+
+Với SVN, Perforce, Mercurial hay hệ khác, cấu hình hook `WorktreeCreate` và `WorktreeRemove` để cấp logic tạo và dọn riêng. **Vì hook thay thế hành vi git mặc định, `.worktreeinclude` KHÔNG được xử lý** — hãy copy file cấu hình cục bộ trong chính script hook của bạn.
+
+### Quản worktree bằng git trực tiếp
+
+Dùng git trực tiếp khi bạn cần checkout một branch cụ thể đã tồn tại, hoặc đặt worktree ngoài repository:
+
+```bash
+git worktree add ../project-feature-a -b feature-a
+git worktree add ../project-bugfix fix-issue-456
+git worktree list
+git worktree remove ../project-feature-a
+```
+
+## Nguồn
+
+- [Orchestrate teams of Claude Code sessions](https://code.claude.com/docs/en/agent-teams)
+- [Message your other Claude Code sessions](https://code.claude.com/docs/en/cross-session-messaging)
+- [Run parallel sessions with worktrees](https://code.claude.com/docs/en/worktrees)
+
+Docs gốc cập nhật thường xuyên; khi có mâu thuẫn, tin bản tiếng Anh.

@@ -1,0 +1,495 @@
+---
+title: 'Claude Code từ zero đến thành thạo · Phần 13 — Hooks: tự động hoá tất định'
+description: 'Hook cho bạn quyền kiểm soát tất định: 30 sự kiện vòng đời, năm loại hook, exit code và JSON output, matcher, cùng các ví dụ chạy được — format sau khi sửa, chặn file được bảo vệ, thông báo desktop, và Stop hook chặn tới khi test pass.'
+pubDate: 2026-09-11
+lang: vi
+tags: [claude-code, ai, agent, cli, productivity]
+series: claude-code
+seriesOrder: 13
+draft: false
+---
+
+Phần 11 đã nêu khác biệt quan trọng nhất giữa hook và mọi cơ chế khác: **`CLAUDE.md` và skill là lời đề nghị, hook là cưỡng chế**. Bài này nói cách dùng nó.
+
+Hook là **lệnh shell do bạn định nghĩa**. Claude Code chạy chúng ở những thời điểm cụ thể trong vòng đời của mình, cho bạn quyền kiểm soát **tất định**: một số hành động **luôn** xảy ra, thay vì phụ thuộc việc LLM có chọn chạy chúng hay không.
+
+Với những quyết định cần **phán đoán** thay vì luật cứng, bạn còn dùng được **prompt-based hook** và **agent-based hook** — hai loại này gọi một model Claude để đánh giá điều kiện.
+
+## Hook đầu tiên
+
+Mở `~/.claude/settings.json` và thêm một hook `Notification`. Ví dụ dưới dùng `osascript` cho macOS:
+
+```json
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "osascript -e 'display notification \"Claude Code needs your attention\" with title \"Claude Code\"'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Nếu file settings của bạn **đã có** khoá `hooks`, hãy thêm `Notification` **làm sibling** của các khoá sự kiện có sẵn, đừng thay cả object. Mỗi tên sự kiện là một khoá bên trong **một** object `hooks` duy nhất:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path' | xargs npx prettier --write"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "osascript -e 'display notification \"...\" with title \"Claude Code\"'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Gõ `/hooks` để mở trình duyệt hook: nó liệt kê mọi sự kiện hook khả dụng, kèm số lượng hook đã cấu hình cho từng sự kiện. Chọn một hook để xem chi tiết — sự kiện, matcher, loại, file nguồn, và lệnh.
+
+> **Menu `/hooks` chỉ đọc.** Muốn thêm, sửa hay xoá hook thì sửa trực tiếp file settings JSON, hoặc **nhờ Claude viết hook cho bạn** bằng cách mô tả thứ bạn muốn.
+
+Trên macOS, nếu không thấy thông báo nào: `osascript` gửi thông báo qua app Script Editor dựng sẵn. Nếu Script Editor **chưa có quyền thông báo**, lệnh **fail âm thầm** và macOS **không** nhắc bạn cấp quyền. Chạy lệnh này một lần trong Terminal để Script Editor xuất hiện trong cài đặt thông báo:
+
+```bash
+osascript -e 'display notification "test"'
+```
+
+Chưa có gì hiện ra. Mở **System Settings → Notifications**, tìm **Script Editor**, bật **Allow Notifications**, rồi chạy lại lệnh.
+
+Trên Linux dùng `notify-send 'Claude Code' 'Claude Code needs your attention'`.
+
+---
+
+## Ba mươi sự kiện vòng đời
+
+Khi một sự kiện kích hoạt, Claude Code chạy **mọi hook khớp, song song**.
+
+| Sự kiện                             | Kích hoạt khi                                                                                                                    |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `SessionStart`                      | Một phiên bắt đầu hoặc được resume                                                                                               |
+| `Setup`                             | Bạn khởi động với `--init-only`, hoặc với `--init`/`--maintenance` ở chế độ `-p`. Dành cho chuẩn bị một lần trong CI hoặc script |
+| `UserPromptSubmit`                  | Bạn gửi một prompt, **trước khi** Claude xử lý                                                                                   |
+| `UserPromptExpansion`               | Một lệnh bạn gõ nở thành prompt, trước khi tới tay Claude. **Chặn được** việc nở                                                 |
+| `PreToolUse`                        | Trước khi một tool call thực thi. **Chặn được**                                                                                  |
+| `PermissionRequest`                 | Khi một tool call cần quyết định về quyền                                                                                        |
+| `PermissionDenied`                  | Khi auto mode từ chối một tool call                                                                                              |
+| `PostToolUse`                       | Sau khi một tool call **thành công**                                                                                             |
+| `PostToolUseFailure`                | Sau khi một tool call **thất bại**                                                                                               |
+| `PostToolBatch`                     | Sau khi cả một lô tool call song song giải quyết xong, trước lượt gọi model kế tiếp                                              |
+| `Notification`                      | Khi Claude Code gửi thông báo                                                                                                    |
+| `MessageDisplay`                    | Trong lúc text tin nhắn của assistant được hiển thị                                                                              |
+| `SubagentStart` / `SubagentStop`    | Khi một subagent được sinh ra / kết thúc                                                                                         |
+| `TaskCreated` / `TaskCompleted`     | Khi một task được tạo / được đánh dấu hoàn thành                                                                                 |
+| `Stop`                              | Khi Claude **kết thúc phản hồi**                                                                                                 |
+| `StopFailure`                       | Khi lượt kết thúc vì lỗi API                                                                                                     |
+| `TeammateIdle`                      | Khi một thành viên agent team sắp rảnh                                                                                           |
+| `InstructionsLoaded`                | Khi một file `CLAUDE.md` hoặc `.claude/rules/*.md` được nạp vào context                                                          |
+| `ConfigChange`                      | Khi một file cấu hình đổi trong lúc phiên đang chạy                                                                              |
+| `CwdChanged`                        | Khi thư mục làm việc đổi, ví dụ khi Claude chạy `cd`                                                                             |
+| `DirectoryAdded`                    | Khi một thư mục làm việc được thêm giữa phiên qua `/add-dir`                                                                     |
+| `FileChanged`                       | Khi một file được theo dõi đổi trên đĩa. Trường `matcher` chỉ định tên file cần theo dõi                                         |
+| `WorktreeCreate` / `WorktreeRemove` | Khi một worktree được tạo / bị xoá. **Thay thế hành vi git mặc định**                                                            |
+| `PreCompact` / `PostCompact`        | Trước / sau khi compact context                                                                                                  |
+| `Elicitation` / `ElicitationResult` | Khi một MCP server yêu cầu input từ user / sau khi user trả lời                                                                  |
+| `SessionEnd`                        | Khi một phiên kết thúc                                                                                                           |
+
+## Năm loại hook
+
+Mỗi hook có một `type` quyết định cách nó chạy:
+
+| Loại         | Chạy cái gì                                                   | Timeout mặc định |
+| ------------ | ------------------------------------------------------------- | ---------------- |
+| `"command"`  | Một lệnh shell. Đây là loại phổ biến nhất                     | 10 phút          |
+| `"http"`     | POST dữ liệu sự kiện tới một URL                              | 10 phút          |
+| `"mcp_tool"` | Gọi một tool trên MCP server đã kết nối                       | 10 phút          |
+| `"prompt"`   | Đánh giá bằng LLM một lượt                                    | 30 giây          |
+| `"agent"`    | Kiểm chứng nhiều lượt, **có quyền dùng tool**. **Thử nghiệm** | 60 giây          |
+
+`UserPromptSubmit` hạ timeout của ba loại đầu xuống **30 giây**, `MessageDisplay` hạ xuống **10 giây**. Hook `SessionEnd` ở mọi loại chia chung ngân sách **1,5 giây**.
+
+---
+
+## Bốn ví dụ chạy được
+
+### Format code sau khi sửa
+
+Chạy Prettier trên mọi file Claude sửa. Hook này dùng sự kiện `PostToolUse` với matcher `Edit|Write` nên chỉ chạy sau các tool sửa file. Lệnh trích đường dẫn file bằng `jq` rồi truyền cho Prettier. Thêm vào `.claude/settings.json` ở gốc project:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path' | xargs npx prettier --write"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Thử: bảo Claude thêm một dòng có chuỗi dùng nháy đơn vào một file JavaScript, rồi mở file — với thiết lập mặc định của Prettier, hook viết lại thành nháy đôi.
+
+**Khi hook thành công, Claude Code không hiện gì trong hội thoại.** Muốn xác nhận nó chạy thì kiểm tra file đã được format lại, hoặc bật debug log.
+
+> Các ví dụ Bash trong bài dùng `jq` để parse JSON. Cài bằng `brew install jq` trên macOS, `apt-get install jq` trên Debian và Ubuntu.
+
+### Chặn sửa file được bảo vệ
+
+Ngăn Claude sửa các file nhạy cảm như `.env`, `package-lock.json`, hoặc bất cứ gì trong `.git/`. Claude **nhận được phản hồi giải thích vì sao bị chặn**, nên nó điều chỉnh cách tiếp cận được.
+
+Lưu vào `.claude/hooks/protect-files.sh`:
+
+```bash
+#!/bin/bash
+# protect-files.sh
+
+INPUT=$(cat)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+
+# Chuẩn hoá dấu gạch chéo ngược của Windows để các pattern dưới khớp được
+FILE_PATH="${FILE_PATH//\\//}"
+
+PROTECTED_PATTERNS=(".env" "package-lock.json" ".git/")
+
+for pattern in "${PROTECTED_PATTERNS[@]}"; do
+  if [[ "$FILE_PATH" == *"$pattern"* ]]; then
+    echo "Blocked: $FILE_PATH matches protected pattern '$pattern'" >&2
+    exit 2
+  fi
+done
+
+exit 0
+```
+
+Trên macOS và Linux, **script hook phải executable** để Claude Code chạy được:
+
+```bash
+chmod +x .claude/hooks/protect-files.sh
+```
+
+Rồi đăng ký một hook `PreToolUse`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/protect-files.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Thử bằng cách bảo Claude thêm một comment vào file `.env` của bạn. Claude Code chặn lần sửa **trước khi nó chạy** và chuyển thông báo `Blocked:` của script cho Claude làm phản hồi.
+
+### Tiêm lại context sau compaction
+
+Khi context đầy, compaction tóm tắt hội thoại để giải phóng chỗ — và việc đó **có thể làm mất chi tiết quan trọng**. Dùng một hook `SessionStart` với matcher `compact` để tiêm lại context thiết yếu **sau mỗi lần compact**.
+
+Claude Code **thêm text thuần mà lệnh của bạn ghi ra stdout vào context của Claude**. Đây là cách nhắc Claude về convention project và công việc gần đây một cách tất định — đáng dùng nếu bạn hay thấy Claude "quên" luật sau compaction (xem phần 3).
+
+### Kiểm chứng test pass trước khi cho Claude dừng
+
+Đây là ví dụ agent-based hook, và là hiện thực hoá đúng nghĩa lời khuyên "cho Claude một cách tự kiểm chứng" ở phần 10. Không như prompt hook chỉ gọi LLM một lượt, agent hook **sinh một subagent đọc được file, tìm được code, và dùng được tool khác** để kiểm chứng điều kiện trước khi trả về quyết định:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "agent",
+            "prompt": "Verify that all unit tests pass. Run the test suite and check the results. $ARGUMENTS",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Agent hook dùng định dạng phản hồi `"ok"` / `"reason"`, timeout mặc định 60 giây và **tối đa 50 lượt dùng tool**.
+
+> **Dùng prompt hook khi chỉ dữ liệu input của hook là đủ để ra quyết định. Dùng agent hook khi bạn cần kiểm chứng thứ gì đó với trạng thái thật của codebase.**
+>
+> Agent hook là tính năng **thử nghiệm**; hành vi và cấu hình có thể đổi. Với workflow production, ưu tiên command hook.
+
+---
+
+## Hook nói chuyện với Claude Code thế nào
+
+Command hook giao tiếp qua **stdin, stdout, stderr và exit code**. Khi một sự kiện kích hoạt, Claude Code truyền dữ liệu riêng của sự kiện dưới dạng JSON vào stdin của script bạn.
+
+Mọi sự kiện đều gồm các trường chung như `session_id` và `cwd`, còn mỗi loại sự kiện thêm dữ liệu khác nhau. Với một `PreToolUse` hook, script nhận được: `hook_event_name`, `tool_name`, và `tool_input` (với Bash, trường `command` của nó giữ lệnh shell).
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command')
+
+if echo "$COMMAND" | grep -q "drop table"; then
+  echo "Blocked: dropping tables is not allowed" >&2  # stderr thành phản hồi cho Claude
+  exit 2                                               # exit 2 = chặn hành động
+fi
+
+exit 0  # exit 0 = không quyết định gì; luồng permission bình thường vẫn áp dụng
+```
+
+### Exit code quyết định gì
+
+- **Exit 0** — hook **không phản đối** qua exit code. Với `PreToolUse`, điều này **không phê duyệt** tool call: luồng permission bình thường vẫn áp dụng. Với `UserPromptSubmit`, `UserPromptExpansion` và `SessionStart`, Claude Code **thêm stdout vào context** của Claude dưới dạng text thuần.
+- **Exit 2** — Claude Code **chặn hành động**. Ghi lý do ra stderr. Chỗ lý do đó đi tới phụ thuộc sự kiện: một số sự kiện đưa nó cho Claude làm phản hồi để nó điều chỉnh, số khác hiện cho user, và vài cái như `ConfigChange` và `Elicitation` **không hiện thông báo nào**. Một số sự kiện **không chặn được**: với `SessionStart`, `Setup` và vài cái khác, exit 2 hiện stderr cho user rồi **tiếp tục thực thi**.
+- **Mọi exit code khác** — kết quả phụ thuộc thứ hook in ra stdout. Một object JSON parse được và **qua được validate schema** thì Claude Code bỏ qua exit code, JSON quyết định kết quả, và hook **không** bị báo là lỗi. JSON parse được nhưng **fail validate** thì thành lỗi non-blocking. Stdout dạng text thuần hoặc rỗng thì hành động vẫn tiếp tục dưới dạng lỗi non-blocking, và transcript hiện `<hook name> hook error`.
+
+### JSON output có cấu trúc
+
+Exit code chỉ cho bạn **chặn hoặc im lặng**. Muốn kiểm soát nhiều hơn thì **exit 0 và in một object JSON ra stdout**:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "Use rg instead of grep for better performance"
+  }
+}
+```
+
+Ba giá trị `permissionDecision` riêng của `PreToolUse`:
+
+- `"allow"` — bỏ qua prompt hỏi quyền tương tác. **Deny và ask rule vẫn áp dụng**, gồm cả managed deny list của tổ chức.
+- `"deny"` — huỷ tool call và gửi lý do cho Claude.
+- `"ask"` — hiện prompt hỏi quyền như bình thường.
+
+Với `UserPromptSubmit` hook, dùng `hookSpecificOutput.additionalContext` để tiêm text vào context của Claude. **Phải lồng `additionalContext` bên trong `hookSpecificOutput`** — đặt nó ở cấp cao nhất của JSON thì Claude Code **bỏ qua âm thầm**:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "UserPromptSubmit",
+    "additionalContext": "Current branch: release-42. Deploy freeze until Friday."
+  }
+}
+```
+
+> Dùng exit 2 để chặn kèm thông báo stderr, **hoặc** exit 0 kèm JSON để kiểm soát có cấu trúc. **Chọn một cách cho mỗi hook**, đừng trộn.
+
+### Khi nhiều hook khớp cùng một sự kiện
+
+**Mọi lệnh của mọi hook đều chạy tới hết trước khi Claude Code gộp kết quả.** Một hook trả `deny` **không** ngăn các hook sibling thực thi — nên **đừng dựa vào `deny` của một hook để chặn tác dụng phụ của hook khác**.
+
+Sau khi mọi hook khớp xong, Claude Code gộp output. Với quyết định quyền của `PreToolUse`, **câu trả lời hạn chế nhất thắng**, theo thứ tự `deny` → `defer` → `ask` → `allow`. Text từ `additionalContext` được **giữ lại từ mọi hook** và truyền cho Claude cùng nhau.
+
+Ví dụ hai `PreToolUse` hook trên `Bash` — một ghi log mọi lệnh rồi exit 0, một chạy script exit 2 để deny khi lệnh chứa `rm -rf`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r .tool_input.command >> ~/.claude/bash.log"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/block-rm-rf.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Khi Claude cố chạy `rm -rf /tmp/build`, cả hai hook thực thi song song. Hook log ghi lệnh vào file rồi exit 0. Hook lan can exit 2 nên deny. **Deny thắng**, nên Claude Code chặn lệnh — nhưng **dòng log vẫn được ghi** vì hook log đã chạy rồi.
+
+## Matcher
+
+Không có matcher thì hook kích hoạt ở **mọi lần** sự kiện của nó xảy ra. Matcher thu hẹp việc đó. Matcher `"Edit|Write"` chỉ kích hoạt khi Claude dùng tool `Edit` hoặc `Write`. Từ v2.1.191, dấu phẩy phân tách các lựa chọn theo cùng cách, nên `"Edit, Write"` là tương đương.
+
+Mỗi loại sự kiện khớp trên một trường khác nhau:
+
+| Sự kiện                                                                                                                                                         | Matcher lọc theo             | Giá trị ví dụ                                                                               |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------- |
+| `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`, `PermissionDenied`                                                                      | Tên tool                     | `Bash`, `Edit\|Write`, `mcp__.*`                                                            |
+| `SessionStart`                                                                                                                                                  | Cách phiên bắt đầu           | `startup`, `resume`, `clear`, `compact`, `fork`                                             |
+| `Setup`                                                                                                                                                         | Flag CLI nào kích hoạt setup | `init`, `maintenance`                                                                       |
+| `SessionEnd`                                                                                                                                                    | Vì sao phiên kết thúc        | `clear`, `resume`, `logout`, `prompt_input_exit`, `other`                                   |
+| `Notification`                                                                                                                                                  | Loại thông báo               | `permission_prompt`, `idle_prompt`, `auth_success`, `agent_needs_input`, `agent_completed`… |
+| `SubagentStart`, `SubagentStop`                                                                                                                                 | Loại agent                   | `general-purpose`, `Explore`, `Plan`, hoặc tên agent tuỳ biến                               |
+| `PreCompact`, `PostCompact`                                                                                                                                     | Cái gì kích hoạt compaction  | `manual`, `auto`                                                                            |
+| `ConfigChange`                                                                                                                                                  | Nguồn cấu hình               | `user_settings`, `project_settings`, `local_settings`, `policy_settings`, `skills`          |
+| `InstructionsLoaded`                                                                                                                                            | Lý do nạp                    | `session_start`, `nested_traversal`, `path_glob_match`, `include`, `compact`                |
+| `FileChanged`                                                                                                                                                   | Tên file cần theo dõi        | `.envrc\|.env`                                                                              |
+| `UserPromptExpansion`                                                                                                                                           | Tên lệnh                     | Tên skill hoặc command của bạn                                                              |
+| `UserPromptSubmit`, `PostToolBatch`, `Stop`, `TeammateIdle`, `TaskCreated`, `TaskCompleted`, `WorktreeCreate`, `WorktreeRemove`, `CwdChanged`, `MessageDisplay` | **Không hỗ trợ matcher**     | Luôn kích hoạt ở mọi lần                                                                    |
+
+> **Claude cũng tạo và sửa file được bằng cách chạy lệnh shell.** Nếu hook của bạn **phải** thấy mọi thay đổi file — ví dụ để quét tuân thủ hoặc ghi audit log — hãy thêm một hook `Stop` quét working tree một lần mỗi lượt. Muốn phủ theo từng lời gọi thì thêm matcher `Bash|PowerShell` và để script liệt kê file đã sửa cùng file untracked bằng `git status --porcelain`.
+
+## Đặt hook ở đâu
+
+| Vị trí                        | Phạm vi                                        | Chia sẻ được                                           |
+| ----------------------------- | ---------------------------------------------- | ------------------------------------------------------ |
+| `~/.claude/settings.json`     | Mọi project của bạn                            | Không, cục bộ trên máy bạn                             |
+| `.claude/settings.json`       | Một project                                    | **Có**, commit vào repo được                           |
+| `.claude/settings.local.json` | Một project                                    | Không, bị gitignore khi Claude Code ghi setting vào nó |
+| Managed policy settings       | Toàn tổ chức                                   | Có, do admin kiểm soát                                 |
+| Plugin `hooks/hooks.json`     | Khi plugin được bật                            | Có, đóng gói cùng plugin                               |
+| Frontmatter của **skill**     | Phần còn lại của phiên, sau khi skill được gọi | Có, khai trong file skill                              |
+| Frontmatter của **subagent**  | Trong lúc subagent đó chạy                     | Có, khai trong file subagent                           |
+
+Tắt hook bằng `"disableAllHooks": true` trong file settings. Claude Code đọc **giá trị còn lại sau khi thứ tự ưu tiên settings được áp**, nên settings của một project **ghi đè được** settings của bạn. Hook cấu hình trong managed settings **vẫn chạy** trừ khi `disableAllHooks` cũng được đặt ở đó.
+
+---
+
+## Hook và permission mode
+
+Đây là điểm mạnh nhất của hook, và cũng là điều đáng nhớ nhất trong bài:
+
+> **`PreToolUse` hook kích hoạt trước mọi kiểm tra permission mode, ở mọi mode, kể cả `dontAsk`.** Một hook trả `permissionDecision: "deny"` **chặn tool ngay cả ở `bypassPermissions` mode** hoặc với `--dangerously-skip-permissions`.
+
+Nghĩa là bạn cưỡng chế được chính sách mà **user không lách qua được bằng cách đổi permission mode**.
+
+Nhưng **chiều ngược lại không đúng**: một hook trả `"allow"` **không** vượt qua được deny rule trong settings, và không chặn được prompt cho connector tool mà tổ chức đặt thành `ask`. **Hook thắt chặt được hạn chế, nhưng không nới lỏng quá mức permission rule cho phép.**
+
+## Giới hạn cần biết
+
+- Command hook giao tiếp **chỉ qua stdout, stderr và exit code**. Chúng **không** kích hoạt được lệnh `/` hay tool call.
+- **`PostToolUse` hook không hoàn tác được hành động** — tool đã thực thi rồi.
+- **`Stop` hook kích hoạt mỗi khi Claude kết thúc phản hồi**, không chỉ khi task hoàn thành. Chúng **không** kích hoạt khi user ngắt; lỗi API kích hoạt `StopFailure` thay thế.
+- Khi nhiều `PreToolUse` hook trả `updatedInput` để viết lại tham số của một tool, **cái xong sau cùng thắng**. Vì hook chạy song song, thứ tự là **không xác định** — nên **đừng để nhiều hơn một hook sửa input của cùng một tool**.
+
+---
+
+## Troubleshooting
+
+### Hook không kích hoạt
+
+- Chạy `/hooks` và xác nhận hook xuất hiện dưới đúng sự kiện
+- Kiểm tra matcher khớp **chính xác** tên tool — **matcher phân biệt hoa thường**
+- Xác nhận bạn đang kích hoạt đúng loại sự kiện: `PreToolUse` trước khi tool chạy, `PostToolUse` sau
+
+### Lỗi hook trong output
+
+Thấy thông báo kiểu `PreToolUse hook error: ...` trong transcript. Test script bằng tay bằng cách đổ JSON mẫu vào:
+
+```bash
+echo '{"tool_name":"Bash","tool_input":{"command":"ls"}}' | ./my-hook.sh
+echo $?  # Kiểm tra exit code
+```
+
+- Thấy `command not found` → dùng đường dẫn tuyệt đối hoặc `${CLAUDE_PROJECT_DIR}`. Muốn tránh hẳn chuyện quote của shell thì thêm `"args": []` để chuyển sang **exec form**, nó sinh script trực tiếp không qua shell
+- Thấy `jq: command not found` → cài `jq`, hoặc dùng Python/Node.js để parse JSON
+- Script không chạy chút nào → `chmod +x ./my-hook.sh`
+
+### `/hooks` báo không có hook nào
+
+- Sửa file thường được nhận tự động. Nếu sau vài giây vẫn chưa hiện, file watcher có thể đã bỏ sót — **khởi động lại phiên** để buộc nạp lại
+- Xác nhận JSON hợp lệ: **không được có dấu phẩy cuối và không được có comment**
+- Xác nhận file settings ở đúng vị trí
+
+### `Stop` hook đụng trần chặn
+
+Claude cứ làm tiếp thay vì dừng, rồi kết thúc lượt kèm cảnh báo `Stop` hook đã chặn quá nhiều lần liên tiếp.
+
+Claude Code **ghi đè một `Stop` hook sau khi nó chặn tám lần liên tiếp mà không có tiến triển**. Script của bạn cần tự kiểm xem nó đã kích hoạt một lần tiếp tục chưa — parse trường `stop_hook_active` từ JSON input và thoát sớm nếu nó `true`:
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+if [ "$(echo "$INPUT" | jq -r '.stop_hook_active')" = "true" ]; then
+  exit 0  # Cho Claude dừng
+fi
+# ... phần còn lại của logic hook
+```
+
+Nếu hook của bạn **thật sự** cần hơn tám vòng để hội tụ, nâng trần bằng `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`.
+
+### JSON của hook không có tác dụng
+
+Hook in JSON hợp lệ, nhưng quyết định không có tác dụng và **không có lỗi nào hiện trong transcript**. Đây là cái bẫy khó chẩn đoán nhất trong cả bài.
+
+Khi Claude Code chạy một command hook dạng shell-form (không có `args`), nó sinh `sh -c` trên macOS và Linux, Git Bash trên Windows, hoặc PowerShell khi không có Git Bash. Shell này **non-interactive**, nhưng Git Bash và một số cấu hình **vẫn source profile của bạn**. Nếu profile đó chứa lệnh `echo` không điều kiện, output bị **chèn lên trước JSON của hook**:
+
+```text
+Shell ready on arm64
+{"decision": "block", "reason": "Not allowed"}
+```
+
+Output gộp lại **không còn bắt đầu bằng `{`**, nên Claude Code coi toàn bộ stdout là text thuần và **bỏ qua JSON**. Ở exit 0 thì **không có gì được báo trong transcript**; lần thử parse chỉ được ghi vào debug log.
+
+Cách sửa — bọc các lệnh `echo` trong shell profile để chúng chỉ chạy ở shell tương tác:
+
+```bash
+# Trong ~/.zshrc hoặc ~/.bashrc
+if [[ $- == *i* ]]; then
+  echo "Shell ready"
+fi
+```
+
+Biến `$-` chứa cờ của shell, và `i` nghĩa là interactive. Hook chạy trong shell non-interactive nên lệnh `echo` bị bỏ qua.
+
+### Kỹ thuật debug
+
+Bấm `Ctrl+O` để mở transcript view và xem kết quả một lượt chạy hook:
+
+- **Chạy thành công** — bạn **không thấy gì**, trừ khi JSON của hook làm lộ ra thứ gì đó như `systemMessage`. Muốn xác nhận hook đã chạy thì kiểm tra **tác dụng** của nó, ví dụ một file đã được format lại.
+- **Lỗi chặn** — ở phần lớn sự kiện bạn thấy phản hồi của hook.
+- **Lỗi non-blocking** — hành động vẫn tiếp tục, và bạn thấy một thông báo `<hook name> hook error`.
+
+Muốn xem đầy đủ chi tiết thực thi — hook nào khớp, exit code, stdout, stderr — thì đọc debug log:
+
+```bash
+claude --debug-file /tmp/claude.log
+```
+
+Rồi `tail -f /tmp/claude.log` ở một terminal khác. Nếu bạn đã khởi động mà không có flag đó, chạy `/debug` giữa phiên để bật log và tìm đường dẫn file log.
+
+## Nguồn
+
+- [Automate actions with hooks](https://code.claude.com/docs/en/hooks-guide)
+- [Hooks reference](https://code.claude.com/docs/en/hooks)
+
+Docs gốc cập nhật thường xuyên; khi có mâu thuẫn, tin bản tiếng Anh.

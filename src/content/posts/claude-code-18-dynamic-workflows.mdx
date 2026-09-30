@@ -1,0 +1,306 @@
+---
+title: 'Claude Code từ zero đến thành thạo · Phần 18 — Dynamic workflow: điều phối subagent ở quy mô lớn'
+description: 'Dynamic workflow chuyển kế hoạch vào code: một script JavaScript điều phối hàng chục tới hàng trăm subagent, giữ kết quả trung gian trong biến thay vì trong context. Cách chạy, cách lưu, giới hạn và chi phí.'
+pubDate: 2026-09-21
+lang: vi
+tags: [claude-code, ai, agent, cli, productivity]
+series: claude-code
+seriesOrder: 18
+draft: false
+---
+
+Ba phần trước là ba cách song song hoá mà **Claude giữ kế hoạch trong đầu**: nó quyết định từng lượt sẽ sinh gì tiếp theo, và mọi kết quả rơi vào một context window.
+
+**Dynamic workflow chuyển kế hoạch vào code.** Một script JavaScript giữ vòng lặp, giữ nhánh rẽ, và giữ kết quả trung gian — nên **context của Claude chỉ chứa câu trả lời cuối cùng**.
+
+Claude viết script đó cho task bạn mô tả, và một runtime thực thi nó **ở nền** trong lúc phiên của bạn vẫn phản hồi bình thường.
+
+> Dynamic workflow cần Claude Code v2.1.154 trở lên, có ở **mọi gói trả phí**. Trên gói Pro thì bật nó ở dòng **Dynamic workflows** trong `/config`.
+
+## Khi nào dùng workflow
+
+Khác biệt giữa bốn cơ chế nằm ở **ai giữ kế hoạch**:
+
+|                                  | Subagent                    | Skill                     | Agent team                             | **Workflow**                                    |
+| -------------------------------- | --------------------------- | ------------------------- | -------------------------------------- | ----------------------------------------------- |
+| **Là gì**                        | Một worker Claude sinh ra   | Chỉ dẫn Claude làm theo   | Một lead giám sát các phiên ngang hàng | **Một script runtime thực thi**                 |
+| **Ai quyết định chạy gì tiếp**   | Claude, từng lượt           | Claude, theo prompt       | Lead, từng lượt                        | **Script**                                      |
+| **Kết quả trung gian nằm ở đâu** | Context window của Claude   | Context window của Claude | Task list dùng chung                   | **Biến trong script**                           |
+| **Cái gì tái dùng được**         | Định nghĩa worker           | Chỉ dẫn                   | Định nghĩa team                        | **Chính việc điều phối**                        |
+| **Quy mô**                       | Vài task được giao mỗi lượt | Như subagent              | Vài peer chạy lâu                      | **Hàng chục tới hàng trăm agent mỗi lượt chạy** |
+| **Khi bị ngắt**                  | Lượt chạy lại từ đầu        | Lượt chạy lại từ đầu      | Teammate vẫn chạy                      | **Resume được trong cùng phiên**                |
+
+Nhưng chuyển kế hoạch vào code còn cho một thứ nữa quan trọng hơn quy mô: nó cho workflow **áp một mẫu chất lượng lặp lại được**. Nó cho các agent độc lập **review đối kháng phát hiện của nhau trước khi báo về**, hoặc **dựng plan từ nhiều góc rồi cân chúng với nhau** — nên bạn nhận được kết quả đáng tin hơn một lượt chạy đơn.
+
+Với tay tới workflow khi: một task cần nhiều agent hơn mức một hội thoại điều phối được, hoặc bạn muốn **việc điều phối được mã hoá thành một script đọc được và chạy lại được**. Ví dụ: quét bug toàn codebase, migration 500 file, một câu hỏi nghiên cứu cần đối chiếu nguồn với nhau, và một plan khó đáng dựng từ nhiều góc độc lập trước khi cam kết một hướng.
+
+---
+
+## Chạy workflow dựng sẵn
+
+Cách nhanh nhất để thấy workflow hoạt động là chạy `/deep-research`:
+
+```text
+/deep-research What changed in the Node.js permission model between v20 and v22?
+```
+
+Claude Code hỏi bạn có cho phép workflow chạy không. Chọn **Yes**. Lượt chạy bắt đầu ở nền. Chạy `/workflows`, chọn lượt chạy đó, bấm `Enter` để mở màn hình tiến trình.
+
+Khi xong, báo cáo rơi vào phiên của bạn. Nó **trích dẫn nguồn cho từng khẳng định**, và các khẳng định **không sống sót qua bước đối chiếu đã bị lọc bỏ**.
+
+> Khi các agent kiểm chứng **không kiểm được** một khẳng định — ví dụ sau một lần rate limit hoặc lỗi API — báo cáo liệt kê nó là **unverified** chứ **không** tính là đã bị bác bỏ. Đây là một chi tiết quan trọng khi đọc báo cáo.
+
+`/deep-research` **chỉ chạy khi bạn gọi**, Claude không tự gọi nó.
+
+### Theo dõi lượt chạy
+
+Màn hình tiến trình hiện từng phase kèm số agent, tổng token, và thời gian đã trôi.
+
+| Phím             | Tác dụng                                                                                              |
+| ---------------- | ----------------------------------------------------------------------------------------------------- |
+| `↑` / `↓`        | Chọn một phase hoặc một agent                                                                         |
+| `Enter` hoặc `→` | Đi sâu vào phase đang chọn, rồi vào một agent để đọc prompt, các tool call gần đây, và kết quả của nó |
+| `Esc` hoặc `←`   | Lùi ra một cấp                                                                                        |
+| `j` / `k`        | Cuộn trong phần chi tiết agent khi nó tràn                                                            |
+| `f`              | Lọc danh sách agent trong phase theo trạng thái. Bấm lại để xoay vòng                                 |
+| `p`              | **Tạm dừng hoặc tiếp tục** lượt chạy                                                                  |
+| `x`              | Dừng agent đang chọn, hoặc dừng cả workflow khi focus ở lượt chạy                                     |
+| `r`              | **Khởi động lại** agent đang chạy được chọn                                                           |
+| `s`              | **Lưu** script của lượt chạy thành một lệnh                                                           |
+
+Bạn cũng theo dõi được từ task panel dưới ô nhập: một dòng tóm tắt tiến trình hiện ở đó trong lúc chạy. Bấm mũi tên xuống để focus vào nó, rồi `Enter` để mở rộng.
+
+---
+
+## Bảo Claude viết một workflow
+
+### Cách 1 — nêu trong prompt
+
+Chèn từ khoá `ultracode` vào prompt của bạn:
+
+```text
+ultracode: audit every API endpoint under src/routes/ for missing auth checks
+```
+
+Nói bằng lời của bạn cũng được — _"use a workflow"_ hay _"run a workflow"_ — Claude coi một yêu cầu trực tiếp là cùng một sự đồng ý.
+
+Claude Code tô sáng từ khoá đó trong ô nhập của bạn. **Từ khoá chỉ chọn cách Claude cấu trúc công việc**: một workflow khởi động kiểu này chạy **trong permission mode hiện tại của phiên**, và các tool call của agent nhận đúng những kiểm tra quyền và sandbox như mọi tool call khác.
+
+Không cố ý khởi động workflow thì bấm `Option+W` (macOS) hoặc `Alt+W` (Windows/Linux) để bỏ tô sáng cho prompt này, hoặc bấm backspace khi con trỏ ngay sau từ khoá.
+
+> **Từ khoá chỉ là opt-in trong prompt bạn tự gõ.** Nó **không** khởi động workflow khi tới phiên bằng đường khác: một prompt truyền qua `-p`; một prompt từ Agent SDK không đóng dấu là input của người; **prompt của scheduled task**; hoặc **payload webhook hay comment trên pull request được chuyển vào hội thoại**. Đây là một biên bảo mật, không phải giới hạn tiện lợi.
+
+### Cách 2 — để Claude tự quyết bằng ultracode
+
+**Ultracode** là một thiết lập kết hợp reasoning effort `xhigh` với **việc tự động điều phối workflow**. Bật rồi thì Claude **tự lập workflow cho mỗi task đáng kể** mà không chờ bạn yêu cầu:
+
+```text
+/effort ultracode
+```
+
+Hoặc khởi động luôn với `claude --effort ultracode`.
+
+Với ultracode bật, **một yêu cầu duy nhất có thể biến thành vài workflow liên tiếp**: một cái để hiểu code, một cái để thực hiện thay đổi, một cái để kiểm chứng. Điều này áp cho **mọi** task trong phiên, nên **mỗi yêu cầu tốn nhiều token hơn và lâu hơn** so với các mức effort thấp.
+
+Ultracode kéo dài trong phiên hiện tại và **reset khi bạn mở phiên mới**. Quay lại `/effort high` khi về việc thường.
+
+### Duyệt plan trước khi nó chạy
+
+Prompt duyệt hiện các phase đã lập kèm bốn lựa chọn: **Yes, run it**; **Yes, and don't ask again** cho workflow này trong project này; **View raw script** để đọc script trước khi quyết; và **No**. Bấm `Ctrl+G` để mở script trong editor; `Tab` để chỉnh prompt trước khi chạy.
+
+| Permission mode                            | Bạn bị hỏi khi nào                                                                                                                          |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Auto**                                   | **Chỉ lần khởi động đầu.** Bất kỳ **Yes** nào ghi lại sự đồng ý vào user settings, các lần sau chạy không hỏi. **Bỏ hẳn khi ultracode bật** |
+| Manual, accept edits                       | **Mọi lượt chạy**, trừ khi bạn đã chọn _"Yes, and don't ask again"_ cho workflow đó trong project này                                       |
+| Bypass permissions, `claude -p`, Agent SDK | **Không bao giờ.** Lượt chạy bắt đầu ngay                                                                                                   |
+
+Và đây là chi tiết quan trọng nhất về quyền trong cả bài:
+
+> **Permission mode của bạn chỉ điều khiển prompt lúc khởi động ở trên.** Các subagent mà workflow sinh ra **luôn chạy ở `acceptEdits` mode** và kế thừa tool allowlist của bạn, **bất kể mode của phiên bạn là gì**. **Việc sửa file được tự động phê duyệt.**
+>
+> Lệnh shell, web fetch, và MCP tool **không** nằm trong allowlist của bạn thì vẫn hỏi bạn giữa lượt chạy. Muốn tránh việc này ở một lượt chạy dài thì **thêm sẵn các lệnh agent cần vào allowlist trước khi bắt đầu**.
+
+---
+
+## Lưu workflow để dùng lại
+
+Chạy `/workflows`, chọn lượt chạy bạn muốn giữ, bấm `s`. Trong hộp thoại lưu, `Tab` chuyển giữa hai vị trí:
+
+- **`.claude/workflows/`** trong project — **chia sẻ với mọi người clone repo**
+- **`~/.claude/workflows/`** trong thư mục home — dùng được ở mọi project, **chỉ bạn thấy**
+
+Bấm `Enter` để lưu. Workflow chạy bằng `/<name>` ở các phiên sau, từ vị trí nào cũng được.
+
+Nếu một workflow project và một workflow cá nhân **trùng tên**, bản **project** chạy.
+
+Trong monorepo có nhiều thư mục `.claude/`, bạn giữ workflow cạnh package nó áp dụng cho. Lưu vào vị trí project ghi vào **thư mục `.claude/workflows/` gần nhất đã tồn tại** giữa thư mục làm việc và gốc repository. Khi nhiều nơi khai cùng một tên, Claude Code chạy cái **gần thư mục làm việc nhất**.
+
+### Truyền input cho workflow đã lưu
+
+Một workflow đã lưu nhận input qua tham số `args`, và script đọc nó như một biến toàn cục tên `args`:
+
+```text
+Run /triage-issues on issues 1024, 1025, and 1030
+```
+
+Claude truyền danh sách đó dưới dạng **dữ liệu có cấu trúc**, nên script gọi trực tiếp method của array và object trên `args` được **mà không phải parse trước**. Bỏ `args` thì biến toàn cục là `undefined` trong script.
+
+### Phân phối workflow trong plugin
+
+Đặt script vào thư mục `workflows/` ở gốc plugin. **Workflow của plugin có namespace theo tên plugin**: một plugin tên `acme-tools` chứa script có `meta.name` là `release-audit` sẽ chạy bằng `/acme-tools:release-audit`.
+
+---
+
+## Sáu mẫu prompt
+
+Workflow hợp nhất khi task **lớn hơn mức một agent giữ được trong context**, hoặc khi **cùng một bước cần chạy trên nhiều item**. Bạn không tự viết script — bạn mô tả task.
+
+**Audit nhiều file tìm cùng một vấn đề** — toả một agent mỗi file, rồi thu và kiểm chứng phát hiện:
+
+```text
+use a workflow to audit every route handler under src/routes/ for missing authentication checks, and adversarially verify each finding before reporting it
+```
+
+**Sửa tới khi một kiểm tra pass** — chạy checker, sửa thứ fail, lặp:
+
+```text
+use a workflow to run npx tsc --noEmit and keep fixing the reported errors until the type check passes or two rounds in a row make no progress
+```
+
+**Migrate nhiều file song song** — tìm file cần migrate, biến đổi từng cái **trong một bản copy cô lập** để sửa đổi không xung đột:
+
+```text
+use a workflow to migrate every component under src/components/ from styled-components to Tailwind, working on each file in its own isolated copy
+```
+
+**Review mọi file đã đổi rồi viết một bản tóm tắt** — một reviewer mỗi file, rồi giao toàn bộ phát hiện cho một agent xếp hạng và dedupe:
+
+```text
+use a workflow to review every file changed in this PR for correctness issues, then merge the per-file findings into one ranked summary
+```
+
+**Nghiên cứu một chủ đề qua nhiều nguồn:**
+
+```text
+use a workflow to research how our three competitors handle rate limiting: read their public docs and recent changelog entries in parallel, then compare the approaches
+```
+
+**Tìm vấn đề tới khi danh sách ngừng dài ra** — tìm theo vòng và dừng khi vòng mới không ra gì mới:
+
+```text
+use a workflow to find flaky tests in this repo: run the suite repeatedly, record which tests fail intermittently, and stop once two rounds in a row find nothing new
+```
+
+## Script trông như thế nào
+
+Bạn thường **không cần sửa** script, nhưng đây là hình dạng của một cái nhỏ để bạn nhận ra thứ Claude sinh ra:
+
+```javascript
+export const meta = {
+  name: 'audit-routes',
+  description: 'Audit every route handler for missing auth checks',
+};
+
+const found = await agent('List every .ts file under src/routes/.', {
+  schema: {
+    type: 'object',
+    required: ['files'],
+    properties: { files: { type: 'array', items: { type: 'string' } } },
+  },
+});
+
+const audits = await pipeline(found.files, (file) =>
+  agent(`Audit ${file} for missing authentication checks.`, { label: file })
+);
+
+return audits.filter(Boolean);
+```
+
+Phần thân là **JavaScript thuần với top-level `await`**. Hàm `agent()` sinh một subagent; `pipeline()` chạy một cái cho mỗi item trong một danh sách.
+
+> Một lời gọi `agent()` **giải về `null`** nếu bạn dừng nó giữa lượt chạy hoặc nó gặp lỗi API không phục hồi được. `pipeline()` **giữ `null` đó trong mảng kết quả** — đó là lý do ví dụ kết bằng `.filter(Boolean)` để bỏ các entry rỗng.
+
+## Lượt chạy diễn ra thế nào
+
+Runtime thực thi script trong **môi trường cô lập**, tách khỏi hội thoại của bạn. Kết quả trung gian nằm trong **biến của script** thay vì rơi vào context của Claude.
+
+**Mỗi lượt chạy ghi script của nó ra một file** dưới thư mục phiên của bạn trong `~/.claude/projects/`. Claude nhận đường dẫn đó khi lượt chạy bắt đầu, nên **bạn hỏi nó được**. Bạn mở file đó để đọc việc điều phối Claude đã viết, **diff nó với script của lượt chạy trước**, hoặc **sửa nó rồi bảo Claude chạy lại từ bản đã sửa**.
+
+### Prompt caching trong một lượt toả
+
+Đây là phần nối trực tiếp với phần 3, và là một tối ưu đáng biết:
+
+Các agent trong cùng một lượt chạy **đọc được prompt cache của nhau**. Hai agent chạy với cùng model, cùng effort level, cùng loại agent, cùng bộ tool, cùng output schema và cùng thư mục làm việc thì dựng **cùng một prefix** — nên một agent khởi động sau khi phản hồi của một sibling khớp đã bắt đầu sẽ **đọc cache của sibling đó ngay ở request đầu tiên**.
+
+Khi một lượt toả khởi động nhiều agent khớp nhau cùng lúc, Claude Code **giữ lại tất cả trừ cái đầu tiên** tới khi phản hồi của cái đầu bắt đầu, rồi **giải phóng chúng cùng lúc** để request đầu tiên của chúng đọc prefix dùng chung thay vì mỗi cái tự xử lý lại. Việc giữ bị chặn trên ở `CLAUDE_CODE_WORKFLOW_PREFIX_STAGGER_MS` millisecond, **mặc định 5000**. Đặt `0` để tắt.
+
+### Sáu ràng buộc của runtime
+
+| Ràng buộc                                                                                   | Vì sao                                                                                                                            |
+| ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| **Không có input của user giữa lượt chạy**                                                  | Chỉ prompt hỏi quyền của agent tạm dừng được lượt chạy. Cần ký duyệt giữa các stage thì **chạy mỗi stage như một workflow riêng** |
+| **Script không truy cập trực tiếp filesystem hay shell**                                    | Agent đọc, ghi và chạy lệnh. Script chỉ **điều phối** agent                                                                       |
+| **Không nạp module** — script chứa `import()` sẽ **fail trước khi lượt chạy bắt đầu**       | Phần thân là JavaScript thuần. Việc cần library thì đặt vào task của một agent                                                    |
+| **Tối đa 16 agent đồng thời**, ít hơn khi Claude Code có ít CPU hơn                         | Chặn mức dùng tài nguyên cục bộ                                                                                                   |
+| Trong một lượt toả, agent dùng chung prefix cache khởi động **muộn tới 5 giây** sau cái đầu | Để chúng đọc prefix cái đầu đã cache                                                                                              |
+| **1.000 agent tổng cho mỗi lượt chạy**                                                      | Chống vòng lặp chạy loạn                                                                                                          |
+
+---
+
+## Resume sau khi tạm dừng
+
+Dừng một lượt chạy rồi resume được. Agent đã hoàn thành **thường** trả về kết quả cache, phần còn lại chạy thật.
+
+Hai luật quyết định kết quả nào sống sót:
+
+1. **Một agent còn đang chạy lúc bạn dừng thì không được lưu**, nên nó **chạy lại từ đầu** khi resume.
+2. **Việc phát lại đi theo thứ tự agent khởi động.** Kết quả cache **dừng ở agent đầu tiên chưa hoàn thành**, và **mọi agent khởi động sau cái đó đều chạy lại — kể cả khi chúng đã hoàn thành**.
+
+Luật thứ hai là thứ khiến việc dừng giữa một lượt toả trở nên đắt. Giả sử script khởi động bốn agent A, B, C, D theo thứ tự đó, và bạn dừng khi B còn đang chạy. Khi resume: **A** trả về từ cache. **B** chạy lại vì nó chưa bao giờ hoàn thành. **C và D cũng chạy lại**, vì chúng khởi động **sau** B — dù cả hai đã hoàn thành trước lúc bạn dừng.
+
+> Hệ quả thiết kế đáng nhớ: **một workflow toả việc ra nhiều agent nhỏ giữ được nhiều tiến độ hơn một workflow có một agent dài.**
+
+**Resume chỉ hoạt động trong cùng một phiên Claude Code.** Nếu bạn thoát Claude Code trong lúc một workflow đang chạy, **phiên kế tiếp khởi động workflow đó lại từ đầu**.
+
+## Chi phí
+
+Một workflow sinh nhiều agent, nên **một lượt chạy tốn nhiều token hơn hẳn** so với làm cùng task đó trong hội thoại. Lượt chạy tính vào usage và rate limit của gói bạn như mọi phiên khác.
+
+**Để đo chi phí trước khi cam kết một task lớn, chạy workflow trên một mảnh nhỏ trước**: một thư mục thay vì cả repo, hoặc một câu hỏi hẹp thay vì một câu rộng. Màn hình `/workflows` hiện mức dùng token của từng agent trong lúc chạy, và bạn dừng lượt chạy ở đó bất cứ lúc nào, **thường không mất việc đã hoàn thành**.
+
+Claude Code cũng **gắn cờ một lượt chạy phình lớn bất thường**: khi workflow lên lịch **hơn 25 agent**, hoặc tổng token dự phóng **vượt 1,5 triệu**, dòng tiến trình của nó hiện cảnh báo `Large workflow`. **Cảnh báo này chỉ mang tính tư vấn** — nó không tạm dừng cũng không giới hạn lượt chạy. Phiên có **ultracode bật thì không hiện cảnh báo**, vì bật ultracode đã là đồng ý cho các lượt chạy lớn.
+
+Hai cách kiểm soát chi phí model: **kiểm `/model` trước một lượt chạy lớn** nếu bạn hay chuyển sang model nhỏ cho việc thường; và **bảo Claude dùng model nhỏ hơn cho các stage không cần model mạnh nhất** ngay khi bạn mô tả task.
+
+### Đặt hướng dẫn quy mô
+
+Hướng dẫn quy mô nói cho Claude biết nên nhắm bao nhiêu agent khi viết workflow. Claude Code gửi nó cho Claude **như lời khuyên, không phải trần cứng** — nên một prompt đòi quy mô khác vẫn thắng.
+
+| Giá trị        | Số agent Claude nhắm tới                    |
+| -------------- | ------------------------------------------- |
+| `unrestricted` | Không có hướng dẫn: Claude tự căn theo task |
+| `small`        | Dưới 5 agent                                |
+| `medium`       | Dưới 15 agent                               |
+| `large`        | Dưới 50 agent                               |
+
+**Mặc định là `medium`.** Đổi bằng `/config workflowSizeGuideline=small`, hoặc đặt khoá `workflowSizeGuideline` trong file settings — **giá trị ở file settings thắng `/config`**.
+
+Nếu bạn tự chọn một hướng dẫn quy mô, **số agent của nó thay thế ngưỡng 25-agent** cho cảnh báo `Large workflow`.
+
+## Tắt workflow
+
+Ba cách tắt cho riêng bạn: toggle **Dynamic workflows** trong `/config`; đặt `"disableWorkflows": true` trong `~/.claude/settings.json`; hoặc đặt `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
+
+Khi workflow bị tắt: **lệnh workflow dựng sẵn không khả dụng**, từ khoá `ultracode` **không còn kích hoạt** một lượt chạy, và `ultracode` **bị gỡ khỏi menu `/effort`**.
+
+## Hết chặng nhiều agent
+
+Ba phần 16–18 đã phủ toàn bộ việc chạy nhiều agent: subagent và agent view (16), agent team cùng cross-session messaging và worktree (17), và dynamic workflow (18).
+
+Chặng cuối gom phần còn lại: headless và tự động hoá (phần 19), code review cùng security và CI (phần 20), cấu hình (phần 21), và troubleshooting cùng Agent SDK (phần 22).
+
+## Nguồn
+
+- [Orchestrate subagents at scale with dynamic workflows](https://code.claude.com/docs/en/workflows)
+
+Docs gốc cập nhật thường xuyên; khi có mâu thuẫn, tin bản tiếng Anh.

@@ -614,6 +614,59 @@ export const SERIES: Record<string, SeriesMeta> = {
       },
     ],
   },
+  'claude-code': {
+    homepagePick: 'claude-code-01-overview-and-roadmap',
+    title: 'Claude Code từ zero đến thành thạo',
+    description:
+      'Series tiếng Việt về Claude Code: cài đặt, agent loop, context window, CLAUDE.md, permission mode, skills, hooks, MCP, plugin, subagent và tự động hoá.',
+    blurb:
+      'Series tiếng Việt dịch và sắp lại tài liệu chính thức của Claude Code theo thứ tự học thay vì thứ tự tra cứu. Chặng nền tảng đi từ cài đặt và phiên làm việc đầu tiên tới agent loop, bộ tool, context window, prompt caching và cách Claude nhớ project qua CLAUDE.md. Chặng vận hành hằng ngày bao interactive mode, CLI, slash command, permission mode, session, checkpointing, workflow thường gặp và best practices. Chặng mở rộng đào sâu bốn cơ chế tuỳ biến — skills, hooks, MCP và plugin. Chặng nhiều agent nói về subagent, agent team, worktree và dynamic workflow. Chặng cuối khép lại bằng headless, chạy theo lịch, code review, CI, cấu hình và Agent SDK.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Nền tảng',
+        description:
+          'Cài đặt, phiên làm việc đầu tiên, agent loop và bộ tool, context window, rồi cách Claude nhớ project qua CLAUDE.md.',
+        from: 1,
+        to: 4,
+      },
+      {
+        title: 'Vận hành hằng ngày',
+        description:
+          'Bàn phím và CLI, slash command, permission mode, session và checkpoint, các workflow thường gặp và best practice.',
+        from: 5,
+        to: 10,
+      },
+      {
+        title: 'Mở rộng năng lực',
+        description:
+          'Bốn cơ chế tuỳ biến — skill, hook, MCP và plugin — cùng cách chọn đúng cơ chế cho từng nhu cầu.',
+        from: 11,
+        to: 15,
+      },
+      {
+        title: 'Nhiều agent làm việc cùng lúc',
+        description:
+          'Subagent và agent view, agent team cùng cross-session messaging và worktree, rồi dynamic workflow điều phối subagent ở quy mô lớn.',
+        from: 16,
+        to: 18,
+      },
+      {
+        title: 'Tự động hoá, cấu hình và tra cứu',
+        description:
+          'Headless và chạy theo lịch, code review cùng security và CI, toàn bộ cấu hình, rồi troubleshooting, glossary và Agent SDK.',
+        from: 19,
+        to: 22,
+      },
+      {
+        title: 'Làm việc với model mới',
+        description:
+          'Cách giao việc, lái lượt chạy dài và kiểm kết quả thay đổi theo từng thế hệ model — bắt đầu với Opus 5.5.',
+        from: 23,
+        to: 23,
+      },
+    ],
+  },
 };
 
 /**

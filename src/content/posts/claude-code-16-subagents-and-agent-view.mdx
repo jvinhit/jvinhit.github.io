@@ -1,0 +1,538 @@
+---
+title: 'Claude Code từ zero đến thành thạo · Phần 16 — Subagent, chạy song song và agent view'
+description: 'Bốn subagent dựng sẵn, toàn bộ trường frontmatter để tự viết subagent, fork khác subagent thường ở đâu, foreground so với background, và agent view — một màn hình điều phối nhiều phiên chạy nền.'
+pubDate: 2026-09-17
+lang: vi
+tags: [claude-code, ai, agent, cli, productivity]
+series: claude-code
+seriesOrder: 16
+draft: false
+---
+
+Chặng 4 nói về **nhiều agent làm việc cùng lúc**. Bài này là hai lớp đầu: **subagent** (worker bên trong một phiên) và **agent view** (một màn hình điều phối nhiều phiên chạy nền).
+
+Trước khi đi vào chi tiết, đây là bản đồ bốn cách song song hoá — nhớ nó sẽ giúp bạn không chọn sai công cụ:
+
+| Cách                 | Cho bạn gì                                                                                                                 | Dùng khi                                                                                                                                       |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Subagent**         | Worker được giao việc **bên trong một phiên**, làm việc phụ trong context riêng rồi trả về bản tóm tắt                     | Một việc phụ sẽ làm ngập hội thoại chính bằng kết quả tìm kiếm, log, hay nội dung file mà bạn không đọc lại                                    |
+| **Agent view**       | Một màn hình để điều phối và theo dõi các **phiên chạy nền**, mở bằng `claude agents`. _Research preview_                  | Bạn có vài task độc lập, muốn giao đi, xem trạng thái trong một cái nhìn, và chỉ can thiệp khi có cái cần bạn                                  |
+| **Agent team**       | Nhiều phiên phối hợp, có **task list dùng chung** và nhắn tin giữa các agent, do một lead quản. _Thử nghiệm, tắt mặc định_ | Bạn muốn Claude tự chia một project thành từng phần, phân công, và giữ các worker đồng bộ                                                      |
+| **Dynamic workflow** | Một **script** chạy nhiều subagent và đối chiếu kết quả của chúng                                                          | Việc vượt quá vài subagent, hoặc bạn muốn phát hiện được kiểm chứng lẫn nhau: audit toàn codebase, migration 500 file, nghiên cứu có đối chiếu |
+
+Ba câu hỏi giúp chọn nhanh: **ai điều phối?** — Claude trong một hội thoại (subagent), bạn (agent view), Claude quản một nhóm (agent team), hay một script (dynamic workflow). **Các worker có cần nói chuyện với nhau?** — subagent chỉ báo về nơi gọi nó; phiên trong agent view chỉ báo cho bạn; thành viên agent team nhắn tin trực tiếp cho nhau. **Các task có chạm cùng file không?** — nếu có thì cô lập bằng **worktree** (phần 17).
+
+> Chạy nhiều phiên hoặc nhiều subagent cùng lúc **nhân số token tiêu thụ lên**. 10 agent song song ngốn quota nhanh gấp khoảng 10 lần một agent.
+
+---
+
+## Subagent là gì
+
+Subagent là trợ lý chuyên biệt xử lý một loại task cụ thể **trong context window cô lập**. Mỗi cái chạy độc lập với: context window riêng, system prompt riêng, quyền truy cập tool riêng, và permission riêng.
+
+Năm lợi ích:
+
+- **Giữ context** — việc khám phá và cài đặt nằm ngoài hội thoại chính của bạn
+- **Cưỡng chế ràng buộc** — giới hạn tool mà một subagent dùng được
+- **Tái dùng cấu hình** giữa các project bằng subagent cấp user
+- **Chuyên biệt hoá hành vi** bằng system prompt tập trung cho một miền cụ thể
+- **Kiểm soát chi phí** bằng cách đẩy task sang model nhanh và rẻ hơn như Haiku
+
+## Bốn subagent dựng sẵn
+
+| Agent                  | Model                                                 | Tool                               | Mục đích                                                                            |
+| ---------------------- | ----------------------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------- |
+| **Explore**            | Kế thừa từ phiên chính (trần là Opus trên Claude API) | Chỉ đọc; `Write` và `Edit` bị deny | Khám phá codebase và tìm file, nhanh và chỉ đọc                                     |
+| **Plan**               | Kế thừa từ phiên chính                                | Chỉ đọc; `Write` và `Edit` bị deny | Agent nghiên cứu cho plan mode, thu ngữ cảnh trước khi trình plan                   |
+| **General-purpose**    | Kế thừa từ phiên chính                                | Mọi tool khả dụng cho subagent     | Nghiên cứu phức tạp, thao tác nhiều bước, và sửa code cần cả khám phá lẫn hành động |
+| **Nhóm trợ giúp khác** | Thay đổi (Sonnet, Haiku)                              | Theo từng tool                     | `claude` (catch-all), `statusline-setup`, `claude-code-guide`                       |
+
+> **Hành vi đặc biệt đáng nhớ: `Explore` và `Plan` bỏ qua file `CLAUDE.md` của bạn và bỏ qua git status của phiên cha** — để việc nghiên cứu nhanh và rẻ. Nghĩa là nếu bạn dựa vào một luật trong `CLAUDE.md`, hai agent này **không thấy nó**.
+
+Tắt một subagent dựng sẵn:
+
+```json
+{
+  "permissions": {
+    "deny": ["Agent(Explore)", "Agent(Plan)"]
+  }
+}
+```
+
+---
+
+## Tự viết subagent
+
+Cách nhanh nhất là **nhờ Claude viết**:
+
+```text
+Create a personal code-improver subagent in ~/.claude/agents/ that scans
+files and suggests improvements for readability, performance, and best
+practices. Make it read-only and have it use Sonnet.
+```
+
+File nó viết ra có dạng:
+
+```markdown
+---
+name: code-improver
+description: Scans files and suggests improvements for readability, performance, and best practices. Use after writing or modifying code.
+tools: Read, Grep, Glob
+model: sonnet
+---
+
+You are a code improvement specialist. For each issue you find, explain
+the problem, show the current code, and provide an improved version.
+```
+
+Frontmatter khai metadata và cấu hình; **phần thân trở thành system prompt** điều khiển hành vi.
+
+### Vị trí và độ ưu tiên
+
+| Vị trí                       | Phạm vi             | Ưu tiên       |
+| ---------------------------- | ------------------- | ------------- |
+| Managed settings             | Toàn tổ chức        | 1 (cao nhất)  |
+| Flag CLI `--agents`          | Phiên hiện tại      | 2             |
+| `.claude/agents/`            | Project hiện tại    | 3             |
+| `~/.claude/agents/`          | Mọi project của bạn | 4             |
+| Thư mục `agents/` của plugin | Nơi plugin được bật | 5 (thấp nhất) |
+
+> **Subagent cấp project (`.claude/agents/`) là lựa chọn tốt nhất để chia sẻ trong team** — commit chúng vào version control để cả team dùng và cải thiện cùng nhau.
+
+### Toàn bộ trường frontmatter
+
+| Trường            | Bắt buộc | Mô tả                                                                                                                                   |
+| ----------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`            | **Có**   | Định danh duy nhất, chữ thường và gạch nối. **Tên file không cần khớp.** Không được chứa `:` (dành riêng cho định danh có scope plugin) |
+| `description`     | **Có**   | Khi nào Claude nên giao việc cho subagent này                                                                                           |
+| `tools`           | Không    | Tool subagent dùng được. Bỏ trống thì kế thừa mọi tool khả dụng cho subagent                                                            |
+| `disallowedTools` | Không    | Tool bị deny, gỡ khỏi danh sách kế thừa hoặc danh sách đã khai                                                                          |
+| `model`           | Không    | `sonnet`, `opus`, `haiku`, `fable`, một model ID đầy đủ, hoặc `inherit`. Mặc định `inherit`                                             |
+| `permissionMode`  | Không    | `default`, `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`, `plan`, hoặc `manual`                                                 |
+| `maxTurns`        | Không    | Số lượt agentic tối đa trước khi subagent dừng                                                                                          |
+| `skills`          | Không    | Skill **nạp trước** vào context của subagent lúc khởi động                                                                              |
+| `mcpServers`      | Không    | MCP server khả dụng cho subagent này, theo tên hoặc định nghĩa inline                                                                   |
+| `hooks`           | Không    | Hook vòng đời **chỉ áp cho subagent này**                                                                                               |
+| `memory`          | Không    | Phạm vi memory bền vững: `user`, `project`, hoặc `local`                                                                                |
+| `background`      | Không    | Đặt `true` để **giữ subagent này ở nền** ngay cả khi Claude muốn chạy nó ở foreground                                                   |
+| `effort`          | Không    | Effort level khi subagent này hoạt động                                                                                                 |
+| `isolation`       | Không    | Đặt `worktree` để chạy subagent trong một **git worktree tạm** với bản sao repo cô lập                                                  |
+| `color`           | Không    | Màu hiển thị trong task list                                                                                                            |
+| `initialPrompt`   | Không    | Được tự gửi làm lượt user đầu tiên khi agent này chạy làm agent của phiên chính                                                         |
+
+### Model được giải theo thứ tự nào
+
+1. Biến môi trường `CLAUDE_CODE_SUBAGENT_MODEL`
+2. Tham số `model` ở từng lời gọi
+3. Frontmatter `model` trong định nghĩa subagent
+4. Model của hội thoại chính
+
+### Tool nào subagent dùng được
+
+Subagent **kế thừa** tool built-in từ hội thoại chính, qua **hai lớp lọc**.
+
+**Lọc thứ nhất** gỡ các tool này khỏi **mọi** subagent: `Agent` (khi đã tới giới hạn độ sâu), `AskUserQuestion`, `EndConversation`, `EnterPlanMode`, `ExitPlanMode` (trừ khi `permissionMode: plan`), `ScheduleWakeup`, `TaskOutput`, `WaitForMcpServers`, `Workflow`.
+
+**Lọc thứ hai** áp cho **background subagent**, chỉ giữ lại: `Read`, `Grep`, `Glob`, `Bash`, `PowerShell`, `Edit`, `Write`, `NotebookEdit`, `WebFetch`, `WebSearch`, `TodoWrite`, `Skill`, `ToolSearch`, `EnterWorktree`, `ExitWorktree`, `Monitor`, `TaskStop`, `SendMessage`, `Artifact`.
+
+> Lớp lọc thứ hai là nguyên nhân của một triệu chứng hay gặp: **một subagent chạy ở nền đột nhiên không dùng được tool mà bạn nghĩ nó có**. Nếu các bước trong subagent phụ thuộc tool ngoài bộ đó, hãy buộc nó chạy foreground.
+
+Dùng `tools` như allowlist hoặc `disallowedTools` như denylist:
+
+```yaml
+---
+name: safe-researcher
+description: Research agent with restricted capabilities
+tools: Read, Grep, Glob, Bash
+---
+```
+
+```yaml
+---
+name: no-writes
+description: Inherits the available tools except file writes
+disallowedTools: Write, Edit
+---
+```
+
+Hỗ trợ pattern MCP: `mcp__<server>` hoặc `mcp__<server>__*` cho server cụ thể, hoặc `mcp__*` để gỡ mọi MCP tool.
+
+### Nạp trước skill, scope MCP server, và memory bền vững
+
+**Nạp trước skill** — tiêm nội dung skill vào context của subagent ngay lúc khởi động:
+
+```yaml
+---
+name: api-developer
+description: Implement API endpoints following team conventions
+skills:
+  - api-conventions
+  - error-handling-patterns
+---
+Implement API endpoints. Follow the conventions and patterns from the preloaded skills.
+```
+
+**Scope MCP server** — cấp cho subagent quyền dùng MCP server **không có** trong hội thoại chính:
+
+```yaml
+---
+name: browser-tester
+description: Tests features in a real browser using Playwright
+mcpServers:
+  - playwright:
+      type: stdio
+      command: npx
+      args: ['-y', '@playwright/mcp@latest']
+  - github
+---
+Use the Playwright tools to navigate, screenshot, and interact with pages.
+```
+
+**Memory bền vững** — cho một subagent tích luỹ kiến thức qua nhiều hội thoại:
+
+| Phạm vi   | Vị trí                               | Dùng khi                                                        |
+| --------- | ------------------------------------ | --------------------------------------------------------------- |
+| `user`    | `~/.claude/agent-memory/<name>/`     | Subagent nên nhớ điều học được **qua mọi project**              |
+| `project` | `.claude/agent-memory/<name>/`       | Kiến thức riêng project và **chia sẻ được qua version control** |
+| `local`   | `.claude/agent-memory-local/<name>/` | Kiến thức riêng project nhưng **không nên commit**              |
+
+`project` là mặc định được khuyến nghị. Ba mẹo dùng: bảo subagent **tra memory trước khi bắt đầu** (_"Review this PR, and check your memory for patterns you've seen before"_), bảo nó **cập nhật memory sau khi xong**, và **đưa chỉ dẫn về memory thẳng vào system prompt**.
+
+### Luật có điều kiện bằng hook
+
+Hook khai trong frontmatter của subagent **chỉ áp trong lúc subagent đó chạy** — đây là cách gắn lan can cho một worker cụ thể:
+
+```yaml
+---
+name: db-reader
+description: Execute read-only database queries
+tools: Bash
+hooks:
+  PreToolUse:
+    - matcher: 'Bash'
+      hooks:
+        - type: command
+          command: './scripts/validate-readonly-query.sh'
+---
+```
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+
+# Chặn thao tác ghi SQL
+if echo "$COMMAND" | grep -iE '\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE)\b' > /dev/null; then
+  echo "Blocked: Only SELECT queries are allowed" >&2
+  exit 2
+fi
+
+exit 0
+```
+
+---
+
+## Subagent thấy gì lúc khởi động
+
+| Thành phần            | Mô tả                                                                                                 |
+| --------------------- | ----------------------------------------------------------------------------------------------------- |
+| **System prompt**     | Prompt của chính agent cộng chi tiết môi trường — **không** phải system prompt đầy đủ của Claude Code |
+| **Task message**      | Prompt giao việc mà Claude viết khi chuyển việc                                                       |
+| **File `CLAUDE.md`**  | Mọi cấp trong hệ thống `CLAUDE.md` mà hội thoại chính nạp (**trừ `Explore` và `Plan`**)               |
+| **Git status**        | Ảnh chụp lúc phiên cha bắt đầu (**không có** với `Explore` và `Plan`)                                 |
+| **Skill nạp trước**   | Nội dung đầy đủ của skill khai ở trường `skills`                                                      |
+| **Danh sách sibling** | System reminder liệt kê `main` và mọi agent có tên trong phiên                                        |
+
+**Ba thứ không bao giờ tới được một subagent không phải fork:** output style, auto memory (trừ khi subagent có phạm vi memory riêng), và kích thước context window.
+
+---
+
+## Foreground hay background
+
+**Foreground subagent** chặn hội thoại chính tới khi xong, và prompt hỏi quyền được chuyển thẳng cho bạn ngay.
+
+**Background subagent** chạy đồng thời trong lúc bạn làm việc tiếp; prompt hỏi quyền **hiện trong phiên chính của bạn, kèm tên subagent** — duyệt để nó tiếp tục, hoặc bấm `Esc` để từ chối lời gọi tool đó.
+
+Claude Code quyết định theo thứ tự ưu tiên:
+
+1. Nếu một thành viên agent team in-process sinh ra nó → **foreground**
+2. Nếu `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` → **foreground**
+3. Nếu fork mode bật → **background** (mặc định ở phiên tương tác)
+4. Nếu fork mode tắt → **background** mặc định, **foreground khi Claude cần kết quả**
+
+Khi một background subagent xong, Claude Code gỡ dòng của nó ngay, rồi hiện `/tasks to see subagents` ở footer trong **30 giây**. Chạy `/tasks` rồi bấm `Enter` trên subagent để mở transcript của nó.
+
+## Fork: subagent kế thừa cả hội thoại
+
+**Fork** là một subagent đặc biệt **kế thừa toàn bộ hội thoại tới hiện tại** thay vì bắt đầu từ context rỗng.
+
+|                           | Fork                           | Subagent thường                          |
+| ------------------------- | ------------------------------ | ---------------------------------------- |
+| **Context**               | Toàn bộ lịch sử hội thoại      | Context mới với prompt bạn truyền vào    |
+| **System prompt và tool** | Giống phiên chính              | Từ file định nghĩa của subagent          |
+| **Model**                 | Giống phiên chính              | Từ trường `model` của subagent           |
+| **Permission**            | Prompt hiện ở terminal của bạn | Prompt hiện ở phiên chính (khi chạy nền) |
+| **Prompt cache**          | **Dùng chung** với phiên chính | Cache riêng                              |
+
+> **Vì fork dùng lại prompt cache của phiên cha, fork rẻ hơn sinh một subagent mới** cho những task cần đúng ngữ cảnh đó. Đây là hệ quả trực tiếp của phần 3.
+
+Khởi động một fork bằng `/subtask`:
+
+```text
+/subtask draft unit tests for the parser changes so far
+```
+
+**Fork mode bật mặc định ở phiên tương tác.** Khi bật, Claude sinh fork được bằng cách yêu cầu loại subagent `fork`, và **mọi subagent được sinh ra đều chạy ở nền**. Ghi đè bằng `CLAUDE_CODE_FORK_SUBAGENT=1` (bật ở chế độ non-interactive) hoặc `=0` (tắt ở mọi nơi). Muốn ngăn Claude sinh fork mà vẫn giữ fork mode thì deny `Agent(fork)`.
+
+## Ba cách gọi subagent
+
+**1. Ngôn ngữ tự nhiên** — nêu tên, Claude tự quyết có giao việc không:
+
+```text
+Use the test-runner subagent to fix failing tests
+```
+
+**2. `@`-mention** — **đảm bảo** subagent đó chạy:
+
+```text
+@"code-reviewer (agent)" look at the auth changes
+```
+
+Hoặc gõ tay: `@agent-code-reviewer` cho subagent local, `@agent-my-plugin:code-reviewer` cho subagent của plugin.
+
+**3. Cả phiên dùng subagent đó:**
+
+```bash
+claude --agent code-reviewer
+```
+
+## Resume, lồng nhau, và giới hạn
+
+**Mỗi lần gọi subagent tạo một instance mới với context sạch.** Muốn tiếp tục việc đang dở thì nói tiếp trong hội thoại — Claude dùng tool `SendMessage` để resume với đầy đủ ngữ cảnh từ cuộc hội thoại trước của subagent đó.
+
+**Transcript của subagent tồn tại độc lập** với hội thoại chính: **không bị ảnh hưởng bởi compaction**, lưu ở file riêng, resume được sau khi khởi động lại Claude Code, và bị xoá sau thời hạn `cleanupPeriodDays`.
+
+**Subagent lồng nhau:** mặc định một subagent sinh subagent của riêng nó được, **tới ba tầng dưới hội thoại chính**. Tới giới hạn thì tool `Agent` bị thu hồi. Đổi giới hạn bằng `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`; đặt `1` để tắt hẳn việc lồng.
+
+**Giới hạn đồng thời:** mặc định khi **20 subagent đang chạy**, sinh thêm sẽ fail với `Concurrent subagent limit reached`. Đổi bằng `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`.
+
+---
+
+## Agent view: một màn hình cho nhiều phiên nền
+
+```bash
+claude agents
+```
+
+Từ trong một phiên `claude` thường, **bấm `←` khi ô nhập rỗng** để đẩy nó xuống nền và mở agent view trong một bước.
+
+### Trạng thái phiên
+
+| Trạng thái     | Icon     | Nghĩa                                           |
+| -------------- | -------- | ----------------------------------------------- |
+| Working        | `✽` động | Claude đang chạy tool hoặc đang sinh nội dung   |
+| Needs input    | `✻` vàng | Đang chờ câu trả lời, quyền, hoặc input của bạn |
+| Idle           | `∙` mờ   | Sẵn sàng nhận prompt tiếp                       |
+| Completed      | Xanh lá  | Task xong thành công                            |
+| Failed         | Đỏ       | Task kết thúc với lỗi                           |
+| Stopped        | Xám      | Phiên bị dừng bằng `Ctrl+X`                     |
+| Loop/scheduled | `✢`      | Phiên `/loop` đang chạy, kèm đồng hồ đếm        |
+
+Mỗi dòng hiện: **tên** · **hoạt động** · **tuổi** · **pull request** (nếu có).
+
+### Phím tắt
+
+| Phím                  | Tác dụng                                                        |
+| --------------------- | --------------------------------------------------------------- |
+| `↑` / `↓`             | Di chuyển giữa các dòng                                         |
+| `Enter`               | Attach vào phiên đang chọn, hoặc **dispatch** nếu ô nhập có chữ |
+| `Space`               | Mở/đóng **peek panel** cho phiên đang chọn                      |
+| `Shift+Enter`         | Dispatch rồi attach ngay                                        |
+| `→`                   | Attach vào phiên đang chọn                                      |
+| `Alt+1`–`9`           | Attach vào phiên 1–9 trong thư mục đó                           |
+| `Ctrl+S`              | Đổi cách nhóm: theo trạng thái ↔ theo thư mục                   |
+| `Ctrl+T`              | Ghim/bỏ ghim phiên — **giữ nó chạy dù đang idle**               |
+| `Ctrl+R`              | Đổi tên phiên                                                   |
+| `Ctrl+G`              | Sửa prompt dispatch trong `$VISUAL` hoặc `$EDITOR`              |
+| `Ctrl+X`              | Dừng phiên; bấm lại trong 2 giây để **xoá**                     |
+| `Shift+↑` / `Shift+↓` | Đổi thứ tự phiên                                                |
+| `?`                   | Hiện toàn bộ phím tắt                                           |
+
+### Dispatch một phiên
+
+Gõ mô tả task rồi bấm `Enter`. **Mỗi prompt khởi động một phiên độc lập mới**; gõ nhiều prompt là chạy chúng song song.
+
+| Input                       | Tác dụng                                                       |
+| --------------------------- | -------------------------------------------------------------- |
+| `<agent-name> <prompt>`     | Chạy một subagent tuỳ biến làm agent chính                     |
+| `@<agent-name>`             | Mention một subagent ở bất kỳ đâu để chạy nó                   |
+| `@<repo>`                   | Mention một repository để chạy phiên ở đó                      |
+| `/<command>`                | Gợi ý skill và command                                         |
+| `! <command>`               | Chạy lệnh shell như một background job (**không** phải Claude) |
+| `#<number>` hoặc URL của PR | Chọn phiên sẵn có đang làm PR đó                               |
+
+Lọc thay vì dispatch: `a:<name>` (phiên đang chạy agent có tên đó), `s:<state>` (phiên ở trạng thái đó, ví dụ `s:working`), `#<number>`, hoặc một URL.
+
+Từ trong một phiên: `/bg` đẩy xuống nền và giải phóng terminal; `/fork` copy phiên xuống nền và **bạn làm việc tiếp ở đây**.
+
+Từ shell:
+
+```bash
+claude --bg "fix the auth bug"
+claude --bg --name "auth-fix" "fix the auth bug"
+claude --bg --agent code-reviewer "review PR"
+claude --bg --exec 'pytest -x'
+```
+
+### Peek panel và attach
+
+Bấm `Space` trên một dòng để mở **peek panel**: nó hiện đầy đủ text bị cắt của dòng đó, câu hỏi Claude đang hỏi nếu phiên đang bị chặn, danh sách PR liên kết, và thời gian đã chờ. Trả lời ngay trong peek bằng cách gõ rồi `Enter`; nếu có lựa chọn sẵn thì bấm phím số; thêm tiền tố `!` để gửi lệnh Bash.
+
+Bấm `Enter` hoặc `→` để **attach** — phiên chiếm terminal như một phiên tương tác đầy đủ, luôn render ở chế độ fullscreen. Detach bằng `←`, `Ctrl+Z`, `/exit`, hoặc `Ctrl+C` hai lần. **Detach không bao giờ dừng phiên nền** — nó vẫn chạy.
+
+### Worktree tự động
+
+**Phiên nền tự chuyển vào git worktree cô lập** (`.claude/worktrees/`) **trước khi sửa file**, nên các phiên song song không xung đột. Bỏ qua khi: phiên đã ở trong một worktree liên kết, thư mục không phải git repo, hoặc lần ghi nằm ngoài thư mục làm việc.
+
+Tắt việc cô lập:
+
+```json
+{
+  "worktree": {
+    "bgIsolation": "none"
+  }
+}
+```
+
+**Cái gì còn lại sau khi phiên kết thúc:** commit được tạo và push (nếu repo có remote); draft PR được mở nếu task cần; và **công việc vẫn còn dù phiên bị xoá**.
+
+> **Cẩn thận khi xoá phiên:** xoá từ agent view **gỡ luôn worktree và các thay đổi chưa commit**. Còn `claude rm` thì **giữ worktree nếu còn thay đổi chưa commit**. Cả hai đều giữ worktree có commit chưa push. **Hãy commit trước khi xoá một phiên đã sửa file.**
+
+### Quản lý từ shell
+
+```bash
+claude agents --json --all      # Liệt kê dạng JSON, gồm cả phiên đã xong
+claude attach <id>
+claude logs <id>                # In output gần đây
+claude stop <id>
+claude respawn <id>             # Khởi động lại, giữ nguyên hội thoại
+claude rm <id>                  # Gỡ khỏi danh sách, transcript vẫn giữ
+claude daemon status
+```
+
+### Tiến trình supervisor
+
+Phiên nền được host bởi một **tiến trình supervisor theo từng user**. Nó tự khởi động ở lần đầu bạn chạy `claude --bg` hoặc `claude agents`, giữ **một worker được làm nóng sẵn** để dispatch nhanh, xác thực bằng credential đã lưu, tự khởi động lại vào version mới khi Claude Code cập nhật, **dừng các phiên idle không được ghim sau khoảng một giờ**, và **giữ phiên sống qua lúc máy sleep**.
+
+Hai điều supervisor **không** kế thừa từ shell dispatch: biến gateway kiểu `ANTHROPIC_BASE_URL` (trừ khi supervisor khởi động trong cùng môi trường), và việc chọn provider khi dispatch sang thư mục khác. Nó **có** kế thừa `PATH`.
+
+Trạng thái lưu ở `~/.claude/daemon.log`, `~/.claude/daemon/roster.json`, và `~/.claude/jobs/<id>/`.
+
+### Cái gì theo bạn xuống nền
+
+Khi bạn đẩy một phiên xuống nền, những thứ này **đi theo và tiếp tục chạy**: lệnh shell nền, subagent nền, dynamic workflow, scheduled task tạo bằng `/loop`, và monitor.
+
+Cấu hình được giữ: permission mode, model và effort level, MCP server, settings, fallback model, thư mục thêm bằng `/add-dir`.
+
+### Ba giới hạn
+
+- **Rate limit vẫn áp dụng** — 10 agent song song ngốn quota nhanh gấp khoảng 10 lần.
+- **Phiên là cục bộ** — chúng chạy trên máy bạn và **dừng khi máy tắt** (nhưng sống qua lúc sleep).
+- **Xoá phiên trong agent view xoá luôn worktree** — commit trước khi xoá.
+
+---
+
+## Kiểm tra việc đang chạy
+
+Lệnh phụ thuộc bạn dùng cách nào:
+
+| Bạn dùng                                | Kiểm bằng                                                                                            |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Phiên nền                               | `claude agents` — một màn hình hiện mọi phiên, trạng thái, và cái nào cần bạn                        |
+| Subagent trong phiên hiện tại           | Subagent nền có tên hiện trong typeahead của `@`-mention kèm trạng thái                              |
+| Bất cứ gì chạy nền trong phiên hiện tại | `/tasks` — liệt kê từng mục, cho bạn kiểm, attach, hoặc dừng. Gồm cả subagent đã xong                |
+| Dynamic workflow                        | `/workflows` — liệt kê run đang chạy và đã xong, phase của mỗi cái, và bao nhiêu agent đã hoàn thành |
+
+> Một chỗ dễ nhầm tên: **`/agents` khác `claude agents`.** Từ v2.1.198, `/agents` **không** mở panel nào nữa — nó chỉ in ra lời nhắc về vị trí file subagent.
+
+## Hai subagent mẫu
+
+**Code reviewer:**
+
+```markdown
+---
+name: code-reviewer
+description: Expert code review specialist. Proactively reviews code for quality, security, and maintainability. Use immediately after writing or modifying code.
+tools: Read, Grep, Glob, Bash
+model: inherit
+---
+
+You are a senior code reviewer ensuring high standards of code quality and security.
+
+When invoked:
+
+1. Run git diff to see recent changes
+2. Focus on modified files
+3. Begin review immediately
+
+Review checklist:
+
+- Code is clear and readable
+- No duplicated code
+- Proper error handling
+- No exposed secrets or API keys
+- Input validation implemented
+- Good test coverage
+
+Provide feedback organized by priority:
+
+- Critical issues (must fix)
+- Warnings (should fix)
+- Suggestions (consider improving)
+```
+
+**Debugger:**
+
+```markdown
+---
+name: debugger
+description: Debugging specialist for errors, test failures, and unexpected behavior. Use proactively when encountering any issues.
+tools: Read, Edit, Bash, Grep, Glob
+---
+
+You are an expert debugger specializing in root cause analysis.
+
+When invoked:
+
+1. Capture error message and stack trace
+2. Identify reproduction steps
+3. Isolate the failure location
+4. Implement minimal fix
+5. Verify solution works
+
+For each issue, provide:
+
+- Root cause explanation
+- Evidence supporting the diagnosis
+- Specific code fix
+- Testing approach
+
+Focus on fixing the underlying issue, not the symptoms.
+```
+
+## Sáu best practice
+
+- **Thiết kế subagent có trọng tâm** — mỗi cái giỏi đúng một việc
+- **Viết `description` chi tiết** — Claude dùng nó để quyết định khi nào giao việc
+- **Giới hạn quyền truy cập tool** — chỉ cấp thứ cần thiết
+- **Commit subagent cấp project** vào version control để chia sẻ với team
+- **Dùng phạm vi memory `project`** để kiến thức của subagent chia sẻ được
+- **Bảo subagent tra và cập nhật memory** — trước khi bắt đầu và sau khi xong
+
+## Nguồn
+
+- [Create custom subagents](https://code.claude.com/docs/en/sub-agents)
+- [Run agents in parallel](https://code.claude.com/docs/en/agents)
+- [Manage multiple agents with agent view](https://code.claude.com/docs/en/agent-view)
+
+Docs gốc cập nhật thường xuyên; khi có mâu thuẫn, tin bản tiếng Anh.

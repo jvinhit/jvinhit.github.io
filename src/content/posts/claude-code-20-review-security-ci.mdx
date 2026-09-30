@@ -1,0 +1,496 @@
+---
+title: 'Claude Code từ zero đến thành thạo · Phần 20 — Code review, security và CI'
+description: 'Bốn lớp kiểm tra chất lượng: /code-review cục bộ, ultrareview trên cloud, plugin security-guidance chạy ngầm ba tầng, và Code Review trên PR. Cộng GitHub Actions và cách cấu hình cho monorepo.'
+pubDate: 2026-09-25
+lang: vi
+tags: [claude-code, ai, agent, cli, productivity]
+series: claude-code
+seriesOrder: 20
+draft: false
+---
+
+Phần 10 nói nguyên tắc: **cho Claude một cách tự kiểm chứng**. Bài này là các công cụ hiện thực nguyên tắc đó, xếp theo thứ tự **càng sớm càng tốt**.
+
+| Giai đoạn                  | Công cụ                        | Phủ cái gì                                                             |
+| -------------------------- | ------------------------------ | ---------------------------------------------------------------------- |
+| **Trong phiên**            | Plugin `security-guidance`     | Lỗ hổng phổ biến trong code Claude vừa viết, sửa ngay trong cùng phiên |
+| **Theo yêu cầu, một lượt** | `/security-review`             | Một lượt quét bảo mật trên branch hiện tại                             |
+| **Theo yêu cầu, quét sâu** | Plugin Claude Security         | Quét lỗ hổng đa agent cả repository                                    |
+| **Cục bộ trước khi push**  | `/code-review`                 | Lỗi đúng-sai và chỗ dọn được trong diff                                |
+| **Trước khi merge**        | `/code-review ultra`           | Review sâu trên cloud, mọi phát hiện được kiểm chứng độc lập           |
+| **Trên pull request**      | Code Review (Team/Enterprise)  | Review đa agent với ngữ cảnh cả codebase                               |
+| **Trong CI**               | Static analysis sẵn có của bạn | Luật theo ngôn ngữ, kiểm tra supply chain                              |
+
+---
+
+## `/code-review` cục bộ
+
+```text
+/code-review
+```
+
+Nó review **các commit của branch bạn vượt trước upstream, cộng mọi thay đổi chưa commit** — nên cần có việc trên branch hoặc trong working tree mới có gì để báo. Muốn review thứ khác thì truyền một target: đường dẫn file, số PR, tên branch, hoặc một dải ref như `main...my-feature`.
+
+Ba cờ:
+
+- `--fix` — áp dụng phát hiện vào working tree sau khi review
+- `--comment` — đăng phát hiện thành inline comment trên PR
+- `--post` — với một `ultra` cloud review trên PR của `github.com`, chọn sẵn việc đăng phát hiện lên PR
+
+Review **chạy như một background subagent với context window riêng**, nên nó không làm đầy hội thoại của bạn. Phát hiện tới hội thoại khi review xong.
+
+### Điều chỉnh effort
+
+Truyền một effort level để đổi giữa **độ phủ và độ tự tin**: ở `low` và `medium`, review chỉ báo những phát hiện nó tự tin nhất, nên bạn thấy ít false positive; `high` tới `max` mở rộng độ phủ và **có thể kèm những phát hiện nó chắc ít hơn**.
+
+> Khi bạn **không** gõ mức, review **dùng lại mức từ `low` tới `max` bạn gõ lần trước**, kể cả từ một phiên trước đó, và Claude Code hiện thông báo kiểu `Reusing high effort, the level you typed last time`. Gõ một mức để đổi thứ các lần sau dùng lại.
+
+Hai điều đáng biết về cách nó đọc phần còn lại của dòng: **không có `ultra`** thì mọi thứ còn lại là **review target**, kể cả khi nó bắt đầu bằng tên một lệnh khác — `/code-review /fix-issue 123` review với `/fix-issue 123` **làm text target** chứ không nạp `/fix-issue` thành skill thứ hai. **Có `ultra`** thì Claude Code đọc một từ đơn là base branch hoặc số PR, còn text dài hơn không phải tên branch/PR thì thành **một ghi chú gắn vào review**.
+
+### Nó đọc gì và sửa gì
+
+Review theo `CLAUDE.md` của bạn như mọi phiên Claude Code, **nhưng nó không đọc `REVIEW.md`** (file đó chỉ dành cho Code Review trên PR).
+
+> **Một background review áp các lần sửa `--fix` ngoài checkpoint của phiên bạn**, nên `/rewind` **không** hoàn tác chúng — dùng git để revert. Khi review chạy ở foreground thì nó sửa working tree trong chính lượt của bạn, nên `/rewind` khôi phục được.
+
+Review chạy ở foreground trong ba trường hợp: bạn chạy `/code-review` lần nữa khi một review trước còn đang chạy; bạn chạy ở chế độ non-interactive; hoặc bạn đặt `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`.
+
+### Claude tự khởi động review
+
+Claude tự chạy `/code-review` được — bảo nó review thay đổi của bạn bằng lời thường là đủ. Muốn ngăn cả Claude lẫn scheduled task khởi động review mà vẫn giữ `/code-review` cho bạn tự gõ:
+
+```json
+{
+  "skillOverrides": {
+    "code-review": "user-invocable-only"
+  }
+}
+```
+
+---
+
+## `/code-review ultra` — ultrareview
+
+**Ultrareview là một review sâu chạy trên hạ tầng Claude Code on the web.** Claude Code khởi động **một đội agent reviewer trong một sandbox từ xa**.
+
+So với `/code-review` cục bộ, nó cho ba thứ:
+
+- **Tín hiệu cao hơn** — **mọi phát hiện được tái hiện và kiểm chứng độc lập**, nên kết quả tập trung vào bug thật chứ không phải gợi ý style
+- **Độ phủ rộng hơn** — một đội reviewer lớn hơn khám phá thay đổi song song
+- **Không tốn tài nguyên máy bạn** — review chạy hoàn toàn trong sandbox từ xa
+
+```text
+/code-review ultra              # branch hiện tại so với default branch
+/code-review ultra develop      # so với một base khác
+/code-review ultra 1234         # review một pull request
+/code-review ultra check my auth changes   # kèm một ghi chú
+```
+
+**Không tham số thì nó review diff giữa branch hiện tại và default branch, gồm cả thay đổi chưa commit và đã stage.** Với review branch, Claude Code **đóng gói trạng thái repository và upload lên sandbox từ xa**; với review một PR thì nó **không upload gì từ máy bạn** — sandbox clone thẳng PR từ host.
+
+Trước khi khởi động, Claude Code hiện hộp thoại xác nhận với **phạm vi review, số lượt chạy miễn phí còn lại, và chi phí ước tính**.
+
+> Lệnh này **chỉ chạy khi bạn tự gọi**; Claude không tự khởi động ultrareview.
+
+### Giới hạn diff
+
+- **Diff quá lớn** — review branch nhận tối đa **500 file đổi và 8.000 dòng đổi** mặc định. Lời từ chối nêu rõ giá trị đang có hiệu lực, kích thước diff của bạn, và **các file có nhiều dòng đổi nhất**.
+- **Không có gì để review** — khi diff so với base là rỗng, Claude Code nói vậy và gợi ý stage hoặc commit các sửa đổi cục bộ.
+- **Không có merge base** — khi branch của bạn **không chung lịch sử** với base branch, Claude Code **lùi về review mọi file được track trong repository**.
+
+Nếu repo quá lớn để đóng gói, Claude Code nhắc bạn dùng PR mode: push branch, mở một draft PR, rồi chạy `/code-review ultra <PR-number>`.
+
+### Đăng phát hiện lên PR
+
+Với PR trên `github.com`, bạn cho Claude **đăng phát hiện lên PR thành một comment thường từ chính tài khoản GitHub của bạn**. Comment đó **không phải một review và không phải một approval**, và nó kết bằng ghi chú "Generated by Claude Code".
+
+> **Claude Code không bao giờ đăng trừ khi bạn chọn ở lượt chạy đó**, và `--no-post` là mặc định.
+>
+> Ở phiên tương tác, Claude Code bắt đầu việc đăng **khi phát hiện tới** — nên **giữ phiên mở tới khi review xong**. Nếu phiên kết thúc trước, Claude Code **không đăng gì**, kể cả khi bạn resume hội thoại sau đó.
+
+### Chi phí
+
+Ultrareview **tính vào usage credit chứ không vào phần usage bao gồm trong gói**.
+
+| Gói                | Lượt chạy miễn phí | Sau đó                 |
+| ------------------ | ------------------ | ---------------------- |
+| Pro                | **3 lượt**         | Tính theo usage credit |
+| Max                | **3 lượt**         | Tính theo usage credit |
+| Team và Enterprise | **không có**       | Tính theo usage credit |
+
+Ba lượt miễn phí của Pro và Max là **một suất duy nhất cho mỗi tài khoản và không làm mới**. Sau đó, **thường 5–25 USD** mỗi review tuỳ kích thước thay đổi.
+
+> **Một lượt chạy bị tính khi phiên cloud khởi động.** Một review bạn dừng sớm hoặc fail giữa đường **vẫn dùng một lượt miễn phí**; một review trả tiền chỉ bị tính cho phần đã chạy.
+
+Review thường mất **5–10 phút**. Dùng `/tasks` để xem review đang chạy và đã xong, mở chi tiết, hoặc dừng một cái đang chạy. **Dừng thì Claude Code lưu trữ phiên cloud và không trả về phát hiện dở dang.**
+
+### Chạy từ CI
+
+```bash
+claude ultrareview
+claude ultrareview 1234
+claude ultrareview origin/main
+```
+
+Subcommand này **chặn tới khi review từ xa xong và in phát hiện ra stdout**. Bốn cờ: `--json` in payload `bugs.json` thô; `--timeout <minutes>` mặc định 30; `--post` và `--no-post` (mặc định).
+
+**Thông báo tiến trình và URL phiên đi ra stderr để stdout còn parse được.** Exit code: **0** khi review xong dù có hay không có phát hiện, **1** khi không khởi động được / phiên cloud lỗi / hết timeout, **130** khi bị ngắt bằng Ctrl-C. _Review từ xa vẫn tiếp tục chạy nếu bạn ngắt subcommand._
+
+### So sánh
+
+|           | `/code-review`                                   | `/code-review ultra`                                |
+| --------- | ------------------------------------------------ | --------------------------------------------------- |
+| Target    | Diff đang làm, một PR, một branch, hoặc một path | Diff đang làm hoặc một PR                           |
+| Chạy ở    | **Cục bộ** trong phiên của bạn                   | **Từ xa** trong sandbox cloud                       |
+| Độ sâu    | Co giãn theo effort                              | Đội đa agent **có kiểm chứng độc lập**              |
+| Thời gian | Giây tới vài phút                                | **Khoảng 5–10 phút**                                |
+| Chi phí   | Tính vào usage thường                            | Lượt miễn phí, rồi **5–25 USD** mỗi review          |
+| Hợp với   | Phản hồi nhanh trong lúc lặp                     | **Sự tự tin trước khi merge** trên thay đổi đáng kể |
+
+---
+
+## Plugin `security-guidance`
+
+Plugin này bắt Claude **review chính code nó vừa viết** để tìm lỗ hổng trong lúc làm việc, và **sửa thứ nó tìm thấy ngay trong cùng phiên**.
+
+```text
+/plugin install security-guidance@claude-plugins-official
+```
+
+Cài xong thì **plugin tự chạy — không có gì để gọi và không có lệnh riêng nào phải nhớ**.
+
+Nó cần Python 3.7 trở lên trên `PATH` (**review commit dạng agentic cần Python 3.10+**), và một git repository. Lần chạy đầu nó tạo một virtualenv ở `~/.claude/security/` và cài Claude Agent SDK vào đó.
+
+Plugin **user-scope không đi theo vào Claude Code on the web**. Muốn bật ở đó, hoặc bật cho mọi người clone repo, thì khai trong settings đã commit:
+
+```json
+{
+  "enabledPlugins": {
+    "security-guidance@claude-plugins-official": true
+  }
+}
+```
+
+### Ba tầng kiểm tra
+
+**1. Mỗi lần sửa file** — quét nội dung mới tìm pattern rủi ro đã biết. Đây là **khớp chuỗi, không có lời gọi model, nên không tốn chi phí usage nào**. Nhóm pattern: thực thi code động (`eval(`, `new Function`, `os.system`, `child_process.exec`); deserialize không an toàn (`pickle`); DOM injection (`dangerouslySetInnerHTML`, `.innerHTML =`, `document.write`); và **sửa file dưới `.github/workflows/`**, vốn cấp được quyền ở mức repository.
+
+Mỗi cảnh báo **kích hoạt một lần cho mỗi pattern, mỗi file, mỗi phiên**, nên các lần khớp lặp trong cùng file không làm ngập hội thoại.
+
+**2. Cuối mỗi lượt** — plugin tính git diff của **mọi thứ đã đổi trong working tree suốt lượt đó**, gồm cả thay đổi từ tool sửa file của Claude, lệnh Bash, và subagent, rồi gửi tới **một lượt review Claude riêng** tập trung vào bảo mật. Review chạy ở nền nên phản hồi của Claude không bị chậm. Tìm thấy vấn đề thì **Claude được prompt lại với các phát hiện** và xử lý chúng như một việc tiếp theo.
+
+Tầng này bắt được thứ mà khớp chuỗi không bắt được: **authorization bypass, insecure direct object reference, injection, SSRF, và cryptography yếu**. Nó phủ **tối đa 30 file đổi mỗi lượt** và kích hoạt **nhiều nhất ba lần liên tiếp** trước khi nhường lại cho bạn.
+
+**3. Mỗi lần Claude commit hoặc push** — một review agentic **sâu hơn**, đọc code xung quanh gồm cả caller, sanitizer, và các file liên quan, để **quyết định một phát hiện có thật hay không trước khi báo**. Ngữ cảnh thêm đó giữ false positive thấp với các pattern trông nguy hiểm khi đứng riêng nhưng an toàn trong codebase của bạn.
+
+> Tầng này **chỉ kích hoạt với commit và push Claude thực hiện qua tool Bash của nó.** Commit bạn tự chạy từ shell của mình, **kể cả qua shell escape `!` trong phiên, không được review.** Giới hạn **20 lần mỗi giờ trượt**.
+
+### Tính độc lập của review
+
+> **Plugin không nhờ chính instance Claude đã viết code tự cho điểm mình.** Kiểm tra mỗi lần sửa là khớp chuỗi tất định không có model. Review cuối lượt và review commit chạy như **một lời gọi Claude riêng với context mới và một prompt tập trung vào bảo mật**: reviewer bắt đầu từ diff, **không có đầu tư gì vào cách tiếp cận ban đầu**, và chỉ được chỉ dẫn đi tìm vấn đề.
+>
+> Nhưng **không tầng nào chặn việc ghi hay commit**. Phát hiện tới tay Claude đang viết dưới dạng chỉ dẫn, và **model review vẫn có thể bỏ sót**. Hãy coi plugin là **một lớp trong phòng thủ nhiều lớp**, không phải một giải pháp bảo mật hoàn chỉnh.
+
+### Thêm luật của riêng bạn
+
+Hai điểm mở rộng, **cả hai chỉ cộng thêm — bạn thêm được kiểm tra nhưng không tắt được kiểm tra dựng sẵn từ các file này**.
+
+**Hướng dẫn cho các review dùng model** — tạo `.claude/claude-security-guidance.md`:
+
+```markdown
+# Security guidance for this repo
+
+- Do not log `customer_id` or `account_number` at INFO level or above.
+- All routes under `/admin` must call `require_role("admin")` before any database read.
+- Use `crypto.timingSafeEqual` for token comparison instead of `===`.
+```
+
+**Pattern riêng cho kiểm tra mỗi lần sửa** — tạo `.claude/security-patterns.yaml`:
+
+```yaml
+patterns:
+  - rule_name: internal_api_key
+    substrings: ['sk_live_', 'AKIA']
+    reminder: 'Hardcoded API key prefix. Load credentials from the secret manager.'
+  - rule_name: tenant_unfiltered_query
+    regex: "\\.objects\\.all\\(\\)"
+    paths: ['**/src/tenants/**']
+    reminder: 'Multi-tenant code must filter by org_id.'
+```
+
+| Trường          | Mô tả                                                                                                                 |
+| --------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `rule_name`     | Định danh hiện trong cảnh báo                                                                                         |
+| `reminder`      | Text cảnh báo nối vào context của Claude, **giới hạn 1 KB**                                                           |
+| `regex`         | Regex Python khớp với nội dung đã sửa                                                                                 |
+| `substrings`    | Danh sách chuỗi con nguyên văn; dùng cái này **hoặc** `regex`                                                         |
+| `paths`         | Glob tuỳ chọn; luật chỉ áp cho file khớp. **Glob khớp với đường dẫn đầy đủ**, nên tiền tố `**/` cho pattern tương đối |
+| `exclude_paths` | Glob tuỳ chọn để bỏ qua                                                                                               |
+
+Plugin nạp **tối đa 50 luật riêng** và **bỏ qua các regex trông dễ gây catastrophic backtracking**. File `.yaml` cần PyYAML import được — **plugin không cài nó hộ bạn**; dùng `.json` nếu không có.
+
+Ba vị trí file luật, **nạp tất cả những cái tồn tại rồi nối lại, tổng giới hạn 8 KB**: `~/.claude/` (mọi project), `.claude/` (commit theo repo), và `.claude/*.local.md` (override cá nhân, nhớ gitignore).
+
+### Chi phí và cách tắt
+
+Kiểm tra mỗi lần sửa **không tốn gì**. Review cuối lượt và review commit tốn thêm usage model. Cả hai dùng **Claude Opus 4.7 mặc định**; đổi bằng `SECURITY_REVIEW_MODEL` và `SG_AGENTIC_MODEL`.
+
+| Biến                            | Tắt cái gì                   |
+| ------------------------------- | ---------------------------- |
+| `ENABLE_PATTERN_RULES=0`        | Kiểm tra pattern mỗi lần sửa |
+| `ENABLE_STOP_REVIEW=0`          | Review diff cuối lượt        |
+| `ENABLE_COMMIT_REVIEW=0`        | Review commit và push        |
+| `ENABLE_CODE_SECURITY_REVIEW=0` | **Mọi** review dùng model    |
+| `SECURITY_GUIDANCE_DISABLE=1`   | Tắt hẳn plugin mà không gỡ   |
+
+**Plugin được xây hoàn toàn trên hook** — nếu bạn tự viết hook thì source của nó là một ví dụ chạy thật về việc gọi một model riêng từ hook rồi đưa kết quả về phiên:
+
+| Hook event                                                     | Mục đích                                                   |
+| -------------------------------------------------------------- | ---------------------------------------------------------- |
+| `SessionStart`                                                 | Bootstrap môi trường Python của plugin                     |
+| `UserPromptSubmit`                                             | Chụp baseline working tree để review cuối lượt diff với nó |
+| `PostToolUse` trên `Edit`, `Write`, `NotebookEdit`             | Khớp pattern mỗi lần sửa                                   |
+| `Stop`                                                         | Review diff cuối lượt, chạy ở nền                          |
+| `PostToolUse` trên `Bash`, lọc theo `git commit` và `git push` | Review commit và push, chạy ở nền                          |
+
+Plugin ghi chẩn đoán runtime vào `~/.claude/security/log.txt` — **kiểm ở đó trước** nếu review không xuất hiện.
+
+---
+
+## Code Review trên pull request
+
+> Code Review là **research preview, dành cho gói Team và Enterprise**, và **không khả dụng cho tổ chức bật Zero Data Retention**. Trên gói khác bạn vẫn review diff cục bộ được bằng `/code-review`.
+
+Nó phân tích pull request GitHub và **đăng phát hiện thành inline comment ngay trên dòng code có vấn đề**. Một đội agent chuyên biệt xem xét thay đổi **trong ngữ cảnh cả codebase của bạn**.
+
+**Phát hiện được gắn nhãn mức nghiêm trọng và không approve cũng không block PR của bạn**, nên workflow review sẵn có không bị ảnh hưởng.
+
+| Dấu | Mức              | Nghĩa                                                         |
+| --- | ---------------- | ------------------------------------------------------------- |
+| 🔴  | **Important**    | Một bug nên sửa trước khi merge                               |
+| 🟡  | **Nit**          | Vấn đề nhỏ, đáng sửa nhưng không chặn                         |
+| 🟣  | **Pre-existing** | Một bug đã có trong codebase nhưng **không do PR này gây ra** |
+
+Ba chế độ kích hoạt, chọn theo từng repository: **một lần sau khi PR được tạo**; **sau mỗi lần push** (chạy nhiều review nhất và tốn nhất, nhưng tự resolve thread khi bạn sửa); và **manual** (chỉ chạy khi ai đó comment `@claude review`).
+
+| Lệnh comment            | Tác dụng                                                          |
+| ----------------------- | ----------------------------------------------------------------- |
+| `@claude review`        | Bắt đầu **một** review, **không** đăng ký PR vào các lần push sau |
+| `@claude review always` | Bắt đầu review **và** đăng ký PR vào review theo push từ đó       |
+| `@claude review once`   | Giống `@claude review`                                            |
+
+Phải đăng nó thành **top-level PR comment**, **đặt lệnh ở đầu comment**, và bạn phải có quyền owner/member/collaborator.
+
+### `CLAUDE.md` và `REVIEW.md`
+
+Code Review đọc **hai** file, khác nhau về mức ảnh hưởng:
+
+- **`CLAUDE.md`** — chỉ dẫn project dùng chung. Code Review đọc nó làm ngữ cảnh và **gắn nhãn các vi phạm mới xuất hiện là nit**. Việc này **hai chiều**: nếu PR của bạn làm một câu trong `CLAUDE.md` trở nên lỗi thời, Claude cũng chỉ ra rằng docs cần cập nhật.
+- **`REVIEW.md`** — chỉ dẫn **chỉ dành cho review**, được **tiêm thẳng vào mọi agent trong pipeline review với độ ưu tiên cao nhất**.
+
+> `REVIEW.md` **được dán nguyên văn**: cú pháp import `@` **không** được mở rộng, và file được nhắc tới **không** được đọc vào prompt. Hãy đặt luật bạn muốn cưỡng chế **trực tiếp trong file**.
+
+Bảy thứ đáng tinh chỉnh trong `REVIEW.md`: **định nghĩa lại 🔴 Important nghĩa là gì với repo của bạn**; **chặn số lượng nit** một review đăng; **luật bỏ qua** theo path và loại phát hiện; **kiểm tra riêng của repo**; **ngưỡng kiểm chứng** (ví dụ _"behavior claims need a `file:line` citation, not an inference from naming"_); **hành vi khi review lại** (ví dụ _"after the first review, suppress new nits and post Important findings only"_); và **hình dạng bản tóm tắt**.
+
+> **Độ dài có giá:** một `REVIEW.md` dài **làm loãng chính những luật quan trọng nhất**. Giữ nó ở mức các chỉ dẫn **đổi hành vi review**, và để ngữ cảnh project chung trong `CLAUDE.md`.
+
+Chi phí: **trung bình 15–25 USD mỗi review**, tính riêng qua usage credit và **không tính vào phần usage bao gồm trong gói**.
+
+### Check run và cổng CI
+
+**Check run luôn kết thúc với kết luận neutral nên nó không bao giờ block việc merge** qua branch protection rule. Muốn gate merge theo phát hiện thì đọc phân rã mức nghiêm trọng từ output của check run trong CI của bạn — dòng cuối của phần Details là **một comment máy đọc được**:
+
+```bash
+gh api repos/OWNER/REPO/check-runs/CHECK_RUN_ID \
+  --jq '.output.text | split("bughunter-severity: ")[1] | split(" -->")[0] | fromjson'
+```
+
+Nó trả về một object JSON đếm theo mức, ví dụ `{"normal": 2, "nit": 1, "pre_existing": 0}`. Khoá `normal` giữ số phát hiện Important; **giá trị khác 0 nghĩa là Claude tìm thấy ít nhất một bug đáng sửa trước khi merge**.
+
+> **Nút Re-run trong tab Checks của GitHub KHÔNG kích hoạt lại Code Review.** Dùng lệnh comment hoặc một lần push mới.
+
+---
+
+## GitHub Actions
+
+Khác Code Review — vốn là dịch vụ được quản — **GitHub Action là workflow bạn tự cấu hình trong repository**.
+
+Cách nhanh: chạy `/install-github-app` từ Claude Code. Nó cài Claude GitHub App, thêm secret xác thực, và chuẩn bị pull request chứa workflow. _Cần `gh` CLI đã xác thực và quyền admin trên repository._
+
+Secret được lưu tên `ANTHROPIC_API_KEY` (API key) hoặc `CLAUDE_CODE_OAUTH_TOKEN` (token gắn với subscription, sinh bằng `claude setup-token`).
+
+### Hai chế độ
+
+Action **tự phát hiện chế độ từ cấu hình workflow**:
+
+- **Interactive** — workflow **không** có input `prompt`. Claude chờ cụm kích hoạt, mặc định `@claude`, trong comment của issue/PR, trong một PR review, hoặc trong body/title của issue mới mở. **Tiến trình và kết quả hiện thành comment** trên issue hoặc PR đó.
+- **Automation** — workflow **có** input `prompt`. Claude chạy **không cần chờ mention**. Mặc định kết quả hiện trong log của workflow run chứ không thành comment.
+
+Workflow tối thiểu cho chế độ interactive:
+
+```yaml
+name: Claude Code
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+jobs:
+  claude:
+    if: contains(github.event.comment.body, '@claude')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+Bốn dòng không phải boilerplate: `id-token: write` **bắt buộc** cho xác thực GitHub App mặc định; `actions: read` cho Claude đọc kết quả CI trên PR; `actions/checkout` cấp cho Claude một bản copy repo để làm việc; và `if` **ngăn runner khởi động** trên các comment không mention `@claude`.
+
+### Hai lớp kiểm tra người kích hoạt
+
+Ở **cả hai** chế độ, Action chạy hai kiểm tra trên actor kích hoạt trước khi Claude bắt đầu, và **run fail khi một trong hai từ chối**:
+
+- **Quyền write** — với sự kiện issue và pull request, user kích hoạt **phải có quyền write** trên repository. Muốn cho một số user không có quyền write thì đặt `allowed_non_write_users` **và** truyền `github_token` của riêng bạn. Sự kiện không do user nào tạo, ví dụ trigger `schedule`, **bỏ qua kiểm tra này**.
+- **Actor là người** — ở **mọi** sự kiện, Action **từ chối actor là bot** trừ khi bạn liệt kê nó trong `allowed_bots` — điều này **ngăn bot kích hoạt Claude thành vòng lặp**. Kiểm tra này cũng áp cho scheduled run, mà GitHub gán cho một repository user, thường là người sửa `cron` gần nhất.
+
+### Input đáng nhớ
+
+| Tham số                           | Tác dụng                                                                                                   |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `prompt`                          | Chỉ dẫn cho Claude, dạng text thuần **hoặc một lời gọi skill**. Bỏ trống thì Claude phản hồi cụm kích hoạt |
+| `claude_args`                     | Tham số CLI truyền cho Claude Code                                                                         |
+| `plugin_marketplaces` / `plugins` | Danh sách marketplace và plugin cần cài trước khi chạy                                                     |
+| `settings`                        | Settings Claude Code, dạng chuỗi JSON hoặc đường dẫn file                                                  |
+| `trigger_phrase`                  | Cụm kích hoạt. Mặc định `@claude`                                                                          |
+| `github_token`                    | Bỏ trống thì Action xác thực **như Claude GitHub App**                                                     |
+
+`claude_args` nhận mọi tham số CLI của Claude Code:
+
+```yaml
+claude_args: '--max-turns 5 --model claude-sonnet-5'
+```
+
+### Hai lỗi hay gặp
+
+**Claude không phản hồi `@claude`** — kiểm GitHub App đã cài trên repository, workflow đã bật, secret đã đặt, và **comment chứa `@claude` như một từ trọn vẹn** (không phải `/claude` hay `@claude-bot`), và user comment **có quyền write**.
+
+**CI không chạy trên commit của Claude** — **GitHub không kích hoạt workflow trên commit tạo bằng `GITHUB_TOKEN` mặc định.** Nếu bạn truyền `github_token: ${{ secrets.GITHUB_TOKEN }}` cho Action thì **bỏ nó đi** để Action xác thực như Claude GitHub App, hoặc truyền token của một custom app.
+
+---
+
+## Cấu hình cho monorepo
+
+Codebase lớn có thể là một repo hàng triệu dòng, hoặc một monorepo nhiều package. Vấn đề: **các mặc định được tinh chỉnh cho project nhỏ sẽ làm đầy context window bằng chỉ dẫn và các lượt đọc file không liên quan tới task**.
+
+| Bạn muốn                                                                        | Dùng                                          |
+| ------------------------------------------------------------------------------- | --------------------------------------------- |
+| Chỉ nạp convention cho code bạn chạm tới                                        | **`CLAUDE.md` theo từng thư mục**             |
+| Loại `CLAUDE.md` của package bạn không bao giờ làm                              | `claudeMdExcludes`                            |
+| Chặn Claude mở build output, code sinh tự động, dependency vendored             | **`Read` deny rule** trong `permissions.deny` |
+| Tìm định nghĩa hoặc caller của một symbol qua language server thay vì quét file | Một **code intelligence plugin**              |
+| Chỉ checkout các thư mục một task cần khi Claude tạo worktree                   | `worktree.sparsePaths`                        |
+| Đọc và sửa package cạnh đó từ cùng một phiên                                    | `--add-dir` hoặc `additionalDirectories`      |
+| Cấp cho Claude quy trình riêng của một vùng, nạp chỉ khi liên quan              | **Skill theo từng thư mục**                   |
+
+### Khởi động ở đâu là quyết định đầu tiên
+
+| Khởi động từ        | Truy cập file                        | `CLAUDE.md` nạp lúc launch                                              | Dùng khi                    |
+| ------------------- | ------------------------------------ | ----------------------------------------------------------------------- | --------------------------- |
+| **Gốc repository**  | Mọi file                             | **Chỉ file gốc**; file thư mục con nạp theo nhu cầu khi Claude đọc ở đó | Task trải qua nhiều package |
+| **Một thư mục con** | Chỉ subtree đó, tới khi bạn cấp thêm | File của thư mục đó **cộng của mọi thư mục cha**                        | Việc gói trong một package  |
+
+> Một điểm rất dễ vấp: **`.claude/settings.json` chỉ nạp từ thư mục bạn khởi động, và KHÔNG được kế thừa từ thư mục cha** như `CLAUDE.md`. Một `.claude/settings.json` ở gốc repository **chỉ áp dụng khi bạn khởi động từ gốc**.
+
+### Ba thiết lập giảm mức đọc
+
+**`claudeMdExcludes`** — bỏ hẳn file theo path hoặc glob. Dùng cho thư mục bạn **không bao giờ** làm. _Danh sách này là tĩnh, không phải công tắc theo từng task_ — muốn tập trung vào một package hôm nay và một package khác mai thì **khởi động Claude từ thư mục package đó** thay vì sửa danh sách loại trừ:
+
+```json
+{
+  "claudeMdExcludes": ["**/packages/web/**"]
+}
+```
+
+**`Read` deny rule** — tìm kiếm nội dung của Claude **đã tôn trọng `.gitignore`** mặc định, nên `node_modules/`, `dist/`, `build/` đã nằm ngoài kết quả. Deny rule dành cho **path đã được commit** như một SDK vendored hoặc code sinh tự động đã commit:
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Read(./**/dist/**)",
+      "Read(./**/build/**)",
+      "Read(./**/*.generated.*)",
+      "Read(./vendor/**)"
+    ]
+  }
+}
+```
+
+**Code intelligence plugin** — thay các lượt quét file bằng tra cứu qua language server. Nó **kết hợp rất tốt** với hai thiết lập trên: hai cái kia giữ nội dung không liên quan ra ngoài context, còn code intelligence **giữ Claude khỏi phải đọc xuyên phần còn lại để định vị một định nghĩa**.
+
+### `worktree.sparsePaths`
+
+Mặc định `--worktree` checkout **cả repository**. Trong repo lớn, `sparsePaths` dùng git sparse-checkout để **chỉ ghi các thư mục được liệt kê cộng file ở cấp gốc** ra đĩa:
+
+```json
+{
+  "worktree": {
+    "sparsePaths": [".claude", "packages/api", "packages/shared"],
+    "symlinkDirectories": ["node_modules"]
+  }
+}
+```
+
+Path trong `sparsePaths` **tương đối so với gốc repository**, bất kể bạn khởi động từ thư mục con nào. **Liệt kê thư mục, không liệt kê file lẻ.** File ở cấp gốc như `package.json` **luôn được checkout**; **thư mục ở cấp gốc thì không** — nên **nhớ đưa `.claude` vào danh sách** nếu bạn muốn `.claude/settings.json`, `.claude/rules/`, `.claude/skills/` của gốc repo có mặt trong worktree.
+
+`symlinkDirectories` tạo symlink từ `node_modules/` của mỗi worktree về bản của repo chính **thay vì nhân đôi trên đĩa**.
+
+### Cấp quyền qua package khác
+
+```json
+{
+  "permissions": {
+    "additionalDirectories": ["../shared", "../web"]
+  }
+}
+```
+
+Nhưng **cái gì được nạp thì khác nhau tuỳ cách bạn thêm**:
+
+| Thêm bằng                             | Nạp `CLAUDE.md` và rule                                         | Nạp skill         |
+| ------------------------------------- | --------------------------------------------------------------- | ----------------- |
+| Setting `additionalDirectories`       | **Không bao giờ**                                               | **Không bao giờ** |
+| Flag `--add-dir` hoặc lệnh `/add-dir` | **Chỉ khi** có `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` | **Có**            |
+
+### Skill theo từng thư mục
+
+Bất kỳ thư mục con nào cũng khai được skill gắn với stack của riêng nó, ở `.claude/skills/`. Skill nạp theo nhu cầu khi Claude thấy liên quan, nên **tooling của API không ăn context trong lúc làm frontend**.
+
+Nhưng có một cái bẫy về quy mô: **skill nào trong phạm vi phụ thuộc chỗ bạn khởi động Claude**. Khởi động từ **gốc repository** thì skill từ **mọi thư mục con Claude chạm tới trong phiên** đều tích lại — **có thể lên tới hàng trăm**. Và như phần 12 đã nói, **khi có nhiều skill thì description bị rút ngắn**, có thể cắt mất chính từ khoá Claude cần để khớp. Nên **giữ description ngắn và mở đầu bằng từ mà một yêu cầu sẽ chứa**, kiểu _"writing or modifying tests in `packages/api/`"_.
+
+### Hai kỹ thuật cho thay đổi xuyên package
+
+Cấu hình ở trên kiểm soát **thứ Claude thấy**. Khi một thay đổi chạm nhiều package, **cách bạn khoanh và xếp thứ tự task cũng ảnh hưởng kết quả**:
+
+- **Giao cả thay đổi trong một phiên** — đưa lần sửa chung và các call site của nó cùng lúc **giữ các quyết định phía sau từng lần sửa nhất quán**, thay vì suy lại từ đầu cho mỗi package.
+- **Lưu plan ra file trước khi sửa** — một phiên xuyên package dài **sẽ compact context dọc đường**, và **plan đã lưu sống sót ở chỗ lịch sử hội thoại có thể không**.
+
+## Nguồn
+
+- [Code Review](https://code.claude.com/docs/en/code-review)
+- [Find bugs with ultrareview](https://code.claude.com/docs/en/ultrareview)
+- [Catch security issues as Claude writes code](https://code.claude.com/docs/en/security-guidance)
+- [Claude Code GitHub Actions](https://code.claude.com/docs/en/github-actions)
+- [Set up Claude Code in a monorepo or large codebase](https://code.claude.com/docs/en/large-codebases)
+
+Docs gốc cập nhật thường xuyên; khi có mâu thuẫn, tin bản tiếng Anh.
