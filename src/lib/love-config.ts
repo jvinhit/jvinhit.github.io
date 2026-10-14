@@ -5,9 +5,11 @@
  * docs/specs/005-daily-love-board/firebase-setup.md (Bước 7).
  *
  * Mọi giá trị ở đây là PUBLIC trên repo. An toàn vì: apiKey Firebase không
- * phải secret (chỉ là identifier trỏ tới project), dữ liệu được bảo vệ bằng
- * Firestore security rules khóa theo UID. Mật mã (password của tài khoản
- * chung) KHÔNG BAO GIỜ được đặt vào đây hay bất kỳ đâu trong repo.
+ * phải secret (chỉ là identifier trỏ tới project), UID cũng chỉ là chuỗi
+ * ngẫu nhiên định danh tài khoản (không suy ra email, không đăng nhập được),
+ * dữ liệu được bảo vệ bằng Firestore security rules khóa theo UID. Email và
+ * mật mã (password) của hai tài khoản KHÔNG BAO GIỜ được đặt vào đây hay bất
+ * kỳ đâu trong repo.
  */
 
 export interface LoveFirebaseConfig {
@@ -26,9 +28,17 @@ export interface LoveProfile {
   name: string;
   /** Avatar emoji. */
   emoji: string;
+  /**
+   * User UID của tài khoản Firebase Auth ứng với người này (spec 007) — copy
+   * từ Authentication → Users. Đăng nhập tài khoản nào thì board tự biết
+   * mình là ai qua UID này, không còn picker "Ai đang viết?".
+   */
+  uid: string;
 }
 
 const PLACEHOLDER = 'PASTE_ME';
+/** Placeholder riêng cho UID để `profileForUid` nhận ra config chưa điền. */
+const PLACEHOLDER_UID = 'PASTE_UID';
 
 export const LOVE_CONFIG = {
   /** Web config copy từ Firebase console (firebase-setup.md, Bước 6). */
@@ -42,17 +52,33 @@ export const LOVE_CONFIG = {
   } satisfies LoveFirebaseConfig,
 
   // Email đăng nhập KHÔNG để ở đây (tránh lộ email thật trên repo public):
-  // nhập trên form login, được nhớ theo máy qua localStorage.
+  // nhập trên form login, được nhớ theo máy qua localStorage. Chỉ UID mới
+  // nằm trong `profiles` bên dưới.
 
   /** Ngày bắt đầu yêu (YYYY-MM-DD) — mốc cho bộ đếm "bên nhau X ngày". */
   anniversary: '2026-08-16',
 
-  /** Hai đứa. Phần tử đầu là người hay dùng máy này (mặc định của picker). */
+  /**
+   * Hai đứa — mỗi người một tài khoản Firebase riêng, gắn qua `uid`
+   * (firebase-setup.md, Bước 3 và Bước 7). Hai `uid` phải KHÁC nhau; dán
+   * trùng là board coi cả hai là một người.
+   */
   profiles: [
-    { id: 'p1', name: 'Oán Oán Cô Nương', emoji: '🐻' },
-    { id: 'p2', name: 'Đồ Tró', emoji: '🐰' },
+    { id: 'p1', name: 'anh', emoji: '🐻', uid: 'oVxmoTbFu7NXndArTqyPo0NcxpM2' },
+    { id: 'p2', name: 'em', emoji: '🐰', uid: 'r93HpNZe9kYjXY5X2VVohLBUKd92' },
   ] as [LoveProfile, LoveProfile],
 };
+
+/**
+ * Profile của tài khoản đang đăng nhập, suy từ UID (spec 007). Trả `null` khi
+ * UID không khớp ai hoặc config còn placeholder — page coi đó là "tài khoản
+ * chưa được gán tên" và khóa ghi, cố ý KHÔNG fallback về p1 để không ghi
+ * nhầm người.
+ */
+export function profileForUid(uid: string): LoveProfile | null {
+  if (!uid || uid === PLACEHOLDER_UID) return null;
+  return LOVE_CONFIG.profiles.find((profile) => profile.uid === uid) ?? null;
+}
 
 /**
  * Trang hiện màn hình "chưa setup" (thay vì lỗi khó hiểu) khi config còn

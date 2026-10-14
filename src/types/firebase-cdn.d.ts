@@ -59,12 +59,19 @@ declare module 'https://www.gstatic.com/firebasejs/12.12.0/firebase-firestore.js
     readonly app: FirebaseApp;
   }
 
+  /**
+   * `type` là field thật của SDK ('collection' / 'document'). Khai ra để hai
+   * interface không còn trùng shape — nếu trùng, overload `onSnapshot` cho
+   * DocumentReference (spec 009) sẽ bị TS chọn nhầm sang bản Query.
+   */
   export interface CollectionReference {
+    readonly type: 'collection';
     readonly id: string;
     readonly path: string;
   }
 
   export interface DocumentReference {
+    readonly type: 'document';
     readonly id: string;
     readonly path: string;
   }
@@ -92,6 +99,13 @@ declare module 'https://www.gstatic.com/firebasejs/12.12.0/firebase-firestore.js
     readonly empty: boolean;
   }
 
+  /** Snapshot một document lẻ (spec 009: `pregnancySettings/current`). */
+  export interface DocumentSnapshot {
+    readonly id: string;
+    exists(): boolean;
+    data(): DocumentData | undefined;
+  }
+
   export function getFirestore(app: FirebaseApp): Firestore;
   export function collection(db: Firestore, path: string): CollectionReference;
   export function doc(
@@ -103,6 +117,15 @@ declare module 'https://www.gstatic.com/firebasejs/12.12.0/firebase-firestore.js
     ref: CollectionReference,
     data: DocumentData
   ): Promise<DocumentReference>;
+  /**
+   * Ghi document có id định trước; `merge: true` để patch từng field mà
+   * không phải getDoc trước (spec 009 dùng cho settings và checklist).
+   */
+  export function setDoc(
+    ref: DocumentReference,
+    data: DocumentData,
+    options?: { merge?: boolean }
+  ): Promise<void>;
   export function updateDoc(
     ref: DocumentReference,
     data: DocumentData
@@ -116,7 +139,12 @@ declare module 'https://www.gstatic.com/firebasejs/12.12.0/firebase-firestore.js
     field: string,
     direction?: 'asc' | 'desc'
   ): QueryConstraint;
-  /** Trả về hàm unsubscribe. */
+  /** Trả về hàm unsubscribe. Overload document đặt TRƯỚC để TS ưu tiên khớp. */
+  export function onSnapshot(
+    ref: DocumentReference,
+    next: (snapshot: DocumentSnapshot) => void,
+    error?: (err: Error) => void
+  ): () => void;
   export function onSnapshot(
     q: Query | CollectionReference,
     next: (snapshot: QuerySnapshot) => void,

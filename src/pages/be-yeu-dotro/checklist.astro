@@ -1,0 +1,498 @@
+---
+/**
+ * `/be-yeu-dotro/checklist/` — 6 checklist mẫu + mục tự do (spec 009, AC-17).
+ * Mục mẫu render tĩnh (checkbox thật + label); script đổ trạng thái tick từ
+ * Firestore và dựng mục tự do. Toggle dùng arrayUnion/arrayRemove nên hai
+ * người tick cùng lúc không đè nhau; state khóa theo id ổn định của mục.
+ */
+import PregnancyLayout from '~/layouts/PregnancyLayout.astro';
+import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
+---
+
+<PregnancyLayout title="Checklist" nav="checklist">
+  <h1 class="by-title">Checklist</h1>
+  <p class="by-muted mt-1">
+    Tick xong là cả hai máy cùng thấy. Mỗi list thêm được mục riêng của nhà
+    mình.
+  </p>
+  <p class="by-error by-inline-error" data-by-cl-error aria-live="polite"></p>
+
+  {
+    CHECKLISTS.map((list, index) => (
+      <details
+        class="by-card by-cl mt-4"
+        id={list.id}
+        data-by-cl={list.id}
+        open={index === 0}
+      >
+        <summary class="by-cl-summary">
+          <span class="by-cl-emoji" aria-hidden="true">
+            {list.emoji}
+          </span>
+          <span class="by-cl-title-wrap">
+            <span class="by-cl-title">{list.title}</span>
+            <span class="by-cl-progress" data-by-cl-progress>
+              0/{templateItemCount(list)}
+            </span>
+          </span>
+        </summary>
+        <p class="by-muted mt-2">{list.intro}</p>
+        <fieldset class="by-fieldset" data-by-cl-fields disabled>
+          {list.groups.map((group) => (
+            <div class="by-cl-group">
+              <h2 class="by-cl-group-title">{group.title}</h2>
+              <ul class="by-cl-items">
+                {group.items.map((item) => (
+                  <li>
+                    <label class="by-cl-item">
+                      <input
+                        type="checkbox"
+                        data-by-cl-item={item.id}
+                        data-by-cl-list={list.id}
+                      />
+                      <span class="by-cl-item-text">
+                        {item.text}
+                        {item.note && (
+                          <span class="by-cl-item-note">{item.note}</span>
+                        )}
+                      </span>
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+          <div class="by-cl-group">
+            <h2 class="by-cl-group-title">Mục của nhà mình</h2>
+            <ul class="by-cl-items" data-by-cl-custom />
+            <form class="by-cl-add" data-by-cl-add>
+              <label class="sr-only" for={`by-cl-add-${list.id}`}>
+                Thêm mục vào {list.title}
+              </label>
+              <input
+                id={`by-cl-add-${list.id}`}
+                class="by-input"
+                type="text"
+                name="text"
+                maxlength="160"
+                placeholder="Thêm mục…"
+                autocomplete="off"
+              />
+              <button class="by-ghost-button" type="submit">
+                Thêm
+              </button>
+            </form>
+          </div>
+        </fieldset>
+      </details>
+    ))
+  }
+</PregnancyLayout>
+
+<script>
+  import { firebaseErrorCode } from '~/lib/love-firebase';
+  import { CHECKLISTS, templateItemIds } from '~/lib/pregnancy-checklists';
+  import {
+    checklistStateFromDoc,
+    shortId,
+    type ChecklistState,
+    type CustomChecklistItem,
+  } from '~/lib/pregnancy';
+  import {
+    pregnancyWriteErrorMessage,
+    readErrorMessage,
+    whileSignedIn,
+    type SessionContext,
+  } from '~/lib/pregnancy-session';
+
+  const COLLECTION = 'pregnancyChecklist';
+  const errorEl =
+    document.querySelector<HTMLParagraphElement>('[data-by-cl-error]');
+  const showError = (message: string) => {
+    if (errorEl) errorEl.textContent = message;
+  };
+
+  let ctx: SessionContext | null = null;
+  /** State mới nhất theo listId; thiếu = chưa tick gì. */
+  const states = new Map<string, ChecklistState>();
+
+  const sections = new Map<string, HTMLDetailsElement>();
+  for (const section of document.querySelectorAll<HTMLDetailsElement>(
+    '[data-by-cl]'
+  )) {
+    const id = section.dataset.byCl;
+    if (id) sections.set(id, section);
+  }
+
+  // ---- ghi ---------------------------------------------------------------------
+
+  async function writeList(
+    listId: string,
+    patch: Record<string, unknown>
+  ): Promise<boolean> {
+    if (!ctx) return false;
+    try {
+      // setDoc merge: tạo document nếu chưa có, không cần getDoc trước.
+      await ctx.fb.dbApi.setDoc(
+        ctx.fb.dbApi.doc(ctx.fb.db, COLLECTION, listId),
+        patch,
+        {
+          merge: true,
+        }
+      );
+      showError('');
+      return true;
+    } catch (err) {
+      showError(pregnancyWriteErrorMessage(firebaseErrorCode(err)));
+      return false;
+    }
+  }
+
+  function toggle(
+    listId: string,
+    itemId: string,
+    checked: boolean
+  ): Promise<boolean> {
+    if (!ctx) return Promise.resolve(false);
+    const { dbApi } = ctx.fb;
+    return writeList(listId, {
+      checked: checked ? dbApi.arrayUnion(itemId) : dbApi.arrayRemove(itemId),
+    });
+  }
+
+  async function addCustom(listId: string, text: string): Promise<boolean> {
+    if (!ctx) return false;
+    const item: CustomChecklistItem = {
+      id: `c-${shortId()}`,
+      text,
+      author: ctx.me.id,
+      createdAtMs: Date.now(),
+    };
+    return writeList(listId, { custom: ctx.fb.dbApi.arrayUnion(item) });
+  }
+
+  async function removeCustom(
+    listId: string,
+    item: CustomChecklistItem
+  ): Promise<void> {
+    if (!ctx) return;
+    if (!window.confirm(`Xóa mục "${item.text}"?`)) return;
+    const { dbApi } = ctx.fb;
+    // arrayRemove so bằng tuyệt đối → truyền đúng object 4 field đã parse.
+    await writeList(listId, {
+      custom: dbApi.arrayRemove({
+        id: item.id,
+        text: item.text,
+        author: item.author,
+        createdAtMs: item.createdAtMs,
+      }),
+      checked: dbApi.arrayRemove(item.id),
+    });
+  }
+
+  // ---- render --------------------------------------------------------------------
+
+  function renderList(listId: string): void {
+    const section = sections.get(listId);
+    const list = CHECKLISTS.find((l) => l.id === listId);
+    if (!section || !list) return;
+    const state = states.get(listId) ?? { checked: [], custom: [] };
+    const checked = new Set(state.checked);
+
+    for (const box of section.querySelectorAll<HTMLInputElement>(
+      '[data-by-cl-item]'
+    )) {
+      box.checked = checked.has(box.dataset.byClItem ?? '');
+    }
+
+    const customEl = section.querySelector<HTMLUListElement>(
+      '[data-by-cl-custom]'
+    );
+    if (customEl) {
+      customEl.replaceChildren(
+        ...state.custom.map((item) => {
+          const li = document.createElement('li');
+          const label = document.createElement('label');
+          label.className = 'by-cl-item';
+          const box = document.createElement('input');
+          box.type = 'checkbox';
+          box.checked = checked.has(item.id);
+          box.addEventListener('change', () => {
+            void toggle(listId, item.id, box.checked).then((ok) => {
+              if (!ok) box.checked = !box.checked;
+            });
+          });
+          const text = document.createElement('span');
+          text.className = 'by-cl-item-text';
+          text.textContent = item.text;
+          label.append(box, text);
+          const remove = document.createElement('button');
+          remove.type = 'button';
+          remove.className = 'by-icon-button by-cl-remove';
+          remove.setAttribute('aria-label', `Xóa mục ${item.text}`);
+          remove.textContent = '✕';
+          remove.addEventListener(
+            'click',
+            () => void removeCustom(listId, item)
+          );
+          li.append(label, remove);
+          return li;
+        })
+      );
+    }
+
+    // Tiến độ: mục mẫu còn tồn tại + mục tự do; id lạ (mục đã gỡ) bỏ qua.
+    const templateIds = templateItemIds(list);
+    const total = templateIds.size + state.custom.length;
+    const done =
+      state.checked.filter((id) => templateIds.has(id)).length +
+      state.custom.filter((item) => checked.has(item.id)).length;
+    const progress = section.querySelector<HTMLSpanElement>(
+      '[data-by-cl-progress]'
+    );
+    if (progress) {
+      progress.textContent = `${done}/${total}`;
+      progress.dataset.done = done === total && total > 0 ? '1' : '0';
+    }
+  }
+
+  function renderAll(): void {
+    for (const id of sections.keys()) renderList(id);
+  }
+
+  // ---- wiring tĩnh ------------------------------------------------------------------
+
+  for (const [listId, section] of sections) {
+    for (const box of section.querySelectorAll<HTMLInputElement>(
+      '[data-by-cl-item]'
+    )) {
+      box.addEventListener('change', () => {
+        const itemId = box.dataset.byClItem ?? '';
+        void toggle(listId, itemId, box.checked).then((ok) => {
+          if (!ok) box.checked = !box.checked;
+        });
+      });
+    }
+    const addForm = section.querySelector<HTMLFormElement>('[data-by-cl-add]');
+    addForm?.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const input = addForm.querySelector<HTMLInputElement>('[name="text"]');
+      const text = input?.value.trim() ?? '';
+      if (!text || !input) return;
+      void addCustom(listId, text).then((ok) => {
+        if (ok) input.value = '';
+      });
+    });
+  }
+
+  // ---- phiên ------------------------------------------------------------------------
+
+  whileSignedIn((session) => {
+    ctx = session;
+    for (const fs of document.querySelectorAll<HTMLFieldSetElement>(
+      '[data-by-cl-fields]'
+    )) {
+      fs.disabled = false;
+    }
+    const { fb } = session;
+    const unsub = fb.dbApi.onSnapshot(
+      fb.dbApi.collection(fb.db, COLLECTION),
+      (snap) => {
+        states.clear();
+        for (const docSnap of snap.docs) {
+          states.set(docSnap.id, checklistStateFromDoc(docSnap.data()));
+        }
+        showError('');
+        renderAll();
+      },
+      (err) => showError(readErrorMessage(firebaseErrorCode(err)))
+    );
+    // App vừa được layout mở khóa trong cùng lượt auth → cuộn tới list theo
+    // hash sau frame kế (lúc load, phần tử còn hidden nên scrollIntoView
+    // không có tác dụng).
+    requestAnimationFrame(openFromHash);
+    return () => {
+      unsub();
+      ctx = null;
+      states.clear();
+      for (const fs of document.querySelectorAll<HTMLFieldSetElement>(
+        '[data-by-cl-fields]'
+      )) {
+        fs.disabled = true;
+      }
+      renderAll();
+    };
+  });
+
+  // Vào bằng anchor (#hospital-bag từ cẩm nang / dashboard): mở đúng list
+  // vì <details> đóng thì trình duyệt cuộn tới nhưng nội dung vẫn gấp.
+  function openFromHash(): void {
+    const id = window.location.hash.slice(1);
+    const target = id ? sections.get(id) : undefined;
+    if (!target) return;
+    target.open = true;
+    target.scrollIntoView({ block: 'start' });
+  }
+  window.addEventListener('hashchange', openFromHash);
+  openFromHash();
+
+  renderAll();
+</script>
+
+<style is:global>
+  /* is:global: mục tự do dựng bằng script. Prefix .by-cl-*. */
+  .by-cl {
+    padding: 1rem 1.1rem;
+  }
+
+  .by-cl-summary {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    min-height: 44px;
+    cursor: pointer;
+    list-style: none;
+  }
+
+  .by-cl-summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .by-cl-summary::after {
+    content: '▾';
+    margin-left: auto;
+    color: var(--by-fg-muted);
+    transition: transform 0.2s var(--ease-out-quad);
+  }
+
+  .by-cl[open] > .by-cl-summary::after {
+    transform: rotate(180deg);
+  }
+
+  .by-cl {
+    scroll-margin-top: 1rem;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .by-cl-summary::after {
+      transition: none;
+    }
+  }
+
+  .by-cl-emoji {
+    font-size: 1.5rem;
+    line-height: 1;
+  }
+
+  .by-cl-title-wrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 0.6rem;
+    align-items: baseline;
+  }
+
+  .by-cl-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--by-green-deep);
+  }
+
+  .by-cl-progress {
+    padding: 0.1rem 0.6rem;
+    border-radius: 999px;
+    background: var(--by-peach-soft);
+    color: var(--by-peach-deep);
+    font-size: 0.8rem;
+    font-weight: 700;
+  }
+
+  .by-cl-progress[data-done='1'] {
+    background: var(--by-green-soft);
+    color: var(--by-green-deep);
+  }
+
+  .by-cl-group {
+    margin-top: 1rem;
+  }
+
+  .by-cl-group-title {
+    font-size: 0.85rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--by-peach-deep);
+  }
+
+  .by-cl-items {
+    display: grid;
+    gap: 0.25rem;
+    margin-top: 0.35rem;
+    list-style: none;
+    padding: 0;
+  }
+
+  .by-cl-items li {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .by-cl-item {
+    display: flex;
+    flex: 1;
+    gap: 0.75rem;
+    align-items: flex-start;
+    min-height: 44px;
+    padding: 0.5rem 0.25rem;
+    border-radius: 10px;
+    cursor: pointer;
+  }
+
+  .by-cl-item:hover {
+    background: var(--by-bg);
+  }
+
+  .by-cl-item input {
+    flex: none;
+    width: 1.35rem;
+    height: 1.35rem;
+    margin-top: 0.15rem;
+    accent-color: var(--by-green-deep);
+  }
+
+  .by-cl-item input:checked + .by-cl-item-text {
+    color: var(--by-fg-muted);
+    text-decoration: line-through;
+  }
+
+  .by-cl-item-text {
+    line-height: 1.45;
+  }
+
+  .by-cl-item-note {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--by-fg-muted);
+  }
+
+  .by-cl-remove {
+    width: 36px;
+    height: 36px;
+    font-size: 0.9rem;
+  }
+
+  .by-cl-add {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-top: 0.5rem;
+  }
+
+  .by-cl-add .by-input {
+    margin-top: 0;
+  }
+
+  .by-cl-add .by-ghost-button {
+    flex: none;
+  }
+</style>
