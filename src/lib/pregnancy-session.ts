@@ -235,6 +235,56 @@ export function watchCollection<T>(
   );
 }
 
+// ---- ghi khi mạng chậm -------------------------------------------------------
+
+/**
+ * Promise ghi của Firestore chỉ resolve khi SERVER xác nhận — mạng chậm thì
+ * vài giây, mất mạng thì treo tới khi có sóng (SDK tự gửi lại). UI không nên
+ * khóa nút lâu như vậy: chờ tối đa `slowMs`, quá thì trả 'queued' để page
+ * nhả form và báo "đã lưu trên máy, sẽ tự gửi". Snapshot realtime đã hiện
+ * bản ghi ngay nhờ latency compensation nên người dùng vẫn thấy kết quả.
+ *
+ * Lỗi về TRƯỚC hạn → throw như thường (page hiện lỗi, giữ chữ đang gõ).
+ * Lỗi về SAU hạn (ví dụ rules từ chối) → gọi `onLateError` vì lúc đó form
+ * đã nhả; Firestore tự rollback bản ghi khỏi snapshot.
+ */
+export async function awaitWrite(
+  write: Promise<unknown>,
+  onLateError: (message: string) => void,
+  slowMs = 5000
+): Promise<'done' | 'queued'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  const slow = new Promise<'queued'>((resolve) => {
+    timer = setTimeout(() => resolve('queued'), slowMs);
+  });
+  const done = write.then(
+    () => {
+      settled = true;
+      return 'done' as const;
+    },
+    (err: unknown) => {
+      settled = true;
+      throw err;
+    }
+  );
+  try {
+    const result = await Promise.race([done, slow]);
+    if (result === 'queued' && !settled) {
+      done.catch((err: unknown) =>
+        onLateError(pregnancyWriteErrorMessage(firebaseErrorCode(err)))
+      );
+    }
+    return result;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Câu báo khi `awaitWrite` trả 'queued'. */
+export const QUEUED_MESSAGE =
+  'Mạng đang chậm 🐢 đã lưu trên máy, sẽ tự gửi khi kết nối ổn định.';
+
 // ---- thông báo lỗi -----------------------------------------------------------
 
 const RULES_HINT =

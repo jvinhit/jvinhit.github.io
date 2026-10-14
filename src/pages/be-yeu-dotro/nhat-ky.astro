@@ -164,7 +164,12 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
   <p class="by-muted mt-3" data-by-note-empty hidden>
     Chưa có ghi chú nào — bắt đầu bằng cảm giác của mẹ hôm nay nhé 🌱
   </p>
-  <div class="mt-3" data-by-timeline></div>
+  <div class="mt-3" data-by-timeline aria-busy="true">
+    <span class="by-skel by-skel-line by-note-skel-title" aria-hidden="true"
+    ></span>
+    <span class="by-skel by-skel-card by-note-skel" aria-hidden="true"></span>
+    <span class="by-skel by-skel-card by-note-skel" aria-hidden="true"></span>
+  </div>
 </PregnancyLayout>
 
 <script>
@@ -184,12 +189,15 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
     type PregnancySettings,
   } from '~/lib/pregnancy';
   import {
+    awaitWrite,
     onSettings,
     pregnancyWriteErrorMessage,
+    QUEUED_MESSAGE,
     watchCollection,
     whileSignedIn,
     type SessionContext,
   } from '~/lib/pregnancy-session';
+  import { markLoaded, showSkeletonCards, withBusy } from '~/lib/pregnancy-ui';
 
   const COLLECTION = 'pregnancyNotes';
 
@@ -233,6 +241,8 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
   let ctx: SessionContext | null = null;
   let settings: PregnancySettings | null = null;
   let current: PregnancyNote[] = [];
+  /** Đã có snapshot đầu chưa — trước đó timeline là skeleton, không báo rỗng. */
+  let loaded = false;
   let activeKind: NoteKind = 'checkup';
   let activeFilter: 'all' | NoteKind = 'all';
   let editingId: string | null = null;
@@ -278,12 +288,14 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
     photoInput.value = '';
     if (!file) return;
     formError.textContent = '';
-    void compressImage(file).then((dataUrl) => {
-      if (dataUrl) showPhoto(dataUrl);
-      else
-        formError.textContent =
-          'Ảnh này nén mãi vẫn to quá 🥲 chọn ảnh khác nhé (chữ đang gõ vẫn còn).';
-    });
+    void withBusy(photoPick, 'Đang nén ảnh…', () => compressImage(file)).then(
+      (dataUrl) => {
+        if (dataUrl) showPhoto(dataUrl);
+        else
+          formError.textContent =
+            'Ảnh này nén mãi vẫn to quá 🥲 chọn ảnh khác nhé (chữ đang gõ vẫn còn).';
+      }
+    );
   });
   photoRemove.addEventListener('click', () => {
     // '' để updateDoc ghi đè ảnh cũ thành "không có" (quy ước love board).
@@ -358,50 +370,63 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
       return;
     }
     const { fb, me } = ctx;
-    submitButton.disabled = true;
+    let write: Promise<unknown>;
+    if (editingId) {
+      const patch: Record<string, unknown> = {
+        dateKey,
+        kind: activeKind,
+        text,
+        weightKg,
+        updatedAtMs: Date.now(),
+      };
+      if (pendingImage !== undefined) patch.imageBase64 = pendingImage;
+      write = fb.dbApi.updateDoc(
+        fb.dbApi.doc(fb.db, COLLECTION, editingId),
+        patch
+      );
+    } else {
+      write = fb.dbApi.addDoc(fb.dbApi.collection(fb.db, COLLECTION), {
+        dateKey,
+        kind: activeKind,
+        text,
+        weightKg,
+        imageBase64: pendingImage ?? '',
+        author: me.id,
+        createdAtMs: Date.now(),
+      });
+    }
     try {
-      if (editingId) {
-        const patch: Record<string, unknown> = {
-          dateKey,
-          kind: activeKind,
-          text,
-          weightKg,
-          updatedAtMs: Date.now(),
-        };
-        if (pendingImage !== undefined) patch.imageBase64 = pendingImage;
-        await fb.dbApi.updateDoc(
-          fb.dbApi.doc(fb.db, COLLECTION, editingId),
-          patch
-        );
-      } else {
-        await fb.dbApi.addDoc(fb.dbApi.collection(fb.db, COLLECTION), {
-          dateKey,
-          kind: activeKind,
-          text,
-          weightKg,
-          imageBase64: pendingImage ?? '',
-          author: me.id,
-          createdAtMs: Date.now(),
-        });
-      }
+      const outcome = await withBusy(submitButton, 'Đang lưu…', () =>
+        awaitWrite(write, (message) => {
+          listError.textContent = message;
+        })
+      );
       resetForm();
       render();
+      if (outcome === 'queued') formError.textContent = QUEUED_MESSAGE;
     } catch (err) {
       // Chữ đang gõ giữ nguyên trong form (AC-14).
       formError.textContent = pregnancyWriteErrorMessage(
         firebaseErrorCode(err)
       );
-    } finally {
-      submitButton.disabled = false;
     }
   }
 
-  async function remove(note: PregnancyNote): Promise<void> {
+  async function remove(
+    note: PregnancyNote,
+    trigger: HTMLButtonElement
+  ): Promise<void> {
     if (!ctx) return;
     if (!window.confirm('Xóa ghi chú này? Không hoàn tác được đâu.')) return;
+    const { fb } = ctx;
     try {
-      await ctx.fb.dbApi.deleteDoc(
-        ctx.fb.dbApi.doc(ctx.fb.db, COLLECTION, note.id)
+      await withBusy(trigger, 'Đang xóa…', () =>
+        awaitWrite(
+          fb.dbApi.deleteDoc(fb.dbApi.doc(fb.db, COLLECTION, note.id)),
+          (message) => {
+            listError.textContent = message;
+          }
+        )
       );
       if (editingId === note.id) resetForm();
     } catch (err) {
@@ -423,7 +448,25 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
           other.dataset.byFilter === activeFilter ? 'true' : 'false'
         );
       }
-      render();
+      // Cho trình duyệt vẽ chip vừa chọn TRƯỚC, rồi mới dựng lại timeline
+      // (nhiều ảnh base64 → vài trăm ms trên điện thoại). Gọi render ngay
+      // trong click thì chip chỉ đổi màu sau khi timeline vẽ xong.
+      scheduleRender();
+    });
+  }
+
+  let renderQueued = false;
+  function scheduleRender(): void {
+    if (renderQueued) return;
+    renderQueued = true;
+    timeline.setAttribute('aria-busy', 'true');
+    timeline.classList.add('is-refreshing');
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        renderQueued = false;
+        timeline.classList.remove('is-refreshing');
+        render();
+      }, 0);
     });
   }
 
@@ -480,7 +523,7 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
       edit.addEventListener('click', () => startEdit(note));
       const del = el('button', 'by-ghost-button by-note-btn', 'Xóa');
       del.type = 'button';
-      del.addEventListener('click', () => void remove(note));
+      del.addEventListener('click', () => void remove(note, del));
       actions.append(edit, del);
       card.append(actions);
     }
@@ -488,6 +531,13 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
   }
 
   function render(): void {
+    if (!loaded) {
+      emptyEl.hidden = true;
+      weightCard.hidden = true;
+      showSkeletonCards(timeline, 2, 5);
+      return;
+    }
+    markLoaded(timeline);
     const visible =
       activeFilter === 'all'
         ? current
@@ -571,6 +621,7 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
       'createdAtMs',
       noteFromDoc,
       (items) => {
+        loaded = true;
         current = items.reverse(); // mới → cũ
         if (editingId && !current.some((n) => n.id === editingId)) {
           resetForm();
@@ -581,6 +632,8 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
         render();
       },
       (message) => {
+        loaded = true;
+        render();
         listError.textContent = message;
       }
     );
@@ -588,6 +641,7 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
       unsub();
       ctx = null;
       current = [];
+      loaded = false;
       fields.disabled = true;
       resetForm();
       render();
@@ -597,6 +651,22 @@ import { NOTE_KINDS } from '~/lib/pregnancy';
 
 <style is:global>
   /* is:global: timeline dựng bằng script. Prefix .by-note-* / .by-weight-* / .by-chip. */
+  .by-note-skel-title {
+    width: 6rem;
+    height: 1.1rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .by-note-skel {
+    height: 5rem;
+  }
+
+  /* Đổi bộ lọc: timeline cũ mờ đi trong khoảnh khắc dựng lại. */
+  [data-by-timeline].is-refreshing {
+    opacity: 0.5;
+    transition: opacity 0.1s;
+  }
+
   .by-chip {
     display: inline-flex;
     align-items: center;

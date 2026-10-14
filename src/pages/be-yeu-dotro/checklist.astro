@@ -31,8 +31,14 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
           </span>
           <span class="by-cl-title-wrap">
             <span class="by-cl-title">{list.title}</span>
-            <span class="by-cl-progress" data-by-cl-progress>
-              0/{templateItemCount(list)}
+            <span
+              class="by-cl-progress"
+              data-by-cl-progress
+              data-total={templateItemCount(list)}
+              data-state="loading"
+            >
+              <span class="by-skel by-cl-progress-skel" aria-hidden="true" />
+              <span class="sr-only">Đang tải tiến độ</span>
             </span>
           </span>
         </summary>
@@ -99,11 +105,13 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
     type CustomChecklistItem,
   } from '~/lib/pregnancy';
   import {
+    awaitWrite,
     pregnancyWriteErrorMessage,
     readErrorMessage,
     whileSignedIn,
     type SessionContext,
   } from '~/lib/pregnancy-session';
+  import { withBusy } from '~/lib/pregnancy-ui';
 
   const COLLECTION = 'pregnancyChecklist';
   const errorEl =
@@ -113,15 +121,25 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
   };
 
   let ctx: SessionContext | null = null;
+  /** Có snapshot đầu chưa — trước đó tiến độ là skeleton, ô tick khóa. */
+  let loaded = false;
   /** State mới nhất theo listId; thiếu = chưa tick gì. */
   const states = new Map<string, ChecklistState>();
 
   const sections = new Map<string, HTMLDetailsElement>();
+  /** Markup skeleton gốc của từng ô tiến độ — để trả lại khi đăng xuất. */
+  const progressSkeletons = new Map<string, string>();
   for (const section of document.querySelectorAll<HTMLDetailsElement>(
     '[data-by-cl]'
   )) {
     const id = section.dataset.byCl;
-    if (id) sections.set(id, section);
+    if (id) {
+      sections.set(id, section);
+      const progress = section.querySelector<HTMLElement>(
+        '[data-by-cl-progress]'
+      );
+      if (progress) progressSkeletons.set(id, progress.innerHTML);
+    }
   }
 
   // ---- ghi ---------------------------------------------------------------------
@@ -131,14 +149,17 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
     patch: Record<string, unknown>
   ): Promise<boolean> {
     if (!ctx) return false;
+    const { fb } = ctx;
     try {
       // setDoc merge: tạo document nếu chưa có, không cần getDoc trước.
-      await ctx.fb.dbApi.setDoc(
-        ctx.fb.dbApi.doc(ctx.fb.db, COLLECTION, listId),
-        patch,
-        {
+      // awaitWrite: mạng chậm/mất mạng thì coi như đã xếp hàng (snapshot
+      // local đã phản ánh tick), không để ô tick "đang lưu" treo mãi.
+      await awaitWrite(
+        fb.dbApi.setDoc(fb.dbApi.doc(fb.db, COLLECTION, listId), patch, {
           merge: true,
-        }
+        }),
+        showError,
+        3000
       );
       showError('');
       return true;
@@ -158,6 +179,19 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
     return writeList(listId, {
       checked: checked ? dbApi.arrayUnion(itemId) : dbApi.arrayRemove(itemId),
     });
+  }
+
+  /** Tick lạc quan: đổi ngay, mờ nhẹ lúc đang gửi, lỗi thì trả lại. */
+  async function toggleBox(
+    listId: string,
+    itemId: string,
+    box: HTMLInputElement
+  ): Promise<void> {
+    const label = box.closest<HTMLElement>('.by-cl-item');
+    label?.setAttribute('data-saving', '1');
+    const ok = await toggle(listId, itemId, box.checked);
+    label?.removeAttribute('data-saving');
+    if (!ok) box.checked = !box.checked;
   }
 
   async function addCustom(listId: string, text: string): Promise<boolean> {
@@ -218,9 +252,7 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
           box.type = 'checkbox';
           box.checked = checked.has(item.id);
           box.addEventListener('change', () => {
-            void toggle(listId, item.id, box.checked).then((ok) => {
-              if (!ok) box.checked = !box.checked;
-            });
+            void toggleBox(listId, item.id, box);
           });
           const text = document.createElement('span');
           text.className = 'by-cl-item-text';
@@ -250,7 +282,8 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
     const progress = section.querySelector<HTMLSpanElement>(
       '[data-by-cl-progress]'
     );
-    if (progress) {
+    if (progress && loaded) {
+      progress.dataset.state = 'ready';
       progress.textContent = `${done}/${total}`;
       progress.dataset.done = done === total && total > 0 ? '1' : '0';
     }
@@ -267,19 +300,21 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
       '[data-by-cl-item]'
     )) {
       box.addEventListener('change', () => {
-        const itemId = box.dataset.byClItem ?? '';
-        void toggle(listId, itemId, box.checked).then((ok) => {
-          if (!ok) box.checked = !box.checked;
-        });
+        void toggleBox(listId, box.dataset.byClItem ?? '', box);
       });
     }
     const addForm = section.querySelector<HTMLFormElement>('[data-by-cl-add]');
     addForm?.addEventListener('submit', (event) => {
       event.preventDefault();
       const input = addForm.querySelector<HTMLInputElement>('[name="text"]');
+      const addButton = addForm.querySelector<HTMLButtonElement>(
+        'button[type="submit"]'
+      );
       const text = input?.value.trim() ?? '';
-      if (!text || !input) return;
-      void addCustom(listId, text).then((ok) => {
+      if (!text || !input || !addButton) return;
+      void withBusy(addButton, 'Đang thêm…', () =>
+        addCustom(listId, text)
+      ).then((ok) => {
         if (ok) input.value = '';
       });
     });
@@ -289,12 +324,14 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
 
   whileSignedIn((session) => {
     ctx = session;
-    for (const fs of document.querySelectorAll<HTMLFieldSetElement>(
-      '[data-by-cl-fields]'
-    )) {
-      fs.disabled = false;
-    }
     const { fb } = session;
+    const setFieldsDisabled = (disabled: boolean) => {
+      for (const fs of document.querySelectorAll<HTMLFieldSetElement>(
+        '[data-by-cl-fields]'
+      )) {
+        fs.disabled = disabled;
+      }
+    };
     const unsub = fb.dbApi.onSnapshot(
       fb.dbApi.collection(fb.db, COLLECTION),
       (snap) => {
@@ -303,6 +340,10 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
           states.set(docSnap.id, checklistStateFromDoc(docSnap.data()));
         }
         showError('');
+        // Mở khóa ô tick chỉ khi đã biết trạng thái thật — tick trước đó
+        // sẽ bị snapshot đầu ghi đè, trông như "mất tick".
+        loaded = true;
+        setFieldsDisabled(false);
         renderAll();
       },
       (err) => showError(readErrorMessage(firebaseErrorCode(err)))
@@ -315,10 +356,16 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
       unsub();
       ctx = null;
       states.clear();
-      for (const fs of document.querySelectorAll<HTMLFieldSetElement>(
-        '[data-by-cl-fields]'
-      )) {
-        fs.disabled = true;
+      loaded = false;
+      setFieldsDisabled(true);
+      for (const [id, html] of progressSkeletons) {
+        const el = sections
+          .get(id)
+          ?.querySelector<HTMLElement>('[data-by-cl-progress]');
+        if (el) {
+          el.dataset.state = 'loading';
+          el.innerHTML = html;
+        }
       }
       renderAll();
     };
@@ -404,6 +451,22 @@ import { CHECKLISTS, templateItemCount } from '~/lib/pregnancy-checklists';
     color: var(--by-peach-deep);
     font-size: 0.8rem;
     font-weight: 700;
+  }
+
+  .by-cl-progress[data-state='loading'] {
+    padding: 0.2rem 0.5rem;
+    background: transparent;
+  }
+
+  .by-cl-progress-skel {
+    width: 2.5rem;
+    height: 0.9rem;
+    border-radius: 999px;
+  }
+
+  /* Ô vừa tick, đang gửi lên server. */
+  .by-cl-item[data-saving] {
+    opacity: 0.6;
   }
 
   .by-cl-progress[data-done='1'] {
