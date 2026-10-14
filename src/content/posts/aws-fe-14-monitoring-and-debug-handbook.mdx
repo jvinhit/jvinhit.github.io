@@ -1,0 +1,256 @@
+---
+title: 'AWS cho Frontend Developer · Phần 14 — Giám sát và sổ tay debug 6 bước'
+description: 'Trên AWS "không hoạt động" là câu vô nghĩa: bạn phải chỉ ra chặng nào hỏng. Bài này liệt kê nguồn thông tin và metric nên theo dõi, quy trình chẩn đoán 6 bước, bộ lệnh curl/aws nên thuộc lòng và bảng tra cứu triệu chứng → nguyên nhân.'
+pubDate: 2026-11-07
+lang: vi
+tags: [aws, debugging, observability, cloudfront, devops]
+series: aws-fe
+seriesOrder: 14
+draft: false
+---
+
+import NetworkDiagram from '~/components/blog/NetworkDiagram.astro';
+
+Ở local, khi có lỗi bạn nhìn vào terminal đang chạy `npm run dev` và thấy ngay stack trace. Trên AWS, request đi qua sáu chặng thuộc sáu dịch vụ, mỗi dịch vụ ghi log ở một nơi khác nhau, và "không hoạt động" là một câu vô nghĩa vì nó không nói chặng nào hỏng. Kỹ năng thật sự không phải biết mọi dịch vụ, mà là **xác định đúng chặng trong hai phút** rồi mới đào vào log của chặng đó.
+
+Bài này cho bạn ba thứ: bản đồ nguồn thông tin (mở cái gì, ở đâu, nó nói gì), một quy trình chẩn đoán sáu bước áp dụng cho mọi lỗi, và bộ lệnh `curl`/`aws` đủ để tái hiện lỗi ngoài trình duyệt. Cuối bài là bảng tra cứu triệu chứng → nguyên nhân gom lại từ toàn bộ series, để bạn dán cạnh màn hình.
+
+---
+
+## Nguồn thông tin ở đâu
+
+| Công cụ                | Cho bạn biết                                                                           | Mở ở đâu                                    |
+| ---------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------- |
+| **DevTools Network**   | Status code, header, thời gian từng giai đoạn của mỗi request. **Luôn bắt đầu từ đây** | Trình duyệt                                 |
+| **CloudWatch Logs**    | Log in ra từ backend (ECS, Lambda), `console.log` của bạn                              | CloudWatch → Log groups                     |
+| **CloudWatch Metrics** | Số liệu: số request, tỷ lệ lỗi, độ trễ, tỷ lệ cache hit                                | CloudWatch → Metrics                        |
+| **ALB Access Logs**    | Từng request qua ALB: đi tới target nào, mất bao lâu, mã lỗi của ALB và của target     | Bật trong ALB → ghi vào S3                  |
+| **CloudFront Logs**    | Từng request qua CDN: hit/miss, edge nào, User-Agent, thời gian                        | Bật trong distribution → S3 hoặc realtime   |
+| **CloudWatch RUM**     | Trải nghiệm thật của người dùng: Core Web Vitals, lỗi JS, hành trình                   | CloudWatch → RUM (cần nhúng script vào app) |
+| **X-Ray**              | Lần theo một request qua nhiều dịch vụ, tìm chặng nào chậm                             | X-Ray → Service map                         |
+
+Ba dòng đầu giải quyết 90% ca debug của frontend. ALB access log và CloudFront log là thứ bạn bật sẵn ngay hôm nay để **có** dữ liệu khi cần — không bật thì lúc sự cố xảy ra không có gì để đọc, và bật sau sự cố không giúp gì. RUM và X-Ray là tầng tiếp theo khi hệ thống đã ổn định và bạn muốn tối ưu thay vì chữa cháy.
+
+### Metric frontend nên theo dõi
+
+| Metric                   | Của dịch vụ | Ngưỡng cảnh báo gợi ý        | Vì sao                                                                                                                                 |
+| ------------------------ | ----------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `5xxErrorRate`           | CloudFront  | trên 1% trong 5 phút         | Bao trùm mọi lỗi phía server mà người dùng thật nhìn thấy                                                                              |
+| `CacheHitRate`           | CloudFront  | dưới 80% cho asset tĩnh      | Thấp nghĩa là cache policy sai hoặc cache key quá rộng ([Phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/)) |
+| `OriginLatency`          | CloudFront  | p99 trên 2 giây              | Origin chậm → mọi cache miss đều chậm                                                                                                  |
+| `HTTPCode_ELB_5XX_Count` | ALB         | trên 10 trong 5 phút         | Lỗi do chính ALB sinh ra (502/503/504), không phải backend                                                                             |
+| `TargetResponseTime`     | ALB         | p95 trên 1 giây              | Backend chậm trước khi thành 504                                                                                                       |
+| `UnHealthyHostCount`     | ALB         | từ 1 trở lên — cảnh báo ngay | Một target unhealthy hôm nay là 503 toàn trang ngày mai                                                                                |
+
+Hai chi tiết khi tìm metric trong console: metric của CloudFront nằm trong namespace `AWS/CloudFront` **ở region `us-east-1`** với dimension `Region=Global` và `DistributionId` — bạn đang ở Singapore mà không thấy metric là vì chưa đổi region. Metric của ALB nằm ở `AWS/ApplicationELB` cùng region với ALB, dimension `LoadBalancer` là phần sau `loadbalancer/` trong ARN (dạng `app/my-alb/abc123`). `CacheHitRate` và các metric chi tiết hơn của CloudFront cần bật "Additional metrics" trên distribution, có phụ phí nhỏ.
+
+Alarm cho metric quan trọng nhất, tạo bằng CLI để lưu được vào repo:
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name "alb-unhealthy-hosts" \
+  --namespace AWS/ApplicationELB \
+  --metric-name UnHealthyHostCount \
+  --dimensions Name=LoadBalancer,Value=app/my-alb/abc123 Name=TargetGroup,Value=targetgroup/api-tg/def456 \
+  --statistic Maximum --period 60 --evaluation-periods 1 \
+  --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold \
+  --alarm-actions arn:aws:sns:ap-southeast-1:123456789012:alerts
+```
+
+Topic SNS `alerts` gửi email hoặc Slack qua webhook. Alarm không có `--alarm-actions` chỉ đổi màu trong console — không ai nhìn console lúc 2 giờ sáng.
+
+### Đọc log ALB và CloudFront
+
+ALB access log là file text nén trong S3, mỗi dòng một request, các cột cách nhau bằng khoảng trắng. Bốn cột đáng đọc: thời gian xử lý ở target (`target_processing_time`), mã ALB trả (`elb_status_code`), mã target trả (`target_status_code`, là `-` nếu không có target nào trả lời), và `target:port`. Một dòng có `elb_status_code=504` và `target_processing_time=-1` là target không trả lời — đúng chữ ký của Security Group chặn hoặc backend treo ở [Phần 9](/blog/aws-fe-09-alb-gateway-to-backend/).
+
+CloudFront standard log có cột `x-edge-result-type` (`Hit`, `Miss`, `RefreshHit`, `Error`), `x-edge-location`, `sc-status`, `cs-uri-stem`. Nhóm theo `x-edge-result-type` và `cs-uri-stem` là bạn biết file nào đang miss nhiều bất thường.
+
+Với log backend trong CloudWatch, Logs Insights nhanh hơn `grep` khi log group lớn:
+
+```text
+fields @timestamp, @message
+| filter @message like /ERROR/ or @message like /5\d\d/
+| sort @timestamp desc
+| limit 50
+```
+
+Nếu backend log dạng JSON có trường `requestId`, hãy ghi vào đó giá trị header `X-Amz-Cf-Id` (CloudFront gắn vào mỗi request và forward xuống origin khi Origin Request Policy cho phép). Khi người dùng gửi ảnh chụp lỗi có ID này, bạn tìm được đúng dòng log trong vài giây.
+
+---
+
+## Quy trình chẩn đoán 6 bước
+
+Áp dụng theo thứ tự, không nhảy cóc. Mỗi bước loại bỏ một nửa không gian nguyên nhân.
+
+**① Trình duyệt có gửi request đi không?**
+DevTools → Network. Không thấy request nào? Lỗi ở JS: điều kiện `if` sai, exception ném ra trước khi tới `fetch`, URL sai nên bị chặn ngay. **Chưa phải lỗi AWS.** Dừng lại, sửa code.
+
+**② Có nhận được response không?**
+Không (pending mãi rồi fail) → nghi network, firewall, timeout — chuyển sang bước ⑤ với `curl`. Có → đọc status code, đi tiếp.
+
+**③ Status code là gì?**
+4xx → thường là request của mình sai (auth, method, path). 5xx → phía server; xem `X-Cache` và các header AWS để biết **ai** trả lỗi. Status `0` hoặc "Failed to fetch" → CORS, DNS hoặc TLS; mở tab Console, trình duyệt ghi lý do ở đó chứ không phải ở tab Network.
+
+**④ Ai đã trả lỗi này?**
+
+| Dấu hiệu trong response                                    | Người trả lỗi | Nghĩa là                                                                                                                   |
+| ---------------------------------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Có header `X-Cache` / `X-Amz-Cf-Id`                        | CloudFront    | Request đã tới CloudFront; nhìn `X-Cache` để biết có xuống origin không                                                    |
+| Body là XML có `<Error><Code>AccessDenied</Code>` (của S3) | S3            | Lỗi từ S3: OAC, bucket policy, key không tồn tại ([Phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/)) |
+| Trang HTML ngắn có chữ "ELB", header `Server: awselb/2.0`  | ALB           | Lỗi từ ALB: 502/503/504 theo bảng ở [Phần 9](/blog/aws-fe-09-alb-gateway-to-backend/)                                      |
+| JSON đúng format lỗi của app                               | Backend       | Tốt, dễ nhất: log backend chắc chắn có                                                                                     |
+
+**⑤ Tái hiện không qua trình duyệt.**
+`curl -v https://...` cùng URL, cùng method, cùng header. Vẫn lỗi → lỗi thật ở server, đi tiếp bước ⑥. Hết lỗi → vấn đề nằm ở thứ chỉ trình duyệt có: CORS, cookie, cache trình duyệt, Service Worker.
+
+**⑥ Đào vào log của đúng chặng đã xác định ở bước ④.**
+CloudFront → CloudFront log hoặc header. S3 → `aws s3 ls` và bucket policy. ALB → target health và access log. Backend → CloudWatch Logs đúng khung thời gian.
+
+Câu thần chú của [Phần 1](/blog/aws-fe-01-mindset-and-request-lifecycle/) vẫn là kim chỉ nam: "request này đang đứng ở chặng nào, và chặng đó có biết nó cần làm gì với request không?"
+
+---
+
+## Bộ lệnh debug nên thuộc lòng
+
+<NetworkDiagram
+  kind="debugging"
+  caption="Chọn công cụ theo tầng đang nghi ngờ: curl cho HTTP và header, openssl s_client cho TLS, dig cho DNS; đừng bật tcpdump khi vấn đề là một header Cache-Control"
+/>
+
+```bash
+# Xem toàn bộ header, theo dõi cả redirect
+curl -svL https://shop.example.com 2>&1 | grep -E "^(<|>|\*)"
+
+# Chỉ lấy header, kiểm tra cache
+curl -sI https://shop.example.com/assets/main-a3f9.js | \
+  grep -iE "cache-control|x-cache|age|etag|content-encoding"
+
+# Kiểm tra CloudFront có nén không (giả vờ là trình duyệt hỗ trợ brotli)
+curl -sI -H "Accept-Encoding: gzip, br" https://shop.example.com/assets/main.js | grep -i content-encoding
+
+# Mô phỏng preflight CORS — cực kỳ hữu ích
+curl -sI -X OPTIONS https://api.example.com/orders \
+  -H "Origin: https://app.example.com" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization,content-type"
+
+# Đo thời gian từng giai đoạn của request
+curl -s -o /dev/null -w \
+  "dns:%{time_namelookup}s tls:%{time_appconnect}s ttfb:%{time_starttransfer}s total:%{time_total}s\n" \
+  https://shop.example.com
+
+# Bỏ qua DNS, gọi thẳng một IP cụ thể (kiểm tra khi nghi DNS sai)
+curl -sI https://shop.example.com --resolve shop.example.com:443:1.2.3.4
+
+# Lỗi lúc được lúc không: gọi lặp 20 lần, đếm mã trả về
+for i in $(seq 1 20); do curl -s -o /dev/null -w "%{http_code}\n" https://shop.example.com/api/me; done | sort | uniq -c
+
+# Xem metadata của object trên S3 — kiểm tra Cache-Control đã đúng chưa
+aws s3api head-object --bucket my-bucket --key index.html
+
+# Xem log ECS theo thời gian thực
+aws logs tail /ecs/my-api --follow --since 10m
+
+# Lọc log tìm lỗi
+aws logs tail /ecs/my-api --since 1h --filter-pattern "ERROR"
+
+# Xem trạng thái sức khoẻ của target group
+aws elbv2 describe-target-health --target-group-arn arn:aws:elasticloadbalancing:...
+
+# Invalidation đã xong chưa
+aws cloudfront get-invalidation --distribution-id E1ABCDEFGHIJKL --id I2J3K4L5M6N7O8
+```
+
+Vài ghi chú cách dùng:
+
+- Lệnh đo thời gian cho bạn biết chậm ở đâu: `dns` lớn → resolver hoặc TTL; `tls` lớn → bắt tay TLS với edge xa; `ttfb` lớn mà `tls` nhỏ → origin chậm (cache miss). Chạy hai lần liên tiếp; lần hai nhanh hẳn nghĩa là cache đang làm việc.
+- Lệnh preflight phải trả 204 hoặc 200 kèm đủ ba header `Access-Control-Allow-*`. Thiếu một là trình duyệt chặn dù request thật sẽ chạy — toàn bộ cơ chế ở [Phần 3](/blog/aws-fe-03-cors-vpc-security-group/).
+- Vòng lặp 20 lần tách được "một target hỏng trong ba" (thấy 200 và 502 xen kẽ theo tỷ lệ) khỏi "cache key sai" (thấy lỗi theo pattern lặp lại đúng URL).
+- `--resolve` bỏ qua DNS, hữu ích khi vừa đổi bản ghi và muốn thử hạ tầng mới trước khi TTL hết.
+
+Kỹ thuật `curl`/`jq` sâu hơn — theo dõi redirect, gửi JSON, lọc response — ở [bài về HTTP API debugging](/blog/dev-cli-06-http-api-debugging-curl-jq/).
+
+---
+
+## Bảng tra cứu nhanh: triệu chứng → nguyên nhân
+
+| Triệu chứng                               | Nguyên nhân có thể (theo thứ tự hay gặp)                                                                                      | Kiểm tra bằng                                                                                                                           |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Trang trắng, console báo 404 cho file JS  | 1. HTML cũ bị cache trỏ tới asset đã bị xoá. 2. `--delete` xoá file trước khi HTML mới lên. 3. Sai `base` trong `vite.config` | `curl -sI` xem `Age` của `index.html`; xem Sources trong DevTools                                                                       |
+| F5 bị lỗi, click link thì được            | Thiếu SPA fallback ở CloudFront                                                                                               | Cấu hình Custom Error Response hoặc CloudFront Function ở [Phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/) |
+| CSS không áp dụng dù file tải được        | `Content-Type` sai (`application/octet-stream` thay vì `text/css`)                                                            | `aws s3api head-object`                                                                                                                 |
+| "Failed to fetch", Console báo CORS       | 1. Preflight `OPTIONS` không được xử lý. 2. CloudFront không forward `Origin`. 3. Sai origin trong `Allow-Origin`             | Lệnh `curl -X OPTIONS` ở trên                                                                                                           |
+| API chạy trong Postman, lỗi trong browser | CORS (Postman không áp dụng CORS)                                                                                             | Như trên                                                                                                                                |
+| Đăng nhập xong reload lại mất session     | Cookie thiếu `Secure` / `SameSite` phù hợp, hoặc cross-site; backend thiếu `trust proxy`                                      | DevTools → Application → Cookies                                                                                                        |
+| Deploy xong 10 phút vẫn bản cũ            | 1. Chưa invalidate. 2. `index.html` có `max-age` dài. 3. Service Worker giữ bản cũ                                            | `X-Cache`, `Age`; DevTools → Application → Service Workers                                                                              |
+| Lúc được lúc không, không tái hiện nổi    | 1. Cache key thiếu yếu tố phân biệt. 2. Một target trong ALB bị lỗi còn target kia bình thường                                | Vòng lặp `curl` 20 lần; `describe-target-health`                                                                                        |
+| Ảnh upload lên nhưng hiển thị 403         | Object nằm trong bucket private, CloudFront chưa có behavior cho prefix đó, hoặc bucket policy không phủ prefix               | Kiểm tra behavior và bucket policy                                                                                                      |
+| Tải chậm ở VN, nhanh ở nước ngoài         | Cache hit rate thấp → mọi request đều phải về origin ở region xa                                                              | CloudFront → Reports → Cache statistics; `X-Amz-Cf-Pop`                                                                                 |
+
+Nếu bạn cũng vận hành site sau Cloudflare, bảng tương ứng cho mã 5xx và 1xxx của Cloudflare ở [Cloudflare phần 11](/blog/cloudflare-fe-11-debug-and-error-handbook/) — cùng phương pháp, khác tên header.
+
+---
+
+## Một ca debug mẫu, đi đủ sáu bước
+
+Tình huống: sau deploy chiều thứ Sáu, QA báo "trang đơn hàng không tải được, chỉ thấy spinner". Đi theo quy trình:
+
+1. **Request có đi không?** Network tab: có `GET /api/orders`, trạng thái `(failed)`. Không phải lỗi JS.
+2. **Có response không?** Không. Pending 3 giây rồi fail. Chưa kết luận được timeout vì fail nhanh.
+3. **Status?** `0`. Console: `Access to fetch at ... has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header`. Vậy là CORS — nhưng deploy hôm nay chỉ đổi frontend, backend không đổi.
+4. **Ai trả?** Response header có `X-Cache: Hit from cloudfront`. **Hit.** Một response API đang được trả từ cache CloudFront, và nó là response được cache cho một `Origin` khác (staging), thiếu header CORS cho origin hiện tại. Đây là ca "cache key thiếu `Origin`" ở [Phần 6](/blog/aws-fe-06-cloudfront-cdn-behaviors-cache-key/).
+5. **Tái hiện bằng curl:** `curl -sI -H "Origin: https://app.example.com" https://app.example.com/api/orders` cho `X-Cache: Hit` và không có `Access-Control-Allow-Origin`. Đổi URL query một chút để bỏ cache → `Miss` và có header đúng. Khẳng định.
+6. **Log của chặng CloudFront:** kiểm tra behavior `/api/*`: ai đó đã đổi Cache Policy từ `CachingDisabled` sang `CachingOptimized` để "làm API nhanh hơn" trong tuần. Sửa lại, invalidate `/api/*`, xong.
+
+Mất tám phút, không mở một dòng log backend nào, và thay đổi đúng một ô cấu hình. Đó là lý do bước ④ quan trọng hơn mọi lệnh `aws logs` trong bài.
+
+---
+
+## Thực hành — alarm và log (45 phút)
+
+Nguồn tài liệu không có lab riêng cho chương này; bài tập sau tương ứng "Tạo CloudWatch Alarm cho 5xx và UnHealthyHostCount, bật CloudFront logs" của Tuần 8.
+
+**1.** Tạo topic SNS `alerts`, subscribe email của bạn, xác nhận email.
+
+**2.** Tạo alarm `UnHealthyHostCount` cho target group từ Lab 5.1 bằng lệnh ở trên. Đổi health check path thành `/khong-ton-tai` như Lab 5.1 → trong 1–2 phút bạn nhận email `ALARM`. Đổi lại → email `OK`.
+
+**3.** Tạo alarm `5xxErrorRate` cho distribution (region `us-east-1`, dimension `Region=Global`). Gọi một URL chắc chắn lỗi qua CloudFront 50 lần bằng vòng lặp `curl` (ví dụ `/api/slow` từ Lab 5.1) và xem metric nhích lên trong Metrics explorer.
+
+**4.** Bật standard logging cho distribution vào một bucket log. Tải trang vài lần, chờ vài phút, tải file log về, `zcat` và tìm cột `x-edge-result-type` cho `index.html` (phải là `Miss` hoặc `RefreshHit`) và cho một file trong `/assets/` (phải là `Hit` từ lần hai).
+
+**5.** Đặt retention 14 ngày cho log group ECS: `aws logs put-retention-policy --log-group-name /ecs/my-api --retention-in-days 14`. Mặc định là vĩnh viễn và tốn tiền âm thầm ([Phần 15](/blog/aws-fe-15-security-performance-cost/)).
+
+**6.** Chạy lệnh đo thời gian `curl -w` ba lần liên tiếp vào trang chủ; ghi lại `ttfb` lần đầu và lần ba. Giải thích chênh lệch bằng `X-Cache`.
+
+> **Kết quả mong đợi:** bạn nhận được email alarm khi target unhealthy và khi 5xx tăng; đọc được log CloudFront để biết file nào hit/miss; log group có retention. Từ giờ hệ thống báo cho bạn trước khi người dùng báo.
+
+---
+
+## Sai lầm hay gặp
+
+- **Đọc log backend đầu tiên** khi lỗi là 403 XML của S3 hay 503 HTML của ALB — backend không có dòng log nào vì request chưa tới nó. Làm bước ④ trước.
+- **Kết luận "backend hỏng" vì Postman chạy còn browser lỗi** — Postman không áp dụng CORS. Lỗi ở header, không ở logic.
+- **Tìm metric CloudFront ở region Singapore** → không thấy gì → tưởng chưa có traffic. Đổi sang `us-east-1`.
+- **Alarm không có action** → chỉ đổi màu trong console. Luôn gắn SNS.
+- **Bật log rồi không đặt retention** → hoá đơn CloudWatch Logs tăng dần theo tháng.
+- **Debug cache bằng trình duyệt có Service Worker cũ** → mọi kết luận sai. Tick "Bypass for network" trong DevTools → Application → Service Workers, hoặc dùng `curl`.
+- **Không ghi lại `X-Amz-Cf-Id`** khi mở ticket AWS Support — họ sẽ hỏi cái đó đầu tiên.
+
+---
+
+## Tóm tắt
+
+- Bắt đầu từ DevTools Network; CloudWatch Logs cho backend; Metrics cho xu hướng; bật sẵn ALB access log và CloudFront log để có dữ liệu khi cần; RUM và X-Ray khi đã ổn định.
+- Sáu metric có ngưỡng: `5xxErrorRate` trên 1%, `CacheHitRate` dưới 80%, `OriginLatency` p99 trên 2s, `HTTPCode_ELB_5XX_Count` trên 10/5 phút, `TargetResponseTime` p95 trên 1s, `UnHealthyHostCount` từ 1. Metric CloudFront ở `us-east-1`. Alarm phải có SNS action.
+- Sáu bước: request có đi không → có response không → status gì → ai trả (`X-Cache` = CloudFront, XML = S3, HTML "ELB" = ALB, JSON app = backend) → tái hiện bằng `curl` → log đúng chặng.
+- Bộ lệnh: `curl -sI` xem cache header, `curl -X OPTIONS` mô phỏng preflight, `curl -w` đo thời gian, vòng lặp 20 lần cho lỗi chập chờn, `head-object`, `logs tail`, `describe-target-health`.
+- Bảng triệu chứng → nguyên nhân gom mười ca hay gặp nhất; phần lớn quy về cache, CORS, Content-Type, health check.
+- Ghi `X-Amz-Cf-Id` vào log backend để nối trình duyệt với log; đặt retention cho log group.
+
+Phần tiếp theo — **[Phần 15 — Bảo mật, hiệu năng và chi phí](/blog/aws-fe-15-security-performance-cost/)** — security header và CSP theo giai đoạn, WAF, các đòn bẩy hiệu năng CloudFront cho bạn, và cái gì trong hoá đơn thật sự tốn tiền.
+
+## Đọc thêm
+
+- [Amazon CloudWatch — User Guide](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/)
+- [Amazon CloudFront — Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/)
+- [Application Load Balancer — User Guide](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/)

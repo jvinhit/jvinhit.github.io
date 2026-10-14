@@ -667,6 +667,144 @@ export const SERIES: Record<string, SeriesMeta> = {
       },
     ],
   },
+  'cloudflare-fe': {
+    homepagePick: 'cloudflare-fe-01-what-cloudflare-really-is',
+    title: 'Cloudflare cho Frontend Developer',
+    description:
+      'Series 13 phần về Cloudflare cho frontend developer: nameserver, DNS, đám mây cam và xám, SSL/TLS, cache, Rules, Pages, Workers, WAF, sổ tay lỗi 5xx và giới hạn gói Free.',
+    blurb:
+      'Series tiếng Việt 13 phần dành cho frontend developer chưa từng dùng Cloudflare, đi theo đúng thứ tự bạn gặp trong thực tế: mua tên miền, mua hosting, rồi nghe nói nên đưa qua Cloudflare. Chặng nền tảng trả lời Cloudflare thực ra là gì bằng vòng đời một request qua reverse proxy toàn cầu, rồi làm rõ nameserver, zone, bốn loại bản ghi DNS, đám mây cam và đám mây xám, PoP và Anycast. Chặng trỏ tên miền đi từng bước Hostinger cộng Cloudflare, các kịch bản trỏ vào Pages, Vercel, Netlify hay CloudFront, và chương gây lỗi nhiều nhất là SSL/TLS với bốn chế độ cùng lỗi ERR_TOO_MANY_REDIRECTS giải thích tận gốc. Chặng vận hành bao cache và cf-cache-status, Cache Rules, Redirect và Transform Rules, Cloudflare Pages với preview deployment, và Workers chạy code ở edge. Chặng cuối bàn bảo mật với WAF, bot và rate limiting, hiệu năng, quy trình debug năm bước cùng sổ tay mã lỗi 5xx và 1xxx, giới hạn gói Free, đối chiếu với AWS, rồi khép lại bằng lộ trình bốn tuần, checklist, từ điển và câu hỏi thường gặp.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Nền tảng',
+        description:
+          'Cloudflare thực ra là gì, vòng đời một request qua reverse proxy toàn cầu, rồi nameserver, zone, bản ghi DNS, đám mây cam và xám, PoP, Anycast và origin.',
+        from: 1,
+        to: 2,
+      },
+      {
+        title: 'Trỏ tên miền và HTTPS',
+        description:
+          'Thiết lập Hostinger cộng Cloudflare từ A đến Z, các kịch bản trỏ tên miền vào Pages, Vercel, Netlify hay CloudFront, và bốn chế độ SSL/TLS cùng lỗi lặp chuyển hướng.',
+        from: 3,
+        to: 5,
+      },
+      {
+        title: 'Cache, Rules, Pages và Workers',
+        description:
+          'Vì sao deploy xong vẫn thấy bản cũ, Cache Rules và purge, Redirect và Transform Rules, host frontend miễn phí trên Pages, rồi chạy code ở edge bằng Workers.',
+        from: 6,
+        to: 9,
+      },
+      {
+        title: 'Bảo mật, debug và chi phí',
+        description:
+          'WAF, bot, rate limiting và các tuỳ chọn hiệu năng, quy trình chẩn đoán năm bước với sổ tay mã lỗi 5xx và 1xxx, giới hạn gói Free và đối chiếu với AWS.',
+        from: 10,
+        to: 12,
+      },
+      {
+        title: 'Lộ trình và tra cứu',
+        description:
+          'Lộ trình bốn tuần với bốn dự án thực hành, checklist, từ điển thuật ngữ và câu hỏi thường gặp.',
+        from: 13,
+        to: 13,
+      },
+    ],
+  },
+  'aws-fe': {
+    homepagePick: 'aws-fe-01-mindset-and-request-lifecycle',
+    title: 'AWS cho Frontend Developer',
+    description:
+      'Series 16 phần về AWS cho frontend developer: vòng đời request, Route 53, ACM, CORS, S3, CloudFront, ALB, ECS, Lambda, Amplify, Cognito, biến môi trường, CI/CD với OIDC, debug và chi phí.',
+    blurb:
+      'Series tiếng Việt 16 phần giải thích chính xác điều gì xảy ra với file và request của bạn sau khi rời máy local lên AWS, viết cho frontend developer chưa từng mở AWS Console. Chặng tư duy bắt đầu bằng vòng đời một request qua Route 53, CloudFront, S3, ALB và backend, rồi lấp những lỗ hổng nền tảng hay gặp nhất: DNS, HTTPS và ACM, HTTP header, CORS tận gốc, VPC và Security Group ở mức đủ dùng. Chặng S3 và CloudFront là trọng tâm: bucket và hai cách phục vụ file, upload build đúng cách, presigned URL, behavior và cache key, chiến lược cache chuẩn, invalidation, sửa lỗi F5 bị 403 cho SPA, CloudFront Functions và Lambda@Edge, signed URL. Chặng backend đứng sau đi qua ALB với health check và bảng mã lỗi, các nơi chạy code từ EC2, ECS, Lambda tới Amplify, bốn con đường deploy Next.js, API Gateway và Cognito. Chặng vận hành bao biến môi trường build-time và runtime, CI/CD với GitHub Actions và OIDC, preview environment, giám sát và sổ tay debug sáu bước, bảo mật, hiệu năng và chi phí, rồi khép lại bằng lộ trình tám tuần, năm dự án thực hành, từ điển, checklist production và câu hỏi phỏng vấn.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Tư duy và nền tảng web',
+        description:
+          'Từ npm run dev sang hạ tầng, vòng đời một request, Region và Edge Location, IAM tối thiểu, rồi DNS với Route 53, HTTPS với ACM, HTTP header, CORS, VPC và Security Group.',
+        from: 1,
+        to: 3,
+      },
+      {
+        title: 'S3 và CloudFront',
+        description:
+          'Nơi file build thực sự nằm, upload build và presigned URL, rồi CDN, behavior, cache key, chiến lược cache, invalidation, SPA routing, edge function và signed URL.',
+        from: 4,
+        to: 8,
+      },
+      {
+        title: 'Backend đứng sau',
+        description:
+          'ALB với health check, timeout và bảng mã lỗi; các nơi chạy code từ EC2, ECS, Lambda tới Amplify và bốn con đường deploy Next.js; API Gateway và Cognito.',
+        from: 9,
+        to: 11,
+      },
+      {
+        title: 'Cấu hình, CI/CD và vận hành',
+        description:
+          'Biến môi trường build-time và runtime, pipeline GitHub Actions với OIDC và preview environment, giám sát và sổ tay debug, bảo mật, hiệu năng và chi phí.',
+        from: 12,
+        to: 15,
+      },
+      {
+        title: 'Lộ trình và tra cứu',
+        description:
+          'Lộ trình tám tuần, năm dự án thực hành, từ điển thuật ngữ, checklist trước khi lên production và câu hỏi phỏng vấn thường gặp.',
+        from: 16,
+        to: 16,
+      },
+    ],
+  },
+  'k8s-fe': {
+    homepagePick: 'k8s-fe-01-why-and-big-picture',
+    title: 'Kubernetes cho Frontend Developer',
+    description:
+      'Series 19 phần về Kubernetes cho frontend developer: Linux, Docker, Pod, Deployment, Service, Ingress, ConfigMap, probe, deploy React SPA và Next.js SSR, Helm, CI/CD, ArgoCD và observability.',
+    blurb:
+      'Series tiếng Việt 19 phần đưa frontend developer chưa từng làm việc với server, Docker hay Linux chuyên sâu đi từ con số 0 tới deploy production trên Kubernetes. Chặng định vị và nền tảng bắt buộc trả lời vì sao FE dev nên học K8s và học tới đâu là đủ, vẽ bức tranh từ npm run build đến URL production, rồi trang bị 20 lệnh Linux, mạng cơ bản, YAML, container, Dockerfile chuẩn cho app frontend, registry và Docker Compose. Chặng Kubernetes core đi qua kiến trúc cluster, kubectl, Pod, ReplicaSet và Deployment, label và namespace, Service và Ingress, ConfigMap và Secret, ba loại probe, requests và limits, storage và vòng đời Pod. Chặng deploy thực tế giải bài toán biến môi trường build-time và runtime, deploy React SPA và Next.js SSR từ A đến Z, nhiều app trên một domain, cache và CDN đứng trước cluster, zero-downtime deploy và sổ tay 12 lỗi thường gặp. Chặng nâng cao bao chiến lược rollout, autoscaling, Helm và Kustomize, CI/CD với GitHub Actions và GitOps với ArgoCD, HTTPS tự động với cert-manager, observability, bảo mật cơ bản, chi phí và khi nào không nên dùng K8s, rồi khép lại bằng thời khoá biểu sáu tuần, checklist, đồ án cuối khoá và cheat sheet kubectl.',
+    lang: 'vi',
+    sections: [
+      {
+        title: 'Định vị và nền tảng bắt buộc',
+        description:
+          'Vì sao FE dev nên học K8s và học tới đâu là đủ, bức tranh từ npm run build đến URL production, rồi Linux, mạng, YAML, container, Dockerfile, registry và Docker Compose.',
+        from: 1,
+        to: 4,
+      },
+      {
+        title: 'Kubernetes core',
+        description:
+          'Kiến trúc cluster và kubectl, Pod, ReplicaSet và Deployment, label và namespace, Service và Ingress, ConfigMap và Secret, probe, resources, storage và vòng đời Pod.',
+        from: 5,
+        to: 9,
+      },
+      {
+        title: 'Deploy hệ thống frontend thực tế',
+        description:
+          'Biến môi trường build-time và runtime, deploy React SPA và Next.js SSR từ A đến Z, nhiều app trên một domain, cache và CDN trước cluster, zero-downtime deploy và sổ tay 12 lỗi.',
+        from: 10,
+        to: 13,
+      },
+      {
+        title: 'Nâng cao',
+        description:
+          'Chiến lược rollout và autoscaling, Helm và Kustomize, CI/CD với GitHub Actions và GitOps với ArgoCD, cert-manager, observability, bảo mật cơ bản, chi phí và khi nào không nên dùng K8s.',
+        from: 14,
+        to: 18,
+      },
+      {
+        title: 'Lộ trình, checklist và tài nguyên',
+        description:
+          'Thời khoá biểu sáu tuần, checklist tự đánh giá năng lực, đồ án cuối khoá, cheat sheet kubectl và tài nguyên học tiếp.',
+        from: 19,
+        to: 19,
+      },
+    ],
+  },
 };
 
 /**

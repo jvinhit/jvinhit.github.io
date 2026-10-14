@@ -1,0 +1,289 @@
+---
+title: 'Cloudflare cho Frontend Developer · Phần 5 — SSL/TLS: bốn chế độ và lỗi ERR_TOO_MANY_REDIRECTS'
+description: 'Hai chặng mã hoá thay vì một, bốn chế độ SSL (Off, Flexible, Full, Full strict), vòng lặp chuyển hướng giải thích từng bước và ba cách sửa, Origin Certificate cho VPS, HSTS, bảng chẩn đoán nhanh lỗi SSL và lab tự gây lỗi rồi tự sửa.'
+pubDate: 2026-10-10
+lang: vi
+tags: [cloudflare, devops, ssl, tls, https]
+series: cloudflare-fe
+seriesOrder: 5
+draft: false
+---
+
+import HostingDiagram from '~/components/blog/HostingDiagram.astro';
+
+Bạn bật Cloudflare, mở trang, và Chrome trả về một màn hình trắng với dòng `ERR_TOO_MANY_REDIRECTS`. Bạn xoá cache, thử trình duyệt khác, thử điện thoại — vẫn vậy. Lên diễn đàn thì có người bảo "đổi SSL sang Flexible", người khác bảo "tắt Always Use HTTPS đi", và cả hai đều làm cho "hết lỗi" theo cách khiến chặng Cloudflare ↔ origin đi HTTP trần hoặc mất luôn HTTPS.
+
+Đây là câu hỏi phổ biến nhất về Cloudflare trên mọi diễn đàn, và nguyên nhân nằm trọn trong bài này. Cốt lõi chỉ có một câu: **có hai chặng mã hoá, không phải một, và SSL mode của Cloudflare chỉ quyết định chặng thứ hai.** Hiểu câu đó rồi thì vòng lặp chuyển hướng tự giải thích được, lỗi 525/526 tự giải thích được, và bạn biết Origin Certificate dùng để làm gì. Cuối bài là lab tự gây ra lỗi này rồi tự sửa — làm một lần, nhớ cả đời.
+
+> Thuật ngữ giữ tiếng Anh: edge certificate, origin certificate, Universal SSL, Flexible, Full, Full (strict), HSTS, mixed content. Đó là chữ trong tab SSL/TLS của dashboard.
+
+## Hai chặng mã hoá, không phải một
+
+```text
+Người dùng ══════════════► Cloudflare ══════════════► Origin
+              CHẶNG 1                    CHẶNG 2
+            "edge cert"                "origin cert"
+
+   Luôn HTTPS nếu bạn bật       Có mã hoá hay không, có kiểm
+   Universal SSL (mặc định)     tra chứng chỉ hay không
+                                → do bạn CHỌN bằng SSL mode
+```
+
+<HostingDiagram
+  kind="tls-modes"
+  caption="Chặng 1 (browser ↔ edge) luôn là HTTPS với Universal SSL. Chặng 2 (edge ↔ origin) tuỳ SSL mode: Flexible đi HTTP, Full đi HTTPS không kiểm tra, Full (strict) đi HTTPS và kiểm tra chứng chỉ"
+/>
+
+Chặng 1 là thứ người dùng nhìn thấy: ổ khoá trên thanh địa chỉ, chứng chỉ do Cloudflare xuất (Universal SSL, miễn phí, tự gia hạn). Chặng 1 tồn tại độc lập với origin — origin của bạn có thể không có chứng chỉ, thậm chí chỉ nói HTTP, người dùng vẫn thấy ổ khoá. Đó là lý do nhiều người bật Cloudflare, thấy ổ khoá, và tưởng "xong HTTPS rồi".
+
+Chặng 2 là thứ người dùng không nhìn thấy: Cloudflare gõ cửa origin bằng cái gì. **Cấu hình SSL mode trong Cloudflare chỉ quyết định chặng 2.** Đây là điểm hầu hết mọi người hiểu nhầm — họ tưởng SSL mode là "bật/tắt HTTPS cho website", trong khi nó là "Cloudflare nói chuyện với máy chủ của tôi kiểu gì".
+
+Bài [Cloudflare proxy, SSL/TLS và origin](/blog/hosting-08-cloudflare-proxy-ssl-tls-origin/) trong series Hosting và [TLS/HTTPS từ handshake](/blog/net-07-tls-https/) trong series Networking là nền nếu bạn muốn hiểu chứng chỉ và bắt tay TLS ở mức giao thức; bài này chỉ cần bạn chấp nhận "hai chặng, hai cấu hình".
+
+---
+
+## Bốn chế độ SSL
+
+Vào **SSL/TLS → Overview** bạn thấy bốn lựa chọn. Cột "Chặng 2" là thứ duy nhất chúng thay đổi:
+
+| Chế độ            | Chặng 2 (Cloudflare → origin)           | Rủi ro                                                             | Dùng khi                                                                 |
+| ----------------- | --------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| **Off**           | Không có HTTPS ở chặng nào              | Không an toàn                                                      | Gần như không bao giờ                                                    |
+| **Flexible**      | HTTP — không mã hoá                     | Dữ liệu đi hở giữa Cloudflare và origin. **Gây lặp chuyển hướng.** | Chỉ khi origin tuyệt đối không có SSL và bạn chấp nhận rủi ro. Tạm thời. |
+| **Full**          | HTTPS, **không kiểm tra** chứng chỉ     | Chống nghe lén được, nhưng không chống được giả mạo origin         | Origin dùng chứng chỉ tự ký                                              |
+| **Full (strict)** | HTTPS, **có kiểm tra** chứng chỉ hợp lệ | Không có                                                           | **Luôn chọn cái này.** Cần origin có chứng chỉ hợp lệ.                   |
+
+Vài điều bảng không nói hết:
+
+- **Off** còn tắt luôn chặng 1: người dùng gõ `https://` cũng bị đẩy về `http://`. Nó tồn tại cho các tình huống lịch sử, không phải lựa chọn cho bạn.
+- **Flexible** nghe hấp dẫn vì "không cần làm gì ở origin". Cái giá: mọi thứ người dùng gửi — mật khẩu, token, form — được Cloudflare giải mã rồi gửi **HTTP trần** qua Internet công cộng tới máy chủ của bạn. Ổ khoá trên trình duyệt lúc này là lời hứa chỉ đúng một nửa đường.
+- **Full** khác **Full (strict)** đúng một chữ: có kiểm tra chứng chỉ hay không. Nếu bạn từng chạy `NODE_TLS_REJECT_UNAUTHORIZED=0` để `fetch` tới một API có chứng chỉ tự ký "cho qua", đó là Full: có mã hoá, nhưng không biết mình đang nói chuyện với đúng máy chủ hay với ai đó chen giữa. Full có chỗ dùng — origin tự ký trong lúc chờ cài chứng chỉ thật — nhưng là trạm dừng, không phải đích.
+- **Full (strict)** yêu cầu chứng chỉ ở origin hợp lệ: đúng tên miền, còn hạn, do một CA được tin cậy cấp — **hoặc** là Origin Certificate của chính Cloudflare (mục dưới). Đây là chế độ duy nhất cho bạn HTTPS thật trên toàn tuyến.
+
+Nếu bạn làm đúng bước 2 ở [phần 3](/blog/cloudflare-fe-03-hostinger-cloudflare-setup-a-to-z/) (cài Let's Encrypt trên Hostinger trước), Full (strict) chạy được ngay và bạn không bao giờ gặp vòng lặp bên dưới.
+
+---
+
+## Lỗi ERR_TOO_MANY_REDIRECTS — giải thích tận gốc
+
+Đây là kịch bản xảy ra khi bạn chọn **Flexible** mà máy chủ của bạn đã được cấu hình **tự ép HTTPS** (Hostinger, WordPress, hầu hết hosting hiện nay đều làm vậy mặc định):
+
+```text
+① Người dùng gọi https://example.com
+        │
+        ▼
+② Cloudflare nhận qua HTTPS ✓
+   Chế độ Flexible → gọi xuống origin bằng HTTP
+        │
+        ▼  http://example.com
+③ Origin (Hostinger) thấy đây là HTTP
+   Quy tắc trong .htaccess: "HTTP thì chuyển sang HTTPS"
+   → trả về 301 Location: https://example.com
+        │
+        ▼
+④ Cloudflare nhận 301, chuyển tiếp cho trình duyệt
+        │
+        ▼
+⑤ Trình duyệt lại gọi https://example.com
+        │
+        └──────► quay lại bước ② ... VÒNG LẶP VÔ TẬN
+
+Sau ~20 lần, trình duyệt bỏ cuộc: ERR_TOO_MANY_REDIRECTS
+```
+
+Cả hai bên đều đang làm đúng việc của mình. Origin nói "tôi chỉ phục vụ HTTPS" — hợp lý. Cloudflare nói "chế độ Flexible thì tôi gọi xuống bằng HTTP" — đúng như bạn chọn. Không ai sai, chỉ có cấu hình của bạn khiến hai bên cãi nhau mãi. Nhìn thấy nó từ terminal:
+
+```bash
+curl -sIL https://example.com | grep -iE "^(HTTP|location)"
+# HTTP/2 301
+# location: https://example.com/
+# HTTP/2 301
+# location: https://example.com/
+# HTTP/2 301
+# location: https://example.com/
+# ... lặp tới khi curl bỏ cuộc (mặc định 50 lần)
+```
+
+Dấu hiệu đặc trưng: `location` trỏ về **chính URL bạn vừa gọi**. Redirect bình thường (http → https, www → apex) đổi URL rồi dừng; vòng lặp thì URL không đổi.
+
+> **Cách sửa — theo thứ tự ưu tiên:**
+>
+> 1. **Đúng nhất:** cài chứng chỉ SSL hợp lệ trên origin (Hostinger cấp miễn phí), rồi đổi Cloudflare sang **Full (strict)**. Vòng lặp biến mất vì Cloudflare gọi xuống bằng HTTPS, origin không cần chuyển hướng nữa.
+> 2. **Tạm thời:** giữ Flexible nhưng **tắt quy tắc ép HTTPS ở origin** (sửa `.htaccess`, hoặc tắt "Force HTTPS" trong hPanel). Cách này chạy được nhưng chặng 2 vẫn hở — chỉ nên dùng trong lúc chờ cài chứng chỉ.
+> 3. **Không bao giờ:** tắt "Always Use HTTPS" ở Cloudflare để "hết lỗi". Làm vậy là bỏ HTTPS, không phải sửa lỗi.
+
+### Cùng vòng lặp, thủ phạm là chính app của bạn
+
+Với người viết backend Node, vòng lặp này có một phiên bản không liên quan tới `.htaccess`: app tự ép HTTPS trong code.
+
+```js
+// Đoạn middleware "ép HTTPS" quen thuộc
+app.use((req, res, next) => {
+  if (!req.secure) {
+    return res.redirect(301, 'https://' + req.headers.host + req.url);
+  }
+  next();
+});
+```
+
+Sau Cloudflare (kể cả Full strict, khi có nginx giải mã TLS rồi `proxy_pass` HTTP vào app), kết nối tới app là HTTP, nên `req.secure` luôn `false` → redirect → vòng lặp. Cloudflare và nginx đều gửi kèm header `X-Forwarded-Proto: https` để nói "người dùng vào bằng HTTPS đấy"; app phải được bảo **tin proxy** thì mới đọc header đó:
+
+```js
+app.set('trust proxy', true); // req.secure và req.protocol đọc X-Forwarded-Proto
+```
+
+Next.js, Django, Rails, Laravel đều có cấu hình tương đương ("trusted proxies"). WordPress thì hay vấp ở `siteurl` đặt `https://` trong khi `$_SERVER['HTTPS']` không được set — plugin Cloudflare chính thức, hoặc vài dòng trong `wp-config.php` đọc `HTTP_X_FORWARDED_PROTO`, là cách sửa quen thuộc. Checklist ở phần 13 có riêng một dòng cho việc này.
+
+### Vòng lặp khác: www ↔ apex cãi nhau
+
+Không phải mọi `ERR_TOO_MANY_REDIRECTS` đều do Flexible. Trường hợp thứ hai hay gặp: bạn tạo Redirect Rule ở Cloudflare chuyển `www → example.com` ([phần 7](/blog/cloudflare-fe-07-rules-redirect-and-transform/)), trong khi origin (hoặc plugin WordPress) vẫn giữ quy tắc cũ `example.com → www`. Hai bên đá qua đá lại. Nhận biết bằng `curl -sIL`: `location` **luân phiên** giữa hai hostname thay vì đứng yên. Sửa: chọn một dạng chuẩn và bỏ quy tắc ở phía kia.
+
+---
+
+## Origin Certificate — chứng chỉ miễn phí của Cloudflare cho origin
+
+Nếu origin của bạn là VPS tự quản (không có sẵn chứng chỉ như Hostinger), Cloudflare cho bạn một cách rất tiện: **Origin Certificate**, hạn tới 15 năm, miễn phí, không phải cài certbot, không phải gia hạn ba tháng một lần.
+
+1. Vào **SSL/TLS → Origin Server → Create Certificate**.
+2. Chọn hostname (mặc định `example.com` và `*.example.com`), thời hạn 15 năm.
+3. Cloudflare đưa cho bạn hai khối văn bản: **certificate** và **private key**. Copy ngay — **private key chỉ hiển thị một lần.**
+4. Cài lên máy chủ như chứng chỉ bình thường (nginx: `ssl_certificate` và `ssl_certificate_key`).
+5. Đặt Cloudflare về **Full (strict)**.
+
+Cấu hình nginx tối thiểu cho một app Node phía sau:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name example.com www.example.com;
+
+    ssl_certificate     /etc/ssl/cloudflare/origin.pem;
+    ssl_certificate_key /etc/ssl/cloudflare/origin.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+Đặt file key với quyền `600`, kiểm tra `nginx -t`, reload, rồi xác nhận từ Cloudflare: `curl -sI https://example.com` phải trả `200` chứ không phải `526`. Bài [Nginx: TLS, security và performance](/blog/nginx-04-tls-security-and-performance/) có phần cứng hoá cấu hình TLS nếu bạn muốn đi xa hơn tối thiểu.
+
+> **Origin Certificate chỉ được Cloudflare tin, không phải trình duyệt.** Nếu ai đó truy cập thẳng IP máy chủ bằng HTTPS, trình duyệt sẽ báo chứng chỉ không hợp lệ. Điều này bình thường và đúng thiết kế — chứng chỉ này chỉ dùng cho chặng Cloudflare ↔ origin. Hệ quả kèm theo: **nếu bạn tắt đám mây cam, website sẽ báo lỗi chứng chỉ ngay**, vì lúc đó trình duyệt nói chuyện thẳng với origin và không tin CA của Cloudflare.
+
+Hệ quả thứ hai đáng ghi vào sổ: vì Origin Certificate gắn chặt với đám mây cam, phép thử debug "tạm chuyển xám xem lỗi ở đâu" ([phần 11](/blog/cloudflare-fe-11-debug-and-error-handbook/)) sẽ cho kết quả sai lệch — chuyển xám là lỗi chứng chỉ ngay, không phải vì origin hỏng. Khi cần gọi thẳng origin để so sánh, dùng `curl -k --resolve` (bỏ kiểm tra chứng chỉ) thay vì đổi màu đám mây. Nếu bạn dự tính có lúc tắt proxy, Let's Encrypt qua certbot vẫn là lựa chọn an toàn hơn cho origin.
+
+---
+
+## Các tuỳ chọn khác trong Edge Certificates
+
+Tab **SSL/TLS → Edge Certificates** có một danh sách công tắc. Bảng dưới là thứ nên bật cho một website frontend bình thường:
+
+| Tuỳ chọn                     | Nên      | Tác dụng                                                                                     |
+| ---------------------------- | -------- | -------------------------------------------------------------------------------------------- |
+| **Always Use HTTPS**         | Bật      | Mọi request HTTP được trả 301 sang HTTPS ngay tại edge, không làm phiền origin.              |
+| **Automatic HTTPS Rewrites** | Bật      | Tự đổi link `http://` trong HTML thành `https://`. Cứu tinh cho website cũ bị mixed content. |
+| **Minimum TLS Version**      | TLS 1.2  | Chặn các phiên bản TLS cũ không an toàn. TLS 1.2 an toàn mà vẫn tương thích rộng.            |
+| **Opportunistic Encryption** | Bật      | Cho phép mã hoá cả với client chưa hỗ trợ HTTPS đầy đủ.                                      |
+| **TLS 1.3**                  | Bật      | Bắt tay nhanh hơn, an toàn hơn.                                                              |
+| **HSTS**                     | Cẩn thận | Buộc trình duyệt chỉ dùng HTTPS cho tên miền này. Xem cảnh báo bên dưới.                     |
+
+Với **Always Use HTTPS** bật ở edge, origin của bạn không cần tự ép HTTPS nữa — request HTTP không bao giờ tới được origin. Bạn có thể giữ quy tắc ở origin làm lớp phòng hờ (khi đã Full strict thì nó vô hại), nhưng biết rằng nó thừa.
+
+**Automatic HTTPS Rewrites** chỉ sửa được link tới những host mà Cloudflare biết chắc có HTTPS; nó là băng dính cho site cũ, không thay được việc sửa `http://` trong code. Với dự án Vite/Next mới, mixed content hầu như chỉ đến từ URL ảnh hay script bên thứ ba hard-code `http://` — tìm bằng `grep -rn "http://" src/` là ra.
+
+> **HSTS là quyết định khó quay đầu.** Khi bật HSTS với `max-age` dài, trình duyệt của mọi người đã từng truy cập sẽ từ chối mở trang qua HTTP trong suốt khoảng thời gian đó — **kể cả khi HTTPS của bạn hỏng.** Không có cách nào "gỡ" từ xa; phải chờ hết hạn trên từng máy.
+>
+> Cách làm an toàn: chạy HTTPS ổn định ít nhất vài tuần trước. Khi bật, bắt đầu với `max-age` ngắn (vài giờ), theo dõi, rồi mới tăng dần. Chỉ bật `includeSubDomains` khi chắc chắn mọi subdomain đều có HTTPS — kể cả `mail.`, `ftp.`, `staging.` đang xám. Chỉ bật `preload` khi bạn thực sự hiểu hậu quả: tên miền được ghi cứng vào danh sách trong mã nguồn trình duyệt, gỡ ra mất nhiều tháng.
+
+Header mà HSTS gửi xuống trông như sau, và bạn kiểm tra được bằng `curl -sI https://example.com | grep -i strict`:
+
+```http
+strict-transport-security: max-age=31536000; includeSubDomains; preload
+```
+
+Nếu bạn thích đặt header này qua Transform Rule hay file `_headers` cho "gọn một chỗ", đừng — bật qua mục HSTS ở SSL/TLS để Cloudflare quản lý nhất quán, và để bạn không vô tình gửi hai giá trị khác nhau.
+
+---
+
+## Bảng chẩn đoán nhanh lỗi SSL
+
+| Triệu chứng                         | Nguyên nhân                                                                         | Cách sửa                                                               |
+| ----------------------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `ERR_TOO_MANY_REDIRECTS`            | Flexible + origin ép HTTPS                                                          | Chuyển sang Full (strict), hoặc tắt ép HTTPS ở origin                  |
+| Error 526 Invalid SSL certificate   | Full (strict) nhưng chứng chỉ origin sai tên / hết hạn / tự ký                      | Cài chứng chỉ hợp lệ hoặc Origin Certificate                           |
+| Error 525 SSL handshake failed      | Origin không nhận kết nối HTTPS ở cổng 443                                          | Kiểm tra máy chủ có lắng nghe 443 và cấu hình TLS đúng                 |
+| Cảnh báo "Not secure" dù đã bật     | Universal SSL chưa Active, hoặc bản ghi đang đám mây xám                            | Kiểm tra trạng thái Edge Certificate; kiểm tra màu đám mây             |
+| Mixed content trong Console         | HTML còn link `http://`                                                             | Bật Automatic HTTPS Rewrites; sửa link trong code                      |
+| Subdomain hai cấp báo lỗi chứng chỉ | Universal SSL chỉ phủ `example.com` và `*.example.com`, không phủ `a.b.example.com` | Cần Advanced Certificate Manager (trả phí) hoặc đổi cấu trúc subdomain |
+
+Dòng cuối hay bắt người đặt tên môi trường kiểu `api.staging.example.com`: `staging.example.com` được wildcard phủ, nhưng `api.staging.example.com` là hai cấp — Cloudflare không có chứng chỉ cho nó, và người dùng thấy lỗi chứng chỉ dù mọi thứ khác đúng. Đổi sang `api-staging.example.com` là xong, miễn phí.
+
+### Nhìn chứng chỉ ở từng chặng
+
+Hai lệnh dưới đây cho bạn thấy đúng "hai chặng" bằng mắt: chứng chỉ người dùng nhận từ edge, và chứng chỉ origin đang thật sự phục vụ.
+
+```bash
+# Chặng 1: chứng chỉ ở edge (Universal SSL của Cloudflare)
+echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+# issuer thường là Google Trust Services, Let's Encrypt hoặc một CA Cloudflare dùng
+
+# Chặng 2: chứng chỉ ở origin, bỏ qua Cloudflare bằng --resolve
+curl -vI https://example.com --resolve example.com:443:203.0.113.45 2>&1 \
+  | grep -iE "subject:|issuer:|expire|SSL certificate"
+# Nếu là Origin Certificate → issuer: CloudFlare Origin SSL ... và curl báo không tin
+# Thêm -k để bỏ kiểm tra khi chỉ muốn xem origin trả gì
+```
+
+Nếu lệnh thứ hai báo "connection refused" hoặc timeout ở 443, đó chính là nguyên nhân của 525: origin không nghe HTTPS. Nếu nó bắt tay được nhưng chứng chỉ sai tên hoặc hết hạn, đó là 526 đang chờ bạn ở Full (strict).
+
+---
+
+## Lab 5.1 — Tự tạo và sửa lỗi lặp chuyển hướng (30 phút)
+
+Làm trên tên miền đã qua Cloudflare ở phần 3. Lab này cố tình làm hỏng — chọn lúc không có người dùng thật, hoặc dùng subdomain `test`.
+
+1. Đặt SSL mode về **Flexible**.
+2. Đảm bảo origin có ép HTTPS (Hostinger thường bật sẵn "Force HTTPS"; VPS thì thêm `return 301 https://$host$request_uri;` vào khối `listen 80`).
+3. Mở website — bạn sẽ thấy `ERR_TOO_MANY_REDIRECTS`.
+4. Chạy `curl -sIL https://example.com | grep -iE "^(HTTP|location)"` và quan sát chuỗi 301 lặp lại với `location` không đổi.
+5. Chuyển sang **Full (strict)**, chờ khoảng một phút, tải lại — hết lỗi. Chạy lại lệnh ở bước 4: chỉ còn một dòng `HTTP/2 200`.
+6. Thử đặt **Full** (không strict) và tự hỏi: chế độ này khác Full (strict) chỗ nào về mặt an toàn? (Gợi ý: ai có thể đứng giữa Cloudflare và origin, và Full có phát hiện được không?)
+
+> **Tiêu chí hoàn thành:** bạn tự gây ra được lỗi lặp chuyển hướng và tự sửa, đồng thời giải thích được vì sao Flexible lại sinh ra vòng lặp đó — bằng năm bước trong sơ đồ, không cần nhìn bài.
+
+Nếu bước 3 không ra lỗi: origin của bạn không ép HTTPS, nên Flexible "chạy được" — và đó chính là trạng thái nguy hiểm hơn cả lỗi, vì mọi thứ trông ổn trong khi chặng 2 đi HTTP trần. Kiểm tra bằng cách xem log origin (request tới bằng `http`), rồi vẫn chuyển về Full (strict).
+
+---
+
+## Sai lầm hay gặp ở chương này
+
+- **Chọn Flexible vì "chưa có chứng chỉ ở origin".** Hostinger cấp Let's Encrypt miễn phí; VPS có Origin Certificate 15 năm miễn phí. Không có lý do để ở lại Flexible quá một buổi chiều.
+- **Sửa vòng lặp bằng cách tắt Always Use HTTPS.** Hết lỗi vì không còn HTTPS để lặp. Đó là bỏ HTTPS.
+- **Full (strict) báo 526, đổi về Full cho xong.** 526 đang nói "chứng chỉ origin có vấn đề" — sửa chứng chỉ. Full chỉ che thông báo.
+- **Bật HSTS với `max-age` một năm và `includeSubDomains` ngay ngày đầu.** Sau đó phát hiện `staging.` chưa có HTTPS, và không gỡ được cho những ai đã ghé thăm.
+- **Dùng Origin Certificate rồi chuyển đám mây xám để debug.** Trình duyệt báo lỗi chứng chỉ ngay, và bạn tưởng origin hỏng. Dùng `curl -k --resolve` thay vì đổi màu đám mây.
+- **Đặt tên môi trường hai cấp (`api.staging.example.com`).** Universal SSL không phủ; đổi thành một cấp với dấu gạch ngang.
+
+---
+
+## Tóm tắt
+
+- Có **hai chặng mã hoá**: người dùng ↔ Cloudflare (edge cert, luôn HTTPS với Universal SSL) và Cloudflare ↔ origin. **SSL mode chỉ quyết định chặng 2.**
+- Bốn chế độ: Off (không), Flexible (HTTP trần xuống origin, gây vòng lặp), Full (HTTPS không kiểm tra chứng chỉ), **Full (strict)** (HTTPS có kiểm tra — luôn chọn cái này).
+- `ERR_TOO_MANY_REDIRECTS` = Flexible + origin ép HTTPS: origin thấy HTTP → 301 sang HTTPS → Cloudflare chuyển tiếp → trình duyệt gọi lại → lặp. Sửa đúng: chứng chỉ hợp lệ ở origin + Full (strict). Tạm: tắt ép HTTPS ở origin. Không bao giờ: tắt Always Use HTTPS.
+- App Node tự ép HTTPS cũng tạo vòng lặp; sửa bằng `trust proxy` để đọc `X-Forwarded-Proto`. Rule www ↔ apex ở hai phía cũng tạo vòng lặp; chọn một phía.
+- **Origin Certificate**: miễn phí, 15 năm, chỉ Cloudflare tin — tắt đám mây cam là lỗi chứng chỉ ngay.
+- Bật Always Use HTTPS, Automatic HTTPS Rewrites, TLS 1.2 tối thiểu, TLS 1.3, Opportunistic Encryption. **HSTS** chỉ sau nhiều tuần HTTPS ổn định, bắt đầu với `max-age` ngắn.
+- 525 = origin không nghe HTTPS; 526 = chứng chỉ origin không hợp lệ; subdomain hai cấp không được Universal SSL phủ.
+
+Phần tiếp theo: [Phần 6 — Cache: vì sao deploy xong vẫn thấy bản cũ](/blog/cloudflare-fe-06-cache-old-version-after-deploy/) — Cloudflare mặc định cache gì, đọc `cf-cache-status`, chiến lược Cache-Control cho SPA, và purge từ pipeline.
+
+## Đọc thêm
+
+- [Cloudflare SSL/TLS docs](https://developers.cloudflare.com/ssl/) — encryption modes, Origin CA, Edge Certificates, HSTS.
+- [Cloudflare Fundamentals](https://developers.cloudflare.com/fundamentals/) — cách Cloudflare làm proxy và các header nó gửi xuống origin.
+- [nginx documentation](https://nginx.org/en/docs/) — module `ngx_http_ssl_module` cho phần cài Origin Certificate.

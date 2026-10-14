@@ -1,0 +1,391 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 11 — Deploy Next.js SSR, nhiều app trên một domain và micro-frontend'
+description: 'Next.js SSR khác SPA ở đâu trên K8s: Dockerfile standalone, HOSTNAME=0.0.0.0, startupProbe, ISR cache không chia sẻ giữa Pod. Rồi Ingress cho nhiều app theo path hoặc subdomain, cạm bẫy base path và Module Federation.'
+pubDate: 2026-10-30
+lang: vi
+tags: [kubernetes, nextjs, deployment, devops, frontend]
+series: k8s-fe
+seriesOrder: 11
+draft: false
+---
+
+SPA ở [Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/) là trường hợp dễ: nginx phục vụ file tĩnh, 30 MB RAM, khởi động dưới một giây. Next.js SSR là một tiến trình Node.js phải luôn chạy, ăn vài trăm MB, mất 3–15 giây để sẵn sàng, và có cache trên đĩa. Mỗi khác biệt đó kéo theo một chỗ phải cấu hình khác trên K8s, và mỗi chỗ đó là một lỗi kinh điển: Pod Running mà 502 vì listen sai địa chỉ, `CrashLoopBackOff` vì liveness không chờ nổi Node khởi động, người dùng thấy nội dung không nhất quán vì ba Pod có ba bản cache. Nửa đầu bài là Project 2: Dockerfile standalone và Deployment đúng cho Next.js. Nửa sau trả lời câu hỏi tiếp theo mà mọi công ty đều gặp: nhiều app frontend trên một domain đặt thế nào, và micro-frontend với Module Federation cần gì từ Ingress.
+
+## Khác biệt căn bản so với SPA
+
+| Khía cạnh           | SPA tĩnh                           | Next.js SSR                                                            |
+| ------------------- | ---------------------------------- | ---------------------------------------------------------------------- |
+| Runtime             | nginx phục vụ file                 | Tiến trình Node.js phải luôn chạy                                      |
+| RAM                 | ~30 MB                             | ~200–600 MB                                                            |
+| Khởi động           | Dưới 1 giây                        | 3–15 giây → cần `startupProbe`                                         |
+| Biến môi trường     | Phải dùng runtime config (Phần 10) | Biến server-side đọc trực tiếp được; `NEXT_PUBLIC_*` vẫn là build-time |
+| Cache               | Không                              | ISR ghi vào `.next/cache` → cần chia sẻ hoặc tắt                       |
+| Port                | 80                                 | 3000                                                                   |
+| Tài nguyên theo tải | Gần như phẳng                      | Mỗi request tốn CPU để render → HPA có ý nghĩa thật                    |
+
+Cột bên phải là danh sách việc phải làm của bài này.
+
+---
+
+## Dockerfile cho Next.js (standalone output)
+
+Mặc định `next build` tạo thư mục `.next` cần **toàn bộ `node_modules`** để chạy, tức image runtime vẫn phải mang vài trăm MB dependency. Chế độ `standalone` giải quyết đúng chỗ đó: Next.js lần theo import và gom **chỉ những file thật sự cần** vào `.next/standalone`, kèm một `server.js` tối giản.
+
+```js
+// next.config.js
+module.exports = {
+  output: 'standalone', // BẮT BUỘC: gom mọi dependency cần thiết
+};
+```
+
+```dockerfile
+# ---- deps ----
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+
+# ---- builder ----
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+# ---- runner ----
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+
+# Chạy bằng user không phải root
+RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
+
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+USER nextjs
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+Ba stage thay vì hai như SPA: tách `deps` khỏi `builder` để layer `npm ci` được cache độc lập với source, giống quy tắc "copy `package.json` trước" ở Phần 4 nhưng rõ ràng hơn. Hai dòng `COPY` cuối là bắt buộc và hay bị quên: standalone **không** tự mang theo `public/` và `.next/static` (Next.js giả định bạn sẽ đưa chúng lên CDN), thiếu là mọi asset 404. `CMD ["node", "server.js"]` gọi Node trực tiếp, không qua `npm start`, để Node là PID 1 và nhận SIGTERM đúng cách ([Phần 9](/blog/k8s-fe-09-resources-qos-storage-pod-lifecycle/)).
+
+Nếu dự án dùng pnpm hoặc yarn, đổi hai dòng cài dependency cho khớp lockfile; phần còn lại giữ nguyên. Nếu dùng `next/image` với tối ưu ảnh phía server, image cần thêm `sharp`; kiểm tra docs phiên bản Next.js của bạn.
+
+> **Bắt buộc: `HOSTNAME=0.0.0.0`.** Tuỳ phiên bản, server standalone của Next.js có thể listen ở `localhost`, nghĩa là chỉ nhận kết nối từ bên trong chính container đó. Kubernetes gửi request từ ngoài vào (kube-proxy, kubelet chạy probe) sẽ bị từ chối → Pod Running nhưng readiness luôn fail và Service trả 502. Đây là lỗi tốn rất nhiều giờ debug vì `kubectl exec` rồi `curl localhost:3000` bên trong container **vẫn chạy tốt**. Luôn đặt biến này tường minh trong Dockerfile, đừng tin mặc định.
+
+### Health check endpoint
+
+```ts
+// app/api/health/route.ts
+export const dynamic = 'force-dynamic';
+
+export async function GET() {
+  return Response.json({ status: 'ok', ts: Date.now() });
+}
+```
+
+`force-dynamic` để route không bị render tĩnh lúc build; probe cần một tiến trình Node đang thật sự trả lời, không phải một file JSON đóng băng.
+
+---
+
+## Deployment cho Next.js
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextjs-app
+  namespace: web
+  labels:
+    app.kubernetes.io/name: nextjs-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nextjs-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nextjs-app
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001 # khớp user nextjs trong Dockerfile
+      containers:
+        - name: web
+          image: ghcr.io/my-org/nextjs-app:v2.1.0
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: NODE_ENV
+              value: production
+            # Biến server-side: đọc runtime được, an toàn
+            - name: INTERNAL_API_URL
+              value: http://backend.web.svc.cluster.local:3000
+            - name: SESSION_SECRET
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: SESSION_SECRET }
+            # Cho V8 dọn rác trước khi chạm memory limit (~80% của 768Mi)
+            - name: NODE_OPTIONS
+              value: --max-old-space-size=600
+          resources:
+            requests: { cpu: 150m, memory: 320Mi }
+            limits: { cpu: 1000m, memory: 768Mi }
+          # Next.js khởi động chậm -> dùng startupProbe
+          startupProbe:
+            httpGet: { path: /api/health, port: http }
+            failureThreshold: 30
+            periodSeconds: 3 # cho phép tối đa 30 x 3 = 90 giây
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 20
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ['sh', '-c', 'sleep 5']
+          volumeMounts:
+            - name: cache
+              mountPath: /app/.next/cache
+      volumes:
+        - name: cache
+          emptyDir: { sizeLimit: 512Mi }
+```
+
+Những gì khác Deployment của SPA:
+
+- **`startupProbe`** thay cho `initialDelaySeconds` dài: cho Next.js tối đa 90 giây khởi động, xong lúc nào nhận traffic lúc đó. Không có nó, liveness với `initialDelaySeconds: 15` sẽ giết Pod trên node chậm, đúng cạm bẫy ở [Phần 8](/blog/k8s-fe-08-configmap-secret-probes/).
+- **Resources** lớn hơn hẳn và **`NODE_OPTIONS`** giới hạn heap V8 dưới memory limit, để Node thu gom rác thay vì bị `OOMKilled`.
+- **`emptyDir` cho `.next/cache`**: Next.js ghi ISR cache và image cache vào đây; với `readOnlyRootFilesystem` sau này, thư mục này bắt buộc phải là volume. `sizeLimit` chặn cache phình vô hạn.
+- **Biến môi trường server-side** (`INTERNAL_API_URL`, `SESSION_SECRET`) đọc runtime bình thường trong server component, route handler và middleware; không cần runtime config pattern cho phía server.
+- **`preStop` chỉ `sleep 5`**: Next.js tự xử lý SIGTERM để tắt; việc của bạn chỉ là chờ endpoints lan truyền.
+
+---
+
+## Ba điểm cần lưu ý riêng cho Next.js trên K8s
+
+### 1. `NEXT_PUBLIC_*` vẫn bị nhúng lúc build
+
+Chúng là biến client-side và Next.js thay thế tĩnh y như Vite làm với `VITE_*`. Muốn cấu hình runtime cho phía client, có hai đường:
+
+- Dùng lại pattern `config.js` của Phần 10 (đặt script vào `app/layout.tsx` qua thẻ `<script src="/config.js">`, và sinh file đó vào `public/` lúc container start).
+- Sạch hơn với App Router: **đọc biến ở server component rồi truyền xuống client qua props**. Root layout là server component, nó thấy `process.env.API_BASE_URL` lúc runtime:
+
+```tsx
+// app/layout.tsx (server component)
+import { ConfigProvider } from './config-provider';
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const config = {
+    apiBaseUrl: process.env.API_BASE_URL ?? 'http://localhost:3000',
+    featureNewCheckout: process.env.FEATURE_NEW_CHECKOUT === 'true',
+  };
+  return (
+    <html lang="vi">
+      <body>
+        <ConfigProvider value={config}>{children}</ConfigProvider>
+      </body>
+    </html>
+  );
+}
+```
+
+`ConfigProvider` là một client component bọc React context. Client component nào cần config thì `useConfig()`. Cách này không cần file phụ, không cần script blocking, và ConfigMap đổi xong `rollout restart` là có giá trị mới. Chỉ đưa xuống client những giá trị công khai; `SESSION_SECRET` không bao giờ đi qua đường này.
+
+### 2. ISR cache không chia sẻ giữa các Pod
+
+Mỗi Pod có `.next/cache` riêng trên `emptyDir`. Trang dùng ISR (`revalidate: 60`) sẽ được render lại độc lập ở từng Pod: người dùng bị load balancer đưa tới Pod A thấy giá mới, F5 sang Pod B thấy giá cũ, và gọi `revalidatePath()` chỉ xoá cache của **Pod nhận request đó**. Ba cách xử lý:
+
+- **Custom cache handler trỏ về Redis**: Next.js cho khai `cacheHandler` trong `next.config.js` (kèm `cacheMaxMemorySize: 0` để tắt cache trong bộ nhớ) và có package cộng đồng cho Redis. Cache thành tài nguyên chung, `revalidate` có tác dụng trên mọi Pod. Kiểm tra docs phiên bản Next.js bạn dùng, API này thay đổi giữa các bản.
+- **Chấp nhận**: nội dung lệch nhau tối đa bằng thời gian `revalidate`. Với trang marketing đổi vài lần một ngày, không ai nhận ra.
+- **Chuyển sang SSG + CDN**: nếu trang không cần dữ liệu theo từng request, build tĩnh rồi để CDN phục vụ ([Phần 12](/blog/k8s-fe-12-cache-cdn-zero-downtime/)), không còn cache nào để chia sẻ.
+
+Liên quan tới cache: chỉ build **một image** rồi chạy ở mọi môi trường. Build ID của Next.js sinh lúc build; hai bản build khác nhau có hai bộ tên chunk khác nhau, và nếu vì lý do gì hai Pod chạy hai bản build, trình duyệt sẽ tải chunk từ Pod này rồi 404 ở Pod kia.
+
+### 3. Gọi API nội bộ dùng Service DNS
+
+Từ server component hay route handler, gọi `http://backend.web.svc.cluster.local:3000` nhanh hơn nhiều so với đi vòng ra Internet qua `https://api.congty.com`: không qua DNS công cộng, không TLS handshake, không qua CDN và Ingress. Đó là lý do có hai biến: `INTERNAL_API_URL` cho phía server, `API_BASE_URL` (public) cho phía client. Với Next.js, phần lớn request dữ liệu nên đi ở phía server bằng biến nội bộ, còn client chỉ gọi những gì thật sự cần tương tác.
+
+### Thực hành 11.1: Next.js trên kind
+
+1. `npx create-next-app@latest my-next --ts --app`, thêm `output: 'standalone'` vào `next.config.js` và route `app/api/health/route.ts` ở trên.
+2. Viết Dockerfile như trên, `docker build -t my-next:v1 .`, `docker images my-next` để thấy image cỡ 150–250 MB (so với hơn 1 GB nếu không dùng standalone).
+3. `kind load docker-image my-next:v1 --name fe-lab`, sửa `image` trong Deployment thành `my-next:v1` với `imagePullPolicy: IfNotPresent`, tạm bỏ hai biến `INTERNAL_API_URL` và `SESSION_SECRET`. Tạo Service `nextjs-app` port 80 → `targetPort: http`. Apply.
+4. `kubectl -n web get pods -w`: Pod ở `Running` với READY `0/1` trong vài giây (startupProbe đang chờ), rồi `1/1`. `kubectl describe pod` không có Events `Unhealthy` nào.
+5. Cố tình đổi `ENV HOSTNAME=0.0.0.0` thành `ENV HOSTNAME=127.0.0.1`, build tag `v1-broken`, load và `set image`. Quan sát READY kẹt `0/1`, Events báo `connection refused`, và qua Ingress nhận 502. `kubectl exec` vào Pod rồi `wget -qO- localhost:3000/api/health` **vẫn ra `ok`**. Đây chính là lỗi HOSTNAME.
+6. Rollback: `kubectl -n web rollout undo deploy/nextjs-app`.
+
+> **Kết quả mong đợi:** Bước 4 thấy startupProbe bảo vệ Pod trong lúc khởi động; bước 5 tái hiện được lỗi "trong container chạy, ngoài container 502" và bạn không bao giờ mất một buổi chiều vì nó nữa.
+
+---
+
+## Nhiều app trên một domain
+
+Công ty hiếm khi chỉ có một frontend. Kịch bản phổ biến: trang marketing, dashboard, tài liệu, API, tất cả dưới `congty.com`:
+
+```text
+congty.com/         -> marketing-site  (Next.js)
+congty.com/app/*    -> dashboard       (React SPA)
+congty.com/docs/*   -> documentation   (Docusaurus)
+congty.com/api/*    -> backend
+```
+
+```yaml
+# multi-app-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: multi-app
+  namespace: web
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: congty.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend: { service: { name: backend, port: { number: 3000 } } }
+          - path: /app
+            pathType: Prefix
+            backend: { service: { name: dashboard, port: { number: 80 } } }
+          - path: /docs
+            pathType: Prefix
+            backend: { service: { name: docs, port: { number: 80 } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: marketing, port: { number: 3000 } } }
+```
+
+Ingress chỉ chuyển request; nó **không** sửa đường dẫn. Request `GET /app/assets/main-abc.js` tới Pod dashboard vẫn nguyên `/app/assets/main-abc.js`, và nginx trong Pod đó phải biết phục vụ dưới tiền tố `/app/`. Đây là nguồn của cạm bẫy lớn nhất mục này.
+
+> **Cạm bẫy base path:** App SPA đặt ở `/app` phải được **build với base path tương ứng**, nếu không `index.html` sẽ tham chiếu `/assets/main.js` thay vì `/app/assets/main.js`. Request `/assets/main.js` khớp path `/` → tới marketing-site → 404 → trang trắng, console đầy lỗi 404 asset. Cấu hình cho từng công cụ:
+>
+> - Vite: `base: '/app/'` trong `vite.config.ts`
+> - Next.js: `basePath: '/app'` trong `next.config.js` (tự xử lý cả asset lẫn `Link`)
+> - React Router: `<BrowserRouter basename="/app">`
+> - Docusaurus: `baseUrl: '/docs/'` trong `docusaurus.config.js`
+
+Còn lại là chọn một trong hai cách để nginx trong Pod SPA hiểu tiền tố:
+
+- **Cắt tiền tố ở Ingress** bằng `rewrite-target` trong một Ingress riêng cho `/app` (như bài thực hành Phần 7): container nhận `/assets/main-abc.js`, `nginx.conf` giữ nguyên như Phần 4. Trình duyệt vẫn thấy `/app/...` nhờ `base`, nên hai bên khớp nhau.
+- **Phục vụ dưới tiền tố ngay trong nginx**, không rewrite:
+
+```nginx
+location /app/ {
+  alias /usr/share/nginx/html/;
+  try_files $uri $uri/ /app/index.html;
+}
+```
+
+Cách một giữ image SPA "không biết gì" về vị trí được đặt, cách hai giữ Ingress đơn giản. Chọn một và dùng nhất quán cho mọi app.
+
+Đặt nhiều app cùng origin còn nghĩa là chúng **chia sẻ cookie, `localStorage` và CSP**. Dashboard lưu `localStorage.setItem('token', ...)` thì docs cũng đọc được; một app đặt CSP chặt sẽ ảnh hưởng app kia nếu header đặt ở Ingress dùng chung. Đặt tên key có tiền tố app và giữ security header ở cấp Ingress riêng từng path nếu chúng khác nhau.
+
+### Kịch bản mỗi app một subdomain (khuyến nghị)
+
+Đơn giản hơn nhiều vì không cần base path, mỗi app build và chạy như thể nó ở `/`:
+
+```yaml
+rules:
+  - host: www.congty.com
+    http:
+      paths:
+        - path: /
+          pathType: Prefix
+          backend: { service: { name: marketing, port: { number: 3000 } } }
+  - host: app.congty.com
+    http:
+      paths:
+        - path: /
+          pathType: Prefix
+          backend: { service: { name: dashboard, port: { number: 80 } } }
+  - host: docs.congty.com
+    http:
+      paths:
+        - path: /
+          pathType: Prefix
+          backend: { service: { name: docs, port: { number: 80 } } }
+```
+
+Đổi lại, các app giờ là **origin khác nhau**: cookie đăng nhập muốn dùng chung phải đặt `Domain=.congty.com`; dashboard gọi `api.congty.com` là cross-origin và cần CORS (hoặc vẫn đưa `/api` vào host `app.congty.com` như Phần 7 để né); mỗi host cần chứng chỉ, mà cert-manager lo được cả danh sách host hoặc một wildcard. Với đa số team, chi phí này nhỏ hơn hẳn việc theo dõi base path ở bốn công cụ khác nhau. [Bài CORS](/blog/cors-explained-deep-dive/) giải thích chính xác khi nào subdomain khác bị coi là origin khác.
+
+---
+
+## Micro-frontend với Module Federation
+
+Nếu team dùng Module Federation (webpack 5, Rspack, hoặc plugin cho Vite), host app tải code của các remote **lúc runtime** qua file `remoteEntry.js`. Trên K8s, mỗi remote là một **Deployment + Service riêng**, deploy độc lập, có version độc lập. Ingress phải đảm bảo ba điều:
+
+1. **Cho phép CORS giữa host và remote**, hoặc tránh luôn bằng cách đặt chung origin qua path (`congty.com/mf/checkout/remoteEntry.js`). Cùng origin là lựa chọn ít đau nhất; nếu buộc phải khác origin, bật `enable-cors` trên Ingress của remote với `cors-allow-origin` là host.
+2. **Không cache `remoteEntry.js`**: file này là "mục lục" trỏ tới các chunk có hash của remote. Nếu nó bị cache, host sẽ nạp phiên bản remote cũ, trỏ tới chunk đã bị xoá sau khi remote deploy → lỗi tải module ngẫu nhiên ở một số người dùng. Đặt header ngay trong `nginx.conf` của image remote là chắc nhất:
+
+```nginx
+location = /remoteEntry.js {
+  add_header Cache-Control "no-cache, no-store, must-revalidate";
+}
+```
+
+Hoặc ở Ingress của remote như tài liệu gốc gợi ý:
+
+```yaml
+nginx.ingress.kubernetes.io/configuration-snippet: |
+  location ~* remoteEntry\.js$ {
+    add_header Cache-Control "no-cache, no-store, must-revalidate";
+  }
+```
+
+`configuration-snippet` được chèn **bên trong** block `location` mà ingress-nginx sinh ra, nên một số phiên bản từ chối `location` lồng nhau; khi đó chuyển sang `server-snippet`, hoặc dùng cách `nginx.conf` ở trên. Admin cũng có thể đã tắt snippet (Phần 7).
+
+3. **Đảm bảo phiên bản shared dependency tương thích**: host và remote cùng khai `react` là `singleton` với `requiredVersion` khớp nhau. Deploy remote dùng React 19 khi host còn React 18 sẽ lỗi lúc runtime chứ không lỗi lúc build, vì hai bên build ở hai pipeline khác nhau. Đây là lý do micro-frontend cần contract test hoặc ít nhất một môi trường staging chạy đủ host lẫn remote trước khi lên production.
+
+Cache của các chunk khác trong remote (`/assets/*-[hash].js`) thì ngược lại, cache dài hạn thoải mái, đúng chiến lược hai tầng ở Phần 12.
+
+### Thực hành 11.2: hai SPA dưới hai path
+
+1. Từ app Vite ở Phần 10, build hai image: `dashboard:v1` với `base: '/app/'` và `docs:v1` với `base: '/docs/'` (đổi tiêu đề để phân biệt). Load cả hai vào kind.
+2. Tạo hai Deployment + hai Service, và Ingress `multi-app` ở trên với host `app.local` (bỏ path `/api` và `/` nếu chưa có backend và marketing).
+3. Mở `http://app.local/app/` và `http://app.local/docs/`: hai app khác nhau, Network tab thấy asset tải từ `/app/assets/...` và `/docs/assets/...` với 200. Nếu bạn chọn cách cắt tiền tố, tách Ingress và thêm `rewrite-target` như Phần 7; nếu chọn cách `alias`, sửa `nginx.conf` của hai image.
+4. F5 ở `http://app.local/app/settings`: không 404 (React Router có `basename`, nginx có fallback đúng).
+5. Cố tình build lại `dashboard` **không có** `base`, deploy, mở `/app/`: trang trắng, console báo 404 cho `/assets/index-xxx.js`. Ghi nhớ hình ảnh này rồi khôi phục.
+
+> **Kết quả mong đợi:** Bước 3 và 4 chạy đúng; bước 5 tái hiện lỗi base path, lỗi số một khi ghép nhiều app trên một domain.
+
+---
+
+## Tóm tắt
+
+- Next.js SSR là tiến trình Node.js luôn chạy: nhiều RAM, khởi động chậm, có cache trên đĩa. Mỗi điểm cần một cấu hình K8s riêng.
+- `output: 'standalone'` cho image nhỏ; nhớ copy `public/` và `.next/static`; `CMD ["node", "server.js"]` để Node là PID 1; **luôn đặt `HOSTNAME=0.0.0.0`**, nếu không Pod Running mà Service 502.
+- Deployment Next.js: `startupProbe` (30 × 3 giây), resources theo Phần 9 kèm `NODE_OPTIONS=--max-old-space-size` dưới limit, `emptyDir` cho `.next/cache`, biến server-side qua env/Secret, `preStop` sleep.
+- `NEXT_PUBLIC_*` vẫn build-time: truyền config runtime xuống client qua props từ server component, hoặc dùng lại pattern `config.js`.
+- ISR cache không chia sẻ giữa Pod: custom cache handler về Redis, chấp nhận lệch trong thời gian `revalidate`, hoặc chuyển SSG + CDN. Chỉ build một image cho mọi môi trường.
+- Nhiều app một domain theo path: **phải build với base path** (Vite `base`, Next `basePath`, Router `basename`), và chọn cắt tiền tố ở Ingress hay `alias` trong nginx. Theo subdomain đơn giản hơn nhiều, đổi lại cookie `Domain` và CORS.
+- Module Federation: mỗi remote một Deployment + Service; cùng origin để né CORS; không cache `remoteEntry.js`; shared dependency phải khớp version.
+
+## Đọc thêm
+
+- [Next.js Docs](https://nextjs.org/docs): mục Deploying và cấu hình `output`, `basePath`, `cacheHandler`
+- [Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/) trong docs Kubernetes
+- [ingress-nginx annotations](https://kubernetes.github.io/ingress-nginx/): `rewrite-target`, `enable-cors`, snippet
+- [Module Federation](https://module-federation.io/): tài liệu chính thức về host, remote và shared dependency
+
+[Phần 12](/blog/k8s-fe-12-cache-cdn-zero-downtime/) nói về thứ đứng **trước** Ingress: Cache-Control đúng cho từng loại file, nén gzip/brotli, CDN đứng trước cluster, và checklist 7 điểm để deploy không mất một request nào, kể cả với ChunkLoadError của SPA.

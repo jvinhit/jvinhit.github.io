@@ -1,0 +1,413 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 7 — Service và Ingress'
+description: 'Pod đổi IP liên tục nên không ai hardcode được. Service cho bạn một tên DNS và IP ổn định đứng trước nhóm Pod; Ingress đọc host và path để đưa request từ Internet vào đúng Service. Kèm cách chẩn đoán endpoints rỗng, 502, 503.'
+pubDate: 2026-10-18
+lang: vi
+tags: [kubernetes, networking, nginx, devops, frontend]
+series: k8s-fe
+seriesOrder: 7
+draft: false
+---
+
+import DockerDiagram from '~/components/blog/DockerDiagram.astro';
+
+Ở [Phần 6](/blog/k8s-fe-06-pod-replicaset-deployment-labels-namespace/) bạn đã có ba Pod nginx chạy dưới một Deployment. Giờ thử `kubectl get pods -o wide`, xoá một Pod, xem lại: Pod mới sinh ra mang IP khác hẳn. Backend muốn gọi frontend, Ingress muốn đưa request vào, ai cũng cần một địa chỉ, mà địa chỉ thì đổi liên tục. Bài này giải quyết đúng chỗ đó bằng hai tài nguyên: **Service** cho bạn một tên và một IP ổn định đứng trước nhóm Pod, **Ingress** đọc hostname và path của request từ Internet rồi đưa vào đúng Service. Đọc xong bạn viết được `service.yaml` và `ingress.yaml` từ đầu, phân biệt được 502 với 503, và tự chẩn đoán được ba nguyên nhân khiến Service "không chạy" mà không cần hỏi ai.
+
+<DockerDiagram
+  kind="k8s-objects"
+  caption="Deployment giữ đủ số Pod; Service đứng trước nhóm Pod với một IP ảo ổn định và chia tải giữa chúng"
+/>
+
+## Vấn đề Service giải quyết
+
+Pod là thực thể phù du. Mỗi lần restart, scale hay chuyển node, Pod nhận IP mới. Không ai có thể hardcode IP của Pod, cũng như bạn không bao giờ hardcode đường dẫn `node_modules/lodash/lodash.js` mà chỉ `import lodash`.
+
+Service tạo ra một **IP ảo** (ClusterIP) và một **tên DNS** cố định, đứng trước một nhóm Pod và cân bằng tải giữa chúng. Nhóm Pod đó được chọn bằng label selector, đúng cơ chế "chất keo" bạn học ở Phần 6:
+
+```text
+Service: my-frontend-svc   (ClusterIP 10.96.12.34, DNS my-frontend-svc)
+        |
+        | selector: app=my-frontend
+        |
+        +------------------+------------------+
+        |                  |                  |
+  Pod 10.244.1.5     Pod 10.244.2.8     Pod 10.244.1.9
+        (cả ba Pod đều mang label app=my-frontend)
+```
+
+### Bên dưới Service có gì
+
+Bạn không cần vận hành phần này, nhưng biết nó giúp đọc lỗi nhanh hơn:
+
+- **ClusterIP là IP ảo**, không gắn với card mạng nào. `kube-proxy` trên mỗi node viết luật iptables/IPVS: gói tin gửi tới `10.96.12.34:80` bị đổi đích sang một Pod IP ngẫu nhiên trong danh sách endpoints. Đó là toàn bộ "load balancing" tầng 4 của Service.
+- **Danh sách endpoints là object riêng** (`Endpoints`, nay là `EndpointSlice`), chỉ chứa Pod khớp selector _và_ đã pass readiness probe. Pod chưa ready thì không có mặt, dù vẫn Running.
+- **CoreDNS tạo bản ghi** `my-frontend-svc.production.svc.cluster.local` trỏ về ClusterIP. Cùng namespace gọi `my-frontend-svc` là đủ (search domain trong `/etc/resolv.conf` của Pod tự nối phần còn lại); khác namespace phải ghi `my-frontend-svc.production`.
+
+Ba điều trên tương ứng với ba nguyên nhân lỗi ở mục chẩn đoán bên dưới: endpoints rỗng, sai cổng, Pod chưa ready.
+
+---
+
+## Bốn loại Service
+
+| Loại             | Phạm vi truy cập                          | Dùng khi nào                                                                                                            |
+| ---------------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| **ClusterIP**    | Chỉ trong cluster                         | Mặc định, dùng 95% trường hợp. Frontend và backend đều để ClusterIP, ra ngoài Internet bằng Ingress.                    |
+| **NodePort**     | Mở một port 30000–32767 trên **mọi** node | Test nhanh ở local. Không dùng production: port lạ, không có TLS, mỗi app chiếm một port trên toàn bộ node.             |
+| **LoadBalancer** | Cấp IP public qua cloud provider          | Thường chỉ dùng cho Ingress Controller, không dùng cho từng app vì mỗi LB của cloud tốn tiền riêng.                     |
+| **ExternalName** | Alias CNAME tới một domain ngoài          | Trỏ tới database managed hoặc API bên ngoài cluster để code bên trong vẫn gọi bằng tên nội bộ, đổi đích không sửa code. |
+
+Điểm đáng nhớ: ba loại đầu **xếp chồng lên nhau**. NodePort vẫn có ClusterIP; LoadBalancer vẫn có NodePort và ClusterIP bên dưới. Cloud LB thực ra chỉ đẩy traffic vào NodePort của các node. Vì thế trên production, mô hình chuẩn là: **một** Service LoadBalancer cho Ingress Controller, còn mọi app đều ClusterIP. Bạn sẽ thấy điều đó ở nửa sau bài.
+
+---
+
+## Service manifest
+
+```yaml
+# service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-frontend-svc
+  namespace: production
+spec:
+  type: ClusterIP
+  # Chọn Pod theo label - PHẢI khớp labels trong template của Deployment
+  selector:
+    app: my-frontend
+  ports:
+    - name: http
+      port: 80 # cổng của Service (người khác gọi vào đây)
+      targetPort: 80 # cổng trên container (Service chuyển tiếp tới đây)
+      protocol: TCP
+```
+
+Đọc từng phần:
+
+- `metadata.name` chính là tên DNS, bạn sẽ gõ nó trong URL: `http://my-frontend-svc`.
+- `spec.selector` là toàn bộ "liên kết" giữa Service và Pod. Không có trường nào ghi "Service này thuộc Deployment kia"; chỉ có label khớp hay không.
+- `spec.ports` là mảng: một Service mở được nhiều cổng, khi đó mỗi cổng bắt buộc có `name`.
+
+### port, targetPort, nodePort
+
+| Trường       | Nghĩa                                                           | Ví dụ                       |
+| ------------ | --------------------------------------------------------------- | --------------------------- |
+| `port`       | Cổng bạn gọi vào Service                                        | `http://my-frontend-svc:80` |
+| `targetPort` | Cổng container thực sự listen, phải khớp `containerPort`        | nginx `80`, Next.js `3000`  |
+| `nodePort`   | Chỉ có khi `type: NodePort`; cổng mở trên node, dải 30000–32767 | `http://<node-ip>:31080`    |
+
+`targetPort` nhận cả **tên cổng** thay vì số. Nếu trong Deployment bạn đặt `ports: [{ name: http, containerPort: 80 }]`, Service có thể viết `targetPort: http`. Sau này đổi container sang cổng 8080 (chẳng hạn khi chuyển sang image `nginx-unprivileged`), bạn chỉ sửa Deployment, Service không đụng tới. Bộ manifest production ở Phần 10 dùng cách này.
+
+> **Cạm bẫy:** Nhầm `targetPort` là nguyên nhân số 1 của lỗi 502 Bad Gateway. Service vẫn tạo được, endpoints vẫn có IP, DNS vẫn phân giải, nhưng gói tin đến cổng không ai nghe. Trước khi nghĩ tới bất kỳ thứ gì phức tạp, so `targetPort` với `containerPort` và với cổng app thật sự listen (`kubectl exec <pod> -- netstat -tlnp` hoặc đọc log khởi động của app).
+
+---
+
+## Kiểm tra Service có hoạt động không
+
+Làm đúng thứ tự ba bước này, mỗi bước loại trừ một tầng:
+
+```bash
+# BƯỚC 1: Service có tìm thấy Pod nào không?
+kubectl get endpoints my-frontend-svc
+# NAME              ENDPOINTS                                   AGE
+# my-frontend-svc   10.244.1.5:80,10.244.2.8:80,10.244.1.9:80   2m
+#
+# Nếu cột ENDPOINTS là <none> -> selector KHÔNG khớp label của Pod nào.
+# Đây là kiểm tra đầu tiên phải làm khi Service không hoạt động.
+
+# BƯỚC 2: Gọi thử từ bên trong cluster
+kubectl run tmp --rm -it --image=curlimages/curl -- sh
+# bên trong Pod tạm:
+curl -v http://my-frontend-svc.production:80
+nslookup my-frontend-svc.production.svc.cluster.local
+
+# BƯỚC 3: Truy cập từ máy bạn
+kubectl port-forward svc/my-frontend-svc 8080:80
+# -> mở http://localhost:8080
+```
+
+Bước 2 dùng Pod tạm vì máy bạn **không nằm trong mạng cluster**: ClusterIP không route được ra laptop. `kubectl run --rm -it` tạo một Pod dùng xong tự xoá, là thủ thuật bạn sẽ dùng hằng ngày; muốn nhiều công cụ hơn (`dig`, `nc`, `tcpdump`), thay image bằng `nicolaka/netshoot`.
+
+Bước 3 (`port-forward`) đi vòng qua apiserver, không qua kube-proxy, nên nó **không chứng minh** Service hoạt động trong cluster; nó chỉ tiện để xem app trên trình duyệt.
+
+> **Quy tắc chẩn đoán:** Service không chạy chỉ có ba nguyên nhân. (1) Selector không khớp label → endpoints rỗng. (2) Sai `targetPort` → endpoints có IP nhưng `connection refused`. (3) Pod chưa pass readiness probe → K8s **cố tình** loại Pod khỏi endpoints, `kubectl get pods` thấy `READY 0/1`. Xem kỹ probe ở [Phần 8](/blog/k8s-fe-08-configmap-secret-probes/).
+
+Bảng đối chiếu nhanh khi `curl` từ Pod tạm không ra kết quả:
+
+| Bạn thấy gì                                    | Nguyên nhân                                   | Lệnh kiểm tra                                               |
+| ---------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------- |
+| `ENDPOINTS` là `<none>`                        | Selector không khớp label Pod                 | `kubectl get pods --show-labels` rồi so với `spec.selector` |
+| Endpoints có IP, curl báo `Connection refused` | Sai `targetPort`, hoặc app listen `127.0.0.1` | `kubectl exec <pod> -- netstat -tlnp`                       |
+| Endpoints thiếu một vài Pod                    | Pod đó chưa ready                             | `kubectl get pods` xem cột READY, `describe` đọc Events     |
+| `nslookup` báo `NXDOMAIN`                      | Sai tên hoặc thiếu namespace                  | `kubectl get svc -A` để tìm đúng tên và namespace           |
+
+Với `Connection refused`, nhớ cạm bẫy từ Phần 3: app trong container phải listen `0.0.0.0`, không phải `127.0.0.1`. Vite preview, Next.js standalone và nhiều dev server mặc định chỉ bind localhost; trong container, "localhost" là chính container đó, nên request từ kube-proxy tới Pod IP bị từ chối dù cổng đúng.
+
+### Headless Service
+
+Đặt `clusterIP: None` thì Service không có IP ảo; DNS trả về thẳng IP của từng Pod. Dùng cho StatefulSet (database, Kafka) nơi client cần nói chuyện với **từng** Pod cụ thể. Frontend hầu như không cần, biết để đọc hiểu manifest của team backend là đủ.
+
+---
+
+## Thực hành 7.1: Service
+
+1. Apply Deployment `my-frontend` ở Phần 6 (image `nginx:1.27-alpine`, 3 replica) và file `service.yaml` ở trên. Nếu đang dùng namespace `default`, bỏ dòng `namespace: production` hoặc tạo namespace trước.
+2. `kubectl get endpoints my-frontend-svc`. Phải thấy **3 IP**, mỗi IP kèm `:80`.
+3. Cố tình sửa `selector.app` trong Service thành `app: sai-ten`, apply lại.
+4. Xem lại endpoints: giờ là `<none>`. Ghi nhớ hình ảnh này, nó là thứ bạn sẽ thấy nhiều nhất khi "Service không chạy".
+5. Sửa lại đúng, apply, xác nhận 3 IP trở lại. Không cần xoá Service; K8s tự cập nhật endpoints trong vài giây.
+6. Chạy `kubectl run tmp --rm -it --image=curlimages/curl -- sh`, bên trong gõ `curl -s http://my-frontend-svc | head -5`. Gõ thêm `nslookup my-frontend-svc` để thấy ClusterIP.
+
+> **Kết quả mong đợi:** Bước 2 thấy 3 endpoints; bước 4 thấy `<none>`; bước 6 nhận HTML chào của nginx. Nếu bước 6 báo `Could not resolve host`, bạn đang chạy Pod tạm ở namespace khác với Service: thêm `.default` (hoặc đúng namespace) sau tên.
+
+---
+
+## Ingress khác Service thế nào
+
+Service hoạt động ở **tầng 4** (TCP): nó chỉ biết IP và cổng, chuyển gói tin đi mà không đọc nội dung. Ingress hoạt động ở **tầng 7** (HTTP): nó đọc được hostname và đường dẫn URL, nên định tuyến được theo `app.congty.com/api` hay `admin.congty.com`, kết thúc TLS, thêm header, redirect. Nói cách khác, Ingress chính là reverse proxy bạn học ở Phần 2, được khai báo bằng YAML thay vì file `nginx.conf` viết tay.
+
+```text
+                    Internet
+                       |
+                       v
+       [ LoadBalancer của cloud ]     <- 1 IP public duy nhất cho cả cluster
+                       |
+                       v
+       [ Ingress Controller ]         <- nginx / traefik chạy như Pod trong cluster,
+                       |                 đọc các Ingress resource để biết luật định tuyến
+                       |
+                       +-- app.congty.com/        -> frontend-svc:80
+                       +-- app.congty.com/api/*   -> backend-svc:3000
+                       +-- admin.congty.com/      -> admin-svc:80
+```
+
+Toàn bộ cluster chỉ cần **một** IP public: cloud LB đẩy mọi request vào Ingress Controller, Controller nhìn host và path rồi chuyển tới ClusterIP Service tương ứng. Với cluster kind ở [Phần 5](/blog/k8s-fe-05-architecture-local-cluster-kubectl/), vai trò "LB của cloud" được thay bằng `extraPortMappings` ánh xạ cổng 80/443 của máy bạn vào node.
+
+> **Hai thứ khác nhau, đừng nhầm:** **Ingress Controller** là phần mềm thật (nginx, Traefik, HAProxy) chạy dưới dạng Pod, phải cài trước, thường bằng Helm hoặc một file manifest của nhà cung cấp. **Ingress resource** là file YAML khai báo luật. Tạo Ingress resource mà chưa cài Controller thì không có gì xảy ra cả: `kubectl get ingress` vẫn liệt kê, nhưng cột ADDRESS trống mãi và không request nào được route. Đây là lỗi làm người mới bối rối nhất.
+
+Kiểm tra Controller đã có chưa:
+
+```bash
+kubectl get pods -n ingress-nginx
+# ingress-nginx-controller-xxxxx   1/1   Running
+
+kubectl get ingressclass
+# NAME    CONTROLLER             PARAMETERS   AGE
+# nginx   k8s.io/ingress-nginx   <none>       5d
+```
+
+Tên trong cột NAME của `ingressclass` là giá trị bạn sẽ ghi vào `spec.ingressClassName`. Cluster có thể cài nhiều Controller (một cho traffic public, một cho nội bộ), trường này quyết định Ingress của bạn thuộc về cái nào. Bỏ trống thì chỉ Controller được đánh dấu default mới nhận, và không phải cluster nào cũng có default.
+
+---
+
+## Ingress cho hệ thống frontend + backend
+
+```yaml
+# ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+  namespace: production
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: '20m'
+    nginx.ingress.kubernetes.io/ssl-redirect: 'true'
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - app.congty.com
+      secretName: app-tls-cert # cert-manager sẽ tự tạo Secret này
+  rules:
+    - host: app.congty.com
+      http:
+        paths:
+          # QUAN TRỌNG: path cụ thể hơn đặt TRƯỚC
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-svc
+                port:
+                  number: 3000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-frontend-svc
+                port:
+                  number: 80
+```
+
+Đọc từng khối:
+
+- **`annotations`** là cách truyền cấu hình riêng cho từng Controller, vì spec Ingress chuẩn khá tối giản. Tiền tố `nginx.ingress.kubernetes.io/` chỉ ingress-nginx hiểu; Traefik có bộ annotation khác. `cert-manager.io/cluster-issuer` là chỗ [Phần 17](/blog/k8s-fe-17-cert-manager-and-observability/) sẽ dùng để tự xin chứng chỉ Let's Encrypt.
+- **`tls`** khai báo host nào dùng chứng chỉ trong Secret nào. Secret kiểu `kubernetes.io/tls` chứa `tls.crt` và `tls.key`; bạn tạo tay bằng `kubectl create secret tls`, hoặc để cert-manager tạo. TLS kết thúc ở Ingress Controller; Pod phía sau chỉ nói HTTP thuần.
+- **`rules`** là mảng theo host; mỗi host có mảng `paths`. Request `GET https://app.congty.com/api/users` khớp host, rồi khớp path `/api` → tới `backend-svc:3000`, đường dẫn giữ nguyên là `/api/users`. Request tới `/dashboard` không khớp `/api` nên rơi xuống `/` → frontend, và nginx trong Pod frontend `try_files` về `index.html` cho React Router xử lý.
+- **`backend.service.port.number`** là `port` của Service, không phải `targetPort`. Chuỗi đầy đủ là: Ingress → Service `port` → Pod `targetPort`.
+
+Cách đặt `/api` và `/` trên **cùng một host** là lời giải gọn nhất cho CORS: trình duyệt thấy frontend và API cùng origin `https://app.congty.com`, không có preflight, không có header `Access-Control-*`. Nếu bạn vẫn muốn hiểu vì sao CORS chặn và khi nào không tránh được, [bài CORS](/blog/cors-explained-deep-dive/) giải thích tận gốc.
+
+---
+
+## pathType: ba giá trị cần hiểu
+
+| pathType                 | Hành vi                                                                                                                                   |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `Prefix`                 | Khớp theo **phân đoạn** đường dẫn. `/api` khớp `/api`, `/api/`, `/api/users`, nhưng **không** khớp `/apiv2`. Dùng cái này 90% trường hợp. |
+| `Exact`                  | Khớp chính xác tuyệt đối, kể cả dấu `/` cuối. `/healthz` không khớp `/healthz/`.                                                          |
+| `ImplementationSpecific` | Tuỳ Controller quyết định. Với ingress-nginx, đây là cách bật regex trong path. Nên tránh trừ khi cần rewrite.                            |
+
+Về thứ tự: ingress-nginx tự ưu tiên path dài hơn (cụ thể hơn) trước khi khớp, nên `/api` thắng `/` dù bạn viết `/` ở trên. Nhưng không phải Controller nào cũng thế, và người đọc YAML thì đọc từ trên xuống. Cứ đặt path cụ thể trước cho an toàn và dễ đọc.
+
+---
+
+## Annotation nginx hữu ích cho frontend
+
+```yaml
+annotations:
+  # Cắt bỏ tiền tố: /api/users -> backend nhận /users
+  nginx.ingress.kubernetes.io/rewrite-target: /$2
+  # (dùng kèm path: /api(/|$)(.*) và pathType: ImplementationSpecific)
+
+  nginx.ingress.kubernetes.io/proxy-body-size: '50m' # cho phép upload file lớn
+  nginx.ingress.kubernetes.io/proxy-read-timeout: '300' # SSE / long polling
+
+  nginx.ingress.kubernetes.io/enable-cors: 'true'
+  nginx.ingress.kubernetes.io/cors-allow-origin: 'https://app.congty.com'
+
+  nginx.ingress.kubernetes.io/configuration-snippet: |
+    more_set_headers "X-Frame-Options: SAMEORIGIN";
+    more_set_headers "X-Content-Type-Options: nosniff";
+```
+
+Từng annotation giải quyết một tình huống cụ thể mà FE dev hay gặp:
+
+- **`rewrite-target`**: backend của bạn không có route bắt đầu bằng `/api` (Express mount ở `/users`, không phải `/api/users`). Path `/api(/|$)(.*)` có hai capture group; `$2` là phần sau `/api/`. Annotation này **áp cho mọi path trong cùng Ingress resource**, nên nếu chỉ một path cần rewrite, tách nó ra Ingress riêng. Đây cũng là lý do bài thực hành bên dưới dùng hai Ingress.
+- **`proxy-body-size`**: mặc định ingress-nginx chặn body trên 1m, upload avatar 3MB sẽ nhận `413 Request Entity Too Large` mà app không hề thấy request. Đặt vừa đủ cho tính năng upload lớn nhất.
+- **`proxy-read-timeout`**: mặc định 60 giây. Server-Sent Events, long polling, hay một export report chạy lâu sẽ bị cắt ở giây 60 với lỗi 504 nếu không tăng. WebSocket hoạt động mặc định qua ingress-nginx (nó hiểu header `Upgrade`), nhưng cũng chịu timeout này khi kết nối im lặng lâu.
+- **`enable-cors`**: chỉ cần khi frontend và API **thật sự** khác origin (`app.congty.com` gọi `api.congty.com`). Đã đưa API về `/api` cùng host thì đừng bật.
+- **`configuration-snippet`**: chèn nguyên văn nginx config vào block `location`; `more_set_headers` đến từ module headers-more có sẵn trong ingress-nginx. Admin cluster có thể **tắt** snippet vì lý do bảo mật (cấu hình `allow-snippet-annotations`); nếu header không xuất hiện, hỏi DevOps hoặc đặt header ngay trong `nginx.conf` của image.
+
+---
+
+## Test Ingress ở local
+
+Ingress khớp theo host, nên máy bạn phải phân giải `app.local` về chính nó:
+
+```bash
+# Thêm vào /etc/hosts (macOS/Linux)
+# hoặc C:\Windows\System32\drivers\etc\hosts (Windows)
+127.0.0.1 app.local
+
+# Trong Ingress đặt host: app.local, bỏ khối tls và annotation cert-manager
+kubectl apply -f ingress.yaml
+kubectl get ingress
+# NAME          CLASS   HOSTS       ADDRESS     PORTS   AGE
+# app-ingress   nginx   app.local   localhost   80      30s
+
+curl -H "Host: app.local" http://localhost/
+# hoặc mở trình duyệt http://app.local
+```
+
+Cách `curl -H "Host: ..."` không cần sửa `/etc/hosts`: request gửi tới `localhost` nhưng header Host là `app.local`, đúng thứ Ingress Controller đọc. Cột ADDRESS có thể trống vài chục giây sau khi apply; trên kind nó hiện `localhost`, trên cloud là IP hoặc hostname của LB. Trống mãi thì quay lại mục "Hai thứ khác nhau" ở trên.
+
+### Gateway API: tương lai thay thế Ingress
+
+Từ 2023 K8s giới thiệu Gateway API với các tài nguyên `Gateway`, `HTTPRoute`. Nó mạnh hơn (chia traffic theo trọng số, header matching chuẩn hoá, không phụ thuộc annotation) và tách vai trò tốt hơn: DevOps sở hữu `Gateway`, dev sở hữu `HTTPRoute`. Tuy nhiên tính tới nay Ingress vẫn phổ biến áp đảo trong doanh nghiệp. Học Ingress trước, biết Gateway API tồn tại là đủ.
+
+---
+
+## Thực hành 7.2: Ingress
+
+1. Đảm bảo đã cài ingress-nginx ở Phần 5 (`kubectl get pods -n ingress-nginx` thấy controller `Running`).
+2. Deploy hai app khác nhau và tạo hai Service:
+
+   ```bash
+   kubectl create deployment web1 --image=nginx:alpine
+   kubectl create deployment web2 --image=httpd:alpine
+   kubectl expose deployment web1 --port=80
+   kubectl expose deployment web2 --port=80
+   kubectl get endpoints web1 web2 # mỗi cái phải có 1 IP
+   ```
+
+3. Viết Ingress định tuyến `app.local/` → web1 và `app.local/second` → web2. Vì httpd không có route `/second`, path thứ hai cần rewrite về `/`, mà rewrite là annotation áp cho cả Ingress, nên tách thành **hai** Ingress:
+
+   ```yaml
+   # lab-ingress.yaml
+   apiVersion: networking.k8s.io/v1
+   kind: Ingress
+   metadata:
+     name: web1
+   spec:
+     ingressClassName: nginx
+     rules:
+       - host: app.local
+         http:
+           paths:
+             - path: /
+               pathType: Prefix
+               backend:
+                 service:
+                   name: web1
+                   port:
+                     number: 80
+   ---
+   apiVersion: networking.k8s.io/v1
+   kind: Ingress
+   metadata:
+     name: web2
+     annotations:
+       nginx.ingress.kubernetes.io/rewrite-target: /$2
+   spec:
+     ingressClassName: nginx
+     rules:
+       - host: app.local
+         http:
+           paths:
+             - path: /second(/|$)(.*)
+               pathType: ImplementationSpecific
+               backend:
+                 service:
+                   name: web2
+                   port:
+                     number: 80
+   ```
+
+4. Thêm `127.0.0.1 app.local` vào hosts, rồi `kubectl apply -f lab-ingress.yaml`.
+5. Truy cập cả hai đường dẫn: `curl http://app.local/` ra trang chào nginx, `curl http://app.local/second` ra `It works!` của httpd.
+6. Xoá Service của app 2: `kubectl delete svc web2`, F5 `/second` → nhận **503**. Xoá Service là xoá luôn endpoints, Controller không còn upstream nào để chuyển. Tạo lại bằng `kubectl expose deployment web2 --port=80`, F5 lại thấy `It works!`.
+7. Thử thêm: sửa `targetPort` của Service web1 thành `8080` (cổng không ai nghe) bằng `kubectl edit svc web1`, F5 `/` → nhận **502**. Đây là khác biệt giữa 502 và 503 bạn phải nhớ: 503 là không có endpoint nào, 502 là có endpoint nhưng không nối được.
+
+> **Kết quả mong đợi:** Hai path ra hai app khác nhau; bước 6 ra 503 và bước 7 ra 502. Nếu `/second` ra 404 thay vì trang httpd, rewrite chưa đúng: kiểm tra `pathType: ImplementationSpecific` và annotation nằm ở Ingress `web2`.
+
+---
+
+## Sai lầm hay gặp
+
+- **Quên `ingressClassName`** trên cluster không có IngressClass default: Ingress tạo thành công, ADDRESS trống, không lỗi nào hiện ra. `kubectl describe ingress` không có Events là dấu hiệu Controller chưa nhận nó.
+- **Ghi `targetPort` vào `backend.service.port.number`**: Ingress cần `port` của Service, không phải cổng container. Với SPA hai số này thường bằng nhau nên bạn không thấy lỗi, tới Next.js (Service 80, container 3000) mới lộ.
+- **Ingress ở namespace khác Service**: Ingress chỉ trỏ được tới Service cùng namespace. Muốn route tới app ở namespace khác, tạo Ingress trong namespace đó.
+- **Test bằng `curl http://localhost/` không có header Host**: request rơi vào default backend, nhận 404 của ingress-nginx và bạn tưởng app hỏng. Luôn thêm `-H "Host: app.local"`.
+- **Nhiều app dưới nhiều path trên một host** kéo theo bài toán base path (`/app/assets/...`), là chủ đề riêng ở [Phần 11](/blog/k8s-fe-11-nextjs-ssr-and-micro-frontends/).
+
+---
+
+## Tóm tắt
+
+- Pod đổi IP liên tục; **Service** cho một ClusterIP và tên DNS ổn định, chọn Pod bằng label selector, chia tải ở tầng 4 qua kube-proxy.
+- Bốn loại Service xếp chồng: ClusterIP cho mọi app, NodePort để test, LoadBalancer chỉ cho Ingress Controller, ExternalName để alias ra ngoài.
+- `port` là cổng của Service, `targetPort` là cổng container; nhầm `targetPort` là nguyên nhân số 1 của 502.
+- Chẩn đoán Service theo ba bước: `get endpoints` → curl từ Pod tạm → `port-forward`. Ba nguyên nhân duy nhất: selector lệch, sai cổng, Pod chưa ready.
+- **Ingress** là reverse proxy tầng 7: đọc host và path, kết thúc TLS, route tới Service. Phải có **Ingress Controller** cài sẵn thì Ingress resource mới có tác dụng.
+- Đưa `/api` và `/` về cùng host là cách hết CORS gọn nhất. Path cụ thể đặt trước, `pathType: Prefix` cho 90% trường hợp.
+- 503 là không có endpoint; 502 là có endpoint nhưng không nối được. Nhớ cặp này là tự debug được nửa số sự cố.
+
+## Đọc thêm
+
+- [Service](https://kubernetes.io/docs/concepts/services-networking/service/) trong docs Kubernetes
+- [Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/) trong docs Kubernetes
+- [DNS for Services and Pods](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/)
+- [ingress-nginx](https://kubernetes.github.io/ingress-nginx/): toàn bộ annotation và cách cài
+
+Phần tiếp theo, [Phần 8](/blog/k8s-fe-08-configmap-secret-probes/), tách cấu hình khỏi image bằng ConfigMap và Secret, rồi đi vào ba loại probe, thứ quyết định Pod có được đứng trong endpoints hay không.

@@ -1,0 +1,376 @@
+---
+title: 'Cloudflare cho Frontend Developer · Phần 9 — Workers: chạy code ở edge'
+description: 'Worker là gì và năm việc nó giải quyết cho frontend: proxy API hết CORS, giấu secret, A/B test, chuyển hướng theo quốc gia, sửa HTML bằng HTMLRewriter. Kèm Wrangler, route, secret, debug và khi nào không nên dùng.'
+pubDate: 2026-10-22
+lang: vi
+tags: [cloudflare, devops, serverless, frontend, security]
+series: cloudflare-fe
+seriesOrder: 9
+draft: false
+---
+
+Bạn có một SPA ở `example.com` và một API ở `backend.example.net`. Mỗi lần gọi API là một preflight `OPTIONS`, cookie thì phải `SameSite=None`, còn khoá của dịch vụ bên thứ ba thì không biết giấu vào đâu vì "frontend không có server". Trước đây câu trả lời là dựng thêm một backend nhỏ chỉ để làm proxy. Với Cloudflare, câu trả lời là một Worker: đoạn JavaScript chạy tại PoP, đứng giữa trình duyệt và origin, xử lý request **trước khi** nó tới máy chủ của bạn.
+
+Đọc xong bài này bạn viết được Worker đầu tiên bằng đúng API `fetch`, `Request`, `Response` mà bạn đã dùng hằng ngày, deploy nó bằng Wrangler, gắn vào một đường dẫn trên tên miền của mình, giấu secret đúng chỗ, và quan trọng không kém: biết khi nào một Redirect Rule làm được việc mà không cần tới Worker.
+
+## Worker là gì
+
+Worker là một đoạn JavaScript hoặc TypeScript chạy ở edge của Cloudflare, tức là ngay tại PoP đã nhận request của người dùng, trước khi request đi xuống origin. Nhìn lại sơ đồ vòng đời request ở [Phần 1](/blog/cloudflare-fe-01-what-cloudflare-really-is/): Worker là bước ⑤(d), sau WAF, Redirect Rules và Transform Rules, nhưng trước khi tra cache và trước origin.
+
+Bốn đặc điểm quyết định cách bạn dùng nó:
+
+- **Viết bằng API chuẩn web.** `fetch`, `Request`, `Response`, `Headers`, `URL`, `crypto.subtle`, `TextEncoder`. Không có Express, không có `req.body` kiểu Node; nhưng nếu bạn đã viết `fetch` ở phía client thì bạn đã biết 80% API của Worker.
+- **Chạy ở hơn 300 PoP, khởi động gần như tức thì.** Worker chạy trong V8 isolate, cùng công nghệ tab của Chrome, chứ không phải container hay máy ảo. Không có cold start hàng trăm mili-giây như Lambda; một Worker mới thức dậy trong vài mili-giây.
+- **Gói Free: 100.000 request mỗi ngày** cho cả tài khoản, mỗi request được tối đa khoảng 10 ms CPU và 50 subrequest. Con số CPU nghe nhỏ nhưng thời gian chờ mạng (`await fetch(...)`) không tính vào CPU; 10 ms là đủ cho proxy, chuyển hướng, sửa header, sửa HTML. Nó không đủ để render một trang React nặng hay băm mật khẩu bằng bcrypt.
+- **Gắn vào một route** (`example.com/api/*`) trên zone của bạn, hoặc chạy trên tên miền `my-worker.<tài-khoản>.workers.dev` mà Cloudflare cấp sẵn.
+
+Những thứ Worker **không** có, để bạn khỏi bất ngờ: không có hệ thống file, không có tiến trình sống lâu (mỗi request là một lần chạy), không có sẵn module Node như `fs` hay `net` (một phần API Node bật được qua cờ `nodejs_compat`, nhưng đừng mang cả thư viện server-side sang mà chưa thử). Trạng thái, nếu cần, nằm ở các dịch vụ đi kèm: KV (key-value), D1 (SQLite), R2 (object storage), Durable Objects. Bài này không đi vào chúng; nhưng bạn nên biết chúng tồn tại để không tự dựng "database" bằng biến toàn cục — biến toàn cục trong Worker không bền và không chia sẻ giữa các PoP.
+
+Nếu bạn đã đọc [Phần 8](/blog/cloudflare-fe-08-cloudflare-pages-free-hosting/): Pages Functions chính là Worker được gắn sẵn vào dự án Pages, với routing theo file. Cùng runtime, cùng giới hạn, cùng `env`. Khác biệt chỉ ở cách đóng gói: Functions sống trong repo của frontend, Worker "trần" là một dự án riêng gắn vào bất kỳ đường dẫn nào trên zone, kể cả trước một origin không phải Pages như Hostinger hay VPS.
+
+---
+
+## Năm việc Worker giải quyết tốt cho frontend
+
+| Bài toán                 | Cách Worker giải quyết                                                                                                                                                                |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tránh CORS               | Cho `example.com/api/*` đi qua Worker rồi chuyển tiếp tới backend ở tên miền khác. Với trình duyệt thì vẫn là same-origin: không preflight, không CORS, cookie `SameSite=Lax` vẫn đi. |
+| Giấu khoá API            | Worker giữ secret, thêm vào request trước khi gọi dịch vụ thật; frontend chỉ gọi endpoint của chính mình.                                                                             |
+| A/B testing              | Đọc cookie hoặc random, trả về phiên bản A hoặc B, ghi cookie để giữ nguyên lựa chọn cho lần sau.                                                                                     |
+| Chuyển hướng theo địa lý | Đọc `request.cf.country`, đưa người Việt vào `/vi`, người khác vào `/en`.                                                                                                             |
+| Sửa HTML on-the-fly      | Dùng `HTMLRewriter` để chèn thẻ, đổi thuộc tính, thay nội dung mà không sửa origin.                                                                                                   |
+
+Cả năm việc có một điểm chung: chúng cần **logic**, tức là một câu `if` phụ thuộc vào request. Việc nào không cần logic (www về tên miền gốc, thêm security header, cache HTML) thì Rules ở [Phần 7](/blog/cloudflare-fe-07-rules-redirect-and-transform/) làm được, nhanh hơn và không phải bảo trì code. Giữ nguyên tắc này trong đầu, bạn sẽ ít viết Worker thừa.
+
+---
+
+## Ví dụ 1: proxy API để không còn CORS
+
+Kịch bản ở [Phần 4](/blog/cloudflare-fe-04-dns-scenarios-pages-vercel-cloudfront/): frontend ở `example.com`, backend ở `backend.example.net`. Thay vì mở CORS ở backend, ta cho `example.com/api/*` đi qua Worker:
+
+```js
+// src/index.js
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    // Chỉ xử lý /api/*
+    if (!url.pathname.startsWith('/api/')) {
+      return fetch(request); // còn lại để nguyên, đi tiếp như thường
+    }
+
+    // Đổi đích sang backend thật, bỏ tiền tố /api
+    const backend = new URL(request.url);
+    backend.hostname = 'backend.example.net';
+    backend.pathname = url.pathname.replace(/^\/api/, '');
+
+    // new Request(url, request) giữ nguyên method, header, body của request gốc
+    const proxied = new Request(backend, request);
+    proxied.headers.set('X-Api-Key', env.BACKEND_SECRET); // secret giấu ở đây
+
+    return fetch(proxied);
+  },
+};
+```
+
+Với trình duyệt, request vẫn đi tới `example.com/api/...` — cùng origin. Không có preflight, cookie `SameSite=Lax` hoạt động bình thường, và `backend.example.net` không cần biết CORS là gì. Đây chính là thứ CloudFront gọi là behavior `/api/*` trỏ sang origin thứ hai, nhưng viết bằng mười dòng JavaScript.
+
+Ba chi tiết dễ vấp:
+
+- **Dòng `return fetch(request)` cho đường dẫn không khớp** là bắt buộc. Quên nó, mọi request tới route của Worker (kể cả `/` và asset) nhận `undefined` và người dùng thấy lỗi 1101. Nếu route đã là `example.com/api/*` thì đường dẫn khác không bao giờ tới Worker, nhưng giữ dòng này để Worker vẫn đúng khi ai đó đổi route rộng hơn.
+- **Cookie do backend đặt** với thuộc tính `Domain=backend.example.net` sẽ bị trình duyệt bỏ qua, vì với trình duyệt response đến từ `example.com`. Sửa ở backend: bỏ `Domain`, hoặc để Worker viết lại header `Set-Cookie`.
+- **Cache**: response JSON qua Worker vẫn tuân theo `Cache-Control` từ backend. Backend trả `no-store` cho dữ liệu riêng từng người là đủ; nếu backend quên, thêm một Cache Rule bypass cho `/api/*` như Phần 6 để không ai nhận nhầm dữ liệu của người khác.
+
+Kiểm tra sau khi deploy:
+
+```bash
+# Không còn header CORS nào cần thiết, và server đứng sau là Cloudflare
+curl -sI https://example.com/api/health | grep -iE "^(HTTP|server|cf-ray|access-control)"
+
+# Preflight không xảy ra nữa vì same-origin; nhưng nếu muốn mô phỏng:
+curl -sI -X OPTIONS https://example.com/api/orders \
+  -H "Origin: https://example.com" \
+  -H "Access-Control-Request-Method: POST"
+```
+
+Nếu bạn muốn hiểu vì sao same-origin lại xoá sạch preflight, [bài giải thích CORS tận gốc](/blog/cors-explained-deep-dive/) có đủ chi tiết.
+
+---
+
+## Ví dụ 2: chuyển hướng theo quốc gia
+
+Cloudflare tự nhận diện quốc gia của người truy cập và đưa vào `request.cf.country` (mã ISO hai chữ, ví dụ `VN`). Bản đơn giản nhất:
+
+```js
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const country = request.cf?.country; // Cloudflare tự nhận diện
+
+    // Chỉ xử lý trang gốc, tránh can thiệp vào asset và các trang khác
+    if (url.pathname === '/') {
+      const lang = country === 'VN' ? '/vi' : '/en';
+      return Response.redirect(url.origin + lang, 302);
+    }
+    return fetch(request);
+  },
+};
+```
+
+> **Cạm bẫy:** chuyển hướng tự động theo địa lý gây khó chịu (người Việt ở nước ngoài muốn đọc tiếng Việt, người nước ngoài ở Việt Nam bị ép vào bản tiếng Việt) và ảnh hưởng SEO nếu bot của Google, vốn phần lớn đi từ Mỹ, bị đẩy hết sang `/en` và không bao giờ thấy `/vi`. Cách tốt hơn: **gợi ý** bằng banner, để người dùng tự chọn, và nhớ lựa chọn đó bằng cookie.
+
+Bản "gợi ý thay vì ép" trông thế này: Worker chỉ chuyển hướng khi người dùng **đã chọn** (có cookie `lang`); nếu chưa, nó trả trang gốc như thường và đặt thêm một cookie gợi ý để frontend hiện banner:
+
+```js
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname !== '/') return fetch(request);
+
+    const cookie = request.headers.get('Cookie') ?? '';
+    const chosen = cookie.match(/(?:^|;\s*)lang=(vi|en)\b/)?.[1];
+    if (chosen) {
+      return Response.redirect(`${url.origin}/${chosen}/`, 302);
+    }
+
+    // Chưa chọn: không ép, chỉ gợi ý
+    const suggested = request.cf?.country === 'VN' ? 'vi' : 'en';
+    const response = await fetch(request);
+    const out = new Response(response.body, response); // bản sao sửa được header
+    out.headers.append(
+      'Set-Cookie',
+      `suggested_lang=${suggested}; Path=/; Max-Age=86400; SameSite=Lax`
+    );
+    return out;
+  },
+};
+```
+
+Phía React: đọc `document.cookie`, thấy `suggested_lang=vi` mà người dùng chưa chọn thì hiện banner "Đọc bằng tiếng Việt?"; bấm đồng ý thì đặt cookie `lang=vi` và điều hướng. Bot tìm kiếm không có cookie nên luôn thấy trang gốc. Hai mẫu `Response.redirect` với mã 302 (tạm thời) chứ không phải 301: lựa chọn ngôn ngữ có thể đổi, đừng để trình duyệt ghi nhớ vĩnh viễn.
+
+---
+
+## Ví dụ 3: A/B testing bằng cookie
+
+Cùng kỹ thuật cookie, áp cho việc chia người dùng thành hai nhóm để thử một trang giá mới:
+
+```js
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname !== '/pricing') return fetch(request);
+
+    const cookie = request.headers.get('Cookie') ?? '';
+    let variant = cookie.match(/(?:^|;\s*)ab_pricing=(a|b)\b/)?.[1];
+    const isNew = !variant;
+    if (isNew) variant = Math.random() < 0.5 ? 'a' : 'b';
+
+    // Biến thể B là một trang tĩnh khác ở origin; người dùng vẫn thấy URL /pricing
+    const target = new URL(request.url);
+    if (variant === 'b') target.pathname = '/pricing-b';
+
+    const response = await fetch(new Request(target, request));
+    const out = new Response(response.body, response);
+    if (isNew) {
+      out.headers.append(
+        'Set-Cookie',
+        `ab_pricing=${variant}; Path=/; Max-Age=2592000; SameSite=Lax`
+      );
+    }
+    // Hai biến thể cùng một URL: không được để edge hay trình duyệt cache nhầm
+    out.headers.set('Cache-Control', 'private, no-store');
+    return out;
+  },
+};
+```
+
+Điểm quan trọng nhất nằm ở dòng cuối: hai nội dung khác nhau đang trả về cho cùng một URL, nên trang này **không được cache** ở edge lẫn trình duyệt, nếu không nhóm A sẽ nhận bản của nhóm B sau lần HIT đầu tiên. Đây cũng là lý do A/B test bằng Worker chỉ hợp với vài trang, không hợp cho cả site.
+
+---
+
+## Ví dụ 4: sửa HTML on-the-fly bằng HTMLRewriter
+
+`HTMLRewriter` là parser HTML dạng streaming có sẵn trong runtime: bạn đăng ký selector CSS và callback, Cloudflare sửa HTML khi nó chảy qua, không cần đọc cả trang vào bộ nhớ. Ví dụ chèn một thẻ vào `head` và sửa link `http://` thành `https://` cho một origin cũ mà bạn không sửa được:
+
+```js
+export default {
+  async fetch(request) {
+    const response = await fetch(request);
+    const type = response.headers.get('Content-Type') ?? '';
+    if (!type.includes('text/html')) return response; // chỉ đụng vào HTML
+
+    return new HTMLRewriter()
+      .on('head', {
+        element(el) {
+          el.append('<meta name="served-by" content="edge">', { html: true });
+        },
+      })
+      .on('a[href^="http://"]', {
+        element(el) {
+          const href = el.getAttribute('href');
+          el.setAttribute('href', href.replace('http://', 'https://'));
+        },
+      })
+      .transform(response);
+  },
+};
+```
+
+Dùng nó cho: chèn script analytics mà không đụng repo của bên khác, thay banner theo chiến dịch, thêm `rel="noopener"` cho link ngoài, chèn `nonce` cho CSP. Đừng dùng nó để "render" trang: mỗi byte HTML đều đi qua callback của bạn và tính vào 10 ms CPU.
+
+---
+
+## Triển khai bằng Wrangler
+
+Wrangler là CLI chính thức. Cài global hoặc chạy qua `npx` đều được:
+
+```bash
+# Cài công cụ dòng lệnh và đăng nhập (mở trình duyệt để cấp quyền)
+npm install -g wrangler
+wrangler login
+
+# Tạo dự án mới — chọn template "Hello World" Worker, JavaScript hoặc TypeScript
+npm create cloudflare@latest my-worker
+cd my-worker
+
+# Chạy thử ở máy (http://localhost:8787), có request.cf giả lập
+npx wrangler dev
+
+# Triển khai lên *.workers.dev và các route đã khai báo
+npx wrangler deploy
+
+# Lưu secret: không nằm trong code, không lên Git, chỉ đọc được qua env
+npx wrangler secret put BACKEND_SECRET
+
+# Xem log thật từ edge (console.log, exception) theo thời gian thực
+npx wrangler tail
+```
+
+File cấu hình `wrangler.toml` (dự án mới tạo có thể sinh `wrangler.jsonc`, cùng nội dung, khác cú pháp):
+
+```toml
+name = "my-worker"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+# Chỉ thêm khi cần API kiểu Node (Buffer, một phần crypto, path...)
+# compatibility_flags = ["nodejs_compat"]
+
+# Biến không bí mật, commit được; secret thì dùng `wrangler secret put`
+[vars]
+API_BASE = "https://backend.example.net"
+
+# Gắn worker vào đường dẫn cụ thể trên tên miền của bạn
+[[routes]]
+pattern = "example.com/api/*"
+zone_name = "example.com"
+```
+
+`compatibility_date` là "ngày runtime" mà Worker của bạn tuân theo: Cloudflare thay đổi hành vi runtime theo thời gian, và Worker chỉ nhận thay đổi có hiệu lực trước ngày này. Đặt nó bằng ngày tạo dự án và chỉ tăng khi bạn đã đọc changelog — nó là `engines.node` của thế giới Workers.
+
+### Route chỉ chạy khi bản ghi DNS được proxy
+
+Đây là cạm bẫy số một khi gắn Worker vào tên miền riêng. Route `example.com/api/*` chỉ có tác dụng khi request tới `example.com` **đi qua Cloudflare**, nghĩa là bản ghi DNS cho hostname đó phải tồn tại và để đám mây cam. Hostname chưa có bản ghi, hoặc bản ghi đang xám, thì Worker không bao giờ được gọi, và bạn ngồi nhìn `wrangler deploy` báo thành công mà không hiểu vì sao không có gì xảy ra.
+
+Hai cách gắn, chọn theo việc Worker có phải là origin hay không:
+
+| Cách          | Khai báo                                                  | Dùng khi                                                                                             |
+| ------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Route         | `pattern = "example.com/api/*"` + `zone_name`             | Worker đứng **trước** một origin có sẵn (Hostinger, VPS, Pages). Cần bản ghi DNS proxy cho hostname. |
+| Custom domain | `pattern = "whoami.example.com"` + `custom_domain = true` | Worker **chính là** origin. Cloudflare tự tạo bản ghi DNS và chứng chỉ cho hostname đó.              |
+
+Pattern chỉ hỗ trợ dấu `*` (khớp bất kỳ), không hỗ trợ query string, và pattern cụ thể hơn thắng pattern chung hơn: có cả `example.com/*` lẫn `example.com/api/*` thì request `/api/x` đi vào Worker gắn với pattern thứ hai.
+
+### Secret, biến và binding
+
+Ba loại giá trị đi vào `env`, ba cách khai báo khác nhau:
+
+| Loại        | Khai báo                                                                      | Ví dụ                                       |
+| ----------- | ----------------------------------------------------------------------------- | ------------------------------------------- |
+| Biến thường | `[vars]` trong `wrangler.toml`, commit được                                   | `API_BASE`, cờ tính năng                    |
+| Secret      | `wrangler secret put NAME`, hoặc dashboard → Settings → Variables and Secrets | khoá API, token                             |
+| Binding     | `[[kv_namespaces]]`, `[[d1_databases]]`, `[[r2_buckets]]`                     | `env.CACHE.get(key)`, `env.DB.prepare(sql)` |
+
+Khi chạy `wrangler dev`, secret lấy từ file `.dev.vars` ở gốc dự án (định dạng `KEY=value`, nhớ thêm vào `.gitignore`). Đây là nơi duy nhất secret nằm trên máy bạn; production đọc từ Cloudflare, không có file nào chứa nó trong repo.
+
+### Debug: ba công cụ và hai mã lỗi
+
+- `wrangler dev` chạy Worker ở máy với runtime giống production; thêm `--remote` để chạy thật trên edge (cần khi bạn muốn `request.cf` thật hoặc binding thật).
+- `wrangler tail` stream `console.log` và exception từ production. Bật nó trước khi tái hiện lỗi.
+- Dashboard → Workers & Pages → chọn Worker → **Metrics**: số request, lỗi, CPU time, và **Logs** nếu bạn bật Workers Logs.
+
+Hai mã lỗi Cloudflare trả về khi Worker hỏng, để bạn nhận ra ngay trong sổ tay ở [Phần 11](/blog/cloudflare-fe-11-debug-and-error-handbook/):
+
+- **1101** — Worker ném exception: `TypeError: Cannot read properties of undefined`, quên `return`, hàm không trả `Response`. Nhìn `wrangler tail`.
+- **1102** — Worker vượt giới hạn tài nguyên: quá 10 ms CPU (vòng lặp nặng, parse JSON khổng lồ, `HTMLRewriter` trên trang nhiều MB) hoặc quá 50 subrequest.
+
+Vượt 100.000 request mỗi ngày ở gói Free, Cloudflare trả lỗi thay vì cho request đi thẳng xuống origin. Với một Worker gắn vào route production, hãy nhìn biểu đồ request trong Metrics vài ngày đầu; nếu con số sát ngưỡng thì Workers Paid (xem [Phần 12](/blog/cloudflare-fe-12-free-plan-limits-and-aws-comparison/)) rẻ hơn nhiều so với một buổi tối site sập.
+
+---
+
+## Khi nào KHÔNG nên dùng Worker
+
+- **Khi một Redirect Rule hay Transform Rule làm được.** Rules đơn giản hơn, nhanh hơn, không phải bảo trì code, không tính vào quota Workers, và không thể ném exception.
+- **Khi logic phức tạp, cần database quan hệ, cần thư viện nặng.** Lúc đó một backend thật (Node, Go, PHP trên VPS hay Hostinger) hợp lý hơn: đủ CPU, đủ bộ nhớ, đủ thư viện.
+- **Khi bạn chưa đo được rằng mình thực sự cần.** Worker thêm một tầng nữa vào đường đi của request, và thêm một tầng nữa để debug. "Vì sao trang này lỗi?" giờ có thêm câu trả lời "vì Worker".
+
+Bảng chọn nhanh cho những việc frontend hay gặp:
+
+| Việc                                             | Công cụ đúng                   |
+| ------------------------------------------------ | ------------------------------ |
+| www về tên miền gốc, đổi URL cũ sang mới         | Redirect Rule                  |
+| Thêm security header, xoá `X-Powered-By`         | Transform Rule                 |
+| Cache HTML, bypass cache cho `/api/*`            | Cache Rule                     |
+| Chặn `/admin` từ ngoài nước, rate limit `/login` | WAF Custom Rule, Rate Limiting |
+| Proxy `/api/*` sang tên miền khác, giấu khoá     | Worker hoặc Pages Function     |
+| Nội dung phụ thuộc cookie, quốc gia, header      | Worker                         |
+| Sửa HTML của origin không sửa được               | Worker với HTMLRewriter        |
+| Xử lý ảnh, PDF, hàng đợi, giao dịch database     | Backend thật                   |
+
+Thứ tự thực thi ở [Phần 7](/blog/cloudflare-fe-07-rules-redirect-and-transform/) nhắc thêm một điều: Redirect Rules chạy **trước** Worker. Nếu bạn có rule chuyển hướng `/api/*` từ trước, Worker gắn cùng đường dẫn sẽ không bao giờ thấy request đó.
+
+---
+
+## Lab 9.1 — Worker đầu tiên (40 phút)
+
+1. Cài Wrangler, tạo Worker mới bằng `npm create cloudflare@latest whoami-worker` (template Hello World, JavaScript), chạy `npx wrangler dev` và mở `http://localhost:8787`.
+2. Sửa `src/index.js` để trả về JSON gồm quốc gia (`request.cf.country`), thành phố (`request.cf.city`), mã PoP (`request.cf.colo`) và giờ hiện tại:
+
+   ```js
+   export default {
+     async fetch(request, env) {
+       const cf = request.cf ?? {};
+       return Response.json({
+         country: cf.country ?? null,
+         city: cf.city ?? null,
+         colo: cf.colo ?? null, // trùng ba chữ cuối của cf-ray
+         time: new Date().toISOString(),
+         secretHint: (env.MY_SECRET ?? '').slice(0, 3) + '***',
+       });
+     },
+   };
+   ```
+
+3. Deploy bằng `npx wrangler deploy`, mở URL `*.workers.dev` mà lệnh in ra, xem kết quả. So `colo` với ba chữ cuối `cf-ray` trong DevTools.
+4. Gắn Worker vào route `example.com/whoami` trên tên miền của bạn (khai `[[routes]]` rồi deploy lại, hoặc dashboard → Worker → Settings → Domains & Routes). Xác nhận bản ghi DNS của `example.com` đang cam. Gọi `curl https://example.com/whoami`.
+5. Thêm secret bằng `npx wrangler secret put MY_SECRET`, gọi lại: `secretHint` phải hiện ba ký tự đầu, xác nhận secret có mặt ở runtime mà không nằm trong code hay Git. Chạy `npx wrangler tail` ở một terminal khác rồi gọi tiếp để thấy log chảy về.
+
+> **Kết quả mong đợi:** Worker chạy ở cả `*.workers.dev` lẫn `example.com/whoami`; JSON trả về đúng quốc gia và PoP của bạn; secret đọc được từ `env` nhưng `grep MY_SECRET src/` không thấy giá trị nào.
+
+---
+
+## Tóm tắt
+
+- Worker là JavaScript chạy tại PoP, trước origin, bằng API chuẩn web; V8 isolate nên gần như không có cold start; gói Free 100.000 request mỗi ngày, khoảng 10 ms CPU mỗi request.
+- Năm việc đáng dùng Worker cho frontend: proxy API cùng origin để hết CORS, giấu khoá bên thứ ba, A/B test bằng cookie, gợi ý ngôn ngữ theo `request.cf.country`, sửa HTML bằng `HTMLRewriter`.
+- Mẫu proxy: `new Request(backendUrl, request)` giữ method, header, body; thêm secret từ `env`; luôn `return fetch(request)` cho đường dẫn không xử lý.
+- Chuyển hướng theo địa lý nên là gợi ý có cookie, không ép; A/B test phải `no-store` vì hai nội dung chung một URL.
+- Wrangler: `dev`, `deploy`, `secret put`, `tail`; cấu hình trong `wrangler.toml` với `compatibility_date`, `[vars]`, `[[routes]]`.
+- Route chỉ chạy khi hostname có bản ghi DNS đang cam; Worker là origin thì dùng custom domain.
+- Lỗi 1101 là exception trong code, 1102 là vượt CPU hoặc subrequest; đọc bằng `wrangler tail`.
+- Không dùng Worker khi một rule làm được, khi cần backend thật, hay khi chưa đo được nhu cầu.
+
+## Đọc thêm
+
+- [Cloudflare Workers docs](https://developers.cloudflare.com/workers/)
+- [Cloudflare Rules docs](https://developers.cloudflare.com/rules/) — cân nhắc trước khi viết Worker
+- [Cloudflare Pages docs](https://developers.cloudflare.com/pages/) — Pages Functions, cùng runtime với Worker

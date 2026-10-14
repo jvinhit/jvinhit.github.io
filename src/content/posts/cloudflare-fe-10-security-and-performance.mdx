@@ -1,0 +1,256 @@
+---
+title: 'Cloudflare cho Frontend Developer · Phần 10 — Bảo mật và hiệu năng: WAF, bot, rate limit, tối ưu'
+description: 'Cloudflare bật sẵn gì, WAF Custom Rules viết thế nào cho an toàn, vì sao Bot Fight Mode và Under Attack Mode dễ làm vỡ API, rate limit trang đăng nhập, bảo vệ API token, và tính năng tối ưu nào nên bật, nào nên tắt.'
+pubDate: 2026-10-25
+lang: vi
+tags: [cloudflare, devops, security, performance, frontend]
+series: cloudflare-fe
+seriesOrder: 10
+draft: false
+---
+
+Tab Security và tab Speed của Cloudflare có hàng chục công tắc, mỗi cái đều nghe có lợi. Bật hết thì sao? Bạn sẽ có một website mà webhook thanh toán bị chặn, ứng dụng di động không gọi được API, React vỡ vì thứ tự script bị đảo, và người dùng thật phải giải captcha để xem trang chủ. Cloudflare bật sẵn khá nhiều thứ đúng; phần còn lại cần bạn hiểu từng công tắc làm gì với **loại traffic của một ứng dụng frontend hiện đại**, thứ khác hẳn website tĩnh với jQuery mà nhiều tính năng này được sinh ra để phục vụ.
+
+Bài này gom hai chương của tài liệu gốc: bảo mật (WAF, bot, rate limit, Under Attack Mode, API token) và hiệu năng (bật gì, tắt gì, đo bằng gì). Đọc xong bạn viết được WAF rule đầu tiên mà không tự chặn mình, biết vì sao Bot Fight Mode nguy hiểm với API, hiểu rate limit ở gói Free làm được tới đâu, và có một danh sách công tắc để tắt ngay nếu JavaScript vỡ sau khi bật Cloudflare.
+
+## Những gì bạn được sẵn, không cần làm gì
+
+Khi bản ghi đang cam, bốn thứ này đã chạy, kể cả gói Free:
+
+- **Chống DDoS không giới hạn** ở tầng mạng (L3/L4) và tầng ứng dụng (L7). Đây là lý do nhiều dự án nhỏ dùng Cloudflare: một máy chủ Hostinger vài đô một tháng bỗng chịu được lưu lượng tấn công mà bình thường sẽ sập trong vài giây.
+- **Giấu IP origin.** DNS trả IP của Cloudflare; kẻ tấn công không biết đánh vào đâu. (Với điều kiện bạn đã "khoá cửa sau" như bước 10 ở [Phần 3](/blog/cloudflare-fe-03-hostinger-cloudflare-setup-a-to-z/); IP thật vẫn có thể lộ qua lịch sử DNS hay email gửi đi.)
+- **Universal SSL miễn phí, tự gia hạn.**
+- **Một bộ quy tắc WAF cơ bản do Cloudflare quản lý** (Free Managed Ruleset), chặn các lỗ hổng lớn đang bị khai thác hàng loạt. Bộ đầy đủ với OWASP Core Ruleset cần gói Pro trở lên.
+
+Thứ bạn cần tự làm là phần còn lại của bài: rule cho những đường dẫn riêng của ứng dụng bạn.
+
+---
+
+## WAF Custom Rules
+
+Vào **Security → WAF → Custom rules**. Gói Free cho 5 rule (Pro 20, Business 100), đủ cho nhu cầu thông thường vì mỗi rule là một biểu thức, và biểu thức có thể gom nhiều điều kiện bằng `and`, `or`.
+
+Ví dụ 1: chỉ cho phép truy cập trang quản trị từ Việt Nam.
+
+| Trường    | Giá trị                                                       |
+| --------- | ------------------------------------------------------------- |
+| Điều kiện | URI Path starts with `/admin` AND Country does not equal `VN` |
+| Hành động | Block                                                         |
+
+Ví dụ 2: thử thách người truy cập trang đăng nhập có dấu hiệu đáng ngờ.
+
+| Trường    | Giá trị                                                   |
+| --------- | --------------------------------------------------------- |
+| Điều kiện | URI Path equals `/login` AND Threat Score greater than 10 |
+| Hành động | Managed Challenge                                         |
+
+Trình soạn rule có hai chế độ: bấm chọn từng trường, hoặc **Edit expression** để gõ biểu thức theo ngôn ngữ Rules của Cloudflare. Hai ví dụ trên viết thành:
+
+```text
+(http.request.uri.path starts_with "/admin" and ip.src.country ne "VN")
+
+(http.request.uri.path eq "/login" and cf.threat_score gt 10)
+```
+
+Biết cú pháp này có lợi vì nó dùng chung cho Redirect, Transform, Cache, Configuration Rules: học một lần, dùng khắp dashboard. Vài trường hay dùng với frontend: `http.host`, `http.request.uri.path`, `http.request.uri.query`, `http.request.method`, `http.user_agent`, `http.referer`, `ip.src`, `ip.src.country`, `cf.client.bot` (true với bot đã xác minh như Googlebot). Trường Threat Score là trường cũ, Cloudflare đang chuyển dần sang các điểm số khác; nếu dashboard của bạn không còn cho chọn nó, thay bằng rate limiting ở mục dưới cho trang đăng nhập.
+
+### Các hành động và ý nghĩa
+
+| Hành động             | Nghĩa                                                                                                                  |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Block                 | Chặn thẳng, trả trang lỗi 1020 với mã HTTP 403.                                                                        |
+| Managed Challenge     | Cloudflare tự chọn mức thử thách phù hợp. Người thật thường qua được mà không phải làm gì. Nên ưu tiên hơn Block.      |
+| JS Challenge          | Chạy một đoạn JS kiểm tra, không cần người dùng tương tác. Trình duyệt thật qua được, script và app di động thì không. |
+| Interactive Challenge | Bắt người dùng tương tác (dạng captcha). Chỉ cho đường dẫn nhạy cảm.                                                   |
+| Skip                  | Bỏ qua các rule phía sau, hoặc bỏ qua một số tính năng bảo mật, cho request khớp — dùng để tạo ngoại lệ.               |
+| Log                   | Chỉ ghi nhận, không can thiệp. Cách an toàn nhất để thử rule mới — **nhưng chỉ có ở gói Enterprise**.                  |
+
+> **Ghi chú:** tài liệu gốc khuyên "luôn bắt đầu bằng hành động Log, chạy vài ngày rồi mới siết". Đó là quy trình đúng, nhưng hành động Log chỉ có ở Enterprise. Ở gói Free và Pro, quy trình an toàn tương đương là: (1) vào **Security → Analytics**, lọc traffic theo đúng điều kiện bạn định viết (đường dẫn, quốc gia, user agent) và nhìn xem những request khớp trông thế nào trong vài ngày qua — nếu toàn người dùng thật thì điều kiện sai; (2) tạo rule với **Managed Challenge** trước, vì người thật vẫn qua được nếu bạn nhầm; (3) theo dõi **Security → Events** vài ngày; (4) khi chắc chắn mới đổi sang Block.
+
+Skip là hành động bạn sẽ cần ngay khi có webhook: rule `Skip` cho `/api/webhooks/*` từ dải IP của nhà cung cấp thanh toán, đặt **phía trên** các rule chặn, để những request đó không bị rule phía dưới đụng vào. Thứ tự rule trong danh sách chính là thứ tự đánh giá.
+
+### Nhận biết mình bị chính rule của mình chặn
+
+Với SPA, một request `fetch('/api/orders')` bị WAF chặn không hiện ra như "bị chặn"; nó hiện ra như lỗi lạ:
+
+- Nếu API cùng origin: response là **HTML** trang lỗi 1020 (Block) hoặc trang thử thách (Challenge) với mã 403, nên `response.json()` ném `SyntaxError: Unexpected token '<'`. Cloudflare gắn header `cf-mitigated: challenge` vào response thử thách để code của bạn nhận ra:
+
+  ```ts
+  const res = await fetch('/api/orders');
+  if (res.headers.get('cf-mitigated') === 'challenge') {
+    // Người dùng cần mở lại trang để qua thử thách; đừng parse JSON
+    window.location.reload();
+    return;
+  }
+  ```
+
+- Nếu API khác origin (`api.example.com`): trang lỗi của Cloudflare không có header CORS, nên DevTools báo **lỗi CORS** dù backend của bạn cấu hình CORS hoàn toàn đúng. Đây là cái bẫy tốn nhiều giờ nhất: bạn đi sửa CORS ở backend trong khi thủ phạm là một WAF rule hay Bot Fight Mode.
+
+Cách kiểm tra trong một phút: **Security → Events**, lọc theo đường dẫn hoặc IP của bạn, xem request bị hành động nào và bởi rule nào. Mã 1020 và 1015 nằm trong sổ tay ở [Phần 11](/blog/cloudflare-fe-11-debug-and-error-handbook/).
+
+---
+
+## Bot Fight Mode — cẩn thận
+
+Ở **Security → Bots**, gói Free có Bot Fight Mode. Nghe hấp dẫn, nhưng nó có tác dụng phụ đáng kể.
+
+> **Nguy hiểm:** Bot Fight Mode thử thách mọi thứ trông giống bot, bao gồm:
+>
+> - Webhook từ dịch vụ thanh toán, CI/CD, Zalo/Telegram bot
+> - Ứng dụng di động gọi API của bạn
+> - Script `curl` trong pipeline của chính bạn
+> - Công cụ giám sát uptime
+> - Một số trình thu thập dữ liệu hợp pháp
+>
+> Nếu website của bạn có API được gọi từ bên ngoài trình duyệt, hãy cân nhắc kỹ trước khi bật.
+
+Tài liệu gốc gợi ý: nếu vẫn muốn bật, tạo WAF rule với hành động Skip cho `/api/*` và cho các webhook cần thiết. Theo docs hiện tại của Cloudflare, điều này **không áp dụng cho Bot Fight Mode ở gói Free**: nó chạy tách khỏi bộ máy rule, nên WAF Custom Rules hay Page Rules không bypass được nó. Chỉ Super Bot Fight Mode (gói Pro trở lên) mới hỗ trợ Skip rule. Ở gói Free, lựa chọn thực tế là:
+
+- Site thuần frontend, không có API gọi từ ngoài trình duyệt, không webhook: bật được, lợi nhiều hơn hại.
+- Có API cho app di động, có webhook, có script tự động: **tắt** Bot Fight Mode và dựa vào WAF Custom Rules cùng rate limiting, những thứ bạn kiểm soát được.
+- Cần chống bot ở form (đăng ký, bình luận): dùng **Turnstile**, widget miễn phí thay captcha, gắn vào đúng form đó thay vì thử thách toàn site.
+
+Cách thử trước khi quyết định: bật Bot Fight Mode, gọi `curl -sI https://example.com/api/health` từ máy bạn. Nếu nhận 403 với trang thử thách thay vì JSON, thì mọi client không phải trình duyệt của bạn cũng sẽ nhận thế.
+
+---
+
+## Rate Limiting
+
+Giới hạn số request trong một khoảng thời gian, tính theo IP. Hữu ích cho:
+
+- Trang đăng nhập — chặn dò mật khẩu.
+- Endpoint gửi email, OTP — chặn lạm dụng, vì mỗi request là tiền thật.
+- API tốn tài nguyên — tìm kiếm, export, sinh báo cáo.
+
+Ví dụ trong tài liệu gốc: `/login`, tối đa 5 request trong 60 giây từ cùng một IP, vượt thì Managed Challenge trong 10 phút. Ở **Security → WAF → Rate limiting rules**, rule gồm ba phần: điều kiện khớp (đường dẫn, method), ngưỡng (số request trong một chu kỳ, tính theo đặc trưng nào), và hành động kèm thời gian áp dụng.
+
+Gói Free hạn chế mạnh ở đây, và nên biết trước khi thiết kế: **1 rule**, chu kỳ đếm cố định **10 giây**, thời gian áp dụng hành động **10 giây**, chỉ đếm theo **IP**, và điều kiện chỉ dùng được đường dẫn cùng cờ bot đã xác minh. Vì vậy ví dụ trên phải viết lại thành: `/login`, hơn 5 request trong 10 giây từ cùng IP thì Managed Challenge trong 10 giây. Vẫn đủ để làm chậm dò mật khẩu từ một IP xuống mức vô dụng. Chu kỳ dài hơn, đếm theo header hay cookie, nhiều rule hơn — kiểm tra trang pricing để biết gói nào có.
+
+Hai điều để không tự hại mình:
+
+- **Đếm theo IP nghĩa là cả một văn phòng, một trường học, hay mạng di động sau NAT là một IP.** Ngưỡng 5 request trong 10 giây cho `/login` là hợp lý; ngưỡng đó cho `/api/*` nói chung sẽ chặn chính khách hàng của bạn khi họ mở app cùng lúc.
+- **Frontend nên xử lý mã 429.** Khi hành động là Block, Cloudflare trả HTTP 429 với trang lỗi 1015. `fetch` không ném lỗi với 429; hãy kiểm tra `res.status === 429`, hiện thông báo "thử lại sau vài giây" thay vì retry ngay lập tức, vì retry chỉ kéo dài thời gian bị chặn.
+
+---
+
+## Under Attack Mode
+
+Ở Overview của zone có công tắc **Under Attack Mode**. Khi bật, mọi người truy cập đều phải qua một trang kiểm tra khoảng 5 giây trước khi thấy nội dung.
+
+> **Nguy hiểm:** chỉ dùng khi đang thực sự bị tấn công. Nó ảnh hưởng nặng tới trải nghiệm người dùng và làm hỏng mọi lời gọi API tự động: app di động, webhook, script, và cả `fetch` từ SPA của bạn nếu trang thử thách chưa được vượt qua. Bật khi đang bị tấn công, và nhớ tắt sau khi hết. Nhiều người bật rồi quên, tự làm chậm website của mình hàng tháng trời.
+
+Cùng chỗ đó là **Security Level** (Essentially Off → Low → Medium → High → I'm Under Attack); Under Attack Mode chính là mức cao nhất. Nếu bạn cần chế độ này cho phần web mà vẫn muốn `/api/*` sống, dùng Configuration Rule đặt Security Level riêng cho `/api/*`, hoặc tốt hơn, đưa API sang subdomain riêng để bật tắt độc lập.
+
+---
+
+## Bảo vệ API token của chính bạn
+
+Token Cloudflare là chìa khoá vào DNS, cache và rule của tên miền bạn. Một token lộ trong repo công khai đồng nghĩa ai đó có thể trỏ `example.com` đi nơi khác.
+
+| Nên                                                           | Không nên                                                           |
+| ------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Dùng API Token với quyền giới hạn đúng zone và đúng hành động | Dùng Global API Key — nó có toàn quyền trên mọi thứ trong tài khoản |
+| Lưu token trong GitHub Secrets / biến môi trường CI           | Ghi token vào code hoặc file cấu hình commit lên Git                |
+| Đặt ngày hết hạn cho token                                    | Token vĩnh viễn không bao giờ rà soát lại                           |
+| Bật xác thực hai lớp cho tài khoản Cloudflare                 | Chỉ dùng mật khẩu                                                   |
+
+Tạo token ở **My Profile → API Tokens → Create Token**. Có sẵn template như "Edit zone DNS"; với bước purge cache trong CI ở [Phần 6](/blog/cloudflare-fe-06-cache-old-version-after-deploy/), tạo token tuỳ chỉnh chỉ có quyền `Zone → Cache Purge → Purge` trên đúng zone đó. Token còn giới hạn được theo dải IP của client (Client IP Address Filtering) — hữu ích nếu CI của bạn có IP cố định. Kiểm tra token sau khi tạo:
+
+```bash
+curl -s "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+  -H "Authorization: Bearer $CF_API_TOKEN"
+# "status": "active" là được; token sai hoặc hết hạn trả success:false
+```
+
+Mỗi vài tháng mở lại danh sách token: cái nào không nhớ dùng ở đâu thì thu hồi. Token mới tạo được trong một phút; token cũ bị lộ thì không rút lại được.
+
+---
+
+## Hiệu năng: nên bật
+
+| Tính năng                   | Ở đâu                  | Tác dụng                                                                                    |
+| --------------------------- | ---------------------- | ------------------------------------------------------------------------------------------- |
+| Brotli                      | Speed → Optimization   | Nén tốt hơn gzip khoảng 15–20% cho text (HTML, JS, CSS, JSON). Bật mặc định ở hầu hết zone. |
+| HTTP/2 và HTTP/3            | Network                | Nhiều request song song trên một kết nối. HTTP/3 (QUIC) tốt cho mạng di động không ổn định. |
+| 0-RTT Connection Resumption | Network                | Kết nối lại nhanh hơn cho người dùng quay lại.                                              |
+| Early Hints                 | Speed → Optimization   | Báo trình duyệt tải trước CSS, font ngay khi máy chủ còn đang xử lý HTML.                   |
+| Tiered Cache                | Caching → Tiered Cache | Tăng tỷ lệ hit, giảm tải origin (xem Phần 6).                                               |
+
+Hai ghi chú để những công tắc này thực sự có tác dụng:
+
+- **Early Hints cần origin hợp tác.** Cloudflare chỉ phát `103 Early Hints` khi HTML của bạn trả header `Link: </assets/app.css>; rel=preload; as=style` (hoặc `rel=preconnect`); nó ghi nhớ các header đó và gửi sớm ở lần sau, qua HTTP/2 hoặc HTTP/3. Trên Pages, thêm `Link` vào `_headers` cho `/`; trên Hostinger, thêm bằng `.htaccess` hoặc Response Header Transform Rule. Không có `Link` thì công tắc chỉ là công tắc.
+- **Kiểm tra HTTP/3 đang chạy:** DevTools → Network → thêm cột Protocol; thấy `h3` là được. Lần đầu có thể là `h2` vì trình duyệt chỉ biết có HTTP/3 sau khi nhận header `alt-svc`.
+
+Còn một thứ không nằm trong tab Speed nhưng ảnh hưởng nhiều hơn mọi công tắc: chiến lược `Cache-Control` cho asset có hash và HTML ở Phần 6. Không có nó, Brotli và HTTP/3 chỉ làm việc tải lại nhanh hơn, chứ không bớt được số lần tải lại.
+
+---
+
+## Cẩn thận hoặc nên tắt
+
+| Tính năng               | Vì sao cần cẩn thận                                                                                                                                                                                                                                                       |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rocket Loader           | Thủ phạm số một gây vỡ JavaScript. Nó thay đổi thứ tự thực thi script để trang hiện nhanh hơn; kết quả là thư viện phụ thuộc thứ tự tải sẽ lỗi, script inline không chạy, một số widget bên thứ ba chết. Với SPA hiện đại, tắt đi: bundler của bạn đã tối ưu tốt hơn rồi. |
+| Auto Minify             | Cloudflare đã gỡ dần tính năng này. Bundler (Vite, webpack, esbuild) minify tốt hơn và an toàn hơn nhiều vì hiểu cấu trúc code. Minify lúc build, không phải lúc phục vụ.                                                                                                 |
+| Mirage / Polish         | Tối ưu ảnh, cần gói trả phí. Hữu ích nhưng không thay được việc bạn tự dùng định dạng WebP/AVIF và kích thước phù hợp ngay từ build.                                                                                                                                      |
+| Email Obfuscation       | Chèn script vào HTML để giấu địa chỉ email. Có thể xung đột với framework render phía client (hydration mismatch). Nếu thấy lỗi lạ trong HTML, thử tắt ở Scrape Shield.                                                                                                   |
+| Hotlink Protection      | Chặn ảnh bị nhúng từ site khác dựa vào header Referer. Cũng chặn luôn ảnh của bạn khi nhúng từ subdomain khác hay từ email. Chỉ bật khi thật sự bị "ăn cắp" băng thông ảnh.                                                                                               |
+| Browser Integrity Check | Chặn request thiếu hoặc lạ ở User-Agent. Vài client HTTP tối giản và một số webhook bị vướng. Nếu API bị 403 không rõ lý do, thử tắt để loại trừ.                                                                                                                         |
+
+Cách nhận biết Rocket Loader đang làm hỏng bạn mà không cần đoán: mở View Source của trang production, nếu thấy thẻ script bị đổi thành `type="<hash>-text/javascript"` và có thêm một script `rocket-loader.min.js` từ `/cdn-cgi/scripts/`, thì nó đang chạy. Tắt ở Speed → Optimization → Content Optimization, purge cache HTML nếu bạn cache HTML, tải lại. Nếu vì lý do nào đó vẫn muốn giữ nó cho phần còn lại của site, loại trừ từng script bằng thuộc tính `data-cfasync="false"` đặt trước `src`, và nhớ rằng CSP của bạn phải cho phép `ajax.cloudflare.com` thì script của Rocket Loader mới chạy; [bài về CSP](/blog/web-security-03-content-security-policy/) nói rõ vì sao một script được chèn từ bên ngoài lại là thứ CSP sinh ra để chặn.
+
+> **Ghi chú:** những tính năng "tự động tối ưu" của Cloudflare sinh ra từ thời web toàn trang tĩnh và jQuery. Với dự án frontend hiện đại có bundler, phần lớn chúng thừa hoặc có hại. Hãy tối ưu ở tầng build, và để Cloudflare làm đúng việc nó giỏi nhất: phân phối nhanh, nén, và bảo vệ.
+
+---
+
+## Đo lường
+
+| Công cụ                                           | Cho biết                                                                                            |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Cloudflare Analytics (Analytics & Logs → Traffic) | Số request, băng thông, tỷ lệ cache hit, phân bố địa lý, mã trạng thái. Có sẵn ở gói Free.          |
+| Web Analytics                                     | Phân tích truy cập không dùng cookie, có Core Web Vitals. Miễn phí, nhẹ, tôn trọng quyền riêng tư.  |
+| PageSpeed Insights / Lighthouse                   | Điểm hiệu năng, gợi ý cụ thể theo từng trang. Speed → Observatory chạy Lighthouse hộ bạn theo lịch. |
+| WebPageTest                                       | Đo từ nhiều vị trí địa lý, xem waterfall chi tiết từng request.                                     |
+
+Ba con số nên nhìn mỗi tuần: **tỷ lệ cache hit** (thấp thì asset chưa có hash hoặc `Cache-Control` sai), **phân bố mã trạng thái** (4xx tăng đột ngột thường là rule mới chặn nhầm, 5xx là origin), và **Core Web Vitals** trong Web Analytics (LCP xấu ở Việt Nam nhưng tốt ở Singapore thì vấn đề nằm ở origin xa, không phải ở code). Web Analytics chèn được tự động cho zone đang proxy, hoặc bằng một thẻ script nếu site không qua proxy.
+
+Khi cần số liệu thô cho một URL cụ thể, `curl` với `-w` in thời gian từng giai đoạn (DNS, TLS, TTFB) — bộ lệnh đầy đủ nằm ở Phần 11.
+
+---
+
+## Thực hành — tuần bảo mật và hiệu năng (60 phút)
+
+1. **WAF rule đầu tiên.** Tạo rule `URI Path starts with /admin AND Country does not equal VN`, hành động Managed Challenge. Mở `/admin` từ mạng di động hoặc VPN nước ngoài, quan sát trang thử thách. Vào Security → Events, tìm đúng request đó, xem rule nào bắt.
+2. **Thử Bot Fight Mode.** Bật lên, chạy `curl -sI https://example.com/ | head -1` và `curl -sI https://example.com/api/health | head -1`. Ghi lại mã trạng thái. Tắt đi nếu bạn có API hoặc webhook.
+3. **Rate limit trang đăng nhập.** Tạo rule `/login`, hơn 5 request trong 10 giây từ cùng IP, Managed Challenge. Kiểm tra:
+
+   ```bash
+   for i in $(seq 1 8); do
+     curl -s -o /dev/null -w "%{http_code}\n" https://example.com/login
+   done
+   # vài dòng 200 đầu, sau đó 403 hoặc 429 tuỳ hành động
+   ```
+
+4. **Tắt Rocket Loader** nếu đang bật; xác nhận View Source không còn `rocket-loader.min.js`.
+5. **Chạy Lighthouse** trước và sau khi bật Brotli, HTTP/3, Early Hints và sửa `Cache-Control`. So cột Performance và mục "Serve static assets with an efficient cache policy".
+6. **Rà token.** Tạo một API Token chỉ có quyền purge cache cho đúng zone, đặt hạn 90 ngày, xác minh bằng endpoint `tokens/verify`, đưa vào GitHub Secrets. Nếu pipeline nào đang dùng Global API Key, đổi ngay.
+
+> **Kết quả mong đợi:** có một WAF rule đang chạy và bạn tìm được sự kiện nó bắt trong Security → Events; rate limit làm `/login` trả 403/429 sau vài request; Rocket Loader tắt; điểm Lighthouse Performance trên 90 với asset cache một năm; không còn Global API Key trong CI.
+
+---
+
+## Tóm tắt
+
+- Đám mây cam cho sẵn chống DDoS, giấu IP, Universal SSL và WAF cơ bản; phần còn lại là rule cho đường dẫn riêng của bạn.
+- WAF Custom Rules: 5 rule ở gói Free, viết bằng ngôn ngữ Rules dùng chung cả dashboard; ưu tiên Managed Challenge hơn Block; hành động Log chỉ có ở Enterprise nên thử bằng Security → Analytics rồi Managed Challenge trước.
+- Request bị chặn hiện ra ở SPA như lỗi parse JSON hoặc lỗi CORS; nhận biết bằng header `cf-mitigated` và Security → Events.
+- Bot Fight Mode ở gói Free không bypass được bằng Skip rule: có API hoặc webhook thì tắt, dùng WAF rule, rate limiting và Turnstile.
+- Rate limiting ở gói Free: 1 rule, chu kỳ 10 giây, theo IP; đủ cho `/login`, không đủ để "bảo vệ toàn bộ API". Frontend phải xử lý 429.
+- Under Attack Mode chỉ bật khi đang bị tấn công và phải nhớ tắt; nó giết mọi lời gọi API tự động.
+- API Token giới hạn quyền, có hạn, lưu trong CI secrets; không bao giờ dùng Global API Key.
+- Bật Brotli, HTTP/2, HTTP/3, 0-RTT, Early Hints (kèm header `Link`), Tiered Cache. Tắt Rocket Loader, Auto Minify; cân nhắc Email Obfuscation, Hotlink Protection, Browser Integrity Check. Tối ưu ở tầng build.
+
+## Đọc thêm
+
+- [Cloudflare WAF docs](https://developers.cloudflare.com/waf/) — custom rules, rate limiting, managed rules
+- [Cloudflare Rules docs](https://developers.cloudflare.com/rules/) — ngôn ngữ biểu thức dùng chung và Configuration Rules
+- [Cloudflare Cache docs](https://developers.cloudflare.com/cache/) — Tiered Cache và Early Hints

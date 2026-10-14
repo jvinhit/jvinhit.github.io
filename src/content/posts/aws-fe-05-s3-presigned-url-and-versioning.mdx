@@ -1,0 +1,380 @@
+---
+title: 'AWS cho Frontend Developer · Phần 5 — Presigned URL cho upload trực tiếp và Versioning'
+description: 'Cho user upload thẳng lên S3 mà backend không chịu tải: ký presigned PUT bằng SDK v3, PUT bằng fetch trần, bốn lỗi kinh điển, presigned POST giới hạn dung lượng, CORS bucket, rồi Versioning và lifecycle làm lưới an toàn, kết bằng Lab 3.1.'
+pubDate: 2026-10-11
+lang: vi
+tags: [aws, devops, s3, security, frontend]
+series: aws-fe
+seriesOrder: 5
+draft: false
+---
+
+Tính năng "đổi ảnh đại diện" hay "đính kèm tài liệu" là chỗ nhiều frontend làm sai lần đầu: gửi file 20 MB lên backend, backend đọc vào bộ nhớ rồi đẩy tiếp lên S3. Chạy được ở local, lên AWS thì ALB cắt ở 60 giây, API Gateway từ chối body quá 10 MB, backend nghẽn vì vài người upload cùng lúc. Cách đúng là để trình duyệt đưa file thẳng lên S3, còn backend chỉ làm một việc rất nhẹ: ký một URL cho phép đúng thao tác đó trong vài phút.
+
+Bài này viết cả hai phía của presigned URL bằng TypeScript (backend ký với SDK v3, frontend PUT bằng `fetch` trần), liệt kê bốn lỗi kinh điển và cách nhận biết từng cái, mở rộng sang presigned POST khi cần giới hạn dung lượng thật sự, rồi bật Versioning và lifecycle để bucket có lưới an toàn. Kết bài là Lab 3.1: đưa trang React đầu tiên lên S3 với đúng metadata, và nhìn thấy cái 403 "đúng" trước khi mở đường qua CloudFront ở các phần sau.
+
+## Presigned URL — cho phép user upload file trực tiếp
+
+Đừng cho file đi qua backend: tốn băng thông, chậm, và giới hạn dung lượng request (ALB idle timeout 60 giây, API Gateway giới hạn payload 10 MB, Lambda 6 MB).
+
+```text
+✗ QUA BACKEND                          ✓ PRESIGNED URL
+────────────────────                   ──────────────────────────────────────
+Browser ──file 20MB──► Backend         ① Browser ──"xin phép"──► Backend
+                          │                        (chỉ vài byte JSON)
+                          │ file 20MB              Backend ký URL bằng IAM
+                          ▼                                  │
+                         S3            ② ◄────URL có chữ ký──┘
+                                       ③ Browser ──file 20MB──► S3
+Backend phải chịu tải,                    (thẳng, nhanh, backend rảnh)
+giới hạn body size, timeout
+```
+
+### Presigned URL thực chất là gì
+
+Là một URL S3 bình thường (`https://acme-uploads.s3.ap-southeast-1.amazonaws.com/uploads/42/abc.jpg`) kèm chuỗi query chứa chữ ký SigV4: `X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-SignedHeaders`, `X-Amz-Signature`. Chữ ký được tính từ credential của backend trên **đúng một thao tác**: method (PUT), bucket, key, những header đã ký (như `Content-Type`), và thời hạn. Ai cầm URL này đều thực hiện được thao tác đó cho tới khi hết hạn, không cần tài khoản AWS, không cần header `Authorization`. Đổi bất kỳ thứ gì đã ký (method, key, `Content-Type`) là chữ ký sai.
+
+Hệ quả: quyền của URL là quyền của backend. Role của backend chỉ nên có `s3:PutObject` (và `s3:GetObject` nếu cần ký URL tải về) trên prefix upload, không phải `s3:*`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::acme-uploads/uploads/*"
+    }
+  ]
+}
+```
+
+### Backend tạo URL
+
+Express + SDK v3. Backend là nơi kiểm tra đăng nhập, loại file, và tự quyết định key; client không được chọn key.
+
+```ts
+import { randomUUID } from 'node:crypto';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+
+const s3 = new S3Client({ region: 'ap-southeast-1' });
+const BUCKET = 'acme-uploads';
+const ALLOWED: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
+
+app.post('/api/upload-url', authRequired, async (req, res) => {
+  const { fileName, contentType } = req.body as {
+    fileName: string;
+    contentType: string;
+  };
+
+  // Kiểm tra đầu vào — đừng tin client
+  const ext = ALLOWED[contentType];
+  if (!ext) {
+    return res.status(400).json({ error: 'Loại file không được phép' });
+  }
+
+  // Đặt key theo user để không ghi đè của nhau; phần mở rộng lấy từ contentType,
+  // KHÔNG lấy từ fileName (client có thể gửi "../../x.html")
+  const key = `uploads/${req.user.id}/${randomUUID()}.${ext}`;
+
+  const url = await getSignedUrl(
+    s3,
+    new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: key,
+      ContentType: contentType,
+    }),
+    { expiresIn: 300 } // URL hết hạn sau 5 phút
+  );
+
+  res.json({ uploadUrl: url, key, originalName: fileName });
+});
+```
+
+Cùng cơ chế cho phép tải về file riêng tư mà không mở bucket: ký `GetObjectCommand` với `expiresIn` ngắn, trả URL cho frontend mở trong thẻ mới hoặc gán vào `<img src>`.
+
+```ts
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+
+app.get('/api/files/:id/download-url', authRequired, async (req, res) => {
+  const file = await db.files.findOwnedBy(req.user.id, req.params.id);
+  if (!file) return res.status(404).end();
+  const url = await getSignedUrl(
+    s3,
+    new GetObjectCommand({
+      Bucket: BUCKET,
+      Key: file.key,
+      ResponseContentDisposition: `attachment; filename="${file.originalName}"`,
+    }),
+    { expiresIn: 60 }
+  );
+  res.json({ url });
+});
+```
+
+Về thời hạn: `expiresIn` tối đa 7 ngày khi ký bằng access key dài hạn của IAM user; nhưng khi backend chạy trong ECS hay Lambda với role (credential tạm thời), URL vô hiệu ngay khi credential đó hết hạn dù `expiresIn` còn dài. Cứ để ngắn (1–5 phút): frontend xin URL ngay trước khi dùng, không có lý do gì để URL sống lâu.
+
+### Frontend dùng URL
+
+```ts
+async function uploadAvatar(file: File): Promise<string> {
+  // 1. Xin URL
+  const res = await fetch('/api/upload-url', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileName: file.name, contentType: file.type }),
+  });
+  if (!res.ok) throw new Error('Không xin được URL upload');
+  const { uploadUrl, key } = (await res.json()) as {
+    uploadUrl: string;
+    key: string;
+  };
+
+  // 2. PUT thẳng lên S3 — KHÔNG gửi Authorization header ở đây!
+  //    Chữ ký đã nằm trong query string của uploadUrl rồi.
+  const upload = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': file.type }, // PHẢI khớp với lúc ký
+    body: file,
+  });
+  if (!upload.ok) throw new Error('Upload thất bại');
+
+  // 3. Báo backend biết key để lưu vào DB
+  await fetch('/api/profile/avatar', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ avatarKey: key }),
+  });
+
+  return key;
+}
+```
+
+Bước 3 quan trọng hơn vẻ ngoài của nó: S3 không báo cho backend biết có file mới (trừ khi bạn cấu hình S3 event). Nếu người dùng đóng tab sau bước 2, bạn có một object mồ côi trong bucket. Chấp nhận điều đó và dọn định kỳ bằng lifecycle rule cho các key không có trong DB, hoặc để backend chỉ "công nhận" file sau khi nhận bước 3.
+
+`fetch` không báo tiến độ upload. Muốn có thanh phần trăm, dùng `XMLHttpRequest` cho bước 2:
+
+```ts
+function putWithProgress(
+  url: string,
+  file: File,
+  onProgress: (pct: number) => void
+) {
+  return new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url);
+    xhr.setRequestHeader('Content-Type', file.type);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable)
+        onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () =>
+      xhr.status < 300 ? resolve() : reject(new Error(`S3 trả ${xhr.status}`));
+    xhr.onerror = () => reject(new Error('Lỗi mạng khi upload'));
+    xhr.send(file);
+  });
+}
+```
+
+> **Bốn lỗi kinh điển với presigned URL:**
+>
+> 1. **`SignatureDoesNotMatch`**: `Content-Type` lúc PUT khác lúc ký. Phải giống hệt từng ký tự. Hay gặp với file có đuôi lạ: `file.type` rỗng ở trình duyệt, backend ký với chuỗi rỗng, còn `fetch` tự gửi `application/octet-stream`.
+> 2. **Vẫn gửi `Authorization` header**: nhiều người để axios interceptor tự thêm token vào mọi request. Với presigned URL điều này làm hỏng chữ ký (S3 thấy hai cơ chế xác thực cùng lúc). Phải dùng `fetch` trần hoặc một axios instance riêng không có interceptor.
+> 3. **Lỗi CORS khi PUT**: bucket cần cấu hình CORS cho phép method `PUT` từ origin của bạn. Request PUT có `Content-Type: image/jpeg` là request không đơn giản, nên có preflight `OPTIONS` tới S3, và S3 chỉ trả lời preflight khi có cấu hình CORS ([phần 3](/blog/aws-fe-03-cors-vpc-security-group/)).
+> 4. **Không giới hạn kích thước**: presigned PUT cho phép upload file bao nhiêu cũng được (tới 5 GB một request). Muốn giới hạn thật sự thì dùng presigned POST với điều kiện `content-length-range`, mục dưới.
+
+Nhận biết nhanh trong tab Network: lỗi 1 và 2 là response 403 từ S3 với body XML có `SignatureDoesNotMatch` hoặc `InvalidArgument` (chữ "Only one auth mechanism allowed"); lỗi 3 là request `OPTIONS` màu đỏ hoặc thông báo CORS trong Console mà không có response nào từ S3; còn `RequestTimeTooSkewed` nghĩa là đồng hồ máy chủ ký lệch quá 15 phút so với S3.
+
+### Cấu hình CORS cho bucket nhận upload
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://app.example.com", "http://localhost:5173"],
+    "AllowedMethods": ["PUT", "POST", "GET", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3000
+  }
+]
+```
+
+```bash
+aws s3api put-bucket-cors --bucket acme-uploads --cors-configuration file://cors.json
+```
+
+`ExposeHeaders: ["ETag"]` để JS đọc được ETag của object vừa upload (hữu ích khi làm multipart). `AllowedOrigins` là danh sách chính xác, không có dấu `/` cuối; S3 hỗ trợ `*` nhưng đừng dùng cho bucket có ghi.
+
+### Presigned POST — khi cần giới hạn dung lượng và loại file thật sự
+
+Presigned PUT ký "một key, một content-type"; nó không ký kích thước. Presigned POST ký một **policy** với các điều kiện mà S3 kiểm tra trước khi nhận file: khoảng kích thước cho phép, prefix của key, tiền tố của `Content-Type`. Frontend gửi bằng `multipart/form-data`.
+
+```ts
+import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
+
+app.post('/api/upload-form', authRequired, async (req, res) => {
+  const key = `uploads/${req.user.id}/${randomUUID()}`;
+  const { url, fields } = await createPresignedPost(s3, {
+    Bucket: BUCKET,
+    Key: key,
+    Conditions: [
+      ['content-length-range', 0, 5 * 1024 * 1024], // tối đa 5 MB
+      ['starts-with', '$Content-Type', 'image/'],
+    ],
+    Fields: { 'Content-Type': 'image/jpeg' },
+    Expires: 300,
+  });
+  res.json({ url, fields, key });
+});
+```
+
+```ts
+async function uploadWithForm(file: File) {
+  const res = await fetch('/api/upload-form', { method: 'POST' });
+  const { url, fields } = (await res.json()) as {
+    url: string;
+    fields: Record<string, string>;
+  };
+
+  const form = new FormData();
+  for (const [name, value] of Object.entries(fields)) form.append(name, value);
+  form.append('Content-Type', file.type);
+  form.append('file', file); // file PHẢI là field cuối cùng
+
+  const upload = await fetch(url, { method: 'POST', body: form });
+  if (!upload.ok) throw new Error('Upload thất bại');
+}
+```
+
+File vượt 5 MB bị S3 từ chối với `EntityTooLarge` trước khi lưu, không cần backend kiểm tra sau. Thứ tự field trong form quan trọng: S3 bỏ qua mọi field đứng sau `file`.
+
+### Sau khi upload, phục vụ file đó thế nào
+
+Bucket upload vẫn kín. Ba cách cho trình duyệt xem được file:
+
+| Cách                                                  | Khi nào                                                               | Ghi chú                                                                                                                                             |
+| ----------------------------------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Presigned GET (ngắn hạn)                              | File riêng tư của từng người: hoá đơn, hồ sơ                          | Mỗi lần xem là một URL mới, không cache được ở CDN.                                                                                                 |
+| CloudFront behavior `/uploads/*` → bucket upload, OAC | Nội dung công khai nhưng bucket vẫn kín: avatar, ảnh sản phẩm         | Cache được (`public, max-age=86400`, [phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/)); URL sạch, cùng origin với app. |
+| CloudFront signed URL / signed cookie                 | Nội dung trả phí, cả một khu vực: khoá học video, thư viện thành viên | Cache được và vẫn kiểm soát truy cập, [phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/).                                      |
+
+Khi người dùng đổi ảnh, dùng key mới (UUID) thay vì ghi đè key cũ; nếu không CloudFront và trình duyệt còn giữ ảnh cũ tới hết `max-age`. Key mới = URL mới = không phải invalidate.
+
+### Vài ghi chú thực chiến
+
+- **File lớn (trên 100 MB)**: một PUT duy nhất dễ đứt giữa chừng. Cách chuẩn là multipart upload: backend gọi `CreateMultipartUpload`, ký presigned URL cho từng `UploadPart` (mỗi part 5–100 MB), frontend upload song song rồi backend gọi `CompleteMultipartUpload` với danh sách ETag. Nhớ lifecycle rule dọn multipart dở dang (mục Versioning bên dưới).
+- **Đừng log presigned URL** ở server hay gửi lên analytics. Tới khi hết hạn, nó là một chiếc chìa khoá.
+- **Presigned URL chỉ hợp lệ với đúng host đã ký** (endpoint S3). Đổi host sang tên miền CloudFront là chữ ký sai.
+- **SDK v3 bản mới** (từ đầu 2025) mặc định thêm checksum vào request và có thể đưa header checksum vào phần ký, khiến PUT từ trình duyệt bị `SignatureDoesNotMatch` sau khi nâng SDK. Nếu gặp, xem option `requestChecksumCalculation: 'WHEN_REQUIRED'` khi tạo `S3Client` và kiểm tra docs phiên bản bạn dùng.
+- **Không muốn có backend?** Cognito Identity Pool cấp credential tạm thời cho trình duyệt để gọi S3 trực tiếp ([phần 11](/blog/aws-fe-11-api-gateway-and-cognito/)). Nhưng backend ký URL vẫn là cách dễ kiểm soát và dễ audit hơn cho đa số ứng dụng.
+
+---
+
+## Versioning — mạng an toàn khi deploy hỏng
+
+Bật Versioning trên bucket, mỗi lần ghi đè hoặc xoá một key, S3 giữ lại bản cũ dưới dạng "noncurrent version". Đổi lại bạn tốn thêm dung lượng, nên gắn kèm Lifecycle Rule để tự xoá bản cũ sau 30 ngày.
+
+```bash
+aws s3api put-bucket-versioning \
+  --bucket acme-shop-frontend-prod \
+  --versioning-configuration Status=Enabled
+
+# Xem các phiên bản của index.html
+aws s3api list-object-versions \
+  --bucket acme-shop-frontend-prod --prefix index.html \
+  --query 'Versions[].{id:VersionId,latest:IsLatest,time:LastModified,size:Size}'
+
+# Khôi phục một bản cũ: copy phiên bản đó đè lên chính key (thành bản mới nhất)
+aws s3api copy-object \
+  --bucket acme-shop-frontend-prod --key index.html \
+  --copy-source "acme-shop-frontend-prod/index.html?versionId=3sL4kqtJlcpXroDTDmJ..." \
+  --metadata-directive COPY
+```
+
+Hai điều cần hiểu về Versioning để không kỳ vọng sai:
+
+- **Xoá chỉ tạo delete marker.** `aws s3 sync --delete` không thật sự xoá file cũ; nó đặt một "dấu đã xoá" lên trên, bản cũ vẫn nằm dưới dạng noncurrent. Xoá delete marker (bằng `delete-object --version-id <id-cua-marker>`) là file "sống lại". Đây là lưới an toàn cho lỗi "lỡ tay xoá nhầm".
+- **Versioning là theo từng object, không phải snapshot của cả lần deploy.** Khôi phục `index.html` về bản trước không tự khôi phục các file JS mà bản HTML đó trỏ tới (chúng đã có delete marker sau `sync --delete`). Vì vậy Versioning không phải cơ chế rollback; rollback nhanh thật sự là deploy theo phiên bản vào `releases/<sha>/` và đổi origin path của CloudFront, ở [phần 13](/blog/aws-fe-13-ci-cd-github-actions-oidc-preview-environments/).
+
+Lifecycle rule đi kèm, bao gồm cả việc dọn multipart upload dở dang (thứ âm thầm tính tiền lưu trữ):
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "don-ban-cu-va-multipart-do-dang",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 30 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 },
+      "Expiration": { "ExpiredObjectDeleteMarker": true }
+    }
+  ]
+}
+```
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket acme-shop-frontend-prod \
+  --lifecycle-configuration file://lifecycle.json
+```
+
+`ExpiredObjectDeleteMarker: true` dọn nốt các delete marker mồ côi sau khi mọi bản cũ dưới nó đã hết hạn, để `list-object-versions` không đầy rác.
+
+> **Khuyến nghị cấu hình bucket frontend:**
+>
+> - Block all public access: BẬT
+> - Versioning: BẬT + lifecycle xoá noncurrent version sau 30 ngày
+> - Default encryption (SSE-S3): bật (mặc định đã bật)
+> - Server access logging: tuỳ, thường dùng CloudFront log là đủ
+> - Region: cùng region với backend để tiết kiệm phí truyền dữ liệu
+
+---
+
+## Lab 3.1 — Đưa trang đầu tiên lên S3 (45 phút)
+
+1. Tạo project: `npm create vite@latest my-aws-app -- --template react`, rồi `npm run build`. Mở `dist/` và nhìn tên file trong `dist/assets/`: mỗi file có một đoạn hash.
+2. Tạo bucket tên `<tên-bạn>-aws-hoc-tap` ở `ap-southeast-1`, giữ nguyên "Block all public access" (nếu đã tạo ở [phần 4](/blog/aws-fe-04-s3-where-your-build-lives/), dùng lại).
+3. Chạy hai lệnh `aws s3 sync` ở phần 4 (hoặc `deploy.sh`) với `BUCKET` là bucket vừa tạo.
+4. Chạy `aws s3 ls s3://<bucket>/ --recursive --human-readable` để xem danh sách key. So sánh với cây thư mục `dist/`.
+5. Chạy `aws s3api head-object --bucket <bucket> --key index.html` và xác nhận `CacheControl`, `ContentType` đúng như mong đợi. Chạy tiếp với một key trong `assets/` và so sánh `CacheControl`.
+6. Thử mở `https://<bucket>.s3.ap-southeast-1.amazonaws.com/index.html` trên trình duyệt: sẽ thấy 403. Đây là kết quả đúng, vì bucket đang kín. Các phần sau sẽ mở đường qua CloudFront.
+7. (Thêm) Bật Versioning và lifecycle bằng hai lệnh ở trên. Sửa một dòng chữ trong `App.jsx`, `npm run build`, chạy lại `deploy.sh`, rồi `list-object-versions --prefix index.html`: thấy hai phiên bản, bản mới `IsLatest: true`. Trong `assets/` bạn thấy file JS cũ có delete marker và file JS mới có hash khác.
+
+> **Kết quả mong đợi:** `head-object` cho `index.html` in `no-cache, must-revalidate` và `text/html; charset=utf-8`; cho file trong `assets/` in `public, max-age=31536000, immutable` và đúng `application/javascript` hoặc `text/css`. URL S3 trực tiếp trả XML `AccessDenied`. `list-object-versions` cho thấy hai phiên bản `index.html`, và bạn giải thích được vì sao file JS cũ không bị mất hẳn.
+
+---
+
+## Sai lầm hay gặp
+
+- **Cho client chọn key hoặc tên file.** `../../index.html` hoặc key trùng của người khác. Backend sinh key bằng UUID, chỉ lưu tên gốc trong DB.
+- **Tin `file.type` từ trình duyệt.** Nó chỉ suy từ phần mở rộng; đổi tên `virus.exe` thành `anh.jpg` là qua. Allowlist theo `Content-Type` là lớp một; lớp hai là xử lý phía server sau upload (Lambda kích hoạt từ S3 event, resize ảnh bằng `sharp`, kết quả sai định dạng thì xoá).
+- **Ký URL sống 7 ngày "cho chắc".** Lộ URL là lộ quyền ghi trong 7 ngày. Giữ 1–5 phút.
+- **Ghi đè key cũ khi đổi ảnh** rồi thắc mắc "đã upload mà vẫn thấy ảnh cũ". Key mới cho mỗi lần upload.
+- **Cấu hình CORS trên bucket nhưng gọi PUT qua tên miền CloudFront.** Chữ ký gắn với host S3; PUT phải đi thẳng S3.
+- **Bật Versioning mà không có lifecycle.** Bucket phình mãi, hoá đơn lưu trữ tăng đều mỗi lần deploy.
+- **Dùng presigned PUT rồi kiểm tra kích thước ở backend sau khi upload xong.** Lúc đó file 2 GB đã nằm trong bucket và bạn đã trả tiền. Giới hạn trước bằng presigned POST.
+
+---
+
+## Tóm tắt
+
+- Presigned URL là URL S3 kèm chữ ký SigV4 cho đúng một thao tác trong thời hạn ngắn; ai cầm URL là dùng được, không cần `Authorization`. Quyền của URL là quyền của backend, nên role backend chỉ cấp `PutObject`/`GetObject` trên prefix upload.
+- Luồng ba bước: frontend xin URL (backend kiểm tra đăng nhập, loại file, tự sinh key) → PUT thẳng lên S3 với đúng `Content-Type` đã ký → báo backend key để lưu DB.
+- Bốn lỗi kinh điển: `SignatureDoesNotMatch` do `Content-Type` lệch, interceptor tự thêm `Authorization`, thiếu CORS trên bucket cho `PUT`, và không giới hạn kích thước. Presigned POST với `content-length-range` giải quyết cái cuối.
+- Phục vụ file đã upload bằng presigned GET (riêng tư), CloudFront behavior trên bucket kín (công khai, cache được) hoặc CloudFront signed URL/cookie (trả phí). Đổi ảnh thì dùng key mới.
+- Versioning giữ bản cũ khi ghi đè hoặc xoá (xoá chỉ tạo delete marker). Nó là lưới an toàn cho "xoá nhầm", không phải cơ chế rollback cả lần deploy. Luôn đi kèm lifecycle: noncurrent 30 ngày, dọn multipart dở dang, dọn delete marker.
+- Bucket frontend chuẩn: Block Public Access bật, Versioning + lifecycle, SSE-S3 mặc định, cùng region với backend.
+
+[Phần 6](/blog/aws-fe-06-cloudfront-cdn-behaviors-cache-key/) bắt đầu chương quan trọng nhất với frontend: CloudFront. Distribution, origin, behavior (bộ định tuyến của cả hệ thống), và cache key, thứ quyết định vì sao có lúc CDN trả nhầm dữ liệu.
+
+## Đọc thêm
+
+- [Amazon S3 User Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/)
+- [IAM User Guide](https://docs.aws.amazon.com/IAM/latest/UserGuide/)
+- [Amazon CloudFront Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/)

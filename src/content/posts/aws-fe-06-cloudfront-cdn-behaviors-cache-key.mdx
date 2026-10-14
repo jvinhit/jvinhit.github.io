@@ -1,0 +1,265 @@
+---
+title: 'AWS cho Frontend Developer · Phần 6 — CloudFront: CDN, behavior và cache key'
+description: 'Distribution, origin, behavior, cache key: behavior xét theo thứ tự và lỗi POST /api bị 403, cache key quá hẹp thì trả nhầm dữ liệu, quá rộng thì CDN vô dụng, managed policy nên dùng và cách phân biệt Cache Policy với Origin Request Policy.'
+pubDate: 2026-10-14
+lang: vi
+tags: [aws, devops, cloudfront, cdn, cache]
+series: aws-fe
+seriesOrder: 6
+draft: false
+---
+
+Nếu chỉ có thời gian học một dịch vụ AWS, hãy học cái này. CloudFront là nơi quyết định tốc độ trang, hành vi cache, routing, HTTPS, và là nơi sinh ra phần lớn lỗi khó hiểu: POST bị 403 mà backend không có log, CORS lúc được lúc không, user A thấy dữ liệu của user B. Tất cả đều quy về ba khái niệm: origin, behavior và cache key.
+
+Bài này là nửa đầu của chương CloudFront. Bạn sẽ hiểu distribution gồm những gì, cách CloudFront chọn origin bằng behavior theo thứ tự từ trên xuống, vì sao behavior mặc định chỉ cho GET/HEAD làm hỏng mọi request POST, cache key là gì và hai kiểu lỗi đối lập khi nó quá hẹp hoặc quá rộng, rồi bộ managed policy nên dùng sẵn thay vì tự chế. Nửa sau ([phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/)) lo chiến lược cache, invalidation và SPA routing; [phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/) có Lab 4.1 dựng distribution hoàn chỉnh.
+
+## CDN hoạt động ra sao
+
+CloudFront đặt bản sao file của bạn ở hơn 600 điểm khắp thế giới. Người dùng lấy file từ điểm gần nhất thay vì từ S3 ở Singapore. Đó là bước ④ trong sơ đồ vòng đời request ở [phần 1](/blog/aws-fe-01-mindset-and-request-lifecycle/), và là hộp mà bài này phóng to.
+
+| Khái niệm                    | Giải thích                                                                                                                                                               |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Distribution**             | Một "cấu hình CDN". Có ID dạng `E1ABCDEFGHIJKL` và tên miền `d111abc.cloudfront.net`.                                                                                    |
+| **Origin**                   | Nguồn gốc để lấy file khi cache miss. Có thể là S3 bucket, ALB, API Gateway, hoặc bất kỳ server HTTP nào. Một distribution có thể có nhiều origin.                       |
+| **Behavior**                 | Luật định tuyến theo path: "path nào thì đi origin nào, cache kiểu gì". Đây là khái niệm bạn phải nắm chắc nhất.                                                         |
+| **Cache key**                | Chuỗi định danh mà CloudFront dùng để tra cứu cache. Mặc định chỉ gồm host + path. Bạn có thể thêm query string, header, cookie vào.                                     |
+| **Invalidation**             | Lệnh xoá cache ở toàn bộ edge.                                                                                                                                           |
+| **Alternate domain (CNAME)** | Tên miền riêng của bạn gắn vào distribution, ví dụ `shop.example.com`. Cần chứng chỉ ACM ở `us-east-1` phủ tên đó ([phần 2](/blog/aws-fe-02-route53-acm-http-headers/)). |
+
+### Một request đi qua CloudFront thế nào
+
+```text
+Trình duyệt ──► Edge location (Hà Nội)
+                  │ có trong cache? ── CÓ ──► trả về         X-Cache: Hit from cloudfront
+                  │ KHÔNG
+                  ▼
+                Regional edge cache (lớp cache lớn hơn, ít điểm hơn)
+                  │ có? ── CÓ ──► trả về, edge lưu lại      X-Cache: Hit from cloudfront
+                  │ KHÔNG
+                  ▼
+                Origin (S3 / ALB)                            X-Cache: Miss from cloudfront
+                  đọc Cache-Control của response → quyết định lưu bao lâu
+```
+
+Giá trị `X-Cache` bạn sẽ gặp và ý nghĩa:
+
+| `X-Cache`                                   | Nghĩa                                                                                                                            |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `Hit from cloudfront`                       | Phục vụ từ cache, không đụng origin.                                                                                             |
+| `Miss from cloudfront`                      | Không có trong cache, đã xuống origin lấy về (và có thể đã lưu).                                                                 |
+| `RefreshHit from cloudfront`                | Có trong cache nhưng hết TTL; CloudFront hỏi origin "đổi chưa" bằng `If-None-Match`, origin trả 304, dùng lại bản cũ. Rẻ.        |
+| `Error from cloudfront`                     | Origin trả lỗi hoặc CloudFront không kết nối được origin (502/503/504).                                                          |
+| `Redirect from cloudfront`                  | CloudFront tự trả 301 (thường là HTTP → HTTPS theo viewer protocol policy).                                                      |
+| `FunctionGeneratedResponse from cloudfront` | Một CloudFront Function đã trả response ngay tại edge ([phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/)). |
+
+### Origin: S3 và custom origin khác nhau ở đâu
+
+Có hai loại origin, và cài đặt của chúng khác nhau:
+
+- **S3 origin**: chọn bucket từ danh sách, bật OAC, CloudFront ký request tới S3 ([phần 4](/blog/aws-fe-04-s3-where-your-build-lives/)). Dùng REST endpoint của bucket, không phải website endpoint.
+- **Custom origin**: bất kỳ hostname HTTP nào (ALB, API Gateway, server riêng). Cài đặt đáng chú ý: **Origin protocol policy** (`HTTPS only` là mặc định nên chọn; `HTTP only` khi origin không có TLS; `Match viewer` hiếm khi cần), cổng, và **custom header** gửi kèm mọi request tới origin.
+
+Với origin là ALB có hai bẫy. Thứ nhất, hostname origin phải là tên DNS (`my-alb-123.ap-southeast-1.elb.amazonaws.com` hoặc tốt hơn là `origin.example.com` trỏ vào ALB), không phải IP. Thứ hai, nếu chọn `HTTPS only`, chứng chỉ trên ALB phải phủ đúng hostname đó; tên `*.elb.amazonaws.com` không nằm trong chứng chỉ của bạn, nên CloudFront bắt tay TLS thất bại và bạn nhận 502. Cách chuẩn: tạo `origin.example.com` ALIAS tới ALB, xin chứng chỉ ACM cho nó ở region của ALB, dùng tên đó làm origin. Chi tiết ALB ở [phần 9](/blog/aws-fe-09-alb-gateway-to-backend/).
+
+Custom header là cách để backend biết request thật sự đến từ CloudFront chứ không phải ai đó gọi thẳng ALB: CloudFront gắn `X-Origin-Verify: <chuỗi bí mật>` vào mọi request tới origin, ALB listener rule chỉ forward khi header khớp, còn lại trả 403. Kết hợp với Security Group giới hạn nguồn là prefix list của CloudFront ([phần 3](/blog/aws-fe-03-cors-vpc-security-group/)), không ai bỏ qua được cache và WAF.
+
+**Origin path** là prefix được nối vào trước mọi path khi gọi origin: origin path `/releases/abc123` biến request `/index.html` thành `releases/abc123/index.html` trên S3. Đây là cơ chế đằng sau rollback tức thì ở [phần 13](/blog/aws-fe-13-ci-cd-github-actions-oidc-preview-environments/).
+
+### Vài cài đặt cấp distribution đáng biết
+
+- **Default root object** = `index.html`: để request `/` thành `/index.html`. Chỉ áp dụng cho root, không áp dụng cho `/products/` (S3 không tự tìm index trong "thư mục").
+- **Viewer protocol policy** trên behavior: `Redirect HTTP to HTTPS`.
+- **Supported HTTP versions**: bật HTTP/2 và HTTP/3. Miễn phí, giúp nhiều request song song trên một kết nối.
+- **Price class**: chọn "all edge locations" nếu có người dùng ở Việt Nam; price class rẻ hơn bỏ qua một số vùng, người dùng ở đó bị đẩy sang edge xa hơn.
+- **IPv6**: bật, rồi tạo cả bản ghi AAAA ALIAS.
+- **Standard logging** và **WAF**: gắn khi lên production ([phần 14](/blog/aws-fe-14-monitoring-and-debug-handbook/), [phần 15](/blog/aws-fe-15-security-performance-cost/)).
+
+Mọi thay đổi distribution mất vài phút để lan ra edge (trạng thái `Deploying` → `Deployed`). CLI hữu ích:
+
+```bash
+aws cloudfront list-distributions \
+  --query 'DistributionList.Items[].{id:Id,domain:DomainName,aliases:Aliases.Items,status:Status}'
+
+aws cloudfront get-distribution-config --id E1ABCDEFGHIJKL > dist.json
+aws cloudfront wait distribution-deployed --id E1ABCDEFGHIJKL
+```
+
+Nếu bạn đã quen Cloudflare, [Cloudflare phần 12](/blog/cloudflare-fe-12-free-plan-limits-and-aws-comparison/) đối chiếu từng khái niệm (zone, cache rule, page rule) với distribution, behavior và policy ở đây.
+
+---
+
+## Behavior — bộ định tuyến của cả hệ thống
+
+Behavior được xét theo thứ tự từ trên xuống, cái đầu tiên khớp sẽ thắng. Behavior mặc định `*` luôn nằm cuối cùng.
+
+```text
+┌──── CloudFront Distribution: shop.example.com ──────────────────────────┐
+│                                                                         │
+│  #  Path pattern       Origin      Cache policy       Methods           │
+│  ─────────────────────────────────────────────────────────────────────  │
+│  0  /api/*         →   ALB         CachingDisabled    GET,POST,PUT,DEL  │
+│  1  /assets/*      →   S3          CachingOptimized   GET,HEAD          │
+│  2  /images/*      →   S3-media    CachingOptimized   GET,HEAD          │
+│  3  * (mặc định)   →   S3          CachingDisabled*   GET,HEAD          │
+│                                    (*vì đây là index.html)              │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Request /api/orders    → khớp #0 → ALB, không cache
+Request /assets/x.js   → khớp #1 → S3, cache 1 năm
+Request /products/123  → không khớp 0,1,2 → #3 → S3 → S3 trả 403
+                         → Custom Error Response biến thành /index.html 200
+```
+
+Đây là bản "production" của `server.proxy` trong `vite.config.ts`: dòng `#0` chính là proxy `/api`, ba dòng còn lại là phần phục vụ file tĩnh. Vì tất cả nằm sau một tên miền, `fetch('/api/orders')` là same-origin, không có CORS ([phần 3](/blog/aws-fe-03-cors-vpc-security-group/)).
+
+Luật khớp path pattern: `*` khớp 0 hoặc nhiều ký tự bất kỳ (kể cả `/`), `?` khớp đúng một ký tự, phân biệt hoa thường, không có regex. `/api/*` khớp `/api/orders` và `/api/v2/orders/7` nhưng không khớp `/api` (không có dấu `/` sau). Khi có hai pattern lồng nhau (`/api/public/*` cache được, `/api/*` không cache), cái cụ thể hơn phải có precedence nhỏ hơn (đứng trên).
+
+### Mỗi behavior cấu hình những gì
+
+- **Origin** đích.
+- **Viewer protocol policy**: `Redirect HTTP to HTTPS`.
+- **Allowed HTTP methods**: ba lựa chọn: `GET, HEAD`; `GET, HEAD, OPTIONS`; hoặc đủ bảy `GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE`. CloudFront chỉ cache GET/HEAD (và OPTIONS nếu bạn chọn), các method còn lại luôn đi thẳng origin.
+- **Cache policy** và **Origin request policy** (mục sau).
+- **Response headers policy**: thêm security header, CORS header ở edge ([phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/)).
+- **Compress objects automatically**: bật.
+- **Function associations**: CloudFront Function hoặc Lambda@Edge gắn vào bốn sự kiện.
+- **Restrict viewer access**: bật khi dùng signed URL/cookie.
+
+> **Lỗi kinh điển: POST tới `/api` bị trả về 403.** Behavior mặc định của CloudFront chỉ cho phép `GET, HEAD`. Nếu behavior `/api/*` của bạn không bật đủ method `GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE`, thì mọi request POST sẽ bị CloudFront từ chối thẳng, không bao giờ tới được backend. Backend không có log gì cả, và bạn sẽ debug nhầm chỗ hàng giờ. Dấu hiệu: response 403 với body HTML có chữ "Generated by cloudfront" và câu đại ý "This distribution is not configured to allow the HTTP request method", kèm `X-Cache: Error from cloudfront`.
+
+Một biến thể tinh vi hơn: behavior phục vụ font hoặc ảnh cho trang ở tên miền khác chỉ bật `GET, HEAD`. Trình duyệt gửi preflight `OPTIONS` cho font (font luôn là tài nguyên CORS), CloudFront trả 403, và bạn thấy "lỗi CORS" trong khi thực ra là method bị chặn. Behavior có CORS phải bật ít nhất `GET, HEAD, OPTIONS`.
+
+### Công thức ba behavior cho SPA + API
+
+| Behavior       | Origin      | Methods     | Cache policy       | Origin request policy | Compress           |
+| -------------- | ----------- | ----------- | ------------------ | --------------------- | ------------------ |
+| `/api/*`       | ALB (HTTPS) | đủ 7        | `CachingDisabled`  | `AllViewer`           | Bật (JSON nén tốt) |
+| `/assets/*`    | S3 (OAC)    | `GET, HEAD` | `CachingOptimized` | không cần             | Bật                |
+| `*` (mặc định) | S3 (OAC)    | `GET, HEAD` | `CachingDisabled`  | không cần             | Bật                |
+
+Nếu ảnh do người dùng upload nằm ở bucket khác ([phần 5](/blog/aws-fe-05-s3-presigned-url-and-versioning/)), thêm origin `S3-media` và behavior `/uploads/*` giống dòng `/assets/*`. Với Next.js SSR, asset tĩnh nằm ở `/_next/static/*` và phải có behavior riêng để không đi qua server ([phần 10](/blog/aws-fe-10-where-code-runs-ec2-ecs-lambda-amplify-nextjs/)).
+
+---
+
+## Cache key — vì sao có lúc trả nhầm dữ liệu
+
+CloudFront tra cache bằng cache key. Mặc định cache key chỉ gồm **host + đường dẫn**. Hai request có cùng key thì nhận cùng một response từ cache, bất kể chúng khác nhau ở header, cookie hay query string. Điều này gây ra hai loại lỗi đối lập:
+
+**Cache key quá hẹp** (bỏ sót yếu tố phân biệt → trả nhầm nội dung):
+
+- `/api/me` không đưa cookie vào key → user A nhận dữ liệu user B. Sự cố bảo mật nghiêm trọng, và là lý do `/api/*` phải dùng `CachingDisabled`.
+- Không đưa `Origin` vào key → lỗi CORS lúc được lúc không ([phần 3](/blog/aws-fe-03-cors-vpc-security-group/)).
+- Không đưa `Accept-Encoding` vào key (khi tự nén ở origin) → trình duyệt không hỗ trợ brotli nhận file `.br` và không đọc được.
+
+**Cache key quá rộng** (thêm quá nhiều yếu tố → tỷ lệ hit thấp, CDN vô dụng):
+
+- Đưa cả `User-Agent` vào key → mỗi phiên bản trình duyệt là một bản cache riêng → gần như luôn miss.
+- Forward tất cả query string, trong khi Facebook, Google Ads gắn `?fbclid=...`, `?utm_source=...` vào mọi link → mỗi link là một key mới, cùng một `index.html` bị cache thành hàng nghìn bản.
+- Đưa toàn bộ cookie vào key cho asset tĩnh → mỗi user một bản cache của cùng file JS.
+
+Với asset có hash trong tên, key chỉ cần path là đủ: nội dung đổi thì tên đổi, không có lý do gì để phân biệt thêm.
+
+### Managed policy — dùng sẵn, đừng tự chế
+
+| Cache Policy                                     | Dùng cho                                                                                                                    |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `Managed-CachingOptimized`                       | Asset tĩnh có hash trong tên. Không đưa query/cookie/header vào key. Bật nén. Đây là lựa chọn cho `/assets/*`.              |
+| `Managed-CachingDisabled`                        | API và HTML. Không cache gì cả, mọi request xuống origin.                                                                   |
+| `Managed-CachingOptimizedForUncompressedObjects` | File đã nén sẵn hoặc ảnh/video.                                                                                             |
+| `Managed-UseOriginCacheControlHeaders`           | Origin tự quyết bằng `Cache-Control` (SSR, HTML có `max-age` riêng từng trang). Bản `-QueryStrings` đưa thêm query vào key. |
+| `Managed-Elemental-MediaPackage`                 | Streaming. Frontend thường không dùng.                                                                                      |
+
+| Origin Request Policy               | Dùng cho                                                                                                     |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `Managed-AllViewer`                 | Behavior `/api/*` trỏ ALB. Chuyển tiếp mọi header, cookie, query xuống origin. Backend cần đầy đủ thông tin. |
+| `Managed-AllViewerExceptHostHeader` | Như trên nhưng giữ nguyên `Host` của origin. Bắt buộc khi origin là API Gateway (nó định tuyến theo `Host`). |
+| `Managed-CORS-S3Origin`             | S3 origin có CORS. Chuyển tiếp `Origin`, `Access-Control-Request-*`.                                         |
+| `Managed-CORS-CustomOrigin`         | Origin không phải S3 có CORS.                                                                                |
+| `Managed-UserAgentRefererHeaders`   | Khi origin cần biết trình duyệt/nguồn giới thiệu.                                                            |
+
+Xem danh sách và nội dung từng policy bằng CLI, hữu ích để biết chính xác `CachingOptimized` làm gì:
+
+```bash
+aws cloudfront list-cache-policies --type managed \
+  --query 'CachePolicyList.Items[].{id:CachePolicy.Id,name:CachePolicy.CachePolicyConfig.Name}'
+
+aws cloudfront list-origin-request-policies --type managed \
+  --query 'OriginRequestPolicyList.Items[].OriginRequestPolicy.OriginRequestPolicyConfig.Name'
+```
+
+> **Phân biệt hai loại policy — điểm hay nhầm nhất.** Cache Policy = "những gì đưa vào cache key" → ảnh hưởng tỷ lệ hit. Origin Request Policy = "những gì chuyển tiếp xuống origin" → ảnh hưởng thông tin backend nhận được.
+>
+> Một thứ có thể được chuyển tiếp mà không nằm trong cache key. Ví dụ với `/api/*`: bạn muốn chuyển tiếp tất cả cookie xuống backend (Origin Request Policy = `AllViewer`) nhưng không cache gì (Cache Policy = `CachingDisabled`). Rất hợp lý.
+>
+> Ngược lại, thứ nằm trong cache key thì luôn được chuyển tiếp (CloudFront cần nó để hỏi origin đúng bản).
+
+Hệ quả thực tế của luật cuối: nếu bạn gắn `AllViewer` cho behavior trỏ S3, header `Host` (là `shop.example.com`) bị chuyển tiếp xuống S3, S3 không nhận ra bucket nào và trả lỗi. S3 origin dùng `CORS-S3Origin` hoặc không cần origin request policy; `AllViewer` chỉ dành cho ALB.
+
+### Bên trong một cache policy
+
+Khi managed policy không đủ (ví dụ cần cache theo header `CloudFront-Viewer-Country` để phục vụ nội dung theo quốc gia), bạn tạo custom policy với bốn nhóm cài đặt:
+
+- **TTL**: `Min`, `Default`, `Max` (giây). Chúng phối hợp với `Cache-Control` từ origin theo luật: origin gửi `max-age=N` → cache N giây nhưng bị kẹp trong `[Min, Max]`; origin không gửi `Cache-Control` → dùng `Default`; origin gửi `no-cache`, `no-store` hoặc `private` → không cache nếu `Min = 0`, còn `Min` lớn hơn 0 thì vẫn cache đúng `Min` giây (bẫy: `Min` khác 0 sẽ ghi đè cả `no-cache` của `index.html`).
+- **Headers** đưa vào key: chỉ có allowlist. `Origin` cho CORS, `CloudFront-Viewer-Country` cho geo, `Authorization` gần như không bao giờ (mỗi token một bản cache).
+- **Query strings**: none / all / allowlist / all-except. Cho asset tĩnh: none. Cho API có cache: allowlist đúng những tham số ảnh hưởng kết quả (`page`, `q`), bỏ `utm_*`.
+- **Cookies**: none / all / allowlist. Cho asset tĩnh: none.
+- **Compression support**: bật Gzip và Brotli; CloudFront tự chuẩn hoá `Accept-Encoding` thành hai giá trị thay vì hàng chục biến thể của trình duyệt.
+
+`CachingOptimized` chính là: TTL 1 giây / 86400 / 31536000, không header, không query, không cookie, nén bật. `CachingDisabled` là TTL 0/0/0. Với `index.html` mà bạn muốn tận dụng `RefreshHit` (edge hỏi S3 bằng `If-None-Match`, nhận 304, tiết kiệm băng thông), một custom policy TTL `0 / 0 / 31536000` kèm nén bật cũng là lựa chọn hợp lý; `CachingDisabled` thì đơn giản hơn và đủ cho đa số.
+
+`Vary` từ origin chỉ có tác dụng khi header được nêu tên nằm trong cache key (hoặc là `Accept-Encoding` với nén bật). `Vary: Origin` mà không có `Origin` trong key thì CloudFront vẫn chỉ giữ một bản.
+
+---
+
+## Thực hành nhanh — Đọc behavior và cache key bằng CLI và curl (20 phút)
+
+Bạn chưa có distribution cho tới Lab 4.1 ở [phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/); các bước 1–2 làm với distribution bất kỳ của công ty (chỉ đọc), bước 3–4 làm với trang public nào đó dùng CloudFront, rồi quay lại chạy toàn bộ sau Lab 4.1.
+
+1. Liệt kê behavior theo đúng thứ tự CloudFront xét, và đọc ra pattern, origin, method của từng dòng:
+
+```bash
+aws cloudfront get-distribution-config --id E1ABCDEFGHIJKL \
+  --query 'DistributionConfig.CacheBehaviors.Items[].{path:PathPattern,origin:TargetOriginId,methods:AllowedMethods.Items,cache:CachePolicyId}' \
+  --output table
+aws cloudfront get-distribution-config --id E1ABCDEFGHIJKL \
+  --query 'DistributionConfig.DefaultCacheBehavior.{origin:TargetOriginId,methods:AllowedMethods.Items,cache:CachePolicyId}'
+```
+
+2. Với `CachePolicyId` lấy được, chạy `aws cloudfront get-cache-policy --id <id>` và đọc TTL, header, query, cookie trong key.
+3. Gọi một file JS hai lần bằng `curl -sI`, xem `x-cache` đổi từ `Miss` sang `Hit`. Gọi lần ba với `?v=1` sau URL: nếu vẫn `Hit` và cùng `age`, behavior đó không đưa query vào key (đúng cho asset). Với `index.html`, mong đợi `Miss` hoặc `RefreshHit` mỗi lần.
+4. Gửi `curl -sI -X POST https://<domain>/` vào một behavior chỉ cho GET/HEAD và đọc response 403 từ CloudFront; so với cùng lệnh vào `/api/...` của một hệ thống có bật đủ method.
+
+> **Kết quả mong đợi:** Bạn đọc được thứ tự behavior mà không cần mở Console, chỉ ra được cache policy của từng behavior đưa gì vào key, quan sát được `Miss` → `Hit` và chứng minh được query string không ảnh hưởng key của asset. Bạn nhận diện được lỗi 403 "method không được phép" chỉ bằng `X-Cache: Error from cloudfront` và body HTML của CloudFront.
+
+---
+
+## Sai lầm hay gặp
+
+- **Quên bật đủ 7 method cho `/api/*`.** POST bị 403 tại edge, backend không có log.
+- **Behavior cụ thể đứng sau behavior rộng hơn.** `/api/*` với `CachingDisabled` đứng dưới `/api/public/*`? Đúng. Nhưng `/api/*` đứng dưới `/*`-kiểu-pattern nào đó là sai: dòng trên "ăn" hết request. Xem precedence khi có nhiều behavior.
+- **Gắn `AllViewer` cho S3 origin.** `Host` bị forward xuống S3 → lỗi. S3 chỉ cần `CORS-S3Origin` hoặc không policy.
+- **Gắn `AllViewer` cho API Gateway origin.** Cũng vì `Host`; dùng `AllViewerExceptHostHeader`.
+- **Origin ALB với `HTTPS only` nhưng dùng tên `*.elb.amazonaws.com`.** Chứng chỉ không khớp → 502. Đặt `origin.example.com` + ACM cùng region ALB.
+- **Custom cache policy có `Min TTL` lớn hơn 0 cho behavior HTML.** `no-cache` của `index.html` bị ghi đè; deploy xong vẫn bản cũ suốt `Min TTL`.
+- **Dùng website endpoint của S3 làm origin rồi bật OAC.** OAC chỉ hoạt động với REST endpoint; website endpoint đòi bucket public.
+- **Forward tất cả query string cho `index.html`** để "cho chắc". `?utm_source=` biến một file thành nghìn bản cache và mỗi bản đều phải invalidate riêng.
+
+---
+
+## Tóm tắt
+
+- Distribution là một cấu hình CDN với tên `dxxx.cloudfront.net`; origin là nơi lấy file khi miss (S3 với OAC, hoặc custom origin như ALB với `HTTPS only` và tên miền có chứng chỉ khớp); alternate domain cần chứng chỉ ACM ở `us-east-1`.
+- `X-Cache` nói request đã đi tới đâu: `Hit`, `Miss`, `RefreshHit`, `Error`, `Redirect`, `FunctionGeneratedResponse`.
+- Behavior xét từ trên xuống, khớp đầu tiên thắng, `*` cuối cùng. Công thức SPA + API: `/api/*` → ALB, đủ 7 method, `CachingDisabled` + `AllViewer`; `/assets/*` → S3, `CachingOptimized`; `*` → S3, `CachingDisabled`; nén bật ở mọi behavior.
+- Behavior mặc định chỉ cho `GET, HEAD`; quên bật method là POST bị 403 tại edge, backend không thấy gì.
+- Cache key mặc định là host + path. Quá hẹp thì trả nhầm dữ liệu (cookie, `Origin`); quá rộng thì hit rate rớt (`User-Agent`, mọi query string, mọi cookie).
+- Cache Policy quyết định cache key và TTL; Origin Request Policy quyết định cái gì được forward. Thứ trong key luôn được forward; thứ được forward không nhất thiết trong key. Không gắn `AllViewer` cho S3.
+- Dùng managed policy trước; chỉ tạo custom policy khi cần header hay query cụ thể, và hiểu luật TTL `Min/Default/Max` phối hợp với `Cache-Control` của origin.
+
+[Phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/) dán lên tường bảng `Cache-Control` chuẩn cho từng loại file, giải thích vì sao asset không bao giờ cần invalidate còn `index.html` thì có, và sửa dứt điểm lỗi F5 bị 403/404 của SPA bằng hai cách.
+
+## Đọc thêm
+
+- [Amazon CloudFront Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/)
+- [Amazon S3 User Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/)
+- [Application Load Balancer Guide](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/)

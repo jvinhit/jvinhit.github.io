@@ -1,0 +1,521 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 15 — Helm và Kustomize'
+description: 'Mười lăm file YAML gần giống nhau cho ba môi trường: Helm biến chúng thành template có values, Kustomize thành base và overlay. Cấu trúc chart, lệnh cần thuộc, checksum/config, configMapGenerator và chọn cái nào.'
+pubDate: 2026-11-11
+lang: vi
+tags: [kubernetes, helm, deployment, devops, frontend]
+series: k8s-fe
+seriesOrder: 15
+draft: false
+---
+
+Ở [Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/) thư mục `k8s/` của bạn có sáu file: namespace, configmap, deployment, service, ingress, hpa. Đủ cho một môi trường. Rồi QA cần staging với host `staging.app.congty.com`, `replicas: 1` và `API_BASE_URL` trỏ sang API staging. Cách nhanh nhất là copy thư mục thành `k8s-staging/` và sửa vài dòng. Ba tháng sau bạn có ba thư mục, mười lăm file, và một bug chỉ xảy ra ở production vì ai đó thêm `preStop` vào bản prod mà quên hai bản kia.
+
+Bài này giới thiệu hai công cụ giải cùng một bài toán bằng hai triết lý ngược nhau. **Helm** biến YAML thành template có biến, giống EJS cho manifest, kèm quản lý release và rollback. **Kustomize** không có template: bạn giữ một `base` YAML thuần và ghi đè từng lớp bằng `overlay`. Đọc xong bạn viết được chart Helm cho app frontend của mình, viết được bộ overlay Kustomize cho staging và production, và hiểu vì sao nhiều team dùng cả hai.
+
+## Vấn đề cả hai cùng giải
+
+Liệt kê thật những gì khác nhau giữa ba môi trường của một app frontend:
+
+| Thứ khác nhau  | dev                  | staging                  | production        |
+| -------------- | -------------------- | ------------------------ | ----------------- |
+| namespace      | `web-dev`            | `web-staging`            | `web`             |
+| host Ingress   | `dev.app.congty.com` | `staging.app.congty.com` | `app.congty.com`  |
+| `replicas`     | 1                    | 2                        | 3 (hoặc HPA 3–20) |
+| image tag      | `sha-a1b2c3d`        | `sha-a1b2c3d`            | `1.4.2`           |
+| `API_BASE_URL` | API dev              | API staging              | API production    |
+| `resources`    | thấp                 | trung bình               | như đã đo         |
+
+Chỉ khoảng sáu giá trị khác nhau, còn lại 95% nội dung năm file YAML là giống hệt. Bạn muốn viết phần giống nhau **một lần** và chỉ khai báo phần khác. Đây đúng là bài toán "component nhận props" trong React: Deployment là component, sáu giá trị kia là props.
+
+Helm và Kustomize khác nhau ở cách truyền props. Helm dùng template: trong file có `{{ .Values.replicaCount }}`, lúc render thay bằng số. Kustomize dùng ghi đè: `base/deployment.yaml` là YAML hợp lệ chạy được ngay, `overlays/production/` chỉ chứa phần "patch" đè lên, giống `Object.assign(base, overlay)`.
+
+---
+
+## Helm: đóng gói ứng dụng thành chart
+
+### Cấu trúc một chart
+
+```text
+my-frontend/
+├── Chart.yaml            # metadata: tên, version của chart, version của app
+├── values.yaml           # giá trị mặc định
+├── values-staging.yaml   # ghi đè cho staging
+├── values-prod.yaml      # ghi đè cho production
+├── .helmignore
+└── templates/
+    ├── _helpers.tpl      # hàm dùng chung: tên, label
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── ingress.yaml
+    ├── configmap.yaml
+    ├── hpa.yaml
+    └── NOTES.txt         # in ra sau khi cài (tuỳ chọn)
+```
+
+`helm create my-frontend` sinh bộ khung này kèm template mẫu khá dài (serviceaccount, tests, nhiều điều kiện). Với app frontend, xoá phần không cần và thay bằng nội dung dưới; chart càng ngắn càng dễ đọc sáu tháng sau.
+
+`Chart.yaml`:
+
+```yaml
+apiVersion: v2
+name: my-frontend
+description: React SPA phục vụ bằng nginx, runtime config qua config.js
+type: application
+version: 0.3.0 # version của CHART: tăng khi sửa template
+appVersion: '1.4.2' # version của APP: chỉ để hiển thị, tag image lấy từ values
+```
+
+### values.yaml: mọi thứ khác nhau giữa môi trường
+
+```yaml
+replicaCount: 3
+
+image:
+  repository: ghcr.io/my-org/frontend
+  tag: '1.4.2'
+  pullPolicy: IfNotPresent
+
+# Đặt tên tài nguyên cố định là "frontend" thay vì "<release>-my-frontend"
+fullnameOverride: frontend
+
+config:
+  API_BASE_URL: 'https://api.congty.com'
+  FEATURE_NEW_CHECKOUT: 'true'
+  SENTRY_ENVIRONMENT: 'production'
+
+ingress:
+  enabled: true
+  className: nginx
+  host: app.congty.com
+  tlsSecret: frontend-tls
+  clusterIssuer: letsencrypt-prod
+
+resources:
+  requests: { cpu: 25m, memory: 48Mi }
+  limits: { cpu: 300m, memory: 192Mi }
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+```
+
+Hai file ghi đè chỉ chứa phần khác. `values-staging.yaml`:
+
+```yaml
+replicaCount: 2
+image:
+  tag: 'sha-a1b2c3d'
+config:
+  API_BASE_URL: 'https://api-staging.congty.com'
+  SENTRY_ENVIRONMENT: 'staging'
+ingress:
+  host: staging.app.congty.com
+  tlsSecret: frontend-staging-tls
+  clusterIssuer: letsencrypt-staging
+autoscaling:
+  enabled: false
+```
+
+`values-prod.yaml` thường rất ngắn, thậm chí rỗng, vì `values.yaml` đã là bản production; nhiều team làm ngược lại, để `values.yaml` là bản an toàn nhất (staging) và prod ghi đè. Chọn một quy ước và ghi vào README của chart.
+
+### \_helpers.tpl: tên và label dùng chung
+
+```yaml
+{{- define "my-frontend.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "my-frontend.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name (include "my-frontend.name" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+
+{{- define "my-frontend.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "my-frontend.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{- define "my-frontend.labels" -}}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+{{ include "my-frontend.selectorLabels" . }}
+app.kubernetes.io/version: {{ .Values.image.tag | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+```
+
+Ba hàm này là lý do mọi tài nguyên trong chart có bộ label thống nhất và Service luôn khớp selector của Deployment. Bạn không cần thuộc cú pháp Go template; chỉ cần biết `include "tên" .` gọi hàm, `.Values` là nội dung values.yaml, `.Release.Name` là tên bạn đặt khi `helm install`.
+
+### templates/deployment.yaml
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "my-frontend.fullname" . }}
+  labels:
+    {{- include "my-frontend.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "my-frontend.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      annotations:
+        # Hash của ConfigMap -> đổi config là Pod tự rolling update
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "my-frontend.selectorLabels" . | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: web
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 80
+          envFrom:
+            - configMapRef:
+                name: {{ include "my-frontend.fullname" . }}-config
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5 && nginx -s quit"]
+```
+
+Bốn chỗ đáng chú ý:
+
+- `if not .Values.autoscaling.enabled` bỏ hẳn dòng `replicas` khi HPA quản lý, đúng cái bẫy đã nói ở [Phần 14](/blog/k8s-fe-14-rollout-strategies-and-autoscaling/).
+- `nindent N` xuống dòng rồi thụt vào N khoảng trắng. Con số phải khớp vị trí bạn đặt dòng đó trong YAML, lệch là lỗi cú pháp khó đọc.
+- `toYaml .Values.resources` đổ nguyên khối YAML từ values vào, nên bạn thêm `ephemeral-storage` hay bỏ CPU limit mà không sửa template.
+- `checksum/config` là annotation trên **Pod template**, không phải trên Deployment. Nội dung của nó là hash của file configmap.yaml sau khi render. Đổi ConfigMap → hash đổi → Pod template đổi → Kubernetes rolling update. Đây là lời giải triệt để cho cạm bẫy "đổi ConfigMap mà Pod không cập nhật" ở [Phần 8](/blog/k8s-fe-08-configmap-secret-probes/), và là một trong những lý do chính nên dùng Helm.
+
+### Các template còn lại
+
+`templates/configmap.yaml`, lặp qua toàn bộ `config` trong values nên thêm biến mới không cần sửa template:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "my-frontend.fullname" . }}-config
+  labels:
+    {{- include "my-frontend.labels" . | nindent 4 }}
+data:
+  {{- range $key, $value := .Values.config }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
+```
+
+`templates/service.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: { { include "my-frontend.fullname" . } }
+  labels: { { - include "my-frontend.labels" . | nindent 4 } }
+spec:
+  type: ClusterIP
+  selector: { { - include "my-frontend.selectorLabels" . | nindent 4 } }
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+`templates/ingress.yaml`, chỉ render khi bật:
+
+```yaml
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "my-frontend.fullname" . }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer }}
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: {{ .Values.ingress.tlsSecret }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "my-frontend.fullname" . }}
+                port: { number: 80 }
+{{- end }}
+```
+
+`templates/hpa.yaml`:
+
+```yaml
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "my-frontend.fullname" . }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "my-frontend.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+```
+
+Không có `namespace` trong bất kỳ template nào: namespace là thứ bạn chọn lúc `helm install -n`, và Helm gắn vào mọi tài nguyên. Ghi cứng namespace trong template là cách chắc chắn để chart không dùng lại được cho staging.
+
+### Lệnh Helm cần thuộc
+
+```bash
+helm create my-frontend                 # tạo chart mẫu
+helm lint ./my-frontend -f values-prod.yaml
+
+# Xem YAML sinh ra mà KHÔNG apply -> luôn làm bước này trước
+helm template frontend ./my-frontend -f values-prod.yaml
+helm template frontend ./my-frontend -f values-prod.yaml | kubectl apply --dry-run=server -f -
+
+# Cài / nâng cấp (upgrade --install là lệnh dùng trong CI: chưa có thì cài, có rồi thì nâng cấp)
+helm upgrade --install frontend ./my-frontend \
+  -n web --create-namespace \
+  -f values-prod.yaml \
+  --set-string image.tag=1.4.3 \
+  --wait --timeout 5m
+
+helm list -n web                        # các release trong namespace
+helm history frontend -n web            # từng revision, trạng thái, mô tả
+helm get values frontend -n web         # values đang chạy thật (đã gộp --set)
+helm get manifest frontend -n web       # YAML đang chạy thật
+helm rollback frontend 3 -n web         # quay về revision 3
+helm uninstall frontend -n web
+
+helm diff upgrade frontend ./my-frontend -f values-prod.yaml   # cần plugin helm-diff
+```
+
+Ba cờ đáng giải thích. `--wait` bắt Helm chờ Pod ready (và Ingress, Service có endpoints) trước khi báo thành công; không có nó, `helm upgrade` trả về ngay khi apply xong, CI báo xanh trong khi Pod đang CrashLoopBackOff. `--timeout` đi cùng `--wait`; hết giờ thì release bị đánh dấu `failed`. `--atomic` (hoặc `--rollback-on-failure` ở Helm mới) tự rollback về revision trước khi thất bại, thay cho bước `if: failure()` thủ công trong pipeline.
+
+Một release là một cặp (tên, namespace). `frontend` trong `web-staging` và `frontend` trong `web` là hai release độc lập với lịch sử riêng, nên bạn rollback staging mà không đụng production.
+
+### Cạm bẫy Helm hay gặp
+
+- **`--set` ép kiểu số.** `--set image.tag=1.4` thành số thực `1.4`, và `--set image.tag=1.10` thành `1.1`. Với tag image, luôn dùng `--set-string` hoặc để tag trong values có nháy.
+- **ConfigMap chỉ nhận string.** `FEATURE_NEW_CHECKOUT: true` trong values là boolean; render vào `data:` không qua `quote` thì API server từ chối với lỗi "cannot unmarshal bool into string". Template configmap ở trên `quote` mọi giá trị vì lý do này.
+- **`nindent` sai số** → YAML sinh ra thụt lề lệch, lỗi báo ở dòng chẳng liên quan. Chữa bằng `helm template` rồi nhìn output, không nhìn template.
+- **Sửa tay tài nguyên do Helm quản.** `kubectl edit deploy` vẫn được, nhưng `helm upgrade` lần sau tính diff ba chiều (manifest cũ, manifest mới, trạng thái thật) và có thể ghi đè phần bạn sửa. Sửa values rồi upgrade, đừng sửa trực tiếp.
+- **Đổi `selectorLabels` sau khi đã cài.** Selector của Deployment là immutable; upgrade sẽ fail. Phải `helm uninstall` rồi cài lại, tức là có downtime, nên hãy chốt bộ label ngay từ đầu.
+- **Quên `fullnameOverride`** → tài nguyên tên `frontend-my-frontend`, và các manifest thuần bạn viết ở Phần 10 (PDB, NetworkPolicy) trỏ tới `frontend` không còn khớp.
+
+---
+
+## Kustomize: base và overlay, không template
+
+Kustomize đã tích hợp sẵn trong kubectl (cờ `-k`), không cần cài thêm. Triết lý khác Helm: không dùng template và biến, mà dùng **base + overlay**, ghi đè theo lớp. Mọi file trong base là YAML thuần, mở ra là đọc được, `kubectl apply -f base/` vẫn chạy.
+
+```text
+k8s/
+├── base/
+│   ├── kustomization.yaml
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── ingress.yaml
+└── overlays/
+    ├── staging/
+    │   ├── kustomization.yaml
+    │   └── patch-replicas.yaml
+    └── production/
+        ├── kustomization.yaml
+        └── patch-resources.yaml
+```
+
+`base/kustomization.yaml`:
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+commonLabels:
+  app.kubernetes.io/name: frontend
+```
+
+> **Ghi chú:** kustomize phiên bản mới cảnh báo `commonLabels` đã deprecated. Dạng thay thế là khối `labels` với `includeSelectors: true`; hai cách cho cùng kết quả (gắn label lên metadata lẫn selector), chỉ khác cú pháp. Nếu `kubectl kustomize` in cảnh báo, đổi sang dạng mới theo đúng thông báo.
+
+`overlays/production/kustomization.yaml`:
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: web-prod
+resources:
+  - ../../base
+images:
+  - name: ghcr.io/my-org/frontend
+    newTag: '1.4.2'
+replicas:
+  - name: frontend
+    count: 5
+configMapGenerator:
+  - name: frontend-config
+    literals:
+      - API_BASE_URL=https://api.congty.com
+      - SENTRY_ENVIRONMENT=production
+patches:
+  - path: patch-resources.yaml
+    target:
+      kind: Deployment
+      name: frontend
+```
+
+`overlays/production/patch-resources.yaml` là một "strategic merge patch": chỉ viết phần muốn đổi, kustomize gộp vào theo tên container:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  template:
+    spec:
+      containers:
+        - name: web
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+```
+
+Overlay staging tương tự với `namespace: web-staging`, `newTag: sha-a1b2c3d`, `count: 2`, literal API staging. Đổi host Ingress dùng patch kiểu JSON 6902, khi bạn muốn nhắm đúng một phần tử trong mảng:
+
+```yaml
+patches:
+  - target: { kind: Ingress, name: frontend }
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: staging.app.congty.com
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: staging.app.congty.com
+```
+
+Ba lệnh:
+
+```bash
+kubectl kustomize overlays/production      # xem YAML kết quả, không apply
+kubectl diff -k overlays/production        # so sánh với cluster hiện tại
+kubectl apply -k overlays/production       # áp dụng
+```
+
+### configMapGenerator: tính năng hay nhất của Kustomize
+
+Nó tự thêm hậu tố hash vào tên ConfigMap, ví dụ `frontend-config-7bf9d2k4`, và **tự sửa mọi chỗ tham chiếu** tới tên đó (`envFrom.configMapRef`, `volumes.configMap`) trong các tài nguyên của cùng kustomization, kể cả tài nguyên nằm trong base. Khi nội dung đổi, hash đổi, tên đổi, Deployment tham chiếu tên mới → Pod template đổi → tự rolling update. Cùng kết quả với `checksum/config` của Helm, nhưng không cần viết gì.
+
+Hệ quả cần biết: ConfigMap tên cũ vẫn nằm lại trong cluster cho tới khi bạn `kubectl apply -k --prune` hoặc xoá tay (ArgoCD ở [Phần 16](/blog/k8s-fe-16-ci-cd-github-actions-gitops-argocd/) có `prune` để dọn). Nếu một công cụ ngoài kustomize cần tên ConfigMap cố định, tắt hash cho riêng nó:
+
+```yaml
+configMapGenerator:
+  - name: frontend-nginx
+    files:
+      - nginx.conf # sinh key "nginx.conf" từ file cùng thư mục
+    options:
+      disableNameSuffixHash: true
+```
+
+`files:` là cách sạch để đưa `nginx.conf` vào ConfigMap mà không phải copy nội dung vào YAML; `envs:` đọc file `.env` dạng `KEY=value` thành từng key.
+
+---
+
+## Helm hay Kustomize?
+
+| Tiêu chí            | Helm                                                      | Kustomize                          |
+| ------------------- | --------------------------------------------------------- | ---------------------------------- |
+| Cách tiếp cận       | Template + biến                                           | Base + overlay/patch               |
+| Độ phức tạp         | Cao hơn (cú pháp Go template)                             | Thấp, vẫn là YAML thuần            |
+| Cài đặt             | Cần cài riêng                                             | Có sẵn trong kubectl               |
+| Chia sẻ / phân phối | Rất mạnh (Helm repository, version, dependency)           | Yếu                                |
+| Rollback            | Có sẵn `helm rollback`                                    | Dựa vào Git                        |
+| Debug               | `helm template` rồi đọc output                            | `kubectl kustomize` rồi đọc output |
+| Khi nào dùng        | Phát hành package cho người khác; cài phần mềm bên thứ ba | Quản lý app nội bộ của chính bạn   |
+
+Thực tế nhiều team dùng cả hai: **Helm để cài phần mềm bên thứ ba** (ingress-nginx, cert-manager, kube-prometheus-stack, ArgoCD; bạn sẽ gõ `helm install` cho chúng ở Phần 17) và **Kustomize cho app của mình**, vì app của mình không cần phân phối, còn YAML thuần thì cả team đọc được mà không phải học template. Kustomize còn có trường `helmCharts` để render một chart Helm rồi patch tiếp bằng overlay, hữu ích khi chart bên thứ ba thiếu một option bạn cần. ArgoCD nhận cả hai định dạng, nên lựa chọn này không ảnh hưởng tới GitOps.
+
+Câu hỏi để chọn cho app frontend: nếu bạn chỉ có một app và ba môi trường, Kustomize là đủ và rẻ hơn. Nếu bạn có năm app frontend cùng hình dáng (đều là SPA nginx với runtime config), một chart Helm dùng chung cho cả năm, mỗi app một file values, sẽ tiết kiệm nhiều hơn.
+
+---
+
+## Thực hành
+
+Xuất phát từ bộ manifest `k8s/` của Phần 10 và cluster `fe-lab`.
+
+1. **Tạo chart.** `helm create my-frontend`, xoá `templates/serviceaccount.yaml`, `templates/tests/`, rồi thay `values.yaml` và các template bằng bản trong bài. Chạy `helm lint ./my-frontend`.
+
+   > **Kết quả mong đợi:** `1 chart(s) linted, 0 chart(s) failed`.
+
+2. **So sánh hai môi trường.** `helm template frontend ./my-frontend -f values-staging.yaml > /tmp/staging.yaml` và tương tự cho prod, rồi `diff /tmp/staging.yaml /tmp/prod.yaml`. Chỉ được khác ở replicas, tag, host, API URL và có/không có HPA.
+
+3. **Cài hai release.** `helm upgrade --install frontend ./my-frontend -n web-staging --create-namespace -f values-staging.yaml --wait` và bản prod vào `-n web`. `helm list -A` hiện hai release.
+
+4. **Đổi ConfigMap và xem checksum làm việc.** Sửa `config.FEATURE_NEW_CHECKOUT` trong `values-staging.yaml`, upgrade lại, đồng thời `kubectl -n web-staging get pods -w`.
+
+   > **Kết quả mong đợi:** Pod cũ Terminating, Pod mới sinh dù image không đổi. `kubectl -n web-staging get deploy frontend -o yaml` cho thấy annotation `checksum/config` đã đổi giá trị.
+
+5. **Rollback.** `helm history frontend -n web-staging` rồi `helm rollback frontend 1 -n web-staging`. Config trở về giá trị cũ, và lịch sử có thêm revision 3 với mô tả "Rollback to 1".
+
+6. **Kustomize.** Tạo `k8s/base` từ ba file gốc (bỏ `namespace:` trong metadata), viết hai overlay như bài. `kubectl kustomize overlays/staging` phải in ConfigMap có hậu tố hash và Deployment tham chiếu đúng tên hash đó. `kubectl apply -k overlays/staging`, sửa một literal, apply lại, quan sát Pod rolling update.
+
+7. **Dọn dẹp:** `helm uninstall` hai release, `kubectl delete -k overlays/staging`.
+
+---
+
+## Tóm tắt
+
+- Cả Helm và Kustomize giải bài toán "95% YAML giống nhau, 5% khác theo môi trường"; Helm bằng template và values, Kustomize bằng base và overlay.
+- Chart Helm gồm `Chart.yaml`, `values.yaml`, `templates/` với `_helpers.tpl` cho tên và label; `helm template` trước, `helm upgrade --install --wait` sau.
+- `checksum/config` trên Pod template và `configMapGenerator` với hậu tố hash là hai cách giải cùng một vấn đề: đổi ConfigMap thì Pod tự rolling update.
+- Bỏ `replicas` khi HPA bật, `quote` mọi giá trị ConfigMap, dùng `--set-string` cho tag image, đừng ghi cứng namespace trong template.
+- Kustomize có sẵn trong kubectl: `kubectl kustomize`, `kubectl diff -k`, `kubectl apply -k`; patch kiểu strategic merge cho khối, JSON 6902 cho phần tử mảng.
+- Helm cho phần mềm bên thứ ba và chart dùng chung nhiều app; Kustomize cho app nội bộ; ArgoCD nhận cả hai.
+
+## Đọc thêm
+
+- [Helm Docs](https://helm.sh/docs/)
+- [Kustomize](https://kustomize.io/)
+- [ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/)

@@ -1,0 +1,248 @@
+---
+title: 'Cloudflare cho Frontend Developer · Phần 2 — Nameserver, zone, bản ghi DNS, đám mây cam và xám'
+description: 'Sáu khái niệm chiếm 80% việc dùng Cloudflare hằng ngày: nameserver quyết định ai trả lời về tên miền, zone, bốn loại bản ghi DNS, công tắc đám mây cam và xám, PoP, Anycast, cf-ray và origin — kèm lab quan sát trên trang thật.'
+pubDate: 2026-10-01
+lang: vi
+tags: [cloudflare, devops, dns, networking, frontend]
+series: cloudflare-fe
+seriesOrder: 2
+draft: false
+---
+
+import HostingDiagram from '~/components/blog/HostingDiagram.astro';
+
+Bạn đã biết Cloudflare là một reverse proxy đứng trước origin ([phần 1](/blog/cloudflare-fe-01-what-cloudflare-really-is/)). Nhưng khi mở dashboard lần đầu, bạn gặp ngay một loạt chữ lạ: nameserver, zone, bản ghi A và CNAME, cái đám mây màu cam bấm được cạnh mỗi dòng, và một header `cf-ray` trong DevTools. Bấm sai một cái đám mây là mất email cả công ty; hiểu sai chữ nameserver là sửa DNS cả buổi mà không có gì thay đổi.
+
+Bài này đi qua sáu khái niệm đó — chúng chiếm khoảng 80% những gì bạn cần để dùng Cloudflare hằng ngày. Đọc xong, bạn nhìn một tên miền bất kỳ và xác định được nó có đang dùng Cloudflare hay không chỉ bằng hai lệnh `dig`, và biết chính xác bản ghi nào bắt buộc phải để đám mây xám. Nắm chắc chúng trước khi bấm nút nào trong dashboard; [phần 3](/blog/cloudflare-fe-03-hostinger-cloudflare-setup-a-to-z/) mới là lúc bấm.
+
+> Thuật ngữ giữ tiếng Anh: nameserver, zone, record, proxied, DNS only, PoP, Anycast, origin. Chúng xuất hiện nguyên văn trong dashboard, nên dịch ra chỉ làm bạn khó tra hơn.
+
+## Nameserver — thứ quyết định "ai được trả lời về tên miền này"
+
+Khi bạn mua tên miền, nhà đăng ký ghi vào hệ thống toàn cầu một thông tin duy nhất: **máy chủ nào có thẩm quyền trả lời các câu hỏi DNS về tên miền này.** Đó là nameserver. Nameserver không chứa website, không chứa email — nó chỉ giữ _bảng tra_ tên → địa chỉ, và là nơi duy nhất được phép trả lời khi cả thế giới hỏi "example.com ở đâu?".
+
+Hình dung theo cách của npm: `package.json` không chứa code của dependency, nó chỉ ghi "hỏi registry nào để lấy". Đổi registry trong `.npmrc` thì cùng một `npm install` sẽ hỏi chỗ khác. Đổi nameserver cũng vậy: tên miền vẫn là của bạn, chỉ có _nơi trả lời_ thay đổi.
+
+```text
+MẶC ĐỊNH KHI MUA Ở HOSTINGER
+─────────────────────────────────────────────────
+example.com
+└─ nameserver: ns1.dns-parking.com
+               ns2.dns-parking.com   ← Hostinger trả lời
+   Bảng DNS nằm trong hPanel của Hostinger
+
+SAU KHI CHUYỂN QUA CLOUDFLARE
+─────────────────────────────────────────────────
+example.com
+└─ nameserver: gina.ns.cloudflare.com
+               rick.ns.cloudflare.com   ← Cloudflare trả lời
+   Bảng DNS nằm trong dashboard Cloudflare
+```
+
+<HostingDiagram
+  kind="dns-delegation"
+  caption="Registrar ghi nameserver vào TLD; resolver đi từ root → TLD → nameserver có thẩm quyền để lấy bản ghi. Đổi nameserver là đổi nơi trả lời"
+/>
+
+Chuỗi hỏi đáp thật diễn ra như sau khi trình duyệt cần IP của `example.com`: resolver (thường là của ISP, hoặc `1.1.1.1` / `8.8.8.8`) hỏi root server → được chỉ sang máy chủ của `.com` → `.com` trả lời "example.com uỷ quyền cho `gina.ns.cloudflare.com` và `rick.ns.cloudflare.com`" → resolver hỏi Cloudflare → Cloudflare trả về bản ghi. Cái mà nhà đăng ký ghi vào `.com` chính là hai cái tên nameserver đó. Bài [DNS records, delegation và propagation](/blog/hosting-02-dns-records-delegation-propagation/) trong series Hosting vẽ chuỗi này chi tiết hơn nếu bạn muốn đào sâu.
+
+> **Hệ quả quan trọng nhất của việc đổi nameserver:** sau khi chuyển sang Cloudflare, **bảng DNS trong hPanel của Hostinger không còn tác dụng nữa.** Mọi bản ghi phải được khai báo lại trong Cloudflare. Rất nhiều người sửa DNS trong Hostinger cả buổi mà không hiểu vì sao không có gì thay đổi — lý do là họ đang sửa nhầm chỗ. Cloudflare có bước quét tự động để nhập sẵn các bản ghi cũ, nhưng nó **không bao giờ quét đủ 100%**. Luôn kiểm tra lại bằng tay, đặc biệt là bản ghi email.
+
+Cách kiểm tra nameserver hiện tại của bất kỳ tên miền nào:
+
+```bash
+dig example.com NS +short
+# gina.ns.cloudflare.com.
+# rick.ns.cloudflare.com.
+```
+
+Thấy hai tên kết thúc bằng `ns.cloudflare.com` là tên miền đó đang do Cloudflare trả lời. Thấy `dns-parking.com` là Hostinger. Tên cụ thể (`gina`, `rick`) là ngẫu nhiên theo tài khoản — của bạn sẽ khác.
+
+---
+
+## Zone — một tên miền trong Cloudflare
+
+Mỗi tên miền bạn thêm vào Cloudflare gọi là một **zone** (dashboard còn gọi là "site"). Gói Free cho phép thêm bao nhiêu zone cũng được. Mỗi zone có bảng DNS riêng, cấu hình SSL riêng, rules riêng, cache riêng — đổi SSL mode ở zone này không ảnh hưởng zone kia.
+
+Ranh giới của zone hay bị hiểu sai:
+
+- `example.com` và `example.net` là **hai zone khác nhau**, dù cùng một chủ.
+- `app.example.com` **không** là zone riêng — nó chỉ là một bản ghi DNS trong zone `example.com`. Mọi subdomain, dù sâu bao nhiêu cấp, đều nằm trong zone của tên miền gốc.
+
+Nếu bạn biết AWS, zone tương đương Route 53 Hosted Zone — chỉ khác là Cloudflare không tính phí theo zone ([AWS cho Frontend Developer · Phần 2](/blog/aws-fe-02-route53-acm-http-headers/) so sánh hai bên). Zone có trạng thái: khi mới thêm là **Pending Nameserver Update** (Cloudflare chờ bạn đổi nameserver ở nhà đăng ký), sau khi phát hiện nameserver đã trỏ về nó thì chuyển thành **Active**. Chỉ khi Active thì các tính năng proxy, SSL, rules mới thật sự có hiệu lực với người dùng.
+
+---
+
+## Bản ghi DNS — bốn loại bạn dùng 95% thời gian
+
+Bảng DNS của một zone là danh sách bản ghi. Mỗi dòng có bốn cột bạn phải điền: **Type**, **Name**, **Content**, và với A/AAAA/CNAME còn có **Proxy status** (cái đám mây). Bốn họ bản ghi dưới đây (A và AAAA tính là một họ) là tất cả những gì bạn dùng trong 95% thời gian:
+
+| Loại      | Trỏ tới            | Dùng khi                                                                                              |
+| --------- | ------------------ | ----------------------------------------------------------------------------------------------------- |
+| **A**     | Một địa chỉ IPv4   | Hosting cho bạn một IP cụ thể: Hostinger, VPS, máy chủ riêng                                          |
+| **AAAA**  | Một địa chỉ IPv6   | Như A nhưng cho IPv6. Có thì thêm, không có cũng không sao                                            |
+| **CNAME** | Một tên miền khác  | Nền tảng cho bạn một tên miền thay vì IP: `my-app.vercel.app`, `abc.pages.dev`, `d123.cloudfront.net` |
+| **MX**    | Máy chủ nhận email | Nhận email `@example.com`. **Luôn để đám mây xám**                                                    |
+| **TXT**   | Văn bản bất kỳ     | Xác minh sở hữu tên miền (Google, Facebook), cấu hình SPF/DKIM/DMARC cho email                        |
+
+Ký hiệu trong ô **Name**:
+
+| Gõ vào ô Name | Nghĩa là                    | Kết quả                 |
+| ------------- | --------------------------- | ----------------------- |
+| `@`           | Chính tên miền gốc          | `example.com`           |
+| `www`         | Subdomain www               | `www.example.com`       |
+| `api`         | Subdomain api               | `api.example.com`       |
+| `*`           | Mọi subdomain chưa khai báo | `bất-kỳ-gì.example.com` |
+
+Vài chi tiết dashboard không nói rõ nhưng bạn sẽ vấp:
+
+- Chỉ gõ phần subdomain vào ô Name, **không gõ cả tên miền**. Gõ `www` chứ không phải `www.example.com`; Cloudflare tự ghép phần còn lại (và nếu bạn gõ đủ, nó cũng tự nhận ra, nhưng đừng tập thói quen đó vì nhiều nhà cung cấp DNS khác sẽ tạo ra `www.example.com.example.com`).
+- Theo chuẩn DNS, **một tên đã có CNAME thì không được có bản ghi nào khác cùng tên**. Nếu `www` đã là CNAME thì không thêm được A hay TXT cho `www` — dashboard sẽ báo lỗi. Muốn TXT xác minh cho `www` thì phải đổi CNAME thành A, hoặc đặt TXT ở tên khác theo hướng dẫn của bên xác minh.
+- Bản ghi `*` chỉ khớp tên **chưa được khai báo**. Có `*` rồi mà vẫn thêm `api` riêng thì `api` thắng, đó là cách bạn tạo ngoại lệ.
+- TXT xác minh thường có dạng `google-site-verification=...` hoặc một chuỗi ngẫu nhiên do bên kia đưa; cứ dán nguyên vào Content, Name thường là `@` hoặc một tên họ chỉ định như `_vercel`.
+
+> **CNAME ở tên miền gốc — ưu điểm riêng của Cloudflare:** theo chuẩn DNS, bạn không được đặt bản ghi CNAME cho tên miền gốc (`example.com`, không có `www`). Đây là hạn chế gây phiền phức ở mọi nhà cung cấp DNS khác. Cloudflare giải quyết bằng kỹ thuật **CNAME Flattening**: bạn cứ khai CNAME ở `@`, Cloudflare tự phân giải rồi trả về địa chỉ IP như thể đó là bản ghi A. Nhờ vậy bạn trỏ thẳng `example.com` vào Vercel, Netlify hay Pages mà không cần biết IP của họ — và IP của họ đổi lúc nào cũng không ảnh hưởng.
+
+Với người làm frontend, CNAME là loại bạn gặp nhiều nhất, vì gần như mọi nền tảng deploy hiện đại (Vercel, Netlify, Pages, Render, Railway, CloudFront) đều cấp cho bạn một tên miền chứ không cấp IP. Bản ghi A chỉ xuất hiện khi bạn có máy chủ thật: Hostinger, VPS, hoặc GitHub Pages (họ công bố bốn IP cố định). [Phần 4](/blog/cloudflare-fe-04-dns-scenarios-pages-vercel-cloudfront/) có bảng tra "trỏ vào đâu thì dùng loại gì".
+
+---
+
+## Đám mây cam và đám mây xám — khái niệm quan trọng nhất
+
+Bên cạnh mỗi bản ghi A, AAAA, CNAME trong Cloudflare có một biểu tượng đám mây bấm được. Đây là **công tắc bật/tắt toàn bộ Cloudflare cho bản ghi đó.** Mọi tính năng ở phần 1 — cache, SSL ở edge, WAF, Rules, giấu IP — chỉ có hiệu lực khi đám mây màu cam. Không có cấu hình nào khác quan trọng bằng cái nút này.
+
+| Tiêu chí                    | ● Đám mây cam — "Proxied"        | ○ Đám mây xám — "DNS only"         |
+| --------------------------- | -------------------------------- | ---------------------------------- |
+| DNS trả về                  | IP của Cloudflare                | IP THẬT của bạn                    |
+| Đường đi của request        | Người dùng → Cloudflare → origin | Người dùng → origin, kết nối thẳng |
+| CDN, cache                  | ✓                                | ✗ Không cache                      |
+| SSL miễn phí ở edge         | ✓                                | ✗ Không có SSL của Cloudflare      |
+| WAF, chống DDoS             | ✓                                | ✗ Không bảo vệ                     |
+| Rules (redirect, transform) | ✓ Có hiệu lực                    | ✗ Rules KHÔNG chạy                 |
+| IP máy chủ                  | ✓ Được giấu                      | ✗ Công khai                        |
+| Cổng và giao thức           | ✗ Chỉ đi qua các cổng web        | ✓ Mọi cổng, mọi giao thức          |
+
+Cột bên phải không phải "tệ hơn" — nó là chế độ đúng cho mọi thứ không phải web. Cloudflare chỉ biết nói HTTP/HTTPS; đưa một thứ khác qua nó là hỏng.
+
+### Khi nào phải để đám mây xám
+
+| Trường hợp                                        | Vì sao                                                                                                                                                                      |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Bản ghi MX (email)                                | Cloudflare chỉ proxy HTTP/HTTPS. Email dùng giao thức SMTP — proxy sẽ làm hỏng. Đây là lỗi phổ biến nhất của người mới: proxy bản ghi email rồi mất toàn bộ email đến.      |
+| Bản ghi trỏ tới máy chủ mail (`mail.example.com`) | Như trên: SMTP, IMAP, POP3 không phải giao thức web. MX thường trỏ tới tên này, nên tên này cũng phải xám.                                                                  |
+| Bản ghi cho SSH, FTP                              | Không phải giao thức web. `ssh user@example.com` khi `@` đang cam sẽ đập vào Cloudflare và bị từ chối.                                                                      |
+| Dịch vụ chạy trên cổng lạ                         | Proxy chỉ hỗ trợ một tập cổng web nhất định (80, 443, 8080, 8443…). Cổng 3000, 5432 sẽ không đi qua được.                                                                   |
+| Bản ghi xác minh (TXT)                            | TXT không có tuỳ chọn proxy — nó luôn là DNS thuần. Bạn sẽ không thấy đám mây ở dòng này.                                                                                   |
+| Vercel, Netlify (theo khuyến nghị của họ)         | Các nền tảng này đã có CDN riêng. Chồng hai lớp CDN dễ gây lỗi chứng chỉ và cache khó đoán. [Phần 4](/blog/cloudflare-fe-04-dns-scenarios-pages-vercel-cloudfront/) bàn kỹ. |
+
+<HostingDiagram
+  kind="email-dns"
+  caption="Web đi qua proxy Cloudflare được, còn email đi thẳng từ mail server của người gửi tới MX của bạn — không có chỗ cho proxy chen vào"
+/>
+
+> **Cổng được hỗ trợ khi bật đám mây cam:** Cloudflare chỉ proxy lưu lượng HTTP/HTTPS trên một tập cổng: **80, 8080, 8880, 2052, 2082, 2086, 2095** (HTTP) và **443, 2053, 2083, 2087, 2096, 8443** (HTTPS). Nếu ứng dụng của bạn chạy ở cổng 3000 và bạn bật đám mây cam, người dùng sẽ không truy cập được. Giải pháp: cấu hình máy chủ lắng nghe cổng 443 (thường là đặt nginx đứng trước app Node của bạn, xem [VPS + nginx reverse proxy](/blog/hosting-07-vps-domain-nginx-reverse-proxy/)), hoặc để đám mây xám.
+
+Điểm này hay bắt được người deploy app Node/Docker lên VPS lần đầu: ở máy local bạn quen `localhost:3000`, lên VPS cũng chạy `node server.js` ở 3000, trỏ bản ghi A vào IP VPS, bật đám mây cam — và `https://example.com` báo lỗi trong khi `http://203.0.113.45:3000` vẫn chạy. Không phải Cloudflare hỏng; nó chỉ không bao giờ gõ cửa cổng 3000.
+
+### Nhìn thấy sự khác biệt bằng `dig`
+
+Cái đám mây thay đổi thứ DNS trả về, nên bạn nhìn thấy nó ngay từ dòng lệnh:
+
+```bash
+# Đám mây CAM: trả IP của Cloudflare
+dig www.example.com +short
+# 104.21.45.67
+# 172.67.150.10
+
+# Đám mây XÁM: trả IP thật của origin
+dig www.example.com +short
+# 203.0.113.45
+```
+
+IP dạng `104.x.x.x` hoặc `172.67.x.x` là dải Cloudflare hay dùng cho proxy. Bật cam, Cloudflare trả **hai** IP (và cả AAAA IPv6, dù origin của bạn không có IPv6 — vì người dùng đang nối tới Cloudflare chứ không phải origin). Tắt cam, nó trả đúng nội dung bạn khai. Đổi màu đám mây có hiệu lực ở phía Cloudflare gần như tức thì, nhưng resolver của bạn có thể còn giữ kết quả cũ vài phút; muốn thấy ngay thì hỏi thẳng `dig @1.1.1.1 www.example.com +short`.
+
+---
+
+## PoP, Anycast, cf-ray và cf-cache-status
+
+Bốn chữ này xuất hiện liên tục trong header và trong docs:
+
+| Khái niệm           | Giải thích                                                                                                                                                                                                                                     |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **PoP**             | Point of Presence — một trung tâm dữ liệu của Cloudflare. Có hơn 300 thành phố, bao gồm Hà Nội và TP.HCM. Tương đương "edge location" bên AWS CloudFront.                                                                                      |
+| **Anycast**         | Kỹ thuật cho phép cùng một địa chỉ IP tồn tại ở hàng trăm nơi. Mạng tự động đưa bạn tới nơi gần nhất. Đây là lý do Cloudflare chỉ cần một IP mà vẫn phục vụ toàn cầu, và cũng là lý do chống DDoS tốt — tấn công bị chia đều ra khắp thế giới. |
+| **cf-ray**          | Header duy nhất cho mỗi request, dạng `8a1b2c3d4e5f6789-HAN`. Ba chữ cái cuối là mã sân bay của PoP đã phục vụ bạn (`HAN` = Hà Nội, `SGN` = TP.HCM, `SIN` = Singapore). Mở DevTools xem header này là biết Cloudflare có đang hoạt động không. |
+| **cf-cache-status** | Cho biết request vừa rồi lấy từ cache hay xuống origin. Chi tiết ở [phần 6](/blog/cloudflare-fe-06-cache-old-version-after-deploy/).                                                                                                           |
+
+Anycast đáng dừng lại một chút, vì nó trái với trực giác "một IP = một máy". Bình thường (unicast) mỗi IP thuộc về đúng một máy ở một nơi. Với Anycast, Cloudflare công bố cùng một dải IP từ hàng trăm PoP; các router trên Internet tự chọn đường ngắn nhất, nên gói tin của người ở Hà Nội rơi vào PoP Hà Nội, của người ở Đức rơi vào Frankfurt — dù cả hai cùng gõ một IP. Hệ quả cho bạn: **không có gì để cấu hình về "region"**. Không chọn vùng, không tạo distribution, không nhân bản; bật đám mây cam là toàn cầu.
+
+Mã `cf-ray` còn có một công dụng thực tế: khi người dùng ở nước ngoài báo "trang lỗi" mà bạn ở Việt Nam thấy bình thường, hãy xin họ ba chữ cuối của `cf-ray`. Hai người được phục vụ từ hai PoP khác nhau, cache ở hai PoP có thể khác nhau — đó là manh mối đầu tiên ([phần 11](/blog/cloudflare-fe-11-debug-and-error-handbook/) có bảng triệu chứng cho trường hợp này). Và khi mở ticket hỗ trợ với Cloudflare, Ray ID là thứ họ hỏi đầu tiên.
+
+---
+
+## Origin — máy chủ thật của bạn
+
+Trong tài liệu Cloudflare, **origin** nghĩa là nơi thực sự chứa website của bạn: máy chủ Hostinger, VPS, Vercel, S3… Bạn sẽ gặp từ này liên tục, trong ba ngữ cảnh:
+
+- **Origin server** — máy chủ gốc. Nếu bạn quen nginx, đây chính là `upstream` trong `proxy_pass`.
+- **Origin certificate** — chứng chỉ Cloudflare cấp để mã hoá chặng Cloudflare ↔ origin ([phần 5](/blog/cloudflare-fe-05-ssl-tls-modes-and-redirect-loop/)).
+- **Error 521 / 522** — "không kết nối được origin". Cloudflare khoẻ, người dùng tới được Cloudflare, nhưng Cloudflare gõ cửa máy chủ của bạn thì không ai mở.
+
+Origin có thể là bất cứ thứ gì nói được HTTP: shared hosting chạy PHP, một container Docker sau nginx, một bucket S3 bật static website, hay thậm chí một nền tảng có CDN riêng như Vercel. Cloudflare không quan tâm đằng sau là gì; nó chỉ cần một địa chỉ (A) hoặc một tên (CNAME) để gõ cửa, trên một cổng web, và tuỳ SSL mode mà nói HTTP hay HTTPS.
+
+Một cách nhớ: mọi vấn đề bạn gặp với Cloudflare đều quy về câu hỏi "lỗi ở Cloudflare hay ở origin?". Bật đám mây xám tạm thời, người dùng nối thẳng origin — vẫn lỗi là origin, hết lỗi là cấu hình Cloudflare. Đó là phép thử mạnh nhất trong sổ tay debug ở phần 11.
+
+---
+
+## Lab 2.1 — Quan sát Cloudflare trên một trang thật (15 phút)
+
+Chưa cần tên miền của bạn. Lab này chỉ dùng DevTools và `dig` trên những trang đang chạy.
+
+1. Mở một trang web bất kỳ — rất nhiều trang Việt Nam dùng Cloudflare (báo điện tử, trang thương mại, blog cá nhân). Nếu trang đầu tiên không có, thử trang khác.
+2. DevTools → Network → tải lại trang → chọn request đầu tiên (chính là tài liệu HTML).
+3. Trong **Response Headers**, tìm ba dòng: `server: cloudflare`, `cf-ray`, `cf-cache-status`.
+4. Đọc ba chữ cái cuối của `cf-ray` — bạn đang được phục vụ từ PoP nào? Thử bật VPN sang nước khác rồi tải lại: mã PoP đổi theo vị trí của bạn, đó là Anycast đang làm việc.
+5. Chạy `dig example.com +short` với tên miền vừa xem — bạn sẽ thấy IP dạng `104.x.x.x` hoặc `172.67.x.x`, đó là IP của Cloudflare chứ không phải máy chủ thật.
+6. Chạy `dig example.com NS +short` — thấy hai nameserver kết thúc bằng `ns.cloudflare.com`.
+
+```bash
+dig vnexpress.net +short          # thay bằng tên miền bạn vừa mở
+dig vnexpress.net NS +short
+```
+
+Trên macOS và Linux `dig` có sẵn. Trên Windows dùng `nslookup -type=NS example.com` hoặc PowerShell `Resolve-DnsName example.com -Type NS`; kết quả đọc giống nhau. Nếu không cài được gì, gõ "dig online" và dùng một trang tra DNS bất kỳ — chỉ cần nhìn được NS và A.
+
+> **Tiêu chí hoàn thành:** bạn nhìn một tên miền bất kỳ và xác định được nó có đang dùng Cloudflare hay không, chỉ bằng hai lệnh `dig`. Và bạn phân biệt được hai trường hợp: NS là Cloudflare nhưng A trả IP thật (đang dùng Cloudflare làm DNS thuần, đám mây xám) với NS là Cloudflare và A trả `104.x` (đám mây cam, đi qua proxy).
+
+Thử thêm một bước nếu còn thời gian: mở một trang bạn biết chắc host trên Vercel (nhiều landing page startup). Rất có thể NS là Cloudflare nhưng `dig` trả về IP không phải `104.x` và header `server` là `Vercel` — đó chính là kịch bản "Cloudflare làm DNS, đám mây xám" ở phần 4.
+
+---
+
+## Sai lầm hay gặp ở chương này
+
+- **Sửa DNS ở nhà đăng ký sau khi đã đổi nameserver.** Nhận biết: `dig` không đổi dù bạn đã lưu. Sửa: mọi bản ghi giờ nằm ở tab DNS của zone trong Cloudflare.
+- **Proxy bản ghi MX hoặc `mail`.** Nhận biết: email đến bị trả về hoặc mất, vài ngày sau mới có người báo. Sửa: chuyển sang xám, rồi kiểm tra `dig example.com MX +short` trả về tên mail server chứ không phải IP Cloudflare. Bài [Email DNS: SPF, DKIM, DMARC](/blog/hosting-09-email-dns-spf-dkim-dmarc/) đi sâu phần email.
+- **Bật đám mây cam cho app đang nghe cổng 3000.** Nhận biết: HTTPS lỗi nhưng gọi thẳng `IP:3000` chạy. Sửa: đặt nginx nghe 443 hoặc để xám.
+- **Tưởng `app.example.com` cần một zone mới.** Không — chỉ cần thêm một bản ghi trong zone `example.com`.
+- **Gõ `www.example.com` vào ô Name.** Cloudflare tha cho bạn, nhưng thói quen này gây lỗi ở DNS khác. Gõ `www` thôi.
+- **Đổi đám mây rồi kết luận ngay từ trình duyệt.** Resolver và trình duyệt còn cache. Kiểm tra bằng `dig @1.1.1.1` trước khi kết luận cấu hình sai.
+
+---
+
+## Tóm tắt
+
+- **Nameserver** quyết định ai được trả lời về tên miền. Đổi nameserver sang Cloudflare thì bảng DNS ở Hostinger hết tác dụng; mọi bản ghi phải khai lại trong Cloudflare, và bước quét tự động không bao giờ đủ 100%.
+- **Zone** = một tên miền trong Cloudflare, có DNS, SSL, rules riêng. Subdomain không phải zone riêng.
+- Bốn họ bản ghi: **A/AAAA** (IP), **CNAME** (tên khác — loại FE dev gặp nhiều nhất), **MX** (email, luôn xám), **TXT** (xác minh, SPF/DKIM). Ký hiệu `@` là tên miền gốc, `*` là mọi subdomain chưa khai.
+- **CNAME Flattening** cho phép CNAME ở tên miền gốc — điều DNS chuẩn không cho.
+- **Đám mây cam** = đi qua Cloudflare (cache, SSL, WAF, rules, giấu IP, nhưng chỉ cổng web). **Đám mây xám** = DNS thuần, nối thẳng origin, mọi cổng mọi giao thức. MX, mail, SSH, FTP, cổng lạ: bắt buộc xám.
+- **PoP** là trung tâm dữ liệu edge; **Anycast** đưa bạn tới PoP gần nhất bằng cùng một IP; **cf-ray** cho biết PoP nào phục vụ; **cf-cache-status** cho biết có lấy từ cache không.
+- **Origin** là máy chủ thật. Mọi lỗi đều quy về "ở Cloudflare hay ở origin?".
+
+Phần tiếp theo: [Phần 3 — Thiết lập Hostinger + Cloudflare từ A đến Z](/blog/cloudflare-fe-03-hostinger-cloudflare-setup-a-to-z/) — mười bước đưa tên miền thật của bạn qua Cloudflare không gián đoạn, không mất email.
+
+## Đọc thêm
+
+- [Cloudflare DNS docs](https://developers.cloudflare.com/dns/) — quản lý bản ghi, proxy status, CNAME flattening, nameserver.
+- [Cloudflare Fundamentals](https://developers.cloudflare.com/fundamentals/) — khái niệm nền, cách Cloudflare hoạt động.
+- [Cloudflare IP ranges](https://www.cloudflare.com/ips/) — dải IP chính thức của Cloudflare, dùng để nhận diện IP proxy và cấu hình tường lửa origin.

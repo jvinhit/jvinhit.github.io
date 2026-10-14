@@ -1,0 +1,434 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 16 — CI/CD với GitHub Actions và GitOps với ArgoCD'
+description: 'Pipeline GitHub Actions: test, build và push lên ghcr.io, deploy có tự rollback, ServiceAccount giới hạn quyền cho CI. Rồi đảo sang mô hình pull với ArgoCD: cài đặt, Application manifest, selfHeal, prune và bẫy HPA.'
+pubDate: 2026-11-14
+lang: vi
+tags: [kubernetes, ci-cd, gitops, devops, frontend]
+series: k8s-fe
+seriesOrder: 16
+draft: false
+---
+
+Đến giờ mọi thứ bạn deploy đều bằng tay: `docker build`, `kind load`, `kubectl apply`. Trên production, "bằng tay" là nguồn của phần lớn sự cố chiều thứ Sáu: quên chạy test, build từ branch chưa merge, gõ nhầm tag, apply nhầm context. Pipeline CI/CD tồn tại để loại con người khỏi chuỗi thao tác lặp lại đó, và để mỗi thứ chạy trên production đều truy được về một commit.
+
+Bài này có hai nửa. Nửa đầu là pipeline GitHub Actions ba job: test, build và push image lên ghcr.io, deploy vào cluster kèm tự rollback; cộng cách cấp cho CI một danh tính chỉ đủ quyền deploy đúng namespace. Nửa sau đảo mô hình: CI không đụng vào cluster nữa, ArgoCD chạy **trong** cluster kéo manifest từ Git về. Đây là mô hình GitOps mà hầu hết công ty đã chuẩn hoá trên Kubernetes đang dùng, và cũng là thứ chart Helm hoặc overlay Kustomize ở [Phần 15](/blog/k8s-fe-15-helm-and-kustomize/) được sinh ra để phục vụ.
+
+## Push hay pull: hai mô hình
+
+```text
+CI/CD truyền thống (push):
+
+  GitHub Actions ──── kubectl apply / helm upgrade ────▶ Cluster
+  (CI phải giữ credential vào cluster)
+
+GitOps (pull):
+
+  GitHub Actions ──── push image + sửa tag trong repo manifest ────▶ Git
+                                                                       │
+  ArgoCD (chạy TRONG cluster) ◀──── theo dõi Git, tự đồng bộ ──────────┘
+  (CI không cần bất kỳ quyền nào vào cluster)
+```
+
+Mô hình push dễ hiểu và dựng trong một buổi chiều, nên bạn học nó trước. Mô hình pull an toàn hơn và trung thực hơn (Git là nguồn chân lý), nhưng cần thêm một thành phần trong cluster. Thứ tự hợp lý: dựng pipeline push để hiểu từng bước, rồi thay job `deploy` bằng một commit vào repo manifest khi đã sẵn sàng.
+
+---
+
+## Pipeline GitHub Actions: test → build-push → deploy
+
+`.github/workflows/deploy.yml` đầy đủ:
+
+```yaml
+name: Build and Deploy Frontend
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch: # cho phép bấm "Run workflow" bằng tay
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }} # my-org/frontend
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false # không cắt ngang một lần deploy đang chạy
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test -- --run
+      - run: npm run build
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # cần để push lên ghcr.io bằng GITHUB_TOKEN
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production # bật yêu cầu phê duyệt thủ công trong Settings > Environments
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cau hinh kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+      - name: Trien khai
+        id: rollout
+        run: |
+          kubectl -n web set image deploy/frontend \
+            web=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7}
+          kubectl -n web rollout status deploy/frontend --timeout=5m
+      - name: Tu dong rollback neu that bai
+        if: failure() && steps.rollout.conclusion == 'failure'
+        run: kubectl -n web rollout undo deploy/frontend
+```
+
+### Job `test`: cổng chất lượng
+
+Không có gì Kubernetes ở đây, và đó là điểm quan trọng: image chỉ được build khi lint, test và build local đều pass. `npm run test -- --run` là cú pháp bắt Vitest chạy một lần thay vì watch mode (watch mode treo CI vô hạn, lỗi rất hay gặp lần đầu). `cache: 'npm'` của `setup-node` cache `~/.npm` theo hash của `package-lock.json`, giảm `npm ci` từ vài phút xuống vài chục giây. Dùng pnpm thì thay bằng `pnpm/action-setup` rồi `cache: 'pnpm'`.
+
+### Job `build-and-push`: image có ba cái tên
+
+`docker/metadata-action` sinh tag từ ngữ cảnh Git, để bạn không tự nối chuỗi:
+
+| Sự kiện           | `type=...`                   | Tag sinh ra                                                |
+| ----------------- | ---------------------------- | ---------------------------------------------------------- |
+| push lên `main`   | `ref,event=branch`           | `ghcr.io/my-org/frontend:main` (tag di động, chỉ để xem)   |
+| push tag `v1.4.2` | `semver,pattern={{version}}` | `ghcr.io/my-org/frontend:1.4.2`                            |
+| mọi push          | `sha,prefix=sha-`            | `ghcr.io/my-org/frontend:sha-a1b2c3d` (7 ký tự đầu commit) |
+
+Tag `sha-…` là **tag bất biến** bạn deploy; tag `1.4.2` để người đọc; tag `main` chỉ để tiện xem image mới nhất, không bao giờ dùng trong manifest (cùng lý do với `:latest` ở [Phần 4](/blog/k8s-fe-04-dockerfile-registry-compose/)). `labels` gắn `org.opencontainers.image.*` (source, revision, created) vào image; sau này `docker inspect` một image bất kỳ là biết nó từ commit nào.
+
+`cache-from`/`cache-to: type=gha` lưu layer cache của BuildKit vào cache của GitHub Actions. Với Dockerfile multi-stage copy `package*.json` trước như Phần 4, lần build không đổi dependency chỉ mất phần `npm run build`. `permissions: packages: write` là bắt buộc; quên nó thì `docker push` báo 403 dù login thành công, vì `GITHUB_TOKEN` mặc định chỉ có quyền đọc.
+
+`GITHUB_TOKEN` là token GitHub tự cấp cho mỗi lần chạy workflow, hết hạn khi job xong; bạn không tạo, không lưu, không xoay vòng nó. Đây là lý do ghcr.io là registry tiện nhất cho project trên GitHub.
+
+### Job `deploy`: set image, chờ, rollback
+
+`environment: production` liên kết job với một environment trong Settings của repo. Ở đó bạn bật **required reviewers**: workflow dừng lại trước job này cho tới khi một người bấm duyệt. Secret `KUBE_CONFIG` cũng gắn vào environment đó, nên job chạy trên branch khác không đọc được.
+
+`set image` chỉ đổi đúng một trường trong Deployment. `rollout status --timeout=5m` chờ rollout xong; nếu Pod mới CrashLoopBackOff, `progressDeadlineSeconds` ([Phần 14](/blog/k8s-fe-14-rollout-strategies-and-autoscaling/)) khiến lệnh thoát với mã lỗi, job fail, và bước cuối `rollout undo` đưa Deployment về revision trước. Điều kiện `steps.rollout.conclusion == 'failure'` để không undo khi thứ fail là bước kubeconfig (lúc đó chưa có gì để undo). `${GITHUB_SHA::7}` là cú pháp cắt chuỗi của bash, khớp với độ dài 7 ký tự mặc định của `type=sha`.
+
+Với chart Helm ở Phần 15, thay hai lệnh kubectl bằng một:
+
+```bash
+helm upgrade --install frontend ./chart -n web -f values-prod.yaml \
+  --set-string image.tag=sha-${GITHUB_SHA::7} --wait --timeout 5m --atomic
+```
+
+`--atomic` tự rollback khi thất bại, không cần bước `if: failure()`.
+
+---
+
+## Kubeconfig cho CI: ServiceAccount và RBAC tối thiểu
+
+`KUBE_CONFIG` trong secret **không** được là kubeconfig admin của bạn. Một kubeconfig admin lọt ra ngoài (log bị in nhầm, fork độc hại, action bên thứ ba bị chiếm) là toàn bộ cluster bị chiếm. CI chỉ cần đúng quyền: đọc và sửa Deployment `frontend` trong namespace `web`, xem Pod và ReplicaSet để `rollout status` và `rollout undo` hoạt động.
+
+`k8s/ci-rbac.yaml`:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-deployer
+  namespace: web
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer
+  namespace: web
+rules:
+  - apiGroups: ['apps']
+    resources: ['deployments']
+    verbs: ['get', 'list', 'watch', 'patch', 'update']
+  - apiGroups: ['apps']
+    resources: ['replicasets']
+    verbs: ['get', 'list'] # rollout undo cần đọc lịch sử ReplicaSet
+  - apiGroups: ['']
+    resources: ['pods']
+    verbs: ['get', 'list']
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-deployer
+  namespace: web
+subjects:
+  - kind: ServiceAccount
+    name: ci-deployer
+    namespace: web
+roleRef:
+  kind: Role
+  name: deployer
+  apiGroup: rbac.authorization.k8s.io
+---
+# Token dài hạn gắn với ServiceAccount (Kubernetes 1.24+ không tự tạo nữa)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ci-deployer-token
+  namespace: web
+  annotations:
+    kubernetes.io/service-account.name: ci-deployer
+type: kubernetes.io/service-account-token
+```
+
+Không có `delete`, không có `create`, không có Secret, không có gì ngoài namespace `web`. Kiểm tra bằng impersonation trước khi đưa vào CI:
+
+```bash
+kubectl apply -f k8s/ci-rbac.yaml
+kubectl auth can-i patch deployments -n web --as=system:serviceaccount:web:ci-deployer   # yes
+kubectl auth can-i delete deployments -n web --as=system:serviceaccount:web:ci-deployer  # no
+kubectl auth can-i get secrets -n web --as=system:serviceaccount:web:ci-deployer         # no
+```
+
+Dựng kubeconfig từ token đó:
+
+```bash
+TOKEN=$(kubectl -n web get secret ci-deployer-token -o jsonpath='{.data.token}' | base64 -d)
+CA=$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+SERVER=$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
+
+cat > ci-kubeconfig.yaml <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+  - name: prod
+    cluster: { server: $SERVER, certificate-authority-data: $CA }
+users:
+  - name: ci-deployer
+    user: { token: $TOKEN }
+contexts:
+  - name: ci
+    context: { cluster: prod, user: ci-deployer, namespace: web }
+current-context: ci
+EOF
+
+KUBECONFIG=./ci-kubeconfig.yaml kubectl get deploy -n web   # phải chạy được
+base64 -i ci-kubeconfig.yaml | tr -d '\n' | pbcopy           # dán vào GitHub secret KUBE_CONFIG
+rm ci-kubeconfig.yaml
+```
+
+Token của Secret kiểu `service-account-token` không hết hạn; xoá Secret là thu hồi. Thích token có hạn thì `kubectl create token ci-deployer -n web --duration=24h` và xoay vòng định kỳ (nhiều cluster managed giới hạn `--duration` tối đa một ngày).
+
+> **Cạm bẫy:** `SERVER` của cluster kind là `https://127.0.0.1:<port>`, runner của GitHub không thể gọi tới. Pipeline push chỉ test được với cluster có địa chỉ công khai, hoặc self-hosted runner đặt trong mạng với cluster. Đây là một lý do nữa để chuyển sang GitOps: ArgoCD ở trong cluster, kind hay EKS đều như nhau.
+
+### Bốn mức bảo mật CI/CD, từ tạm được tới tốt nhất
+
+1. **Không dùng kubeconfig admin trong CI.** ServiceAccount riêng với RBAC chỉ đủ quyền deploy đúng namespace, như trên.
+2. **Lưu kubeconfig trong GitHub Secrets gắn với environment**, không bao giờ trong repo, không in ra log (`echo` một biến secret ra log sẽ bị GitHub che, nhưng `base64` của nó thì không).
+3. **Tốt hơn: OIDC.** GitHub ký một token ngắn hạn cho mỗi lần chạy, cloud (AWS/GCP/Azure) đổi nó lấy credential tạm; không có secret dài hạn nào để lộ. Với EKS/GKE, CI lấy kubeconfig bằng `aws eks update-kubeconfig` hoặc `gcloud container clusters get-credentials` sau bước OIDC. Cách cấu hình phía AWS được mô tả kỹ ở [AWS cho Frontend Developer · Phần 13](/blog/aws-fe-13-ci-cd-github-actions-oidc-preview-environments/).
+4. **Tốt nhất: GitOps.** CI chỉ build và push image, không hề có quyền vào cluster. Phần dưới.
+
+### Bẫy pipeline hay gặp
+
+- **Package trên ghcr.io mặc định private** sau lần push đầu. Cluster pull sẽ `ImagePullBackOff` cho tới khi bạn tạo `imagePullSecrets` (Phần 4) hoặc chuyển package sang public trong trang Packages của repo.
+- **`base64` trên macOS chèn xuống dòng** mỗi 76 ký tự ở một số phiên bản; secret dán vào bị hỏng và `kubectl` báo "error loading config". Luôn `tr -d '\n'`.
+- **Hai push liên tiếp chạy song song** → hai `set image` chen nhau, rollout thứ hai huỷ rollout thứ nhất, `rollout status` của job đầu fail và undo nhầm. Khối `concurrency` ở đầu workflow xếp hàng chúng.
+- **Tag Git và tag image lệch nhau.** Push tag `v1.4.2` sinh image `1.4.2`, nhưng job deploy vẫn dùng `sha-…`; chọn một quy ước và ghi vào README. Deploy theo sha là lựa chọn an toàn vì mọi commit đều có.
+- **Fork và pull request.** `on: push` chỉ chạy trên repo chính; PR từ fork không có secret. Muốn CI cho PR, tách job `test` sang workflow `on: pull_request` riêng, không có bước deploy.
+
+---
+
+## GitOps với ArgoCD
+
+ArgoCD là một controller chạy trong cluster, theo dõi một đường dẫn trong một repo Git, render manifest ở đó (YAML thuần, Kustomize hoặc Helm) và liên tục so sánh với trạng thái thật của cluster. Khác nhau thì nó apply (nếu bật tự động) hoặc báo OutOfSync để bạn bấm Sync. Nói cách khác, nó là vòng lặp reconciliation của Kubernetes, nhưng "desired state" nằm trong Git thay vì trong etcd.
+
+Lợi ích cụ thể:
+
+- **Git là nguồn chân lý duy nhất.** Muốn biết production đang chạy gì → xem Git, không cần `kubectl get`.
+- **Tự phát hiện drift.** Ai đó `kubectl edit` hay `kubectl scale` bằng tay → ArgoCD báo OutOfSync, và với `selfHeal` nó tự sửa lại về đúng Git.
+- **Rollback = `git revert`.** Không cần nhớ revision số mấy.
+- **Audit trail hoàn chỉnh** qua lịch sử commit và pull request: ai đổi, đổi gì, ai duyệt.
+- **Bảo mật tốt hơn:** không có credential cluster nằm ngoài cluster; ArgoCD chỉ cần quyền **đọc** repo Git.
+
+### Cài ArgoCD trên cluster kind
+
+```bash
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+kubectl -n argocd rollout status deploy/argocd-server --timeout=3m
+
+# Lấy mật khẩu admin ban đầu
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d; echo
+
+# Mở UI ở https://localhost:8080 (chứng chỉ tự ký, trình duyệt sẽ cảnh báo)
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+```
+
+Đăng nhập với user `admin` và mật khẩu vừa lấy. CLI đi kèm hữu ích trong terminal và trong script:
+
+```bash
+brew install argocd
+argocd login localhost:8080 --username admin --password '<mat-khau>' --insecure
+argocd app list
+```
+
+### Application: một app, một đường dẫn Git
+
+Tách manifest ra repo riêng (`frontend-manifests`) chứa `base/` và `overlays/` của Phần 15, để thay đổi hạ tầng và thay đổi code có lịch sử độc lập. `argocd-app.yaml`:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: frontend
+  namespace: argocd # Application luôn nằm trong namespace của ArgoCD
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/my-org/frontend-manifests
+    targetRevision: main
+    path: overlays/production # ArgoCD tự nhận ra kustomization.yaml
+  destination:
+    server: https://kubernetes.default.svc # cluster mà ArgoCD đang chạy trong
+    namespace: web
+  syncPolicy:
+    automated:
+      prune: true # xoá tài nguyên đã bị gỡ khỏi Git
+      selfHeal: true # tự sửa khi có người chỉnh tay
+    syncOptions:
+      - CreateNamespace=true
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas # HPA đổi replicas, đừng coi đó là drift
+```
+
+```bash
+kubectl apply -f argocd-app.yaml
+argocd app get frontend        # Sync Status: Synced, Health Status: Healthy
+```
+
+Repo private thì thêm credential đọc bằng `argocd repo add https://github.com/my-org/frontend-manifests --username x --password <PAT chỉ có quyền read>` hoặc deploy key SSH; ArgoCD lưu nó dưới dạng Secret trong namespace `argocd`.
+
+Hai trạng thái bạn sẽ nhìn suốt ngày: **Sync** (Synced / OutOfSync: Git và cluster có khớp không) và **Health** (Healthy / Progressing / Degraded: tài nguyên có chạy tốt không, tính từ readiness của Pod, rollout của Deployment, endpoint của Service). OutOfSync mà Healthy là "có người sửa tay"; Synced mà Degraded là "manifest đúng như Git nhưng app hỏng", ví dụ image mới CrashLoopBackOff.
+
+### Pipeline trong mô hình GitOps
+
+Job `deploy` biến mất. Thay vào đó CI sửa tag trong repo manifest và commit:
+
+```yaml
+update-manifests:
+  needs: build-and-push
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: my-org/frontend-manifests
+        token: ${{ secrets.MANIFESTS_PAT }} # PAT hoặc GitHub App có quyền ghi repo manifest
+    - name: Bump image tag
+      run: |
+        cd overlays/production
+        kustomize edit set image ghcr.io/my-org/frontend=ghcr.io/my-org/frontend:sha-${GITHUB_SHA::7}
+        git config user.name "ci-bot"
+        git config user.email "ci-bot@congty.com"
+        git commit -am "frontend: deploy sha-${GITHUB_SHA::7}" && git push
+```
+
+`kustomize edit set image` chỉ sửa dòng `newTag` trong `kustomization.yaml`; nếu runner không có sẵn `kustomize`, một dòng `sed` trên `newTag:` cũng đủ. Với Helm, sửa `image.tag` trong `values-prod.yaml` bằng `yq`. Từ đây, ArgoCD thấy commit mới (mặc định nó poll Git mỗi 3 phút; cấu hình webhook từ GitHub tới `/api/webhook` của ArgoCD để đồng bộ tức thì), render overlay, apply, và trạng thái chuyển Progressing → Healthy. Muốn có bước phê duyệt, tắt `automated` cho production và để một người bấm Sync, hoặc bắt commit trên đi qua pull request.
+
+Lệnh vận hành hằng ngày:
+
+```bash
+argocd app diff frontend              # Git khác cluster ở đâu
+argocd app sync frontend              # đồng bộ ngay, không chờ poll
+argocd app history frontend           # từng lần sync, commit nào
+argocd app rollback frontend <ID>     # quay về lần sync trước (tắt automated tạm thời)
+kubectl -n argocd get applications    # xem nhanh không cần CLI
+```
+
+### Bẫy ArgoCD
+
+- **`selfHeal` đánh nhau với `kubectl rollout restart`.** `rollout restart` thêm annotation `restartedAt` vào Pod template; ArgoCD thấy khác Git và với `selfHeal` sẽ gỡ nó ra, có khi ngay giữa chừng. Muốn restart trong mô hình GitOps: `argocd app actions run frontend restart --kind Deployment --resource-name frontend`, hoặc dựa vào `checksum/config` và hậu tố hash của Kustomize để đổi config là Pod tự restart.
+- **`prune: true` xoá thật.** Gỡ một file khỏi kustomization là ArgoCD xoá tài nguyên đó khỏi cluster, kể cả PVC nếu bạn có. Bật prune khi đã hiểu, và giữ Secret ngoài phạm vi ArgoCD quản.
+- **Secret không được nằm trong Git.** Sealed Secrets (mã hoá bằng khoá công khai của cluster, commit được) hoặc External Secrets Operator (đồng bộ từ AWS Secrets Manager/Vault) là hai cách phổ biến; [Phần 8](/blog/k8s-fe-08-configmap-secret-probes/) đã nhắc và [Phần 18](/blog/k8s-fe-18-security-cost-when-not-k8s/) bàn thêm.
+- **HPA làm app OutOfSync mãi** nếu bạn quên `ignoreDifferences` cho `/spec/replicas` (hoặc không bỏ `replicas` khỏi manifest).
+- **Application trỏ vào `main` của repo code** thay vì repo manifest: mỗi commit sửa README cũng kích hoạt sync. Tách repo, hoặc ít nhất tách thư mục và dùng `path`.
+
+Khi số app tăng, bạn sẽ gặp mẫu **app of apps**: một Application cha trỏ vào thư mục chứa các Application con, và **ArgoCD Image Updater** tự sửa tag trong Git khi registry có image mới (thay cho job `update-manifests`). Cả hai chỉ đáng học khi bạn đã có hơn ba app.
+
+---
+
+## Thực hành
+
+Cần một repo GitHub cho app frontend của Phần 10 và một repo `frontend-manifests` chứa `base/` và `overlays/` của Phần 15.
+
+1. **Pipeline build và push.** Thêm `.github/workflows/deploy.yml` với hai job `test` và `build-and-push` (bỏ `deploy`), push lên `main`. Vào tab Actions xem log, rồi vào Packages của repo.
+
+   > **Kết quả mong đợi:** package `frontend` xuất hiện với ba tag `main`, `sha-…` và (nếu bạn push tag `v1.0.0`) `1.0.0`. `docker pull ghcr.io/<ban>/frontend:sha-<7 ký tự>` kéo được sau khi bạn `docker login ghcr.io`.
+
+2. **RBAC cho CI.** Apply `ci-rbac.yaml` vào cluster kind, chạy ba lệnh `kubectl auth can-i --as=...` ở trên. Dựng kubeconfig từ token và thử `KUBECONFIG=./ci-kubeconfig.yaml kubectl delete deploy frontend -n web`.
+
+   > **Kết quả mong đợi:** `yes`, `no`, `no`; và lệnh delete bị từ chối với `forbidden`.
+
+3. **Cài ArgoCD**, đăng nhập UI, apply `argocd-app.yaml` trỏ vào `overlays/production` của repo manifest (đổi `namespace` overlay thành `web` cho khớp). Trong UI, app phải chuyển sang Synced và Healthy, cây tài nguyên hiện Deployment, ReplicaSet, Pod, Service, Ingress, ConfigMap.
+
+4. **Deploy bằng Git.** Sửa `newTag` trong overlay thành tag `sha-…` từ bước 1 (package đã public, hoặc đã có `imagePullSecrets`), commit, push. Bấm Refresh trong UI hoặc chờ tối đa 3 phút.
+
+   > **Kết quả mong đợi:** `kubectl -n web get deploy frontend -o jsonpath='{.spec.template.spec.containers[0].image}'` in ra tag mới; `argocd app history frontend` có thêm một dòng với commit của bạn.
+
+5. **Drift và selfHeal.** `kubectl -n web scale deploy/frontend --replicas=1` rồi nhìn UI: app OutOfSync trong giây lát rồi tự về Synced, `kubectl get pods` lại đủ số replica trong Git. Xoá `ignoreDifferences` và lặp lại với HPA đang bật để thấy vì sao cần nó.
+
+6. **Prune.** Gỡ `ingress.yaml` khỏi `resources` của base, commit. Ingress biến mất khỏi cluster. Khôi phục commit bằng `git revert`, Ingress quay lại: đó là rollback kiểu GitOps.
+
+---
+
+## Tóm tắt
+
+- Pipeline ba job: `test` chặn code hỏng, `build-and-push` tạo image với tag `sha-…` bất biến lên ghcr.io bằng `GITHUB_TOKEN`, `deploy` chạy `set image` + `rollout status` + `rollout undo` khi fail, sau cổng phê duyệt của `environment`.
+- CI không bao giờ cầm kubeconfig admin: ServiceAccount + Role chỉ có `get/list/watch/patch/update` trên Deployment và đọc ReplicaSet/Pod trong một namespace; kiểm chứng bằng `kubectl auth can-i --as`.
+- OIDC bỏ secret dài hạn; GitOps bỏ luôn quyền vào cluster của CI.
+- ArgoCD chạy trong cluster, theo dõi một `path` trong Git, báo Sync/Health, `automated` với `prune` và `selfHeal` giữ cluster đúng như Git.
+- Trong mô hình GitOps, deploy là một commit sửa tag; rollback là `git revert`; restart Pod qua action của ArgoCD hoặc checksum, không phải `kubectl rollout restart`.
+- HPA cần `ignoreDifferences` trên `/spec/replicas`; Secret không vào Git; `prune` xoá thật.
+
+## Đọc thêm
+
+- [GitHub Actions](https://docs.github.com/en/actions)
+- [Argo CD](https://argo-cd.readthedocs.io/en/stable/)
+- [Using RBAC Authorization](https://kubernetes.io/docs/reference/access-authn-authz/rbac/)
+- [Kustomize](https://kustomize.io/)

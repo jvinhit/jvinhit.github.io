@@ -1,0 +1,328 @@
+---
+title: 'AWS cho Frontend Developer · Phần 8 — CloudFront Functions, Lambda@Edge, nén, signed URL và sổ tay lỗi'
+description: 'Chọn CloudFront Functions hay Lambda@Edge, security header không cần code bằng Response Headers Policy, bật nén brotli đúng cách, signed URL và signed cookie cho nội dung trả phí, sổ tay lỗi CloudFront và Lab 4.1 dựng distribution đầy đủ.'
+pubDate: 2026-10-20
+lang: vi
+tags: [aws, devops, cloudfront, security, debugging]
+series: aws-fe
+seriesOrder: 8
+draft: false
+---
+
+Tới đây bạn đã có S3 chứa build, hiểu behavior và cache key, biết sửa lỗi F5. Bài này khép lại chương CloudFront bằng những thứ biến một distribution "chạy được" thành một distribution production: chạy code ngay tại edge (và chọn đúng công cụ giữa CloudFront Functions với Lambda@Edge), gắn security header mà không cần viết dòng nào, bật nén để bundle nhẹ đi 60–80%, bảo vệ nội dung trả phí bằng signed URL hoặc signed cookie, và một sổ tay lỗi để tra khi CloudFront trả về thứ bạn không hiểu.
+
+Kết bài là Lab 4.1, lab quan trọng nhất của series: dựng distribution hoàn chỉnh từ bucket ở Lab 3.1, tự gây ra lỗi F5 rồi sửa, quan sát `X-Cache` đổi từ `Miss` sang `Hit`, và tự tay cảm nhận khoảnh khắc deploy xong mà chưa thấy gì đổi cho tới khi invalidate. Sau lab này, mọi thứ ở [phần 9](/blog/aws-fe-09-alb-gateway-to-backend/) trở đi chỉ là cắm thêm origin vào cái distribution bạn vừa dựng.
+
+## CloudFront Functions vs Lambda@Edge
+
+CloudFront cho phép chạy code ở bốn điểm trên đường đi của một request. Hai điểm phía viewer chạy trên **mọi** request; hai điểm phía origin chỉ chạy khi cache miss:
+
+```text
+Trình duyệt                  CloudFront edge                         Origin
+    │                              │                                    │
+    │──── request ────► ① Viewer Request                                │
+    │                       │ (mọi request; rewrite URI, redirect,      │
+    │                       │  auth, chuẩn hoá cache key)               │
+    │                       ▼                                           │
+    │                    tra CACHE ── HIT ──────────────────┐            │
+    │                       │ MISS                          │            │
+    │                       ▼                               │            │
+    │                  ② Origin Request ──────────────────────────────► │
+    │                       (chọn origin, thêm header)      │            │
+    │                                                       │  ◄─────── │
+    │                  ③ Origin Response ◄───────────────────────────── │
+    │                       (sửa response trước khi LƯU cache)          │
+    │                       ▼                               │            │
+    │                    lưu CACHE ◄────────────────────────┘            │
+    │                       ▼                                            │
+    │◄─── response ──── ④ Viewer Response                                │
+    │                       (mọi response; thêm header cho viewer)       │
+```
+
+CloudFront Functions chỉ gắn được vào ① và ④. Lambda@Edge gắn được cả bốn.
+
+| Tiêu chí              | CloudFront Functions                                                                    | Lambda@Edge                                                        |
+| --------------------- | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Ngôn ngữ              | JavaScript (runtime riêng, gần ES5.1 cộng một số API ES6+ như `startsWith`, `includes`) | Node.js, Python                                                    |
+| Sự kiện hỗ trợ        | Viewer Request, Viewer Response                                                         | Cả 4: Viewer/Origin × Request/Response                             |
+| Thời gian chạy tối đa | Dưới 1 ms                                                                               | 5 giây (viewer) / 30 giây (origin)                                 |
+| Gọi mạng được không   | Không                                                                                   | Có (gọi API, đọc DynamoDB…)                                        |
+| Truy cập body request | Không                                                                                   | Có                                                                 |
+| Chi phí               | Rất rẻ (khoảng 1/6 Lambda@Edge)                                                         | Cao hơn nhiều                                                      |
+| Nơi chạy              | Tại mọi edge location                                                                   | Tại regional edge cache                                            |
+| Dùng cho              | Rewrite URL, redirect, thêm/bớt header, kiểm tra token đơn giản, chuẩn hoá cache key    | SSR ở edge, A/B testing cần gọi API, resize ảnh, xác thực phức tạp |
+
+Vài ràng buộc thực tế của từng bên:
+
+- **CloudFront Functions**: kích thước code nhỏ (vài KB), không `fetch`, không `setTimeout`, không truy cập body. Có **KeyValueStore** để đọc cấu hình nhỏ (bảng redirect, feature flag) mà không cần deploy lại code. Có hai stage `DEVELOPMENT` và `LIVE`; sửa xong phải `publish` thì behavior mới thấy bản mới. Trong [phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/) bạn đã có một function SPA router; đó là ví dụ điển hình.
+- **Lambda@Edge**: hàm phải tạo ở `us-east-1`, gắn bằng version đánh số (không dùng `$LATEST`), không có biến môi trường (đọc từ SSM lúc cold start hoặc nhúng lúc build), và xoá hàm phải chờ bản sao ở các region được thu hồi (hàng giờ). Cold start ở edge cộng thêm độ trễ cho request đầu. Chỉ dùng khi thật sự cần mạng, body hoặc điểm Origin Request/Response.
+
+Với frontend, 90% nhu cầu (SPA routing, redirect, header, chặn staging bằng mật khẩu, chuẩn hoá cache key) nằm gọn trong CloudFront Functions. Nếu bạn quen Cloudflare Workers ([Cloudflare phần 9](/blog/cloudflare-fe-09-workers-code-at-the-edge/)), Lambda@Edge gần với nó hơn; CloudFront Functions là bản gọn nhẹ hơn nhiều.
+
+### Ví dụ thực tế: thêm security header bằng CloudFront Function
+
+Gắn vào Viewer Response:
+
+```js
+function handler(event) {
+  var response = event.response;
+  var headers = response.headers;
+
+  headers['strict-transport-security'] = {
+    value: 'max-age=63072000; includeSubDomains; preload',
+  };
+  headers['x-content-type-options'] = { value: 'nosniff' };
+  headers['x-frame-options'] = { value: 'DENY' };
+  headers['referrer-policy'] = { value: 'strict-origin-when-cross-origin' };
+  headers['permissions-policy'] = {
+    value: 'camera=(), microphone=(), geolocation=()',
+  };
+
+  return response;
+}
+```
+
+Chú ý cấu trúc `headers['tên-thường'] = { value: '...' }`: tên header viết thường, giá trị bọc trong object. Đây là điểm khác biệt hay gây lỗi khi chuyển từ code Node thông thường.
+
+> **Có cách còn đơn giản hơn:** CloudFront có **Response Headers Policy** dựng sẵn, cấu hình bằng giao diện, không cần viết code. Dùng managed policy `Managed-SecurityHeadersPolicy` (gồm HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `X-XSS-Protection`) là đủ cho phần lớn trường hợp. Chỉ viết function khi cần logic động. Riêng `Content-Security-Policy` không có trong managed policy vì nó phụ thuộc từng app; tạo custom Response Headers Policy để thêm CSP, bắt đầu từ chế độ Report-Only ([phần 15](/blog/aws-fe-15-security-performance-cost/) và [CSP deep dive](/blog/web-security-03-content-security-policy/)). Response Headers Policy còn xoá được header (như `Server`) và thêm `Server-Timing` để đo hiệu năng cache.
+
+### Ba function nhỏ nữa bạn sẽ dùng
+
+Chuyển hướng `www` về apex, gắn ở Viewer Request (một function trả về object có `statusCode` nghĩa là "trả response ngay, không đi tiếp"):
+
+```js
+function handler(event) {
+  var request = event.request;
+  var host = request.headers.host.value;
+  if (host === 'www.example.com') {
+    return {
+      statusCode: 301,
+      statusDescription: 'Moved Permanently',
+      headers: { location: { value: 'https://example.com' + request.uri } },
+    };
+  }
+  return request;
+}
+```
+
+Chặn môi trường staging bằng mật khẩu đơn giản (Basic Auth), ở Viewer Request. Chuỗi sau `Basic ` là base64 của `user:password`:
+
+```js
+function handler(event) {
+  var request = event.request;
+  var auth = request.headers.authorization
+    ? request.headers.authorization.value
+    : '';
+  if (auth !== 'Basic c3RhZ2luZzpiaS1tYXQ=') {
+    return {
+      statusCode: 401,
+      statusDescription: 'Unauthorized',
+      headers: { 'www-authenticate': { value: 'Basic realm="staging"' } },
+    };
+  }
+  return request;
+}
+```
+
+Chuẩn hoá cache key: bỏ các tham số tracking trước khi CloudFront tra cache, để `?utm_source=` và `?fbclid=` không tạo bản cache mới (Viewer Request; hữu ích khi behavior của bạn buộc phải đưa query string vào key):
+
+```js
+function handler(event) {
+  var request = event.request;
+  var qs = request.querystring;
+  for (var key in qs) {
+    if (key.indexOf('utm_') === 0 || key === 'fbclid' || key === 'gclid') {
+      delete qs[key];
+    }
+  }
+  return request;
+}
+```
+
+---
+
+## Nén — việc nhỏ, lợi ích lớn
+
+Bật **Compress objects automatically = Yes** trên behavior. CloudFront sẽ tự nén gzip hoặc brotli tuỳ theo header `Accept-Encoding` của trình duyệt.
+
+| File                | Gốc    | Gzip    | Brotli  |
+| ------------------- | ------ | ------- | ------- |
+| Bundle JS điển hình | 800 KB | ~240 KB | ~200 KB |
+| CSS                 | 120 KB | ~20 KB  | ~17 KB  |
+| JSON response       | 50 KB  | ~8 KB   | ~7 KB   |
+
+Lưu ý: CloudFront chỉ nén file từ 1 KB đến 10 MB và đúng `Content-Type` được hỗ trợ (text, JS, CSS, JSON, SVG…). Ảnh JPEG/PNG đã nén sẵn nên không nén thêm; font `woff2` cũng vậy.
+
+Ba điều kiện phải cùng đúng thì mới thấy `content-encoding: br` trong response:
+
+1. Behavior bật Compress.
+2. Cache policy của behavior bật hỗ trợ Gzip và Brotli (`CachingOptimized` bật sẵn; custom policy phải tự bật). Với behavior HTML dùng `CachingDisabled` mà không thấy nén, kiểm tra mục này hoặc tạo custom policy TTL 0 có bật nén.
+3. Object ở S3 có `Content-Type` được hỗ trợ và **không** có sẵn `Content-Encoding`. Nếu bạn đã nén trước bằng plugin build và upload kèm `Content-Encoding: br`, CloudFront giữ nguyên; thường không cần làm vậy.
+
+CloudFront nén lúc lấy object về từ origin để lưu cache, nên đôi khi request đầu tiên sau khi cache trống được trả về chưa nén; request sau mới có. Kiểm tra bằng `curl -sI -H "Accept-Encoding: gzip, br" <url> | grep -i content-encoding` hai lần. `Vary: Accept-Encoding` được thêm tự động.
+
+Với API JSON qua behavior `/api/*`, bật Compress cũng có tác dụng dù không cache: CloudFront nén response từ ALB trước khi trả cho viewer, và một response 50 KB thành 7 KB đáng kể trên 4G.
+
+---
+
+## Signed URL và Signed Cookie — nội dung trả phí
+
+| Loại              | Dùng khi                                                | Đặc điểm                                                                                    |
+| ----------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| **Signed URL**    | Một file riêng lẻ: hoá đơn PDF, file tải về có thời hạn | Mỗi file một URL. Link chứa chữ ký + thời hạn.                                              |
+| **Signed Cookie** | Cả một khu vực: khoá học video, thư viện ảnh thành viên | Đặt cookie một lần, mọi file khớp pattern đều truy cập được. Không phải sửa URL trong HTML. |
+
+Khác với presigned URL của S3 ([phần 5](/blog/aws-fe-05-s3-presigned-url-and-versioning/)), thứ đi thẳng tới S3 và bỏ qua CDN, signed URL/cookie của CloudFront vẫn tận dụng cache: một video được cache ở edge phục vụ nghìn học viên, mỗi người mang chữ ký riêng, và CloudFront chỉ kiểm tra chữ ký trước khi trả từ cache.
+
+### Cơ chế
+
+1. Tạo cặp khoá RSA. Public key upload lên CloudFront và gom vào một **key group**; private key cất ở backend (Secrets Manager, [phần 12](/blog/aws-fe-12-env-vars-build-time-runtime-secrets/)).
+2. Behavior phục vụ nội dung (ví dụ `/courses/*`) bật **Restrict viewer access** và chọn key group đó. Từ lúc này, request không có chữ ký hợp lệ bị 403.
+3. Backend, sau khi kiểm tra người dùng đã trả tiền, ký URL hoặc ký cookie bằng private key, kèm chính sách: tài nguyên nào, hết hạn khi nào, (tuỳ chọn) từ IP nào.
+
+```bash
+openssl genrsa -out cf-private.pem 2048
+openssl rsa -pubout -in cf-private.pem -out cf-public.pem
+
+aws cloudfront create-public-key --public-key-config \
+  CallerReference=$(date +%s),Name=media-key-2026,EncodedKey="$(cat cf-public.pem)"
+# rồi tạo key group chứa public key vừa có (Console hoặc create-key-group)
+```
+
+Backend ký bằng gói chính thức `@aws-sdk/cloudfront-signer`:
+
+```ts
+import { getSignedUrl, getSignedCookies } from '@aws-sdk/cloudfront-signer';
+
+const keyPairId = process.env.CF_KEY_PAIR_ID!; // ID của public key trên CloudFront
+const privateKey = await loadPrivateKeyFromSecretsManager();
+
+// Signed URL cho một file, hết hạn sau 10 phút (canned policy)
+export function invoiceUrl(invoiceKey: string) {
+  return getSignedUrl({
+    url: `https://media.example.com/invoices/${invoiceKey}`,
+    keyPairId,
+    privateKey,
+    dateLessThan: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+  });
+}
+
+// Signed cookie cho cả khoá học, hết hạn sau 24 giờ (custom policy có wildcard)
+export function courseCookies(courseId: number) {
+  const policy = JSON.stringify({
+    Statement: [
+      {
+        Resource: `https://media.example.com/courses/${courseId}/*`,
+        Condition: {
+          DateLessThan: {
+            'AWS:EpochTime': Math.floor(Date.now() / 1000) + 86400,
+          },
+        },
+      },
+    ],
+  });
+  return getSignedCookies({ keyPairId, privateKey, policy });
+}
+```
+
+`getSignedCookies` trả về ba giá trị với tên cố định `CloudFront-Policy`, `CloudFront-Signature`, `CloudFront-Key-Pair-Id`. Backend đặt chúng vào response của endpoint `/api/courses/12/access`:
+
+```ts
+app.post('/api/courses/:id/access', authRequired, paidFor, (req, res) => {
+  const cookies = courseCookies(Number(req.params.id));
+  for (const [name, value] of Object.entries(cookies)) {
+    res.cookie(name, value, {
+      domain: '.example.com', // để cookie gửi được tới media.example.com
+      path: `/courses/${req.params.id}`,
+      httpOnly: true,
+      secure: true,
+      sameSite: 'lax',
+    });
+  }
+  res.status(204).end();
+});
+```
+
+Sau đó `<video src="https://media.example.com/courses/12/lesson-3.mp4" crossorigin="use-credentials">` chạy mà không cần sửa URL nào; player HLS tải hàng trăm segment `.ts` đều được cookie che. Nếu media và app cùng nằm trong một distribution (`/courses/*` là một behavior của `app.example.com`), không cần `domain` và `crossorigin`, mọi thứ là same-origin.
+
+Hai lỗi hay gặp: cookie không được gửi vì `domain`/`path` không khớp tên miền media (kiểm tra tab Application → Cookies), và chữ ký sai vì `Resource` trong policy phải khớp chính xác scheme + host + path pattern của URL thật.
+
+---
+
+## Sổ tay lỗi CloudFront
+
+| Triệu chứng                  | Nguyên nhân thường gặp                                                      | Cách kiểm tra / sửa                                                                                                                             |
+| ---------------------------- | --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| 403 `AccessDenied` dạng XML  | OAC chưa cấu hình; bucket policy thiếu; file không tồn tại; sai origin path | Thử `aws s3 ls s3://bucket/key`. Kiểm tra bucket policy có đúng distribution ARN ([phần 4](/blog/aws-fe-04-s3-where-your-build-lives/)).        |
+| Deploy rồi vẫn bản cũ        | `index.html` bị cache; chưa invalidate; Service Worker giữ bản cũ           | Xem `X-Cache` và `Age`. Kiểm tra `Cache-Control` của `index.html` bằng `head-object`. DevTools → Application → Service Workers.                 |
+| F5 bị 403/404                | Chưa có Custom Error Response hoặc CloudFront Function cho SPA              | Thêm cấu hình ở [phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/).                                                  |
+| POST `/api` trả 403          | Behavior `/api/*` chỉ bật GET, HEAD                                         | Bật đủ 7 method trong Allowed HTTP Methods.                                                                                                     |
+| Lỗi CORS lúc có lúc không    | Header `Origin` không nằm trong cache key                                   | Gắn Origin Request Policy `CORS-S3Origin`; đảm bảo origin trả `Vary: Origin`.                                                                   |
+| 504 Gateway Timeout          | Origin (ALB/backend) không trả lời trong 30 giây                            | Xem CloudWatch metric của ALB. Có thể tăng origin response timeout, nhưng nên sửa backend ([phần 9](/blog/aws-fe-09-alb-gateway-to-backend/)).  |
+| 502 Bad Gateway              | Lỗi bắt tay TLS với origin; chứng chỉ origin hết hạn; sai protocol policy   | Kiểm tra Origin Protocol Policy (HTTPS only vs Match Viewer) và chứng chỉ trên ALB phủ đúng hostname origin.                                    |
+| Cache hit rate thấp          | Forward quá nhiều query string / cookie; TTL quá ngắn                       | CloudFront → Reports → Cache Statistics. Đổi sang `CachingOptimized` cho asset ([phần 6](/blog/aws-fe-06-cloudfront-cdn-behaviors-cache-key/)). |
+| Nhận HTML ở chỗ đáng lẽ JSON | Custom Error Response đang rewrite cả request API bị lỗi                    | Chuyển sang CloudFront Function (cách 2, phần 7); Custom Error Response áp cho mọi behavior kể cả `/api/*`.                                     |
+
+Thêm ba dòng từ kinh nghiệm với nội dung bài này:
+
+| Triệu chứng                                      | Nguyên nhân                                                                           | Sửa                                                               |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Function sửa rồi mà hành vi không đổi            | Chưa `publish`, behavior vẫn dùng bản `LIVE` cũ                                       | `aws cloudfront publish-function`, chờ vài phút.                  |
+| Không thấy `content-encoding` dù đã bật Compress | Cache policy không bật Gzip/Brotli, file dưới 1 KB, hoặc sai `Content-Type`           | Kiểm tra ba điều kiện ở mục Nén; `head-object` xem `ContentType`. |
+| 403 trên `/courses/*` dù đã đăng nhập            | Cookie signed không tới được (sai `domain`/`path`), hoặc `Resource` trong policy lệch | Tab Application → Cookies; so `Resource` với URL thật.            |
+
+---
+
+## Lab 4.1 — Dựng CloudFront hoàn chỉnh (90 phút)
+
+Cần: bucket từ Lab 3.1 ([phần 5](/blog/aws-fe-05-s3-presigned-url-and-versioning/)) đã có build bên trong. Chứng chỉ ACM từ [phần 2](/blog/aws-fe-02-route53-acm-http-headers/) dùng cho bước 11 (tuỳ chọn).
+
+1. Tạo distribution mới, Origin = bucket ở Lab 3.1 (chọn từ danh sách, không gõ website endpoint), mục Origin access chọn **Origin access control settings**, bấm **Create new OAC**.
+2. Copy bucket policy AWS gợi ý, dán vào bucket (Permissions → Bucket policy). Kiểm tra `SourceArn` là ID distribution vừa tạo.
+3. Default root object: `index.html`. Viewer protocol policy: **Redirect HTTP to HTTPS**.
+4. Behavior mặc định: Cache policy `CachingDisabled`, bật **Compress objects automatically**.
+5. Tạo behavior mới: path `/assets/*`, cùng origin, Cache policy `CachingOptimized`, Compress bật.
+6. Tab Error pages: thêm `403 → /index.html → 200 → TTL 0`. Làm tương tự cho `404`.
+7. Chờ distribution chuyển sang trạng thái **Deployed** (5–15 phút), mở `https://dxxxx.cloudfront.net`. Thấy app React của bạn.
+8. Thêm một route trong React Router (ví dụ `/about`), build, deploy bằng `deploy.sh`, thử F5 tại route đó. Nhờ bước 6, trang vẫn hiện.
+9. Mở DevTools, tải lại 2 lần, quan sát `X-Cache` của file trong `/assets/` đổi từ `Miss` sang `Hit`, còn `index.html` luôn `Miss`.
+10. Sửa text trong app, build, sync lại, tải trang: chưa thấy đổi. Chạy invalidation `/index.html` và `/`, tải lại: thấy đổi. Hãy cảm nhận kỹ khoảnh khắc này, nó là bài học quan trọng nhất của chương.
+11. (Tuỳ chọn) Gắn tên miền thật: Alternate domain name = `app.example.com`, chọn chứng chỉ ACM ở `us-east-1`, lưu; trong Route 53 tạo bản ghi A và AAAA kiểu ALIAS trỏ vào distribution. Mở `https://app.example.com`.
+12. (Tuỳ chọn) Thay bước 6 bằng cách 2 của phần 7: xoá hai Custom Error Response, tạo và publish function `spa-router`, gắn vào behavior mặc định ở Viewer Request. Kiểm tra `curl -sI https://app.example.com/assets/khong-co.js` trả 403 thay vì HTML 200.
+13. (Tuỳ chọn) Gắn Response Headers Policy `SecurityHeadersPolicy` vào behavior mặc định, `curl -sI` trang chủ và đọc HSTS, `x-frame-options`.
+
+> **Kết quả mong đợi:** `https://dxxxx.cloudfront.net` hiện app; F5 ở `/about` không lỗi; `X-Cache` của asset chuyển `Miss` → `Hit`; sau khi sửa code, trang chỉ đổi sau invalidation `/index.html`; và bạn giải thích được vì sao file JS mới không cần invalidate. Nếu làm bước 11, `https://app.example.com` chạy với ổ khoá và chứng chỉ do Amazon cấp.
+
+Distribution không tốn tiền khi không có lưu lượng, và CloudFront có bậc miễn phí rộng cho dự án nhỏ; không cần xoá sau lab. Các phần sau dựng tiếp trên chính distribution này.
+
+---
+
+## Sai lầm hay gặp
+
+- **Viết CloudFront Function như Node.js**: dùng `const`, `let`, arrow function, `fetch`, `async`. Runtime từ chối hoặc không có API đó. Viết kiểu ES5 với `var`, không gọi mạng.
+- **Quên publish function** hoặc gắn vào sai behavior (gắn SPA router vào `/api/*`).
+- **Tạo Lambda@Edge ở `ap-southeast-1`** rồi không thấy trong danh sách gắn. Phải `us-east-1`.
+- **Dùng Lambda@Edge cho việc CloudFront Functions làm được** (thêm header, redirect): trả tiền gấp nhiều lần và chịu cold start.
+- **Bật Compress nhưng custom cache policy không bật Gzip/Brotli.** Không có lỗi, chỉ là không nén.
+- **Signed cookie đặt trên `app.example.com` mà media ở `media.example.com`** không có `domain: '.example.com'`. Cookie không được gửi, 403.
+- **Dùng S3 presigned URL cho video khoá học.** Mỗi học viên tải thẳng từ S3, không cache, tốn băng thông ra Internet của S3. Dùng CloudFront signed cookie.
+- **Giữ cả Custom Error Response lẫn function SPA router.** Nhược điểm "API 404 thành HTML 200" vẫn còn.
+
+---
+
+## Tóm tắt
+
+- Bốn điểm chạy code: Viewer Request, Origin Request, Origin Response, Viewer Response. CloudFront Functions chỉ hai điểm viewer, dưới 1 ms, không mạng, rất rẻ, đủ cho rewrite, redirect, header, auth đơn giản, chuẩn hoá cache key. Lambda@Edge đủ bốn điểm, có mạng và body, tạo ở `us-east-1`, dùng khi thật sự cần.
+- Security header: dùng Response Headers Policy `SecurityHeadersPolicy` trước; viết function chỉ khi cần logic động; CSP làm bằng custom policy và bắt đầu Report-Only.
+- Nén cần ba điều kiện: Compress bật trên behavior, cache policy bật Gzip/Brotli, object có `Content-Type` hỗ trợ và chưa có `Content-Encoding`. Chỉ nén 1 KB–10 MB.
+- Signed URL cho một file, signed cookie cho cả khu vực; cần key group trên CloudFront, private key ở backend, behavior bật Restrict viewer access; ký bằng `@aws-sdk/cloudfront-signer`. Khác S3 presigned ở chỗ vẫn tận dụng cache.
+- Sổ tay lỗi: 403 XML (OAC/policy/file), bản cũ (cache/invalidate/SW), F5 (SPA fallback), POST 403 (method), CORS chập chờn (`Origin` trong key), 504 (origin chậm), 502 (TLS với origin), hit rate thấp (key quá rộng), HTML thay JSON (Custom Error Response).
+- Lab 4.1 là cột mốc: OAC, root object, redirect HTTPS, hai behavior, SPA fallback, `Miss` → `Hit`, và invalidation `/index.html`.
+
+[Phần 9](/blog/aws-fe-09-alb-gateway-to-backend/) rời phần tĩnh để đi vào backend: ALB là gì, giải phẫu listener, rule, target group, health check quyết định web sống hay chết, chuỗi timeout phải thuộc, bảng mã 502/503/504 đọc là biết lỗi của ai, và `X-Forwarded-Proto` gây mixed content.
+
+## Đọc thêm
+
+- [Amazon CloudFront Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/)
+- [AWS Lambda Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/)
+- [Amazon S3 User Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/)

@@ -1,0 +1,333 @@
+---
+title: 'AWS cho Frontend Developer · Phần 2 — DNS với Route 53, HTTPS với ACM và HTTP header phải đọc được'
+description: 'Bốn loại bản ghi DNS bạn thật sự dùng, ALIAS khác CNAME chỗ nào, hosted zone và TTL, xin chứng chỉ ACM đúng region bằng DNS validation, và bảng HTTP header mà 80% việc debug trên AWS xoay quanh.'
+pubDate: 2026-10-02
+lang: vi
+tags: [aws, devops, dns, tls, https]
+series: aws-fe
+seriesOrder: 2
+draft: false
+---
+
+import NetworkDiagram from '~/components/blog/NetworkDiagram.astro';
+
+Phần lớn "lỗi AWS" mà frontend gặp thực ra là lỗi kiến thức HTTP, DNS và TLS cơ bản, chỉ là ở local chúng bị che đi: `localhost` không cần DNS, Vite tự lo HTTPS giả, và không có CDN nào chen vào giữa để thêm header. Lên AWS, ba lớp đó lộ ra cùng lúc, và bạn phải đọc được chúng.
+
+Bài này lấp đúng ba lỗ hổng đó. Đọc xong, bạn tạo được hosted zone trên Route 53 và trỏ tên miền vào CloudFront bằng bản ghi ALIAS, xin được chứng chỉ ACM ở đúng region với DNS validation để nó tự gia hạn mãi mãi, và nhìn vào tab Network là biết request vừa rồi được phục vụ từ edge nào, có cache hay không, có nén hay không. Đây là nền cho mọi bài sau, vì mọi lỗi từ [phần 4](/blog/aws-fe-04-s3-where-your-build-lives/) trở đi đều được chẩn đoán bằng header.
+
+## DNS và Route 53
+
+DNS dịch tên miền thành địa chỉ IP. Trình duyệt không kết nối tới `shop.example.com`, nó kết nối tới một IP, và DNS là bước hỏi "tên này là IP nào" trước khi mở socket. Route 53 là dịch vụ DNS của AWS; nó không bắt buộc (bạn giữ DNS ở Cloudflare hay nhà đăng ký cũng được), nhưng có một lý do rất cụ thể để dùng nó, sẽ nói ngay dưới.
+
+<NetworkDiagram
+  kind="dns"
+  caption="Trình duyệt hỏi resolver, resolver hỏi lên chuỗi name server, kết quả được cache ở mỗi chặng theo TTL"
+/>
+
+### Bốn loại bản ghi frontend cần nắm
+
+| Loại      | Công dụng                                                        | Ví dụ và lưu ý                                                                                                             |
+| --------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| **A**     | Tên miền → địa chỉ IPv4                                          | `api.example.com → 52.1.2.3`. Ít dùng trực tiếp trên AWS vì IP của dịch vụ thay đổi.                                       |
+| **CNAME** | Tên miền → tên miền khác                                         | `www.example.com → d111.cloudfront.net`. Không dùng được cho tên miền gốc (apex domain, tức `example.com` không có `www`). |
+| **ALIAS** | Như CNAME nhưng dùng được cho apex, trỏ thẳng tới tài nguyên AWS | `example.com → CloudFront distribution`. Riêng của Route 53. Đây là thứ bạn sẽ dùng 90% thời gian. Miễn phí truy vấn.      |
+| **TXT**   | Chứa văn bản tuỳ ý                                               | Dùng để xác minh sở hữu tên miền (ACM, Google Search Console), SPF cho email.                                              |
+
+Ngoài bốn loại trên, bạn sẽ thấy **AAAA** (tên miền → IPv6). CloudFront hỗ trợ IPv6, nên khi tạo ALIAS trỏ vào distribution hãy tạo cả A lẫn AAAA, nếu không người dùng trên mạng chỉ có IPv6 sẽ chậm hơn hoặc không vào được.
+
+### Vì sao CNAME không đặt được ở apex, và ALIAS giải quyết thế nào
+
+Theo chuẩn DNS, một tên đã có bản ghi CNAME thì không được có bất kỳ bản ghi nào khác. Nhưng tên miền gốc `example.com` bắt buộc phải có bản ghi NS và SOA (nó là đỉnh của zone), nên không thể thêm CNAME vào đó. Đó là lý do mọi nhà cung cấp DNS "thường" chỉ cho bạn trỏ `www.example.com` bằng CNAME, còn `example.com` thì phải là A với IP cố định, thứ mà CloudFront và ALB không có.
+
+ALIAS là cách Route 53 lách luật này: về hình thức nó là bản ghi A/AAAA, nhưng Route 53 tự tra `d111.cloudfront.net` ở phía server rồi trả IP cho người hỏi. Người hỏi chỉ thấy một bản ghi A bình thường. Hệ quả:
+
+- Dùng được ở apex.
+- Trỏ được tới CloudFront, ALB, API Gateway, S3 website endpoint, và cả một bản ghi khác trong cùng zone.
+- Truy vấn ALIAS tới tài nguyên AWS không tính tiền.
+- TTL do Route 53 quản lý theo tài nguyên đích, bạn không phải chỉnh.
+
+Nếu tên miền của bạn đang ở Cloudflare, Cloudflare có cơ chế tương đương gọi là CNAME flattening ([Cloudflare phần 2](/blog/cloudflare-fe-02-nameserver-zone-dns-records-orange-grey-cloud/) nói kỹ). Ở nhà đăng ký thường (Namecheap, GoDaddy, Hostinger) thì thường không có, và đó là lúc bạn nên chuyển DNS sang Route 53.
+
+### Hosted Zone là gì
+
+Là "hộp chứa" tất cả bản ghi DNS của một tên miền. Bạn mua `example.com` ở đâu cũng được (Namecheap, GoDaddy, Route 53…), nhưng nếu muốn quản lý DNS bằng Route 53 thì phải:
+
+1. Tạo Public Hosted Zone cho `example.com` trong Route 53. Route 53 tự tạo sẵn bản ghi NS và SOA.
+2. Route 53 cấp cho bạn 4 name server (dạng `ns-123.awsdns-45.com`, bốn cái ở bốn TLD khác nhau để một cái sập vẫn còn ba).
+3. Vào nơi mua tên miền, thay name server mặc định bằng 4 cái này.
+4. Chờ lan truyền (thường vài phút đến vài giờ).
+
+Hosted zone tính phí theo tháng (khoảng 0,5 USD mỗi zone, [phần 15](/blog/aws-fe-15-security-performance-cost/) có bảng chi phí). Nếu bạn mua tên miền ngay trong Route 53 thì hosted zone được tạo và trỏ sẵn, bỏ qua bước 2–3.
+
+Tạo bản ghi ALIAS bằng CLI, thứ bạn sẽ cần khi viết script hoặc muốn hiểu Console đang làm gì:
+
+```bash
+# alias.json — trỏ apex vào CloudFront. Z2FDTNDATAQYW2 là hosted zone ID
+# cố định của MỌI CloudFront distribution, không phải zone của bạn.
+cat > alias.json <<'EOF'
+{
+  "Comment": "apex -> CloudFront",
+  "Changes": [{
+    "Action": "UPSERT",
+    "ResourceRecordSet": {
+      "Name": "example.com",
+      "Type": "A",
+      "AliasTarget": {
+        "HostedZoneId": "Z2FDTNDATAQYW2",
+        "DNSName": "d111abc.cloudfront.net",
+        "EvaluateTargetHealth": false
+      }
+    }
+  }]
+}
+EOF
+
+aws route53 list-hosted-zones --query 'HostedZones[].{name:Name,id:Id}'
+aws route53 change-resource-record-sets \
+  --hosted-zone-id Z0123456789ABCDEFGHIJ \
+  --change-batch file://alias.json
+```
+
+Đổi `"Type": "A"` thành `"AAAA"` và chạy lần nữa để có bản ghi IPv6. `UPSERT` nghĩa là tạo mới hoặc ghi đè, an toàn để chạy lặp trong pipeline.
+
+### TTL — thứ khiến bạn tưởng mình cấu hình sai
+
+TTL (Time To Live) là số giây mà máy chủ DNS trung gian và trình duyệt được phép nhớ kết quả cũ. Nếu TTL là 86400 (1 ngày) và bạn vừa đổi bản ghi, sẽ có người vẫn vào IP cũ suốt 24 giờ nữa. Không có gì "lan truyền" cả; chỉ là cache ở từng resolver đang chờ hết hạn.
+
+> **Mẹo thực chiến:** Trước khi định chuyển tên miền sang hạ tầng mới, hạ TTL xuống 60 giây và chờ hết TTL cũ (nếu TTL cũ là 1 ngày, phải hạ trước ít nhất 1 ngày). Chuyển xong, chạy ổn định vài ngày rồi mới nâng TTL lên lại. Bản ghi ALIAS không cần lo việc này, Route 53 quản lý TTL tự động.
+
+Hai loại cache dễ quên: trình duyệt có DNS cache riêng (Chrome xem ở `chrome://net-internals/#dns`), và resolver cũng cache cả câu trả lời "không tồn tại" (negative caching). Nếu bạn `dig` một tên miền trước khi tạo bản ghi, câu trả lời NXDOMAIN có thể bị nhớ vài phút; đừng hoảng khi tạo xong mà vẫn "không thấy".
+
+### Lệnh kiểm tra DNS
+
+```bash
+# Xem tên miền đang trỏ đi đâu
+dig shop.example.com +short
+nslookup shop.example.com
+
+# Hỏi thẳng một DNS server cụ thể, bỏ qua cache của máy mình
+dig @8.8.8.8 shop.example.com
+
+# Xem toàn bộ chuỗi phân giải, hữu ích khi nghi cấu hình sai
+dig shop.example.com +trace
+
+# Xem name server đang có hiệu lực của tên miền
+dig example.com NS +short
+
+# Kiểm tra IPv6 và bản ghi xác minh của ACM
+dig shop.example.com AAAA +short
+dig _3f2a1b.example.com CNAME +short
+```
+
+Đọc kết quả `dig +short`: nếu thấy một dòng `d111abc.cloudfront.net.` rồi vài IP bên dưới, tên miền đang là CNAME tới CloudFront; nếu chỉ thấy IP, đó là A hoặc ALIAS (từ bên ngoài không phân biệt được ALIAS với A, đúng như thiết kế). `dig example.com NS +short` phải trả về bốn tên `awsdns` sau khi bạn đổi name server; nếu vẫn thấy name server của nhà đăng ký, bước 3 chưa có hiệu lực.
+
+---
+
+## HTTPS, TLS và ACM
+
+### Vì sao phải có HTTPS
+
+- Trình duyệt hiện đại chặn hoặc cảnh báo trang HTTP.
+- Nhiều API web chỉ chạy trên HTTPS (secure context): Service Worker, Geolocation, Camera/Mic, Clipboard, Push Notification, WebAuthn. Đây là lý do rất thực tế với frontend: app PWA của bạn đơn giản là không đăng ký được service worker qua HTTP.
+- Cookie có cờ `Secure` không gửi qua HTTP.
+- HTTP/2 và HTTP/3 thực tế chỉ hoạt động trên TLS.
+
+<NetworkDiagram
+  kind="tls"
+  caption="Bắt tay TLS: chứng chỉ chứng minh danh tính của server, rồi hai bên tạo khoá để mã hoá mọi thứ sau đó"
+/>
+
+Trên AWS, bắt tay TLS diễn ra ở CloudFront (bước ③ trong sơ đồ [phần 1](/blog/aws-fe-01-mindset-and-request-lifecycle/)) hoặc ở ALB nếu bạn trỏ thẳng vào ALB. Backend phía sau nhận HTTP thuần, chi tiết ở [phần 9](/blog/aws-fe-09-alb-gateway-to-backend/). Muốn hiểu bắt tay TLS ở mức gói tin, đọc [TLS và HTTPS](/blog/net-07-tls-https/).
+
+### ACM — AWS Certificate Manager
+
+ACM cấp chứng chỉ TLS miễn phí và tự động gia hạn, miễn là bạn dùng nó với CloudFront, ALB hoặc API Gateway. Bạn không tải private key về để tự cài vào Nginx trên EC2 theo cách thông thường; máy chủ tự quản thì dùng Let's Encrypt. Quy trình:
+
+1. Request certificate cho `example.com` và `*.example.com` (wildcard phủ mọi subdomain một cấp). Đưa cả hai vào cùng một chứng chỉ để CloudFront phục vụ được cả apex lẫn `www`, `app`, `api`.
+2. Chọn xác minh bằng **DNS validation** (khuyến nghị, vì nó cho phép tự gia hạn vĩnh viễn; email validation thì không).
+3. ACM đưa cho bạn một bản ghi CNAME. Nếu tên miền đã ở Route 53, bấm nút "Create records in Route 53" là xong. Nếu DNS ở nơi khác, copy tên và giá trị CNAME sang đó bằng tay.
+4. Chờ trạng thái chuyển từ `Pending validation` sang `Issued` (vài phút, đôi khi lâu hơn nếu DNS chưa lan truyền).
+
+Bằng CLI, chú ý `--region us-east-1` ngay trong lệnh:
+
+```bash
+aws acm request-certificate \
+  --region us-east-1 \
+  --domain-name example.com \
+  --subject-alternative-names "*.example.com" \
+  --validation-method DNS
+
+# Lấy bản ghi CNAME cần tạo để xác minh
+aws acm describe-certificate --region us-east-1 \
+  --certificate-arn arn:aws:acm:us-east-1:123456789012:certificate/abcd-... \
+  --query 'Certificate.DomainValidationOptions[].ResourceRecord'
+
+# Theo dõi trạng thái cho tới khi ISSUED
+aws acm describe-certificate --region us-east-1 \
+  --certificate-arn arn:aws:acm:us-east-1:123456789012:certificate/abcd-... \
+  --query 'Certificate.Status'
+```
+
+> **Hai cái bẫy về chứng chỉ:**
+>
+> 1. **Sai region.** Chứng chỉ cho CloudFront phải nằm ở `us-east-1`. Chứng chỉ cho ALB phải nằm cùng region với ALB. Nếu tạo xong mà không thấy trong ô chọn của CloudFront, 99% là bạn đang ở nhầm region.
+> 2. **Wildcard chỉ phủ một cấp.** `*.example.com` khớp `app.example.com` nhưng không khớp `a.b.example.com`. Cần thì xin thêm `*.b.example.com` vào cùng chứng chỉ.
+
+Ba lưu ý nữa mà tài liệu hay bỏ qua:
+
+- **Đừng xoá bản ghi CNAME xác minh** sau khi chứng chỉ đã Issued. ACM dùng lại chính bản ghi đó để tự gia hạn mỗi năm; xoá đi thì lần gia hạn tới thất bại và một ngày đẹp trời trang bạn báo chứng chỉ hết hạn.
+- **`Pending validation` kẹt quá 30 phút:** chạy `dig _xxx.example.com CNAME +short`, nếu không thấy giá trị ACM đưa thì bản ghi chưa tạo đúng (hay gặp: nhà đăng ký tự nối thêm tên miền vào cuối, thành `_xxx.example.com.example.com`). Kiểm tra cả bản ghi CAA của tên miền nếu có: nó phải cho phép `amazon.com` cấp chứng chỉ.
+- **Tên miền phải có trong chứng chỉ trước khi gắn vào CloudFront.** CloudFront chỉ cho thêm alternate domain name khi chứng chỉ đang chọn phủ tên đó. Thứ tự đúng: chứng chỉ Issued → thêm alternate domain + chọn chứng chỉ trong distribution → tạo ALIAS trong Route 53.
+
+Khi gắn chứng chỉ vào CloudFront, giữ mặc định "SNI only" (miễn phí, mọi trình duyệt hiện đại đều hỗ trợ) và security policy mới nhất mà CloudFront khuyến nghị (dòng `TLSv1.2_2021` tại thời điểm viết). Bật "Redirect HTTP to HTTPS" ở viewer protocol policy để `http://` tự nhảy sang `https://`; với ALB, listener cổng 80 làm việc tương đương bằng action redirect sang 443.
+
+### Kiểm tra chứng chỉ bằng dòng lệnh
+
+```bash
+# Xem chứng chỉ đang phục vụ, ngày hết hạn, tên miền được phủ
+echo | openssl s_client -connect shop.example.com:443 -servername shop.example.com 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+
+# Xem toàn bộ header trả về, có redirect HTTP→HTTPS không
+curl -sI https://shop.example.com
+curl -sI http://shop.example.com   # mong đợi 301 → https
+```
+
+Kết quả `openssl` trông như sau. Dòng `issuer` cho biết ai cấp (ACM cấp qua Amazon), `notAfter` là hạn, và `subjectAltName` liệt kê mọi tên miền chứng chỉ phủ:
+
+```text
+subject=CN = example.com
+issuer=C = US, O = Amazon, CN = Amazon RSA 2048 M02
+notBefore=Sep  1 00:00:00 2026 GMT
+notAfter=Sep 30 23:59:59 2027 GMT
+X509v3 Subject Alternative Name:
+    DNS:example.com, DNS:*.example.com
+```
+
+Nếu trình duyệt báo `NET::ERR_CERT_COMMON_NAME_INVALID`, nhìn vào `subjectAltName`: tên bạn đang gõ không nằm trong danh sách (thường là quên `www`, hoặc subdomain hai cấp không được wildcard phủ).
+
+---
+
+## HTTP header mà frontend phải đọc được
+
+Khi debug trên AWS, 80% thông tin nằm trong response header. Mở DevTools → Network → chọn request → tab Headers, nhìn khối Response Headers. Hai lưu ý nhỏ nhưng làm nhiều người đọc sai: ô "Disable cache" đang bật sẽ khiến trình duyệt bỏ qua cache của chính nó (nhưng không ảnh hưởng cache của CloudFront), và cột Size hiện `(disk cache)` hay `(memory cache)` nghĩa là request chưa hề rời máy bạn, mọi header bạn thấy là bản đã lưu từ lần trước.
+
+| Header              | Ý nghĩa và vì sao quan trọng trên AWS                                                                                                                                                                                       |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Cache-Control`     | Quyết định CloudFront và trình duyệt giữ file bao lâu. Header quan trọng nhất với frontend. Chi tiết ở [phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/).                                       |
+| `ETag`              | "Vân tay" của nội dung. Lần sau trình duyệt gửi `If-None-Match`, nếu chưa đổi thì server trả `304 Not Modified` (rất nhẹ, không có body).                                                                                   |
+| `Content-Type`      | S3 không tự đoán loại file khi upload bằng API. Sai `Content-Type` → trình duyệt tải file về thay vì hiển thị, hoặc CSS không được áp dụng.                                                                                 |
+| `Content-Encoding`  | `gzip` hoặc `br`. CloudFront nén tự động nếu bật. Giảm kích thước JS bundle 60–80%.                                                                                                                                         |
+| `Vary`              | Báo cache rằng response thay đổi theo header nào. `Vary: Origin` cực kỳ quan trọng khi có CORS: thiếu nó, CloudFront có thể trả header CORS của origin A cho origin B ([phần 3](/blog/aws-fe-03-cors-vpc-security-group/)). |
+| `X-Cache`           | CloudFront thêm vào: `Hit from cloudfront` hoặc `Miss from cloudfront`. Xem ngay header này khi nghi vấn đề cache.                                                                                                          |
+| `X-Amz-Cf-Pop`      | CloudFront thêm vào: mã edge location đã phục vụ request, ví dụ `SIN52-C1` (Singapore), `HAN50` (Hà Nội).                                                                                                                   |
+| `X-Amz-Cf-Id`       | CloudFront thêm vào: ID duy nhất của request. Khi mở ticket với AWS Support, họ sẽ hỏi cái này.                                                                                                                             |
+| `X-Forwarded-For`   | ALB thêm vào, chứa IP thật của user. Backend đọc `request.ip` sẽ thấy IP của ALB, không phải user; phải đọc header này.                                                                                                     |
+| `X-Forwarded-Proto` | `http` hay `https`. Backend đứng sau ALB luôn nhận HTTP, phải dựa header này mới biết user dùng HTTPS. Nếu không, framework sinh link `http://` gây mixed content ([phần 9](/blog/aws-fe-09-alb-gateway-to-backend/)).      |
+| `Age`               | CloudFront thêm vào: số giây object đã nằm trong cache edge. `Age: 0` kèm `Hit` nghĩa là vừa được cache xong.                                                                                                               |
+| `Last-Modified`     | Thời điểm object được ghi lên S3. Cùng với `ETag` là cơ sở cho 304.                                                                                                                                                         |
+| `Via`               | Chuỗi proxy đã đi qua, ví dụ `1.1 abc.cloudfront.net (CloudFront)`. Thấy dòng này là biết request đã tới CloudFront.                                                                                                        |
+| `Set-Cookie`        | Backend đặt cookie; các cờ `Secure`, `HttpOnly`, `SameSite` quyết định cookie có được gửi lại hay không ([phần 11](/blog/aws-fe-11-api-gateway-and-cognito/)).                                                              |
+
+### Ai thêm header nào — "chữ ký" của từng chặng
+
+Mỗi chặng trong sơ đồ vòng đời request để lại dấu vết riêng. Đây là cách trả lời câu hỏi "ai đã trả lỗi này" ở [phần 14](/blog/aws-fe-14-monitoring-and-debug-handbook/):
+
+| Chặng           | Header đặc trưng                                                                                                                                  |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Trình duyệt gửi | `Origin`, `Accept-Encoding`, `If-None-Match`, `Cookie`, `Authorization`                                                                           |
+| CloudFront      | `X-Cache`, `X-Amz-Cf-Pop`, `X-Amz-Cf-Id`, `Via`, `Age`                                                                                            |
+| ALB             | `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `X-Amzn-Trace-Id` (gửi xuống backend); trang lỗi HTML có chữ "ELB" khi ALB tự trả lỗi |
+| S3              | `ETag`, `x-amz-request-id`, `x-amz-id-2`; body lỗi dạng XML có thẻ `Code`                                                                         |
+| Backend         | `Set-Cookie`, `Access-Control-*`, và bất kỳ header nào code bạn tự thêm                                                                           |
+
+### Đọc một response thật
+
+Đây là header của một file JS được phục vụ qua CloudFront, lấy bằng `curl -sI`:
+
+```http
+HTTP/2 200
+content-type: application/javascript
+content-length: 241203
+cache-control: public, max-age=31536000, immutable
+content-encoding: br
+etag: "7d3c1a9e0b2f4c6d8e1f3a5b7c9d0e2f"
+last-modified: Tue, 29 Sep 2026 02:14:07 GMT
+vary: Accept-Encoding
+x-cache: Hit from cloudfront
+x-amz-cf-pop: SIN52-C1
+x-amz-cf-id: 3kQ9x...==
+age: 5320
+via: 1.1 9f1c2d3e4a5b.cloudfront.net (CloudFront)
+```
+
+Đọc ra được: file được nén brotli (`br`) còn 241 KB; được cache một năm và đánh dấu bất biến, nên trình duyệt sẽ không hỏi lại; request này là HIT tại edge Singapore, object đã nằm ở edge được 5320 giây (gần 1,5 giờ); và `Vary: Accept-Encoding` cho biết CloudFront giữ bản nén và bản không nén riêng. Nếu cùng file mà thấy `x-cache: Miss from cloudfront` hai lần liên tiếp, có gì đó sai trong cache policy ([phần 6](/blog/aws-fe-06-cloudfront-cdn-behaviors-cache-key/)).
+
+Với `index.html` chuẩn, bạn mong đợi khác hẳn: `cache-control: no-cache, must-revalidate`, `content-type: text/html; charset=utf-8`, và `x-cache` có thể là `RefreshHit from cloudfront` (edge hỏi S3 "đổi chưa", S3 trả 304, edge dùng lại bản cũ).
+
+### Lệnh curl để đọc header nhanh
+
+```bash
+# Chỉ lấy header
+curl -sI https://shop.example.com/assets/main-a3f9.js
+
+# Lọc đúng các header liên quan tới cache
+curl -sI https://shop.example.com/assets/main-a3f9.js \
+  | grep -iE "cache-control|x-cache|age|etag|content-encoding|x-amz-cf-pop"
+
+# Giả vờ là trình duyệt hỗ trợ brotli để xem CloudFront có nén không
+curl -sI -H "Accept-Encoding: gzip, br" https://shop.example.com/assets/main.js \
+  | grep -i content-encoding
+
+# Theo dõi redirect (http → https, www → apex)
+curl -sIL http://example.com | grep -iE "^(HTTP|location)"
+```
+
+`curl` không có cache và không áp CORS, nên nó là cách nhanh nhất để tách "lỗi thật ở server" khỏi "lỗi do cache hoặc trình duyệt". Nhiều mẹo `curl` hơn ở [Debug HTTP API với curl và jq](/blog/dev-cli-06-http-api-debugging-curl-jq/).
+
+---
+
+## Thực hành — Tên miền, chứng chỉ và đọc header (45 phút)
+
+Lab này cần một tên miền thật. Tên miền rẻ (`.io.vn`, `.xyz`, khoảng 100–300 nghìn đồng một năm) là khoản đầu tư đáng nhất cho cả series: có tên miền thật, mọi bài sau đều làm được y như production.
+
+1. Tạo Public Hosted Zone cho tên miền trong Route 53. Ghi lại 4 name server trong bản ghi NS.
+2. Vào nhà đăng ký, thay name server bằng 4 tên đó. Chạy `dig example.com NS +short` mỗi vài phút cho tới khi thấy `awsdns`.
+3. Tạo một bản ghi TXT thử nghiệm (`test.example.com` với giá trị `hello`), TTL 60. Chạy `dig test.example.com TXT +short` và `dig @8.8.8.8 test.example.com TXT +short`; so sánh thời điểm hai bên thấy giá trị.
+4. Chuyển region sang `us-east-1`, request chứng chỉ ACM cho `example.com` và `*.example.com`, DNS validation, bấm "Create records in Route 53". Chờ `Issued`.
+5. Chạy `dig _xxx.example.com CNAME +short` với tên ACM đưa, xác nhận thấy giá trị xác minh.
+6. Chọn một trang lớn bạn nghi dùng CloudFront, chạy `curl -sI` lên file JS chính của nó và ghi lại `x-cache`, `x-amz-cf-pop`, `content-encoding`, `cache-control`. Chạy lại lần hai, xem `x-cache` và `age` đổi thế nào.
+7. Chạy lệnh `openssl s_client` ở trên với trang đó, đọc `issuer` và `subjectAltName`.
+
+> **Kết quả mong đợi:** `dig example.com NS +short` trả về bốn name server `awsdns`; chứng chỉ ở trạng thái `Issued` tại `us-east-1` với hai tên trong `subjectAltName`; bạn chỉ ra được edge location đang phục vụ mình và giải thích được vì sao file JS có `max-age` một năm. Chứng chỉ này sẽ được gắn vào CloudFront ở [phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/).
+
+---
+
+## Sai lầm hay gặp
+
+- **Tạo CNAME ở apex.** Route 53 từ chối ngay, nhưng ở nhà đăng ký khác có thể "cho tạo" rồi email của bạn ngừng hoạt động vì bản ghi MX bị CNAME che mất. Apex luôn dùng ALIAS (Route 53) hoặc A.
+- **Quên hạ TTL trước khi chuyển hạ tầng**, rồi kết luận "AWS chậm" khi một nửa người dùng vẫn vào máy chủ cũ suốt một ngày.
+- **Chứng chỉ chỉ có `example.com`**, không có `*.example.com`, rồi gắn `www.example.com` vào CloudFront: CloudFront không cho thêm, hoặc trình duyệt báo tên không khớp.
+- **Xoá bản ghi CNAME xác minh của ACM** vì "đã Issued rồi, để làm gì". Một năm sau chứng chỉ không gia hạn được.
+- **Kiểm tra bằng trình duyệt có cache.** Thấy "vẫn bản cũ" trong khi `curl` đã thấy bản mới. Luôn kiểm tra bằng `curl` hoặc cửa sổ ẩn danh trước khi kết luận.
+- **Đọc header trong tab Network khi request là `(from disk cache)`.** Header đó là bản cũ, không phải thứ CloudFront vừa trả.
+
+---
+
+## Tóm tắt
+
+- Bốn loại bản ghi cần nhớ: A (IPv4), CNAME (tên → tên, không dùng ở apex), ALIAS (riêng Route 53, dùng ở apex, trỏ thẳng tài nguyên AWS, miễn phí truy vấn), TXT (xác minh). Tạo thêm AAAA ALIAS cho IPv6.
+- Hosted zone là hộp chứa bản ghi; muốn Route 53 quản lý DNS thì đổi name server ở nhà đăng ký sang 4 name server `awsdns`. Xác minh bằng `dig example.com NS +short`.
+- TTL là cache; hạ xuống 60 giây trước khi chuyển hạ tầng, ALIAS thì Route 53 tự lo. Nhớ cả DNS cache của trình duyệt và negative caching.
+- ACM cấp chứng chỉ miễn phí, tự gia hạn nếu dùng DNS validation. Chứng chỉ cho CloudFront ở `us-east-1`, cho ALB cùng region với ALB. Wildcard chỉ phủ một cấp. Đừng xoá CNAME xác minh.
+- 80% thông tin debug nằm trong response header: `Cache-Control`, `ETag`, `Content-Type`, `Content-Encoding`, `Vary`, `X-Cache`, `X-Amz-Cf-Pop`, `Age` (CloudFront), `X-Forwarded-For`, `X-Forwarded-Proto` (ALB).
+- Mỗi chặng để lại chữ ký riêng trong header; nhìn header là biết request đã tới đâu và ai trả lỗi.
+- `curl -sI` không có cache, không áp CORS: dùng nó trước khi tin vào trình duyệt.
+
+[Phần 3](/blog/aws-fe-03-cors-vpc-security-group/) đi vào hai thứ gây bực bội nhất khi lên AWS: CORS (vì sao Postman chạy mà browser lỗi, và trên AWS phải sửa ở đâu) và Security Group (thứ chặn request của bạn trong im lặng).
+
+## Đọc thêm
+
+- [Amazon Route 53 Developer Guide](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/)
+- [AWS Certificate Manager User Guide](https://docs.aws.amazon.com/acm/latest/userguide/)
+- [Amazon CloudFront Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/)

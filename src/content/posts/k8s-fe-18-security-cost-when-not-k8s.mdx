@@ -1,0 +1,411 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 18 — Bảo mật cơ bản, chi phí và khi nào không nên dùng K8s'
+description: 'securityContext cho container nginx non-root và read-only, RBAC cho team FE, NetworkPolicy chỉ cho Ingress gọi vào, checklist bảo mật; rồi bảng chi phí thẳng thắn và tiêu chí quyết định frontend có nên lên K8s hay không.'
+pubDate: 2026-11-20
+lang: vi
+tags: [kubernetes, security, devops, frontend, hosting]
+series: k8s-fe
+seriesOrder: 18
+draft: false
+---
+
+Deployment ở [Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/) đã có `allowPrivilegeEscalation: false` và `drop: ["ALL"]`, nhưng container nginx trong đó vẫn chạy bằng root, filesystem vẫn ghi được, mọi Pod trong cluster vẫn gọi được vào nó, và bất kỳ ai có kubeconfig đều xoá được nó. Với một SPA tĩnh, câu hỏi "bảo mật cái gì?" nghe có vẻ thừa: không có database, không có secret. Nhưng Pod frontend là thứ đối diện Internet trực tiếp nhất trong cluster, và nếu nginx hoặc Next.js có lỗ hổng, nó là bàn đạp để đi tiếp vào backend.
+
+Bài này đi qua bốn lớp phòng thủ ở mức frontend developer tự làm được: `securityContext` để container bị chiếm cũng không làm được gì, RBAC để người trong team chỉ có quyền cần thiết, NetworkPolicy để Pod frontend chỉ nói chuyện với đúng hai bên, và checklist mười điểm để tự soát. Nửa sau đổi chủ đề sang câu hỏi ít kỹ thuật hơn nhưng quan trọng hơn cho sự nghiệp: **Kubernetes tốn bao nhiêu, và khi nào frontend không nên dùng nó.**
+
+## Mối đe doạ nào là thật với frontend trên K8s
+
+| Mối đe doạ                                                      | Lớp xử lý                       | Học ở đâu                                                                 |
+| --------------------------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------- |
+| XSS, chèn script, clickjacking                                  | Code app + security header      | [Content Security Policy](/blog/web-security-03-content-security-policy/) |
+| Secret lọt vào bundle JS qua `VITE_*`, `NEXT_PUBLIC_*`          | Quy trình build, runtime config | Phần 10                                                                   |
+| Lỗ hổng trong nginx/Node cho phép chạy lệnh trong container     | `securityContext`, image sạch   | Bài này                                                                   |
+| Container bị chiếm rồi gọi sang database, Redis, dịch vụ nội bộ | NetworkPolicy                   | Bài này                                                                   |
+| Người có kubectl xoá nhầm production, đọc Secret                | RBAC                            | Bài này                                                                   |
+| Image có CVE đã biết, tag `:latest` bị thay ruột                | Trivy trong CI, tag bất biến    | Bài này, Phần 4                                                           |
+
+Hai dòng đầu là việc của code frontend, ba dòng giữa là việc của manifest, dòng cuối là việc của pipeline. Threat model sâu hơn (attacker đã có shell trong Pod thì leo thang thế nào) nằm ở [Docker Part 17](/blog/docker-17-kubernetes-security-hardening/); bài này dừng ở mức đủ để manifest của bạn qua được review của DevOps.
+
+---
+
+## securityContext: làm cứng container
+
+`securityContext` có hai tầng: tầng Pod (áp cho mọi container) và tầng container (ghi đè tầng Pod). Bản đầy đủ cho SPA nginx:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app.kubernetes.io/name: frontend }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: frontend }
+    spec:
+      automountServiceAccountToken: false # frontend không gọi API của Kubernetes
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101 # uid của user nginx trong image nginx-unprivileged
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: ghcr.io/my-org/frontend:v1.5.0 # FROM nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - name: http
+              containerPort: 8080 # unprivileged không mở được cổng dưới 1024
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ['ALL']
+          volumeMounts: # nginx cần ghi vào vài thư mục
+            - { name: cache, mountPath: /var/cache/nginx }
+            - { name: run, mountPath: /var/run }
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 25m, memory: 48Mi }
+            limits: { cpu: 300m, memory: 192Mi }
+      volumes:
+        - { name: cache, emptyDir: {} }
+        - { name: run, emptyDir: {} }
+        - { name: tmp, emptyDir: {} }
+```
+
+Từng trường làm gì:
+
+| Trường                            | Ý nghĩa                                                                                                             |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `runAsNonRoot: true`              | kubelet từ chối khởi động nếu tiến trình là root. Image phải khai `USER` dạng số, nếu không kubelet không kiểm được |
+| `runAsUser` / `runAsGroup`        | uid/gid cụ thể; phải khớp user mà image chuẩn bị quyền thư mục cho                                                  |
+| `fsGroup`                         | gid sở hữu volume mount, để user trên ghi được vào emptyDir                                                         |
+| `seccompProfile: RuntimeDefault`  | Bật bộ lọc syscall mặc định của container runtime; chặn hàng trăm syscall app web không bao giờ dùng                |
+| `allowPrivilegeEscalation: false` | Tiến trình con không thể lấy thêm quyền qua setuid binary                                                           |
+| `readOnlyRootFilesystem: true`    | Không ghi được vào filesystem của image; attacker không cài thêm tool, không sửa `index.html`                       |
+| `capabilities.drop: ALL`          | Bỏ mọi Linux capability (bind cổng thấp, đổi owner file...). Cổng 8080 không cần capability nào                     |
+| `automountServiceAccountToken`    | Không mount token gọi API server vào Pod; frontend không cần, mà token đó là thứ attacker tìm đầu tiên              |
+
+> **Cạm bẫy:** image `nginx` chính thức chạy bằng root và listen cổng 80; đặt `runAsNonRoot: true` cho nó là Pod không bao giờ lên (`CreateContainerConfigError`). Đổi sang `nginxinc/nginx-unprivileged` (listen 8080, chạy uid 101), sửa `containerPort` và `targetPort` của Service thành 8080, và `listen 8080;` trong `nginx.conf`. Với Next.js, Dockerfile ở [Phần 11](/blog/k8s-fe-11-nextjs-ssr-and-micro-frontends/) đã tạo user `nextjs` uid 1001, nên dùng `runAsUser: 1001` và mount emptyDir cho `/app/.next/cache` và `/tmp`.
+
+### Runtime config gặp read-only filesystem
+
+Script `docker-entrypoint.sh` của Phần 10 ghi `config.js` vào `/usr/share/nginx/html/`, giờ là thư mục chỉ đọc; container sẽ crash ngay khi khởi động với "Read-only file system". Cách sửa sạch: ghi vào `/tmp` (đã là emptyDir) và bảo nginx phục vụ từ đó:
+
+```sh
+# docker-entrypoint.sh: chỉ đổi đường dẫn
+CONFIG_FILE=/tmp/config.js
+```
+
+```nginx
+location = /config.js {
+    alias /tmp/config.js;
+    add_header Cache-Control "no-store";
+}
+```
+
+Kiểm chứng sau khi rollout:
+
+```bash
+kubectl -n web exec deploy/frontend -- id
+# uid=101(nginx) gid=101(nginx) groups=101(nginx)
+kubectl -n web exec deploy/frontend -- touch /usr/share/nginx/html/x
+# touch: /usr/share/nginx/html/x: Read-only file system
+kubectl -n web exec deploy/frontend -- sh -c 'grep CapEff /proc/1/status'
+# CapEff: 0000000000000000
+curl -s -H "Host: app.local" http://localhost/config.js   # vẫn ra window.__APP_CONFIG__
+```
+
+### Pod Security Admission: ép luật ở cửa API
+
+Thay vì trông chờ mọi người nhớ viết `securityContext`, gắn nhãn lên namespace để API server từ chối Pod không đạt chuẩn:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: web
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+Chuẩn `restricted` đòi đúng những gì manifest trên có: non-root, không leo thang quyền, drop ALL, seccomp RuntimeDefault. Apply lại Deployment cũ của Phần 10 (chạy root) vào namespace này, `kubectl get rs` sẽ thấy ReplicaSet không tạo được Pod và `kubectl describe rs` in lý do "violates PodSecurity restricted". Bắt đầu với `warn` trên namespace đang chạy để xem cảnh báo, rồi mới `enforce`.
+
+---
+
+## RBAC: ai được làm gì
+
+Kubernetes không có bảng user; danh tính đến từ chứng chỉ, token OIDC hoặc IAM của cloud, và RBAC chỉ trả lời "danh tính này được làm động từ nào lên tài nguyên nào trong namespace nào". Một `Role` cho frontend developer: xem được mọi thứ, deploy được, không xoá được:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: web
+  name: frontend-developer
+rules:
+  - apiGroups: ['', 'apps']
+    resources: ['pods', 'pods/log', 'deployments', 'services', 'configmaps']
+    verbs: ['get', 'list', 'watch']
+  - apiGroups: ['']
+    resources: ['pods/exec', 'pods/portforward']
+    verbs: ['create'] # kubectl exec và port-forward là hành động "create" lên subresource
+  - apiGroups: ['apps']
+    resources: ['deployments']
+    verbs: ['patch', 'update'] # cho phép deploy, không cho xoá
+  - apiGroups: ['apps']
+    resources: ['replicasets']
+    verbs: ['get', 'list'] # rollout undo cần đọc ReplicaSet
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fe-team-binding
+  namespace: web
+subjects:
+  - kind: User
+    name: nguyen.van.a@congty.com
+    apiGroup: rbac.authorization.k8s.io
+  - kind: Group
+    name: team-frontend # group từ OIDC/IAM: gắn cả team một lần
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: frontend-developer
+  apiGroup: rbac.authorization.k8s.io
+```
+
+Không có `secrets` trong danh sách đọc: FE dev không cần đọc `SESSION_SECRET` của Next.js để làm việc, và `kubectl get secret -o yaml` là cách rò rỉ nhàm chán nhất. Với quyền đọc toàn namespace, Kubernetes có sẵn ClusterRole `view`; bind nó bằng RoleBinding là có quyền xem mà không phải liệt kê tài nguyên.
+
+Kiểm tra quyền, của mình và của người khác:
+
+```bash
+kubectl auth can-i delete deployments -n web                                  # no
+kubectl auth can-i --list -n web                                              # toàn bộ quyền trong namespace
+kubectl auth can-i patch deployments -n web --as=nguyen.van.a@congty.com      # yes: test binding không cần đăng nhập
+kubectl auth can-i get secrets -n web --as=nguyen.van.a@congty.com            # no
+```
+
+Trên cluster kind bạn là admin, nên `--as` là cách duy nhất để thấy RBAC hoạt động. ServiceAccount cho CI ở [Phần 16](/blog/k8s-fe-16-ci-cd-github-actions-gitops-argocd/) là cùng cơ chế, chỉ khác `subjects.kind`.
+
+---
+
+## NetworkPolicy: tường lửa giữa các Pod
+
+Mặc định, mọi Pod ở mọi namespace gọi được nhau. Pod frontend bị chiếm có thể `curl http://postgres.data:5432` như bất kỳ Pod nào. NetworkPolicy là danh sách cho phép ở tầng mạng, chọn Pod bằng label như mọi thứ khác trong Kubernetes.
+
+Chính sách cho frontend: chỉ Ingress Controller được gọi vào; đi ra chỉ được DNS và backend:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-policy
+  namespace: web
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        # Chỉ cho Ingress Controller gọi vào frontend
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+      ports:
+        - { protocol: TCP, port: 8080 }
+  egress:
+    # Cho phép DNS, nếu không mọi tên miền nội bộ đều "could not resolve"
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Chỉ cho gọi sang backend (Next.js SSR gọi API nội bộ; SPA nginx thực ra không cần egress nào)
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: backend }
+      ports:
+        - { protocol: TCP, port: 3000 }
+```
+
+Đọc policy này như đọc luật firewall: `podSelector` là "áp cho ai", `policyTypes` là "chiều nào", mỗi phần tử trong `ingress`/`egress` là một luật cho phép, và **cái gì không được liệt kê thì bị chặn** ngay khi có ít nhất một policy chọn trúng Pod. Nhãn `kubernetes.io/metadata.name` được Kubernetes tự gắn lên mọi namespace, nên chọn namespace theo tên luôn hoạt động.
+
+Để "không liệt kê thì chặn" áp cho cả những Pod chưa có policy riêng, thêm một policy default-deny cho namespace, **sau khi** đã có luật cho phép của từng app:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: web
+spec:
+  podSelector: {} # mọi Pod trong namespace
+  policyTypes: [Ingress, Egress]
+```
+
+> **Cạm bẫy:** NetworkPolicy chỉ là **khai báo**; thứ thực thi là CNI plugin. CNI mặc định của kind (kindnet) và một số cấu hình cluster không thực thi, nghĩa là bạn apply xong, `kubectl get networkpolicy` hiện đủ, mà Pod vẫn gọi nhau thoải mái. Trên kind, tạo cluster với `networking.disableDefaultCNI: true` trong `kind-config.yaml` rồi cài Calico (manifest theo docs Calico đúng phiên bản). Trên cloud, hỏi DevOps CNI nào đang chạy trước khi tin vào policy. Kiểm chứng luôn bằng thực nghiệm: một Pod `netshoot` ở namespace `default` chạy `curl -m 3 http://frontend.web:8080/healthz` phải **timeout**, còn `curl -H "Host: app.local" http://localhost/` qua Ingress phải 200. Probe của kubelet không bị policy chặn nên readiness vẫn pass.
+
+Với Next.js SSR gọi API bên ngoài (Stripe, CMS headless), thêm một luật egress `ipBlock` với `cidr: 0.0.0.0/0` và `except` các dải IP nội bộ (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`); đó là cách nói "ra Internet được, nhưng không được lang thang trong mạng nội bộ".
+
+---
+
+## Image và supply chain
+
+Ba thói quen rẻ mà chặn được phần lớn rủi ro:
+
+**Tag bất biến, hoặc digest.** `:latest` và `:main` có thể bị thay ruột mà không ai biết. Deploy `sha-a1b2c3d` như Phần 16, hoặc ghim digest `ghcr.io/my-org/frontend@sha256:...` khi cần chắc tuyệt đối (ArgoCD Image Updater và Renovate cập nhật digest tự động).
+
+**Quét lỗ hổng trong CI.** Trivy quét image (OS package của Alpine, `node_modules` trong image Next.js) và fail pipeline khi có CVE nghiêm trọng:
+
+```yaml
+- uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: ghcr.io/my-org/frontend:sha-${{ github.sha }}
+    severity: CRITICAL,HIGH
+    exit-code: '1'
+    ignore-unfixed: true # bỏ qua CVE chưa có bản vá
+```
+
+Chạy local: `brew install trivy && trivy image ghcr.io/my-org/frontend:v1.5.0`. Kết quả đầu tiên thường làm bạn giật mình vì base image cũ; nâng `nginx:1.27-alpine` lên bản mới nhất là hết một nửa danh sách. Đặt Renovate hoặc Dependabot theo dõi `FROM` trong Dockerfile để không phải nhớ.
+
+**Không cài gì lúc chạy.** Image chứa đúng `dist/` và nginx; không `npm install`, không `curl | sh` trong entrypoint. Multi-stage build ở [Phần 4](/blog/k8s-fe-04-dockerfile-registry-compose/) đã đảm bảo điều này, `readOnlyRootFilesystem` khoá luôn khả năng làm khác đi.
+
+---
+
+## Security header: đặt ở app hay ở Ingress
+
+| Header                      | Giá trị gợi ý cho SPA                                   | Chặn gì                    |
+| --------------------------- | ------------------------------------------------------- | -------------------------- |
+| `Content-Security-Policy`   | `default-src 'self'; connect-src 'self' https://api...` | XSS, script lạ             |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains`                   | Hạ cấp xuống HTTP          |
+| `X-Frame-Options`           | `SAMEORIGIN` (hoặc CSP `frame-ancestors`)               | Clickjacking               |
+| `X-Content-Type-Options`    | `nosniff`                                               | Đoán sai MIME              |
+| `Referrer-Policy`           | `strict-origin-when-cross-origin`                       | Rò URL nội bộ qua Referer  |
+| `Permissions-Policy`        | `camera=(), microphone=(), geolocation=()`              | API trình duyệt không dùng |
+
+Phần 10 đặt header qua annotation `configuration-snippet` của ingress-nginx. Cách đó có hai vấn đề: phiên bản ingress-nginx mới **tắt snippet mặc định** vì lý do bảo mật (`allow-snippet-annotations: false`; bật lại là việc của cluster admin), và header nằm ở hạ tầng thì không test được bằng `docker run` ở local. Khuyến nghị: đặt header trong `nginx.conf` của image, để nó đi cùng app qua mọi môi trường:
+
+```nginx
+server {
+    listen 8080;
+    root /usr/share/nginx/html;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https://api.congty.com; frame-ancestors 'none'" always;
+
+    location / { try_files $uri $uri/ /index.html; }
+}
+```
+
+HSTS để ingress-nginx lo: nó tự thêm header này cho host có TLS (cấu hình qua ConfigMap của controller, khoá `hsts`). Một bẫy nginx đáng nhớ: `add_header` trong một `location` **thay thế toàn bộ** danh sách `add_header` kế thừa từ `server`; location nào có `add_header` riêng (như `/config.js` ở trên) phải lặp lại các header bảo mật, hoặc gom chúng vào một file và `include` ở mỗi chỗ. Chi tiết ở [Nginx · Phần 4](/blog/nginx-04-tls-security-and-performance/).
+
+---
+
+## Checklist bảo mật cho frontend trên K8s
+
+| Mục                                                                               | Kiểm chứng bằng                                                                      |
+| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Không có secret trong image, trong biến `NEXT_PUBLIC_*` / `VITE_*`, hay trong Git | `grep -r "sk_live\|AKIA" dist/`; `git log -p -S "SECRET"`                            |
+| Dùng tag image bất biến, không dùng `:latest`                                     | `kubectl get deploy -A -o jsonpath` lọc image có `:latest`                           |
+| Quét lỗ hổng image bằng Trivy hoặc Snyk trong CI                                  | Pipeline có bước fail khi CRITICAL                                                   |
+| Container chạy non-root, filesystem read-only nếu có thể                          | `kubectl exec -- id`; `kubectl exec -- touch /x` bị từ chối                          |
+| Đặt đủ `resources.limits` để một Pod không ngốn hết node                          | `kubectl get pods -o jsonpath` không có container thiếu limits; QoS không BestEffort |
+| Security header: CSP, HSTS, X-Frame-Options, X-Content-Type-Options               | `curl -I https://app.congty.com` đủ bốn header                                       |
+| HTTPS bắt buộc, ép redirect từ HTTP                                               | `curl -I http://app.congty.com` trả 301/308 sang https                               |
+| RBAC theo nguyên tắc đặc quyền tối thiểu                                          | `kubectl auth can-i --list --as=<user>` không có `delete` ngoài ý muốn               |
+| NetworkPolicy default-deny, mở đúng flow                                          | Pod ngoài namespace `curl` frontend bị timeout                                       |
+| Bật audit log và cảnh báo cho thao tác nguy hiểm (xoá namespace, sửa RBAC)        | Hỏi DevOps: audit policy của API server, alert từ log                                |
+
+Dòng cuối thường thuộc về cluster admin; chín dòng trên bạn tự làm được hết trong một buổi.
+
+---
+
+## Chi phí: nói thẳng
+
+| Phương án                          | Chi phí/tháng (ước tính)          | Công sức vận hành           |
+| ---------------------------------- | --------------------------------- | --------------------------- |
+| S3 + CloudFront / Cloudflare Pages | 0 – 20 USD                        | Gần như bằng 0              |
+| Vercel / Netlify                   | 0 – 20 USD (gói team khoảng 100+) | Rất thấp                    |
+| VPS + Docker Compose               | 10 – 40 USD                       | Thấp                        |
+| Managed K8s (EKS / GKE / AKS)      | 150 – 500+ USD                    | Cao, cần người chuyên trách |
+
+Con số là ước tính để so sánh bậc độ lớn; giá thật kiểm tra ở bảng giá hiện tại của từng nhà cung cấp. Điều đáng hiểu là **vì sao** dòng cuối cao hơn hai bậc:
+
+- **Phí control plane** tính theo giờ dù bạn chạy một Pod hay một nghìn Pod.
+- **Node** phải có ít nhất hai (ba nếu muốn `topologySpreadConstraints` có ý nghĩa), và mỗi node mất một phần cho kubelet, CNI, metrics-server, ingress-nginx trước khi app của bạn chạy.
+- **LoadBalancer** trước Ingress Controller là một dòng tiền riêng, cộng băng thông ra Internet (egress) mà CDN thường rẻ hơn nhiều.
+- **Monitoring** (Prometheus + Grafana + Loki) ăn thêm một node nếu tự host.
+- **Người**: quản trị cluster, nâng cấp version mỗi vài tháng, trực sự cố. Đây là chi phí lớn nhất và không có trong hoá đơn cloud.
+
+Với một SPA tĩnh, toàn bộ số đó mua cho bạn thứ mà CDN đã có sẵn miễn phí: phục vụ file tĩnh, HTTPS, chống DDoS ở edge. Cách deploy SPA lên S3 + CloudFront ở [AWS cho Frontend Developer · Phần 4](/blog/aws-fe-04-s3-where-your-build-lives/) và lên Cloudflare Pages ở [Cloudflare cho Frontend Developer · Phần 8](/blog/cloudflare-fe-08-cloudflare-pages-free-hosting/) đều chưa tới một giờ.
+
+### Khi KHÔNG nên dùng K8s cho frontend
+
+- Chỉ có một SPA tĩnh, không SSR → CDN rẻ hơn, nhanh hơn, đơn giản hơn rất nhiều.
+- Team dưới 5 người, không ai có kinh nghiệm vận hành hạ tầng.
+- Traffic thấp và ổn định, không cần autoscale.
+- Sản phẩm đang ở giai đoạn MVP, ưu tiên tốc độ ra tính năng.
+
+### Khi NÊN dùng K8s cho frontend
+
+- Công ty đã vận hành backend trên K8s → dùng chung hạ tầng, CI/CD, monitoring, quy trình; frontend là thêm một Deployment, không phải thêm một nền tảng.
+- Cần SSR/ISR với logic server phức tạp, cần kiểm soát runtime Node.js (memory, số instance, warm-up).
+- Nhiều app frontend (micro-frontend, nhiều sản phẩm) cần quản lý thống nhất.
+- Yêu cầu tuân thủ: dữ liệu phải ở trong mạng nội bộ, on-premise, không được đi qua CDN bên thứ ba.
+- Cần kiểm soát sâu về mạng, bảo mật, hoặc chạy đa cloud.
+
+Có một phương án lai rất phổ biến mà cả hai danh sách trên chưa nói: **asset tĩnh lên CDN, SSR trên Kubernetes**. Next.js đẩy `/_next/static/` lên S3/Cloudflare qua `assetPrefix`, Pod chỉ render HTML; bạn có cả cache toàn cầu lẫn runtime kiểm soát được, và HPA ([Phần 14](/blog/k8s-fe-14-rollout-strategies-and-autoscaling/)) chỉ phải lo phần render.
+
+> **Lời khuyên nghề nghiệp:** ngay cả khi dự án của bạn không cần K8s, kiến thức K8s vẫn rất đáng học. Nó là ngôn ngữ chung của hạ tầng hiện đại và là kỹ năng được trả giá cao. Nhưng khi ra quyết định kiến trúc, hãy chọn công cụ vừa với bài toán, đừng chọn theo xu hướng. Biết rõ lý do mình chọn (hoặc không chọn) K8s là dấu hiệu của kỹ sư trưởng thành, và là câu trả lời tốt nhất bạn có thể đưa ra trong một buổi phỏng vấn senior.
+
+---
+
+## Thực hành
+
+1. **Làm cứng container.** Đổi Dockerfile của SPA sang `nginxinc/nginx-unprivileged:1.27-alpine`, `listen 8080`, config.js ghi vào `/tmp`. Apply Deployment trong bài (nhớ `targetPort: 8080` ở Service). Chạy bốn lệnh kiểm chứng.
+
+   > **Kết quả mong đợi:** `uid=101`, `touch` báo Read-only file system, `CapEff` toàn số 0, `/config.js` vẫn trả đúng nội dung, trang vẫn mở qua `app.local`.
+
+2. **Pod Security Admission.** Gắn nhãn `enforce: restricted` lên namespace `web`, rồi apply lại Deployment gốc của Phần 10 với tên khác (`frontend-old`).
+
+   > **Kết quả mong đợi:** Deployment tồn tại nhưng `kubectl get rs` cho `frontend-old` có DESIRED 3, CURRENT 0; `kubectl describe rs` in "violates PodSecurity".
+
+3. **RBAC.** Apply Role và RoleBinding, chạy bốn lệnh `kubectl auth can-i` với `--as=nguyen.van.a@congty.com`. Thử thêm `kubectl auth can-i create pods/exec -n web --as=...` và giải thích vì sao là `yes`.
+
+4. **NetworkPolicy (cần CNI thực thi).** Tạo cluster `fe-lab-np` với `disableDefaultCNI: true`, cài Calico theo docs, cài ingress-nginx và deploy lại app. Apply `frontend-policy` rồi `default-deny`. Từ `kubectl run tmp --rm -it --image=nicolaka/netshoot -- bash` ở namespace `default`, `curl -m 3 http://frontend.web:8080/healthz` phải timeout; `curl -H "Host: app.local" http://localhost/` từ máy bạn vẫn 200. Xoá luật DNS trong egress của Next.js (nếu có) và quan sát lỗi "could not resolve" để nhớ vì sao cần nó.
+
+5. **Trivy.** `trivy image` image của bạn, đọc bảng CVE, nâng base image và quét lại. Ghi lại số CVE trước/sau.
+
+6. **Bài tập không cần cluster.** Điền bảng chi phí cho dự án thật của bạn với bốn phương án, kèm một đoạn ba câu "vì sao chọn". Đây là tài liệu bạn sẽ dùng khi ai đó hỏi "sao không lên K8s".
+
+---
+
+## Tóm tắt
+
+- `securityContext` hai tầng: Pod (`runAsNonRoot`, `runAsUser`, `fsGroup`, seccomp) và container (`allowPrivilegeEscalation: false`, `readOnlyRootFilesystem`, `drop ALL`); nginx cần image `nginx-unprivileged` cổng 8080 và emptyDir cho cache, run, tmp.
+- Runtime config với filesystem chỉ đọc: ghi `config.js` vào `/tmp`, nginx `alias` ra.
+- Pod Security Admission `restricted` trên namespace ép mọi Pod đạt chuẩn; bắt đầu bằng `warn`.
+- RBAC: Role đọc mọi thứ trừ Secret, patch/update Deployment, không delete; kiểm bằng `kubectl auth can-i --as`.
+- NetworkPolicy: cho phép Ingress Controller vào, DNS và backend ra, rồi default-deny; chỉ có tác dụng khi CNI thực thi, luôn kiểm bằng `curl` thật.
+- Tag bất biến, Trivy trong CI, không cài gì lúc chạy; security header đặt trong `nginx.conf` của image, HSTS để ingress-nginx lo.
+- Managed K8s tốn hai bậc so với CDN vì control plane, node, LB và người; SPA tĩnh thuần thì lên CDN; K8s khi công ty đã chuẩn hoá trên nó, cần SSR phức tạp, nhiều app hoặc yêu cầu tuân thủ.
+
+## Đọc thêm
+
+- [Configure a Security Context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/)
+- [Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
+- [Using RBAC Authorization](https://kubernetes.io/docs/reference/access-authn-authz/rbac/)
+- [Network Policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/)

@@ -1,0 +1,245 @@
+---
+title: 'Cloudflare cho Frontend Developer · Phần 11 — Debug và sổ tay lỗi 5xx, 1xxx'
+description: 'Lỗi ở Cloudflare hay ở origin? Quy trình chẩn đoán năm bước, bảng mã lỗi 520–526 và 1xxx, bộ lệnh curl, dig, openssl nên thuộc, và bảng tra cứu triệu chứng từ ERR_TOO_MANY_REDIRECTS tới JavaScript vỡ sau khi bật Cloudflare.'
+pubDate: 2026-10-28
+lang: vi
+tags: [cloudflare, devops, debugging, networking, frontend]
+series: cloudflare-fe
+seriesOrder: 11
+draft: false
+---
+
+import HostingDiagram from '~/components/blog/HostingDiagram.astro';
+
+Web lỗi. Trang trắng, hoặc một trang màu cam có logo Cloudflare và một mã 5xx, hoặc DevTools đỏ lòm với lỗi CORS. Bạn có ba nghi phạm: code của bạn, máy chủ, và cái lớp Cloudflare vừa thêm vào tuần trước. Câu hỏi đầu tiên luôn là **lỗi ở Cloudflare hay ở origin?** Trả lời sai câu này là mất cả buổi sửa nhầm chỗ: sửa CORS ở backend trong khi WAF đang chặn, restart nginx trong khi bản ghi A trỏ sai IP, purge cache trong khi trình duyệt đang giữ bản cũ.
+
+Bài này cho bạn cách trả lời trong vòng một phút: quy trình năm bước, bảng mã lỗi 5xx và 1xxx của Cloudflare kèm cách sửa, bộ lệnh `curl`, `dig`, `openssl` nên thuộc, và một bảng tra cứu triệu chứng gom mọi lỗi đã gặp trong mười phần trước về một chỗ.
+
+<HostingDiagram
+  kind="debug-tree"
+  caption="Sáu tầng kiểm tra theo thứ tự từ ngoài vào trong: đăng ký tên miền, câu trả lời DNS, kết nối được không, TLS, HTTP và proxy, rồi mới tới ứng dụng. Dừng ở tầng đầu tiên sai."
+/>
+
+## Đọc trang lỗi trước khi làm bất cứ gì
+
+Trang lỗi cho bạn manh mối đầu tiên, miễn phí:
+
+- **Trang có logo và màu của Cloudflare, có mã lỗi (520–526, 1xxx) và dòng "Ray ID"**: lỗi phát sinh ở Cloudflare, hoặc Cloudflare không gọi được origin. Trang này thường vẽ ba ô Browser – Cloudflare – Host và đánh dấu ô nào hỏng; mục "What happened?" nói thẳng nguyên nhân bằng một câu. Ray ID là mã của đúng request đó; ghi lại nếu cần hỏi support hoặc đối chiếu với log.
+- **Trang lỗi của ứng dụng bạn, của Hostinger, của nginx** (trang 404 của React Router, "502 Bad Gateway" kiểu nginx, trang trắng có stack trace): request **đã tới** origin và lỗi ở origin. Cloudflare vô can, trừ khi origin lỗi vì thứ Cloudflare gửi xuống (ví dụ backend không đọc `X-Forwarded-Proto` nên tưởng đang HTTP).
+- **Trình duyệt tự báo** (`ERR_TOO_MANY_REDIRECTS`, `ERR_SSL_VERSION_OR_CIPHER_MISMATCH`, `NET::ERR_CERT_COMMON_NAME_INVALID`): lỗi ở chặng trình duyệt ↔ Cloudflare hoặc ở vòng lặp giữa hai chặng; xem bảng triệu chứng cuối bài.
+
+Với SPA có thêm một dạng "lỗi giả": `fetch` nhận về **HTML** thay vì JSON. Trong DevTools nó hiện ra là `SyntaxError: Unexpected token '<'` ở dòng `response.json()`, hoặc lỗi CORS nếu API ở subdomain khác. Cả hai đều có thể là trang lỗi hay trang thử thách của Cloudflare đội lốt; mở tab Network, bấm vào request, nhìn tab Response — thấy HTML của Cloudflare là biết.
+
+---
+
+## Quy trình chẩn đoán năm bước
+
+### ① Trang lỗi trông như thế nào?
+
+Trả lời theo mục trên. Trang của Cloudflare thì đi tiếp bước ②; trang của ứng dụng thì mở log origin, Cloudflare không phải chỗ để tìm.
+
+### ② Bật đám mây xám tạm thời, chờ vài phút, thử lại
+
+Đây là phép thử mạnh nhất trong bài. Chuyển bản ghi A hoặc CNAME sang DNS only: người dùng kết nối thẳng tới origin, mọi tính năng Cloudflare (cache, WAF, rules, Worker, SSL mode) đều tắt.
+
+- **Vẫn lỗi** → lỗi ở **origin**. Cloudflare vô can.
+- **Hết lỗi** → lỗi do **cấu hình Cloudflare**: SSL mode, một rule, một Worker, Rocket Loader, Bot Fight Mode… Bước ③ và ⑤ sẽ khoanh vùng.
+
+Nhớ bật lại cam sau khi xong. Trong lúc xám, IP origin lộ và site không có cache, không có chống DDoS. Nếu origin dùng Origin Certificate của Cloudflare (Phần 5), lúc xám trình duyệt sẽ báo lỗi chứng chỉ — đó là hành vi đúng thiết kế chứ không phải lỗi mới; hãy thử bằng `curl -k` thay vì trình duyệt.
+
+### ③ Đọc header
+
+```bash
+curl -sI https://example.com
+```
+
+Ba câu hỏi: có `cf-ray` không (request có đi qua Cloudflare không)? `cf-cache-status` là gì (đang xem bản cache hay bản mới)? `server: cloudflare` hay `server: nginx`? Không có `cf-ray` nghĩa là request không hề tới Cloudflare — DNS đang trỏ thẳng origin, hoặc bạn đang gọi nhầm hostname.
+
+### ④ So sánh với truy cập thẳng origin
+
+```bash
+curl -sI https://example.com --resolve example.com:443:203.0.113.45
+```
+
+`--resolve` bảo curl: "với `example.com` cổng 443, dùng IP này, đừng hỏi DNS". Bạn bỏ qua Cloudflare hoàn toàn mà vẫn gửi đúng header `Host` và SNI, nên shared hosting vẫn nhận ra site. Thêm `-k` nếu origin dùng Origin Certificate. Origin trả 200 mà qua Cloudflare trả 5xx → nhìn vào cấu hình Cloudflare (SSL mode, firewall chặn IP Cloudflare). Origin cũng lỗi → sửa origin.
+
+### ⑤ Xem Cloudflare Security Events
+
+Dashboard → **Security → Events**. Lọc theo đường dẫn, IP của bạn, hoặc khoảng thời gian. Mỗi dòng cho biết request bị hành động gì (Block, Managed Challenge, Skip) bởi dịch vụ nào (Custom rule, Rate limiting, Bot Fight Mode, Managed ruleset). Đây là nơi duy nhất trả lời được "vì sao webhook của tôi bị 403" — [Phần 10](/blog/cloudflare-fe-10-security-and-performance/) đã nói vì sao những lỗi này hay đội lốt lỗi CORS.
+
+Nếu tài khoản của bạn có công cụ **Trace** (Account → Trace), nó cho phép mô phỏng một request tới một URL và liệt kê rule, Worker, cache setting nào sẽ khớp, theo đúng thứ tự thực thi. Rất hợp với câu hỏi "vì sao Worker của tôi không chạy với đường dẫn này" — câu trả lời thường là một Redirect Rule đã cắt ngang ở bước trước.
+
+---
+
+## Mã lỗi 5xx của Cloudflare
+
+Sáu mã này (cộng 526) do Cloudflare sinh ra khi nó **không lấy được response hợp lệ từ origin**. Chúng khác với 500/502/503 do chính origin trả về, thứ Cloudflare chỉ chuyển tiếp nguyên trạng kèm trang lỗi của origin.
+
+| Mã  | Nghĩa                               | Nguyên nhân và cách sửa                                                                                                                                                                                                                                                     |
+| --- | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 520 | Origin trả về phản hồi không hợp lệ | Origin trả response rỗng, header sai chuẩn, header quá lớn (cookie phình to là thủ phạm quen thuộc), hoặc reset kết nối giữa chừng. Xem log origin; thường là lỗi code backend hoặc web server crash đúng lúc trả lời.                                                      |
+| 521 | Origin từ chối kết nối              | Máy chủ đang tắt, web server không chạy, hoặc tường lửa origin chặn IP Cloudflare. Kiểm tra dịch vụ có chạy không (`systemctl status nginx`) và tường lửa có cho phép dải IP Cloudflare không.                                                                              |
+| 522 | Hết thời gian chờ kết nối           | Cloudflare bắt tay TCP không xong. Thường là tường lửa chặn im lặng (drop thay vì reject), máy chủ quá tải, hoặc sai IP trong bản ghi A.                                                                                                                                    |
+| 523 | Không tới được origin               | Bản ghi DNS trỏ tới IP không tồn tại hoặc không định tuyến được. Kiểm tra lại IP trong bảng DNS.                                                                                                                                                                            |
+| 524 | Origin không trả lời kịp            | Kết nối thành công nhưng origin xử lý quá lâu; giới hạn khoảng 100 giây (docs hiện tại ghi 125 giây, chỉ Enterprise nâng được). Tác vụ dài phải chuyển sang mô hình bất đồng bộ: trả về ngay một job id rồi để frontend hỏi lại, đừng bắt người dùng chờ trong một request. |
+| 525 | Bắt tay SSL thất bại                | Đang ở Full hoặc Full (strict) nhưng origin không nhận HTTPS ở cổng 443, hoặc cấu hình TLS không tương thích (không hỗ trợ SNI, cipher quá cũ). Kiểm tra bằng `openssl s_client` tới IP origin.                                                                             |
+| 526 | Chứng chỉ origin không hợp lệ       | Full (strict) nhưng chứng chỉ origin hết hạn, tự ký, hoặc sai tên miền. Cài chứng chỉ hợp lệ hoặc Origin Certificate — xem [Phần 5](/blog/cloudflare-fe-05-ssl-tls-modes-and-redirect-loop/).                                                                               |
+
+Cách nhớ: 521–523 là **không nối được** (theo thứ tự: bị từ chối, không ai trả lời, không tìm thấy đường); 524 là **nối được nhưng chờ mãi**; 525–526 là **nối được nhưng TLS hỏng**; 520 là **nói chuyện được nhưng câu trả lời vô nghĩa**.
+
+Nếu bạn thấy trang lỗi Cloudflare với mã 502, 503 hay 504 cùng Ray ID, hãy mở trang trạng thái của Cloudflare (`cloudflarestatus.com`) trước khi đụng vào origin: hiếm, nhưng đôi khi lỗi thật sự nằm ở một PoP.
+
+Với 521 và 522 trên VPS, lệnh kiểm tra tường lửa nhanh nhất là từ chính máy chủ:
+
+```bash
+# Web server có đang nghe 443 không?
+sudo ss -ltnp | grep ':443'
+# Tường lửa có cho phép 443 từ dải IP Cloudflare không? (ufw)
+sudo ufw status numbered
+# Danh sách dải IP chính thức để cho phép
+curl -s https://www.cloudflare.com/ips-v4
+```
+
+---
+
+## Mã lỗi 1xxx
+
+Mã 1xxx là lỗi do **cấu hình hoặc chính sách ở Cloudflare**, không liên quan tới sức khoẻ origin. Chúng đi kèm mã HTTP 403, 429 hoặc 5xx tuỳ loại.
+
+| Mã               | Nghĩa                           | Cách xử lý                                                                                                                                    |
+| ---------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1000             | DNS trỏ tới IP bị cấm           | Bản ghi A trỏ vào chính IP Cloudflare (thường do copy kết quả `dig` của một tên miền đang proxy), gây vòng lặp. Sửa lại thành IP origin thật. |
+| 1001             | Lỗi phân giải DNS               | CNAME trỏ tới tên miền không phân giải được, hoặc Worker gọi `fetch` tới hostname không tồn tại. Kiểm tra đích của CNAME bằng `dig`.          |
+| 1006, 1007, 1008 | IP của bạn bị chặn              | Một IP Access Rule của zone chặn IP này. Xem Security → WAF → Tools.                                                                          |
+| 1010             | Bị chặn theo chữ ký trình duyệt | Browser Integrity Check không thích User-Agent của client. Hay gặp với script và webhook tối giản; tắt tính năng hoặc tạo Skip.               |
+| 1015             | Bị giới hạn tốc độ              | Rule rate limiting của bạn đang chặn (HTTP 429). Xem lại ngưỡng; nhớ cả một văn phòng sau NAT là một IP.                                      |
+| 1016             | Lỗi DNS của origin              | Cloudflare không phân giải được hostname origin: CNAME trỏ tới tên đã bị xoá, hoặc route Worker gắn vào hostname chưa có bản ghi DNS.         |
+| 1020             | Bị chặn bởi WAF rule            | Vào Security → Events, tìm request bị chặn, xem rule nào. Đây là lỗi hay gặp khi bật rule quá chặt; trình duyệt thấy 403.                     |
+| 1101             | Worker ném exception            | Code Worker lỗi runtime: đọc thuộc tính của `undefined`, quên `return`, hàm không trả `Response`. Mở `wrangler tail` rồi tái hiện.            |
+| 1102             | Worker vượt giới hạn tài nguyên | Quá CPU time hoặc quá số subrequest cho phép. Giảm việc trong Worker, hoặc chuyển phần nặng về backend.                                       |
+
+Hai mã cuối là của [Phần 9](/blog/cloudflare-fe-09-workers-code-at-the-edge/); ba mã 1006–1008 và 1010 ít gặp với chủ site nhưng hay gặp khi bạn là **khách** của một site khác dùng Cloudflare — biết để không đổ lỗi cho mạng công ty.
+
+---
+
+## Bộ lệnh nên thuộc
+
+```bash
+# Header đầy đủ, theo dõi cả chuỗi chuyển hướng (-L) — bắt vòng lặp 301
+curl -sIL https://example.com 2>&1 | grep -iE "^(HTTP|location|server|cf-ray|cf-cache-status)"
+
+# Kiểm tra trạng thái cache của một file
+curl -sI https://example.com/assets/main.js | grep -iE "cf-cache-status|cache-control|age"
+
+# Gọi thẳng origin, bỏ qua Cloudflare hoàn toàn (thêm -k nếu origin dùng Origin Certificate)
+curl -sI https://example.com --resolve example.com:443:203.0.113.45
+
+# Xem chứng chỉ nào đang được phục vụ ở edge (issuer là Cloudflare / Google Trust / Let's Encrypt)
+echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+
+# Xem chứng chỉ ở origin (đây là thứ Full (strict) kiểm tra)
+echo | openssl s_client -connect 203.0.113.45:443 -servername example.com 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+
+# DNS: nameserver, IP, bản ghi mail
+dig example.com NS +short
+dig example.com +short
+dig example.com MX +short
+dig @1.1.1.1 example.com +short      # hỏi DNS công cộng, bỏ qua cache máy mình
+
+# Đo thời gian từng giai đoạn
+curl -s -o /dev/null -w \
+  "dns:%{time_namelookup}s tls:%{time_appconnect}s ttfb:%{time_starttransfer}s total:%{time_total}s\n" \
+  https://example.com
+
+# Mô phỏng preflight CORS
+curl -sI -X OPTIONS https://api.example.com/orders \
+  -H "Origin: https://example.com" \
+  -H "Access-Control-Request-Method: POST"
+```
+
+### Đọc kết quả đo thời gian
+
+Lệnh `-w` in bốn mốc tích luỹ. Cách suy luận:
+
+| Quan sát                                             | Nghĩa là                                                                                                                       |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `dns` cao (hơn 0,1 s)                                | Resolver của bạn chậm hoặc TTL vừa hết; hiếm khi do Cloudflare. Thử `dig @1.1.1.1`.                                            |
+| `tls` trừ `dns` cao                                  | Bắt tay TLS chậm: PoP xa (so ba chữ cuối `cf-ray` với vị trí của bạn), hoặc client không resume được phiên.                    |
+| `ttfb` cao trong khi `cf-cache-status: HIT`          | Vấn đề ở PoP hoặc ở mạng giữa bạn và PoP, không phải origin.                                                                   |
+| `ttfb` cao và `cf-cache-status: MISS` hoặc `DYNAMIC` | Origin chậm. Chạy lại lệnh với `--resolve` tới IP origin để đo thẳng; nếu cũng chậm thì tối ưu backend, không phải Cloudflare. |
+| `total` trừ `ttfb` cao                               | Response lớn hoặc nén chưa bật; kiểm tra `content-encoding: br` và kích thước file.                                            |
+
+Chạy hai lần liên tiếp: lần một thường là MISS (Cloudflare đi lấy), lần hai phải là HIT và `ttfb` tụt hẳn. Không tụt thì file đó không được cache — xem lại phần mở rộng và `Cache-Control` ở [Phần 6](/blog/cloudflare-fe-06-cache-old-version-after-deploy/).
+
+Nếu bạn muốn thành thạo `curl` và `jq` cho mọi API chứ không chỉ Cloudflare, [bài về debug HTTP bằng curl và jq](/blog/dev-cli-06-http-api-debugging-curl-jq/) đi sâu hơn.
+
+---
+
+## Bảng tra cứu triệu chứng
+
+| Triệu chứng                                           | Nguyên nhân thường gặp                                                                               | Kiểm tra bằng                                                                             |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `ERR_TOO_MANY_REDIRECTS`                              | SSL mode Flexible + origin ép HTTPS                                                                  | Đổi sang Full (strict). `curl -sIL` thấy chuỗi 301 lặp lại. Xem Phần 5.                   |
+| Đổi DNS mà không thấy hiệu lực                        | Đang sửa trong hPanel Hostinger trong khi nameserver đã trỏ về Cloudflare                            | `dig example.com NS +short` — thấy `ns.cloudflare.com` thì bảng DNS đúng nằm ở Cloudflare |
+| Mất email                                             | Bản ghi MX bị proxy (cam), hoặc bị quên không nhập lại                                               | `dig example.com MX +short` — phải ra máy chủ mail, không phải IP Cloudflare              |
+| Deploy xong vẫn bản cũ                                | Cache edge chưa purge; hoặc HTML lỡ bị đặt `max-age` dài nên trình duyệt giữ                         | `curl -sI` xem `cf-cache-status` và `age`; xem `Cache-Control` của HTML                   |
+| F5 ở route con bị 404                                 | Thiếu SPA fallback                                                                                   | Thêm `_redirects` (Pages) hoặc đoạn rewrite trong `.htaccess`                             |
+| Lỗi 521 / 522                                         | Tường lửa origin chặn IP Cloudflare; máy chủ tắt                                                     | Gọi thẳng origin bằng `--resolve`; kiểm tra dịch vụ và tường lửa                          |
+| JavaScript vỡ sau khi bật Cloudflare                  | Rocket Loader                                                                                        | Tắt Rocket Loader, purge HTML, thử lại                                                    |
+| Webhook / API bên ngoài bị chặn                       | Bot Fight Mode hoặc WAF rule                                                                         | Security → Events, tìm request bị chặn                                                    |
+| Log server toàn IP giống nhau                         | Đó là IP Cloudflare — đúng như thiết kế                                                              | Đọc header `CF-Connecting-IP` ở backend (Phần 3)                                          |
+| Subdomain hai cấp lỗi chứng chỉ                       | Universal SSL chỉ phủ một cấp wildcard (`*.example.com`, không phủ `a.b.example.com`)                | Đổi cấu trúc subdomain hoặc dùng Advanced Certificate (trả phí)                           |
+| Website chỉ lỗi ở một số người                        | Một PoP có vấn đề, hoặc cache khác nhau giữa các PoP                                                 | So `cf-ray` của người lỗi và người không lỗi; purge by URL                                |
+| Gọi API bị báo CORS dù backend cấu hình đúng          | Trang chặn hay thử thách của Cloudflare không có header CORS                                         | Network → Response của request đó; Security → Events                                      |
+| `response.json()` báo `Unexpected token '<'`          | Nhận HTML (trang lỗi, thử thách, hoặc `index.html` từ SPA fallback bắt nhầm `/api/*`)                | Xem header `cf-mitigated`, `content-type`; kiểm tra thứ tự rule trong `_redirects`        |
+| Worker deploy xong không chạy                         | Hostname của route chưa có bản ghi DNS đang cam; hoặc một Redirect Rule đã trả 301 trước bước Worker | `dig` hostname; xem thứ tự thực thi ở Phần 7; Trace nếu có                                |
+| Cảnh báo mixed content trong Console                  | HTML còn link `http://`                                                                              | Bật Automatic HTTPS Rewrites; sửa link trong code                                         |
+| Origin thấy toàn request HTTP dù người dùng vào HTTPS | Backend không tin proxy                                                                              | Đọc `X-Forwarded-Proto`; Express: `app.set('trust proxy', true)`                          |
+
+Bảng này cố ý lặp lại vài dòng đã có ở các phần trước: khi web đang lỗi, bạn cần một chỗ tra, không cần nhớ lỗi nào nằm ở phần nào. Nếu tình huống của bạn là chuyển hosting đang chạy sang chỗ mới mà không được gián đoạn, [bài về migration không downtime và debug](/blog/hosting-10-zero-downtime-migration-debugging/) có checklist riêng cho việc đó.
+
+---
+
+## Debug từ DevTools: ba header, một tab
+
+Không phải lúc nào cũng có terminal. Trong Chrome DevTools → Network, bấm vào request tài liệu HTML, tab Headers:
+
+- `cf-ray: 8a1b2c3d4e5f6789-HAN` — request đi qua Cloudflare, phục vụ từ PoP Hà Nội. Không có header này thì Cloudflare không nằm trên đường đi.
+- `cf-cache-status` — HIT/MISS/DYNAMIC/BYPASS, đọc như Phần 6.
+- `cf-mitigated: challenge` — response này là trang thử thách, không phải nội dung của bạn.
+
+Bật **Disable cache** ở tab Network khi debug để loại trừ cache trình duyệt; nhưng nhớ rằng người dùng của bạn không bật nó, nên một HTML lỡ `max-age` dài vẫn là lỗi thật dù bạn không tái hiện được. Thêm cột **Protocol** để thấy `h2`/`h3`, và cột **Remote Address** để xác nhận IP là của Cloudflare (`104.x`, `172.67.x`) hay của origin.
+
+---
+
+## Thực hành — tự gây lỗi rồi tự sửa (45 phút)
+
+1. **1020.** Tạo WAF Custom Rule: `URI Path starts with /debug-test` với hành động Block. Mở `https://example.com/debug-test` trong trình duyệt: trang 1020, DevTools thấy 403 và body là HTML của Cloudflare. Gọi cùng URL bằng `fetch` từ Console của trang chủ, quan sát lỗi hiện ra thế nào. Vào Security → Events tìm đúng request. Xoá rule.
+2. **1015.** Với rule rate limiting ở Phần 10, chạy vòng lặp `curl` 8 lần vào `/login`, ghi lại mã 429 và thời điểm được thả.
+3. **So sánh edge và origin.** Chạy lệnh `--resolve` tới IP origin và lệnh thường, so `server`, `cf-ray`, `Cache-Control`. Nếu origin dùng Origin Certificate, quan sát `curl` không có `-k` báo lỗi chứng chỉ — và giải thích được vì sao.
+4. **Đo thời gian.** Chạy lệnh `-w` hai lần với một asset có hash và một lần với `/`. Ghi ba bộ số; giải thích khác biệt bằng `cf-cache-status`.
+5. **Chứng chỉ hai chặng.** Chạy hai lệnh `openssl s_client` (tới edge và tới origin), so `issuer` và `notAfter`. Ghi lại chứng chỉ nào sẽ hết hạn trước và ai gia hạn nó.
+6. **Nếu có VPS: 521.** Dừng nginx (`sudo systemctl stop nginx`), tải lại trang, đọc trang 521 và Ray ID; bật lại, xác nhận hết lỗi. Sau đó chặn cổng 443 với mọi IP trừ máy bạn bằng ufw, tải lại — bạn sẽ thấy 521 hoặc 522 tuỳ tường lửa reject hay drop. Gỡ rule tường lửa.
+
+> **Kết quả mong đợi:** bạn nhìn một trang lỗi là biết nó do Cloudflare hay do origin; tái hiện được 1020 và 1015 rồi tìm thấy chúng trong Security → Events; đọc được `cf-ray`, `cf-cache-status`, `cf-mitigated` trong DevTools; và giải thích được khác biệt giữa `curl` thường và `curl --resolve`.
+
+---
+
+## Tóm tắt
+
+- Câu hỏi đầu tiên luôn là "lỗi ở Cloudflare hay ở origin?"; trang lỗi có Ray ID là Cloudflare, trang lỗi của ứng dụng là origin.
+- Năm bước: nhìn trang lỗi → tạm chuyển xám → đọc header → so với `--resolve` thẳng origin → xem Security → Events.
+- 521–523 là không nối được origin, 524 là chờ quá lâu (khoảng 100–125 giây), 525–526 là TLS chặng hai hỏng, 520 là response vô nghĩa.
+- 1000 là bản ghi A trỏ vào IP Cloudflare, 1001/1016 là CNAME không phân giải, 1015 là rate limit của chính bạn, 1020 là WAF rule, 1101/1102 là Worker lỗi hoặc quá tải.
+- Bộ lệnh: `curl -sIL` bắt vòng lặp, `curl -sI` đọc cache, `--resolve` bỏ qua Cloudflare, `openssl s_client` xem chứng chỉ hai chặng, `dig` cho NS/A/MX, `-w` đo thời gian, `OPTIONS` mô phỏng preflight.
+- Với SPA, request bị chặn hiện ra như lỗi CORS hoặc lỗi parse JSON; tab Response và header `cf-mitigated` vạch mặt nó.
+- Bảng triệu chứng gom mọi lỗi của series về một chỗ; khi web đang lỗi, tra bảng trước, nhớ sau.
+
+## Đọc thêm
+
+- [Cloudflare 5xx errors](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/) — trang chi tiết từng mã 520–526
+- [Cloudflare 1xxx errors](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/)
+- [Cloudflare SSL/TLS docs](https://developers.cloudflare.com/ssl/) — cho 525, 526 và chế độ mã hoá
+- [Cloudflare Cache docs](https://developers.cloudflare.com/cache/) — ý nghĩa từng giá trị `cf-cache-status`

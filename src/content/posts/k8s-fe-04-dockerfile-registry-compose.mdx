@@ -1,0 +1,389 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 4 — Dockerfile chuẩn cho frontend, registry và Docker Compose'
+description: 'Dockerfile multi-stage cho React/Vue/Vite ra image khoảng 25 MB, nginx.conf cho SPA với try_files, .dockerignore, quy ước tên và tag image, push lên ghcr.io, imagePullSecrets, và Docker Compose như bước đệm trước K8s.'
+pubDate: 2026-10-09
+lang: vi
+tags: [kubernetes, docker, nginx, devops, frontend]
+series: k8s-fe
+seriesOrder: 4
+draft: false
+---
+
+import DockerDiagram from '~/components/blog/DockerDiagram.astro';
+
+Bạn đã chạy được container nginx ở [Phần 3](/blog/k8s-fe-03-yaml-and-container-fundamentals/). Giờ là lúc đóng gói chính app của bạn: viết một Dockerfile mà build ra image khoảng 25 MB thay vì 1.2 GB, kèm `nginx.conf` để F5 ở `/about` không ra 404, đẩy image đó lên registry để cluster kéo về được, và chạy thử cả frontend + API + database bằng Docker Compose để làm quen với ý tưởng "gọi nhau bằng tên" trước khi gặp Service của K8s.
+
+Đây là bài cuối của chặng nền tảng. Kết thúc bài, bạn có một image thật trên `ghcr.io` với tag bất biến, và mọi phần K8s từ phần 5 trở đi sẽ deploy chính image đó. Nếu bạn muốn một chặng Docker chậm hơn, series [Docker for Developers](/blog/docker-02-images-and-dockerfile/) trên blog đi kỹ từng chỉ thị Dockerfile; bài này tập trung vào đúng thứ frontend cần.
+
+## Viết Dockerfile chuẩn cho app frontend
+
+### Tư duy: hai giai đoạn khác nhau
+
+App frontend có hai pha hoàn toàn khác nhau:
+
+- **Pha build:** cần Node.js, npm, toàn bộ `node_modules` (có thể 500 MB trở lên), TypeScript, Vite, ESLint. Chỉ dùng một lần.
+- **Pha chạy:** chỉ cần một web server phục vụ file tĩnh trong `dist/` (khoảng 2 MB). Không cần Node, không cần `node_modules`.
+
+Nếu gộp cả hai vào một image, bạn sẽ có image 1.2 GB chứa đầy thứ không cần thiết, và mỗi thứ thừa là thêm thời gian pull, thêm lỗ hổng bảo mật, thêm bề mặt tấn công. Giải pháp là **multi-stage build**: stage 1 build bằng Node, stage 2 chỉ copy `dist/` sang một image nginx nhỏ. Mọi thứ của stage 1 bị bỏ lại.
+
+Với Next.js SSR thì khác: pha chạy vẫn cần Node, nhưng vẫn multi-stage để bỏ devDependencies và source. Phần 11 có Dockerfile riêng cho trường hợp đó; bài này lo SPA.
+
+### Dockerfile hoàn chỉnh cho React / Vue / Vite SPA
+
+```dockerfile
+# ---------- STAGE 1: BUILD ----------
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+# Copy manifest TRƯỚC để tận dụng cache layer
+COPY package*.json ./
+
+# npm ci nhanh và tất định hơn npm install (dùng đúng package-lock.json)
+RUN npm ci
+
+# Copy source code SAU
+COPY . .
+RUN npm run build
+# Kết quả nằm ở /app/dist (Vite) hoặc /app/build (CRA)
+
+# ---------- STAGE 2: RUNTIME ----------
+FROM nginx:1.27-alpine
+
+# Chỉ lấy thư mục dist từ stage builder. node_modules bị bỏ lại hoàn toàn.
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Cấu hình nginx riêng cho SPA
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+Đọc từng khối:
+
+- `FROM node:20-alpine AS builder` đặt tên stage để stage sau tham chiếu bằng `--from=builder`. Chọn `alpine` vì nhỏ; nếu app cần native module (`sharp`, `node-gyp`) mà alpine build lỗi, đổi sang `node:20-slim` (Debian, lớn hơn chút nhưng tương thích hơn).
+- `COPY package*.json ./` copy `package.json` và `package-lock.json`. Nếu dùng pnpm thì copy `pnpm-lock.yaml` và chạy `corepack enable && pnpm install --frozen-lockfile`; yarn thì `yarn.lock` và `yarn install --frozen-lockfile`. Ý tưởng không đổi: lockfile trước, source sau.
+- `RUN npm ci` cài đúng phiên bản trong lockfile, xoá `node_modules` cũ nếu có, và fail nếu lockfile lệch với `package.json`. Đó là hành vi bạn muốn trong build: tất định.
+- `COPY --from=builder /app/dist /usr/share/nginx/html` là toàn bộ điểm của multi-stage. Đường dẫn `/usr/share/nginx/html` là thư mục web root mặc định của image nginx, bạn đã `ls` nó ở phần 3. CRA xuất ra `build/` thay vì `dist/`, sửa đường dẫn cho khớp.
+- `EXPOSE 80` chỉ là ghi chú cho người đọc và công cụ; nó không tự mở cổng, bạn vẫn cần `-p` khi `docker run`.
+
+> **Ghi chú: vì sao `daemon off;`?** Container sống chừng nào tiến trình chính (PID 1) còn chạy. nginx mặc định tự đẩy mình vào chạy nền (daemon) rồi tiến trình gốc thoát; PID 1 kết thúc và container tắt ngay với trạng thái `Completed`. `-g "daemon off;"` bắt nginx chạy foreground. Nguyên tắc chung cho mọi container: tiến trình chính phải chạy foreground. Ở K8s, Pod chạy xong rồi `Completed` với một web server là dấu hiệu chắc chắn của lỗi này.
+
+Dạng `CMD ["nginx", "-g", "daemon off;"]` (mảng JSON, gọi là exec form) khác dạng `CMD nginx -g "daemon off;"` (shell form): exec form chạy nginx trực tiếp làm PID 1, shell form bọc nó trong `sh -c` và `sh` trở thành PID 1, nuốt mất `SIGTERM` mà K8s gửi khi tắt Pod (phần 2 đã nói về tín hiệu). Luôn dùng exec form.
+
+### File nginx.conf cho SPA
+
+```nginx
+server {
+  listen 80;
+  server_name _;
+  root /usr/share/nginx/html;
+  index index.html;
+
+  # Bật nén - giảm 70% dung lượng truyền tải
+  gzip on;
+  gzip_types text/plain text/css application/json application/javascript
+             application/xml text/javascript image/svg+xml;
+  gzip_min_length 1024;
+
+  # Asset có hash trong tên -> cache vĩnh viễn
+  location /assets/ {
+    expires 1y;
+    add_header Cache-Control "public, immutable";
+  }
+
+  # QUAN TRỌNG NHẤT: fallback về index.html cho client-side routing
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+
+  # index.html TUYỆT ĐỐI không được cache
+  location = /index.html {
+    add_header Cache-Control "no-cache, no-store, must-revalidate";
+  }
+
+  # Endpoint cho K8s health check
+  location /healthz {
+    access_log off;
+    return 200 "ok\n";
+  }
+}
+```
+
+Đọc từng khối theo thứ tự quan trọng:
+
+**`try_files $uri $uri/ /index.html;` là lời giải cho lỗi 404-khi-F5.** Dòng này nói với nginx: "tìm file thật trước (`$uri`), rồi thư mục (`$uri/`); không có thì trả `index.html` để React Router tự xử lý đường dẫn". Thiếu dòng này, mọi deploy SPA đều lỗi khi người dùng F5 hoặc mở link trực tiếp, vì `/users/123` không phải file nào trong `dist/`. Bấm link nội bộ vẫn chạy vì đó là History API, không có request nào ra server; chỉ khi request thật tới nginx thì mới lộ.
+
+**`location /assets/` với `immutable`.** Vite (và Webpack) đặt hash nội dung vào tên file: `main-a1b2c3.js`. Đổi nội dung là đổi tên, nên file cũ không bao giờ bị ghi đè và trình duyệt có thể cache một năm không cần hỏi lại. `immutable` bảo trình duyệt đừng revalidate ngay cả khi người dùng F5.
+
+**`location = /index.html` với `no-cache, no-store`.** `index.html` là điểm vào, không có hash trong tên, phải luôn mới để trỏ tới bundle mới. Đây là nguyên nhân số một của "deploy xong user vẫn thấy bản cũ" và "trang trắng sau deploy": `index.html` cũ bị cache, trỏ tới `main-abc.js` đã bị xoá. Vì `try_files` fallback thực hiện một internal redirect tới `/index.html`, khối `location = /index.html` cũng áp dụng cho mọi route SPA, nên `/users/123` cũng không bị cache. Phần 12 mở rộng thành chiến lược cache đầy đủ.
+
+**`gzip`** giảm khoảng 70% dung lượng JS/CSS truyền đi. `gzip_min_length 1024` bỏ qua file quá nhỏ (nén không đáng). Nếu có CDN đứng trước cluster, CDN thường nén lại; bật ở nginx vẫn không hại.
+
+**`/healthz`** trả `200 ok` không đụng vào filesystem, dùng cho readiness và liveness probe ở phần 8. `access_log off` để probe gọi mỗi 5 giây không làm rác log.
+
+Hai chi tiết nginx dễ vấp: `add_header` trong một `location` **thay thế hoàn toàn** các `add_header` ở tầng `server`, không kế thừa cộng dồn; nếu sau này bạn thêm security header ở tầng `server`, nhớ lặp lại chúng trong các `location` có `add_header` riêng. Và luôn kiểm tra cú pháp bằng `docker run --rm -v "$PWD/nginx.conf:/etc/nginx/conf.d/default.conf" nginx:1.27-alpine nginx -t` trước khi build, thay vì build xong mới thấy container chết. Bài [Nginx configuration model](/blog/nginx-02-configuration-model/) trên blog giải thích cách nginx chọn `location` và kế thừa directive.
+
+### File .dockerignore: đừng quên
+
+```text
+node_modules
+dist
+build
+.git
+.env
+.env.local
+*.log
+coverage
+.vscode
+README.md
+Dockerfile
+.dockerignore
+```
+
+Cú pháp giống `.gitignore`. Docker gửi toàn bộ thư mục hiện tại (build context) lên daemon trước khi build; `.dockerignore` loại những gì không cần.
+
+> **Cạm bẫy:** không có `.dockerignore`, lệnh `COPY . .` sẽ copy cả `node_modules` local (có thể build cho macOS ARM) đè lên `node_modules` vừa cài trong container (build cho Linux) → lỗi native module rất khó hiểu, kiểu `Error: Cannot find module '../build/Release/sharp-linux-x64.node'`. Ngoài ra nó làm build chậm gấp nhiều lần (gửi 500 MB context) và có nguy cơ đưa file `.env` chứa secret vào image, nơi bất kỳ ai `docker pull` được đều đọc được bằng `docker run image cat .env`.
+
+Ghi `dist` vào `.dockerignore` tưởng ngược đời (đó là thứ ta cần), nhưng `dist` được build lại bên trong stage 1, còn `dist` trên máy bạn có thể cũ hoặc build với biến môi trường khác. Mọi thứ trong image phải sinh ra từ Dockerfile, không phải từ trạng thái máy bạn.
+
+### Kiểm chứng kết quả tối ưu
+
+| Cách làm                                      | Dung lượng image |
+| --------------------------------------------- | ---------------- |
+| Một stage, `FROM node:20`, giữ `node_modules` | ~1.2 GB          |
+| Một stage, `node:20-alpine`                   | ~450 MB          |
+| Multi-stage + `nginx:alpine`                  | ~25 MB           |
+
+Image nhỏ hơn 40 lần nghĩa là: pull nhanh hơn, Pod khởi động nhanh hơn, scale nhanh hơn, tốn ít băng thông registry và ít lỗ hổng bảo mật hơn (ít package hệ thống hơn để bị CVE). Kiểm tra bằng `docker images my-app`; muốn xem layer nào chiếm bao nhiêu, cài `dive` (`dive my-app:v1`).
+
+Một lưu ý về kiến trúc CPU: Mac M-series build ra image ARM64. Cluster cloud thường chạy x86-64, kéo image ARM về sẽ lỗi `exec format error` và Pod `CrashLoopBackOff` không có log gì đáng đọc. Build đúng nền tảng bằng `docker build --platform linux/amd64 -t my-app:v1 .`, hoặc để CI (chạy trên x86) build thay bạn như phần 16. Bài [BuildKit, multi-platform và supply chain](/blog/docker-12-buildkit-multi-platform-supply-chain/) đi sâu hơn.
+
+---
+
+## Thực hành 1.5
+
+1. Tạo app mới: `npm create vite@latest my-app -- --template react-ts`, rồi `cd my-app && npm install`.
+2. Thêm React Router (`npm install react-router-dom`) với hai route `/` và `/about`, có link qua lại. Chạy `npm run dev`, xác nhận bấm link chuyển trang.
+3. Viết `Dockerfile`, `nginx.conf`, `.dockerignore` như trên, đặt ở thư mục gốc app.
+4. `docker build -t my-app:v1 .` rồi `docker images | grep my-app`. Kiểm tra dung lượng: phải dưới 50 MB.
+5. `docker run -d -p 8080:80 --name my-app my-app:v1`, mở `localhost:8080/about` rồi F5. Phải chạy được. Chạy `curl -I http://localhost:8080/assets/` với tên file JS thật (xem trong `docker exec my-app ls /usr/share/nginx/html/assets`) và đọc header `Cache-Control`.
+6. Thử xoá dòng `try_files`, build lại thành `my-app:v1-broken`, chạy ở cổng 8081, mở `/about` rồi F5 → thấy 404 của nginx. Rồi khôi phục. Đây là bài học đáng giá nhất của chặng nền tảng.
+7. Dọn dẹp: `docker rm -f my-app` và container broken.
+
+> **Kết quả mong đợi:** `docker images` cho thấy `my-app:v1` khoảng 25–45 MB. `curl -I http://localhost:8080/healthz` trả `200`. `curl -I http://localhost:8080/about` trả `200` (không phải 404) và có `Cache-Control: no-cache, no-store, must-revalidate`. Với bản broken, `/about` trả `404`.
+
+---
+
+## Image Registry: nơi cất giữ image
+
+Image build ở máy bạn nằm trên ổ cứng máy bạn. Cluster K8s (ở nơi khác) không thấy được. Bạn cần đẩy image lên **registry**, hệ thống lưu trữ image, hệt như npm registry lưu package. `docker push` tương đương `npm publish`, `docker pull` tương đương `npm install`.
+
+### Quy ước đặt tên image
+
+```text
+ghcr.io / cong-ty / my-frontend : v1.2.0
+   |         |          |           |
+registry   owner    tên image      tag
+```
+
+Ví dụ thực tế:
+
+```text
+docker.io/library/nginx:1.27-alpine                       # Docker Hub (mặc định)
+ghcr.io/my-org/web-app:v2.1.0                             # GitHub Container Registry
+123456.dkr.ecr.ap-southeast-1.amazonaws.com/web:sha-a1b2c3   # AWS ECR
+```
+
+Khi bạn viết `nginx:1.27-alpine` không có registry, Docker hiểu ngầm là `docker.io/library/nginx:1.27-alpine`. Docker Hub giới hạn số lần pull ẩn danh trong một khoảng thời gian; cluster nhiều node pull cùng lúc có thể vướng giới hạn này với lỗi `toomanyrequests`. Với image của chính bạn, dùng ghcr.io (miễn phí cho repo public, đi kèm GitHub) hoặc registry của cloud đang dùng (ECR, GCR/Artifact Registry) để gần cluster.
+
+### Quy tắc đặt tag: cực kỳ quan trọng
+
+> **Nguy hiểm:** KHÔNG BAO GIỜ dùng tag `:latest` trên production. `latest` chỉ là một cái tên, nó trỏ tới image nào thì không ai chắc. Khi Pod restart, nó có thể kéo về một image khác với image đang chạy → hai Pod cùng Deployment chạy hai version khác nhau. Và bạn không thể rollback vì không biết version cũ là gì. Hãy luôn dùng tag bất biến: `v1.2.3` hoặc `sha-a1b2c3d` (commit hash).
+
+Ba lý do kỹ thuật đằng sau quy tắc này:
+
+1. **Tag là con trỏ, không phải nội dung.** Cùng một tag có thể được push đè nhiều lần. Định danh nội dung thật là digest `sha256:...`; bạn thấy nó trong `docker images --digests`, và có thể ghim image bằng `ghcr.io/org/app@sha256:...` khi cần tuyệt đối chắc chắn.
+2. **`imagePullPolicy` của K8s đối xử với `latest` khác.** Nếu tag là `latest` (hoặc bỏ trống), K8s mặc định `imagePullPolicy: Always`, tức mỗi lần Pod khởi động là pull lại. Với tag khác, mặc định là `IfNotPresent`. Kết hợp với điểm 1, `latest` biến mỗi lần restart Pod thành một lần deploy ngẫu nhiên.
+3. **Deployment chỉ rollout khi Pod template đổi.** Nếu bạn push `latest` mới rồi `kubectl apply` cùng file YAML, không có gì đổi trong template nên K8s không làm gì cả. Bạn tưởng đã deploy nhưng Pod vẫn chạy bản cũ. Tag bất biến đổi theo mỗi bản build nên rollout luôn xảy ra, và `kubectl rollout history` có ý nghĩa.
+
+Cách lấy tag từ Git, dùng cả ở local lẫn CI:
+
+```bash
+TAG=sha-$(git rev-parse --short HEAD)
+docker build -t ghcr.io/ten-github/my-app:$TAG .
+```
+
+### Đẩy image lên GitHub Container Registry (miễn phí)
+
+```bash
+# 1. Tạo Personal Access Token trên GitHub với quyền write:packages (và read:packages)
+# 2. Đăng nhập
+echo $GITHUB_TOKEN | docker login ghcr.io -u TEN_GITHUB --password-stdin
+
+# 3. Gắn tag đúng chuẩn registry
+docker tag my-app:v1 ghcr.io/ten-github/my-app:v1.0.0
+
+# 4. Đẩy lên
+docker push ghcr.io/ten-github/my-app:v1.0.0
+
+# 5. Kiểm tra bằng cách kéo về
+docker pull ghcr.io/ten-github/my-app:v1.0.0
+```
+
+`--password-stdin` đọc token từ stdin thay vì đưa vào tham số dòng lệnh, để token không lọt vào lịch sử shell. Với GitHub Actions ở phần 16, `GITHUB_TOKEN` có sẵn, không cần tạo PAT. Sau khi push, package xuất hiện ở tab Packages trên profile GitHub của bạn; kiểm tra visibility ở đó (package mới có thể là private tuỳ cài đặt tài khoản, hãy xem trong settings của package).
+
+`docker tag` không copy gì, nó chỉ gắn thêm một tên vào cùng image ID. Bạn thấy hai dòng trong `docker images` với cùng `IMAGE ID`.
+
+### Registry riêng tư và imagePullSecrets
+
+Nếu image để private, cluster cần credential để pull. Bạn tạo một Secret kiểu `docker-registry` và khai báo trong Pod:
+
+```bash
+kubectl create secret docker-registry ghcr-creds \
+  --docker-server=ghcr.io \
+  --docker-username=TEN_GITHUB \
+  --docker-password=$GITHUB_TOKEN \
+  -n production
+```
+
+```yaml
+spec:
+  imagePullSecrets:
+    - name: ghcr-creds
+  containers:
+    - name: web
+      image: ghcr.io/ten-github/my-app:v1.0.0
+```
+
+Secret này nằm trong namespace, nên mỗi namespace deploy app private cần một bản. Với cluster cloud dùng registry cùng nhà (EKS với ECR, GKE với Artifact Registry), node thường được cấp quyền pull sẵn qua IAM và bạn không cần `imagePullSecrets`; kiểm tra với team DevOps.
+
+> **Cạm bẫy:** lỗi `ImagePullBackOff` có đúng 4 nguyên nhân: (1) sai tên image hoặc tag (gõ nhầm, tag chưa push), (2) image private mà thiếu `imagePullSecrets`, (3) token hết hạn hoặc thiếu quyền `read:packages`, (4) node không có mạng ra registry. Luôn kiểm tra theo thứ tự này. Lệnh chẩn đoán là `kubectl describe pod <ten>` và đọc dòng `Failed to pull image` ở phần Events: nó nói rõ `not found` (nguyên nhân 1), `unauthorized` / `denied` (nguyên nhân 2–3), hay `timeout` (nguyên nhân 4). Với kind ở local còn nguyên nhân thứ 5: quên `kind load docker-image`, phần 5 nói tiếp.
+
+---
+
+## Docker Compose: bước đệm trước K8s
+
+Compose cho phép chạy nhiều container cùng lúc bằng một file YAML. Nó không phải K8s nhưng dùng khái niệm gần giống, và là bước tập dượt rất tốt: bạn sẽ thấy "gọi nhau bằng tên", "tách cấu hình ra biến môi trường", "volume để giữ dữ liệu" ở dạng đơn giản nhất trước khi gặp phiên bản K8s của chúng.
+
+```yaml
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - '8080:80'
+    depends_on:
+      - api
+
+  api:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./api:/app
+    command: npm start
+    environment:
+      DATABASE_URL: postgres://user:pass@db:5432/mydb
+    ports:
+      - '3000:3000'
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: mydb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+```
+
+```bash
+docker compose up -d              # khởi động tất cả
+docker compose logs -f frontend   # log của một service
+docker compose ps                 # trạng thái
+docker compose exec api sh        # chui vào một service
+docker compose down               # dừng và xoá container (volume pgdata vẫn còn)
+docker compose down -v            # xoá cả volume
+```
+
+<DockerDiagram
+  kind="compose-stack"
+  caption="Một file Compose dựng cả stack: các service nằm chung một network tự tạo, gọi nhau bằng tên service; volume có tên giữ dữ liệu của database qua các lần down/up."
+/>
+
+Đọc file này với con mắt sắp học K8s:
+
+- `frontend` dùng `build: ./frontend` (Compose tự build từ Dockerfile trong thư mục đó), `api` và `db` dùng `image:` có sẵn. Ở K8s không có `build`: mọi thứ phải là image trên registry, vì cluster không có source code của bạn.
+- `ports: "8080:80"` cùng nghĩa với `-p 8080:80` của `docker run`; nháy kép để YAML không hiểu `8080:80` là số kiểu giờ:phút (bẫy YAML 1.1 ở phần 3).
+- `volumes: ./api:/app` mount source code từ máy bạn vào container để sửa code là thấy ngay, đúng kiểu dev. Production không làm thế; K8s cũng không có khái niệm "thư mục máy bạn".
+- `depends_on` chỉ quyết định thứ tự khởi động, không chờ service kia sẵn sàng. `api` có thể lên trước khi Postgres nhận kết nối và crash lần đầu. Compose xử lý bằng `healthcheck` + `depends_on: { db: { condition: service_healthy } }`; K8s xử lý bằng readiness probe và init container (phần 6 và 8).
+
+> **Ghi chú, liên hệ tới K8s:** hãy để ý service `api` gọi database bằng tên `db` trong `DATABASE_URL`, không phải IP. Compose tạo một network riêng cho project và một DNS nội bộ ánh xạ tên service thành IP container. Đó chính xác là cách Service DNS hoạt động trong K8s, chỉ khác là ở quy mô nhiều máy. Nắm được điều này ở Compose, bạn sẽ hiểu Service của K8s trong 5 phút ở phần 7.
+
+### Compose và Kubernetes: bảng đối chiếu
+
+| Docker Compose               | Kubernetes tương đương                            |
+| ---------------------------- | ------------------------------------------------- |
+| `services:`                  | Deployment + Service                              |
+| `ports:`                     | Service + Ingress                                 |
+| `environment:`               | ConfigMap / Secret                                |
+| `volumes:`                   | PersistentVolumeClaim (hoặc emptyDir / configMap) |
+| `deploy.replicas`            | `spec.replicas`                                   |
+| `depends_on` + `healthcheck` | Readiness probe + init container                  |
+| Chạy trên 1 máy              | Chạy trên nhiều máy, tự phục hồi, tự cân bằng tải |
+
+Dòng cuối là lý do K8s tồn tại: Compose không biết làm gì khi máy chủ chết, khi cần 20 bản sao trên 5 máy, hay khi muốn thay version mà không có giây nào downtime. Phần 5 mở đầu bằng đúng bốn tình huống đó. Nếu bạn muốn dùng Compose nghiêm túc cho môi trường dev của team (profiles, healthcheck, nhiều file), hai bài [Compose fundamentals](/blog/docker-05-compose-fundamentals/) và [Compose in depth](/blog/docker-06-compose-in-depth-profiles-healthchecks/) trên blog là tài liệu đầy đủ; cho series này, mức ở trên là đủ.
+
+---
+
+## Thực hành 1.6 và 1.7
+
+Hai bài tập ngắn khép lại chặng nền tảng.
+
+**Đẩy image lên ghcr.io (bắt buộc, phần 5 sẽ dùng):**
+
+1. Tạo PAT trên GitHub (Settings → Developer settings → Personal access tokens) với quyền `write:packages`. Lưu vào biến shell: `export GITHUB_TOKEN=...` (không commit, không dán vào file trong repo).
+2. Đăng nhập, gắn tag, push và pull lại theo năm bước ở mục registry, dùng image `my-app:v1` từ Thực hành 1.5 và tag `v1.0.0`.
+3. Mở tab Packages trên GitHub, xác nhận package `my-app` xuất hiện với tag `v1.0.0`.
+
+> **Kết quả mong đợi:** `docker push` in các dòng `Pushed` cho từng layer và kết thúc bằng digest `sha256:...`. `docker pull` sau đó báo `Image is up to date`. Package hiện trên GitHub.
+
+**Compose (tuỳ chọn nếu bạn chỉ có 2 tuần):**
+
+1. Tạo thư mục `lab-compose/` với `docker-compose.yml` ở trên. Trong `api/`, tạo một app Express tối giản có route `/health` trả `ok` và `package.json` với script `start`; thư mục `frontend/` dùng lại app Vite kèm Dockerfile của Thực hành 1.5.
+2. `docker compose up -d`, rồi `docker compose ps`: ba service đều `running`.
+3. `docker compose exec api sh`, bên trong gõ `nslookup db` và `wget -O- http://db:5432` (sẽ báo lỗi giao thức nhưng chứng tỏ tên `db` phân giải được và cổng mở). Gõ `env | grep DATABASE` để thấy biến được nạp.
+4. `docker compose down`, rồi `up -d` lại: dữ liệu Postgres vẫn còn nhờ volume `pgdata`. Cuối cùng `docker compose down -v` để dọn sạch.
+
+> **Kết quả mong đợi:** `nslookup db` trả về một IP dạng `172.x.x.x`. `env` trong container `api` có `DATABASE_URL` với host là `db`. Bạn vừa thấy service discovery bằng tên, thứ K8s làm cho bạn ở phần 7.
+
+---
+
+## Kết thúc chặng nền tảng: bạn phải làm được
+
+- Gõ thành thạo hơn 20 lệnh Linux cơ bản (phần 2).
+- Giải thích được reverse proxy và vì sao SPA cần `try_files` (phần 2 và bài này).
+- Viết YAML không lỗi thụt lề (phần 3).
+- Viết Dockerfile multi-stage cho app FE, image dưới 50 MB.
+- Build, chạy, exec vào container, đọc log.
+- Push image lên ghcr.io.
+
+Nếu còn gạch đầu dòng nào chưa làm được, hãy quay lại trước khi sang [Phần 5](/blog/k8s-fe-05-architecture-local-cluster-kubectl/). Từ đó trở đi, mọi lỗi "K8s" thực ra là một trong sáu điều này chưa vững.
+
+## Tóm tắt
+
+- App frontend có pha build (cần Node, 500 MB `node_modules`) và pha chạy (nginx + 2 MB `dist`). Multi-stage build tách hai pha, cho image khoảng 25 MB thay vì 1.2 GB.
+- `CMD ["nginx", "-g", "daemon off;"]` dạng exec form: tiến trình chính phải chạy foreground và làm PID 1 để nhận `SIGTERM`.
+- `nginx.conf` cho SPA có bốn việc: `try_files` fallback về `index.html` (hết 404 khi F5), `/assets/` cache một năm `immutable`, `index.html` không cache, `/healthz` cho probe.
+- `.dockerignore` loại `node_modules`, `dist`, `.env`: tránh lỗi native module, build chậm và lộ secret vào image.
+- Tên image có bốn phần: registry / owner / tên : tag. Không dùng `:latest` trên production; tag bất biến (`v1.2.3`, `sha-a1b2c3d`) để rollout luôn xảy ra và rollback được.
+- Image private cần Secret `docker-registry` và `imagePullSecrets`. `ImagePullBackOff` có bốn nguyên nhân, kiểm tra theo thứ tự: tên/tag, thiếu secret, token, mạng.
+- Compose là K8s thu nhỏ trên một máy: service gọi nhau bằng tên, cấu hình qua `environment`, dữ liệu qua volume. Điều Compose không làm được (nhiều máy, tự phục hồi, zero-downtime) là lý do học K8s.
+
+## Đọc thêm
+
+- [Dockerfile reference](https://docs.docker.com/reference/dockerfile/) — đặc biệt mục `COPY --from`, `CMD` exec form, và `.dockerignore`.
+- [nginx documentation](https://nginx.org/en/docs/) — `try_files`, `expires`, `add_header`, `gzip`.
+- [Docker Compose](https://docs.docker.com/compose/) — `depends_on` với `condition`, `healthcheck`, profiles.
+- [Tối ưu và bảo mật image](/blog/docker-07-optimizing-securing-images/) trên blog này: chạy non-root, quét lỗ hổng, giảm dung lượng thêm nữa.

@@ -1,0 +1,291 @@
+---
+title: 'AWS cho Frontend Developer · Phần 7 — CloudFront: chiến lược cache, invalidation và SPA routing'
+description: 'Bảng Cache-Control chuẩn cho từng loại file, vì sao asset không bao giờ cần invalidate còn index.html thì có, dùng invalidation đúng liều, và hai cách sửa dứt điểm lỗi F5 bị 403/404 của SPA: Custom Error Response hoặc CloudFront Function.'
+pubDate: 2026-10-17
+lang: vi
+tags: [aws, devops, cloudfront, cache, deployment]
+series: aws-fe
+seriesOrder: 7
+draft: false
+---
+
+Hai câu hỏi xuất hiện trong mọi nhóm frontend mới lên AWS, và thường được "sửa" bằng cách xoá toàn bộ cache sau mỗi deploy: "vì sao deploy xong user vẫn thấy bản cũ?" và "vì sao F5 ở `/products/123` bị 403 còn click từ trang chủ thì được?". Cả hai đều có câu trả lời gọn, và câu trả lời không phải là invalidate `/*`.
+
+Bài này đưa bảng `Cache-Control` chuẩn cho từng loại file (bảng nên dán lên tường), giải thích cơ chế khiến asset có hash không bao giờ cần invalidate còn `index.html` thì có, hướng dẫn dùng invalidation đúng liều với giới hạn và chi phí thật, rồi sửa lỗi F5 bằng hai cách: Custom Error Response (nhanh, phổ biến) và CloudFront Function (chính xác, khuyến nghị khi có `/api/*` cùng distribution). Bạn sẽ hiểu cả ba lớp cache giữa S3 và màn hình người dùng, kể cả lớp hay bị quên nhất: Service Worker.
+
+## Chiến lược cache chuẩn cho frontend
+
+Bảng này giải quyết dứt điểm vấn đề "deploy xong user vẫn thấy bản cũ". Nó là giá trị `Cache-Control` bạn đặt lúc upload lên S3 ([phần 4](/blog/aws-fe-04-s3-where-your-build-lives/)); CloudFront và trình duyệt cùng đọc một header đó.
+
+| Loại file                                  | `Cache-Control`                       | Lý do                                                                                                                                |
+| ------------------------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `index.html`                               | `no-cache, must-revalidate`           | Là bản đồ trỏ tới asset. Phải luôn mới. Trả 304 nếu chưa đổi nên rất rẻ.                                                             |
+| `main-a3f9b2.js`, `style-c7e1.css`         | `public, max-age=31536000, immutable` | Tên chứa hash nội dung. Nội dung đổi → tên đổi → URL khác → không bao giờ trả nhầm. Cache 1 năm hoàn toàn an toàn.                   |
+| Ảnh, font trong `/assets/`                 | `public, max-age=31536000, immutable` | Như trên (nếu build tool có gắn hash; Vite gắn cho mọi thứ import từ code).                                                          |
+| Ảnh do user upload                         | `public, max-age=86400`               | Cân bằng. Hoặc gắn version vào key khi user đổi ảnh thì cache dài được ([phần 5](/blog/aws-fe-05-s3-presigned-url-and-versioning/)). |
+| `service-worker.js`                        | `no-cache`                            | Cache SW là lỗi rất khó gỡ: user kẹt ở bản cũ vĩnh viễn.                                                                             |
+| `/api/*`                                   | `no-store`                            | Dữ liệu động, thường có thông tin riêng từng user.                                                                                   |
+| `robots.txt`, `sitemap.xml`, `favicon.ico` | `public, max-age=3600`                | Ít đổi nhưng cần cập nhật được trong ngày. Không có hash trong tên.                                                                  |
+| `config.json` (cấu hình runtime)           | `no-store`                            | Đổi giá trị là phải có hiệu lực ngay ([phần 12](/blog/aws-fe-12-env-vars-build-time-runtime-secrets/)).                              |
+
+Nghĩa của từng directive, để bạn không copy mà không hiểu:
+
+- `max-age=N`: được coi là mới trong N giây, không cần hỏi lại. `s-maxage=N` giống vậy nhưng chỉ áp cho cache dùng chung (CloudFront), trình duyệt bỏ qua.
+- `public` / `private`: `private` cấm cache dùng chung lưu (CloudFront sẽ không cache), chỉ trình duyệt được lưu. Response có dữ liệu riêng của user mà lỡ cache được thì phải là `private` hoặc `no-store`.
+- `no-cache`: lưu được, nhưng mỗi lần dùng phải hỏi lại server bằng `If-None-Match`/`ETag`; server trả 304 nếu chưa đổi. Không phải "không cache".
+- `no-store`: không lưu ở đâu cả.
+- `must-revalidate`: khi đã hết hạn thì bắt buộc hỏi lại, không được dùng bản cũ "tạm". Đi cùng `no-cache` cho chắc.
+- `immutable`: báo trình duyệt rằng nội dung ở URL này không bao giờ đổi, nên ngay cả khi người dùng bấm reload cũng không cần hỏi lại. Chỉ dùng với file có hash.
+- `stale-while-revalidate=N`: được dùng bản cũ thêm N giây trong khi hỏi lại ngầm. CloudFront và trình duyệt hiện đại đều hiểu directive này; hữu ích cho ảnh upload hoặc HTML của trang SSG có lưu lượng lớn. Kiểm tra docs CloudFront về mức hỗ trợ trước khi dựa vào nó.
+
+Nền tảng HTTP caching ở mức trình duyệt đã có trong [Frontend caching deep dive](/blog/frontend-caching-deep-dive/); bài này chỉ nói phần CloudFront chồng lên đó.
+
+### Cơ chế này hoạt động thế nào khi deploy
+
+```text
+TRƯỚC DEPLOY                          SAU DEPLOY
+──────────────────                    ──────────────────────────────
+index.html (no-cache)                 index.html (no-cache)
+  └─► main-AAAA.js (cache 1 năm)        └─► main-BBBB.js (cache 1 năm)
+
+Người dùng quay lại trang:
+① Lấy index.html → CloudFront hỏi S3 "đổi chưa?" → ĐÃ ĐỔI → trả bản mới
+② HTML mới trỏ tới main-BBBB.js → URL chưa từng thấy → tải mới
+③ main-AAAA.js trong cache trình duyệt vẫn còn nhưng không ai dùng nữa
+
+→ KHÔNG CẦN INVALIDATION cho asset. Chỉ cần invalidate /index.html.
+```
+
+Đây là lý do pipeline ở [phần 13](/blog/aws-fe-13-ci-cd-github-actions-oidc-preview-environments/) chỉ invalidate hai path `/` và `/index.html`, gần như luôn miễn phí, và không bao giờ đụng `/*`.
+
+Với `index.html` có hai lựa chọn về phía CloudFront. `CachingDisabled` (như công thức ở [phần 6](/blog/aws-fe-06-cloudfront-cdn-behaviors-cache-key/)) đưa mọi request HTML xuống S3: đơn giản, luôn đúng, đổi lại mỗi lần tải trang tốn một chuyến về region (khoảng 40ms) và một request S3. Trang có lưu lượng lớn có thể chấp nhận `max-age=60` cho HTML: user thấy bản mới chậm nhất sau một phút, còn 99% request HTML thành `Hit`. Chọn cái nào là câu hỏi về sản phẩm, không phải kỹ thuật; đa số app nội bộ và trang cá nhân dùng `no-cache` là xong.
+
+### Ba lớp cache giữa S3 và màn hình
+
+Khi ai đó nói "vẫn thấy bản cũ", phải hỏi bản cũ đang nằm ở lớp nào:
+
+1. **CloudFront edge**: sửa bằng invalidation, hoặc đợi hết TTL. Nhìn `X-Cache` và `Age`.
+2. **HTTP cache của trình duyệt**: invalidation **không đụng tới lớp này**. Nếu `index.html` từng được upload với `max-age` dài, trình duyệt của người dùng sẽ giữ nó tới hết hạn bất kể bạn làm gì trên AWS. Cách duy nhất là chờ, hoặc đổi URL (không đổi được với `index.html`). Đây là lý do phải đặt đúng `no-cache` từ lần deploy đầu tiên.
+3. **Service Worker**: lớp nằm trước cả HTTP cache. Một SW cache `index.html` theo chiến lược cache-first sẽ phục vụ bản cũ mãi mãi, không có `X-Cache`, không có request nào rời máy. DevTools → Application → Service Workers để thấy nó.
+
+Nếu lỡ ship một SW hỏng, cách gỡ là deploy một SW "tự huỷ" ở đúng URL cũ (nhờ `service-worker.js` đã `no-cache`, trình duyệt sẽ lấy bản mới trong vòng 24 giờ):
+
+```js
+// service-worker.js — bản "tự huỷ": xoá mọi cache, tự gỡ đăng ký, tải lại tab
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    (async () => {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+      await self.registration.unregister();
+      const tabs = await self.clients.matchAll({ type: 'window' });
+      tabs.forEach((tab) => tab.navigate(tab.url));
+    })()
+  );
+});
+```
+
+---
+
+## Invalidation — dùng đúng liều
+
+```bash
+# Chỉ xoá cache cho HTML — đây là cách làm ĐÚNG, gần như luôn miễn phí
+aws cloudfront create-invalidation \
+  --distribution-id E1ABCDEFGHIJKL \
+  --paths "/index.html" "/"
+
+# Xoá tất cả — chỉ dùng khi thực sự cần (đổi cấu hình, sự cố)
+aws cloudfront create-invalidation \
+  --distribution-id E1ABCDEFGHIJKL \
+  --paths "/*"
+```
+
+| Điểm cần biết      | Chi tiết                                                                                                                                                            |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Chi phí            | 1.000 path đầu tiên mỗi tháng miễn phí. Sau đó tính phí theo từng path (vài phần nghìn USD một path, xem bảng giá hiện tại). `/*` tính là 1 path.                   |
+| Thời gian          | Thường 30 giây đến vài phút để lan khắp edge.                                                                                                                       |
+| Số lượng đồng thời | Có giới hạn invalidation đang chạy cùng lúc (theo docs hiện tại: vài nghìn path, và chỉ hơn chục invalidation có wildcard). Pipeline chạy liên tục có thể bị nghẽn. |
+| Nguyên tắc         | Đổi tên file (hash) tốt hơn invalidate. Invalidation chỉ nên dùng cho `index.html` và các file không có hash.                                                       |
+
+Vài chi tiết về path mà lần đầu ai cũng vấp:
+
+- Path phải bắt đầu bằng `/` và là path **của viewer**, không phải key S3 (nếu có origin path `/releases/abc`, vẫn invalidate `/index.html`).
+- `/` và `/index.html` là hai cache key khác nhau. Invalidate cả hai.
+- Wildcard `*` chỉ đứng ở cuối: `/assets/*` hợp lệ, `/*.html` không.
+- Nếu cache key có query string, phải invalidate cả biến thể (`/index.html?v=2`) hoặc dùng wildcard. Lý do nữa để không đưa query vào key của HTML.
+- Path có ký tự đặc biệt hoặc tiếng Việt phải URL-encode.
+
+Theo dõi invalidation trong pipeline, vì bước "kiểm tra sau deploy" chỉ có ý nghĩa sau khi invalidation xong:
+
+```bash
+ID=$(aws cloudfront create-invalidation \
+  --distribution-id E1ABCDEFGHIJKL \
+  --paths "/" "/index.html" \
+  --query 'Invalidation.Id' --output text)
+
+aws cloudfront wait invalidation-completed --distribution-id E1ABCDEFGHIJKL --id "$ID"
+
+aws cloudfront list-invalidations --distribution-id E1ABCDEFGHIJKL \
+  --query 'InvalidationList.Items[].{id:Id,status:Status,time:CreateTime}' --output table
+```
+
+> **Ghi chú:** Invalidation xoá cache ở edge, không xoá cache trong trình duyệt của người dùng và không xoá cache của Service Worker. Nếu sau khi invalidate mà bạn vẫn thấy bản cũ, mở cửa sổ ẩn danh hoặc `curl -sI` để loại hai lớp kia trước khi nghi CloudFront.
+
+Cùng nguyên lý này, [Cloudflare phần 6](/blog/cloudflare-fe-06-cache-old-version-after-deploy/) giải quyết "deploy xong vẫn bản cũ" bằng purge và cache rule; nếu bạn dùng cả hai nền tảng, hai bài đọc cùng nhau rất hợp.
+
+---
+
+## SPA routing — giải quyết lỗi F5 bị 403/404
+
+Đây là vấn đề mọi frontend dùng React Router hoặc Vue Router đều gặp.
+
+### Vì sao lỗi
+
+```text
+Người dùng click link trong app (client-side routing)
+→ React Router đổi URL bằng history.pushState
+→ KHÔNG có request nào rời trình duyệt → hoạt động bình thường ✓
+
+Người dùng nhấn F5 tại /products/123
+→ Trình duyệt gửi GET /products/123 lên CloudFront
+→ CloudFront hỏi S3: "có object key = products/123 không?"
+→ S3: "không" → trả 403 (với OAC) hoặc 404
+→ Người dùng thấy trang lỗi XML xấu xí ✗
+```
+
+Ở local bạn không thấy lỗi này vì dev server của Vite có sẵn "history API fallback": mọi path không phải file đều trả `index.html`. Trên AWS, S3 không làm việc đó, nên CloudFront phải làm.
+
+### Cách 1 — Custom Error Response (đơn giản, phổ biến nhất)
+
+Trong CloudFront → tab Error pages, tạo hai quy tắc:
+
+| HTTP Error Code | Customize Error Response | Response Page Path | HTTP Response Code | TTL |
+| --------------- | ------------------------ | ------------------ | ------------------ | --- |
+| 403 Forbidden   | Yes                      | `/index.html`      | 200                | 0   |
+| 404 Not Found   | Yes                      | `/index.html`      | 200                | 0   |
+
+Cần cả hai dòng vì bucket kín trả 403 cho file thiếu, còn nếu bạn thêm `s3:ListBucket` vào bucket policy thì nó trả 404 ([phần 4](/blog/aws-fe-04-s3-where-your-build-lives/)).
+
+> **Hai chi tiết sống còn:**
+>
+> 1. **Response code phải là 200**, không phải 403/404. Nếu để nguyên mã lỗi, Google sẽ không index trang, và một số thư viện (kể cả `fetch` với `res.ok`) sẽ coi là lỗi.
+> 2. **TTL = 0.** Nếu không, CloudFront cache cả trang lỗi theo TTL đó, và khi bạn sửa xong vẫn còn lỗi.
+
+Nhược điểm của cách này: ảnh hoặc API thật sự không tồn tại cũng trả về HTML của `index.html` với mã 200. Custom Error Response là cài đặt **cấp distribution**, áp cho mọi behavior, kể cả `/api/*`. Backend trả 404 cho `/api/orders/999` → CloudFront thay bằng `index.html` 200 → code frontend gọi `res.json()` và nổ `Unexpected token '<'`. Khi debug thấy response là HTML ở chỗ đáng lẽ là JSON, đây là thủ phạm. Nếu distribution của bạn có `/api/*`, dùng cách 2.
+
+### Cách 2 — CloudFront Function (chính xác hơn, khuyến nghị)
+
+Viết một hàm JavaScript nhỏ chạy ở edge, viết lại URL trước khi tới S3:
+
+```js
+function handler(event) {
+  var request = event.request;
+  var uri = request.uri;
+
+  // Có phần mở rộng file (.js, .css, .png...) → để nguyên, đi thẳng S3
+  if (uri.match(/\.[a-zA-Z0-9]+$/)) {
+    return request;
+  }
+
+  // Đường dẫn kết thúc bằng / → thêm index.html
+  if (uri.endsWith('/')) {
+    request.uri = uri + 'index.html';
+    return request;
+  }
+
+  // Còn lại là route của SPA → trả index.html
+  request.uri = '/index.html';
+  return request;
+}
+```
+
+Gắn function này vào **behavior mặc định** ở sự kiện **Viewer Request**. Ưu điểm: file ảnh không tồn tại vẫn trả 403/404 đúng nghĩa, chỉ có route mới rewrite; và vì gắn theo behavior, `/api/*` không bị ảnh hưởng. Đừng giữ Custom Error Response song song, nếu không nhược điểm của cách 1 quay lại.
+
+Hai trường hợp cần chỉnh regex:
+
+- **Route có dấu chấm**, ví dụ `/users/john.doe` hoặc `/files/report.v2`: regex trên coi `.doe` là phần mở rộng và gửi thẳng xuống S3 → 403. Thay bằng danh sách phần mở rộng thật của asset: `/\.(js|css|map|png|jpg|jpeg|gif|svg|webp|avif|ico|woff2?|ttf|json|txt|xml|webmanifest)$/`.
+- **Trang SSG không có trailing slash** (Next.js `output: 'export'` mặc định sinh `about.html` chứ không phải `about/index.html`): thêm nhánh thử `.html` trước khi rơi về SPA:
+
+```js
+// SSG: /about → /about.html (chỉ khi bạn build ra file .html rời)
+if (!uri.includes('.')) {
+  request.uri = uri + '.html';
+  return request;
+}
+```
+
+Với SSG nhiều trang, hãy quyết định một kiểu URL (có hoặc không có `/` cuối) ngay từ đầu và cấu hình build tool tương ứng (`trailingSlash: true` trong Next.js sinh `about/index.html`, khớp nhánh `endsWith('/')`). Trang 404 thật cho SSG (`404.html` với mã 404) thì cần Custom Error Response `403 → /404.html → 404`, chấp nhận nhược điểm đã nêu, hoặc Lambda@Edge ở Origin Response ([phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/)).
+
+Tạo, test và publish function bằng CLI (gắn vào behavior thì làm trong Console, vì `update-distribution` đòi gửi lại toàn bộ cấu hình kèm ETag):
+
+```bash
+aws cloudfront create-function \
+  --name spa-router \
+  --function-config Comment="SPA rewrite",Runtime=cloudfront-js-2.0 \
+  --function-code fileb://spa-router.js
+
+# Test với một request giả, xem uri sau khi rewrite
+cat > event.json <<'EOF'
+{ "version": "1.0", "context": { "eventType": "viewer-request" },
+  "viewer": { "ip": "1.2.3.4" },
+  "request": { "method": "GET", "uri": "/products/123", "headers": {}, "cookies": {}, "querystring": {} } }
+EOF
+ETAG=$(aws cloudfront describe-function --name spa-router --query 'ETag' --output text)
+aws cloudfront test-function --name spa-router --if-match "$ETAG" \
+  --stage DEVELOPMENT --event-object fileb://event.json \
+  --query 'TestResult.FunctionOutput' --output text
+
+aws cloudfront publish-function --name spa-router --if-match "$ETAG"
+```
+
+Router phía client cũng phải khớp với chỗ app được đặt: nếu app nằm ở `/app/`, React Router cần `basename="/app"` và Vite cần `base: '/app/'`, còn function ở trên rewrite về `/app/index.html`.
+
+---
+
+## Thực hành — Tái hiện và sửa lỗi F5 (30 phút)
+
+Các bước này cần một distribution trỏ vào bucket của bạn; Lab 4.1 ở [phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/) dựng nó và lồng sẵn các bước dưới đây. Nếu đã có distribution, làm ngay:
+
+1. Thêm một route trong React Router (ví dụ `/about`), build, deploy bằng `deploy.sh` ở phần 4. Mở trang chủ, click sang `/about`: chạy. Nhấn F5: lỗi 403 XML.
+2. Kiểm tra bằng `curl -sI https://dxxxx.cloudfront.net/about`: thấy `HTTP/2 403`, `content-type: application/xml`, `x-cache: Error from cloudfront`.
+3. Áp cách 1 (hai Custom Error Response). Chờ `Deployed`. `curl -sI` lại: `200`, `content-type: text/html`. Thử `curl -sI https://dxxxx.cloudfront.net/assets/khong-co.js`: cũng `200` và `text/html`. Đó là nhược điểm của cách 1.
+4. Xoá hai Custom Error Response, tạo và publish function `spa-router`, gắn vào behavior mặc định ở Viewer Request. `curl -sI` `/about` → `200 text/html`; `/assets/khong-co.js` → `403` như đúng nghĩa.
+5. Sửa một dòng chữ trong app, build, deploy. Tải trang: chưa thấy đổi (`x-cache: Hit` với `age` lớn hơn 0 trên `index.html` nếu bạn đang để TTL, hoặc trình duyệt còn giữ). Chạy invalidation `/index.html` và `/`, chờ `wait invalidation-completed`, tải lại: thấy đổi. Hãy cảm nhận kỹ khoảnh khắc này, nó là bài học quan trọng nhất của chương.
+6. Mở DevTools → Network, tải lại hai lần, quan sát `x-cache` của một file trong `/assets/` đổi từ `Miss` sang `Hit`, còn `index.html` là `Miss` hoặc `RefreshHit` mỗi lần.
+
+> **Kết quả mong đợi:** F5 ở route con trả 200 HTML; asset không tồn tại trả 403 (cách 2) thay vì HTML 200 (cách 1); bạn chứng kiến deploy mới chỉ có hiệu lực sau invalidation `/index.html`, trong khi file JS mới chưa từng cần invalidate vì tên đã đổi.
+
+---
+
+## Sai lầm hay gặp
+
+- **Upload `index.html` với `max-age` dài rồi mới sửa sau.** Invalidation không cứu được trình duyệt đã cache. Phải đúng từ lần đầu.
+- **Invalidate `/*` sau mỗi deploy trong CI.** Tốn tiền khi vượt 1.000 path, và pipeline chạy dồn dập sẽ kẹt vì giới hạn invalidation đồng thời. Hash asset + invalidate `/index.html` là đủ.
+- **Custom Error Response để mã 403/404 hoặc TTL khác 0.** SEO chết, hoặc trang lỗi bị cache.
+- **Giữ Custom Error Response khi đã có `/api/*` trong cùng distribution.** API 404 biến thành HTML 200, frontend nổ `Unexpected token '<'`. Chuyển sang CloudFront Function.
+- **Regex phần mở rộng quá rộng.** Route `/users/john.doe` bị coi là file. Dùng danh sách phần mở rộng thật.
+- **Service Worker cache `index.html` cache-first.** User kẹt vĩnh viễn, không có `X-Cache` để nhìn. `service-worker.js` phải `no-cache`, và biết cách ship bản tự huỷ.
+- **Quên `/` trong danh sách invalidation.** `/index.html` mới nhưng trang chủ (`/`) vẫn cũ.
+- **Đưa query string vào cache key của HTML.** `?utm_source=` tạo nghìn bản cache, mỗi bản cần invalidate riêng.
+
+---
+
+## Tóm tắt
+
+- `index.html`: `no-cache, must-revalidate`. Asset có hash: `public, max-age=31536000, immutable`. Ảnh upload: `max-age=86400` hoặc key có version. `service-worker.js`: `no-cache`. `/api/*` và `config.json`: `no-store`. `robots.txt`, `sitemap.xml`: `max-age=3600`.
+- `no-cache` là "hỏi lại rồi 304", `no-store` là "không lưu", `immutable` là "đừng hỏi lại kể cả khi reload".
+- Deploy mới = HTML mới trỏ tới tên file mới. Asset không bao giờ cần invalidate; chỉ `/index.html` và `/`.
+- Ba lớp cache: CloudFront edge (invalidation sửa được), HTTP cache trình duyệt (invalidation không đụng tới), Service Worker (lớp trước cả HTTP cache, cần bản SW tự huỷ nếu hỏng).
+- Invalidation: 1.000 path/tháng miễn phí, `/*` tính một path, có giới hạn đồng thời, path bắt đầu bằng `/` và theo góc nhìn viewer. Dùng `wait invalidation-completed` trong pipeline.
+- Lỗi F5: S3 không có key `products/123`. Cách 1 Custom Error Response 403/404 → `/index.html` → 200, TTL 0, nhưng áp cho cả `/api/*`. Cách 2 CloudFront Function ở Viewer Request của behavior mặc định: chính xác, không đụng API, cần regex phần mở rộng đúng.
+- Router client (`basename`), `base` của Vite và function rewrite phải cùng một tiền tố.
+
+[Phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/) khép lại chương CloudFront: so sánh CloudFront Functions với Lambda@Edge, thêm security header không cần code, bật nén, signed URL và signed cookie cho nội dung trả phí, sổ tay lỗi CloudFront, và Lab 4.1 dựng distribution hoàn chỉnh từ đầu.
+
+## Đọc thêm
+
+- [Amazon CloudFront Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/)
+- [Amazon S3 User Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/)
+- [Network caching cho web performance](/blog/web-perf-11-network-caching/) (bài trong blog này, phía trình duyệt)

@@ -1,0 +1,364 @@
+---
+title: 'AWS cho Frontend Developer · Phần 4 — S3: nơi file build thực sự nằm và cách upload đúng'
+description: 'S3 là object storage chứ không phải hệ thống file: bucket, key, metadata, vì sao không có thư mục thật, hai cách phục vụ file và cái 403 gây hiểu nhầm, OAC để bucket kín hoàn toàn, script sync hai bước với Cache-Control đúng từng loại file.'
+pubDate: 2026-10-08
+lang: vi
+tags: [aws, devops, s3, hosting, deployment]
+series: aws-fe
+seriesOrder: 4
+draft: false
+---
+
+Sau khi chạy `npm run build`, thư mục `dist/` phải đi đâu đó. Với 90% frontend trên AWS, nó đi vào một S3 bucket. Nghe đơn giản như "copy file lên server", nhưng S3 không phải server và cũng không phải ổ đĩa: nó không có thư mục, không tự tìm `index.html`, không đoán loại file, và mặc định trả 403 cho file không tồn tại. Mỗi khác biệt đó là một lỗi bạn sẽ gặp nếu không biết trước.
+
+Bài này đi qua mô hình dữ liệu của S3, hai cách S3 phục vụ file (chọn sai là hỏng cả kiến trúc), cách khoá bucket kín hoàn toàn bằng OAC mà CloudFront vẫn đọc được, và đoạn script upload hai bước với `Cache-Control` khác nhau cho asset và HTML mà bạn sẽ dùng mãi trong pipeline. Đọc xong, bạn hiểu vì sao `index.html` phải `no-cache` còn `main-a3f9.js` được cache một năm, và biết kiểm tra metadata của từng object bằng một lệnh.
+
+## Mô hình dữ liệu của S3
+
+S3 là "object storage", không phải hệ thống file. Khác biệt này quan trọng hơn bạn nghĩ:
+
+| Khái niệm    | Giải thích                                                                                                                                                                              |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Bucket**   | Một thùng chứa. Tên duy nhất trên toàn thế giới: nếu ai đó đã dùng thì bạn không dùng được. Đặt tên kiểu `congty-duan-moitruong`, ví dụ `acme-shop-frontend-prod`.                      |
+| **Object**   | Một file kèm metadata. Tối đa 5 TB.                                                                                                                                                     |
+| **Key**      | Tên đầy đủ của object, ví dụ `assets/main-a3f9b2.js`. Không có thư mục thật, dấu `/` chỉ là ký tự trong tên. Console hiển thị dạng thư mục cho dễ nhìn thôi.                            |
+| **Prefix**   | Phần đầu của key, dùng để lọc. `assets/` là một prefix.                                                                                                                                 |
+| **Metadata** | Đi kèm object: `Content-Type`, `Cache-Control`, `Content-Encoding`… Frontend phải quan tâm trực tiếp cái này, vì CloudFront và trình duyệt đọc nó để quyết định cache và cách hiển thị. |
+
+Vài luật về tên bucket bạn sẽ đụng ngay lần đầu: 3–63 ký tự, chỉ chữ thường, số và dấu gạch ngang, không có dấu gạch dưới, và **không đổi tên được** sau khi tạo. Tránh dấu chấm trong tên (`shop.example.com` làm tên bucket) vì URL HTTPS dạng `bucket.s3.amazonaws.com` sẽ không khớp chứng chỉ wildcard của S3.
+
+Metadata được ghi **lúc upload** và gắn chặt với object. Muốn đổi `Cache-Control` của một file đã có, bạn không "sửa thuộc tính" mà phải copy object đè lên chính nó với metadata mới (lệnh ở mục upload bên dưới). Đây là lý do phải đặt đúng ngay từ lệnh upload đầu tiên.
+
+Thư mục `dist/` của Vite ánh xạ sang key như sau:
+
+```text
+dist/index.html               →  key: index.html
+dist/assets/main-a3f9b2.js    →  key: assets/main-a3f9b2.js
+dist/assets/style-c7e1.css    →  key: assets/style-c7e1.css
+dist/favicon.svg              →  key: favicon.svg
+```
+
+Nếu app được phục vụ dưới một đường dẫn con (ví dụ `https://example.com/app/`), key phải có prefix `app/` và `vite.config.ts` phải đặt `base: '/app/'`, nếu không HTML sẽ trỏ tới `/assets/...` trong khi file nằm ở `app/assets/...`. Sai `base` là nguyên nhân thứ ba của "trang trắng, console báo 404 cho file JS" ([phần 14](/blog/aws-fe-14-monitoring-and-debug-handbook/)).
+
+> **Hệ quả của "không có thư mục thật":** S3 chỉ trả lời được câu hỏi "có object với key chính xác bằng chuỗi này không?". Nó không hiểu "tìm file mặc định trong thư mục" như Apache/Nginx. Đây là lý do gốc rễ khiến SPA bị lỗi khi refresh trang: `/products/123` không phải key nào cả. [Phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/) giải quyết.
+
+Tạo bucket và xem bên trong bằng CLI:
+
+```bash
+# Tạo bucket ở Singapore (region ngoài us-east-1 bắt buộc có LocationConstraint)
+aws s3api create-bucket \
+  --bucket acme-shop-frontend-prod \
+  --region ap-southeast-1 \
+  --create-bucket-configuration LocationConstraint=ap-southeast-1
+
+# Liệt kê key, xem metadata của một object
+aws s3 ls s3://acme-shop-frontend-prod/ --recursive --human-readable
+aws s3api head-object --bucket acme-shop-frontend-prod --key index.html
+```
+
+`head-object` là lệnh bạn sẽ chạy nhiều nhất trong bài này: nó in `ContentType`, `CacheControl`, `ContentLength`, `ETag`, `LastModified` của đúng một object, không qua CloudFront, không qua trình duyệt.
+
+---
+
+## Hai cách S3 phục vụ file — chọn sai là hỏng cả kiến trúc
+
+S3 có hai "cửa" để trình duyệt lấy file, và chúng khác nhau về mọi mặt:
+
+| Tiêu chí                          | Static Website Hosting                           | REST API Endpoint (khuyến nghị)                         |
+| --------------------------------- | ------------------------------------------------ | ------------------------------------------------------- |
+| Dạng URL                          | `bucket.s3-website-ap-southeast-1.amazonaws.com` | `bucket.s3.ap-southeast-1.amazonaws.com`                |
+| HTTPS                             | KHÔNG hỗ trợ                                     | Có                                                      |
+| Bucket phải public                | Có, rủi ro bảo mật                               | Không, dùng OAC, bucket kín hoàn toàn                   |
+| Tự tìm `index.html` trong thư mục | Có                                               | Không, chỉ khớp key chính xác                           |
+| File không tồn tại trả về         | 404                                              | 403 `AccessDenied` (nếu không có quyền `s3:ListBucket`) |
+| Có redirect rule                  | Có                                               | Không                                                   |
+| Dùng khi nào                      | Demo nhanh, không có tên miền, chấp nhận HTTP    | Mọi hệ thống thật, luôn đi kèm CloudFront               |
+
+Website endpoint là cái cửa "giống web server hơn": có index document, error document, redirect rule. Nhưng nó chỉ chạy HTTP và bắt bucket public. Bạn sẽ còn gặp kiến trúc cũ đặt CloudFront trước website endpoint (như một custom origin HTTP); nó chạy được, nhưng bucket vẫn public, ai cũng gọi thẳng S3 để bỏ qua cache và WAF được. Mọi thứ trong series này dùng REST endpoint + OAC.
+
+> **Ghi nhớ cái 403 này:** Với kiến trúc chuẩn (CloudFront + OAC + REST endpoint), file không tồn tại sẽ trả **403 chứ không phải 404**. Rất nhiều người mất cả buổi debug vì tưởng mình bị sai quyền, trong khi thực ra chỉ là gõ nhầm tên file. Và đây cũng là lý do cấu hình SPA fallback phải bắt cả 403 lẫn 404.
+
+Vì sao lại là 403: S3 chỉ "thú nhận" một key không tồn tại (404) khi người gọi có quyền `s3:ListBucket` trên bucket, vì có quyền liệt kê nghĩa là được phép biết cái gì có, cái gì không. Không có quyền đó, S3 trả 403 cho cả "không có quyền" lẫn "không có file", để không rò rỉ thông tin. Bucket policy OAC mặc định chỉ cấp `s3:GetObject`, nên mọi file thiếu đều là 403. Bạn có thể thêm `s3:ListBucket` vào policy đó để nhận 404 cho dễ debug; đổi lại, hãy đảm bảo distribution có Default root object để request `/` không thành lệnh liệt kê bucket.
+
+---
+
+## Bảo mật bucket: đừng bao giờ để public
+
+Cách làm đúng hiện nay là **OAC** (Origin Access Control): bucket chặn toàn bộ truy cập public, chỉ riêng CloudFront distribution của bạn được phép đọc.
+
+```text
+✗ CÁCH CŨ / SAI                    ✓ CÁCH ĐÚNG (OAC)
+──────────────────────             ─────────────────────────────────────
+Internet ──► S3 (public)           Internet ──► CloudFront ──► S3 (kín)
+                                                     │
+Ai cũng gọi thẳng S3 được:         Bucket policy chỉ cho phép
+- Bỏ qua WAF, bỏ qua cache         principal = cloudfront.amazonaws.com
+- Tốn tiền request S3              với điều kiện SourceArn = đúng
+- Lộ cấu trúc bucket               distribution của bạn
+```
+
+Ba lớp khoá đi cùng nhau:
+
+1. **Block all public access** (bốn ô trong tab Permissions): bật hết, giữ nguyên. Nó chặn mọi ACL và policy nào định mở public, kể cả khi ai đó sau này "lỡ tay".
+2. **Bucket policy** cho phép đúng một principal là dịch vụ CloudFront, với điều kiện đúng một distribution.
+3. **OAC** gắn trên origin của CloudFront: CloudFront ký từng request gửi tới S3 bằng SigV4, S3 kiểm tra chữ ký và đối chiếu policy.
+
+Bucket policy mà AWS tự sinh khi bạn bật OAC:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontServicePrincipal",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudfront.amazonaws.com" },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::acme-shop-frontend-prod/*",
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "arn:aws:cloudfront::123456789012:distribution/E1ABCDEFGHIJKL"
+        }
+      }
+    }
+  ]
+}
+```
+
+Điều kiện `SourceArn` rất quan trọng: không có nó, **bất kỳ CloudFront distribution nào của bất kỳ ai** cũng đọc được bucket của bạn, vì principal `cloudfront.amazonaws.com` là chung cho mọi tài khoản AWS. Kẻ khác chỉ cần tạo distribution trỏ vào bucket bạn là có toàn bộ nội dung, và bạn còn trả tiền request.
+
+Bạn sẽ thấy tên cũ **OAI** (Origin Access Identity) trong tài liệu và dự án cũ. OAC là bản thay thế: hỗ trợ mọi region, hỗ trợ bucket mã hoá bằng KMS, và ký được cả request PUT/DELETE. Dự án mới dùng OAC; dự án cũ đang chạy OAI thì không cần vội đổi.
+
+Áp hai lớp đầu bằng CLI (lớp thứ ba, OAC, tạo ở phía CloudFront trong Lab 4.1, [phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/)):
+
+```bash
+aws s3api put-public-access-block \
+  --bucket acme-shop-frontend-prod \
+  --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+aws s3api put-bucket-policy \
+  --bucket acme-shop-frontend-prod \
+  --policy file://bucket-policy.json
+```
+
+Khi CloudFront trả 403 XML dù file có tồn tại, ba thứ để kiểm tra theo thứ tự: origin trong distribution đã chọn OAC chưa (không phải "Public"), bucket policy có statement trên chưa, và `SourceArn` có đúng ID distribution đang dùng không (copy nhầm từ distribution staging là chuyện thường).
+
+---
+
+## Upload build lên S3 — làm đúng ngay từ đầu
+
+Đây là đoạn script bạn sẽ dùng mãi. Điểm mấu chốt: **hai loại file cần hai chính sách cache khác nhau**.
+
+```bash
+# ─── BƯỚC 1: Upload asset có hash trong tên → cache VĨNH VIỄN ───
+# Vite/Webpack sinh tên kiểu main-a3f9b2c1.js. Nội dung đổi → tên đổi.
+# Nên có thể cache 1 năm mà không bao giờ sợ cũ.
+aws s3 sync dist/ s3://acme-shop-frontend-prod/ \
+  --delete \
+  --exclude "*.html" \
+  --exclude "service-worker.js" \
+  --exclude "manifest.json" \
+  --cache-control "public, max-age=31536000, immutable"
+
+# ─── BƯỚC 2: Upload HTML → KHÔNG cache, luôn kiểm tra lại ───
+# index.html là "bản đồ" trỏ tới các asset. Phải luôn mới.
+aws s3 sync dist/ s3://acme-shop-frontend-prod/ \
+  --delete \
+  --exclude "*" \
+  --include "*.html" \
+  --include "service-worker.js" \
+  --include "manifest.json" \
+  --cache-control "no-cache, must-revalidate" \
+  --content-type "text/html; charset=utf-8"
+```
+
+> **Vì sao phải làm hai bước?** Nếu cache `index.html` một năm, bạn deploy xong người dùng vẫn nhận HTML cũ, HTML cũ trỏ tới file JS cũ (đã bị `--delete` xoá) → trang trắng, console đầy lỗi 404. Ngược lại nếu không cache file JS thì mất hết lợi ích của CDN: mỗi lần tải trang là một lần về S3.
+
+`no-cache` không có nghĩa "không lưu". Nó nghĩa là "lưu cũng được, nhưng mỗi lần dùng phải hỏi lại server xem có mới không". Trình duyệt gửi `If-None-Match` với `ETag` cũ, nếu chưa đổi thì server trả 304 rất nhẹ. Muốn cấm lưu hoàn toàn thì dùng `no-store` (dành cho `config.json` chứa cấu hình runtime, [phần 12](/blog/aws-fe-12-env-vars-build-time-runtime-secrets/)). Bảng đầy đủ loại file nào dùng giá trị nào ở [phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/).
+
+Một lỗi nhỏ ẩn trong bước 2: `--content-type "text/html; charset=utf-8"` áp cho **mọi** file được include, kể cả `service-worker.js` và `manifest.json`. Với hai file đó, hãy tách thành lệnh riêng (hoặc bỏ `--content-type` và để CLI tự đoán). Phiên bản đầy đủ bên dưới đã tách.
+
+### Hiểu `aws s3 sync` để không bị bất ngờ
+
+- `sync` chỉ upload file **khác** với bản trên bucket (so kích thước và thời gian sửa). Trong CI, mỗi lần checkout là mọi file có mtime mới nên gần như tất cả được upload lại; vô hại, chỉ tốn vài giây.
+- `--exclude` và `--include` được xét **theo thứ tự viết**, luật khớp cuối cùng thắng. Vì thế bước 2 bắt đầu bằng `--exclude "*"` (loại tất cả) rồi `--include` từng thứ cần. Pattern tính tương đối từ thư mục nguồn, nên `*.html` khớp cả `nested/page.html`.
+- `--delete` xoá trên bucket mọi key **không có trong `dist/`** và không bị exclude. Nếu bucket còn chứa thứ khác (ví dụ `config.json` upload riêng, hay ảnh người dùng), chúng sẽ bị xoá ở bước 1. Hoặc `--exclude` chúng, hoặc tốt hơn: **mỗi bucket một mục đích**, build tĩnh một bucket, upload của người dùng một bucket khác.
+- Thêm `--dryrun` để xem sync định làm gì trước khi chạy thật. Rất đáng làm lần đầu với `--delete`.
+- Muốn loại source map khỏi production, thêm `--exclude "*.map"` vào bước 1 (và upload chúng riêng lên nơi Sentry đọc được nếu cần).
+
+### Content-Type — cái bẫy khi upload bằng SDK
+
+`aws s3 sync` tự đoán `Content-Type` theo phần mở rộng file, khá ổn (vẫn nên kiểm tra các đuôi mới như `.mjs`, `.webmanifest`, `.woff2`, `.wasm` bằng `head-object` sau lần deploy đầu). Nhưng nếu bạn upload bằng SDK (Node, Python) thì phải tự đặt, nếu không S3 gán `application/octet-stream` và trình duyệt sẽ tải file về thay vì chạy nó, còn CSS thì bị bỏ qua vì sai MIME.
+
+```ts
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import mime from 'mime-types';
+
+const s3 = new S3Client({ region: 'ap-southeast-1' });
+
+await s3.send(
+  new PutObjectCommand({
+    Bucket: 'acme-shop-frontend-prod',
+    Key: 'assets/main-a3f9b2.js',
+    Body: fileBuffer,
+    ContentType: mime.lookup('main.js') || 'application/octet-stream', // BẮT BUỘC
+    CacheControl: 'public, max-age=31536000, immutable',
+  })
+);
+```
+
+Mở rộng thành một hàm deploy bằng Node, cho dự án không muốn phụ thuộc vào AWS CLI trong CI. Nó làm y hệt hai bước sync ở trên, và quyết định `Cache-Control` theo tên file:
+
+```ts
+import { readdir, readFile } from 'node:fs/promises';
+import { join, relative } from 'node:path';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import mime from 'mime-types';
+
+const BUCKET = 'acme-shop-frontend-prod';
+const DIST = 'dist';
+const s3 = new S3Client({ region: 'ap-southeast-1' });
+
+const IMMUTABLE = 'public, max-age=31536000, immutable';
+const REVALIDATE = 'no-cache, must-revalidate';
+
+function cacheControlFor(key: string): string {
+  if (key.endsWith('.html')) return REVALIDATE;
+  if (key === 'service-worker.js' || key === 'manifest.json') return REVALIDATE;
+  if (key.startsWith('assets/')) return IMMUTABLE; // Vite đặt file có hash ở đây
+  return 'public, max-age=3600'; // favicon, robots.txt… ít đổi nhưng không có hash
+}
+
+async function* walk(dir: string): AsyncGenerator<string> {
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) yield* walk(full);
+    else yield full;
+  }
+}
+
+async function upload(filter: (key: string) => boolean) {
+  for await (const file of walk(DIST)) {
+    const key = relative(DIST, file).split('\\').join('/');
+    if (!filter(key)) continue;
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: key,
+        Body: await readFile(file),
+        ContentType: mime.lookup(file) || 'application/octet-stream',
+        CacheControl: cacheControlFor(key),
+      })
+    );
+    console.log('uploaded', key);
+  }
+}
+
+// Bước 1: mọi thứ trừ HTML. Bước 2: HTML sau cùng, vì HTML là "công tắc" bật bản mới.
+await upload((key) => !key.endsWith('.html'));
+await upload((key) => key.endsWith('.html'));
+```
+
+Thứ tự "asset trước, HTML sau" không phải ngẫu nhiên: nếu HTML mới lên trước khi JS mới lên xong, người dùng vào đúng khoảng đó sẽ nhận trang trắng. [Phần 13](/blog/aws-fe-13-ci-cd-github-actions-oidc-preview-environments/) dùng lại nguyên tắc này trong pipeline.
+
+### Sửa metadata của object đã upload
+
+Lỡ upload `index.html` với `max-age` dài? Không có nút "sửa Cache-Control"; bạn copy object đè lên chính nó với metadata mới:
+
+```bash
+aws s3 cp s3://acme-shop-frontend-prod/index.html s3://acme-shop-frontend-prod/index.html \
+  --metadata-directive REPLACE \
+  --cache-control "no-cache, must-revalidate" \
+  --content-type "text/html; charset=utf-8"
+
+aws s3api head-object --bucket acme-shop-frontend-prod --key index.html \
+  --query '{type:ContentType,cache:CacheControl}'
+```
+
+Nhớ rằng sửa trên S3 không đụng tới bản đã nằm trong cache CloudFront; sau khi sửa vẫn phải invalidate ([phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/)).
+
+### Script deploy hoàn chỉnh
+
+Gom lại thành `deploy.sh` để chạy tay hoặc gọi từ CI, có kiểm tra đầu vào và xác nhận sau khi xong:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BUCKET="${BUCKET:-acme-shop-frontend-prod}"
+DIST="${DIST:-dist}"
+
+[ -f "$DIST/index.html" ] || { echo "Không thấy $DIST/index.html — đã chạy npm run build chưa?"; exit 1; }
+
+echo "→ Bước 1: asset có hash (cache 1 năm)"
+aws s3 sync "$DIST/" "s3://$BUCKET/" \
+  --delete \
+  --exclude "*.html" --exclude "service-worker.js" --exclude "manifest.json" \
+  --exclude "*.map" \
+  --cache-control "public, max-age=31536000, immutable"
+
+echo "→ Bước 2a: service worker và manifest (no-cache, CLI tự đoán Content-Type)"
+aws s3 sync "$DIST/" "s3://$BUCKET/" \
+  --exclude "*" --include "service-worker.js" --include "manifest.json" \
+  --cache-control "no-cache, must-revalidate"
+
+echo "→ Bước 2b: HTML sau cùng (no-cache)"
+aws s3 sync "$DIST/" "s3://$BUCKET/" \
+  --exclude "*" --include "*.html" \
+  --cache-control "no-cache, must-revalidate" \
+  --content-type "text/html; charset=utf-8"
+
+echo "→ Kiểm tra metadata"
+aws s3api head-object --bucket "$BUCKET" --key index.html \
+  --query '{type:ContentType,cache:CacheControl}' --output table
+```
+
+Quyền IAM cần cho script này chính là statement `GhiFileBuildLenBucket` ở [phần 1](/blog/aws-fe-01-mindset-and-request-lifecycle/): `PutObject`, `DeleteObject` trên `bucket/*` và `ListBucket` trên `bucket`.
+
+---
+
+## Thực hành — Chuẩn bị bucket và quan sát metadata (20 phút)
+
+Lab đầy đủ đưa trang lên S3 (Lab 3.1) nằm ở [phần 5](/blog/aws-fe-05-s3-presigned-url-and-versioning/) cùng với Versioning; bài này làm phần chuẩn bị và một thí nghiệm nhỏ để thấy metadata quan trọng thế nào.
+
+1. Tạo bucket `<tên-bạn>-aws-hoc-tap` ở `ap-southeast-1` bằng lệnh `create-bucket` ở trên, rồi bật Block all public access bằng `put-public-access-block`.
+2. Tạo một file `test.css` bất kỳ và upload sai kiểu: `aws s3 cp test.css s3://<bucket>/test.css --content-type application/octet-stream`.
+3. Chạy `aws s3api head-object --bucket <bucket> --key test.css` và đọc `ContentType`.
+4. Sửa bằng `aws s3 cp` với `--metadata-directive REPLACE --content-type text/css`, chạy lại `head-object`.
+5. Thử `aws s3 cp test.css s3://<bucket>/test.css --acl public-read` và đọc lỗi trả về.
+6. Chạy `aws s3 sync dist/ s3://<bucket>/ --delete --dryrun` với một thư mục `dist/` bất kỳ, đọc danh sách sync định upload và định xoá (lệnh `--dryrun` không thay đổi gì).
+
+> **Kết quả mong đợi:** `head-object` ở bước 3 in `application/octet-stream`, ở bước 4 in `text/css`. Bước 5 bị từ chối với `AccessDenied` vì Block Public Access đang bật, và đó là kết quả đúng: bucket này sẽ chỉ được đọc qua CloudFront. Bước 6 cho bạn thấy `--delete` định xoá những gì trước khi bạn để nó chạy thật.
+
+---
+
+## Sai lầm hay gặp
+
+- **Để bucket public "cho nhanh"** rồi quên. Ai cũng gọi thẳng S3, bỏ qua cache, WAF, và bạn trả tiền request. Luôn Block Public Access + OAC.
+- **Bucket policy OAC thiếu `SourceArn`.** Mọi distribution trên đời đều đọc được bucket của bạn.
+- **`aws s3 sync --delete` vào bucket có chứa thứ khác** (ảnh người dùng, `config.json`). Tách bucket theo mục đích; chạy `--dryrun` trước.
+- **Cache `index.html` một năm** vì dùng chung một lệnh sync cho mọi file. Đây là nguồn gốc số một của "deploy xong vẫn thấy bản cũ".
+- **Upload bằng SDK mà quên `ContentType`**: CSS không áp dụng, JS bị tải về. Kiểm tra bằng `head-object` sau lần deploy đầu.
+- **Tưởng sửa metadata trên S3 là xong.** Bản cũ vẫn nằm trong CloudFront cho tới khi invalidate hoặc hết TTL.
+- **Đặt bucket ở region khác backend** (vì Console đang ở region khác lúc tạo). Vô hại với CloudFront, nhưng tốn phí truyền dữ liệu và chậm hơn khi backend cần đọc bucket.
+
+---
+
+## Tóm tắt
+
+- S3 là object storage: bucket (tên global, không đổi được), object (file + metadata), key (tên đầy đủ, dấu `/` chỉ là ký tự), prefix, metadata. Không có thư mục thật, S3 chỉ khớp key chính xác.
+- Hai cách phục vụ file: website endpoint (HTTP, bucket public, có index/redirect) và REST endpoint (HTTPS, bucket kín qua OAC, chỉ khớp key). Hệ thống thật luôn dùng REST + CloudFront.
+- File không tồn tại trả 403 (không có `ListBucket`) chứ không phải 404; SPA fallback phải bắt cả hai.
+- Khoá bucket bằng ba lớp: Block Public Access, bucket policy cho `cloudfront.amazonaws.com` với điều kiện `SourceArn` đúng distribution, và OAC trên origin. Thiếu `SourceArn` là ai cũng đọc được.
+- Upload hai bước: asset có hash `public, max-age=31536000, immutable`; HTML (và service worker, manifest) `no-cache, must-revalidate`, đúng `Content-Type`. Asset lên trước, HTML lên sau.
+- `no-cache` là "lưu nhưng hỏi lại" (304), `no-store` mới là "không lưu". Đổi metadata bằng `cp --metadata-directive REPLACE`, kiểm tra bằng `head-object`.
+- `sync --delete` xoá mọi thứ không có trong `dist/`: mỗi bucket một mục đích, `--dryrun` trước khi tin.
+
+[Phần 5](/blog/aws-fe-05-s3-presigned-url-and-versioning/) làm tính năng "đổi ảnh đại diện" đúng cách bằng presigned URL (upload thẳng từ trình duyệt lên S3, backend chỉ ký tên), bật Versioning làm lưới an toàn, và chạy Lab 3.1 đưa trang React đầu tiên lên bucket.
+
+## Đọc thêm
+
+- [Amazon S3 User Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/)
+- [Amazon CloudFront Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/)
+- [IAM User Guide](https://docs.aws.amazon.com/IAM/latest/UserGuide/)

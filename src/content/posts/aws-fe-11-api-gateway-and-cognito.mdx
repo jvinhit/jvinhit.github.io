@@ -1,0 +1,275 @@
+---
+title: 'AWS cho Frontend Developer · Phần 11 — API Gateway và Cognito'
+description: 'Khi nào API Gateway thay ALB, HTTP API và REST API khác gì, bẫy stage trong URL, rồi Cognito: User Pool, App Client, ba loại token, lưu token ở đâu cho an toàn và đoạn interceptor refresh token bạn sẽ cần.'
+pubDate: 2026-10-29
+lang: vi
+tags: [aws, cognito, security, serverless, devops]
+series: aws-fe
+seriesOrder: 11
+draft: false
+---
+
+Kiến trúc mức 1 ở [Phần 10](/blog/aws-fe-10-where-code-runs-ec2-ecs-lambda-amplify-nextjs/) không có ALB: behavior `/api/*` trỏ vào **API Gateway**, phía sau là Lambda. Đây là con đường serverless mà dự án cá nhân, MVP và nhiều startup chọn, vì không có gì chạy 24/7. Nhưng API Gateway có luật chơi riêng: timeout cứng gần 30 giây, URL có stage, CORS cấu hình ở nơi khác so với ALB.
+
+Nửa sau của bài là câu hỏi mọi frontend đều gặp khi rời khỏi mock login: **token để ở đâu, refresh thế nào**. Cognito cấp ba loại token, mỗi loại một việc; chọn sai loại hoặc lưu sai chỗ là lỗ hổng bảo mật thật chứ không phải lý thuyết. Đọc xong bài này bạn biết khi nào chọn API Gateway thay ALB, phân biệt ID token với access token, chọn được nơi lưu token phù hợp kiến trúc, và có sẵn đoạn interceptor refresh không gọi trùng.
+
+---
+
+## API Gateway — khi nào thay ALB
+
+| Tiêu chí           | ALB                                 | API Gateway                                              |
+| ------------------ | ----------------------------------- | -------------------------------------------------------- |
+| **Đích đến**       | Container, EC2, Lambda              | Lambda, HTTP endpoint bất kỳ, dịch vụ AWS khác           |
+| **Chi phí**        | Cố định ~16–20 USD/tháng + theo tải | Theo số request, không dùng không trả tiền               |
+| **Timeout tối đa** | Cấu hình được, mặc định 60s         | ~29–30 giây, khó vượt                                    |
+| **Tính năng sẵn**  | Ít — chủ yếu định tuyến             | Rate limit, API key, authorizer, validate request, cache |
+| **CORS**           | Backend tự lo                       | Có mục cấu hình riêng, tiện cho frontend                 |
+| **Phù hợp**        | Backend chạy liên tục, tải ổn định  | Serverless, tải thất thường, cần quản trị API            |
+
+Nhìn hai dòng đầu là đủ quyết định: nếu backend là container chạy liên tục thì ALB; nếu backend là Lambda và tải có lúc bằng 0 thì API Gateway. Dòng "timeout" là thứ bạn phải nhớ khi thiết kế tính năng: xuất báo cáo 45 giây chạy được sau ALB nhưng chết chắc sau API Gateway, và cách sửa vẫn là mô hình job bất đồng bộ ở [Phần 9](/blog/aws-fe-09-alb-gateway-to-backend/).
+
+### Hai loại API Gateway
+
+- **HTTP API** — mới hơn, rẻ hơn khoảng 70%, nhanh hơn, cấu hình CORS đơn giản, có JWT authorizer tích hợp sẵn với Cognito. **Chọn cái này trừ khi thiếu tính năng.**
+- **REST API** — cũ hơn, nhiều tính năng hơn: request validation theo schema, API key và usage plan, WAF tích hợp, response caching, transform request/response bằng mapping template. Chọn khi bạn cần đúng một trong các tính năng đó.
+
+Trong console, hai loại nằm chung một trang "API Gateway" nhưng là hai sản phẩm khác nhau với hai CLI khác nhau (`apigatewayv2` cho HTTP API, `apigateway` cho REST API). Khi đọc hướng dẫn trên mạng, kiểm tra người viết đang nói loại nào trước khi làm theo.
+
+### Stage — cái bẫy về URL
+
+API Gateway mặc định đưa **stage** vào URL: `https://abc123.execute-api.ap-southeast-1.amazonaws.com/prod/users`. Frontend gọi `/users` sẽ nhận 404, và lỗi này không có log ở đâu để tra vì request chưa tới Lambda. Với HTTP API bạn có thể tạo stage mặc định `$default` để URL không có prefix; với REST API thì luôn có stage.
+
+Hai cách xử lý đúng:
+
+1. **Custom domain name cho API Gateway** (ví dụ `api.example.com`), chứng chỉ ACM cùng region (regional endpoint), rồi ánh xạ stage vào đường dẫn gốc. URL sạch: `https://api.example.com/users`. Vẫn còn CORS vì khác host với frontend.
+2. **Tốt hơn: đặt API Gateway làm origin cho behavior `/api/*` của CloudFront**, cùng origin với frontend, không có CORS, cookie `SameSite=Lax` chạy bình thường — đúng lợi ích đã nói ở [Phần 3](/blog/aws-fe-03-cors-vpc-security-group/). Khi làm cách này, ba cài đặt hay sai:
+   - **Origin path** đặt là `/prod` (tên stage) để CloudFront tự thêm stage vào trước path, nếu API dùng stage có tên.
+   - **Origin Request Policy** dùng `Managed-AllViewerExceptHostHeader` chứ không phải `AllViewer`. API Gateway định tuyến theo header `Host`; nếu CloudFront chuyển tiếp `Host: shop.example.com` thì API Gateway không nhận ra và trả 403 hoặc lỗi chứng chỉ.
+   - **Cache Policy** là `CachingDisabled` và bật đủ bảy method, y như với ALB.
+
+### CORS trên HTTP API và Lambda
+
+HTTP API có mục CORS riêng: bạn khai origin, method, header, `Access-Control-Allow-Credentials`, `Max-Age`, và API Gateway tự trả lời preflight `OPTIONS` thay Lambda. Cấu hình tương đương bằng CLI:
+
+```bash
+aws apigatewayv2 update-api --api-id abc123 --cors-configuration \
+  'AllowOrigins=https://app.example.com,http://localhost:5173,AllowMethods=GET,POST,PUT,DELETE,OPTIONS,AllowHeaders=authorization,content-type,AllowCredentials=true,MaxAge=86400'
+```
+
+> **Cạm bẫy:** nếu bạn dùng **Lambda proxy integration** và không bật CORS ở API Gateway, Lambda phải tự trả header CORS trong **mọi** response, kể cả response lỗi. Lỗi kinh điển: Lambda ném exception → API Gateway trả 500 không có `Access-Control-Allow-Origin` → trình duyệt báo "CORS error" thay vì lỗi 500 thật, và bạn debug CORS suốt buổi trong khi vấn đề là một `undefined` trong code.
+
+Nếu vẫn muốn Lambda tự lo, gói header vào một chỗ:
+
+```js
+// handler.js — Lambda proxy integration cho HTTP API
+const CORS = {
+  'Access-Control-Allow-Origin': 'https://app.example.com',
+  'Access-Control-Allow-Headers': 'authorization,content-type',
+  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+  Vary: 'Origin',
+};
+
+export async function handler(event) {
+  if (event.requestContext.http.method === 'OPTIONS') {
+    return { statusCode: 204, headers: CORS };
+  }
+  try {
+    const data = await doWork(event);
+    return { statusCode: 200, headers: CORS, body: JSON.stringify(data) };
+  } catch (err) {
+    console.error(err);
+    // Header CORS phải có cả ở response lỗi
+    return {
+      statusCode: 500,
+      headers: CORS,
+      body: JSON.stringify({ error: 'internal' }),
+    };
+  }
+}
+```
+
+### JWT authorizer — để Lambda không phải tự verify token
+
+HTTP API có **JWT authorizer**: bạn khai issuer là User Pool của Cognito và audience là App Client ID, API Gateway tự kiểm tra chữ ký, hạn, audience của token trong header `Authorization` trước khi gọi Lambda. Token sai → 401 từ API Gateway, Lambda không chạy, không tốn tiền. Claim của user (`sub`, `email`, group) được đưa vào `event.requestContext.authorizer.jwt.claims` để Lambda dùng. Issuer có dạng `https://cognito-idp.ap-southeast-1.amazonaws.com/ap-southeast-1_AbCdEfGhI` — đúng User Pool ID, không phải domain Hosted UI.
+
+---
+
+## Cognito — xác thực người dùng
+
+| Thành phần        | Vai trò                                                                                                                    |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| **User Pool**     | Thư mục người dùng. Đăng ký, đăng nhập, quên mật khẩu, MFA, đăng nhập qua Google/Facebook/SAML. Cấp ra JWT                 |
+| **Identity Pool** | Đổi JWT lấy thông tin xác thực AWS tạm thời, để trình duyệt gọi thẳng dịch vụ AWS (vd upload S3) mà không cần backend      |
+| **App Client**    | Cấu hình cho một ứng dụng cụ thể. App client cho frontend **không được có client secret** — frontend không giữ bí mật được |
+| **Hosted UI**     | Trang đăng nhập dựng sẵn của AWS. Nhanh nhưng khó tuỳ biến giao diện                                                       |
+
+Hai thành phần đầu hay bị lẫn. **User Pool** trả lời "người này là ai" và cấp JWT cho API của bạn. **Identity Pool** trả lời "người này được gọi dịch vụ AWS nào" và cấp access key tạm thời (sống khoảng một giờ) để SDK trong trình duyệt gọi thẳng S3 hoặc DynamoDB. Phần lớn app chỉ cần User Pool; Identity Pool là lựa chọn thay thế cho presigned URL ở [Phần 5](/blog/aws-fe-05-s3-presigned-url-and-versioning/) khi bạn muốn bỏ hẳn backend khỏi luồng upload — đổi lại IAM role của Identity Pool phải viết rất chặt, vì nó chạy trong trình duyệt của người dùng.
+
+### Luồng đăng nhập cho SPA
+
+Với SPA, luồng chuẩn là **Authorization Code với PKCE**: app chuyển hướng người dùng sang Hosted UI (hoặc màn hình đăng nhập tự dựng gọi SDK), Cognito xác thực rồi trả về một `code` ngắn hạn qua redirect URL, app đổi `code` lấy token. PKCE thay thế client secret bằng một chuỗi ngẫu nhiên do app sinh ra mỗi lần đăng nhập, nên app client không cần secret. Đừng dùng Implicit flow (token trả thẳng trong URL) — nó bị bỏ vì token lộ trong lịch sử trình duyệt và log.
+
+Redirect URL phải khai chính xác trong App Client, kể cả `http://localhost:5173/callback` cho dev. Sai một ký tự (thiếu dấu `/` cuối, `http` thay vì `https`) là Cognito trả `redirect_mismatch` — lỗi hay gặp nhất trong tuần đầu.
+
+### Ba loại token và dùng cái nào
+
+| Token             | Hạn                     | Dùng để                                                                                                |
+| ----------------- | ----------------------- | ------------------------------------------------------------------------------------------------------ |
+| **ID token**      | 1 giờ                   | Chứa thông tin người dùng (email, tên). Dùng để hiển thị trên giao diện. **Không nên dùng để gọi API** |
+| **Access token**  | 1 giờ                   | Gửi trong header `Authorization: Bearer ...` khi gọi API. Đây là cái backend kiểm tra                  |
+| **Refresh token** | 30 ngày (cấu hình được) | Lấy cặp token mới khi hết hạn, không bắt user đăng nhập lại                                            |
+
+Vì sao không dùng ID token gọi API: ID token là "giấy tờ tuỳ thân" dành cho chính app đó đọc, có audience là App Client ID; access token là "vé vào cửa" dành cho tài nguyên, có `scope` và được thiết kế để backend kiểm tra. Nhiều tutorial dùng ID token cho tiện vì nó có sẵn email; nó chạy được, nhưng backend của bạn đang verify nhầm loại token, và khi thêm scope hay resource server sau này sẽ phải làm lại.
+
+### Lưu token ở đâu — câu hỏi muôn thuở
+
+| Nơi lưu                        | Chống XSS | Chống CSRF   | Nhận xét                                                                                                                                                            |
+| ------------------------------ | --------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **localStorage**               | Không     | Có           | Tiện nhất, JS đọc được nên XSS lấy được token. Là mặc định của Amplify. Chấp nhận được nếu bạn kiểm soát tốt XSS (CSP nghiêm ngặt, không `dangerouslySetInnerHTML`) |
+| **Bộ nhớ JS** (biến trong app) | Tốt hơn   | Có           | Mất khi F5 → phải dùng refresh token để lấy lại. Cân bằng tốt                                                                                                       |
+| **Cookie `httpOnly`**          | Có        | Cần SameSite | An toàn nhất. JS không đọc được. Cần backend đặt cookie. Nếu frontend và API cùng origin qua CloudFront thì rất dễ làm                                              |
+
+> **Ghi chú:** nếu kiến trúc của bạn đã gộp `/api/*` vào cùng CloudFront distribution, hãy dùng cookie `httpOnly` + `Secure` + `SameSite=Lax`. Bạn vừa an toàn hơn, vừa không phải viết code gắn token vào từng request. Đây là một lợi ích cụ thể nữa của kiến trúc cùng origin. Cơ chế `SameSite` và CSRF được mổ xẻ ở [Web security phần 4](/blog/web-security-04-csrf-samesite-cookies/).
+
+Cách làm cookie trong thực tế là mẫu **BFF** (backend for frontend): backend là bên duy nhất chạm vào token.
+
+```text
+Browser                    Backend (/api/auth/*)                 Cognito
+  │  GET /api/auth/login        │                                   │
+  ├───────────────────────────► │  302 → Hosted UI (PKCE)           │
+  │ ◄─────────────────────────────────────────────────────────────► │  đăng nhập
+  │  GET /api/auth/callback?code=...                                │
+  ├───────────────────────────► │  đổi code lấy token ─────────────►│
+  │                             │ ◄─────────────── id/access/refresh│
+  │  Set-Cookie: access (httpOnly, Secure, SameSite=Lax, 1h)        │
+  │  Set-Cookie: refresh (httpOnly, Path=/api/auth/refresh, 30d)    │
+  │ ◄───────────────────────────┤                                   │
+  │  fetch('/api/orders', { credentials: 'include' })               │
+  ├───────────────────────────► │  đọc cookie, verify JWT, xử lý    │
+```
+
+Chi tiết đáng giá: cookie chứa refresh token đặt `Path=/api/auth/refresh` để trình duyệt chỉ gửi nó tới đúng endpoint refresh, không gửi kèm mọi request API. Hai token, hai cookie, hai vòng đời.
+
+### Refresh token tự động — đoạn code bạn sẽ cần
+
+Access token hết hạn sau một giờ. Khi đó API trả 401, và app phải refresh rồi thử lại **mà không gọi refresh mười lần** khi mười request cùng lúc bị 401. Đây là mẫu single-flight:
+
+```ts
+// Interceptor xử lý 401: refresh một lần, gom các request chờ
+let refreshPromise: Promise<boolean> | null = null;
+
+async function doRefresh(): Promise<boolean> {
+  const res = await fetch('/api/auth/refresh', {
+    method: 'POST',
+    credentials: 'include',
+  });
+  return res.ok;
+}
+
+export async function apiFetch(url: string, options: RequestInit = {}) {
+  let res = await fetch(url, { ...options, credentials: 'include' });
+
+  if (res.status === 401) {
+    // Nếu đã có request refresh đang chạy thì chờ chung, tránh gọi refresh 10 lần
+    refreshPromise =
+      refreshPromise ??
+      doRefresh().finally(() => {
+        refreshPromise = null;
+      });
+    const ok = await refreshPromise;
+    if (!ok) {
+      window.location.href = '/login';
+      throw new Error('Phiên đăng nhập đã hết hạn');
+    }
+    // Thử lại request ban đầu với token mới
+    res = await fetch(url, { ...options, credentials: 'include' });
+  }
+  return res;
+}
+```
+
+Với mô hình Bearer token trong bộ nhớ JS, thay `credentials: 'include'` bằng việc gắn `Authorization: Bearer ${accessToken}` và cập nhật biến token sau khi refresh; cấu trúc single-flight giữ nguyên. Nếu dùng axios, đặt logic này vào response interceptor, và nhớ tạo instance riêng cho presigned URL vì chữ ký S3 không chấp nhận header `Authorization` thừa ([Phần 5](/blog/aws-fe-05-s3-presigned-url-and-versioning/)).
+
+Hai chi tiết hay bị bỏ qua: chỉ retry **một lần** (nếu lần retry vẫn 401 thì đăng xuất, đừng lặp vô hạn), và đừng retry request không idempotent một cách mù quáng — một `POST /api/orders` bị 401 rồi retry có thể tạo hai đơn nếu backend đã xử lý trước khi kiểm tra token (hiếm, nhưng backend nên kiểm tra token trước mọi thứ).
+
+> **Cạm bẫy:** **đồng hồ lệch làm token bị từ chối.** JWT có trường `exp` và `iat`. Nếu đồng hồ máy người dùng lệch quá vài phút, token hợp lệ có thể bị coi là hết hạn hoặc "chưa có hiệu lực". Đừng tự kiểm tra hạn token ở frontend bằng `Date.now()` một cách cứng nhắc — hãy dựa vào phản hồi 401 từ server và refresh khi cần. Nếu muốn refresh chủ động, làm sớm hơn `exp` vài phút và vẫn giữ đường xử lý 401.
+
+### Verify token ở backend
+
+Backend không bao giờ tin token chỉ vì nó "trông giống JWT". Nó phải kiểm tra chữ ký bằng public key của User Pool (JWKS), `exp`, issuer và `client_id`/`aud`. Thư viện `aws-jwt-verify` của AWS gói toàn bộ việc đó:
+
+```ts
+import { CognitoJwtVerifier } from 'aws-jwt-verify';
+
+const verifier = CognitoJwtVerifier.create({
+  userPoolId: 'ap-southeast-1_AbCdEfGhI',
+  tokenUse: 'access', // verify ACCESS token, không phải ID token
+  clientId: '1h57kf5cpq17m0eml12EXAMPLE',
+});
+
+app.use('/api', async (req, res, next) => {
+  const token =
+    req.cookies.access ?? req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'unauthenticated' });
+  try {
+    req.user = await verifier.verify(token); // có sub, scope, username...
+    next();
+  } catch {
+    res.status(401).json({ error: 'invalid token' });
+  }
+});
+```
+
+Thư viện tự tải và cache JWKS, nên không có request mạng cho mỗi lần verify. Nếu dùng JWT authorizer của API Gateway thì bước này API Gateway đã làm; Lambda chỉ đọc claim.
+
+---
+
+## Sai lầm hay gặp
+
+- **Tạo App Client có client secret rồi dùng trong SPA** → SDK báo `SecretHash` thiếu, hoặc tệ hơn là bạn nhúng secret vào bundle. Tạo app client mới không có secret.
+- **Gọi API bằng ID token** → chạy được cho tới khi backend verify đúng `tokenUse: 'access'` hoặc thêm scope. Dùng access token ngay từ đầu.
+- **Lưu refresh token trong localStorage** → XSS lấy được token sống 30 ngày. Nếu buộc phải lưu ở client, để refresh token trong cookie `httpOnly` và access token trong bộ nhớ.
+- **Quên route `OPTIONS`** khi tự lo CORS trong Lambda → preflight 404 → mọi request có `Authorization` fail. Bật CORS ở API Gateway cho khoẻ.
+- **Frontend gọi `/users` trong khi URL thật là `/prod/users`** → 404 không có log. Dùng custom domain hoặc behavior CloudFront với origin path.
+- **`redirect_mismatch`** → so từng ký tự callback URL trong App Client với URL app đang dùng, kể cả dấu `/` cuối.
+- **Hosted UI chạy tốt ở `localhost`, lên production báo CORS** khi đổi token bằng `fetch` từ SPA: endpoint `/oauth2/token` của Cognito có luật CORS riêng; dùng SDK chính thức hoặc đổi code ở backend (BFF).
+
+---
+
+## Thực hành — Cognito User Pool và HTTP API (60 phút)
+
+Nguồn tài liệu không có lab riêng cho chương này; bài tập sau tương ứng "Tuần 6" trong lộ trình.
+
+**1.** Tạo User Pool ở `ap-southeast-1`: đăng nhập bằng email, mật khẩu tối thiểu 8 ký tự, không bật MFA cho lab. Tạo App Client kiểu public (không secret), callback URL `http://localhost:5173/callback`, bật Authorization code grant với scope `openid email`.
+
+**2.** Bật Hosted UI với một domain prefix. Mở URL đăng nhập, tạo tài khoản, xác nhận email. Sau khi redirect về `localhost:5173/callback?code=...`, dán `code` vào lệnh `curl -X POST https://<domain>/oauth2/token` với `grant_type=authorization_code` để nhận ba token. Dán từng token vào jwt.io (chỉ với token lab) và so sánh `token_use`, `aud`/`client_id`, `exp`.
+
+**3.** Tạo một HTTP API với route `GET /me` tích hợp Lambda trả `event.requestContext.authorizer.jwt.claims`. Gắn JWT authorizer với issuer là User Pool và audience là App Client ID.
+
+**4.** Gọi `GET /me` không có header → 401 từ API Gateway. Gọi với `Authorization: Bearer <access token>` → 200 kèm claim. Gọi với ID token → quan sát kết quả và giải thích vì sao (authorizer HTTP API kiểm tra `aud` với ID token và `client_id` với access token; tuỳ cấu hình mà một trong hai bị từ chối).
+
+**5.** Đợi hơn một giờ (hoặc đặt hạn access token xuống 5 phút trong App Client), gọi lại → 401. Dùng `grant_type=refresh_token` để lấy cặp mới, gọi lại → 200. Bạn vừa làm bằng tay chính xác việc interceptor ở trên tự động hoá.
+
+**6.** (Thêm) Bật CORS trên HTTP API cho `http://localhost:5173`, viết một trang Vite gọi `/me` bằng `apiFetch`, và xem preflight `OPTIONS` trong DevTools được API Gateway trả lời 204.
+
+> **Kết quả mong đợi:** bạn đăng nhập được qua Hosted UI, phân biệt được ba token bằng chính nội dung của chúng, thấy API Gateway chặn 401 trước khi Lambda chạy, và refresh được token khi hết hạn. Xoá User Pool domain và HTTP API sau lab nếu không dùng tiếp; cả hai gần như không tốn tiền khi để yên, nhưng dọn dẹp là thói quen tốt.
+
+---
+
+## Tóm tắt
+
+- API Gateway thay ALB khi backend là Lambda và tải thất thường: trả tiền theo request, có rate limit/authorizer/validate sẵn, nhưng timeout cứng ~30 giây và URL có stage.
+- Chọn HTTP API trừ khi cần tính năng chỉ REST API có. Sửa bẫy stage bằng custom domain, hoặc tốt hơn là behavior `/api/*` trên CloudFront với origin path `/prod` và `AllViewerExceptHostHeader`.
+- CORS: bật ở API Gateway để nó trả preflight thay Lambda; nếu Lambda tự lo thì phải trả header ở cả response lỗi.
+- Cognito: User Pool cấp JWT, Identity Pool đổi JWT lấy quyền AWS tạm thời, App Client cho SPA không có secret, luồng chuẩn là Authorization Code + PKCE.
+- ID token để hiển thị, access token để gọi API, refresh token để lấy cặp mới. Backend verify access token bằng JWKS (`aws-jwt-verify`) hoặc để JWT authorizer làm.
+- Lưu token: cookie `httpOnly` + `Secure` + `SameSite=Lax` qua BFF khi cùng origin; bộ nhớ JS + refresh khi không; localStorage chỉ khi kiểm soát XSS tốt.
+- Interceptor 401: refresh single-flight, retry một lần, không tự đoán hạn bằng `Date.now()` vì đồng hồ lệch.
+
+Phần tiếp theo — **[Phần 12 — Biến môi trường: build-time, runtime và secret](/blog/aws-fe-12-env-vars-build-time-runtime-secrets/)** — vì sao `VITE_API_URL` không phải bí mật, và mẫu một bản build chạy được ở mọi môi trường.
+
+## Đọc thêm
+
+- [Amazon API Gateway — Developer Guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/)
+- [Amazon Cognito — Developer Guide](https://docs.aws.amazon.com/cognito/latest/developerguide/)
+- [AWS Lambda — Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/)

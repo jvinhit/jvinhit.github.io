@@ -1,0 +1,405 @@
+---
+title: 'AWS cho Frontend Developer · Phần 13 — CI/CD: GitHub Actions với OIDC và preview environment'
+description: 'Pipeline frontend chuẩn 8 bước, vì sao upload asset trước HTML, cấp quyền AWS cho GitHub Actions bằng OIDC không cần access key, workflow deploy hoàn chỉnh, preview environment cho mỗi PR và chiến lược rollback trong 2 phút.'
+pubDate: 2026-11-04
+lang: vi
+tags: [aws, ci-cd, deployment, security, devops]
+series: aws-fe
+seriesOrder: 13
+draft: false
+---
+
+Mục tiêu của bài này gói trong một câu: **push code lên nhánh `main`, vài phút sau production đã cập nhật, không ai phải gõ lệnh thủ công.** Bạn đã có đủ nguyên liệu từ các phần trước — hai lệnh `aws s3 sync` với hai chính sách cache, lệnh invalidation, policy IAM tối thiểu — giờ chỉ cần xâu chúng thành một pipeline chạy đúng thứ tự và được cấp quyền đúng cách.
+
+"Đúng cách" là chỗ nhiều pipeline cũ sai: họ lưu `AWS_ACCESS_KEY_ID` vào GitHub Secrets, một khoá sống vĩnh viễn, lộ là mất tài khoản. Bài này dùng OIDC để GitHub tự chứng minh danh tính với AWS và nhận thông tin xác thực sống vài phút. Đọc xong bạn có workflow deploy hoàn chỉnh, preview URL cho mỗi pull request, và một cách rollback trong hai phút không cần chạy lại pipeline.
+
+---
+
+## Pipeline frontend chuẩn
+
+```text
+git push
+  │
+  ▼
+① CHECKOUT + CÀI DEPENDENCY   (npm ci — dùng lockfile, tái lập được)
+  │
+  ▼
+② KIỂM TRA CHẤT LƯỢNG         (lint, typecheck, unit test)
+  │   ← fail ở đây thì dừng, không deploy
+  ▼
+③ BUILD                       (npm run build → dist/)
+  │
+  ▼
+④ LẤY QUYỀN AWS               (OIDC — KHÔNG dùng access key cố định)
+  │
+  ▼
+⑤ UPLOAD ASSET                (cache 1 năm, immutable)
+  │   ← upload asset TRƯỚC html
+  ▼
+⑥ UPLOAD HTML                 (no-cache)
+  │
+  ▼
+⑦ INVALIDATE CLOUDFRONT       (chỉ /index.html và /)
+  │
+  ▼
+⑧ KIỂM TRA SAU DEPLOY         (curl trang chủ, mong đợi 200)
+```
+
+Tám bước này là bản "tự động hoá" của những gì bạn làm tay ở [Phần 4](/blog/aws-fe-04-s3-where-your-build-lives/) và [Phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/). Bước ② đứng trước bước ③ vì build tốn thời gian nhất; fail lint trong 20 giây rẻ hơn fail sau 3 phút build. Bước ⑧ là thứ pipeline "làm cho xong" hay bỏ: nó biến "deploy xong" thành "deploy xong **và** trang chủ thật sự trả 200".
+
+> **Cạm bẫy:** **vì sao bước ⑤ phải trước bước ⑥.** Nếu upload `index.html` trước, sẽ có một khoảng vài giây HTML mới đã sống nhưng file JS mới chưa lên xong → người dùng vào đúng lúc đó nhận trang trắng, console đầy 404. Luôn upload asset trước, HTML sau cùng. HTML là "công tắc" bật bản mới; asset là thứ phải nằm sẵn trước khi bật công tắc. Cùng lý do, `--delete` ở bước asset chỉ an toàn vì asset cũ có tên khác asset mới; đừng bao giờ dùng `--delete` khi bạn giữ nhiều bản phát hành cạnh nhau (mục chiến lược bên dưới).
+
+---
+
+## GitHub Actions + OIDC — cách làm đúng hiện nay
+
+Ngày xưa người ta lưu `AWS_ACCESS_KEY_ID` và `AWS_SECRET_ACCESS_KEY` vào GitHub Secrets. Cách đó có khoá tồn tại vĩnh viễn: ai lấy được (log lộ, fork độc hại, nhân viên rời công ty) là dùng được cho tới khi bạn nhớ ra mà thu hồi. Cách hiện đại là **OIDC**: mỗi lần workflow chạy, GitHub cấp cho job một JWT ngắn hạn xác nhận "đây là repo X, nhánh Y"; job đưa JWT đó cho AWS STS; AWS kiểm tra chữ ký của GitHub và điều kiện trong trust policy, rồi trả về thông tin xác thực sống vài phút. Không có gì bí mật được lưu ở đâu cả.
+
+### Bước 1: Tạo Identity Provider trong IAM
+
+```bash
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com
+```
+
+Mỗi tài khoản AWS chỉ cần tạo **một lần**; mọi repo dùng chung provider này và khác nhau ở role. Nếu console hoặc CLI đòi thumbprint, bấm "Get thumbprint" trong console hoặc xem docs hiện tại — với GitHub, AWS đã xác minh qua chuỗi chứng chỉ nên giá trị thumbprint không còn quan trọng.
+
+### Bước 2: Tạo role với trust policy giới hạn đúng repo
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:my-org/my-app:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}
+```
+
+Dòng `sub` là toàn bộ sự an toàn của cơ chế này. Nó nói: **chỉ nhánh `main` của chỉ repo này** được phép mượn role. Các dạng `sub` bạn sẽ cần:
+
+| Giá trị `sub`                               | Khớp khi                                                        |
+| ------------------------------------------- | --------------------------------------------------------------- |
+| `repo:my-org/my-app:ref:refs/heads/main`    | Workflow chạy trên push vào nhánh `main`                        |
+| `repo:my-org/my-app:ref:refs/tags/v*`       | Workflow chạy khi push tag `v1.2.3`                             |
+| `repo:my-org/my-app:pull_request`           | Workflow kích hoạt bởi `pull_request` (dùng cho preview)        |
+| `repo:my-org/my-app:environment:production` | Job khai `environment: production` — kết hợp required reviewers |
+
+> **Nguy hiểm:** để `repo:my-org/*` là sai lầm lớn: **mọi repo trong org sẽ deploy được lên prod**, kể cả repo thử nghiệm mà ai đó tạo tuần trước. Tương tự, `repo:my-org/my-app:*` cho phép mọi nhánh và mọi PR (kể cả PR từ fork nếu bạn cấu hình workflow chạy trên fork) mượn role production.
+
+Gắn vào role này policy quyền tối thiểu đã viết ở [Phần 1](/blog/aws-fe-01-mindset-and-request-lifecycle/): `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket` trên đúng bucket (cả ARN bucket lẫn `bucket/*`), và `cloudfront:CreateInvalidation` trên đúng distribution. Thêm `cloudfront:GetInvalidation` nếu workflow dùng `wait invalidation-completed`.
+
+### Bước 3: Workflow hoàn chỉnh
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy Frontend
+
+on:
+  push:
+    branches: [main]
+
+# BẮT BUỘC cho OIDC
+permissions:
+  id-token: write
+  contents: read
+
+# Đừng huỷ deploy đang chạy giữa chừng; job sau xếp hàng chờ
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-1
+  S3_BUCKET: acme-shop-frontend-prod
+  CF_DISTRIBUTION_ID: E1ABCDEFGHIJKL
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Bật required reviewers cho environment này ở GitHub nếu cần duyệt tay
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Cài dependency
+        run: npm ci
+
+      - name: Kiểm tra chất lượng
+        run: |
+          npm run lint
+          npm run typecheck
+          npm test -- --run
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_APP_VERSION: ${{ github.sha }}
+
+      - name: Lấy quyền AWS qua OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-deploy-frontend
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Upload asset trước: cache vĩnh viễn ──
+      - name: Upload asset
+        run: |
+          aws s3 sync dist/ s3://$S3_BUCKET/ \
+            --delete \
+            --exclude "*.html" \
+            --exclude "config.json" \
+            --exclude "service-worker.js" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      # ── Upload HTML sau: không cache ──
+      - name: Upload HTML
+        run: |
+          aws s3 sync dist/ s3://$S3_BUCKET/ \
+            --exclude "*" \
+            --include "*.html" \
+            --include "service-worker.js" \
+            --cache-control "no-cache, must-revalidate"
+
+      - name: Upload cấu hình runtime
+        run: |
+          aws s3 cp config/production.json s3://$S3_BUCKET/config.json \
+            --cache-control "no-store" \
+            --content-type "application/json"
+
+      - name: Xoá cache CloudFront
+        run: |
+          ID=$(aws cloudfront create-invalidation \
+            --distribution-id $CF_DISTRIBUTION_ID \
+            --paths "/" "/index.html" "/config.json" \
+            --query 'Invalidation.Id' --output text)
+          echo "Invalidation: $ID"
+          aws cloudfront wait invalidation-completed \
+            --distribution-id $CF_DISTRIBUTION_ID --id $ID
+
+      - name: Kiểm tra sau deploy
+        run: |
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" https://shop.example.com)
+          echo "Trang chủ trả về: $CODE (commit ${{ github.sha }})"
+          test "$CODE" = "200"
+```
+
+Những dòng đáng dừng lại đọc kỹ:
+
+- **`permissions: id-token: write`** — không có dòng này, GitHub không cấp JWT và bước `configure-aws-credentials` fail với thông báo khó hiểu về "Credentials could not be loaded". Đây là lỗi số một khi thiết lập OIDC lần đầu.
+- **`concurrency` với `cancel-in-progress: false`** — hai push liên tiếp không được chạy song song (hai `sync --delete` chồng nhau là thảm hoạ), nhưng cũng không huỷ deploy đang dở giữa bước ⑤ và ⑥. Job sau xếp hàng.
+- **`environment: production`** — vừa cho phép bật required reviewers (duyệt tay trước khi deploy), vừa cho bạn dùng `sub` dạng `environment:production` trong trust policy.
+- **`VITE_APP_VERSION: ${{ github.sha }}`** — nhúng commit SHA vào bundle (đây là giá trị build-time hợp lệ theo [Phần 12](/blog/aws-fe-12-env-vars-build-time-runtime-secrets/)). In nó ra footer hoặc `console.info` để khi có bug bạn biết production đang chạy commit nào.
+- **Bước HTML không có `--delete`** — bước asset đã xoá file cũ rồi; `--delete` ở bước HTML với `--exclude "*"` có thể xoá nhầm mọi thứ không khớp `--include`.
+- **`config.json` bị `--exclude` ở bước asset** và upload riêng ở bước sau với `no-store`, đúng mẫu runtime config.
+- **`wait invalidation-completed`** — để bước ⑧ kiểm tra bản mới thật sự, không phải bản cũ còn trong edge. Nó làm job lâu thêm 1–3 phút; nếu chấp nhận rủi ro, bỏ dòng này và chỉ log ID.
+
+Dùng pnpm thì đổi `cache: npm` thành `cache: pnpm` kèm bước `pnpm/action-setup` trước `setup-node`, và `npm ci` thành `pnpm install --frozen-lockfile`. Nếu bạn từng viết workflow deploy lên GitHub Pages ([bài này](/blog/github-pages-actions-deep-dive/)), cấu trúc y hệt — chỉ khác đích đến và bước cấp quyền.
+
+---
+
+## Preview environment cho mỗi Pull Request
+
+Tính năng rất đáng làm: mỗi PR có một URL riêng để designer và QA xem trước, không phải kéo code về chạy local.
+
+| Cách                | Triển khai                                                                                                                                                                                                |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Amplify Hosting** | Bật "Pull request previews" trong cài đặt. Xong. Đây là cách dễ nhất, không phải viết gì                                                                                                                  |
+| **Tự làm với S3**   | Upload vào prefix `pr-123/` trong bucket preview, dùng CloudFront Function đọc subdomain `pr-123.preview.example.com` rồi rewrite URI thành `/pr-123/...`. Cần chứng chỉ wildcard `*.preview.example.com` |
+| **Dọn dẹp**         | Thêm job chạy khi PR đóng để xoá prefix, tránh bucket phình to                                                                                                                                            |
+
+Cách tự làm cần bốn thứ chuẩn bị một lần: một bucket `acme-shop-frontend-preview` (kín, OAC), một distribution với alternate domain `*.preview.example.com` và chứng chỉ wildcard ở `us-east-1`, một bản ghi ALIAS `*.preview.example.com` trong Route 53 trỏ vào distribution, và CloudFront Function sau gắn ở Viewer Request của behavior mặc định:
+
+```js
+// Viewer Request: pr-123.preview.example.com/about → /pr-123/index.html
+function handler(event) {
+  var request = event.request;
+  var host = request.headers.host.value; // vd pr-123.preview.example.com
+  var pr = host.split('.')[0]; // "pr-123"
+  var uri = request.uri;
+
+  if (!/^pr-\d+$/.test(pr)) {
+    return { statusCode: 404, statusDescription: 'Not Found' };
+  }
+  // Có phần mở rộng → asset, giữ nguyên path dưới prefix
+  if (/\.[a-zA-Z0-9]+$/.test(uri)) {
+    request.uri = '/' + pr + uri;
+  } else {
+    // Route SPA → index.html của đúng PR
+    request.uri = '/' + pr + '/index.html';
+  }
+  return request;
+}
+```
+
+Function này gộp luôn logic SPA fallback ([Phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/)), nên distribution preview không cần Custom Error Response. Workflow preview dùng một **role riêng** chỉ có quyền ghi vào bucket preview, với `sub` là `repo:my-org/my-app:pull_request`:
+
+```yaml
+# .github/workflows/preview.yml
+name: PR Preview
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write # để comment URL vào PR
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm run build
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-preview-frontend
+          aws-region: ap-southeast-1
+      - name: Upload vào prefix của PR
+        run: |
+          aws s3 sync dist/ s3://acme-shop-frontend-preview/pr-${{ github.event.number }}/ \
+            --delete --cache-control "no-cache"
+      - name: Comment URL
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ github.event.number }} \
+            --body "Preview: https://pr-${{ github.event.number }}.preview.example.com"
+```
+
+Preview dùng `no-cache` cho mọi file vì URL asset không đổi giữa các lần push của cùng PR mà nội dung thì đổi; cache một năm ở đây chỉ gây nhầm lẫn. Job dọn dẹp:
+
+```yaml
+# .github/workflows/preview-cleanup.yml
+name: PR Preview Cleanup
+on:
+  pull_request:
+    types: [closed]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-preview-frontend
+          aws-region: ap-southeast-1
+      - run: aws s3 rm s3://acme-shop-frontend-preview/pr-${{ github.event.number }}/ --recursive
+```
+
+> **Ghi chú:** PR từ **fork** không được cấp `id-token` trong workflow `pull_request` mặc định của GitHub, nên preview sẽ fail với repo public có người ngoài đóng góp. Đó là hành vi mong muốn — bạn không muốn code lạ deploy lên hạ tầng của mình. Nếu cần, dùng `pull_request_target` với rất nhiều cẩn trọng, hoặc chấp nhận preview chỉ cho PR nội bộ.
+
+---
+
+## Chiến lược phát hành an toàn
+
+| Chiến lược           | Cách làm với frontend tĩnh                                                           | Rollback                                                                |
+| -------------------- | ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| **Ghi đè trực tiếp** | Sync thẳng vào bucket (như workflow trên)                                            | Deploy lại commit cũ — mất vài phút chạy pipeline                       |
+| **Theo phiên bản**   | Upload vào `releases/<sha>/`, đổi **origin path** của CloudFront để trỏ sang bản mới | Tức thì — chỉ đổi lại origin path. Rất đáng làm cho hệ thống quan trọng |
+| **Canary**           | CloudFront Function đọc cookie hoặc tỷ lệ ngẫu nhiên để chọn prefix phiên bản        | Đổi tỷ lệ về 0                                                          |
+
+> **Ghi chú:** **rollback frontend nhanh nhất.** Bật S3 Versioning, và giữ lại vài bản build gần nhất trong `releases/`. Khi có sự cố lúc 2 giờ sáng, đổi origin path của CloudFront về bản trước là xong trong 2 phút, không cần chạy pipeline, không cần ai review PR. Bạn có thể thử rollback ngay trên staging để chắc quy trình chạy — checklist production ở [Phần 16](/blog/aws-fe-16-roadmap-projects-glossary-checklist-interview/) yêu cầu đã thử ít nhất một lần.
+
+Với chiến lược theo phiên bản, workflow đổi hai chỗ: bước upload dùng đích `s3://$S3_BUCKET/releases/${{ github.sha }}/` và **không có `--delete`** (bản cũ phải còn nguyên để rollback), rồi thêm bước cập nhật origin path. Đổi origin path qua CLI hơi lắt léo vì phải lấy toàn bộ config kèm `ETag`, sửa, rồi gửi lại với `--if-match`:
+
+```bash
+# Lấy config hiện tại + ETag
+aws cloudfront get-distribution-config --id $CF_DISTRIBUTION_ID > cf.json
+ETAG=$(jq -r '.ETag' cf.json)
+
+# Đổi OriginPath của origin S3 sang bản mới
+jq --arg p "/releases/$GITHUB_SHA" \
+  '.DistributionConfig | (.Origins.Items[] | select(.Id == "s3-frontend") | .OriginPath) = $p' \
+  cf.json > cf-new.json
+
+aws cloudfront update-distribution --id $CF_DISTRIBUTION_ID \
+  --distribution-config file://cf-new.json --if-match "$ETAG"
+
+# Vẫn phải invalidate HTML: edge đang giữ index.html của bản cũ
+aws cloudfront create-invalidation --distribution-id $CF_DISTRIBUTION_ID --paths "/index.html" "/"
+```
+
+Thay đổi distribution mất vài phút để lan khắp edge, nhưng không có khoảnh khắc nào HTML mới trỏ tới asset chưa tồn tại, vì cả bản mới đã nằm trọn trong prefix của nó trước khi công tắc được gạt. Thêm một lifecycle rule xoá prefix `releases/` cũ hơn 30 ngày, hoặc một bước trong pipeline giữ lại đúng N bản gần nhất.
+
+Canary là mở rộng tự nhiên: CloudFront Function ở Viewer Request đọc cookie `canary` (đặt cho nhóm người dùng thử) hoặc `Math.random()`, rồi rewrite `request.uri` thành `/releases/<sha-mới>` + uri cho nhóm đó, giữ nguyên cho nhóm còn lại, với origin path để trống. Vì URI có prefix phiên bản, cache key tự tách hai bản, không sợ trộn. Đổi tỷ lệ bằng cách sửa hằng số trong function và publish — vài chục giây.
+
+---
+
+## Lab 9.1 — Pipeline đầu tiên (90 phút)
+
+**1.** Đưa project ở Lab 3.1 lên GitHub (repo private cũng được).
+
+**2.** Tạo OIDC provider và role `github-deploy-frontend` theo mục trên. Trust policy dùng `sub` đúng `repo:<user>/<repo>:ref:refs/heads/main`. Gắn policy tối thiểu với bucket và distribution của bạn.
+
+**3.** Tạo `.github/workflows/deploy.yml` với nội dung ở trên, sửa lại `S3_BUCKET`, `CF_DISTRIBUTION_ID`, ARN role và URL kiểm tra. Nếu project chưa có script `lint`, `typecheck`, `test`, tạm thay bằng `npm run build` hoặc thêm chúng — nhưng đừng xoá bước kiểm tra.
+
+**4.** Push lên `main`, mở tab Actions xem pipeline chạy. Mở từng bước để đọc output; để ý bước OIDC in ra ARN của role đã assume.
+
+**5.** Cố tình làm lỗi lint (ví dụ biến khai báo không dùng) → push → xác nhận pipeline **dừng ở bước kiểm tra**, không deploy, trang web vẫn là bản cũ.
+
+**6.** Sửa lỗi, push lại, xác nhận trang web cập nhật sau khi job xanh. Chạy `curl -sI https://<domain>/` và xem `Age` về gần 0 sau invalidation.
+
+**7.** Thêm bước in ra thời gian deploy và commit SHA (`date -u` và `${{ github.sha }}`) để dễ đối chiếu sau này; nếu app hiển thị `VITE_APP_VERSION`, kiểm tra nó khớp với SHA trong log.
+
+**8.** (Thêm) Đổi `sub` trong trust policy thành một nhánh khác, push lên `main` → bước OIDC fail với `Not authorized to perform sts:AssumeRoleWithWebIdentity`. Đổi lại. Bạn vừa thấy trust policy chặn đúng như thiết kế.
+
+> **Kết quả mong đợi:** push lên `main` là tự deploy; pipeline tự dừng khi kiểm tra fail; không còn access key cố định nào trong GitHub Secrets; bạn đọc được trong log commit nào đang chạy trên production.
+
+---
+
+## Sai lầm hay gặp
+
+- **Thiếu `permissions: id-token: write`** → "Credentials could not be loaded". Không phải lỗi IAM, là lỗi workflow.
+- **`sub` khớp `repo:org/*`** → mọi repo trong org deploy được prod. Kiểm tra bằng cách đọc lại trust policy sau khi tạo; console đôi khi gợi ý giá trị rộng.
+- **Thiếu ARN bucket (không có `/*`) trong policy** → `sync` fail `AccessDenied` ở bước `ListBucket`. Cần cả hai ARN ([Phần 1](/blog/aws-fe-01-mindset-and-request-lifecycle/)).
+- **Invalidate `/*` mỗi lần deploy** → hết 1.000 path miễn phí nhanh hơn bạn nghĩ khi có nhiều môi trường, và không cần thiết vì asset có hash.
+- **`cancel-in-progress: true`** cho job deploy → push thứ hai huỷ push thứ nhất giữa bước upload asset và HTML. Chỉ dùng `true` cho job test/preview.
+- **Chạy `sync --delete` vào bucket đang có `releases/`** → xoá sạch mọi bản cũ, mất khả năng rollback.
+- **Không có bước kiểm tra sau deploy** → pipeline xanh nhưng trang 403 vì OAC hỏng, và bạn biết qua người dùng.
+
+Pipeline này deploy file tĩnh. Nếu đích là một cluster Kubernetes, nửa đầu (checkout, test, build, OIDC) giữ nguyên và nửa sau đổi thành build image + cập nhật manifest — [K8s phần 16](/blog/k8s-fe-16-ci-cd-github-actions-gitops-argocd/) đi tiếp từ đó với GitOps và ArgoCD.
+
+---
+
+## Tóm tắt
+
+- Pipeline chuẩn: cài → kiểm tra → build → OIDC → upload asset (immutable) → upload HTML (no-cache) → invalidate `/index.html` → kiểm tra 200. Asset luôn trước HTML.
+- OIDC thay access key: một provider mỗi tài khoản, một role mỗi mục đích, trust policy giới hạn `sub` đúng repo và nhánh. `repo:org/*` là lỗ hổng.
+- Workflow cần `permissions: id-token: write`, `concurrency` không huỷ job đang chạy, `environment: production` để duyệt tay, `VITE_APP_VERSION` để truy vết commit.
+- Preview cho mỗi PR: Amplify bật một ô tick; tự làm với prefix `pr-N/`, wildcard cert, CloudFront Function rewrite theo subdomain, role riêng chỉ ghi bucket preview, job dọn dẹp khi PR đóng.
+- Phát hành theo phiên bản (`releases/<sha>/` + origin path) cho rollback 2 phút không cần pipeline; canary bằng CloudFront Function rewrite URI theo cookie.
+- Không `--delete` khi giữ nhiều bản; lifecycle dọn bản cũ.
+
+Phần tiếp theo — **[Phần 14 — Giám sát và sổ tay debug 6 bước](/blog/aws-fe-14-monitoring-and-debug-handbook/)** — khi pipeline xanh mà production vẫn lỗi, mở cái gì ra xem và theo thứ tự nào.
+
+## Đọc thêm
+
+- [GitHub Actions — Documentation](https://docs.github.com/en/actions)
+- [AWS IAM — User Guide](https://docs.aws.amazon.com/IAM/latest/UserGuide/)
+- [Amazon CloudFront — Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/)

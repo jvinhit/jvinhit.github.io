@@ -1,0 +1,216 @@
+---
+title: 'AWS cho Frontend Developer · Phần 15 — Bảo mật, hiệu năng và chi phí'
+description: 'Sáu security header nên có và cách gắn qua Response Headers Policy, CSP cho SPA đi từ Report-Only, AWS WAF đáng bật gì, bảy đòn bẩy hiệu năng CloudFront, rồi hoá đơn: cái gì tốn tiền, ước tính ba kịch bản và checklist tự bảo vệ.'
+pubDate: 2026-11-10
+lang: vi
+tags: [aws, security, performance, cdn, devops]
+series: aws-fe
+seriesOrder: 15
+draft: false
+---
+
+Ba chủ đề trong bài này có chung một đặc điểm: chúng không làm app "chạy được" — app đã chạy từ [Phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/) — nhưng chúng quyết định app có **an toàn, nhanh và rẻ** khi có người dùng thật hay không. Và cả ba đều là những ô cấu hình bạn bật một lần trong CloudFront rồi quên đi, nên đáng bỏ một buổi làm cho đúng.
+
+Đọc xong bài này bạn gắn được sáu security header bằng một Response Headers Policy, triển khai CSP cho SPA mà không làm vỡ production, biết bật rule WAF nào và tốn bao nhiêu, kéo được điểm Lighthouse lên bằng bảy đòn bẩy CloudFront cho sẵn, và đọc hiểu hoá đơn AWS để không bao giờ bị bất ngờ cuối tháng.
+
+---
+
+## Security header nên có
+
+| Header                            | Tác dụng                                                                                      |
+| --------------------------------- | --------------------------------------------------------------------------------------------- |
+| `Strict-Transport-Security`       | Buộc trình duyệt luôn dùng HTTPS cho tên miền này, kể cả lần sau người dùng gõ `http://`      |
+| `Content-Security-Policy`         | Lá chắn mạnh nhất chống XSS. Khai báo script, style, ảnh, kết nối được phép tải từ đâu        |
+| `X-Content-Type-Options: nosniff` | Cấm trình duyệt tự đoán loại file — chặn một lớp tấn công qua file upload giả dạng            |
+| `X-Frame-Options: DENY`           | Chặn clickjacking (nhúng trang bạn vào iframe của kẻ xấu)                                     |
+| `Referrer-Policy`                 | Kiểm soát thông tin URL rò rỉ sang trang khác khi người dùng bấm link ra ngoài                |
+| `Permissions-Policy`              | Tắt các API trình duyệt không dùng (camera, mic, định vị) để script bên thứ ba không gọi được |
+
+Cách gắn: **CloudFront → Policies → Response headers policy**, tạo policy rồi chọn nó trong từng behavior phục vụ HTML. Managed policy `SecurityHeadersPolicy` có sẵn HSTS, `nosniff`, `X-Frame-Options`, `Referrer-Policy` và `X-XSS-Protection`; nó **không** có CSP và `Permissions-Policy`, nên khi cần hai header đó bạn tạo policy riêng (copy giá trị từ managed policy rồi thêm). Đây là cách nên dùng thay vì viết CloudFront Function như ví dụ ở [Phần 8](/blog/aws-fe-08-cloudfront-functions-lambda-edge-signed-urls/) — function chỉ đáng khi giá trị header phải thay đổi theo request.
+
+Kiểm tra sau khi gắn:
+
+```bash
+curl -sI https://shop.example.com | grep -iE "strict-transport|content-security|x-content-type|x-frame|referrer-policy|permissions-policy"
+```
+
+Với HSTS, giá trị `max-age=63072000; includeSubDomains; preload` là chuẩn hai năm. Hai lưu ý: `includeSubDomains` áp cho mọi subdomain, kể cả cái nội bộ chưa có HTTPS — nếu bạn có `intranet.example.com` chạy HTTP, nó sẽ không mở được nữa. Và HSTS chỉ có nghĩa khi HTTP đã redirect sang HTTPS (Viewer protocol policy = Redirect HTTP to HTTPS), nếu không trình duyệt không bao giờ nhận được header từ kết nối HTTPS đầu tiên.
+
+### CSP cho SPA — bắt đầu từ chế độ chỉ báo cáo
+
+CSP là header duy nhất trong bảng có thể **làm vỡ trang production** khi bật sai, vì nó chặn script và kết nối không được khai báo. Vì vậy luôn đi hai giai đoạn:
+
+```text
+# Giai đoạn 1: chỉ báo cáo, KHÔNG chặn — để xem sẽ vỡ cái gì
+Content-Security-Policy-Report-Only:
+  default-src 'self';
+  script-src 'self';
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data: https://cdn.example.com;
+  connect-src 'self' https://api.example.com https://*.sentry.io;
+  font-src 'self' data:;
+  frame-ancestors 'none';
+  base-uri 'self';
+
+# Giai đoạn 2: sau khi sửa hết cảnh báo trong Console, đổi tên header
+# thành Content-Security-Policy để thực sự chặn
+```
+
+Ở giai đoạn 1, trình duyệt vẫn chạy mọi thứ nhưng in cảnh báo `[Report Only]` vào Console mỗi khi có thứ vi phạm. Bạn dùng app một tuần (hoặc bật `report-to` trỏ về một endpoint thu thập, ví dụ Sentry hỗ trợ sẵn) để gom danh sách vi phạm, thêm domain thiếu vào policy, rồi mới đổi tên header. Checklist production ở [Phần 16](/blog/aws-fe-16-roadmap-projects-glossary-checklist-interview/) yêu cầu Report-Only chạy ít nhất một tuần.
+
+> **Cạm bẫy:** khi áp CSP cho React/Vue: nhiều thư viện CSS-in-JS cần `style-src 'unsafe-inline'`. Nếu dùng Google Analytics, Sentry, Intercom, Stripe… phải thêm domain của chúng vào `script-src` và `connect-src` (và `frame-src` cho widget thanh toán). Triển khai CSP mà không qua giai đoạn Report-Only gần như chắc chắn làm vỡ trang production — và vỡ theo cách người dùng thấy trang trắng còn bạn thấy mọi thứ bình thường vì máy bạn còn cache bản cũ.
+
+Từng directive nghĩa là gì:
+
+- `default-src 'self'` — mặc định chỉ tải từ chính origin. Mọi directive không khai báo rơi về đây.
+- `script-src 'self'` — không có `'unsafe-inline'`, tức là không có `onclick=""` hay thẻ script inline. Build của Vite và Next.js mặc định không sinh script inline cho bundle chính, nhưng hãy kiểm tra `dist/index.html`; nếu có script inline (analytics dán tay), chuyển nó thành file hoặc dùng nonce/hash.
+- `connect-src` — nơi `fetch`, `XMLHttpRequest`, WebSocket được phép gọi. Danh sách này bạn đã có sẵn từ lệnh `grep` URL trong bundle ở [Phần 12](/blog/aws-fe-12-env-vars-build-time-runtime-secrets/). Kiến trúc cùng origin qua CloudFront giúp `connect-src 'self'` là đủ cho API.
+- `frame-ancestors 'none'` — phiên bản hiện đại của `X-Frame-Options: DENY`; giữ cả hai cho trình duyệt cũ.
+- `base-uri 'self'` — chặn kẻ tấn công chèn thẻ `base` đổi gốc của mọi URL tương đối.
+
+Cơ chế CSP, nonce, hash và cách đọc báo cáo vi phạm được mổ xẻ ở [Web security phần 3](/blog/web-security-03-content-security-policy/).
+
+---
+
+## AWS WAF
+
+WAF là tường lửa ứng dụng web, gắn được vào CloudFront (web ACL toàn cầu, tạo ở `us-east-1`) hoặc ALB (web ACL theo region). Với frontend, ba thứ đáng bật:
+
+- **AWS Managed Rules — Common Rule Set:** chặn các mẫu tấn công phổ biến (SQL injection, XSS trong query, path traversal, user-agent xấu). Bật ở chế độ **Count** một tuần trước khi chuyển sang Block, vì bộ rule này có thể chặn nhầm request hợp lệ — ví dụ body JSON lớn vượt ngưỡng của rule giới hạn kích thước body, hoặc URL chứa chuỗi trông giống SQL.
+- **Rate-based rule:** chặn IP gửi quá N request trong 5 phút — hữu ích chống brute-force trang đăng nhập và scraper. Áp cho path `/api/auth/*` với ngưỡng thấp (vài trăm), và toàn site với ngưỡng cao hơn.
+- **Geo match:** chặn hoặc cho phép theo quốc gia, nếu dịch vụ chỉ phục vụ trong nước. Đừng dùng nó như biện pháp bảo mật (VPN qua mặt trong một giây), chỉ như cách giảm nhiễu.
+
+> **Ghi chú:** WAF tính phí theo web ACL + số rule + số request, có thể tốn vài chục USD/tháng. Cân nhắc với dự án cá nhân: bucket kín qua OAC, CORS đúng, security header và rate limit ở backend đã chặn phần lớn nguy cơ của một SPA. Bật WAF khi có dữ liệu người dùng thật hoặc form đăng nhập công khai.
+
+Khi WAF chặn, người dùng thấy 403 với body trống hoặc trang lỗi CloudFront, không có header `Access-Control-Allow-Origin` — nên triệu chứng trong browser lại là "CORS error". Nhớ điều này khi debug: WAF → Sampled requests cho biết rule nào chặn.
+
+---
+
+## Hiệu năng — những đòn bẩy AWS cho bạn
+
+| Kỹ thuật                                        | Cấu hình ở đâu                       | Tác động                                                                          |
+| ----------------------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------- |
+| **Bật nén brotli/gzip**                         | CloudFront behavior → Compress       | Giảm 60–80% kích thước JS/CSS. Đòn bẩy lớn nhất, dễ nhất                          |
+| **Cache asset 1 năm**                           | `Cache-Control: immutable`           | Lần thứ hai trở đi gần như tức thì, không cả request 304                          |
+| **HTTP/2 và HTTP/3**                            | CloudFront → Supported HTTP versions | Nhiều request song song trên một kết nối; HTTP/3 tốt cho mạng di động kém ổn định |
+| **Preconnect tới origin API**                   | `link rel="preconnect"` trong HTML   | Tiết kiệm 100–300ms cho request API đầu tiên khi API ở host khác                  |
+| **Tách asset Next.js ra behavior riêng**        | Behavior `/_next/static/*`           | Không để asset tĩnh đi qua server SSR                                             |
+| **Origin Shield**                               | CloudFront → Origin settings         | Thêm một lớp cache trung gian trước origin, giảm tải origin. Có phụ phí           |
+| **Đặt bucket cùng region với người dùng chính** | Lúc tạo bucket                       | Giảm độ trễ khi cache miss                                                        |
+
+Bảy đòn bẩy này xếp theo tỷ lệ "tác động trên công sức". Hai dòng đầu bạn đã làm từ [Phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/); nếu chưa, đừng làm gì khác trước khi xong chúng. HTTP/3 là một ô tick trong cài đặt distribution. Preconnect là một dòng trong `index.html`:
+
+```html
+<link rel="preconnect" href="https://api.example.com" crossorigin />
+```
+
+Nó chỉ có ý nghĩa khi API ở host khác; với kiến trúc cùng origin qua CloudFront, kết nối đã có sẵn từ lúc tải HTML. Origin Shield chọn một region làm "cache trung tâm": mọi edge miss đều hỏi Origin Shield trước khi hỏi S3/ALB, nên origin chỉ thấy một request cho mỗi file thay vì một request từ mỗi edge. Đáng bật khi origin là ALB tốn kém mỗi request, ít đáng khi origin là S3.
+
+### Nối vào Core Web Vitals
+
+Điểm Lighthouse Performance trên 90 là tiêu chí Tuần 8 của lộ trình. Từng chỉ số ứng với một đòn bẩy hạ tầng:
+
+- **TTFB** (thời gian tới byte đầu tiên) — quyết định bởi cache hit ở edge. `X-Cache: Hit` ở Hà Nội là 15ms; `Miss` là 110ms+ vì phải sang Singapore. HTML `no-cache` vẫn hit được dưới dạng `RefreshHit` (304 từ origin) nếu `ETag` đúng.
+- **LCP** (nội dung lớn nhất) — thường là ảnh hero hoặc font. Ảnh: định dạng WebP/AVIF, kích thước đúng, `fetchpriority="high"` cho ảnh trên màn hình đầu; font: `preload` và `font-display: swap`. CloudFront chỉ giúp phần vận chuyển; kích thước file là việc của build.
+- **INP** (phản hồi tương tác) — là việc của JS, không phải hạ tầng: bundle nhỏ, code splitting theo route, không chặn main thread. Nén và cache làm JS tới nhanh hơn chứ không chạy nhanh hơn.
+- **CLS** — hoàn toàn phía frontend: khai `width`/`height` cho ảnh, không chèn banner đẩy nội dung.
+
+Chiến lược cache trình duyệt và CDN nhìn từ phía web performance ở [Web perf phần 11](/blog/web-perf-11-network-caching/); nếu bạn so sánh với cách Cloudflare làm cùng việc, [Cloudflare phần 10](/blog/cloudflare-fe-10-security-and-performance/) là bài tương ứng.
+
+---
+
+## Chi phí — hiểu để không bị bất ngờ
+
+### Cái gì tốn tiền
+
+| Dịch vụ             | Tính phí theo                            | Ghi chú cho frontend                                                                                        |
+| ------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| **S3**              | Dung lượng lưu + số request + dữ liệu ra | Build vài chục MB → chi phí lưu trữ không đáng kể. Dữ liệu từ S3 sang CloudFront **miễn phí**               |
+| **CloudFront**      | Dữ liệu ra Internet + số request         | Khoản chính. Có bậc miễn phí vĩnh viễn khá rộng rãi cho dự án nhỏ (kiểm tra trang pricing hiện tại)         |
+| **Route 53**        | Hosted zone/tháng + số truy vấn          | Khoảng 0,5 USD/tháng cho mỗi tên miền. Truy vấn ALIAS tới tài nguyên AWS miễn phí                           |
+| **ACM**             | Miễn phí                                 | Chứng chỉ public hoàn toàn miễn phí                                                                         |
+| **ALB**             | Giờ chạy + LCU                           | Khoản cố định đáng kể — chạy 24/7 dù không ai truy cập. Thường là dòng lớn nhất trong hoá đơn của dự án nhỏ |
+| **ECS Fargate**     | vCPU-giờ + GB-giờ                        | Trả tiền khi task chạy. Task nhỏ nhất vẫn tốn vài USD/tháng nếu chạy liên tục                               |
+| **Lambda**          | Số lần gọi + GB-giây                     | Bậc miễn phí rộng. Dự án nhỏ thường 0 đồng                                                                  |
+| **Invalidation**    | 1.000 path/tháng miễn phí                | Nếu chỉ invalidate `/index.html` thì không bao giờ vượt                                                     |
+| **CloudWatch Logs** | Dung lượng nạp vào + lưu trữ             | Hay bị bỏ quên. Log quá nhiều ở production sẽ tốn bất ngờ. Đặt retention 7–30 ngày                          |
+
+Ba thứ rút ra: **frontend tĩnh gần như miễn phí** (S3 nhỏ, S3→CloudFront không tính, CloudFront có bậc miễn phí, ACM miễn phí); **tiền bắt đầu chảy khi có thứ chạy 24/7** (ALB, Fargate, RDS, NAT Gateway); và **log là khoản âm thầm** tăng dần theo tháng nếu không đặt retention.
+
+### Ước tính cho vài kịch bản
+
+| Kịch bản                                  | Hạ tầng                                            | Ước tính mỗi tháng                        |
+| ----------------------------------------- | -------------------------------------------------- | ----------------------------------------- |
+| Portfolio cá nhân, vài nghìn lượt xem     | S3 + CloudFront + Route 53                         | Khoảng 0,5–2 USD (chủ yếu là hosted zone) |
+| SPA + API serverless, vài chục nghìn lượt | S3 + CloudFront + API Gateway + Lambda + DynamoDB  | Khoảng 1–10 USD                           |
+| App công ty nhỏ, có backend chạy liên tục | S3 + CloudFront + ALB + Fargate (2 task) + RDS nhỏ | Khoảng 60–120 USD                         |
+
+Đây là ước tính thô để hình dung thứ tự độ lớn. Giá AWS thay đổi theo thời gian và region — luôn kiểm tra bằng **AWS Pricing Calculator** trước khi cam kết, và nhớ rằng dữ liệu ra Internet từ region châu Á đắt hơn từ Mỹ. Nếu đang cân nhắc Cloudflare cho phần CDN, [Cloudflare phần 12](/blog/cloudflare-fe-12-free-plan-limits-and-aws-comparison/) đối chiếu hai bên trên cùng kịch bản.
+
+### Tự bảo vệ hoá đơn
+
+- [ ] Tạo AWS Budget với cảnh báo email ngay ngày đầu tiên (5 USD cho tài khoản học, ngưỡng thật cho production)
+- [ ] Bật Cost Anomaly Detection (miễn phí) — nó báo khi chi phí lệch khỏi pattern thường ngày, bắt được lỗi "quên tắt" nhanh hơn budget tháng
+- [ ] Gắn tag `Project`, `Environment` cho mọi tài nguyên và kích hoạt chúng làm cost allocation tag để Cost Explorer nhóm theo dự án
+- [ ] Đặt retention cho CloudWatch Logs (mặc định là vĩnh viễn): `aws logs put-retention-policy --log-group-name /ecs/my-api --retention-in-days 14`
+- [ ] Xoá tài nguyên sau mỗi bài lab: ALB, NAT Gateway, RDS là ba thứ đắt nhất khi quên
+- [ ] Kiểm tra vùng khác: có thể bạn đã tạo nhầm tài nguyên ở region khác và quên mất — Cost Explorer nhóm theo Region sẽ lộ ra
+
+> **Nguy hiểm:** ba thứ hay bị quên và đốt tiền nhất khi học:
+>
+> 1. **NAT Gateway** — tính theo giờ + dữ liệu, có thể tốn hơn 30 USD/tháng dù không dùng. Nó được tạo kèm khi bạn bấm "VPC and more" trong wizard, và không hiện ở đâu ngoài trang VPC.
+> 2. **ALB** — chạy 24/7, khoảng 16–20 USD/tháng. Xoá ALB không xoá target group, nhưng target group không tốn tiền.
+> 3. **RDS** — instance chạy liên tục. Nhớ xoá cả snapshot, vì snapshot tính phí lưu trữ riêng.
+>
+> Sau mỗi bài lab, vào Billing → Cost Explorer, nhóm theo Service, kiểm tra không còn gì lạ. Thói quen này mất hai phút và là lý do budget 5 USD không bao giờ bị vượt.
+
+---
+
+## Thực hành — header, CSP và Lighthouse (60 phút)
+
+Nguồn tài liệu không có lab riêng cho hai chương này; bài tập sau tương ứng "Gắn Response Headers Policy, CSP Report-Only, chạy Lighthouse" của Tuần 8.
+
+**1.** Tạo Response headers policy mới, copy giá trị từ managed `SecurityHeadersPolicy`, thêm `Permissions-Policy: camera=(), microphone=(), geolocation=()` và một header custom `Content-Security-Policy-Report-Only` với giá trị ở mục CSP (sửa domain API theo project của bạn). Gắn vào behavior mặc định. Chờ Deployed, chạy lệnh `curl -sI | grep` ở trên và thấy đủ header.
+
+**2.** Mở app, dùng mọi tính năng trong 10 phút với Console mở. Ghi lại từng dòng `[Report Only]`: thường là font từ Google Fonts, ảnh từ S3 upload, script analytics. Thêm domain tương ứng vào policy.
+
+**3.** Khi Console sạch, đổi tên header thành `Content-Security-Policy`. Tải lại ở tab ẩn danh (không có cache), dùng lại 10 phút. Có gì vỡ → đổi lại Report-Only ngay, sửa, thử lại. Với dự án thật, giữ Report-Only một tuần trước bước này.
+
+**4.** Chạy Lighthouse (tab Lighthouse trong DevTools, chế độ Mobile) trên trang chủ qua CloudFront. Ghi điểm Performance và ba con số TTFB, LCP, CLS.
+
+**5.** Bật HTTP/3 trong distribution nếu chưa, kiểm tra Compress đang bật, kiểm tra `X-Cache: Hit` cho asset. Chạy lại Lighthouse, so sánh. Nếu LCP vẫn cao, tìm ảnh lớn nhất trên màn hình đầu và đổi sang WebP với kích thước đúng.
+
+**6.** Vào Billing: tạo budget nếu chưa có, bật Cost Anomaly Detection, mở Cost Explorer nhóm theo Service cho 30 ngày qua. Liệt kê mọi dòng có tiền và giải thích từng dòng đến từ tài nguyên nào. Dòng nào không giải thích được → tìm và xoá.
+
+> **Kết quả mong đợi:** `curl -sI` thấy đủ sáu header; CSP chạy ở chế độ chặn mà app không vỡ; Lighthouse Performance trên 90 (hoặc bạn biết chính xác vì sao chưa đạt và cần đổi gì ở build); hoá đơn 30 ngày qua không có dòng nào lạ.
+
+---
+
+## Sai lầm hay gặp
+
+- **Bật CSP thẳng ở chế độ chặn** → trang trắng cho người dùng, bình thường trên máy dev. Luôn Report-Only trước.
+- **`includeSubDomains` trong HSTS khi còn subdomain HTTP** → subdomain đó không mở được nữa cho tới hết `max-age` trên máy người dùng. Bỏ `includeSubDomains` hoặc đưa mọi subdomain lên HTTPS trước.
+- **Gắn Response Headers Policy vào behavior `/assets/*` nhưng quên behavior mặc định** → HTML không có header, `curl -sI` vào file JS thì có. Header bảo mật phải đi với HTML.
+- **WAF Common Rule Set ở chế độ Block ngay** → form upload hoặc JSON lớn bị 403 và hiện ra như "CORS error". Count trước, đọc Sampled requests.
+- **Tin điểm Lighthouse chạy trên `localhost`** → không có CDN, không có nén, không có độ trễ mạng. Chạy trên URL production hoặc staging.
+- **Không đặt retention log** và **quên NAT Gateway** — hai dòng hoá đơn tăng dần mà không có tính năng nào đổi.
+
+---
+
+## Tóm tắt
+
+- Sáu security header gắn qua Response Headers Policy trên behavior phục vụ HTML; managed `SecurityHeadersPolicy` thiếu CSP và `Permissions-Policy` nên thường cần policy riêng.
+- CSP đi hai giai đoạn: Report-Only gom vi phạm ít nhất một tuần, sửa hết, rồi đổi tên header. CSS-in-JS cần `'unsafe-inline'` cho style; analytics, Sentry, Stripe cần thêm domain.
+- WAF: Common Rule Set (Count trước, Block sau), rate-based cho trang đăng nhập, geo match để giảm nhiễu. Tốn vài chục USD/tháng — cân nhắc với dự án cá nhân. WAF chặn trông như CORS error trong browser.
+- Bảy đòn bẩy hiệu năng theo thứ tự: nén, `immutable`, HTTP/2 và HTTP/3, preconnect, tách `/_next/static/*`, Origin Shield, bucket đúng region. TTFB là cache hit; LCP là ảnh và font; INP là JS.
+- Frontend tĩnh gần như miễn phí; tiền chảy khi có thứ chạy 24/7 (ALB ~16–20 USD, Fargate, RDS, NAT Gateway hơn 30 USD); log không retention tăng âm thầm.
+- Ba kịch bản: portfolio 0,5–2 USD, serverless 1–10 USD, backend liên tục 60–120 USD mỗi tháng — kiểm tra lại bằng Pricing Calculator.
+- Budget + Cost Anomaly Detection + tag + retention + dọn lab + kiểm tra region khác.
+
+Phần tiếp theo — **[Phần 16 — Lộ trình 8 tuần, dự án, từ điển, checklist và phỏng vấn](/blog/aws-fe-16-roadmap-projects-glossary-checklist-interview/)** — gom toàn bộ series thành kế hoạch học từng tuần, năm dự án bỏ vào CV, và các bảng tra cứu để dùng lâu dài.
+
+## Đọc thêm
+
+- [AWS WAF — Developer Guide](https://docs.aws.amazon.com/waf/latest/developerguide/)
+- [Amazon CloudFront — Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/)
+- [AWS Cost Management — User Guide](https://docs.aws.amazon.com/cost-management/latest/userguide/)

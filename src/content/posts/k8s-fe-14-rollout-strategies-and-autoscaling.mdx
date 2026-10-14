@@ -1,0 +1,481 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 14 — Chiến lược rollout và autoscaling'
+description: 'RollingUpdate, Recreate, Blue-Green hay Canary cho frontend: cấu hình từng cách, đo và rollback ra sao; rồi để HPA tự co giãn Pod với metrics-server, resources.requests và behavior chống dao động.'
+pubDate: 2026-11-08
+lang: vi
+tags: [kubernetes, deployment, autoscaling, devops, frontend]
+series: k8s-fe
+seriesOrder: 14
+draft: false
+---
+
+import DockerDiagram from '~/components/blog/DockerDiagram.astro';
+
+Đến [Phần 12](/blog/k8s-fe-12-cache-cdn-zero-downtime/) bạn đã có checklist bảy điểm để deploy không rớt request. Nhưng "deploy" ở đó mới chỉ là RollingUpdate mặc định: thay dần từng Pod. Khi hệ thống lớn dần, hai câu hỏi mới xuất hiện. Một: release có tính năng rủi ro, bạn muốn 10% người dùng thấy trước rồi mới mở rộng, hoặc muốn QA test ngay trên production trước khi chuyển traffic, làm thế nào? Hai: traffic dịp sale tăng gấp mười, ai là người ngồi gõ `kubectl scale` lúc 2 giờ sáng?
+
+Bài này trả lời cả hai. Nửa đầu đi qua bốn chiến lược cập nhật (RollingUpdate, Recreate, Blue-Green, Canary) với manifest chạy được trên cluster kind của bạn. Nửa sau là HPA: cách nó tính số replica, hai điều kiện bắt buộc để nó chạy, và vì sao với SPA tĩnh bạn thường không cần nó nhưng với Next.js SSR thì gần như bắt buộc.
+
+## Bốn chiến lược cập nhật
+
+| Chiến lược        | Cách hoạt động                                                                | Ưu / nhược                                                                                     |
+| ----------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| **RollingUpdate** | Thay dần từng Pod; cũ và mới cùng chạy trong lúc chuyển                       | Mặc định, zero-downtime nếu có readiness probe. Nhược: hai version chạy song song tạm thời     |
+| **Recreate**      | Xoá hết Pod cũ rồi mới tạo Pod mới                                            | Có downtime. Chỉ dùng khi hai version không thể cùng tồn tại (migration DB phá vỡ tương thích) |
+| **Blue-Green**    | Dựng song song môi trường mới hoàn chỉnh, rồi chuyển toàn bộ traffic một nhát | Rollback tức thì. Nhược: tốn gấp đôi tài nguyên trong lúc chuyển                               |
+| **Canary**        | Đưa 5–10% traffic sang version mới, theo dõi, rồi tăng dần                    | An toàn nhất. Nhược: phức tạp, cần công cụ hỗ trợ để tự động hoá                               |
+
+Kubernetes chỉ có sẵn hai chiến lược đầu trong `Deployment.spec.strategy`. Blue-Green và Canary không phải một trường cấu hình; chúng là _cách bạn phối hợp_ Deployment, Service và Ingress. Đó là lý do phần lớn tutorial bỏ qua chúng, và cũng là lý do bài này viết manifest đầy đủ cho cả hai.
+
+---
+
+## RollingUpdate: mặc định và đủ dùng cho 90% trường hợp
+
+<DockerDiagram
+  kind="k8s-objects"
+  caption="Mỗi lần đổi image, Deployment tạo một ReplicaSet mới và chuyển dần Pod từ ReplicaSet cũ sang; ReplicaSet cũ giữ lại ở 0 Pod để rollback"
+/>
+
+Bạn đã gặp cơ chế này ở [Phần 6](/blog/k8s-fe-06-pod-replicaset-deployment-labels-namespace/): đổi image là Deployment tạo ReplicaSet mới, tăng dần ReplicaSet mới và giảm dần ReplicaSet cũ. Hai con số điều khiển nhịp độ đó:
+
+```yaml
+spec:
+  replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25% # được tạo thêm tối đa 25% Pod vượt mức replicas
+      maxUnavailable: 0 # không cho phép thiếu Pod nào so với replicas
+```
+
+Với `replicas: 4`, `maxSurge: 25%` làm tròn lên thành 1 Pod. Chuỗi diễn ra như sau:
+
+```text
+4 cũ  →  4 cũ + 1 mới  →  3 cũ + 2 mới  →  2 cũ + 3 mới  →  1 cũ + 4 mới  →  4 mới
+```
+
+Luôn có ít nhất 4 Pod phục vụ. Chậm hơn nhưng an toàn nhất. Quy tắc làm tròn cần nhớ: `maxSurge` theo phần trăm làm tròn **lên**, `maxUnavailable` theo phần trăm làm tròn **xuống**; hai giá trị không được cùng bằng 0.
+
+"Pod mới" chỉ được tính là sẵn sàng khi readiness probe pass (và đã qua `minReadySeconds` nếu bạn đặt). Không có readiness probe, Kubernetes coi container vừa Running là sẵn sàng, giết Pod cũ ngay, và người dùng nhận 502 trong vài giây nginx còn chưa nhận kết nối. Đây là lý do checklist zero-downtime ở Phần 12 xếp readiness probe ngay sau `maxUnavailable: 0`.
+
+Ba tổ hợp bạn sẽ gặp:
+
+| `maxSurge` / `maxUnavailable` | Hành vi                                              | Hợp với                                                   |
+| ----------------------------- | ---------------------------------------------------- | --------------------------------------------------------- |
+| `1` / `0`                     | Từng Pod một, không bao giờ thiếu Pod                | Frontend production, cluster có dư tài nguyên cho một Pod |
+| `25%` / `25%` (mặc định)      | Nhanh, chấp nhận thiếu một phần Pod trong lúc chuyển | Môi trường dev/staging                                    |
+| `0` / `1`                     | Không tạo thêm Pod, thay tại chỗ                     | Node đã kín tài nguyên, chấp nhận giảm công suất tạm thời |
+
+Hai trường phụ đáng biết:
+
+```yaml
+spec:
+  minReadySeconds: 5 # Pod mới phải ready liên tục 5s mới được tính là available
+  progressDeadlineSeconds: 600 # quá 10 phút không tiến triển → rollout bị đánh dấu thất bại
+```
+
+`minReadySeconds` chặn trường hợp probe pass một lần rồi crash ngay; `progressDeadlineSeconds` là thứ khiến `kubectl rollout status` thoát với lỗi thay vì treo mãi khi image mới bị CrashLoopBackOff, và là điều kiện để bước "tự rollback" trong pipeline CI ở [Phần 16](/blog/k8s-fe-16-ci-cd-github-actions-gitops-argocd/) hoạt động.
+
+Bộ lệnh theo dõi và can thiệp:
+
+```bash
+kubectl -n web set image deploy/frontend web=ghcr.io/my-org/frontend:v1.4.3
+kubectl -n web rollout status deploy/frontend   # theo dõi tới khi xong hoặc lỗi
+kubectl -n web get rs -w                        # xem ReplicaSet cũ giảm, mới tăng
+kubectl -n web rollout history deploy/frontend
+kubectl -n web rollout undo deploy/frontend     # quay về revision trước
+kubectl -n web rollout pause deploy/frontend    # dừng giữa chừng: canary "thủ công"
+kubectl -n web rollout resume deploy/frontend
+```
+
+> **Ghi chú:** `rollout pause` ngay sau `set image` là một kiểu canary tối giản: Deployment tạo Pod mới đầu tiên rồi dừng, bạn có 1 Pod v2 chạy cạnh 3 Pod v1 để quan sát log và lỗi. Không điều khiển được phần trăm traffic (Service chia đều theo số Pod), nhưng không cần cài gì thêm.
+
+---
+
+## Recreate: khi hai version không được cùng tồn tại
+
+```yaml
+spec:
+  strategy:
+    type: Recreate
+```
+
+Kubernetes scale ReplicaSet cũ về 0, chờ mọi Pod cũ biến mất, rồi mới tạo Pod mới. Downtime bằng thời gian pull image cộng thời gian khởi động cộng thời gian probe pass, thường 10–60 giây.
+
+Với frontend, gần như không có lý do dùng Recreate. Trường hợp hợp lệ là workload có state không chia sẻ được (một PersistentVolume chỉ mount được vào một Pod) hoặc backend deploy kèm migration phá tương thích API cũ. Nếu bạn thấy `Recreate` trong manifest frontend của team, hãy hỏi lý do; thường là copy từ tutorial.
+
+---
+
+## Blue-Green bằng Service selector
+
+Ý tưởng: hai Deployment chạy song song, **blue** (v1, đang nhận traffic) và **green** (v2, đã chạy đủ Pod nhưng chưa ai gọi tới). Service chỉ trỏ vào một trong hai qua label `version`. Chuyển traffic là đổi một dòng selector.
+
+`deployment-blue.yaml`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-blue
+  namespace: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: frontend
+      version: blue
+  template:
+    metadata:
+      labels:
+        app: frontend
+        version: blue
+    spec:
+      containers:
+        - name: web
+          image: ghcr.io/my-org/frontend:v1.4.2
+          ports:
+            - name: http
+              containerPort: 80
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+```
+
+`deployment-green.yaml` giống hệt, chỉ khác `name: frontend-green`, `version: green` và `image: ...:v1.5.0`. Service production và một Service phụ để QA test green trước khi chuyển:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: web
+spec:
+  selector:
+    app: frontend
+    version: blue # đang trỏ vào blue
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-preview
+  namespace: web
+spec:
+  selector:
+    app: frontend
+    version: green # luôn trỏ vào bản chờ
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+Quy trình một lần release:
+
+```bash
+# 1. Dựng green, chờ đủ Pod ready
+kubectl apply -f deployment-green.yaml
+kubectl -n web rollout status deploy/frontend-green
+
+# 2. QA test green qua Service preview (port-forward, hoặc một Ingress host riêng như preview.app.congty.com)
+kubectl -n web port-forward svc/frontend-preview 8080:80
+
+# 3. Chuyển 100% traffic sang green: đổi đúng một dòng selector
+kubectl -n web patch svc frontend -p '{"spec":{"selector":{"app":"frontend","version":"green"}}}'
+kubectl -n web get endpoints frontend   # IP giờ là IP của các Pod green
+
+# 4. Có sự cố? Rollback tức thì, không cần chờ Pod nào khởi động
+kubectl -n web patch svc frontend -p '{"spec":{"selector":{"app":"frontend","version":"blue"}}}'
+
+# 5. Ổn định vài giờ/ngày thì thu hồi blue để trả tài nguyên
+kubectl -n web scale deploy/frontend-blue --replicas=0
+```
+
+Việc đổi selector có hiệu lực trong dưới một giây trên toàn cluster vì chỉ là cập nhật endpoints; không Pod nào bị giết, không request nào đang chạy bị cắt. Lần release tiếp theo, vai trò đổi chỗ: green là bản đang chạy, bạn cập nhật blue lên v1.6.0 và chuyển ngược lại.
+
+> **Cạm bẫy:** Blue-Green **không** giải quyết bài toán asset của SPA. Người dùng đang mở tab với `index.html` của v1 vẫn có thể lazy-load một chunk mà v2 không còn → `ChunkLoadError`. Bạn vẫn cần giữ lại asset version cũ trên CDN hoặc bắt lỗi ở router như đã bàn ở [Phần 12](/blog/k8s-fe-12-cache-cdn-zero-downtime/). Cái Blue-Green mua cho bạn là rollback tức thì và cơ hội test trên production trước khi mở, không phải miễn nhiễm với vấn đề cache.
+
+Hai điểm cần cân nhắc trước khi chọn: tài nguyên gấp đôi trong lúc chuyển (với SPA 48Mi mỗi Pod thì không đáng kể, với Next.js 500Mi mỗi Pod thì phải tính), và ConfigMap dùng chung, nghĩa là green phải chạy được với config hiện tại của blue, hoặc bạn tạo `frontend-config-green` riêng.
+
+---
+
+## Canary bằng annotation của ingress-nginx
+
+Canary tinh vi hơn Blue-Green ở chỗ chỉ một phần traffic sang version mới. ingress-nginx hỗ trợ sẵn qua annotation, không cần cài gì thêm. Điều kiện: một Ingress **canary** có cùng `host` và `path` với Ingress chính, trỏ tới Service của version mới.
+
+Trước hết cần Deployment và Service cho v2 (`frontend-v2`, label `app.kubernetes.io/name: frontend-v2`, manifest tương tự bản ở [Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/)). Ingress chính `frontend` giữ nguyên. Thêm Ingress canary:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend-canary
+  namespace: web
+  annotations:
+    nginx.ingress.kubernetes.io/canary: 'true'
+    nginx.ingress.kubernetes.io/canary-weight: '10' # 10% traffic sang v2
+    # Hoặc canary theo header, để QA test trước khi mở theo phần trăm:
+    # nginx.ingress.kubernetes.io/canary-by-header: "X-Canary"
+    # nginx.ingress.kubernetes.io/canary-by-header-value: "qa"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: app.congty.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-v2
+                port: { number: 80 }
+```
+
+Ba cách chọn ai vào canary, có thể kết hợp (thứ tự ưu tiên: header, rồi cookie, rồi weight):
+
+| Annotation                        | Hành vi                                                                                            |
+| --------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `canary-weight: "10"`             | 10% request ngẫu nhiên đi vào canary                                                               |
+| `canary-by-header: "X-Canary"`    | Request có header `X-Canary: always` vào canary, `never` thì không, giá trị khác thì rơi về weight |
+| `canary-by-header-value: "qa"`    | Kết hợp dòng trên: chỉ `X-Canary: qa` mới vào canary, hợp với QA test bằng extension đổi header    |
+| `canary-by-cookie: "canary_user"` | Cookie `canary_user=always` vào canary, dùng cho nhóm beta tester                                  |
+
+Để kiểm chứng phần trăm, thêm vào `nginx.conf` của image v2 một header nhận diện version rồi đếm bằng curl:
+
+```nginx
+add_header X-App-Version "v1.5.0" always;
+```
+
+```bash
+for i in $(seq 1 50); do
+  curl -sI -H "Host: app.local" http://localhost/ | grep -i x-app-version
+done | sort | uniq -c
+# ~45 dòng v1.4.2, ~5 dòng v1.5.0
+```
+
+Lộ trình tăng dần thường là 10 → 25 → 50 → 100, mỗi bước quan sát tỉ lệ 5xx và p99 ([Phần 17](/blog/k8s-fe-17-cert-manager-and-observability/) nói cách đo). Khi weight 100 chạy ổn, bạn đổi image của Deployment chính sang v2 rồi xoá Ingress canary và Deployment `frontend-v2`; hoặc đơn giản hơn, coi `frontend-v2` là bản chính và xoá bản cũ.
+
+> **Cạm bẫy riêng của SPA khi canary theo phần trăm:** request lấy `index.html` và request lấy chunk là hai request HTTP độc lập. Người dùng có 10% nhận `index.html` của v2, rồi request `chunk-abc.js` (chỉ v2 có) lại có 90% rơi vào Pod v1 → 404 → `ChunkLoadError` ở chính nhóm người dùng bạn muốn chiều chuộng nhất. Hai cách xử lý: (1) bật sticky session trên Ingress chính bằng `nginx.ingress.kubernetes.io/affinity: "cookie"` và `session-cookie-name: "route"` để một người dùng luôn về cùng nhóm Pod (kiểm tra thêm annotation `affinity-canary-behavior` trong docs ingress-nginx cho trường hợp canary); (2) đẩy asset của mọi version lên CDN/object storage, nên chunk nào cũng tồn tại bất kể Pod nào trả `index.html`. Với Next.js SSR vấn đề tương tự xảy ra với `/_next/static/`; cách (2) là chuẩn của các team lớn.
+
+### Argo Rollouts và Flagger: tự động hoá canary
+
+Canary thủ công có hai điểm yếu: bạn phải ngồi canh metric, và "tăng dần" là do người gõ. **Argo Rollouts** thay `Deployment` bằng CRD `Rollout` với các bước khai báo sẵn; **Flagger** giữ nguyên Deployment của bạn và tự sinh bản primary/canary. Cả hai tự tăng weight, tự truy vấn Prometheus lấy tỉ lệ lỗi và độ trễ, tự rollback khi vượt ngưỡng. Hình dáng một Rollout canary:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: frontend
+  namespace: web
+spec:
+  replicas: 4
+  selector:
+    matchLabels: { app.kubernetes.io/name: frontend }
+  template:
+    # ... giống hệt Deployment.spec.template
+  strategy:
+    canary:
+      trafficRouting:
+        nginx:
+          stableIngress: frontend # Rollouts tự tạo Ingress canary và chỉnh weight
+      steps:
+        - setWeight: 10
+        - pause: { duration: 10m }
+        - setWeight: 50
+        - pause: { duration: 10m }
+        # - analysis: { templates: [{ templateName: error-rate }] }
+```
+
+Đáng đầu tư khi hệ thống đã ổn định và có Prometheus. Trước đó, canary bằng annotation cộng một người nhìn dashboard là đủ. Hình dáng chính xác của khối `analysis` và các trường khác hãy tra docs Argo Rollouts đúng phiên bản bạn cài.
+
+---
+
+## Autoscaling: bốn loại co giãn
+
+| Loại                                | Co giãn cái gì                                             | FE dev có đụng tới không                                      |
+| ----------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------- |
+| **HPA** (Horizontal Pod Autoscaler) | Tăng/giảm **số lượng Pod**                                 | Có, dùng nhiều nhất; bạn tự viết manifest                     |
+| **VPA** (Vertical Pod Autoscaler)   | Tăng/giảm `requests`/`limits` của Pod                      | Ít dùng cho web; hữu ích ở chế độ chỉ gợi ý số                |
+| **Cluster Autoscaler**              | Tăng/giảm **số node**                                      | DevOps/cloud quản lý; bạn cần biết nó tồn tại để hiểu Pending |
+| **KEDA**                            | Scale theo sự kiện ngoài: độ dài queue, request/giây, lịch | Hợp với SSR khi CPU không phản ánh tải                        |
+
+### HPA cho frontend
+
+`k8s/hpa.yaml` đầy đủ:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend
+  namespace: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70 # % so với resources.requests.cpu, KHÔNG phải limits
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30 # phản ứng nhanh khi tải tăng
+      policies:
+        - type: Percent
+          value: 100 # tối đa gấp đôi số Pod mỗi 30 giây
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300 # giảm chậm (5 phút) để tránh dao động
+      policies:
+        - type: Percent
+          value: 50 # mỗi phút giảm tối đa một nửa
+          periodSeconds: 60
+```
+
+Cách HPA tính, để bạn đọc được cột TARGETS: mỗi 15 giây nó lấy mức dùng trung bình của các Pod, chia cho target rồi nhân với số replica hiện tại:
+
+```text
+desired = ceil( current × (usage / target) )
+Ví dụ: 3 Pod, CPU trung bình 140% của requests, target 70% → ceil(3 × 2.0) = 6 Pod
+```
+
+Sai lệch dưới 10% được bỏ qua để không scale vì nhiễu. Có nhiều metric thì HPA tính từng cái và lấy **số lớn nhất**. `stabilizationWindowSeconds` của scaleDown nghĩa là "nhìn lại 5 phút, lấy giá trị mong muốn cao nhất trong khoảng đó": tải giảm thì Pod không bị thu ngay, tránh tình trạng lên xuống liên tục (flapping) khi traffic răng cưa.
+
+> **Ghi chú về metric memory:** với tiến trình Node.js, heap lớn lên theo tải nhưng hiếm khi co lại khi tải giảm, nên HPA theo memory dễ giữ số Pod cao mãi. Với Next.js, hãy bắt đầu chỉ với CPU; thêm memory khi bạn đã có số liệu thật từ `kubectl top`. Với SPA nginx, memory gần như phẳng và không nói lên gì về tải.
+
+### HPA không hoạt động nếu thiếu hai thứ
+
+**1. metrics-server chưa cài** → cột TARGETS hiện `<unknown>`. Cài:
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+```
+
+Trên cluster kind (và nhiều cluster local), kubelet dùng chứng chỉ tự ký nên metrics-server từ chối kết nối và Pod của nó không bao giờ Ready. Thêm một cờ:
+
+```bash
+kubectl -n kube-system patch deploy metrics-server --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl -n kube-system rollout status deploy/metrics-server
+kubectl top nodes   # có số là xong
+```
+
+Cluster managed (EKS/GKE/AKS) thường có sẵn hoặc cài không cần cờ này. `--kubelet-insecure-tls` chỉ dành cho local, đừng mang lên production.
+
+**2. Container chưa khai báo `resources.requests.cpu`** → HPA không có mốc để tính phần trăm. Đây là điều kiện bắt buộc, và là lý do [Phần 9](/blog/k8s-fe-09-resources-qos-storage-pod-lifecycle/) nhắc "luôn khai báo resources". `averageUtilization: 70` nghĩa là 70% của `requests.cpu`, nên nếu requests đặt quá thấp (10m) thì HPA scale liên tục dù CPU node còn rảnh; đặt quá cao thì không bao giờ scale.
+
+### Xem HPA làm việc
+
+```bash
+kubectl get hpa -n web -w
+# NAME       REFERENCE             TARGETS            MINPODS   MAXPODS   REPLICAS
+# frontend   Deployment/frontend   45%/70%, 30%/80%   3         20        3
+```
+
+Tạo tải giả từ bên trong cluster:
+
+```bash
+kubectl run load --rm -it --image=busybox -n web -- sh
+# bên trong:
+while true; do wget -q -O- http://frontend.web/ > /dev/null; done
+```
+
+Trong terminal khác, `kubectl get hpa -w` sẽ thấy TARGETS tăng rồi REPLICAS nhảy 3 → 6 → 12 sau khoảng 30–90 giây (metrics-server lấy mẫu 15 giây một lần, HPA cũng tính 15 giây một lần). `kubectl describe hpa frontend -n web` liệt kê Events `SuccessfulRescale` kèm lý do. Dừng vòng lặp (Ctrl+C rồi thoát shell), chờ 5 phút, REPLICAS trở về 3.
+
+### Với SPA tĩnh, HPA hiếm khi cần thiết
+
+nginx phục vụ file tĩnh tiêu thụ CPU cực thấp; 3 Pod với `requests.cpu: 25m` chịu được hàng nghìn request/giây, và nút thắt thực tế nằm ở băng thông của Ingress hoặc CDN phía trước. Bạn tạo HPA cho SPA chủ yếu để bảo hiểm trước spike bất thường và để thống nhất manifest với các app khác.
+
+HPA thực sự quan trọng với **Next.js SSR**: mỗi request tốn CPU để render, một Pod Node.js chỉ dùng được một core, và độ trễ p99 tăng dốc khi event loop bận. Với SSR, `minReplicas: 2`, target CPU 60–70%, và `maxReplicas` tính theo ngân sách node.
+
+### Sai lầm hay gặp với HPA
+
+- **`replicas` trong Deployment đánh nhau với HPA.** Mỗi lần `kubectl apply` lại file Deployment có `replicas: 3`, số Pod bị kéo về 3 trong vài giây rồi HPA mới tăng lại. Khi HPA quản lý, bỏ hẳn dòng `replicas` khỏi manifest (chart Helm ở [Phần 15](/blog/k8s-fe-15-helm-and-kustomize/) làm việc này bằng điều kiện `autoscaling.enabled`). Nếu Deployment đã tồn tại với `replicas` trong last-applied, xoá dòng đó khỏi annotation trước bằng `kubectl apply edit-last-applied deploy/frontend -n web`, rồi mới xoá khỏi file; nếu không, lần apply kế tiếp sẽ đặt replicas về mặc định 1.
+- **`maxReplicas` vượt sức chứa cluster** → Pod mới Pending, HPA báo đạt mức mong muốn nhưng thực tế không thêm công suất. Trên cloud, Cluster Autoscaler là thứ thêm node; trên kind, `maxReplicas` chỉ là con số trên giấy.
+- **`minReplicas: 1`** → mất zero-downtime: một Pod thì không có Pod nào phục vụ trong lúc thay.
+- **Tự `kubectl scale` khi có HPA**: HPA ghi đè lại trong vòng 15 giây. Muốn tăng cứng, sửa `minReplicas`.
+- **PodDisruptionBudget `minAvailable` bằng đúng `minReplicas`**: khi HPA đang ở mức sàn, admin không drain được node. Đặt PDB thấp hơn sàn một Pod, hoặc dùng `maxUnavailable: 1` trong PDB.
+
+### VPA, Cluster Autoscaler và KEDA: biết để nói chuyện với DevOps
+
+**VPA** quan sát mức dùng thật và đề xuất (hoặc tự sửa) `requests`/`limits`. Chế độ chỉ gợi ý (`updateMode: "Off"`) hữu ích để tìm con số requests đúng cho Next.js thay vì đoán; chế độ tự sửa phải tạo lại Pod nên ít dùng cho web, và **không chạy chung với HPA trên cùng metric CPU**.
+
+**Cluster Autoscaler** thêm node khi có Pod Pending vì thiếu tài nguyên và bớt node khi node rảnh lâu. Nó là lý do trên cloud bạn thấy Pod Pending vài phút rồi tự Running: node mới đang được tạo. Bạn không cấu hình nó, nhưng `requests` bạn khai báo là input trực tiếp cho quyết định của nó.
+
+**KEDA** mở rộng HPA với các nguồn metric ngoài. Với SSR, scale theo request/giây lấy từ metric của ingress-nginx sát tải hơn CPU:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: nextjs
+  namespace: web
+spec:
+  scaleTargetRef:
+    name: nextjs
+  minReplicaCount: 2
+  maxReplicaCount: 10
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc:9090
+        query: sum(rate(nginx_ingress_controller_requests{ingress="nextjs"}[2m]))
+        threshold: '100' # mỗi Pod gánh ~100 req/s
+```
+
+KEDA tự tạo HPA bên dưới; bạn không viết HPA riêng cho cùng Deployment. Tên trường có thể khác theo phiên bản, kiểm tra docs KEDA trước khi apply.
+
+---
+
+## Thực hành
+
+Cần cluster `fe-lab` và app `frontend` từ Phần 10 đang chạy trong namespace `web`.
+
+1. **Quan sát RollingUpdate.** Mở hai terminal. Terminal 1: `kubectl -n web get pods -w`. Terminal 2: `kubectl -n web set image deploy/frontend web=frontend:v1.4.3` (image bạn vừa build và `kind load`). Ghi lại thứ tự Pod mới sinh và Pod cũ Terminating.
+
+   > **Kết quả mong đợi:** với `maxSurge: 1`, `maxUnavailable: 0`, không lúc nào số Pod Running và Ready dưới 3. `kubectl -n web get rs` hiện hai ReplicaSet, cái cũ DESIRED 0.
+
+2. **Phá RollingUpdate.** Đổi `maxUnavailable` thành `1` và xoá `readinessProbe`, apply, rồi chạy vòng lặp `while true; do curl -s -o /dev/null -w "%{http_code}\n" -H "Host: app.local" http://localhost/; sleep 0.2; done` trong lúc `set image` lần nữa. Bạn sẽ thấy vài dòng `502` hoặc `503`. Khôi phục cấu hình cũ, lặp lại: chỉ còn `200`.
+
+3. **Canary 10%.** Build image v2 với `add_header X-App-Version "v2" always;` trong `nginx.conf`, `kind load`, tạo `frontend-v2` (Deployment + Service) và Ingress canary ở trên với host `app.local`. Chạy vòng lặp 50 lần `curl -sI` và đếm.
+
+   > **Kết quả mong đợi:** khoảng 5 trên 50 dòng mang `x-app-version: v2`. Bật `canary-by-header` rồi thêm `-H "X-Canary: always"` thì 50/50 là v2.
+
+4. **Cài metrics-server** kèm cờ `--kubelet-insecure-tls`. `kubectl top pods -n web` phải in số CPU/RAM cho từng Pod.
+
+5. **HPA.** Apply `hpa.yaml`, mở `kubectl get hpa -n web -w`, tạo tải bằng Pod busybox. Đợi REPLICAS tăng. Dừng tải, chờ 5 phút, REPLICAS về 3. Đọc `kubectl describe hpa frontend -n web` và tìm dòng `SuccessfulRescale`.
+
+6. **Dọn dẹp:** xoá HPA, Ingress canary, Deployment và Service `frontend-v2`.
+
+---
+
+## Tóm tắt
+
+- Kubernetes chỉ có `RollingUpdate` và `Recreate` trong `strategy`; Blue-Green và Canary là cách phối hợp Deployment, Service và Ingress.
+- `maxSurge: 1` (hoặc `25%`) + `maxUnavailable: 0` + readiness probe là tổ hợp zero-downtime; `progressDeadlineSeconds` biến rollout hỏng thành lỗi rõ ràng để CI rollback.
+- Blue-Green: hai Deployment, Service đổi selector; rollback tức thì, tốn gấp đôi tài nguyên lúc chuyển; không cứu được `ChunkLoadError`.
+- Canary bằng annotation ingress-nginx: Ingress thứ hai cùng host/path với `canary: "true"` và `canary-weight`; header/cookie để QA test trước; SPA cần sticky session hoặc asset trên CDN.
+- HPA v2 tính `desired = ceil(current × usage / target)`, cần metrics-server (trên kind thêm `--kubelet-insecure-tls`) và `resources.requests.cpu`.
+- `behavior` với scaleDown 300 giây chống dao động; bỏ `replicas` khỏi Deployment khi HPA quản lý.
+- SPA tĩnh hiếm khi cần HPA; Next.js SSR gần như bắt buộc; KEDA khi CPU không phản ánh tải.
+
+## Đọc thêm
+
+- [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
+- [Horizontal Pod Autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/)
+- [ingress-nginx](https://kubernetes.github.io/ingress-nginx/) (mục Annotations, phần Canary)
+- [Argo Rollouts](https://argo-rollouts.readthedocs.io/en/stable/)

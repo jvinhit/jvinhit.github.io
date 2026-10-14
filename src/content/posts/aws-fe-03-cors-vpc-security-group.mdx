@@ -1,0 +1,335 @@
+---
+title: 'AWS cho Frontend Developer · Phần 3 — CORS giải thích tận gốc, VPC và Security Group mức đủ dùng'
+description: 'CORS là luật của trình duyệt chứ không phải server: preflight, bảng ai trả header CORS trên AWS, bẫy CloudFront trả nhầm header, cách né CORS bằng cùng origin, rồi VPC, subnet và Security Group đủ để hiểu vì sao API treo rồi 504.'
+pubDate: 2026-10-05
+lang: vi
+tags: [aws, devops, security, networking, frontend]
+series: aws-fe
+seriesOrder: 3
+draft: false
+---
+
+Hai thứ khiến frontend bực bội nhất khi lên AWS nằm ở hai đầu đối lập của sơ đồ vòng đời request. Ở đầu gần bạn nhất là CORS: API chạy ngon trong Postman, lên browser thì console đỏ, bạn thêm header ở backend rồi mà vẫn lỗi, lúc được lúc không. Ở đầu xa nhất là Security Group: request đi vào VPC rồi biến mất, không log, không lỗi, chỉ có một cái 504 sau đúng 60 giây.
+
+Bài này giải thích CORS từ bản chất (nó là luật của trình duyệt, không phải của server), chỉ ra trên AWS thì phải sửa ở đâu tuỳ kiến trúc, phơi bày cái bẫy CloudFront trả nhầm header CORS, và đưa ra cách tốt nhất: dựng kiến trúc để không có CORS. Nửa sau là VPC, subnet, Security Group ở mức đủ để bạn không hoang mang khi API "không gọi được mà chẳng có log gì", kèm quy tắc phân biệt timeout với connection refused. Kết bài là Lab 2.1: đọc một request thật.
+
+## CORS — giải thích tận gốc
+
+CORS là nguyên nhân số một khiến frontend bực bội khi lên AWS. Hiểu sai bản chất thì sửa mãi không được.
+
+### Bản chất
+
+CORS là cơ chế của **trình duyệt**, không phải của server. Trình duyệt tự đặt luật: JavaScript ở `https://app.example.com` không được đọc response từ `https://api.other.com`, trừ khi server kia gật đầu đồng ý bằng header. Luật gốc gọi là Same-Origin Policy; CORS là cơ chế để server nới lỏng luật đó một cách có kiểm soát. Bài [CORS deep dive](/blog/cors-explained-deep-dive/) đi sâu vào phía trình duyệt; bài này tập trung vào phía AWS.
+
+> **Hai hệ quả thường bị hiểu nhầm:**
+>
+> 1. **Request vẫn được gửi đi và server vẫn xử lý** (với request đơn giản). Trình duyệt chỉ chặn không cho JS đọc kết quả. Vì vậy "CORS error" không có nghĩa là server không nhận được request; một `POST` tạo đơn hàng có thể đã tạo xong đơn rồi mới bị báo lỗi CORS.
+> 2. **`curl` và Postman không áp dụng CORS.** API chạy ngon trong Postman mà lỗi trong browser là hoàn toàn bình thường, đừng kết luận là backend sai. Ngược lại, cũng đừng dùng Postman để "chứng minh" CORS đã ổn.
+
+### Khi nào là "cross-origin"
+
+Origin = scheme + host + port. Khác một trong ba là cross-origin:
+
+| Từ trang                  | Gọi tới                       | Cross-origin?                         |
+| ------------------------- | ----------------------------- | ------------------------------------- |
+| `https://app.example.com` | `https://app.example.com/api` | Không, cùng origin                    |
+| `https://app.example.com` | `https://api.example.com`     | Có, khác host (dù cùng tên miền gốc!) |
+| `https://app.example.com` | `http://app.example.com`      | Có, khác scheme                       |
+| `http://localhost:5173`   | `http://localhost:3000`       | Có, khác port                         |
+
+Dòng cuối chính là lý do `server.proxy` tồn tại trong `vite.config.ts`: Vite nhận request `/api` ở port 5173 rồi chuyển sang 3000 phía server, nên với trình duyệt mọi thứ đều là `localhost:5173`, cùng origin, không có CORS. Bạn đã sống không CORS suốt quá trình dev nhờ cái proxy đó. Lên production, ai làm việc của proxy? Câu trả lời ở cuối mục này.
+
+### Preflight — request "xin phép" mà bạn không viết ra
+
+Với request "không đơn giản", trình duyệt tự gửi thêm một request `OPTIONS` trước. Request bị coi là không đơn giản nếu:
+
+- Method là `PUT`, `DELETE`, `PATCH` (hoặc bất cứ gì ngoài `GET`/`HEAD`/`POST`), hoặc
+- Có header tuỳ chỉnh, ví dụ `Authorization`, `X-Request-Id`, hoặc
+- `Content-Type` là `application/json` (chỉ 3 giá trị được coi là đơn giản: `text/plain`, `multipart/form-data`, `application/x-www-form-urlencoded`).
+
+Tức là: gần như mọi lời gọi API JSON có token đều kích hoạt preflight.
+
+```http
+BƯỚC 1 — Preflight (trình duyệt tự gửi, bạn không thấy trong code)
+──────────────────────────────────────────────────────────────────
+OPTIONS /api/orders HTTP/1.1
+Origin: https://app.example.com
+Access-Control-Request-Method: POST
+Access-Control-Request-Headers: authorization, content-type
+
+        ▼ server PHẢI trả lời đúng, nếu không dừng tại đây
+
+HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
+Access-Control-Allow-Headers: authorization, content-type
+Access-Control-Allow-Credentials: true
+Access-Control-Max-Age: 86400        ← nhớ kết quả 24h, đỡ 1 request mỗi lần gọi
+Vary: Origin
+
+BƯỚC 2 — Request thật mới được gửi
+──────────────────────────────────────────────────────────────────
+POST /api/orders HTTP/1.1
+Origin: https://app.example.com
+Authorization: Bearer eyJ...
+
+HTTP/1.1 201 Created
+Access-Control-Allow-Origin: https://app.example.com   ← phải lặp lại!
+Vary: Origin
+```
+
+Vài chi tiết trong đoạn trên quyết định thành bại:
+
+- `Access-Control-Allow-Origin` phải khớp **chính xác** giá trị `Origin` trình duyệt gửi: không có dấu `/` cuối, đúng scheme, đúng port. `https://app.example.com/` (có dấu gạch) là sai.
+- Khi có `Access-Control-Allow-Credentials: true` (cookie hoặc `credentials: 'include'`), `Allow-Origin` **không được là `*`**. Trình duyệt từ chối tổ hợp đó. Server phải đọc `Origin`, so với danh sách cho phép, rồi echo lại đúng giá trị.
+- Preflight **không mang cookie, không mang `Authorization`**. Nếu middleware xác thực của bạn chạy trước và trả 401 cho `OPTIONS`, preflight thất bại và bạn thấy lỗi CORS chứ không thấy 401. Xử lý `OPTIONS` phải đứng trước auth.
+- `Access-Control-Max-Age` bị trình duyệt giới hạn (Chromium tối đa 2 giờ, Firefox 24 giờ), nên đừng kỳ vọng "86400" là đúng 24 giờ ở mọi nơi.
+- Muốn JS đọc được header không thuộc danh sách mặc định (như `ETag`, `X-Request-Id`), server phải liệt kê trong `Access-Control-Expose-Headers`. Thiếu nó, `response.headers.get('etag')` trả `null` dù header có trong tab Network.
+
+### Đọc thông báo lỗi trong Console
+
+Chrome nói khá rõ nguyên nhân, chỉ cần đọc hết câu:
+
+| Cụm từ trong thông báo                                                                                                                | Nghĩa là                                                                                    |
+| ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `No 'Access-Control-Allow-Origin' header is present`                                                                                  | Server (hoặc chặng nào đó ở giữa) không trả header. Xem bảng "ai trả header CORS" bên dưới. |
+| `Response to preflight request doesn't pass access control check`                                                                     | Bước 1 hỏng: `OPTIONS` không được xử lý, hoặc trả 401/404/500.                              |
+| `Redirect is not allowed for a preflight request`                                                                                     | `OPTIONS` bị 301/302 (thường là http → https hoặc thiếu dấu `/`). Gọi thẳng URL cuối.       |
+| `The value of the 'Access-Control-Allow-Origin' header must not be the wildcard '*' when the request's credentials mode is 'include'` | Đang gửi cookie mà server trả `*`.                                                          |
+| `Method PUT is not allowed by Access-Control-Allow-Methods`                                                                           | Thiếu method trong `Allow-Methods`, hoặc CloudFront chặn method trước khi tới backend.      |
+
+### Trên AWS, ai là người trả header CORS?
+
+Đây là bảng quan trọng nhất về CORS. Tuỳ kiến trúc, bạn phải sửa ở chỗ khác nhau:
+
+| Kiến trúc                            | Sửa CORS ở đâu                                                      | Ghi chú                                                                                            |
+| ------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Browser → S3 (upload trực tiếp)      | S3 bucket → Permissions → CORS configuration (JSON)                 | Nhớ thêm `ExposeHeaders: ["ETag"]` nếu cần đọc ETag sau khi upload.                                |
+| Browser → ALB → backend              | Code backend (middleware cors)                                      | ALB chỉ chuyển tiếp, không tự thêm header. Nhớ xử lý cả method `OPTIONS`.                          |
+| Browser → API Gateway → Lambda       | Cấu hình CORS ngay trên API Gateway (khuyến nghị) hoặc trong Lambda | HTTP API có mục CORS riêng, tiện. Nếu dùng Lambda proxy integration thì Lambda phải tự trả header. |
+| Browser → CloudFront → (S3 hoặc ALB) | Ở origin, cộng thêm cấu hình CloudFront forward header `Origin`     | Đây là chỗ hay sai nhất. Xem cảnh báo bên dưới.                                                    |
+
+Cấu hình cụ thể cho từng dòng:
+
+**S3** (dùng cho bucket nhận upload ở [phần 5](/blog/aws-fe-05-s3-presigned-url-and-versioning/)):
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://app.example.com", "http://localhost:5173"],
+    "AllowedMethods": ["PUT", "POST", "GET", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3000
+  }
+]
+```
+
+```bash
+aws s3api put-bucket-cors --bucket acme-uploads --cors-configuration file://cors.json
+aws s3api get-bucket-cors --bucket acme-uploads
+```
+
+**Backend Express sau ALB**, với danh sách origin cho phép và cookie:
+
+```ts
+import cors from 'cors';
+
+const ALLOWED = new Set(['https://app.example.com', 'http://localhost:5173']);
+
+app.use(
+  cors({
+    origin(origin, cb) {
+      // origin undefined khi gọi từ curl/Postman/same-origin → cho qua
+      if (!origin || ALLOWED.has(origin)) return cb(null, origin ?? true);
+      cb(new Error('Origin không được phép'));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'X-Request-Id'],
+    exposedHeaders: ['ETag', 'X-Request-Id'],
+    maxAge: 86400,
+  })
+);
+// Middleware xác thực đặt SAU dòng trên, để OPTIONS không bị 401
+```
+
+Thư viện `cors` tự thêm `Vary: Origin` khi `origin` là hàm hoặc danh sách. Nếu bạn tự viết header bằng tay, đừng quên dòng đó.
+
+**API Gateway HTTP API** có mục CORS riêng, cấu hình một lần cho cả API, không cần đụng code Lambda (chi tiết ở [phần 11](/blog/aws-fe-11-api-gateway-and-cognito/)):
+
+```bash
+aws apigatewayv2 update-api --api-id abc123 \
+  --cors-configuration 'AllowOrigins=https://app.example.com,AllowMethods=GET,POST,PUT,DELETE,OPTIONS,AllowHeaders=authorization,content-type,AllowCredentials=true,MaxAge=86400'
+```
+
+**CloudFront** có thể tự trả header CORS ở edge bằng Response Headers Policy (managed policy `CORS-With-Preflight` hoặc `SimpleCORS`), hữu ích khi origin là S3 chứa font/ảnh và bạn không muốn cấu hình CORS trên bucket. Nhưng dù origin hay CloudFront trả header, cái bẫy dưới đây vẫn áp dụng.
+
+> **Bẫy CORS + CloudFront (rất hay gặp, rất khó đoán):** Mặc định CloudFront **không chuyển tiếp header `Origin`** xuống origin và **không đưa nó vào cache key**. Hậu quả:
+>
+> - Origin không nhận được `Origin` → không biết trả `Access-Control-Allow-Origin` cho ai → không trả gì cả.
+> - Tệ hơn: CloudFront cache response có `Access-Control-Allow-Origin: https://a.com` rồi trả chính response đó cho user đến từ `https://b.com` → lỗi CORS ngẫu nhiên, lúc được lúc không, không tài nào tái hiện.
+>
+> Cách sửa: gắn Origin Request Policy `Managed-CORS-S3Origin` (origin là S3) hoặc `Managed-CORS-CustomOrigin` (origin là ALB, API Gateway) để chuyển tiếp `Origin` và `Access-Control-Request-*`, dùng Cache Policy có `Origin` trong danh sách header của cache key, và đảm bảo origin trả `Vary: Origin`. Với behavior `/api/*` dùng `CachingDisabled` thì cache key không thành vấn đề, nhưng vẫn phải forward `Origin` (Origin Request Policy `AllViewer` là đủ). [Phần 6](/blog/aws-fe-06-cloudfront-cdn-behaviors-cache-key/) giải thích hai loại policy này.
+
+Tình huống kinh điển: font đặt trên `static.example.com` (S3 qua CloudFront), trang chạy ở `app.example.com`. Font là tài nguyên bắt buộc có CORS. Bạn cấu hình CORS trên bucket, test bằng `curl -H "Origin: https://app.example.com"` thấy header đúng, nhưng trình duyệt vẫn lỗi. Lý do: CloudFront đã cache bản không có `Origin` từ lần request đầu tiên (lúc bạn mở URL font trực tiếp trên tab mới, không có header `Origin`). Gắn đúng policy rồi invalidate là hết.
+
+### Cách tốt nhất: đừng để có CORS
+
+Nếu frontend và API cùng đi qua một CloudFront distribution, chúng có cùng origin → không có CORS nào cả:
+
+```text
+✗ CÓ CORS                                ✓ KHÔNG CÓ CORS
+─────────────────────────────            ──────────────────────────────────
+app.example.com → CloudFront → S3        app.example.com → CloudFront
+api.example.com → ALB → backend            ├─ "/api/*" → ALB → backend
+                                           └─ "*"      → S3
+
+(2 origin khác nhau → preflight,          (1 origin duy nhất → fetch('/api/x')
+ header, Vary, đủ thứ phiền)               là same-origin, cookie cũng dễ)
+```
+
+Đây là lý do thực tế số một khiến người ta đặt `/api/*` làm một behavior trong CloudFront thay vì tách tên miền riêng. Lợi ích kèm theo:
+
+- Không còn preflight → mỗi lời gọi API tiết kiệm một vòng đi-về (100–300ms với người dùng xa).
+- Cookie `SameSite=Lax` hoạt động bình thường, không cần `SameSite=None` (thứ vừa rắc rối vừa yếu hơn, xem [CSRF và SameSite cookie](/blog/web-security-04-csrf-samesite-cookies/)). Đó cũng là tiền đề cho cách lưu token an toàn nhất ở [phần 11](/blog/aws-fe-11-api-gateway-and-cognito/).
+- `connect-src 'self'` trong CSP là đủ, không phải liệt kê thêm domain.
+- Code frontend gọi `fetch('/api/orders')` bằng đường dẫn tương đối, y hệt lúc dev với Vite proxy. Không còn `VITE_API_URL` để cấu hình sai.
+
+Đây chính là câu trả lời cho câu hỏi "ai làm việc của Vite proxy trên production": behavior `/api/*` của CloudFront. Cách dựng nó (origin ALB, `AllViewer`, `CachingDisabled`, bật đủ 7 method) ở [phần 6](/blog/aws-fe-06-cloudfront-cdn-behaviors-cache-key/).
+
+Khi nào bắt buộc phải có CORS thật: API phục vụ nhiều frontend ở nhiều tên miền, widget nhúng vào trang của khách hàng, hoặc mobile app và web dùng chung API public. Lúc đó làm đúng bằng danh sách origin cho phép, không phải `*`.
+
+---
+
+## VPC, Subnet, Security Group — mức đủ dùng
+
+Bạn sẽ không phải thiết kế VPC, nhưng cần hiểu để không hoang mang khi API "không gọi được mà chẳng có log gì".
+
+```text
+┌─ VPC (mạng riêng của bạn, 10.0.0.0/16) ─────────────────────────────┐
+│                                                                     │
+│  ┌─ PUBLIC SUBNET ──────────────┐   ┌─ PRIVATE SUBNET ───────────┐  │
+│  │ (có đường ra Internet)       │   │ (KHÔNG ra Internet trực)   │  │
+│  │                              │   │                            │  │
+│  │      ┌──────┐                │   │     ┌──────────┐           │  │
+│  │      │ ALB  │────────────────────────►│ ECS task │           │  │
+│  │      └──────┘                │   │     │ (backend)│           │  │
+│  │         ▲                    │   │     └────┬─────┘           │  │
+│  └─────────┼────────────────────┘   └──────────┼─────────────────┘  │
+│            │                                   ▼                    │
+│    Internet Gateway                       ┌─────────┐               │
+└────────────┼──────────────────────────────│   RDS   │───────────────┘
+             │                              └─────────┘
+     Internet / CloudFront
+```
+
+| Khái niệm               | Giải thích cho frontend                                                                                                                        |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| **VPC**                 | Mạng riêng ảo. Mọi thứ trong đó nói chuyện với nhau bằng IP nội bộ (dải `10.x.x.x`).                                                           |
+| **Public subnet**       | Có đường ra Internet Gateway. ALB đặt ở đây để Internet vào được.                                                                              |
+| **Private subnet**      | Không ai từ Internet chạm tới được. Backend và database đặt ở đây cho an toàn.                                                                 |
+| **Security Group (SG)** | Firewall ở mức tài nguyên. Có trạng thái (stateful): cho phép vào thì tự động cho phép trả lời ra. Đây là thứ bạn sẽ nghe nhắc tới nhiều nhất. |
+| **NACL**                | Firewall ở mức subnet, không trạng thái. Ít dùng, thường để mặc định.                                                                          |
+
+Hai khái niệm phụ đáng biết vì chúng gây ra lỗi "im lặng" tương tự:
+
+- **NAT Gateway**: cho tài nguyên trong private subnet đi ra Internet (backend gọi Stripe, gửi email, tải package). Không có NAT thì backend trong private subnet nhận được request từ ALB nhưng mọi lời gọi ra ngoài đều treo rồi timeout. Nó cũng là thứ đắt và hay bị quên nhất khi học ([phần 15](/blog/aws-fe-15-security-performance-cost/)).
+- **Nhiều AZ**: ALB bắt buộc chọn ít nhất hai subnet ở hai AZ khác nhau, để một trung tâm dữ liệu sập thì ALB vẫn nhận request. Backend cũng nên trải ra hai AZ tương ứng.
+
+### Security Group — thứ chặn request của bạn trong im lặng
+
+Một chuỗi SG đúng cho web app trông như sau:
+
+| Tài nguyên      | Inbound rule                            | Nghĩa là                                                                           |
+| --------------- | --------------------------------------- | ---------------------------------------------------------------------------------- |
+| SG của ALB      | Cho phép TCP 443 từ `0.0.0.0/0`         | Cả Internet được gọi HTTPS vào ALB.                                                |
+| SG của backend  | Cho phép TCP 3000 từ **SG của ALB**     | Chỉ ALB gọi được backend. Dùng SG làm nguồn thay vì dải IP: đây là cách làm chuẩn. |
+| SG của database | Cho phép TCP 5432 từ **SG của backend** | Chỉ backend truy cập DB. Internet không thấy DB.                                   |
+
+Vì sao dùng SG làm nguồn thay vì IP: task ECS Fargate nhận IP mới mỗi lần deploy, ALB cũng có nhiều IP thay đổi. Một rule "cho phép từ `sg-0abc` (SG của ALB)" tự đúng bất kể IP nào, còn rule theo IP sẽ hỏng ở lần deploy sau. Outbound của SG mặc định cho phép tất cả, và vì SG stateful nên bạn chỉ cần khai báo chiều vào.
+
+Nếu ALB chỉ nhận request từ CloudFront (kiến trúc cùng origin ở trên), rule của SG ALB nên thu hẹp từ `0.0.0.0/0` xuống managed prefix list `com.amazonaws.global.cloudfront.origin-facing`, là danh sách IP mà CloudFront dùng để gọi origin. Khi đó không ai gọi thẳng ALB để bỏ qua WAF và cache được.
+
+Xem và sửa SG bằng CLI:
+
+```bash
+# Xem rule hiện tại của SG backend
+aws ec2 describe-security-groups --group-ids sg-0backend \
+  --query 'SecurityGroups[0].IpPermissions'
+
+# Cho phép cổng 3000 từ SG của ALB (nguồn là SG, không phải IP)
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0backend \
+  --protocol tcp --port 3000 \
+  --source-group sg-0alb
+```
+
+> **Triệu chứng khi Security Group sai:** Request bị treo rồi timeout (không phải "connection refused" ngay lập tức). Vì gói tin bị firewall lặng lẽ vứt đi, không ai trả lời gì. Ở phía frontend bạn sẽ thấy: ALB trả `504 Gateway Timeout` sau khoảng 60 giây, hoặc health check của target group luôn unhealthy và ALB trả `503 Service Unavailable`.
+>
+> Ghi nhớ: **timeout ≈ nghi firewall. Connection refused ≈ tiến trình không chạy hoặc sai cổng.**
+
+Mở rộng quy tắc đó thành bảng chẩn đoán nhanh, dùng từ bên trong VPC (ví dụ qua ECS Exec, hoặc một EC2 cùng VPC chạy `curl -m 5 http://10.0.2.15:3000/healthz`):
+
+| Bạn thấy                          | Khả năng cao nhất                                                                                       |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Treo tới hết timeout              | SG của backend không cho phép cổng từ SG của ALB; hoặc NACL; hoặc backend gọi ra ngoài mà không có NAT. |
+| `Connection refused` ngay lập tức | Tiến trình chưa chạy, crash lúc khởi động, hoặc lắng nghe `127.0.0.1` thay vì `0.0.0.0`, hoặc sai cổng. |
+| 503 từ ALB                        | Không có target nào healthy; xem health check ở [phần 9](/blog/aws-fe-09-alb-gateway-to-backend/).      |
+| 504 từ ALB sau ~60s               | Backend nhận được nhưng xử lý quá lâu, hoặc SG chặn nên ALB chờ vô vọng.                                |
+| `Could not resolve host`          | Sai hostname, DNS chưa có, hoặc DNS nội bộ VPC bị tắt.                                                  |
+
+---
+
+## Lab 2.1 — Đọc hiểu một request thật (20 phút)
+
+1. Mở một trang web lớn bất kỳ có dùng CloudFront (nhiều trang thương mại điện tử, trang tài liệu của các hãng công nghệ).
+2. DevTools → Network → tải lại trang → chọn file JS chính.
+3. Ghi lại: `Cache-Control`, `X-Cache`, `X-Amz-Cf-Pop`, `Content-Encoding`.
+4. Bấm tải lại lần nữa và so sánh `X-Cache`. Thay đổi không? Nếu thấy `(from disk cache)` ở cột Size, bật "Disable cache" rồi tải lại để buộc request rời máy.
+5. Chạy `dig` trên tên miền đó, xem nó trỏ tới `cloudfront.net` hay đâu.
+6. Chạy lệnh `openssl s_client` ở [phần 2](/blog/aws-fe-02-route53-acm-http-headers/) để xem chứng chỉ của họ do ai cấp, phủ những tên miền nào.
+7. (Thêm) Mô phỏng một preflight bằng `curl` lên bất kỳ API public nào bạn biết, và đọc xem server có trả `Access-Control-Allow-*` không:
+
+```bash
+curl -sI -X OPTIONS https://api.example.com/orders \
+  -H "Origin: https://app.example.com" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization,content-type"
+```
+
+> **Kết quả mong đợi:** Bạn giải thích được vì sao file JS đó có `max-age` rất dài còn file HTML thì không, chỉ ra được edge location nào đang phục vụ bạn, và biết một API có cho phép origin của bạn hay không mà chưa cần viết dòng JS nào.
+
+---
+
+## Sai lầm hay gặp
+
+- **Trả `Access-Control-Allow-Origin: *` trong khi gửi cookie.** Trình duyệt từ chối. Phải echo đúng origin và thêm `Vary: Origin`.
+- **Đặt middleware auth trước handler `OPTIONS`.** Preflight không mang token → 401 → console báo CORS. Nhìn tab Network, request `OPTIONS` màu đỏ với mã 401 là dấu hiệu.
+- **Gọi `http://` rồi bị redirect sang `https://`.** Preflight không được phép redirect. Sửa URL trong config, không sửa server.
+- **Cấu hình CORS trên S3 rồi gọi qua CloudFront mà không forward `Origin`.** Test bằng `curl` thấy đúng, trình duyệt vẫn lỗi. Gắn Origin Request Policy CORS và invalidate.
+- **Sửa CORS bằng cách bật `AllViewer` cho cả behavior asset tĩnh.** Cache key phình, hit rate rớt. Chỉ `/api/*` mới cần `AllViewer`.
+- **Mở `0.0.0.0/0` trên SG backend để "hết 504".** Hết thật, nhưng giờ cả Internet gọi thẳng vào backend, bỏ qua ALB và WAF. Nguồn phải là SG của ALB.
+- **Kết luận "backend chết" khi thấy timeout.** Timeout là firewall; backend chết cho `connection refused` hoặc 503. Đọc đúng triệu chứng tiết kiệm cả buổi.
+
+---
+
+## Tóm tắt
+
+- CORS là luật của trình duyệt. Request vẫn được gửi và xử lý; `curl` và Postman không áp dụng CORS nên không dùng để kết luận.
+- Origin = scheme + host + port; khác một thứ là cross-origin, kể cả `localhost:5173` gọi `localhost:3000`. Vite proxy giúp bạn né CORS ở dev.
+- Request JSON có token gần như luôn có preflight `OPTIONS`. Server phải trả đúng `Allow-Origin` (khớp chính xác, không `*` khi có credential), `Allow-Methods`, `Allow-Headers`, `Max-Age`, và lặp lại `Allow-Origin` ở request thật kèm `Vary: Origin`.
+- Trên AWS, sửa CORS ở đâu tuỳ kiến trúc: S3 có CORS configuration, ALB không thêm gì nên backend tự trả, API Gateway HTTP API có mục CORS riêng, CloudFront phải forward `Origin` và đưa nó vào cache key.
+- Bẫy CloudFront: mặc định không forward `Origin` → origin không trả header, hoặc cache trả nhầm header của origin khác. Sửa bằng Origin Request Policy CORS + Cache Policy có `Origin` + `Vary: Origin`.
+- Cách tốt nhất là không có CORS: đặt `/api/*` làm behavior trong cùng CloudFront distribution với frontend. Không preflight, cookie `SameSite=Lax` chạy được, code gọi đường dẫn tương đối.
+- VPC là mạng riêng; ALB ở public subnet, backend và DB ở private subnet; Security Group là firewall stateful theo tài nguyên, chuỗi chuẩn là Internet → ALB (443) → backend (từ SG của ALB) → DB (từ SG của backend).
+- Timeout ≈ firewall (SG, NACL, thiếu NAT). Connection refused ≈ tiến trình không chạy, sai cổng, hoặc lắng nghe `127.0.0.1`.
+
+[Phần 4](/blog/aws-fe-04-s3-where-your-build-lives/) bước vào chặng chính của series: S3, nơi thư mục `dist/` của bạn thực sự nằm, hai cách S3 phục vụ file mà chọn sai là hỏng cả kiến trúc, OAC, và script upload hai bước bạn sẽ dùng mãi.
+
+## Đọc thêm
+
+- [MDN: Cross-Origin Resource Sharing (CORS)](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS)
+- [Amazon VPC User Guide](https://docs.aws.amazon.com/vpc/latest/userguide/)
+- [Amazon CloudFront Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/)
+- [Amazon S3 User Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/)

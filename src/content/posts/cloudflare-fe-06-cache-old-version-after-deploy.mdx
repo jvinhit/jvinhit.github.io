@@ -1,0 +1,282 @@
+---
+title: 'Cloudflare cho Frontend Developer · Phần 6 — Cache: vì sao deploy xong vẫn thấy bản cũ'
+description: 'Cloudflare mặc định cache gì (và vì sao HTML thì không), đọc cf-cache-status, Edge TTL và Browser TTL, chiến lược Cache-Control chuẩn cho SPA, .htaccess với SPA fallback, ba cách purge và purge từ GitHub Actions, Cache Rules, Tiered Cache.'
+pubDate: 2026-10-13
+lang: vi
+tags: [cloudflare, devops, cache, cdn, performance]
+series: cloudflare-fe
+seriesOrder: 6
+draft: false
+---
+
+Bạn sửa một dòng CSS, `npm run build`, upload lên Hostinger, mở trang, F5 — vẫn màu cũ. Ctrl+Shift+R — vẫn cũ. Mở tab ẩn danh — vẫn cũ. Bạn upload lại lần nữa cho chắc, rồi bắt đầu nghi ngờ FTP, nghi ngờ build, nghi ngờ chính mình. Trong khi đó, thứ đang trả về bản cũ là một PoP của Cloudflare ở Hà Nội, và nó sẽ tiếp tục làm vậy cho tới khi hết TTL hoặc bạn bảo nó thôi.
+
+Cloudflare cache ở hàng trăm PoP. Không hiểu cơ chế này thì bạn sẽ sửa code, upload lên, F5 mãi mà không thấy gì thay đổi. Bài này trả lời bốn câu: Cloudflare mặc định cache gì, làm sao biết một response đến từ cache, ai quyết định cache bao lâu, và làm gì để deploy xong là thấy bản mới — không phải bằng purge thủ công mỗi lần, mà bằng cách đặt `Cache-Control` đúng ngay từ đầu để hầu như không bao giờ phải purge.
+
+> Thuật ngữ giữ tiếng Anh: cache, purge, edge, origin, TTL, HIT/MISS, revalidate, immutable, bypass. Chúng là giá trị header thật, dịch ra là mất khả năng tra.
+
+## Mặc định Cloudflare cache những gì
+
+Đây là điều cần biết đầu tiên, và nó khác với trực giác của nhiều người:
+
+| Loại nội dung                                                                                                | Cache mặc định?  | Ghi chú                                                                     |
+| ------------------------------------------------------------------------------------------------------------ | ---------------- | --------------------------------------------------------------------------- |
+| File tĩnh theo phần mở rộng: `.js` `.css` `.jpg` `.png` `.gif` `.svg` `.ico` `.woff` `.woff2` `.pdf` `.zip`… | **CÓ**           | Cloudflare nhận diện theo đuôi file trong URL                               |
+| HTML (`/`, `/about`, `index.html`)                                                                           | **KHÔNG**        | Đây là điểm quan trọng nhất. Cloudflare mặc định coi HTML là nội dung động. |
+| Phản hồi API (JSON)                                                                                          | **KHÔNG**        | Trừ khi bạn cấu hình rõ ràng                                                |
+| Response có `Set-Cookie`                                                                                     | **KHÔNG**        | Cloudflare tránh cache nội dung có vẻ riêng tư                              |
+| Method POST, PUT, DELETE                                                                                     | **KHÔNG**        | Chỉ GET và HEAD được cache                                                  |
+| Response mã 4xx, 5xx                                                                                         | Hầu hết là không | Một số mã được cache ngắn                                                   |
+
+Hai chi tiết ẩn sau bảng này:
+
+- Cloudflare quyết định theo **đuôi file trong URL**, không theo header `Content-Type`. `/assets/main.js` được cache vì có `.js`; `/api/users` không được cache vì không có đuôi nào trong danh sách. `.json` **không** nằm trong danh sách mặc định (danh sách đầy đủ ở docs Cache — kiểm tra bản hiện tại), nên `config.json` thường không bị cache ở edge — nhưng đừng dựa vào đó, mục chiến lược bên dưới vẫn đặt `no-store` cho nó.
+- Kể cả file trong danh sách, Cloudflare vẫn **tôn trọng origin** khi origin nói đừng cache: `Cache-Control: private`, `no-store`, `no-cache`, `max-age=0`, hoặc có `Set-Cookie` → không lưu. Origin có tiếng nói cuối, trừ khi bạn ghi đè bằng Cache Rules.
+
+> **Hệ quả với SPA:** vì HTML không được cache mặc định, một SPA điển hình (`index.html` + asset có hash) hoạt động đúng ngay mà không cần cấu hình gì: HTML luôn mới, asset được cache mạnh. Đây là mặc định hợp lý — khác với AWS CloudFront, nơi bạn phải tự cấu hình từng behavior ([AWS cho Frontend Developer · Phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/) làm việc đó).
+
+Vậy tại sao vẫn "deploy xong thấy bản cũ"? Ba lý do, theo tần suất: (1) bạn đổi nội dung một file **giữ nguyên tên** — `logo.png`, `main.js` không hash — và edge còn giữ bản cũ; (2) `index.html` bị origin gửi kèm `max-age` dài, nên **trình duyệt** giữ bản cũ và không hỏi ai cả; (3) một Cache Rule hoặc Page Rule "Cache Everything" ai đó đã bật từ trước. Phần còn lại của bài xử lý từng lý do.
+
+---
+
+## cf-cache-status — header cần đọc đầu tiên
+
+Mọi response đi qua đám mây cam đều mang header này. Nó nói chính xác chuyện gì vừa xảy ra ở bước ⑤e trong sơ đồ [phần 1](/blog/cloudflare-fe-01-what-cloudflare-really-is/):
+
+| Giá trị         | Nghĩa                                                                                                    |
+| --------------- | -------------------------------------------------------------------------------------------------------- |
+| **HIT**         | Lấy từ cache ở edge. Nhanh nhất, không làm phiền origin.                                                 |
+| **MISS**        | Không có trong cache, đã phải xuống origin lấy. Lần sau có thể thành HIT.                                |
+| **EXPIRED**     | Có trong cache nhưng đã hết hạn, đã lấy bản mới từ origin.                                               |
+| **REVALIDATED** | Đã hỏi origin "còn mới không", origin trả 304 → dùng lại bản cũ.                                         |
+| **BYPASS**      | Cố tình không cache: do có rule bypass, do `Cache-Control: no-store`, hoặc do Development Mode đang bật. |
+| **DYNAMIC**     | Cloudflare quyết định không cache loại nội dung này. Đây là giá trị bạn sẽ thấy với HTML và API.         |
+| **STALE**       | Trả bản cũ vì origin không phản hồi được. Tính năng cứu nguy khi máy chủ sập.                            |
+
+```bash
+# Xem trạng thái cache của một file
+curl -sI https://example.com/assets/main.js | grep -iE "cf-cache-status|cache-control|age|cf-ray"
+
+# Gọi hai lần liên tiếp để thấy MISS → HIT
+curl -sI https://example.com/assets/main.js | grep -i cf-cache-status
+curl -sI https://example.com/assets/main.js | grep -i cf-cache-status
+```
+
+Đọc kèm hai header nữa thì bức tranh đủ:
+
+- `age` — số giây bản sao này đã nằm ở edge. `cf-cache-status: HIT` với `age: 84000` trên file bạn vừa deploy 5 phút trước nghĩa là: edge đang trả bản từ hôm qua. Đó là bằng chứng, không phải phỏng đoán.
+- `cache-control` — thứ origin đã gửi. Nếu là `max-age=31536000` trên `index.html`, bạn vừa tìm ra lý do (2) ở trên.
+
+Phân biệt hai giá trị hay bị nhầm: **DYNAMIC** là "Cloudflare không coi thứ này là cache được" (HTML, API — do loại nội dung); **BYPASS** là "cache được nhưng có ai đó bảo đừng" (rule, `no-store`, Development Mode). Thấy BYPASS trên file `.js` là dấu hiệu origin đang gửi `no-store` cho asset — sửa header ở origin. Và `cf-ray` khác PoP (`-HAN` với `-SGN`) có thể cho `cf-cache-status` khác nhau trên cùng một URL: mỗi PoP có cache riêng, người ở Sài Gòn thấy bản mới không có nghĩa người ở Hà Nội cũng thấy.
+
+---
+
+## Ai quyết định cache bao lâu
+
+Có hai tầng thời gian, đừng nhầm lẫn:
+
+| Tầng            | Ai điều khiển                                                                                  | Ảnh hưởng                                  |
+| --------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| **Edge TTL**    | Header `Cache-Control` từ origin; hoặc Cache Rules ghi đè                                      | Cloudflare giữ bản sao ở PoP bao lâu       |
+| **Browser TTL** | Header `Cache-Control` gửi tới trình duyệt; hoặc thiết lập Browser Cache TTL trong tab Caching | Trình duyệt người dùng giữ bản sao bao lâu |
+
+Mặc định, cùng một header `Cache-Control` từ origin điều khiển cả hai: Cloudflare đọc nó để quyết định Edge TTL, rồi chuyển tiếp nguyên vẹn xuống trình duyệt. Cache Rules cho phép tách hai tầng ra — ví dụ edge giữ 2 giờ nhưng trình duyệt chỉ giữ 5 phút — để bạn purge ở edge là người dùng thấy bản mới trong tối đa 5 phút. Thiết lập **Browser Cache TTL** trong Caching → Configuration nên để "Respect Existing Headers" nếu origin của bạn đã gửi `Cache-Control` đúng; chỉ đặt giá trị cố định khi origin không gửi gì.
+
+> **Browser cache là thứ bạn không purge được.** Purge cache của Cloudflare chỉ xoá bản sao ở edge. Nếu bạn lỡ gửi `Cache-Control: max-age=31536000` cho `index.html`, trình duyệt của người dùng sẽ giữ bản đó một năm và bạn không có cách nào ép họ tải lại. Đây là loại lỗi phải sống chung, không sửa được từ xa. Vì vậy: **HTML luôn để `no-cache` hoặc `max-age` rất ngắn.**
+
+Nếu bạn đã lỡ: cách "gỡ" duy nhất là đổi URL. Với `index.html` ở `/` thì không đổi được — bạn chỉ có thể đợi. Với asset không hash (`/js/app.js`), thêm query `?v=2` vào thẻ script là URL mới, trình duyệt buộc phải tải — nhưng thẻ script đó nằm trong `index.html` mà trình duyệt đang giữ bản cũ… Đây là lý do mọi bundler hiện đại hash tên file và mọi hướng dẫn đều lặp lại "HTML không cache". Bài [Frontend caching deep dive](/blog/frontend-caching-deep-dive/) và [Network caching](/blog/web-perf-11-network-caching/) mổ xẻ `Cache-Control` ở phía trình duyệt kỹ hơn.
+
+---
+
+## Chiến lược cache chuẩn cho frontend
+
+| Loại file                                  | `Cache-Control` từ origin             | Lý do                                                                    |
+| ------------------------------------------ | ------------------------------------- | ------------------------------------------------------------------------ |
+| `index.html`, các route HTML               | `no-cache, must-revalidate`           | Là bản đồ trỏ tới asset, phải luôn mới. Trả 304 nếu chưa đổi nên rất rẻ. |
+| Asset có hash trong tên (`main-a3f9b2.js`) | `public, max-age=31536000, immutable` | Nội dung đổi → tên đổi → URL khác. Cache một năm hoàn toàn an toàn.      |
+| Ảnh, font trong thư mục build (có hash)    | `public, max-age=31536000, immutable` | Như trên                                                                 |
+| Ảnh người dùng upload                      | `public, max-age=86400`               | Cân bằng giữa tốc độ và khả năng cập nhật                                |
+| `/api/*`                                   | `no-store`                            | Dữ liệu động, thường riêng từng người                                    |
+| `config.json`, `service-worker.js`         | `no-store`                            | Cache những file này gây lỗi rất khó gỡ                                  |
+
+`no-cache` không có nghĩa là "không cache" — nó nghĩa là "được lưu, nhưng phải hỏi lại origin trước khi dùng". Trình duyệt gửi `If-None-Match` với ETag, origin trả `304 Not Modified` nếu chưa đổi: vài trăm byte thay vì cả file, và người dùng luôn thấy bản mới. `no-store` mới là "không lưu gì cả".
+
+Với người dùng Vite: `dist/assets/index-a3f9b2.js` đã có hash sẵn, còn file trong `public/` (logo, favicon, ảnh OG) được copy **nguyên tên** — chúng thuộc dòng "ảnh người dùng upload" chứ không phải dòng "asset có hash", đừng cho chúng một năm. Next.js hash mọi thứ dưới `/_next/static/` và tự gửi `immutable`; Astro dùng thư mục `_astro/`. Service worker phải `no-store` vì trình duyệt kiểm tra file này để quyết định có bản mới không — cache nó là người dùng kẹt ở phiên bản cũ mãi, kể cả khi bạn đã sửa mọi thứ khác.
+
+### Đặt Cache-Control ở đâu tuỳ theo nơi host
+
+| Nơi host              | Cách đặt                                                                                                 |
+| --------------------- | -------------------------------------------------------------------------------------------------------- |
+| Cloudflare Pages      | File `_headers` trong thư mục build. Xem [phần 8](/blog/cloudflare-fe-08-cloudflare-pages-free-hosting/) |
+| Hostinger (Apache)    | File `.htaccess` với `FilesMatch` và `Header set Cache-Control`                                          |
+| Nginx trên VPS        | Khối `location` khớp theo đuôi file với `add_header Cache-Control ...`                                   |
+| Không sửa được origin | Dùng Cache Rules của Cloudflare để ghi đè (mục Cache Rules bên dưới)                                     |
+
+Ví dụ `.htaccess` cho Hostinger, đặt ở thư mục gốc của site (`public_html`):
+
+```text
+# Asset có hash — cache vĩnh viễn
+<FilesMatch "\.(js|css|woff2|woff|ttf|svg|png|jpg|jpeg|gif|webp|ico)$">
+  Header set Cache-Control "public, max-age=31536000, immutable"
+</FilesMatch>
+
+# HTML — luôn kiểm tra lại
+<FilesMatch "\.(html)$">
+  Header set Cache-Control "no-cache, must-revalidate"
+</FilesMatch>
+
+# SPA: mọi đường dẫn không phải file thật đều trả về index.html
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+  RewriteRule ^index\.html$ - [L]
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteCond %{REQUEST_FILENAME} !-d
+  RewriteRule . /index.html [L]
+</IfModule>
+```
+
+Khối đầu áp một năm cho mọi ảnh — đúng nếu ảnh nằm trong build có hash; nếu bạn có ảnh không hash trong `public/`, tách chúng ra một `FilesMatch` riêng với `max-age=86400`. Tương đương trên nginx:
+
+```nginx
+location ~* \.(js|css|woff2|woff|ttf|svg|png|jpg|jpeg|gif|webp|ico)$ {
+    add_header Cache-Control "public, max-age=31536000, immutable";
+}
+location = /index.html {
+    add_header Cache-Control "no-cache, must-revalidate";
+}
+location / {
+    try_files $uri $uri/ /index.html;
+}
+```
+
+> **Đoạn rewrite ở cuối giải quyết lỗi F5 bị 404.** Với SPA dùng React Router hay Vue Router, khi người dùng nhấn F5 tại `/products/123`, máy chủ đi tìm file thật tên `products/123` và không thấy → 404. Ba dòng `RewriteCond` / `RewriteRule` ở trên bảo Apache: nếu đường dẫn không phải file hay thư mục có thật, cứ trả `index.html`. Đây là phiên bản Hostinger của "SPA fallback" (`try_files` là phiên bản nginx, `_redirects` là phiên bản Pages).
+
+---
+
+## Purge cache — ba cách
+
+| Cách                 | Ở đâu                               | Dùng khi                                                                                                 |
+| -------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| **Purge Everything** | Caching → Configuration             | Sau khi deploy lớn, hoặc khi không chắc cái gì đang cũ. Lưu ý: xoá sạch nên tỷ lệ hit tụt trong một lúc. |
+| **Purge by URL**     | Cùng chỗ, nhập danh sách URL đầy đủ | Cách nên dùng thường ngày. Chính xác, không ảnh hưởng phần còn lại.                                      |
+| **Development Mode** | Caching → Configuration             | Tạm ngừng cache trong 3 giờ để dev thoải mái. Tự tắt sau 3 giờ, không lo quên.                           |
+
+Purge by URL khớp **chính xác** URL: scheme, host, đường dẫn, và cả query string. `https://example.com/logo.png` và `https://www.example.com/logo.png` là hai mục cache khác nhau — nếu cả hai hostname đều phục vụ nội dung (chưa redirect về một dạng chuẩn, xem [phần 7](/blog/cloudflare-fe-07-rules-redirect-and-transform/)), phải purge cả hai. Purge theo prefix, theo tag, theo hostname là tính năng gói trả phí.
+
+### Purge bằng API — để đưa vào pipeline
+
+```bash
+# Purge một số URL cụ thể
+curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/purge_cache" \
+  -H "Authorization: Bearer $CF_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"files":["https://example.com/index.html","https://example.com/"]}'
+
+# Purge toàn bộ
+curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/purge_cache" \
+  -H "Authorization: Bearer $CF_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"purge_everything":true}'
+```
+
+Lấy `ZONE_ID` ở trang Overview của zone (cột phải, mục API). Tạo `CF_API_TOKEN` ở **My Profile → API Tokens**, dùng template **"Edit zone"** hoặc chỉ cấp quyền **Zone → Cache Purge**, và giới hạn đúng zone cần thiết — **đừng dùng Global API Key**, nó có toàn quyền trên mọi thứ trong tài khoản.
+
+Ví dụ bước purge trong GitHub Actions, đặt **sau** bước upload build lên hosting:
+
+```yaml
+- name: Xoá cache Cloudflare
+  run: |
+    curl -sS -X POST \
+      "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/purge_cache" \
+      -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+      -H "Content-Type: application/json" \
+      --data '{"files":["https://example.com/","https://example.com/index.html"]}' \
+      | tee /dev/stderr | grep -q '"success":true'
+```
+
+Đoạn `grep -q '"success":true'` làm bước này **fail** nếu API trả lỗi (token hết hạn, sai zone) — không có nó, pipeline xanh mà cache vẫn cũ. Thứ tự quan trọng: build → upload xong → purge. Purge trước khi upload xong là edge kéo bản cũ lên lại ngay. Và nếu bạn làm đúng chiến lược ở trên (HTML `no-cache`, asset có hash), danh sách cần purge chỉ còn vài URL không hash như ảnh trong `public/` — hoặc không cần purge gì cả.
+
+---
+
+## Cache Rules — ghi đè hành vi mặc định
+
+Khi bạn không sửa được header ở origin, hoặc muốn hành vi khác mặc định, dùng **Cache Rules** (Caching → Cache Rules). Rule có hai phần: điều kiện (viết bằng biểu thức trên hostname, đường dẫn, header…) và hành động.
+
+**Ví dụ 1: cache cả HTML cho một trang tĩnh**
+
+| Điều kiện                                                              | Hành động                                                        | Dùng khi                                                                    |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Hostname equals `example.com` AND URI Path does not start with `/api/` | Eligible for cache = Yes; Edge TTL = 2 giờ; Browser TTL = 5 phút | Blog, landing page — nội dung ít đổi, muốn tốc độ tối đa và giảm tải origin |
+
+**Ví dụ 2: không bao giờ cache API**
+
+| Điều kiện                    | Hành động    | Dùng khi                                                  |
+| ---------------------------- | ------------ | --------------------------------------------------------- |
+| URI Path starts with `/api/` | Bypass cache | Luôn nên có rule này nếu bạn bật cache cho HTML ở ví dụ 1 |
+
+> **Bật cache cho HTML: lợi và hại.** Lợi: trang tải gần như tức thì, origin gần như không phải làm gì, chịu được lưu lượng lớn. Hại: nội dung động theo người dùng sẽ bị trả nhầm — người A thấy trang đã đăng nhập của người B. Chỉ bật cho nội dung thực sự giống nhau với mọi người. Nếu trang có phần "Xin chào, [tên]" ở header thì tuyệt đối không bật.
+
+Với SPA thuần (HTML là cái vỏ rỗng, mọi thứ cá nhân hoá lấy qua API sau khi JS chạy), cache HTML tương đối an toàn — cái vỏ giống nhau với mọi người. Với site server-render có session (WordPress đăng nhập, Next.js SSR đọc cookie) thì không. Nếu vẫn muốn cache HTML cho khách vãng lai mà bypass cho người đăng nhập, thêm điều kiện trên cookie (kiểu `Cookie does not contain "session"`) — kiểm tra docs Cache Rules cho gói của bạn về các trường điều kiện hỗ trợ. Và nhớ Edge TTL 2 giờ nghĩa là bài blog vừa sửa có thể hiện bản cũ tới 2 giờ: thêm bước purge by URL vào quy trình đăng bài.
+
+Nếu bạn thấy trong zone còn một **Page Rule** cũ kiểu "Cache Level: Cache Everything", đó là thế hệ trước của Cache Rules và là nghi phạm số một cho "HTML bị cache mà tôi không nhớ đã bật". Chuyển nó sang Cache Rules để dễ đọc, hoặc xoá.
+
+---
+
+## Tiered Cache
+
+Mặc định mỗi PoP giữ cache riêng. Người ở Hà Nội miss thì PoP Hà Nội hỏi origin; người ở Frankfurt miss thì PoP Frankfurt cũng hỏi origin. Origin bị hỏi nhiều lần cho cùng một file — với hàng trăm PoP, một lần deploy có thể kéo theo hàng trăm request MISS xuống origin cho mỗi asset.
+
+**Tiered Cache** tổ chức các PoP thành nhiều tầng: PoP nhỏ hỏi PoP lớn trước, chỉ PoP lớn mới hỏi origin. Kết quả: tỷ lệ hit cao hơn, origin nhẹ hơn. Bật ở **Caching → Tiered Cache** — gói Free có bản Smart Tiered Cache, bật một nút, không có gì để cấu hình thêm. Với origin là shared hosting yếu như Hostinger, đây là nút đáng bật nhất trong tab Caching.
+
+---
+
+## Lab 6.1 — Nghịch cache (30 phút)
+
+1. Tải một file ảnh lên website, mở nó bằng `curl -sI` hai lần, quan sát `cf-cache-status` đổi từ **MISS** sang **HIT** (và `age` bắt đầu tăng).
+2. Mở trang chủ bằng `curl -sI` — quan sát **DYNAMIC** (HTML không cache mặc định).
+3. Sửa nội dung file ảnh ở origin (giữ nguyên tên), tải lại — vẫn thấy bản cũ, `age` vẫn tăng. **Purge by URL**, tải lại — thấy bản mới, `cf-cache-status` quay về MISS rồi HIT.
+4. Bật **Development Mode**, gọi lại — quan sát `cf-cache-status: BYPASS`.
+5. Tạo Cache Rule cho HTML như ví dụ 1, gọi lại trang chủ — quan sát nó chuyển từ DYNAMIC sang MISS rồi HIT.
+6. Xoá rule đó đi khi xong, nếu website của bạn có nội dung theo người dùng. Tắt Development Mode (hoặc để nó tự tắt sau 3 giờ).
+
+```bash
+URL=https://example.com/img/lab.png
+for i in 1 2 3; do curl -sI "$URL" | grep -iE "cf-cache-status|^age"; echo ---; done
+```
+
+> **Kết quả mong đợi:** lần 1 `MISS`, lần 2 và 3 `HIT` với `age` tăng dần. Sau khi sửa ảnh ở origin mà chưa purge: vẫn `HIT`, nội dung cũ. Sau purge: `MISS` rồi `HIT` với nội dung mới. Development Mode: `BYPASS` ở mọi lần gọi. Trang chủ: `DYNAMIC` trước khi có Cache Rule, `MISS` → `HIT` sau khi có.
+
+Nếu bước 1 ra `BYPASS` thay vì MISS: origin đang gửi `no-store` hoặc `Set-Cookie` cho ảnh (WordPress có plugin làm vậy) — xem `curl -sI` đầy đủ để tìm header thủ phạm. Nếu ra `DYNAMIC` trên file `.png`: kiểm tra URL có thật sự kết thúc bằng `.png` không (một số CMS phục vụ ảnh qua `/image?id=123`).
+
+---
+
+## Sai lầm hay gặp ở chương này
+
+- **Purge Everything sau mỗi lần deploy nhỏ.** Chạy được, nhưng tỷ lệ hit về 0 và origin gánh mọi request trong vài phút. Với asset có hash, không cần purge; với HTML `no-cache`, cũng không. Chỉ purge by URL cho vài file không hash.
+- **Gửi `max-age` dài cho `index.html`.** Không purge được, phải sống chung. Kiểm tra `curl -sI https://example.com | grep -i cache-control` ngay sau khi cấu hình host.
+- **Kết luận "cache hỏng" từ một máy.** Trình duyệt của bạn cache, resolver cache, PoP của bạn cache. Dùng `curl -sI` (không có cache trình duyệt) và đọc `age` trước khi kết luận.
+- **Tưởng Ctrl+Shift+R xoá cache ở edge.** Nó chỉ bỏ qua cache trình duyệt; edge vẫn trả HIT. Muốn edge lấy bản mới phải purge hoặc chờ hết Edge TTL.
+- **Bật cache HTML cho site có đăng nhập.** Người A thấy trang của người B. Chỉ bật khi HTML giống nhau với mọi người, và luôn có rule bypass `/api/*`.
+- **Dùng Global API Key trong CI để purge.** Lộ key là lộ toàn bộ tài khoản. Dùng API Token giới hạn quyền Cache Purge cho đúng zone.
+- **Cache `service-worker.js`.** Người dùng kẹt ở phiên bản cũ mãi. Luôn `no-store`.
+
+---
+
+## Tóm tắt
+
+- Cloudflare mặc định **cache file tĩnh theo đuôi file, không cache HTML, API, response có `Set-Cookie`, method khác GET/HEAD.** SPA vì thế chạy đúng ngay: HTML luôn mới, asset cache mạnh.
+- Đọc `cf-cache-status` cùng `age` và `cache-control`: HIT, MISS, EXPIRED, REVALIDATED, BYPASS, DYNAMIC, STALE. DYNAMIC là "loại này không cache", BYPASS là "có ai đó bảo đừng".
+- Hai tầng TTL: **Edge TTL** (Cloudflare giữ bao lâu, purge được) và **Browser TTL** (trình duyệt giữ bao lâu, **không** purge được). HTML luôn `no-cache, must-revalidate`.
+- Chiến lược chuẩn: HTML `no-cache`; asset có hash `public, max-age=31536000, immutable`; ảnh upload `max-age=86400`; `/api/*`, `config.json`, `service-worker.js` là `no-store`. Đặt ở `_headers`, `.htaccess`, nginx, hoặc Cache Rules.
+- SPA fallback ở Hostinger là ba dòng `RewriteCond`/`RewriteRule` trả `index.html` cho đường dẫn không phải file thật.
+- Purge: by URL cho hằng ngày, Everything khi không chắc, Development Mode 3 giờ khi dev. Purge từ CI bằng API Token giới hạn quyền, sau bước upload, có kiểm tra `"success":true`.
+- Cache Rules ghi đè mặc định (cache HTML cho site tĩnh, bypass `/api/*`); Tiered Cache giảm số lần origin bị hỏi.
+
+Phần tiếp theo: [Phần 7 — Rules: chuyển hướng và biến đổi ở edge](/blog/cloudflare-fe-07-rules-redirect-and-transform/) — gom www về tên miền gốc, thêm security header, viết lại đường dẫn, và thứ tự các rule chạy so với cache và Workers. Nếu bạn đang chạy frontend trong Kubernetes với CDN đứng trước, [K8s cho Frontend Developer · Phần 12](/blog/k8s-fe-12-cache-cdn-zero-downtime/) áp cùng chiến lược `Cache-Control` này vào nginx trong container.
+
+## Đọc thêm
+
+- [Cloudflare Cache docs](https://developers.cloudflare.com/cache/) — mặc định cache gì, `cf-cache-status`, Cache Rules, purge, Tiered Cache.
+- [Cloudflare API docs](https://developers.cloudflare.com/api/) — endpoint purge cache và cách tạo API Token.
+- [Cloudflare Rules docs](https://developers.cloudflare.com/rules/) — cú pháp biểu thức dùng trong điều kiện của Cache Rules.

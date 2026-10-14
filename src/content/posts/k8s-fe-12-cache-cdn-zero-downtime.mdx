@@ -1,0 +1,336 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 12 — Cache, nén, CDN đứng trước cluster và zero-downtime deploy'
+description: 'Cache-Control đúng cho index.html, asset có hash và config.js; gzip và brotli nén sẵn lúc build; CDN đứng trước Ingress; checklist 7 điểm zero-downtime với readinessProbe, preStop, PDB, maxUnavailable 0 và cách xử lý ChunkLoadError.'
+pubDate: 2026-11-02
+lang: vi
+tags: [kubernetes, cache, cdn, performance, devops]
+series: k8s-fe
+seriesOrder: 12
+draft: false
+---
+
+Hai tin nhắn bạn không muốn nhận sau khi deploy: "trang trắng, F5 mạnh mới hết" và "lúc deploy có mấy request 502". Cả hai đều không phải lỗi code React. Cái đầu là cache sai: trình duyệt hoặc CDN giữ `index.html` cũ trỏ tới bundle đã bị xoá. Cái sau là rollout thiếu một trong bảy điều kiện để Kubernetes thay Pod mà không rơi request nào. Bài này lo phần đứng **trước** và **quanh** Pod frontend: header `Cache-Control` đúng cho từng loại file, nén gzip/brotli, CDN đứng trước Ingress và lý do chỉ 5–10% request nên chạm tới cluster, rồi checklist zero-downtime đầy đủ, kể cả bài toán riêng của SPA là `ChunkLoadError`. Đọc xong bạn có một `nginx.conf` hoàn chỉnh, một khối `strategy` chuẩn, và một cách kiểm chứng bằng vòng lặp `curl` rằng deploy của mình thật sự không mất request.
+
+## Chiến lược cache hai tầng cho frontend
+
+Bản build của Vite (và CRA, Next.js) tạo ra hai loại file rất khác nhau, và chúng cần hai chính sách cache đối lập:
+
+| Loại file                       | Cache-Control                         | Lý do                                                                                            |
+| ------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `index.html`                    | `no-cache, must-revalidate`           | Là điểm vào, phải luôn mới để trỏ tới bundle mới                                                 |
+| `/assets/*-[hash].js` và `.css` | `public, max-age=31536000, immutable` | Tên có hash, đổi nội dung là đổi tên → cache vĩnh viễn an toàn                                   |
+| `/config.js`                    | `no-store`                            | Chứa cấu hình runtime ([Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/)), phải luôn mới |
+| Ảnh, font trong `public/`       | `public, max-age=2592000`             | 30 ngày, cân bằng giữa mới và nhanh; file này không có hash trong tên                            |
+
+"Hai tầng" nghĩa là: tầng vào (`index.html`, `config.js`) **không bao giờ** được cache lâu, còn tầng asset có hash được cache **vĩnh viễn**. Mọi lần deploy chỉ đổi tầng vào (một file HTML vài KB), và tầng asset của bản mới có tên mới nên không đụng gì tới cache cũ. Người dùng tải HTML mới → thấy tên bundle mới → tải một lần → cache một năm.
+
+### Đọc đúng các directive
+
+- `max-age=N`: được dùng lại trong N giây mà không hỏi server.
+- `no-cache`: **được lưu**, nhưng mỗi lần dùng phải hỏi server xem còn mới không (revalidate). Server trả `304 Not Modified` nếu chưa đổi, rất rẻ. Tên gây hiểu nhầm, nó không có nghĩa "không cache".
+- `no-store`: không lưu ở bất kỳ đâu, lần nào cũng tải lại toàn bộ. Dùng cho file nhỏ mà tuyệt đối không được cũ.
+- `must-revalidate`: khi hết hạn, không được dùng bản cũ "tạm" lúc server không trả lời.
+- `immutable`: nói với trình duyệt "đừng revalidate ngay cả khi người dùng F5", tiết kiệm hàng loạt request 304 khi reload.
+- `public` / `private`: `public` cho phép CDN và proxy trung gian lưu; `private` chỉ cho trình duyệt.
+
+Revalidation hoạt động nhờ `ETag` (nginx tự sinh từ mtime và size của file tĩnh) hoặc `Last-Modified`. Vì vậy `index.html` với `no-cache` vẫn nhanh: trình duyệt gửi `If-None-Match`, nginx trả 304 không body khi file chưa đổi. Chỉ sau deploy, ETag đổi, trình duyệt mới tải HTML mới.
+
+> **Lỗi kinh điển: cache `index.html`.** Nếu `index.html` bị cache (thiếu header, hoặc CDN áp TTL mặc định), người dùng tải HTML cũ trỏ tới `main-abc123.js` đã bị xoá sau khi deploy → 404 → trang trắng hoặc `ChunkLoadError`. Đây là nguyên nhân số 1 của hiện tượng "deploy xong user báo trắng trang, F5 mạnh mới hết": F5 mạnh (Ctrl+Shift+R) bỏ qua cache nên tải được HTML mới, còn F5 thường thì không. Nếu app có service worker (PWA), nó là thêm một tầng cache nữa có thể giữ `index.html`; kiểm tra chiến lược của service worker trước khi đổ lỗi cho nginx.
+
+---
+
+## nginx.conf hoàn chỉnh cho SPA: cache và nén
+
+```nginx
+server {
+  listen 80;
+  server_name _;
+  root /usr/share/nginx/html;
+  index index.html;
+
+  # ---- Nén ----
+  gzip on;
+  gzip_vary on;              # thêm Vary: Accept-Encoding để cache trung gian không trộn bản nén/không nén
+  gzip_proxied any;          # nén cả khi request đi qua proxy (Ingress)
+  gzip_comp_level 6;
+  gzip_min_length 1024;
+  gzip_types text/plain text/css application/json application/javascript
+             application/xml text/javascript image/svg+xml;
+
+  # ---- Asset có hash: cache vĩnh viễn ----
+  # ^~ để block prefix này thắng các block regex bên dưới
+  location ^~ /assets/ {
+    expires 1y;
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    access_log off;
+  }
+
+  # ---- Ảnh, font không có hash (public/) ----
+  location ~* \.(png|jpg|jpeg|gif|webp|avif|ico|svg|woff2?)$ {
+    expires 30d;
+    add_header Cache-Control "public, max-age=2592000";
+  }
+
+  # ---- Tầng vào: không được cũ ----
+  location = /config.js {
+    add_header Cache-Control "no-store";
+    expires -1;
+  }
+
+  location = /index.html {
+    add_header Cache-Control "no-cache, must-revalidate";
+  }
+
+  location /healthz {
+    access_log off;
+    return 200 "ok\n";
+  }
+
+  # ---- SPA fallback ----
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+}
+```
+
+Ba chi tiết nginx dễ làm sai mà chỉ lộ khi đã lên production:
+
+- **Thứ tự chọn `location`**: nginx tìm prefix dài nhất, rồi vẫn thử các block regex (`~*`) và để regex thắng. Không có `^~`, file `/assets/logo-abc.png` sẽ rơi vào block ảnh 30 ngày thay vì block `immutable` một năm. `^~` nói "khớp prefix này rồi thì dừng".
+- **`add_header` không kế thừa**: block `location` nào có `add_header` riêng thì **mất toàn bộ** `add_header` của cấp `server`. Nếu bạn đặt security header ở `server` rồi thêm `Cache-Control` trong một `location`, location đó không còn security header. Đây là lý do [Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/) đặt security header ở Ingress thay vì trong `nginx.conf`.
+- **Fallback vẫn đúng header**: khi `try_files` chuyển `/dashboard/settings` về `/index.html`, nginx thực hiện internal redirect và chọn lại `location`, nên block `= /index.html` áp dụng và response mang `no-cache`. Thiếu block exact-match đó, route con sẽ bị cache như một trang tĩnh bình thường.
+
+Tên thư mục asset tuỳ công cụ: Vite là `assets/[name]-[hash].js`, CRA là `static/js/main.[hash].js` (đổi prefix trong `location`), Next.js là `/_next/static/` và Next tự đặt `immutable` cho thư mục đó khi chạy server; với Next.js bạn chỉ cần lo header cho `public/`.
+
+---
+
+## Nén: gzip và brotli
+
+Text (JS, CSS, HTML, JSON, SVG) nén được 70–80%; một bundle 800 KB thành khoảng 200 KB gzip. Ảnh, font `woff2`, video **đã nén sẵn**, nén lại chỉ tốn CPU, nên `gzip_types` ở trên cố ý không có chúng.
+
+Brotli cho kết quả nhỏ hơn gzip thêm 15–20% với text, và mọi trình duyệt hiện đại đều hỗ trợ (`Accept-Encoding: br`). Nhưng image `nginx:alpine` chính thức **không có** module brotli; muốn dùng, bạn cần image có sẵn `ngx_brotli` hoặc tự build. Trước khi làm vậy, cân nhắc cách tốt hơn cho cả gzip lẫn brotli:
+
+```nginx
+# Nén sẵn lúc build, nginx chỉ việc phục vụ file .gz / .br có sẵn
+gzip_static on;    # tìm main-abc.js.gz cạnh main-abc.js
+brotli_static on;  # cần module brotli; tìm main-abc.js.br
+```
+
+Plugin như `vite-plugin-compression` sinh `.gz` và `.br` cạnh mỗi asset ngay lúc `npm run build`, với mức nén cao nhất (mức 11 của brotli quá chậm để nén runtime nhưng chấp nhận được ở build). nginx không tốn một chu kỳ CPU nào lúc phục vụ, và mức nén tốt hơn `gzip_comp_level 6`. `gzip_static` có sẵn trong image chính thức, nên ít nhất hãy bật nó.
+
+Kiểm tra bằng curl, so sánh dung lượng tải với và không có header `Accept-Encoding`:
+
+```bash
+curl -so /dev/null -w '%{size_download}\n' http://app.local/assets/index-abc123.js
+curl -so /dev/null -w '%{size_download}\n' -H 'Accept-Encoding: gzip, br' http://app.local/assets/index-abc123.js
+curl -sI -H 'Accept-Encoding: gzip, br' http://app.local/assets/index-abc123.js | grep -i content-encoding
+```
+
+Nếu có CDN đứng trước, CDN thường nén ở edge và có thể nén cả brotli mà origin không cần biết; khi đó nén ở nginx chỉ còn ý nghĩa cho 5–10% request đi tới origin. Vẫn bật, nhưng đừng đầu tư xây image brotli riêng chỉ vì thế.
+
+---
+
+## Kiến trúc khuyến nghị: CDN trước Kubernetes
+
+```text
+   Người dùng
+       |
+       v
+   [ CDN: Cloudflare / CloudFront / Fastly ]
+       |  - phục vụ asset tĩnh từ edge gần người dùng
+       |  - chống DDoS, cung cấp TLS, nén
+       |  - chỉ ~5-10% request đi tiếp vào trong
+       v
+   [ Ingress Controller ]
+       |
+       v
+   [ Pod frontend ]
+```
+
+Với chiến lược cache hai tầng ở trên, CDN gần như tự vận hành: asset `immutable` được edge giữ một năm, `index.html` được revalidate (304 từ origin rất rẻ), `config.js` là `no-store` nên CDN không giữ. Người dùng ở xa cluster tải bundle từ edge cách họ vài chục km thay vì từ Pod cách nửa vòng trái đất. Cluster chỉ còn nhận HTML, `config.js`, và các request API.
+
+Cách nối: DNS của `app.congty.com` trỏ vào CDN (bản ghi proxied của Cloudflare, hoặc CNAME sang distribution của CloudFront), CDN có **origin** là hostname của LoadBalancer đứng trước Ingress Controller. Ingress vẫn cần chứng chỉ hợp lệ để CDN nói TLS với origin ở chế độ nghiêm ngặt; cert-manager ở Phần 17 lo việc đó, và với Cloudflare thì để ý cạm bẫy Let's Encrypt HTTP-01 bị proxy che. Cách cấu hình cache ở phía CDN nằm trong hai bài thuộc series bên cạnh: [Cloudflare phần 6](/blog/cloudflare-fe-06-cache-old-version-after-deploy/) về vì sao deploy xong vẫn thấy bản cũ, và [AWS phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/) về CloudFront invalidation và SPA routing.
+
+Bốn cạm bẫy khi đặt CDN trước cluster:
+
+- **TTL mặc định của CDN đè lên `Cache-Control`**: một số CDN không cache HTML mặc định, một số áp TTL mặc định cho mọi thứ; kiểm tra rule của CDN bạn dùng, và sau deploy hãy `curl -I` `index.html` để xem header `cf-cache-status` / `x-cache` báo HIT hay MISS. Nếu CDN giữ HTML, thêm bước purge vào pipeline CI ngay sau `rollout status`.
+- **IP client biến mất**: Ingress và app chỉ thấy IP của CDN. Rate limit theo IP, log, geo-block đều sai. Cấu hình ingress-nginx tin `X-Forwarded-For` từ dải IP của CDN (tuỳ chọn `use-forwarded-headers` và `proxy-real-ip-cidr` trong ConfigMap của controller), và với Cloudflare còn có header `CF-Connecting-IP`. Việc này thuộc DevOps, nhưng bạn cần biết để không mất một ngày tự hỏi vì sao mọi người dùng có cùng IP.
+- **WebSocket và SSE**: một số CDN buffer response hoặc giới hạn thời gian kết nối; kiểm tra docs trước khi đưa endpoint realtime đi qua CDN, hoặc đặt chúng ở subdomain không proxy.
+- **Header `Vary`**: thiếu `Vary: Accept-Encoding` (dòng `gzip_vary on` ở trên) khiến CDN có thể trả bản gzip cho client không hỗ trợ. Hiếm ngày nay nhưng vẫn là một dòng đáng giữ.
+
+> **Suy nghĩ thẳng thắn:** Với một SPA thuần tĩnh, cách rẻ và nhanh nhất là đẩy `dist/` lên S3, Cloudflare Pages hoặc Vercel, không cần Kubernetes. Bạn nên dùng K8s cho frontend khi: (1) công ty đã chuẩn hoá mọi thứ trên K8s, (2) cần SSR có trạng thái, (3) yêu cầu chạy trong mạng nội bộ, (4) cần deploy thống nhất với backend. Biết rõ lý do mình chọn K8s là dấu hiệu của kỹ sư trưởng thành. Phần 18 quay lại câu hỏi này với con số chi phí.
+
+---
+
+## Zero-downtime deploy cho frontend: checklist 7 điểm
+
+Mỗi điểm chặn một cách mất request cụ thể; thiếu một điểm là có một khe hở.
+
+**1. `maxUnavailable: 0` và `maxSurge: 1` (hoặc 25%).** Không lúc nào số Pod sẵn sàng thấp hơn `replicas`. Với 3 replica, rollout diễn ra: 3 cũ → 3 cũ + 1 mới (chờ ready) → 2 cũ + 1 mới → 2 cũ + 2 mới → … → 3 mới. Chậm hơn `maxUnavailable: 1` nhưng không có khoảng thiếu Pod. Cluster phải còn chỗ cho **một Pod thừa** (đủ `requests`), nếu không Pod mới Pending và rollout đứng im.
+
+**2. `readinessProbe` chính xác.** Deployment chỉ tính Pod mới là "available" khi readiness pass, và chỉ khi đó mới tắt Pod cũ tiếp theo. Không có readiness, K8s coi container ready ngay khi start và tắt Pod cũ trong lúc Pod mới còn đang nạp. Thêm `minReadySeconds: 5`: Pod phải ready liên tục 5 giây mới được tính, bắt được những container crash ngay sau khi lên.
+
+**3. `preStop: sleep 5`** để tránh race condition endpoints ở [Phần 9](/blog/k8s-fe-09-resources-qos-storage-pod-lifecycle/): Pod bị gỡ khỏi endpoints và nhận SIGTERM song song; ngủ vài giây cho việc gỡ lan truyền xong rồi mới tắt.
+
+**4. `terminationGracePeriodSeconds` đủ lớn (≥ 30)**, bao gồm cả thời gian `preStop` lẫn thời gian trả nốt request đang dở.
+
+**5. `replicas` ≥ 2.** Một Pod thì không thể zero-downtime bằng bất kỳ cấu hình nào: lúc nó tắt là lúc không còn ai.
+
+**6. Có `PodDisruptionBudget`.** Rolling update là do bạn chủ động và Deployment tự lo; nhưng node drain khi nâng cấp cluster, cluster autoscaler thu node, là những "disruption" do người khác gây ra, và PDB là thứ duy nhất chặn chúng hạ số Pod dưới ngưỡng.
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+  namespace: web
+spec:
+  minAvailable: 2 # hoặc maxUnavailable: 1 với app ít replica
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+```
+
+PDB với `replicas: 1` và `minAvailable: 1` sẽ **chặn drain mãi mãi** và DevOps sẽ tìm tới bạn; với app nhỏ dùng `maxUnavailable: 1`. PDB không can thiệp vào rollout của chính Deployment.
+
+**7. Giữ lại asset của version cũ.** Vấn đề riêng của SPA, mục ngay dưới.
+
+Gom sáu điểm đầu vào Deployment:
+
+```yaml
+spec:
+  replicas: 3
+  minReadySeconds: 5
+  progressDeadlineSeconds: 300 # rollout không tiến triển 5 phút -> đánh dấu failed
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: web
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ['/bin/sh', '-c', 'sleep 5 && nginx -s quit']
+```
+
+`progressDeadlineSeconds` không tự rollback, nhưng làm `kubectl rollout status` thoát với lỗi thay vì treo vô hạn, để pipeline CI ở Phần 16 bắt được và chạy `rollout undo`. Chiến lược ngoài RollingUpdate (blue-green, canary) ở Phần 14.
+
+---
+
+## Vấn đề riêng của SPA: ChunkLoadError khi deploy
+
+Người dùng đang mở tab với bundle v1. Bạn deploy v2. Người dùng bấm vào một route lazy-load → trình duyệt tải `chunk-xyz.js` của v1, nhưng Pod giờ là v2 và không còn file đó → `ChunkLoadError`, ứng dụng vỡ ngay trước mắt người dùng dù rollout hoàn hảo về mặt K8s. Ba cách xử lý, có thể dùng cùng lúc:
+
+**1. Bắt lỗi ở tầng router và tự động reload.**
+
+```tsx
+// Ví dụ xử lý ChunkLoadError với React Router + lazy
+const LazyPage = React.lazy(() =>
+  import('./pages/Dashboard').catch((err) => {
+    if (
+      err?.name === 'ChunkLoadError' ||
+      /Failed to fetch dynamically imported module/.test(err?.message)
+    ) {
+      // Chỉ reload một lần để không rơi vào vòng lặp nếu lỗi do mạng
+      if (!sessionStorage.getItem('chunk-reloaded')) {
+        sessionStorage.setItem('chunk-reloaded', '1');
+        window.location.reload();
+      }
+    }
+    throw err;
+  })
+);
+```
+
+Vite ném lỗi với message `Failed to fetch dynamically imported module` thay vì tên `ChunkLoadError` của webpack, nên bắt cả hai. Cờ trong `sessionStorage` chặn vòng lặp reload vô tận khi lỗi thật sự do mạng; xoá cờ khi app khởi động thành công.
+
+**2. Đẩy asset lên CDN/S3 và giữ lại asset của vài version gần nhất.** Pipeline upload `dist/assets/` lên object storage với header `immutable` và **không bao giờ xoá** (hoặc lifecycle rule xoá sau 30 ngày); Pod chỉ phục vụ `index.html` và `config.js`. Chunk của v1 vẫn tồn tại sau khi deploy v2, người dùng tab cũ tiếp tục dùng bình thường tới khi họ tự F5. Nếu chưa có CDN, có mẹo tương đương ngay trong Dockerfile: copy thư mục asset của image trước vào image mới trước khi copy `dist/`:
+
+```dockerfile
+FROM nginx:1.27-alpine
+# Giữ chunk của bản trước để tab cũ không vỡ
+COPY --from=ghcr.io/my-org/frontend:v1.4.1 /usr/share/nginx/html/assets /usr/share/nginx/html/assets
+COPY --from=builder /app/dist /usr/share/nginx/html
+```
+
+Tag của bản trước có thể truyền bằng `ARG` từ CI. Image phình lên gấp đôi phần asset, thường là vài MB, đổi lấy việc không có `ChunkLoadError` nào.
+
+**3. Hiện thông báo "Đã có phiên bản mới, tải lại trang?" khi phát hiện version mismatch.** Ghi version (git SHA) vào bundle lúc build bằng `define` của Vite, đồng thời sinh `/version.json` với `no-store`; app poll file đó mỗi vài phút hoặc mỗi lần đổi route, khác version thì hiện banner. Người dùng đang điền form không bị reload bất ngờ, và bạn không phụ thuộc vào việc lỗi có xảy ra hay không.
+
+Cách 2 xử lý tận gốc, cách 1 là lưới an toàn rẻ nhất nên luôn có, cách 3 là trải nghiệm tốt nhất cho app dùng lâu trong ngày (dashboard, admin).
+
+---
+
+## Kiểm chứng: deploy không mất một request nào
+
+Mở một terminal chạy vòng lặp gọi liên tục qua Ingress, rồi deploy version mới ở terminal khác:
+
+```bash
+while true; do
+  curl -s -o /dev/null -w "%{http_code}\n" --max-time 3 -H "Host: app.local" http://localhost/
+  sleep 0.2
+done
+```
+
+```bash
+kubectl -n web set image deploy/frontend web=frontend:v1.4.3
+kubectl -n web rollout status deploy/frontend
+```
+
+Nếu không có mã nào khác `200` xuất hiện trong suốt rollout, bạn đã đạt. Mỗi mã lỗi chỉ về một điểm trong checklist: `000` (không nối được) hoặc `502` là Pod bị tắt khi còn nhận request (điểm 2, 3, 4); `503` là có lúc không còn endpoint nào (điểm 1, 5); `404` cho asset là `ChunkLoadError` (điểm 7). Đây cũng chính là bài kiểm tra cuối của đồ án ở Phần 19.
+
+### Thực hành 12
+
+1. Áp dụng `nginx.conf` ở trên vào app Phần 10, build và deploy. Kiểm tra header từng loại file: `curl -sI -H "Host: app.local" http://localhost/` (phải thấy `no-cache`), `.../assets/index-xxx.js` (phải thấy `immutable`), `.../config.js` (phải thấy `no-store`).
+2. So sánh dung lượng tải asset với và không có `Accept-Encoding` như mục nén; ghi lại tỉ lệ.
+3. Chạy vòng lặp `curl`, rollout sang tag mới, xác nhận toàn `200`.
+4. Cố tình sửa `maxUnavailable: 1`, xoá `readinessProbe` và `preStop`, rollout lại: đếm số dòng khác `200`. Khôi phục và rollout lần nữa để thấy khác biệt.
+5. Mở app trong trình duyệt ở route chính, deploy một bản có thêm route lazy-load mới (tên chunk đổi), rồi bấm sang route lazy: quan sát `ChunkLoadError` trong console. Thêm handler ở cách 1, lặp lại: trang tự reload và chạy tiếp.
+6. Chạy `kubectl -n web get pdb`: cột ALLOWED DISRUPTIONS phải là 1 với 3 replica và `minAvailable: 2`.
+
+> **Kết quả mong đợi:** Bước 1 đúng ba header; bước 3 toàn `200`; bước 4 có vài dòng `502`/`503` chứng minh checklist có tác dụng; bước 5 tái hiện và sửa được `ChunkLoadError`.
+
+---
+
+## Bảng tra cứu nhanh
+
+| Triệu chứng                                        | Nguyên nhân                                           | Sửa                                                     |
+| -------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------- |
+| Deploy xong trang trắng, F5 mạnh mới hết           | `index.html` bị cache ở trình duyệt hoặc CDN          | `no-cache` cho `index.html`, kiểm tra TTL CDN, purge    |
+| Tab đang mở báo `ChunkLoadError` sau deploy        | Chunk của bản cũ đã bị xoá                            | Bắt lỗi + reload, giữ asset cũ, banner version mới      |
+| Vài request 502 đúng lúc deploy                    | Pod tắt trước khi endpoints lan truyền                | `preStop` sleep, readiness, grace period                |
+| 503 ngắn lúc deploy                                | Có lúc không còn Pod ready                            | `maxUnavailable: 0`, `replicas` ≥ 2                     |
+| Rollout đứng im, Pod mới Pending                   | Không đủ chỗ cho `maxSurge`                           | Giảm `requests` hoặc thêm node                          |
+| DevOps báo không drain được node                   | PDB quá chặt so với số replica                        | `maxUnavailable: 1` hoặc tăng replica                   |
+| Đổi ConfigMap, `config.js` trên trình duyệt vẫn cũ | `config.js` bị cache (thiếu `no-store`) hoặc CDN giữ  | Header `no-store`, purge, `rollout restart`             |
+| Asset trong `/assets/` chỉ cache 30 ngày           | Block regex thắng block prefix                        | `location ^~ /assets/`                                  |
+| Security header biến mất ở một số URL              | `add_header` trong `location` xoá header cấp `server` | Đặt header ở Ingress hoặc lặp lại trong từng `location` |
+
+---
+
+## Tóm tắt
+
+- Cache hai tầng: `index.html` `no-cache, must-revalidate`; asset có hash `public, max-age=31536000, immutable`; `config.js` `no-store`; ảnh/font 30 ngày. `no-cache` vẫn lưu nhưng revalidate bằng ETag → 304 rẻ.
+- Cache `index.html` là nguyên nhân số 1 của "trang trắng sau deploy"; F5 mạnh hết là dấu hiệu chắc chắn.
+- nginx: `^~ /assets/` để prefix thắng regex; `add_header` trong `location` xoá header cấp trên; exact-match `= /index.html` để fallback SPA vẫn `no-cache`.
+- Nén text bằng gzip (`gzip_vary on`), tốt hơn là nén sẵn lúc build với `gzip_static` / `brotli_static`; brotli cần module không có trong image chính thức.
+- CDN trước Ingress: chỉ 5–10% request chạm cluster; để ý TTL mặc định của CDN, IP client qua `X-Forwarded-For`, WebSocket/SSE. SPA thuần tĩnh có thể không cần K8s.
+- Zero-downtime 7 điểm: `maxUnavailable: 0`, readiness (+ `minReadySeconds`), `preStop` sleep, grace period ≥ 30, `replicas` ≥ 2, PDB, giữ asset cũ. `progressDeadlineSeconds` để CI phát hiện rollout hỏng.
+- `ChunkLoadError`: bắt lỗi rồi reload một lần, giữ chunk bản trước (CDN/S3 hoặc `COPY --from` image cũ), banner "phiên bản mới". Kiểm chứng bằng vòng lặp `curl` trong lúc deploy.
+
+## Đọc thêm
+
+- [Cache-Control](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control) trên MDN: từng directive và cách trình duyệt diễn giải
+- [nginx documentation](https://nginx.org/en/docs/): `ngx_http_gzip_module`, `ngx_http_gzip_static_module`, `ngx_http_headers_module`
+- [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/): `strategy`, `minReadySeconds`, `progressDeadlineSeconds`
+- [Disruptions](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/): PodDisruptionBudget và voluntary disruption
+- Bài [Frontend caching](/blog/frontend-caching-deep-dive/) trong blog này về cache ở tầng trình duyệt
+
+[Phần 13](/blog/k8s-fe-13-debug-handbook-12-errors/) khép lại chặng deploy thực tế bằng sổ tay debug: quy trình chẩn đoán 7 bước và 12 lỗi bạn sẽ gặp nhiều nhất, mỗi lỗi có triệu chứng, lệnh chẩn đoán, nguyên nhân và cách sửa.

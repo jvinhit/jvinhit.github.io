@@ -1,0 +1,359 @@
+---
+title: 'Cloudflare cho Frontend Developer · Phần 3 — Thiết lập Hostinger + Cloudflare từ A đến Z'
+description: 'Mười bước đưa tên miền và hosting Hostinger qua Cloudflare không gián đoạn: sao lưu DNS, cài SSL ở origin trước, thêm zone, đổi nameserver, dựng bảng DNS, chọn Full (strict), sáu lệnh kiểm tra, khôi phục IP thật, khoá cửa sau.'
+pubDate: 2026-10-04
+lang: vi
+tags: [cloudflare, devops, dns, hosting, ssl]
+series: cloudflare-fe
+seriesOrder: 3
+draft: false
+---
+
+import HostingDiagram from '~/components/blog/HostingDiagram.astro';
+
+Bạn có một tên miền `example.com` mua ở Hostinger và một gói hosting Hostinger đang chạy website. Bạn muốn đưa tất cả qua Cloudflare — nhưng đây là site thật, có email thật, và bạn không muốn nó sập trong lúc chuyển, không muốn sáng mai khách hàng báo "gửi mail cho anh bị trả về".
+
+Bài này là hướng dẫn thực hành chi tiết nhất series. Làm theo đúng thứ tự, khoảng 30 phút là xong, cộng thêm thời gian chờ nameserver có hiệu lực. Thứ tự quan trọng hơn từng bước: **cài SSL ở origin trước, dựng bảng DNS trong Cloudflare xong rồi mới đổi nameserver** — làm ngược lại là gặp đúng hai lỗi kinh điển của [phần 1](/blog/cloudflare-fe-01-what-cloudflare-really-is/). Nếu tên miền của bạn mua ở nơi khác (Namecheap, GoDaddy, PA Việt Nam) mà hosting ở Hostinger, mọi bước vẫn đúng, chỉ khác bước 4 làm ở nhà đăng ký đó.
+
+> Thuật ngữ giữ tiếng Anh: nameserver, zone, record, proxied, DNS only, origin, Full (strict) — đúng chữ bạn sẽ thấy trong hPanel và dashboard Cloudflare. Nếu bạn chưa đọc [phần 2](/blog/cloudflare-fe-02-nameserver-zone-dns-records-orange-grey-cloud/), đọc trước, vì bài này dùng cả sáu khái niệm ở đó mà không giải thích lại.
+
+## Bức tranh tổng thể trước khi bắt đầu
+
+```text
+TRẠNG THÁI HIỆN TẠI
+────────────────────────────────────────────────────────
+Tên miền example.com (mua ở Hostinger)
+└─ nameserver: ns1.dns-parking.com, ns2.dns-parking.com
+   └─ bản ghi A:  @ → 203.0.113.45   (IP hosting Hostinger)
+      bản ghi MX: @ → mx1.hostinger.com (email)
+
+TRẠNG THÁI SAU KHI XONG
+────────────────────────────────────────────────────────
+Tên miền example.com
+└─ nameserver: xxx.ns.cloudflare.com, yyy.ns.cloudflare.com
+   └─ bản ghi A:     @   → 203.0.113.45       ● proxied
+      bản ghi CNAME: www → @                  ● proxied
+      bản ghi MX:    @   → mx1.hostinger.com  ○ DNS only
+   SSL/TLS: Full (strict)
+```
+
+<HostingDiagram
+  kind="migration-flow"
+  caption="Thứ tự an toàn: sao lưu DNS → dựng bảng DNS ở nơi mới → đổi nameserver → chờ → kiểm tra. Bảng DNS mới phải đúng TRƯỚC khi nameserver đổi"
+/>
+
+Website không bị gián đoạn trong quá trình này, vì cả nameserver cũ lẫn nameserver mới đều trỏ về cùng một máy chủ Hostinger. Resolver nào đã cập nhật thì hỏi Cloudflare, chưa cập nhật thì hỏi Hostinger — cả hai trả lời đúng. Rủi ro duy nhất là **quên một bản ghi**, nên bước 0 dưới đây không được bỏ.
+
+> **Trước khi bắt đầu — chụp lại bảng DNS hiện tại.** Vào hPanel Hostinger, mở bảng DNS của tên miền, chụp màn hình hoặc chép ra file toàn bộ bản ghi đang có. Đặc biệt là MX, TXT (SPF/DKIM), và bất kỳ bản ghi lạ nào bạn không nhớ đã thêm. Đây là bản sao lưu duy nhất của bạn. Nếu Cloudflare quét thiếu, bạn còn cái để đối chiếu.
+
+Một cách sao lưu chắc hơn ảnh chụp, làm được ngay từ terminal khi nameserver vẫn còn là Hostinger:
+
+```bash
+for t in A AAAA CNAME MX TXT NS; do
+  echo "== $t"; dig example.com $t +short
+done
+dig www.example.com +short
+dig mail.example.com +short
+dig _dmarc.example.com TXT +short
+```
+
+Lưu output vào một file. Lưu ý `dig` chỉ hỏi được tên bạn biết — nó không liệt kê được bản ghi cho subdomain bạn không nhớ, nên ảnh chụp hPanel vẫn cần.
+
+---
+
+## Bước 1 — Lấy IP máy chủ Hostinger
+
+1. Đăng nhập hPanel của Hostinger.
+2. Vào **Hosting** → chọn gói của bạn → **Dashboard**.
+3. Tìm mục thông tin gói (thường ở trang tổng quan hoặc phần "Details"). Ghi lại **IP address** — dạng `203.0.113.45`.
+
+Nếu không tìm thấy, lấy bằng dòng lệnh khi tên miền vẫn đang trỏ về Hostinger:
+
+```bash
+dig example.com +short
+# hoặc
+nslookup example.com
+```
+
+> **Lưu ý về hosting dùng chung:** trên gói shared hosting, IP này được nhiều website dùng chung. Máy chủ phân biệt các site bằng tên miền trong header `Host` của request. Điều này bình thường và không ảnh hưởng gì tới việc dùng Cloudflare — Cloudflare luôn gửi đúng `Host: example.com` xuống origin. Hệ quả duy nhất: gõ thẳng `http://203.0.113.45` vào trình duyệt sẽ không ra website của bạn (ra trang mặc định của máy chủ), và đó là chuyện bình thường.
+
+---
+
+## Bước 2 — Cài SSL trên Hostinger TRƯỚC khi qua Cloudflare
+
+Đây là bước rất hay bị bỏ qua, và bỏ qua nó sẽ dẫn thẳng tới lỗi ở [phần 5](/blog/cloudflare-fe-05-ssl-tls-modes-and-redirect-loop/).
+
+1. Trong hPanel, vào **Websites** → chọn site → **Security** → **SSL**.
+2. Cài chứng chỉ SSL miễn phí (Let's Encrypt) nếu chưa có. Hostinger thường cài tự động, nhưng hãy xác nhận trạng thái là **Active**.
+3. Kiểm tra bằng cách mở `https://example.com` — trình duyệt phải hiện ổ khoá, không cảnh báo.
+
+Kiểm tra kỹ hơn bằng `openssl`, để chắc chứng chỉ đúng tên miền và còn hạn:
+
+```bash
+echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+# subject=CN = example.com
+# issuer=C = US, O = Let's Encrypt, CN = R11
+# notBefore=... notAfter=...   ← phải còn hạn
+```
+
+> **Vì sao phải làm bước này trước:** Cloudflare sẽ mã hoá chặng từ nó xuống Hostinger. Muốn dùng chế độ an toàn **Full (strict)**, máy chủ Hostinger bắt buộc phải có chứng chỉ hợp lệ. Nếu chưa có, bạn sẽ bị đẩy vào dùng chế độ **Flexible** — chế độ gây lỗi lặp chuyển hướng và không thực sự an toàn. Làm đúng ngay từ đầu tiết kiệm rất nhiều thời gian. Và sau khi đã qua Cloudflare, Let's Encrypt của Hostinger vẫn tự gia hạn bình thường, vì Cloudflare cho request xác thực `/.well-known/acme-challenge/` đi qua.
+
+---
+
+## Bước 3 — Thêm tên miền vào Cloudflare
+
+1. Đăng ký tài khoản miễn phí tại `dash.cloudflare.com`. **Bật xác thực hai lớp ngay** — tài khoản này sắp nắm quyền điều khiển DNS của tên miền bạn.
+2. Bấm **Add a site**, nhập `example.com` (không có `www`, không có `https://`).
+3. Chọn gói **Free**. Gói này đủ cho gần như mọi dự án cá nhân và nhiều dự án thương mại.
+4. Cloudflare tự quét bảng DNS hiện tại và hiển thị danh sách bản ghi tìm được.
+5. **Đối chiếu danh sách này với ảnh chụp ở bước 0.** Thiếu bản ghi nào thì thêm tay ngay tại đây. Nhìn kỹ cột đám mây: Cloudflare thường tự đặt cam cho A và CNAME, xám cho MX — nhưng đừng tin, kiểm tra từng dòng.
+6. Bấm **Continue**. Cloudflare hiển thị hai nameserver dành riêng cho tài khoản bạn, dạng:
+
+```text
+gina.ns.cloudflare.com
+rick.ns.cloudflare.com
+```
+
+Tên cụ thể là ngẫu nhiên và khác nhau ở mỗi tài khoản — hãy chép đúng cặp Cloudflare đưa cho bạn, đừng chép từ bài này hay từ tài khoản của người khác.
+
+Sau bước này zone ở trạng thái **Pending Nameserver Update**. Chưa có gì thay đổi với người dùng: Cloudflare chỉ đang giữ một bản sao bảng DNS và chờ bạn "bàn giao" tên miền cho nó ở bước 4. Đây là lúc tốt nhất để sửa bảng DNS cho thật đúng — sửa bao nhiêu cũng không ảnh hưởng ai.
+
+---
+
+## Bước 4 — Đổi nameserver trong Hostinger
+
+1. Trong hPanel, vào **Domains** → chọn `example.com` → **DNS / Nameservers**.
+2. Tìm mục nameserver, chuyển từ tuỳ chọn mặc định của Hostinger sang **Change nameservers** / **Use custom nameservers**.
+3. Xoá nameserver cũ, nhập hai nameserver Cloudflare vừa cho.
+4. Lưu lại.
+
+> **Ba điều cần biết về bước này:**
+>
+> 1. Chỉ có tác dụng nếu tên miền **đăng ký ở Hostinger**. Nếu bạn mua tên miền ở nơi khác (Namecheap, GoDaddy, PA Việt Nam…), phải đổi nameserver ở nhà đăng ký đó, không phải ở Hostinger. Hosting và tên miền là hai hợp đồng khác nhau; nameserver thuộc về hợp đồng tên miền.
+> 2. Phải nhập **đủ cả hai** nameserver. Chỉ nhập một sẽ gây lỗi phân giải không ổn định — lúc được lúc không, rất khó debug.
+> 3. Website **không bị gián đoạn** trong lúc chuyển, miễn là bảng DNS trong Cloudflare đã đúng trước khi đổi. Vì vậy hãy kiểm tra kỹ bản ghi ở bước 3 trước khi làm bước 4.
+
+---
+
+## Bước 5 — Chờ kích hoạt
+
+Cloudflare sẽ tự kiểm tra định kỳ. Trạng thái zone chuyển từ **Pending Nameserver Update** sang **Active**, thường trong vòng vài phút đến vài giờ (giới hạn chính thức là tối đa 24 giờ). Trong dashboard có nút "Check nameservers" để giục nó kiểm tra ngay.
+
+Kiểm tra tiến độ bằng lệnh:
+
+```bash
+# Nameserver đã đổi chưa
+dig example.com NS +short
+# Kết quả mong đợi:
+# gina.ns.cloudflare.com.
+# rick.ns.cloudflare.com.
+
+# Hỏi thẳng một DNS công cộng, bỏ qua cache của máy mình
+dig @1.1.1.1 example.com NS +short
+dig @8.8.8.8 example.com NS +short
+```
+
+Nếu `1.1.1.1` đã trả Cloudflare mà máy bạn vẫn trả `dns-parking.com`, đó là cache của resolver nội bộ — không phải bạn làm sai. Chờ, hoặc đổi DNS máy bạn sang `1.1.1.1` để nhìn thấy sớm hơn.
+
+> **Trong lúc chờ:** đừng sốt ruột đổi đi đổi lại. Mỗi lần thay đổi lại khởi động lại đồng hồ lan truyền. Cứ để yên và kiểm tra lại sau 30 phút. Bạn có thể làm tiếp bước 6 và 7 ngay trong lúc chờ — chúng cấu hình trong Cloudflare và sẽ có hiệu lực khi zone Active.
+
+---
+
+## Bước 6 — Cấu hình bảng DNS trong Cloudflare
+
+Vào zone → tab **DNS** → **Records**. Bảng cấu hình chuẩn cho website trên Hostinger:
+
+| Type  | Name     | Content                                       | Proxy      | Ghi chú                        |
+| ----- | -------- | --------------------------------------------- | ---------- | ------------------------------ |
+| A     | `@`      | `203.0.113.45`                                | ● Proxied  | IP hosting Hostinger           |
+| CNAME | `www`    | `example.com`                                 | ● Proxied  | www trỏ về tên miền gốc        |
+| MX    | `@`      | `mx1.hostinger.com` (ưu tiên 5)               | ○ DNS only | Bắt buộc xám                   |
+| MX    | `@`      | `mx2.hostinger.com` (ưu tiên 10)              | ○ DNS only | Bắt buộc xám                   |
+| TXT   | `@`      | `v=spf1 include:_spf.mail.hostinger.com ~all` | —          | SPF chống giả mạo email        |
+| TXT   | `_dmarc` | `v=DMARC1; p=none;`                           | —          | Nếu nhà cung cấp email yêu cầu |
+| CNAME | `ftp`    | `example.com`                                 | ○ DNS only | FTP không đi qua proxy được    |
+
+Tên mail server và chuỗi SPF ở trên là ví dụ theo mẫu Hostinger; hãy dùng đúng giá trị trong ảnh chụp của bạn hoặc trong hướng dẫn email của nhà cung cấp, vì chúng có thể khác theo gói và theo thời điểm. Nếu bạn dùng Google Workspace hay Zoho cho email, MX và SPF là của họ, không phải của Hostinger.
+
+> **Kiểm tra lại bản ghi email trước khi đi tiếp.** Đây là lỗi gây thiệt hại thật sự: bản ghi MX bị để đám mây cam, hoặc bị quên không nhập lại sau khi chuyển nameserver. Hậu quả là toàn bộ email gửi tới tên miền của bạn bị trả về hoặc mất, và bạn thường chỉ phát hiện sau vài ngày khi có người phàn nàn. Sau khi cấu hình xong, hãy **gửi thử một email từ Gmail tới `bạn@example.com` và xác nhận nhận được.**
+
+Hai lý do bản ghi `www` là CNAME trỏ về `@` chứ không phải bản ghi A thứ hai: đổi IP hosting sau này chỉ sửa một chỗ, và nó đọc đúng ý nghĩa "www là bí danh của tên miền gốc". Cả hai phải cùng màu cam — [phần 7](/blog/cloudflare-fe-07-rules-redirect-and-transform/) sẽ dùng Redirect Rule gom `www` về tên miền gốc, và rule chỉ chạy được khi request tới `www` đi qua Cloudflare.
+
+---
+
+## Bước 7 — Cấu hình SSL/TLS
+
+1. Vào tab **SSL/TLS** → **Overview**.
+2. Chọn chế độ **Full (strict)**. (Nếu bạn đã làm đúng bước 2 thì chế độ này chạy được ngay.)
+3. Vào **SSL/TLS** → **Edge Certificates**, bật:
+   - **Always Use HTTPS** — tự chuyển mọi truy cập HTTP sang HTTPS ngay tại edge.
+   - **Automatic HTTPS Rewrites** — tự sửa link `http://` trong HTML, tránh lỗi mixed content.
+   - **Minimum TLS Version**: đặt **TLS 1.2**.
+4. Chờ **Universal SSL** chuyển sang trạng thái **Active** (thường vài phút, có thể tới 24 giờ với zone mới).
+
+> **Nếu chọn Full (strict) mà web báo lỗi 526:** nghĩa là chứng chỉ trên Hostinger chưa hợp lệ hoặc chưa được cài. Quay lại bước 2. **Đừng "sửa" bằng cách chuyển sang Flexible** — đó là che giấu vấn đề chứ không giải quyết, và sẽ sinh ra lỗi khác. [Phần 5](/blog/cloudflare-fe-05-ssl-tls-modes-and-redirect-loop/) giải thích kỹ vì sao.
+
+Nếu Hostinger của bạn có tuỳ chọn "Force HTTPS" trong hPanel, cứ để bật. Với Full (strict), Cloudflare gọi xuống origin bằng HTTPS nên quy tắc ép HTTPS ở origin không bao giờ kích hoạt — không có vòng lặp. Nó chỉ gây vòng lặp khi kết hợp với Flexible.
+
+---
+
+## Bước 8 — Kiểm tra toàn bộ
+
+Sáu lệnh, chạy sau khi zone Active và Universal SSL Active:
+
+```bash
+# 1. Nameserver đã là Cloudflare
+dig example.com NS +short
+
+# 2. Tên miền trả về IP của Cloudflare (104.x hoặc 172.67.x), KHÔNG phải IP Hostinger
+dig example.com +short
+
+# 3. HTTPS hoạt động, có header của Cloudflare
+curl -sI https://example.com | grep -iE "^(HTTP|server|cf-ray|cf-cache-status)"
+# Mong đợi:
+# HTTP/2 200
+# server: cloudflare
+# cf-ray: 8a1b2c3d4e5f6789-HAN
+
+# 4. HTTP tự chuyển sang HTTPS
+curl -sI http://example.com | grep -iE "^(HTTP|location)"
+# Mong đợi: HTTP/1.1 301 ... location: https://example.com/
+
+# 5. www cũng chạy
+curl -sI https://www.example.com | head -1
+
+# 6. Email vẫn được (bản ghi MX vẫn trỏ đúng, không bị proxy)
+dig example.com MX +short
+```
+
+> **Kết quả mong đợi:** lệnh 1 ra hai tên `ns.cloudflare.com`; lệnh 2 ra IP `104.x` hoặc `172.67.x` (nếu vẫn ra `203.0.113.45` thì bản ghi A đang xám hoặc resolver còn cache); lệnh 3 có `server: cloudflare` và `cf-ray`; lệnh 4 là `301` với `location: https://`; lệnh 5 là `HTTP/2 200`; lệnh 6 ra `5 mx1.hostinger.com.` và `10 mx2.hostinger.com.` — tên máy chủ mail, không phải IP Cloudflare.
+
+Nếu lệnh 3 trả `HTTP/2 526` hoặc `525`, quay lại bước 2 và bước 7. Nếu trả `521` hoặc `522`, Cloudflare không gõ cửa được origin — kiểm tra lại IP ở bản ghi A. [Phần 11](/blog/cloudflare-fe-11-debug-and-error-handbook/) có bảng đầy đủ các mã này.
+
+---
+
+## Bước 9 — Khôi phục IP thật của người truy cập
+
+Sau khi bật proxy, máy chủ Hostinger sẽ thấy mọi request đến từ IP của Cloudflare. Nếu website của bạn có chức năng ghi log IP, chống spam theo IP, giới hạn đăng nhập theo IP, hay thống kê người dùng, chúng sẽ sai hết — mọi người dùng trông như cùng một vài IP.
+
+IP thật nằm trong header `CF-Connecting-IP`. Cách xử lý tuỳ nền tảng:
+
+| Nền tảng          | Cách lấy IP thật                                                                                |
+| ----------------- | ----------------------------------------------------------------------------------------------- |
+| PHP / WordPress   | Đọc `$_SERVER['HTTP_CF_CONNECTING_IP']`. WordPress có sẵn plugin Cloudflare làm việc này.       |
+| Node.js / Express | `app.set('trust proxy', true)` rồi đọc `req.headers['cf-connecting-ip']`                        |
+| Nginx             | Dùng module `real_ip` với danh sách dải IP của Cloudflare và `real_ip_header CF-Connecting-IP;` |
+| Apache            | Module `mod_remoteip` với `RemoteIPHeader CF-Connecting-IP`                                     |
+
+Express đầy đủ hơn một chút — `trust proxy` còn làm `req.protocol` đọc `X-Forwarded-Proto`, để app biết người dùng đang vào bằng HTTPS (nếu không, mọi logic kiểu "chưa HTTPS thì redirect" trong app sẽ tự tạo vòng lặp):
+
+```js
+// server.js
+app.set('trust proxy', true);
+
+app.use((req, _res, next) => {
+  // Ưu tiên CF-Connecting-IP: Cloudflare ghi đè header này bằng IP thật,
+  // còn X-Forwarded-For có thể bị client tự chèn giá trị giả ở đầu chuỗi.
+  req.clientIp = req.headers['cf-connecting-ip'] ?? req.ip;
+  next();
+});
+
+app.get('/whoami', (req, res) => {
+  res.json({ ip: req.clientIp, https: req.secure });
+});
+```
+
+Nginx trên VPS — sinh file cấu hình từ danh sách dải IP chính thức, rồi include vào khối `http`:
+
+```bash
+curl -s https://www.cloudflare.com/ips-v4 | sed 's/^/set_real_ip_from /; s/$/;/' \
+  > /etc/nginx/conf.d/cloudflare-real-ip.conf
+echo 'real_ip_header CF-Connecting-IP;' >> /etc/nginx/conf.d/cloudflare-real-ip.conf
+nginx -t && systemctl reload nginx
+```
+
+```nginx
+# /etc/nginx/conf.d/cloudflare-real-ip.conf (kết quả)
+set_real_ip_from 173.245.48.0/20;
+set_real_ip_from 103.21.244.0/22;
+# ... các dải còn lại
+real_ip_header CF-Connecting-IP;
+```
+
+`set_real_ip_from` là danh sách proxy được tin; nginx chỉ thay `$remote_addr` bằng giá trị trong header khi kết nối thật sự đến từ một trong các dải đó. Không có danh sách này thì ai cũng giả được IP bằng cách tự gửi header. Dải IP Cloudflare thỉnh thoảng đổi — đặt lệnh trên vào cron chạy hằng tuần.
+
+---
+
+## Bước 10 — Khoá cửa sau (khuyến nghị nâng cao)
+
+Sau khi mọi thứ chạy qua Cloudflare, IP thật của bạn vẫn có thể bị tìm ra: qua lịch sử DNS (nhiều dịch vụ lưu lại bản ghi A cũ), qua header của email gửi đi từ máy chủ, qua một subdomain bạn để xám. Kẻ tấn công biết IP thật sẽ bỏ qua Cloudflare và đánh thẳng vào máy chủ — mọi lớp WAF, rate limit, chống DDoS đều vô nghĩa.
+
+Cách phòng: cấu hình tường lửa máy chủ **chỉ chấp nhận kết nối HTTP/HTTPS từ dải IP của Cloudflare.** Danh sách dải IP chính thức công bố tại `cloudflare.com/ips`.
+
+Trên **shared hosting như Hostinger**, bạn thường không có quyền cấu hình tường lửa ở mức này — chấp nhận, vì máy chủ dùng chung phân biệt theo tên miền nên gõ thẳng IP cũng không ra site của bạn. Với **VPS** thì hoàn toàn làm được bằng `ufw` hoặc `iptables`:
+
+```bash
+# Giữ SSH trước khi động vào bất cứ thứ gì
+sudo ufw allow OpenSSH
+
+# Cho phép 80/443 chỉ từ dải IP Cloudflare
+for ip in $(curl -s https://www.cloudflare.com/ips-v4); do
+  sudo ufw allow proto tcp from "$ip" to any port 80,443 comment 'Cloudflare'
+done
+for ip in $(curl -s https://www.cloudflare.com/ips-v6); do
+  sudo ufw allow proto tcp from "$ip" to any port 80,443 comment 'Cloudflare'
+done
+
+# Mọi nguồn khác vào 80/443 bị từ chối
+sudo ufw deny 80/tcp
+sudo ufw deny 443/tcp
+sudo ufw enable
+sudo ufw status numbered
+```
+
+Kiểm tra: `curl -sI https://example.com --resolve example.com:443:203.0.113.45` (gọi thẳng origin, bỏ qua Cloudflare) phải **timeout**, trong khi `curl -sI https://example.com` vẫn `200`. Nếu sau này bạn tắt đám mây cam để debug, nhớ rằng tường lửa này sẽ chặn luôn người dùng thật — tạm `ufw allow 443/tcp` trong lúc debug rồi bỏ đi.
+
+---
+
+## Lab 3.1 — Đưa tên miền của bạn qua Cloudflare (60 phút + thời gian chờ)
+
+1. Làm lần lượt từ bước 1 đến bước 8 ở trên với tên miền thật của bạn.
+2. Chạy đủ 6 lệnh kiểm tra ở bước 8, ghi lại kết quả.
+3. Mở DevTools, xác nhận thấy `cf-ray` trong response header.
+4. Thử truy cập trực tiếp IP Hostinger (`http://203.0.113.45`) — quan sát nó **không** ra website của bạn, vì máy chủ dùng chung phân biệt theo tên miền.
+5. Gửi email thử tới địa chỉ thuộc tên miền và xác nhận nhận được.
+
+> **Tiêu chí hoàn thành:** zone hiển thị **Active**, `https://example.com` và `https://www.example.com` đều chạy có ổ khoá, `http://` tự chuyển sang `https://`, và email vẫn nhận được bình thường.
+
+---
+
+## Nếu có gì sai: cách quay lui
+
+Bạn luôn có đường lùi, và nó nhanh hơn bạn nghĩ:
+
+- **Quay lại nameserver cũ.** Vào hPanel → Domains → Nameservers, chọn lại nameserver mặc định của Hostinger (`ns1.dns-parking.com`, `ns2.dns-parking.com`). Bảng DNS cũ trong hPanel thường vẫn còn nguyên, nhưng hãy đối chiếu với ảnh chụp bước 0 cho chắc. Sau vài phút đến vài giờ, mọi thứ như trước khi bắt đầu.
+- **Chỉ tắt proxy, giữ Cloudflare làm DNS.** Chuyển bản ghi A và CNAME sang đám mây xám: người dùng nối thẳng Hostinger, không SSL của Cloudflare, không cache, không rules — nhưng DNS vẫn ở Cloudflare và bạn không mất công đổi nameserver lần nữa. Đây là bước debug chuẩn: vẫn lỗi khi xám nghĩa là lỗi ở origin, không phải ở Cloudflare.
+- **Đừng chuyển SSL sang Flexible để cứu vãn.** Nó "hết lỗi" trong vài trường hợp và sinh lỗi mới trong nhiều trường hợp khác. Sửa tận gốc ở bước 2.
+
+Bài [Hostinger → Cloudflare nameservers](/blog/hosting-03-hostinger-to-cloudflare-nameservers/) và [Hostinger hosting với Cloudflare DNS](/blog/hosting-04-hostinger-hosting-with-cloudflare-dns/) trong series Hosting đi qua cùng kịch bản với nhiều ảnh màn hình hPanel hơn, nếu bạn muốn đối chiếu giao diện.
+
+---
+
+## Tóm tắt
+
+- Thứ tự an toàn: **sao lưu DNS → cài SSL ở origin → thêm zone, đối chiếu bản ghi → đổi nameserver → chờ Active → dựng bảng DNS → Full (strict) → kiểm tra.** Bảng DNS trong Cloudflare phải đúng trước khi nameserver đổi.
+- Chụp lại bảng DNS ở hPanel trước khi làm bất cứ gì; bước quét tự động của Cloudflare không đủ 100%.
+- Cài Let's Encrypt trên Hostinger **trước** để dùng được Full (strict) ngay, không phải đi qua Flexible.
+- Nameserver đổi ở **nhà đăng ký tên miền**, nhập đủ cả hai, rồi để yên chờ — đừng đổi đi đổi lại.
+- Bảng DNS chuẩn: A `@` cam, CNAME `www` cam, MX xám, TXT SPF/DMARC, CNAME `ftp` xám. Gửi email thử sau khi cấu hình.
+- Bật Always Use HTTPS, Automatic HTTPS Rewrites, Minimum TLS 1.2. Lỗi 526 nghĩa là chứng chỉ origin chưa ổn — sửa origin, đừng đổi sang Flexible.
+- Sau proxy, origin thấy IP Cloudflare: đọc `CF-Connecting-IP` (PHP, Express, nginx `real_ip`, Apache `mod_remoteip`). Trên VPS, khoá 80/443 chỉ cho dải IP Cloudflare.
+
+Phần tiếp theo: [Phần 4 — DNS chi tiết và các kịch bản trỏ tên miền](/blog/cloudflare-fe-04-dns-scenarios-pages-vercel-cloudfront/) — khi frontend không ở Hostinger mà ở Pages, Vercel, Netlify, GitHub Pages hay sau CloudFront, trỏ thế nào và cam hay xám.
+
+## Đọc thêm
+
+- [Cloudflare DNS docs](https://developers.cloudflare.com/dns/) — thêm zone, đổi nameserver, quản lý bản ghi.
+- [Cloudflare SSL/TLS docs](https://developers.cloudflare.com/ssl/) — các chế độ mã hoá, Edge Certificates, Universal SSL.
+- [Cloudflare IP ranges](https://www.cloudflare.com/ips/) — dải IP để cấu hình `real_ip` và tường lửa origin.

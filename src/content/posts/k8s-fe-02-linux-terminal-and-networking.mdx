@@ -1,0 +1,307 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 2 — Linux, terminal và mạng máy tính cho FE'
+description: 'Hơn 20 lệnh Linux đủ dùng khi kubectl exec vào Pod, IP và port, DNS nội bộ của Kubernetes, reverse proxy giải quyết CORS, 404 khi F5 và HTTPS, ba loại lỗi kết nối và bảng HTTP status code để debug hạ tầng.'
+pubDate: 2026-10-03
+lang: vi
+tags: [kubernetes, devops, linux, networking, frontend]
+series: k8s-fe
+seriesOrder: 2
+draft: false
+---
+
+import DockerDiagram from '~/components/blog/DockerDiagram.astro';
+
+Container gần như luôn chạy Linux. Khi bạn `kubectl exec` vào một Pod để debug, bạn đang đứng trong một shell Linux tối giản: không có editor quen thuộc, không có autocomplete, đôi khi không có cả `bash`. Và gần như mọi lỗi K8s mà FE dev gặp (502, 503, connection refused, app gọi sai API) thực chất là lỗi mạng hoặc lỗi biến môi trường, chẩn đoán bằng vài lệnh Linux rất cơ bản.
+
+Bài này cho bạn đúng lượng Linux và mạng cần thiết, không hơn: hơn 20 lệnh gom thành ba nhóm, cách đọc quyền file và tín hiệu tiến trình (vì K8s tắt Pod bằng tín hiệu), rồi IP, port, DNS, reverse proxy và bảng HTTP status code. Đọc xong bạn phân biệt được ba loại lỗi kết nối khác nhau, và biết vì sao reverse proxy là lời giải cho ba vấn đề kinh điển của SPA: CORS, 404 khi F5 và HTTPS.
+
+Đây là phần đầu của chặng nền tảng (phần 2–4). Nếu bạn chưa đọc [Phần 1](/blog/k8s-fe-01-why-and-big-picture/), hãy xem bức tranh chín chặng ở đó trước để biết Linux và mạng nằm ở đâu trong hành trình.
+
+> **Cạm bẫy:** đây là phần mọi người muốn bỏ qua nhất và cũng là phần khiến họ mắc kẹt nhất về sau. Nếu bạn chưa từng viết Dockerfile, tuyệt đối đừng nhảy sang phần 5. Kubernetes chỉ là công cụ điều phối container; không hiểu container, port và DNS thì không hiểu K8s.
+
+## Linux và terminal: hơn 20 lệnh đủ dùng
+
+Bạn không cần thành chuyên gia Linux. Bạn cần đúng bộ lệnh dưới đây, gõ được không cần nghĩ, trong bối cảnh cụ thể: đang đứng trong container nginx hoặc Node.js, muốn biết file build có ở đúng chỗ không, biến môi trường có đúng không, tiến trình có đang listen đúng port không.
+
+Bối cảnh bạn sẽ dùng chúng nhiều nhất là sau lệnh này (phần 5 nói kỹ):
+
+```bash
+kubectl exec -it my-frontend-abc12 -- sh
+```
+
+Để ý `sh` chứ không phải `bash`: các image `alpine` (nhẹ, dùng nhiều nhất cho frontend) không cài `bash` mặc định. Gõ `bash` sẽ nhận `executable file not found`. Mọi lệnh dưới đây chạy được trong `sh`.
+
+### Di chuyển và xem file
+
+```bash
+pwd                          # đang ở thư mục nào
+ls -la                       # liệt kê file, kể cả file ẩn, kèm quyền
+cd /usr/share/nginx/html     # chuyển thư mục
+cat index.html               # in toàn bộ nội dung file
+less app.log                 # xem file dài (q để thoát, / để tìm)
+tail -f app.log              # theo dõi file log theo thời gian thực
+head -n 50 file.txt          # xem 50 dòng đầu
+find / -name "*.js"          # tìm file theo tên
+```
+
+Vài điểm nhỏ giúp bạn không bị kẹt:
+
+- `ls -la` in cả file bắt đầu bằng dấu chấm (`.env`, `.dockerignore`) và cột quyền ở đầu dòng. Đây là lệnh đầu tiên bạn gõ sau khi `cd` vào `/usr/share/nginx/html` để trả lời câu hỏi "file build có thật sự nằm ở đây không".
+- `less` là trình xem có phân trang: phím cách để xuống trang, `G` xuống cuối, `/từ-khoá` để tìm, `q` để thoát. Nếu image không có `less` (nhiều image tối giản không có), dùng `cat file | more` hoặc `head`/`tail`.
+- `tail -f` giữ terminal mở và in thêm dòng mới khi file dài ra. Bấm `Ctrl+C` để thoát. Trong K8s bạn ít dùng nó vì log đã ra `stdout` và đọc bằng `kubectl logs -f`, nhưng khi debug một app ghi log ra file, đây là cách duy nhất.
+- `find / -name "*.js"` quét toàn bộ filesystem, có thể mất vài giây và in nhiều dòng "Permission denied". Thu hẹp bằng thư mục cụ thể: `find /usr/share/nginx/html -name "*.js"`.
+
+### Tiến trình và mạng
+
+```bash
+ps aux                              # liệt kê tiến trình đang chạy
+kill -9 1234                        # giết tiến trình PID 1234
+env                                 # in toàn bộ biến môi trường <- CỰC KỲ HAY DÙNG
+echo $API_URL                       # in một biến cụ thể
+curl -I http://localhost:80         # gửi HTTP request, xem header
+curl http://api-svc:3000/health     # gọi service nội bộ để test
+wget -O- http://localhost           # thay thế curl nếu không có curl
+nslookup my-service                 # kiểm tra DNS nội bộ có phân giải được không
+```
+
+> **Ghi chú:** lệnh quan trọng nhất trong cả danh sách với FE dev là `env`. 90% lỗi "app production gọi sai API" được chẩn đoán bằng cách `kubectl exec` vào Pod rồi gõ `env | grep API`. Nếu biến không có ở đó, ConfigMap chưa được nạp. Nếu biến có nhưng app vẫn gọi sai, bạn đang gặp bài toán build-time vs runtime của [Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/).
+
+`ps aux` in mỗi tiến trình một dòng, cột đáng đọc là `PID` và cột lệnh ở cuối. Trong container, tiến trình có `PID 1` là tiến trình chính: container sống chừng nào PID 1 còn sống. Với image nginx, bạn sẽ thấy `nginx: master process` ở PID 1 và vài `nginx: worker process` bên dưới. Nếu PID 1 là `sh` hay `npm` thay vì `node`, tín hiệu tắt máy có thể không tới được app, chuyện này quay lại ở phần 4 và phần 9.
+
+`wget` và `curl` không phải lúc nào cũng có sẵn. Image `nginx:alpine` có `curl` ở các phiên bản gần đây nhưng image `-slim` hay image tự build có thể không có; `alpine` gốc có `wget` (bản BusyBox). Quy tắc: thử `curl`, không có thì `wget -O-`, không có cả hai thì dùng Pod tạm `curlimages/curl` như phần 5 hướng dẫn.
+
+### File và quyền
+
+```bash
+mkdir -p /app/dist            # tạo thư mục (kể cả thư mục cha)
+cp -r dist/ /var/www/         # copy đệ quy
+rm -rf node_modules           # xoá (cẩn thận!)
+chmod +x entrypoint.sh        # cấp quyền thực thi
+chown -R node:node /app       # đổi chủ sở hữu file
+du -sh /app                   # xem dung lượng thư mục
+```
+
+`rm -rf` không hỏi lại và không có thùng rác. Trong container thì hậu quả nhỏ (container là ephemeral, xoá đi tạo lại), nhưng thói quen gõ `rm -rf /` nhầm vào máy thật là chuyện có thật. Luôn `pwd` trước khi `rm -rf` một đường dẫn tương đối.
+
+### Đọc cột quyền của `ls -la`
+
+Dòng đầu tiên bạn thấy khi `ls -la` trong `/usr/share/nginx/html` trông như thế này:
+
+```text
+-rw-r--r--    1 root     root          1234 Sep 20 10:00 index.html
+drwxr-xr-x    2 root     root          4096 Sep 20 10:00 assets
+```
+
+Ký tự đầu: `-` là file, `d` là thư mục. Chín ký tự tiếp theo là ba nhóm `rwx` (read, write, execute) cho chủ sở hữu, nhóm, và mọi người khác. `-rw-r--r--` nghĩa là chủ đọc/ghi được, người khác chỉ đọc. Hai cột `root root` là chủ sở hữu và nhóm.
+
+Vì sao FE dev cần biết? Vì đây là nguyên nhân của một lỗi rất hay gặp khi làm cứng container ở phần 18: bạn bắt container chạy bằng user không phải root (`runAsNonRoot`), nginx khởi động và cần ghi vào `/var/cache/nginx` hay `/var/run`, nhưng thư mục đó thuộc `root` và user thường không có quyền `w` → nginx chết ngay với `Permission denied`. `chown -R` và `chmod` là hai lệnh sửa chuyện đó, hoặc dùng image `nginxinc/nginx-unprivileged` đã sửa sẵn. Tương tự, `chmod +x entrypoint.sh` là bước hay quên khi bạn thêm script sinh config lúc khởi động ở phần 10: script không có quyền thực thi thì container báo `permission denied` và không lên.
+
+### Tín hiệu: `kill -9` khác `kill` thế nào
+
+`kill 1234` mặc định gửi tín hiệu `SIGTERM` (số 15): "làm ơn tắt". Tiến trình được phép dọn dẹp (đóng kết nối, trả nốt request đang xử lý) rồi tự thoát. `kill -9 1234` gửi `SIGKILL`: kernel giết thẳng, tiến trình không kịp làm gì.
+
+Kubernetes tắt Pod đúng theo hai bước này: gửi `SIGTERM` vào PID 1 của container, chờ tối đa `terminationGracePeriodSeconds` (mặc định 30 giây), hết giờ mà chưa thoát thì `SIGKILL`. Nếu app của bạn không xử lý `SIGTERM` (hoặc PID 1 là một `sh` bọc ngoài nuốt mất tín hiệu), mọi lần deploy đều có 30 giây Pod cũ lơ lửng rồi bị giết cứng, kéo theo request đang dở bị cắt. Phần 9 dùng đúng kiến thức này để làm zero-downtime.
+
+### Vài thao tác shell dùng suốt series
+
+```bash
+env | grep API                 # ống dẫn: lọc output bằng grep
+cat index.html | head -n 20    # nối nhiều lệnh
+echo "hello" > file.txt        # ghi đè file
+echo "hello" >> file.txt       # nối thêm vào cuối file
+curl -s http://localhost/healthz; echo $?   # $? là exit code của lệnh trước, 0 là thành công
+which nginx                    # binary nằm ở đâu
+nginx -t                       # kiểm tra cú pháp nginx.conf mà không khởi động lại
+exit                           # rời shell của container
+```
+
+Hai điều đáng nhớ: `|` (pipe) đưa output lệnh trước làm input lệnh sau, và `$?` là exit code, thứ mà probe kiểu `exec` của K8s dùng để quyết định pass/fail (exit 0 là pass). `nginx -t` là lệnh bạn sẽ gõ ngay khi nghi ngờ file `nginx.conf` mount từ ConfigMap bị sai.
+
+---
+
+## Thực hành 1.1
+
+1. Mở terminal, chạy `docker run -it --rm alpine sh` (nếu đã có Docker) hoặc dùng WSL / terminal máy bạn. Cờ `-it` cho bạn shell tương tác, `--rm` tự xoá container khi bạn `exit`.
+2. Gõ lần lượt toàn bộ các lệnh ở trên. Với `curl`, alpine gốc không có sẵn: chạy `apk add curl` trước (đây cũng là cách cài package trong image alpine, tương đương `apt install` của Ubuntu). Quan sát output của từng lệnh, đặc biệt là `env` và `ps aux`.
+3. Tạo file `test.txt` với 100 dòng bằng vòng lặp shell, rồi dùng `head`, `tail`, `less` để xem:
+
+```bash
+for i in $(seq 1 100); do echo "dong $i" >> test.txt; done
+head -n 5 test.txt
+tail -n 5 test.txt
+tail -f test.txt     # Ctrl+C để thoát
+```
+
+4. Thử `ls -la test.txt`, rồi `chmod 600 test.txt` và `ls -la` lại. Đọc sự thay đổi ở cột quyền.
+5. Gõ `exit`. Chạy lại `docker run -it --rm alpine sh` và `ls`: file `test.txt` không còn. Đó là tính ephemeral của container, chủ đề của phần 3.
+
+> **Kết quả mong đợi:** `ps aux` trong alpine chỉ có vài dòng và `sh` ở PID 1. `env` in ra `PATH`, `HOME`, `HOSTNAME` (chính là ID container). `head -n 5 test.txt` in "dong 1" tới "dong 5". Sau khi vào lại container, file biến mất.
+
+---
+
+## Mạng máy tính cho FE: IP, port, DNS, HTTP, reverse proxy
+
+### IP và port
+
+IP là địa chỉ của một máy (ví dụ `10.244.1.37`). Port là số hiệu "cửa" trên máy đó (ví dụ `3000`). Một máy có 65535 cổng. Khi bạn chạy `npm run dev` và thấy `localhost:5173`, nghĩa là tiến trình Vite đang "nghe" (listen) ở cổng 5173 trên máy bạn; trình duyệt nối tới cửa đó để lấy HTML.
+
+Các port cần nhớ:
+
+| Port               | Dùng cho                                               |
+| ------------------ | ------------------------------------------------------ |
+| 80                 | HTTP (mặc định, nên trình duyệt không hiển thị)        |
+| 443                | HTTPS                                                  |
+| 3000 / 5173 / 8080 | Dev server thông dụng (Next.js, Vite, nhiều backend)   |
+| 5432 / 3306 / 6379 | PostgreSQL / MySQL / Redis                             |
+| 53                 | DNS (UDP), bạn gặp nó khi viết NetworkPolicy ở phần 18 |
+
+Hai chi tiết về port mà mọi lỗi container đều quay về:
+
+**Listen ở `0.0.0.0` hay `127.0.0.1`.** Một tiến trình khi listen phải chọn "nghe trên địa chỉ nào". `127.0.0.1` (localhost) nghĩa là chỉ nhận kết nối từ chính máy đó; `0.0.0.0` nghĩa là nhận từ mọi network interface. Trong container, "chính máy đó" là chính container, nên app listen ở `127.0.0.1` sẽ từ chối mọi request từ ngoài container, kể cả từ Kubernetes. Triệu chứng: Pod `Running`, log bình thường, nhưng readiness probe fail mãi và Service trả 502. Vite dev server mặc định listen localhost, phải chạy `vite --host` để nghe `0.0.0.0`; Next.js standalone cần `HOSTNAME=0.0.0.0`. Đây là lỗi tốn nhiều giờ nhất trong series, gặp lại ở phần 11 và phần 13.
+
+**Port dưới 1024 cần quyền root.** nginx chính thức listen cổng 80 nên chạy bằng root. Khi bạn muốn container chạy bằng user thường (phần 18), phải chuyển sang cổng 8080 (image `nginx-unprivileged` làm sẵn) và đổi `containerPort` / `targetPort` tương ứng.
+
+### DNS
+
+DNS dịch tên thành IP: `google.com` → `142.250.x.x`. Trong Kubernetes có một hệ thống DNS nội bộ (CoreDNS) cực kỳ quan trọng: mỗi Service được cấp một tên miền nội bộ tự động.
+
+```bash
+# Bên trong cluster, từ bất kỳ Pod nào:
+http://api-service                              # cùng namespace
+http://api-service.production                   # khác namespace
+http://api-service.production.svc.cluster.local # tên đầy đủ (FQDN)
+```
+
+Vì sao tên ngắn `api-service` chạy được? Vì K8s ghi sẵn danh sách "search domain" vào `/etc/resolv.conf` của mọi Pod. Bạn tự xem được:
+
+```bash
+cat /etc/resolv.conf
+# search production.svc.cluster.local svc.cluster.local cluster.local
+# nameserver 10.96.0.10
+```
+
+Khi bạn gọi `api-service`, resolver lần lượt thử `api-service.production.svc.cluster.local`, rồi `api-service.svc.cluster.local`, rồi `api-service.cluster.local`. Tên ngắn chỉ khớp khi Service ở cùng namespace với Pod đang gọi; khác namespace thì phải ghi thêm `.ten-namespace`. Rất nhiều lỗi "không gọi được API" chỉ là thiếu phần namespace này.
+
+<DockerDiagram
+  kind="networking"
+  caption="Docker đã có ý tưởng này: trong user-defined network, container gọi nhau bằng tên nhờ embedded DNS. CoreDNS của Kubernetes làm điều tương tự ở quy mô cluster: mỗi Service là một tên."
+/>
+
+> **Ghi chú:** đây là điều đẹp nhất của K8s với FE dev. Bạn không cần biết IP của backend. Chỉ cần gọi `http://api-service:3000` và K8s tự tìm. Giống như bạn `import lodash` mà không cần biết file nằm ở đâu trong `node_modules`: có một cơ chế resolve tên thay bạn.
+
+Hai lệnh kiểm tra DNS từ trong Pod: `nslookup api-service` (có trong hầu hết image) và `dig api-service.production.svc.cluster.local` (chỉ có trong image debug như `nicolaka/netshoot`). Kết quả `NXDOMAIN` hoặc `can't resolve` nghĩa là tên sai, sai namespace, hoặc Service chưa tồn tại.
+
+### Reverse proxy: khái niệm bắt buộc phải hiểu
+
+Một proxy thuận (forward proxy) đứng trước client, ví dụ VPN công ty: client gửi mọi request qua nó. Một **reverse proxy** đứng trước server: nó nhận mọi request từ Internet rồi quyết định chuyển tiếp cho server nội bộ nào.
+
+```text
+                          +---------------------+
+Trình duyệt ----------->  |    Reverse Proxy    |
+  app.com/                |  (nginx / Ingress)  |
+  app.com/api/*           +----------+----------+
+                                     |
+                  +------------------+------------------+
+                  |                                     |
+          /  -> frontend-svc:80              /api/* -> backend-svc:3000
+```
+
+Trong K8s, reverse proxy có tên là Ingress Controller (phần 7). Ở tầng nhỏ hơn, chính nginx trong image frontend của bạn cũng là một reverse proxy thu nhỏ. Cấu hình nginx tối giản để thấy ý tưởng, hai `location` tương ứng hai nhánh trong sơ đồ:
+
+```nginx
+server {
+  listen 80;
+
+  location / {
+    root /usr/share/nginx/html;
+    try_files $uri $uri/ /index.html;
+  }
+
+  location /api/ {
+    proxy_pass http://backend-svc:3000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+```
+
+Nếu bạn từng cấu hình `server.proxy` trong `vite.config.ts`, đây là thứ tương đương ở production. Ba header `X-Forwarded-*` là cách reverse proxy nói với backend "request gốc đến từ IP nào, qua HTTP hay HTTPS", vì backend chỉ thấy kết nối từ proxy chứ không thấy trình duyệt.
+
+Vì sao FE dev phải hiểu? Vì đây chính là lời giải cho ba vấn đề kinh điển:
+
+1. **CORS.** Nếu FE ở `app.com` và API ở `api.com` thì trình duyệt chặn request cross-origin (hoặc bắt backend trả đúng bộ header `Access-Control-*`). Nhưng nếu reverse proxy đưa API về `app.com/api` thì cùng origin, hết CORS, không cần cấu hình gì ở backend. Bài [CORS giải thích tận gốc](/blog/cors-explained-deep-dive/) trên blog này đi sâu vào cơ chế phía trình duyệt.
+2. **404 khi F5 trên SPA.** Route `/users/123` không tồn tại dưới dạng file trong `dist/`. Reverse proxy phải được cấu hình "không tìm thấy file thì trả về `index.html`", đó là dòng `try_files $uri $uri/ /index.html;` ở trên. Thiếu nó, bấm link nội bộ vẫn chạy (React Router đổi URL bằng History API, không có request nào tới server) nhưng F5 hay mở link trực tiếp thì server tìm file `/users/123` và trả 404.
+3. **HTTPS.** Chứng chỉ TLS được xử lý ở reverse proxy (TLS termination). App bên trong chỉ chạy HTTP thuần cho nhẹ, không phải quản lý cert. Đó là lý do container frontend của bạn chỉ `listen 80` mà người dùng vẫn thấy ổ khoá trên trình duyệt.
+
+### Ba loại lỗi kết nối bạn phải phân biệt
+
+Khi `curl` thất bại, thông điệp lỗi nói cho bạn biết đang kẹt ở tầng nào. Ba thông điệp này khác nhau hoàn toàn và dẫn tới ba hướng debug khác nhau:
+
+| Thông điệp curl          | Nghĩa là                                                     | Trong K8s thường là                                                             |
+| ------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| `Could not resolve host` | DNS không dịch được tên thành IP                             | Sai tên Service, thiếu `.namespace`, Service chưa tạo                           |
+| `Connection refused`     | Tới được máy, nhưng không có tiến trình nào listen ở port đó | Sai `targetPort`, app listen `127.0.0.1`, app chưa khởi động xong, app đã crash |
+| `Connection timed out`   | Gói tin gửi đi không có hồi âm                               | Sai IP, NetworkPolicy hoặc firewall chặn, Pod ở node mất mạng                   |
+
+`Connection refused` là lỗi bạn gặp nhiều nhất trong series. Nó gần như luôn có nghĩa "đúng máy, sai cửa": port trong manifest không khớp port app đang listen.
+
+### HTTP status code cần thuộc khi debug hạ tầng
+
+Với app, `404` nghĩa là "không có trang này". Với hạ tầng, cùng con số đó có nghĩa khác. Bảng dưới đọc status code theo góc nhìn hạ tầng:
+
+| Mã                          | Với hạ tầng nghĩa là gì                                                                                                               |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| **200**                     | OK.                                                                                                                                   |
+| **301 / 302**               | Redirect. Hay gặp khi Ingress ép HTTP → HTTPS. Nếu `curl` nhận 301 mãi, kiểm tra vòng lặp redirect giữa CDN và Ingress.               |
+| **404**                     | Reverse proxy tìm thấy server nhưng server không có đường dẫn đó. Thường là lỗi nginx config của bạn (thiếu `try_files`, sai `root`). |
+| **413**                     | Request body quá lớn so với giới hạn của proxy. Ở ingress-nginx sửa bằng annotation `proxy-body-size` (phần 7).                       |
+| **502 Bad Gateway**         | Reverse proxy không nối được tới app phía sau. Pod chết, sai port, hoặc Service không trỏ đúng Pod.                                   |
+| **503 Service Unavailable** | Không có Pod nào sẵn sàng (readiness probe fail hoặc `replicas: 0`). Endpoints của Service rỗng.                                      |
+| **504 Gateway Timeout**     | App phía sau chạy quá lâu không trả lời. Backend chậm, hoặc timeout của proxy quá ngắn cho SSE / long polling.                        |
+
+Quy tắc ghi nhớ: **404 là chuyện bên trong container** (nginx của bạn), **502 là chuyện giữa proxy và container** (port, Pod chết), **503 là chuyện Service không có Pod nào** (selector, probe). Phần 13 mở rộng bảng này thành sổ tay 12 lỗi.
+
+### Bộ `curl` dùng suốt series
+
+```bash
+curl -I https://github.com                       # chỉ lấy header (HEAD)
+curl -v http://localhost:8080/                   # in cả request lẫn response, thấy mọi bước
+curl -H "Host: app.local" http://localhost/      # giả Host header để test Ingress ở local
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost/   # chỉ in status code
+curl --resolve app.congty.com:443:1.2.3.4 https://app.congty.com/   # ép domain về một IP cụ thể, bỏ qua DNS
+```
+
+Dòng thứ tư là công cụ đo zero-downtime ở phần 12 và đồ án cuối khoá: chạy nó trong vòng lặp lúc deploy, nếu xuất hiện mã nào khác 200 là deploy chưa sạch. Dòng cuối cực kỳ hữu ích khi bạn muốn test một origin cụ thể mà DNS vẫn đang trỏ chỗ khác (ví dụ trước khi chuyển tên miền). Nếu bạn muốn thành thạo `curl` hơn, bài [HTTP API debugging với curl và jq](/blog/dev-cli-06-http-api-debugging-curl-jq/) là tài liệu bổ sung.
+
+---
+
+## Thực hành 1.2
+
+1. Chạy `curl -I https://github.com` và đọc từng header. Tìm dòng status (`HTTP/2 200`), `content-type`, `cache-control`, và các header bảo mật như `strict-transport-security`, `x-frame-options`. Bạn sẽ tự đặt những header này ở Ingress vào phần 18.
+2. Chạy `nslookup github.com` để xem IP. Để ý có thể trả về nhiều IP, đó là DNS làm cân bằng tải ở mức thô. Chạy thêm `nslookup localhost` để thấy `127.0.0.1`.
+3. Chạy `curl -I http://localhost:9999`. Không có gì listen ở cổng 9999 nên bạn nhận `Connection refused`. Đây là lỗi bạn sẽ gặp rất nhiều khi sai port trong K8s. Hãy nhớ mặt nó.
+4. Chạy `curl -I http://khong-ton-tai.local` để thấy `Could not resolve host`. So sánh với lỗi ở bước 3: khác hẳn nhau.
+5. Nếu đã có Docker: chạy `docker run -d -p 8080:80 --name web nginx:alpine`, rồi `curl -I http://localhost:8080` (phải 200), rồi `curl -I http://localhost:8080/khong-co` (phải 404). Cuối cùng `docker rm -f web`.
+6. Mở app Vite của bạn bằng `npm run dev`, rồi từ một terminal khác chạy `curl -I http://localhost:5173`. Sau đó thử `npm run dev -- --host` và để ý dòng "Network:" xuất hiện thêm một địa chỉ. Đó là khác biệt giữa listen `127.0.0.1` và `0.0.0.0`.
+
+> **Kết quả mong đợi:** bạn đã nhìn thấy ba loại lỗi khác nhau bằng mắt (200 bình thường, `Connection refused` khi sai port, `Could not resolve host` khi sai tên) và một 404 do server có nhưng đường dẫn không có. Từ giờ mỗi khi thấy một trong bốn thứ này trong K8s, bạn biết ngay phải nhìn vào tầng nào.
+
+---
+
+## Tóm tắt
+
+- Vào Pod bằng `kubectl exec -it <pod> -- sh` (image alpine không có `bash`). Bộ hơn 20 lệnh ở trên là tất cả những gì bạn cần trong đó; `env | grep` là lệnh giá trị nhất.
+- Cột quyền của `ls -la` (`-rw-r--r--`, `root root`) giải thích lỗi `Permission denied` khi chạy container bằng user thường; `chown`, `chmod`, hoặc image `nginx-unprivileged` là cách sửa.
+- `kill` gửi `SIGTERM` (tắt tử tế), `kill -9` gửi `SIGKILL` (giết cứng). K8s tắt Pod đúng theo trình tự đó với 30 giây ân hạn; app phải xử lý `SIGTERM` và PID 1 phải là tiến trình thật.
+- App trong container phải listen `0.0.0.0`, không phải `127.0.0.1`. Đây là nguyên nhân số một của "Pod Running nhưng 502".
+- Mỗi Service có tên DNS nội bộ: `ten-service` cùng namespace, `ten-service.ten-namespace` khác namespace. `/etc/resolv.conf` trong Pod giải thích vì sao.
+- Reverse proxy (nginx, Ingress) giải quyết ba vấn đề kinh điển của SPA: CORS (đưa API về cùng origin), 404 khi F5 (`try_files` fallback về `index.html`), HTTPS (TLS termination ở proxy).
+- Ba lỗi kết nối: `Could not resolve host` (DNS), `Connection refused` (đúng máy sai port), `Connection timed out` (bị chặn hoặc sai IP). Ba status code hạ tầng: 404 trong container, 502 giữa proxy và container, 503 Service không có Pod.
+
+## Đọc thêm
+
+- [Service (Kubernetes docs)](https://kubernetes.io/docs/concepts/services-networking/service/) — mục DNS for Services and Pods giải thích cơ chế tên nội bộ.
+- [nginx documentation](https://nginx.org/en/docs/) — `ngx_http_core_module` cho `try_files`, `ngx_http_proxy_module` cho `proxy_pass`.
+- [HTTP từ socket đi lên](/blog/net-05-http-from-the-socket-up/) trên blog này, nếu bạn muốn hiểu request line, header và kết nối TCP bên dưới `curl -v`.
+- [Nginx reverse proxy và load balancing](/blog/nginx-03-reverse-proxy-and-load-balancing/) — cấu hình reverse proxy đầy đủ hơn đoạn tối giản ở trên.

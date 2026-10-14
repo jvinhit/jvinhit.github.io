@@ -1,0 +1,446 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 17 — HTTPS tự động với cert-manager và observability'
+description: 'Cài cert-manager, viết ClusterIssuer ACME, thêm một annotation để Ingress tự có chứng chỉ và tự gia hạn, debug khi certificate kẹt Pending. Rồi ba trụ cột observability: log JSON ra stdout, metric cần theo dõi, lệnh xem log hằng ngày.'
+pubDate: 2026-11-17
+lang: vi
+tags: [kubernetes, https, observability, devops, frontend]
+series: k8s-fe
+seriesOrder: 17
+draft: false
+---
+
+Từ [Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/) Ingress của bạn đã có khối `tls` và annotation `cert-manager.io/cluster-issuer: letsencrypt-prod`, nhưng bạn chưa cài thứ đọc annotation đó. Trên cluster kind mọi thứ vẫn chạy vì bạn test bằng `http://app.local`. Lên production thì không: trình duyệt chặn HTTP, cookie `Secure` không gửi, và chứng chỉ mua tay hết hạn sau 90 ngày đúng vào kỳ nghỉ lễ. Nửa đầu bài này lắp nốt mảnh đó: cert-manager xin chứng chỉ Let's Encrypt, tự tạo Secret, tự gia hạn, và bạn biết đọc chuỗi Certificate → Order → Challenge khi nó kẹt.
+
+Nửa sau trả lời câu hỏi kế tiếp sau khi app lên production: **làm sao biết nó đang khoẻ?** Không phải bằng cách F5 trang chủ, mà bằng log có cấu trúc, vài metric đúng, và bộ lệnh xem log bạn sẽ gõ mỗi ngày. Bài này dừng ở mức frontend developer cần; muốn đi sâu tới tracing và quy trình incident, [Docker Part 18](/blog/docker-18-kubernetes-observability-incidents/) là bước tiếp theo.
+
+## HTTPS trên Kubernetes: ai giữ chứng chỉ
+
+Nhắc lại từ [Phần 7](/blog/k8s-fe-07-service-and-ingress/): TLS kết thúc ở Ingress Controller. Trình duyệt bắt tay TLS với nginx của ingress-nginx, còn từ Ingress vào Pod là HTTP thuần. Pod frontend của bạn không bao giờ thấy chứng chỉ, và đó là điều tốt: không phải mount key vào từng app.
+
+Chứng chỉ nằm trong một Secret kiểu `kubernetes.io/tls` có hai key `tls.crt` và `tls.key`, cùng namespace với Ingress, và Ingress trỏ tới nó bằng `spec.tls[].secretName`. Không cần cert-manager bạn vẫn tạo được tay:
+
+```bash
+kubectl -n web create secret tls frontend-tls --cert=fullchain.pem --key=privkey.pem
+```
+
+Vấn đề không nằm ở việc tạo, mà ở việc **lặp lại**: chứng chỉ Let's Encrypt sống 90 ngày, mỗi domain một chứng chỉ, mỗi môi trường một domain. cert-manager là controller làm việc đó thay bạn: nó theo dõi Ingress, xin chứng chỉ qua giao thức ACME, ghi vào đúng Secret và gia hạn trước hạn.
+
+---
+
+## ACME HTTP-01 hoạt động thế nào
+
+Let's Encrypt chỉ cấp chứng chỉ cho domain bạn chứng minh được là mình kiểm soát. Cách chứng minh phổ biến nhất là HTTP-01: Let's Encrypt đưa một token, bạn phải phục vụ token đó tại `http://app.congty.com/.well-known/acme-challenge/<token>`. Chuỗi tài nguyên cert-manager tạo ra để làm việc đó:
+
+```text
+Ingress (annotation cluster-issuer + tls.secretName)
+   │  cert-manager "ingress-shim" đọc annotation
+   ▼
+Certificate  ──▶  CertificateRequest  ──▶  Order  ──▶  Challenge (một cái mỗi domain)
+                                                            │
+                                     cert-manager tạo Pod solver + một Ingress tạm cho
+                                     đường dẫn /.well-known/acme-challenge/<token>
+                                                            │
+                Let's Encrypt gọi http://app.congty.com/.well-known/acme-challenge/<token>
+                                                            │  đúng token → Challenge Valid
+                                                            ▼
+                                     Order Valid → chứng chỉ được cấp → Secret frontend-tls
+```
+
+Mỗi mắt xích là một tài nguyên bạn `kubectl get` và `kubectl describe` được. Khi HTTPS không lên, bạn đi từ trái sang phải cho tới mắt xích đầu tiên báo lỗi.
+
+---
+
+## Cài cert-manager
+
+```bash
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace \
+  --set crds.enabled=true
+
+kubectl -n cert-manager get pods
+```
+
+> **Kết quả mong đợi:** ba Pod Running: `cert-manager`, `cert-manager-cainjector`, `cert-manager-webhook`. Chart cũ hơn dùng cờ `--set installCRDs=true` thay cho `crds.enabled`; nếu `helm install` báo giá trị không hợp lệ, tra README của chart đúng phiên bản.
+
+Đây là ví dụ đầu tiên của nguyên tắc ở [Phần 15](/blog/k8s-fe-15-helm-and-kustomize/): phần mềm bên thứ ba cài bằng Helm. Nâng cấp sau này là `helm upgrade cert-manager jetstack/cert-manager -n cert-manager`.
+
+---
+
+## ClusterIssuer: production và staging
+
+`Issuer` chỉ dùng trong một namespace; `ClusterIssuer` dùng được từ mọi namespace, nên một cái cho cả cluster là đủ. `cluster-issuer.yaml`:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: devops@congty.com # nhận mail cảnh báo sắp hết hạn
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key # khoá tài khoản ACME, cert-manager tự tạo
+    solvers:
+      - http01:
+          ingress:
+            class: nginx # Ingress tạm cho challenge sẽ dùng controller này
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: devops@congty.com
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+```
+
+```bash
+kubectl apply -f cluster-issuer.yaml
+kubectl get clusterissuer
+# NAME                  READY   AGE
+# letsencrypt-prod      True    10s
+# letsencrypt-staging   True    10s
+```
+
+Luôn tạo cả hai. Bản staging cấp chứng chỉ mà trình duyệt **không** tin (CA giả), nhưng gần như không giới hạn số lần thử; bản prod là thật nhưng có rate limit. Mọi lần thử nghiệm đường dẫn mới, domain mới, cluster mới đều đi qua staging trước, đổi sang prod khi Certificate đã Ready. Với cert-manager mới, `class: nginx` có thể viết là `ingressClassName: nginx`; hai dạng đều được chấp nhận.
+
+---
+
+## Bật HTTPS cho Ingress bằng một annotation
+
+Chỉ cần hai thứ trong Ingress: annotation chỉ issuer và khối `tls` khai tên Secret. cert-manager sẽ tự xin chứng chỉ, tự tạo Secret, và tự gia hạn trước khi hết hạn.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend
+  namespace: web
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: 'true' # HTTP → 301 HTTPS
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ['app.congty.com']
+      secretName: frontend-tls # cert-manager tạo Secret này
+  rules:
+    - host: app.congty.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port: { number: 80 }
+```
+
+Theo dõi tiến trình:
+
+```bash
+kubectl get certificate -A
+# NAMESPACE   NAME           READY   SECRET         AGE
+# web         frontend-tls   True    frontend-tls   90s
+
+kubectl describe certificate frontend-tls -n web       # Events: Issuing, Generated, Requested, Issued
+kubectl get certificaterequest,order,challenge -A        # debug khi cấp phát lỗi
+kubectl -n web get secret frontend-tls                   # TYPE kubernetes.io/tls
+```
+
+Xác nhận từ ngoài:
+
+```bash
+curl -vI https://app.congty.com/ 2>&1 | grep -E "issuer|expire|HTTP/"
+# *  issuer: C=US; O=Let's Encrypt; CN=R11   (tên CN thay đổi theo thời gian)
+# *  expire date: ...
+# HTTP/2 200
+curl -I http://app.congty.com/      # HTTP/1.1 308 Permanent Redirect → https
+```
+
+Gia hạn: cert-manager làm mới khi chứng chỉ đi được hai phần ba vòng đời, tức khoảng 30 ngày trước hạn với chứng chỉ 90 ngày. Không cần cron, không cần nhớ. Điều duy nhất bạn phải giữ là cluster có thể trả lời HTTP-01 vào thời điểm đó; nếu ba tháng sau ai đó chặn cổng 80 ở firewall "vì đã có HTTPS", lần gia hạn tiếp theo sẽ thất bại và email cảnh báo của Let's Encrypt là thứ cứu bạn.
+
+> **Ghi chú:** ingress-shim (đọc annotation trên Ingress) tiện nhưng gián tiếp. Bạn cũng viết được `Certificate` trực tiếp với `dnsNames` gồm nhiều host và `issuerRef`, rồi nhiều Ingress cùng dùng một `secretName`. Cách này rõ ràng hơn khi một chứng chỉ phục vụ `app.congty.com` lẫn `www.app.congty.com`.
+
+---
+
+## Cạm bẫy khi xin chứng chỉ
+
+Let's Encrypt cần truy cập được `http://domain/.well-known/acme-challenge/...` **từ Internet** để xác thực. Certificate kẹt ở `READY False` gần như luôn vì một trong các lý do:
+
+- **Domain chưa trỏ đúng IP** của LoadBalancer trước Ingress Controller. `dig +short app.congty.com` phải ra IP mà `kubectl -n ingress-nginx get svc` hiển thị ở cột EXTERNAL-IP. DNS mới sửa thì chờ TTL.
+- **Cloudflare đang bật proxy (đám mây cam).** Let's Encrypt gọi tới IP của Cloudflare chứ không phải cluster; với chế độ SSL "Full (strict)" mà origin chưa có chứng chỉ, Cloudflare không nối được về origin và challenge thất bại. Hai cách: tắt proxy (đám mây xám) trong lúc cấp phát lần đầu, hoặc dùng DNS-01 (dưới). Cơ chế bốn chế độ SSL của Cloudflare và vì sao nó tạo vòng lặp redirect được giải thích ở [Cloudflare cho Frontend Developer · Phần 5](/blog/cloudflare-fe-05-ssl-tls-modes-and-redirect-loop/).
+- **Firewall hoặc Security Group chặn cổng 80.** HTTPS chạy trên 443, nhưng challenge đi qua 80. Cổng 80 phải mở ít nhất cho tới khi cấp xong, và tốt nhất là mở luôn để gia hạn.
+- **Ingress tạm bị Ingress của bạn che.** Nếu Ingress chính có `ssl-redirect` và rewrite phức tạp, đôi khi challenge bị redirect sang HTTPS rồi 404. ingress-nginx xử lý được ngoại lệ này, nhưng với controller khác hãy kiểm tra `kubectl describe challenge` xem Let's Encrypt nhận về mã gì.
+- **Rate limit của Let's Encrypt:** 5 lần xác thực thất bại mỗi giờ cho một tài khoản và hostname; tới ngưỡng thì mọi lần thử tiếp theo đều bị từ chối cho tới khi hết giờ. Đây là lý do luôn dùng `letsencrypt-staging` khi thử nghiệm.
+
+### DNS-01 khi không mở được cổng 80 hoặc cần wildcard
+
+DNS-01 chứng minh quyền kiểm soát bằng cách tạo bản ghi TXT `_acme-challenge.app.congty.com`; không cần Internet gọi vào cluster, và là cách duy nhất để lấy chứng chỉ wildcard `*.congty.com`. Với DNS ở Cloudflare, tạo API token có quyền sửa DNS của zone, lưu thành Secret trong namespace `cert-manager` (ClusterIssuer đọc Secret ở namespace của cert-manager), rồi thêm solver:
+
+```yaml
+spec:
+  acme:
+    # ... server, email, privateKeySecretRef như trên
+    solvers:
+      - dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: cloudflare-api-token
+              key: api-token
+```
+
+Cấp phát chậm hơn HTTP-01 vài phút vì phải chờ DNS lan truyền, nhưng không phụ thuộc proxy hay firewall. Cú pháp cho từng nhà cung cấp DNS (Route 53, Cloud DNS, Azure DNS) nằm trong docs cert-manager.
+
+---
+
+## Chạy local với kind: ClusterIssuer tự ký
+
+Cluster kind không có IP công khai, Let's Encrypt không gọi tới được, nên toàn bộ phần trên chỉ test được với domain thật. Để lab vẫn có HTTPS, dùng issuer tự ký:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned
+spec:
+  selfSigned: {}
+```
+
+Đổi annotation trong Ingress thành `cert-manager.io/cluster-issuer: selfsigned`, chờ vài giây:
+
+```bash
+kubectl -n web get certificate                 # READY True
+curl -k -I https://app.local/                  # -k bỏ qua kiểm tra CA
+```
+
+Trình duyệt cảnh báo chứng chỉ không tin cậy là đúng; bạn bấm bỏ qua cho lab. Muốn trình duyệt tin luôn, tạo CA bằng `mkcert`, đưa CA đó vào một Secret và dùng issuer kiểu `ca` thay vì `selfSigned`; quy trình mkcert được mô tả ở [HTTPS cho localhost](/blog/localhost-https-for-development/). Đồ án cuối khoá ở [Phần 19](/blog/k8s-fe-19-schedule-checklist-capstone-cheatsheet/) chấp nhận issuer staging hoặc tự ký khi chạy local.
+
+---
+
+## Debug khi certificate kẹt
+
+Đi theo chuỗi, dừng ở mắt xích đầu tiên không Ready:
+
+```bash
+kubectl -n web describe certificate frontend-tls        # Status.Conditions và Events
+kubectl -n web get certificaterequest                   # READY False? đọc describe
+kubectl -n web get order                                # STATE pending / errored / valid
+kubectl -n web get challenge                            # STATE và REASON
+kubectl -n web describe challenge <ten-challenge>        # dòng Reason: ví dụ "wrong status code '404'"
+kubectl -n cert-manager logs deploy/cert-manager --tail=100
+```
+
+Bốn nguyên nhân hay gặp ngoài danh sách ở trên: `secretName` trong `tls` gõ khác tên bạn nhìn ở `get certificate` (thực ra cert-manager đặt tên Certificate theo `secretName`, nên nếu không thấy Certificate nào nghĩa là annotation sai key); Ingress và Secret khác namespace (bắt buộc cùng); `class` trong solver không khớp `ingressClassName` của cluster; và `email` dùng domain ví dụ như `example.com`, Let's Encrypt từ chối. Sửa xong, xoá Challenge/Order đang errored để cert-manager thử lại ngay thay vì chờ backoff, hoặc `kubectl delete certificate` rồi để ingress-shim tạo lại.
+
+---
+
+## Observability: ba trụ cột
+
+Sang nửa sau. Observability không phải "cài Grafana", mà là khả năng trả lời câu hỏi về hệ thống từ dữ liệu nó phát ra, kể cả câu hỏi bạn chưa nghĩ tới lúc viết code.
+
+| Trụ cột     | Trả lời câu hỏi                             | Công cụ phổ biến                |
+| ----------- | ------------------------------------------- | ------------------------------- |
+| **Logs**    | Chuyện gì đã xảy ra?                        | Loki + Grafana, ELK, CloudWatch |
+| **Metrics** | Hệ thống đang khoẻ không? Xu hướng thế nào? | Prometheus + Grafana            |
+| **Traces**  | Request chậm ở đâu trong chuỗi service?     | Jaeger, Tempo, OpenTelemetry    |
+
+Với frontend, hai trụ cột đầu là thứ bạn dùng hằng ngày. Tracing đáng giá khi Next.js SSR gọi ba backend và bạn cần biết cái nào chậm; hãy để nó cho lúc hệ thống đã ổn định.
+
+### Nguyên tắc ghi log trong container
+
+**Luôn ghi log ra `stdout`/`stderr`, không ghi vào file.** Container là ephemeral; file log biến mất cùng Pod, còn stdout thì kubelet thu, `kubectl logs` đọc được, và agent thu gom log của cluster (Promtail, Fluent Bit, agent của CloudWatch) đẩy về kho tập trung. Ghi log vào file trong container là cách chắc chắn để lúc cần thì không còn.
+
+**Ghi log dạng JSON có cấu trúc** để truy vấn được. Một dòng text "checkout failed for user 123" đọc bằng mắt được nhưng không lọc được theo `userId` khi có một triệu dòng.
+
+```js
+// Node.js / Next.js (route handler, server component, middleware)
+console.log(
+  JSON.stringify({
+    level: 'info',
+    ts: new Date().toISOString(),
+    msg: 'checkout_completed',
+    userId: user.id,
+    orderId: order.id,
+    durationMs: Date.now() - start,
+  })
+);
+```
+
+Thư viện như `pino` làm đúng việc này với chi phí thấp; điểm cần nhớ là mỗi dòng một object JSON, không xuống dòng bên trong, không in object lồng nhiều tầng.
+
+Với SPA nginx, log duy nhất là access log của nginx, mặc định ở định dạng text. Đổi sang JSON bằng một file cấu hình ở cấp `http` (thư mục `conf.d/` được include bên trong khối `http`, nên file này đặt `log_format` được):
+
+```nginx
+# nginx/00-log-format.conf  →  COPY vào /etc/nginx/conf.d/00-log-format.conf
+log_format json escape=json
+  '{"ts":"$time_iso8601","status":$status,"method":"$request_method",'
+  '"uri":"$request_uri","bytes":$body_bytes_sent,"rt":$request_time,'
+  '"ua":"$http_user_agent","ip":"$remote_addr","ref":"$http_referer"}';
+```
+
+```nginx
+# trong server block của default.conf
+access_log /dev/stdout json;
+```
+
+Từ đây `kubectl logs` in ra JSON, và Loki/CloudWatch lọc được `status >= 500` hay đếm `uri` nào 404 nhiều nhất (thường là asset của version cũ, dấu hiệu `index.html` bị cache, xem [Phần 12](/blog/k8s-fe-12-cache-cdn-zero-downtime/)).
+
+### Metric frontend nên theo dõi
+
+Sáu con số, theo thứ tự ưu tiên:
+
+1. **Tỉ lệ lỗi HTTP 5xx từ Ingress.** Chỉ báo sức khoẻ rõ nhất, và đo ở Ingress chứ không ở Pod để bắt cả 502/503 do Pod không nhận được.
+2. **Độ trễ p50 / p95 / p99.** p50 nói hệ thống thường thế nào; p99 mới cho thấy trải nghiệm tệ nhất, và với SSR đó là con số tăng đầu tiên khi CPU thiếu.
+3. **Số Pod ready / mong muốn.** Phát hiện rollout hỏng hoặc readiness fail hàng loạt trước khi người dùng thấy.
+4. **CPU và memory theo % của limit.** Cảnh báo ở 80% memory để sửa trước khi OOMKilled.
+5. **Core Web Vitals (LCP, INP, CLS)** thu từ trình duyệt thật (RUM), vì server khoẻ không có nghĩa trang nhanh.
+6. **Tỉ lệ lỗi JS phía client** qua Sentry hoặc tương đương, gắn với version deploy.
+
+Bốn metric đầu lấy từ Prometheus. Cách phổ biến để có cả Prometheus, Grafana, kube-state-metrics và bộ dashboard sẵn:
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  -n monitoring --create-namespace
+kubectl -n monitoring port-forward svc/monitoring-grafana 3000:80
+# user admin, mật khẩu theo values của chart (grafana.adminPassword)
+```
+
+Stack này nặng (vài trăm MB RAM); trên máy 8GB hãy tắt bớt component qua values. Để có metric của ingress-nginx, bật `controller.metrics.enabled=true` và `controller.metrics.serviceMonitor.enabled=true` khi cài ingress-nginx bằng Helm. Bốn truy vấn PromQL tương ứng bốn metric đầu, dán vào Grafana:
+
+```text
+# 1. tỉ lệ 5xx của namespace web trong 5 phút
+sum(rate(nginx_ingress_controller_requests{namespace="web",status=~"5.."}[5m]))
+  / sum(rate(nginx_ingress_controller_requests{namespace="web"}[5m]))
+
+# 2. p99 độ trễ của Ingress frontend
+histogram_quantile(0.99,
+  sum by (le) (rate(nginx_ingress_controller_request_duration_seconds_bucket{ingress="frontend"}[5m])))
+
+# 3. Pod available / mong muốn
+kube_deployment_status_replicas_available{namespace="web",deployment="frontend"}
+  / kube_deployment_spec_replicas{namespace="web",deployment="frontend"}
+
+# 4. memory theo % limit của container web
+container_memory_working_set_bytes{namespace="web",container="web"}
+  / on (namespace,pod,container) kube_pod_container_resource_limits{resource="memory"}
+```
+
+Tên metric có thể khác một chút theo phiên bản ingress-nginx và kube-state-metrics; gõ tiền tố vào ô Explore của Grafana để autocomplete trước khi tin vào truy vấn.
+
+Hai metric cuối đến từ trình duyệt. Core Web Vitals thu bằng thư viện `web-vitals` và gửi về một endpoint của bạn (hoặc dịch vụ RUM):
+
+```ts
+import { onCLS, onINP, onLCP } from 'web-vitals';
+
+function report(metric: { name: string; value: number; id: string }) {
+  const body = JSON.stringify({
+    ...metric,
+    release: window.__APP_CONFIG__?.RELEASE,
+  });
+  navigator.sendBeacon('/api/rum', body);
+}
+onCLS(report);
+onINP(report);
+onLCP(report);
+```
+
+`RELEASE` là tag image, đưa vào qua runtime config của Phần 10 (thêm một dòng vào `docker-entrypoint.sh` đọc biến `RELEASE` mà Deployment gán bằng chính tag). Cùng giá trị đó làm `release` cho Sentry, để mỗi lỗi JS gắn với đúng commit và bạn thấy ngay "lỗi tăng vọt từ release sha-a1b2c3d".
+
+### Lệnh xem log hằng ngày
+
+```bash
+# Log của mọi Pod frontend, theo dõi realtime, 100 dòng gần nhất
+kubectl logs -f -l app.kubernetes.io/name=frontend -n web --tail=100
+kubectl logs -f deploy/frontend -n web --all-containers
+kubectl logs --previous <pod> -n web            # log của lần chết trước, khi CrashLoopBackOff
+
+# Log của Ingress controller: nơi thấy MỌI request và mã lỗi, kể cả 502/503 mà Pod không thấy
+kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller -f
+
+# stern (brew install stern): log nhiều Pod cùng lúc, mỗi Pod một màu, lọc theo regex
+stern frontend -n web
+stern -n web -l app.kubernetes.io/name=frontend --since 10m -i "status\":5"
+```
+
+`kubectl logs -l` chỉ trả tối đa 10 Pod mặc định và không tô màu; `stern` là nâng cấp đáng cài đầu tiên. Log của ingress-nginx là chỗ bạn nhìn khi người dùng báo 502 mà `kubectl logs` của app sạch trơn: request chưa bao giờ tới app.
+
+### Alert tối thiểu
+
+Dashboard chỉ có ích khi có người nhìn. Hai alert đầu tiên nên có, viết bằng `PrometheusRule` mà kube-prometheus-stack hiểu:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: frontend
+  namespace: web
+  labels:
+    release: monitoring # để Prometheus của stack nhận rule này
+spec:
+  groups:
+    - name: frontend
+      rules:
+        - alert: FrontendHigh5xx
+          expr: |
+            sum(rate(nginx_ingress_controller_requests{namespace="web",status=~"5.."}[5m]))
+              / sum(rate(nginx_ingress_controller_requests{namespace="web"}[5m])) > 0.05
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            { summary: 'Hơn 5% request frontend trả 5xx trong 5 phút' }
+        - alert: FrontendPodsUnavailable
+          expr: kube_deployment_status_replicas_available{namespace="web",deployment="frontend"} < 2
+          for: 3m
+          labels: { severity: warning }
+```
+
+Nối Alertmanager với Slack hoặc email theo docs của stack. Nguyên tắc: alert phải hành động được (5xx tăng → có người xem), và ít; mười alert kêu mỗi ngày là không có alert nào.
+
+---
+
+## Thực hành
+
+1. **cert-manager trên kind.** Cài cert-manager, apply ClusterIssuer `selfsigned`, đổi annotation trên Ingress `frontend`. `kubectl -n web get certificate` phải READY True trong dưới một phút; `curl -k -I https://app.local/` trả 200.
+
+2. **Cố tình làm kẹt.** Đổi `secretName` thành tên khác trong `tls` nhưng giữ Certificate cũ, hoặc đổi annotation sang issuer không tồn tại `letsencrypt-prod` (chưa tạo trên kind). Đi theo chuỗi `certificate → certificaterequest → order` và ghi lại thông báo lỗi bạn thấy ở đâu.
+
+   > **Kết quả mong đợi:** với issuer không tồn tại, `describe certificate` báo trong Events là không tìm thấy ClusterIssuer; không có Order nào được tạo.
+
+3. **Log JSON.** Thêm `00-log-format.conf` và `access_log /dev/stdout json;` vào image SPA, build, `kind load`, rollout. `kubectl logs` phải in JSON một dòng mỗi request. Cài `stern`, chạy `stern frontend -n web` rồi F5 trang vài lần.
+
+4. **Tự tạo 502 và tìm nó.** `kubectl -n web scale deploy/frontend --replicas=0`, curl `http://app.local/` (503), rồi tìm dòng tương ứng trong log ingress-nginx. Scale lại 3. Ghi nhớ: lỗi này không có trong log của app.
+
+5. **(Tuỳ chọn, máy 16GB) kube-prometheus-stack.** Cài, port-forward Grafana, dán truy vấn số 3 (Pod available/mong muốn) vào Explore và nhìn nó tụt xuống 0 khi lặp lại bước 4.
+
+---
+
+## Tóm tắt
+
+- TLS kết thúc ở Ingress Controller; chứng chỉ nằm trong Secret `kubernetes.io/tls` cùng namespace với Ingress.
+- cert-manager theo dõi annotation `cert-manager.io/cluster-issuer`, tạo chuỗi Certificate → CertificateRequest → Order → Challenge, ghi Secret và gia hạn ở hai phần ba vòng đời.
+- Luôn có ClusterIssuer staging để thử; prod có rate limit 5 lần thất bại mỗi giờ.
+- HTTP-01 cần domain trỏ đúng IP, cổng 80 mở, Cloudflare tắt proxy lúc cấp; không được thì DNS-01, cũng là cách duy nhất cho wildcard.
+- Trên kind dùng issuer `selfSigned`; debug đi từ Certificate sang Challenge, dừng ở mắt xích đầu tiên báo lỗi.
+- Log ra stdout, dạng JSON một dòng; nginx đổi `log_format` ở cấp http.
+- Sáu metric: 5xx ở Ingress, p99, Pod ready, memory % limit, Core Web Vitals, lỗi JS gắn release; hai alert đầu tiên là 5xx và Pod thiếu.
+- `kubectl logs -l`, `--previous`, log của ingress-nginx và `stern` là bộ lệnh xem log hằng ngày.
+
+## Đọc thêm
+
+- [cert-manager](https://cert-manager.io/docs/)
+- [Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/)
+- [Prometheus](https://prometheus.io/docs/)
+- [Grafana](https://grafana.com/docs/)

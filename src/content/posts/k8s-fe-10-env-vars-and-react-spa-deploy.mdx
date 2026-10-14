@@ -1,0 +1,523 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 10 — Biến môi trường build-time vs runtime và deploy React SPA từ A đến Z'
+description: 'Vì sao đổi ConfigMap mà SPA vẫn gọi API staging: Vite đóng băng VITE_* lúc build. Runtime config pattern 6 bước với config.js sinh lúc container start, rồi bộ manifest production-ready cho React SPA: Deployment, Service, Ingress, HPA, PDB.'
+pubDate: 2026-10-27
+lang: vi
+tags: [kubernetes, react, deployment, devops, frontend]
+series: k8s-fe
+seriesOrder: 10
+draft: false
+---
+
+Đây là bài quan trọng nhất của cả series đối với frontend developer. Kịch bản quen thuộc: bạn khai báo `API_URL=https://api.congty.com` trong ConfigMap, mount vào Pod, restart, mở app trên production và Network tab vẫn gọi `api-staging.congty.com`. Hầu hết hướng dẫn K8s trên mạng viết cho backend nên bỏ qua vấn đề này, vì với backend nó không tồn tại. Nửa đầu bài giải thích tận gốc vì sao (Vite đóng băng biến vào bundle lúc build) và đưa ra **runtime configuration pattern** sáu bước để một image chạy được ở mọi môi trường. Nửa sau là Project 1: bộ manifest production-ready deploy một React SPA từ đầu đến cuối, gồm namespace, ConfigMap, Deployment, Service, Ingress, HPA và PodDisruptionBudget, kèm checklist xác nhận thành công.
+
+## Gốc rễ vấn đề
+
+Với backend Node.js, `process.env.API_URL` được đọc **lúc chạy**. Đổi biến môi trường → restart Pod → có giá trị mới. Mọi thứ bạn học ở [Phần 8](/blog/k8s-fe-08-configmap-secret-probes/) về ConfigMap hoạt động đúng như mong đợi.
+
+Với frontend, mọi thứ khác hẳn. Webpack/Vite **thay thế văn bản** `import.meta.env.VITE_API_URL` bằng giá trị chuỗi ngay lúc build. Sau khi build, file JS chứa giá trị đã bị "đóng băng":
+
+```ts
+// Code bạn viết
+const api = import.meta.env.VITE_API_URL;
+
+// Sau npm run build, trong dist/assets/index-a1b2.js thực tế là:
+const api = 'https://api-staging.congty.com'; // GIÁ TRỊ ĐÃ CỨNG
+```
+
+Đây không phải lỗi của Vite mà là thiết kế: trình duyệt không có `process.env`, và việc thay thế tĩnh cho phép minifier loại bỏ code chết (`if (import.meta.env.DEV)` biến mất hoàn toàn khỏi bundle production). CRA làm y hệt với `REACT_APP_*`, Next.js với `NEXT_PUBLIC_*`, Angular với `environment.ts`. Tất cả đều là **build-time**.
+
+Hệ quả trong K8s: bạn khai báo ConfigMap `API_URL=https://api.congty.com`, mount vào Pod, restart Pod, app vẫn gọi staging. Vì biến môi trường của Pod chỉ tác động tới tiến trình **nginx**, còn file JS đã build từ lâu rồi; nginx chỉ phục vụ file, nó không đọc và cũng không sửa nội dung file.
+
+### Bốn hệ quả nghiêm trọng
+
+1. **Phải build lại image cho mỗi môi trường.** Image ở production không phải image đã được QA kiểm thử ở staging; nó là một bản build khác, với dependency có thể đã đổi nếu lockfile lỏng.
+2. **Không thể đổi cấu hình mà không deploy lại.** Đổi API URL, bật feature flag, đổi Sentry environment đều phải chạy lại CI 5–10 phút.
+3. **ConfigMap gần như vô dụng với SPA** nếu làm theo cách mặc định. Bạn vừa học một cơ chế rất hay ở Phần 8 mà không dùng được.
+4. **Rủi ro bảo mật:** mọi biến `VITE_*` / `NEXT_PUBLIC_*` nằm công khai trong file JS mà ai cũng tải về xem được, chỉ cần view-source hoặc mở Network tab.
+
+> **Nguy hiểm:** TUYỆT ĐỐI không đặt API key có quyền ghi, database password hay bất kỳ secret nào vào biến `VITE_*`, `NEXT_PUBLIC_*`, `REACT_APP_*`. Chúng sẽ nằm nguyên văn trong bundle JS gửi tới trình duyệt. Cách tự kiểm tra sau mỗi build: `grep -rl "sk_live\|password\|secret" dist/`. Secret thật phải nằm ở backend hoặc ở tầng server của Next.js; frontend chỉ nên giữ những giá trị vốn dĩ công khai (public key của Stripe, DSN của Sentry, ID của Google Analytics).
+
+---
+
+## Giải pháp: Runtime Configuration Pattern
+
+Ý tưởng: thay vì nhúng giá trị lúc build, ta **sinh một file `config.js` lúc container khởi động** từ biến môi trường, nạp nó trước bundle chính, và app đọc từ `window.__APP_CONFIG__`. Bundle không còn chứa giá trị nào của môi trường; cùng một image, chỉ khác biến môi trường.
+
+```text
+kubectl apply ConfigMap  -->  Pod start  -->  entrypoint đọc env
+                                                  |
+                                                  v
+                               ghi /usr/share/nginx/html/config.js
+                                                  |
+                                                  v
+   Trình duyệt tải index.html --> tải /config.js (no-cache) --> tải bundle
+                                                  |
+                                                  v
+                             app đọc window.__APP_CONFIG__.API_BASE_URL
+```
+
+### Bước 1: Thêm placeholder vào index.html
+
+```html
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <title>My App</title>
+    <!-- Nạp TRƯỚC bundle chính. Không cache file này. -->
+    <script src="/config.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+```
+
+Thẻ script này **cố ý** là script thường (không `type="module"`, không `defer`): nó chặn parser cho tới khi tải xong, đảm bảo `window.__APP_CONFIG__` đã có trước khi bundle (là module, luôn chạy sau) bắt đầu. File chỉ vài trăm byte nên chi phí không đáng kể. Khi `vite dev` chạy, `/config.js` chưa tồn tại và trình duyệt báo 404 trong console; vô hại vì code có fallback ở bước 2, nhưng nếu muốn sạch, đặt một file `public/config.js` chứa giá trị dev (Vite copy nguyên `public/` vào `dist/`, và entrypoint ở bước 3 sẽ ghi đè nó lúc container start).
+
+### Bước 2: Lớp truy cập config trong code
+
+```ts
+// src/config.ts
+type AppConfig = {
+  API_BASE_URL: string;
+  FEATURE_NEW_CHECKOUT: boolean;
+  SENTRY_ENVIRONMENT: string;
+};
+
+declare global {
+  interface Window {
+    __APP_CONFIG__?: Partial<AppConfig>;
+  }
+}
+
+// Ưu tiên config runtime; fallback về env lúc build cho dev local
+export const config: AppConfig = {
+  API_BASE_URL:
+    window.__APP_CONFIG__?.API_BASE_URL ??
+    import.meta.env.VITE_API_BASE_URL ??
+    'http://localhost:3000',
+  FEATURE_NEW_CHECKOUT: window.__APP_CONFIG__?.FEATURE_NEW_CHECKOUT ?? false,
+  SENTRY_ENVIRONMENT:
+    window.__APP_CONFIG__?.SENTRY_ENVIRONMENT ?? 'development',
+};
+```
+
+Toàn bộ app chỉ `import { config } from '~/config'`, không đụng `window.__APP_CONFIG__` hay `import.meta.env` ở chỗ nào khác. Nhờ vậy, sau này đổi cơ chế (ví dụ chuyển sang gọi `/api/config`) chỉ sửa một file. `Partial` ở khai báo global là cố ý: `config.js` có thể thiếu key khi ai đó quên khai biến, và fallback sẽ lên tiếng thay vì `undefined` lan khắp app.
+
+### Bước 3: Script entrypoint sinh config.js lúc khởi động
+
+```bash
+#!/bin/sh
+# docker-entrypoint.sh
+set -e
+
+CONFIG_FILE=/usr/share/nginx/html/config.js
+
+cat > "$CONFIG_FILE" <<EOF
+window.__APP_CONFIG__ = {
+  API_BASE_URL: "${API_BASE_URL:-http://localhost:3000}",
+  FEATURE_NEW_CHECKOUT: ${FEATURE_NEW_CHECKOUT:-false},
+  SENTRY_ENVIRONMENT: "${SENTRY_ENVIRONMENT:-development}"
+};
+EOF
+
+echo "[entrypoint] Da sinh config.js:"
+cat "$CONFIG_FILE"
+
+# exec quan trọng: nginx trở thành PID 1, nhận được SIGTERM đúng cách
+exec "$@"
+```
+
+Vài chi tiết dễ sai:
+
+- Cú pháp `${VAR:-default}` của shell: dùng giá trị `VAR` nếu có, không thì dùng default. Nhờ nó, `docker run` không truyền biến vẫn chạy được với giá trị dev.
+- Chuỗi phải nằm trong nháy kép, boolean và số thì không. Nếu một giá trị có thể chứa dấu `"` hay ký tự lạ, script này sẽ sinh JS hỏng và app trắng trang; giữ giá trị config đơn giản (URL, flag, tên môi trường), hoặc sinh JSON bằng `jq -n --arg` nếu image có `jq`.
+- `echo` + `cat` để log ra stdout: `kubectl logs <pod>` sẽ hiện đúng nội dung `config.js` Pod đó đang phục vụ, là cách nhanh nhất để debug "sai API URL".
+- File phải có quyền thực thi và **kết thúc dòng LF**. Script lưu từ Windows với CRLF sẽ lỗi `/bin/sh^M: bad interpreter` hoặc `not found`, một lỗi rất khó hiểu nếu chưa gặp. Thêm `*.sh text eol=lf` vào `.gitattributes`.
+
+### Bước 4: Cập nhật Dockerfile
+
+```dockerfile
+# ---------- STAGE 2: RUNTIME ----------
+FROM nginx:1.27-alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY docker-entrypoint.sh /docker-entrypoint.d/40-app-config.sh
+RUN chmod +x /docker-entrypoint.d/40-app-config.sh
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+> **Mẹo:** Image nginx chính thức tự động chạy mọi script `*.sh` có quyền thực thi trong `/docker-entrypoint.d/` (theo thứ tự tên, nên tiền tố số như `40-` có ý nghĩa) trước khi khởi động nginx. Đặt script vào đó là cách sạch nhất, không cần ghi đè `ENTRYPOINT`. Ở vị trí này, entrypoint của nginx tự `exec nginx` sau khi chạy script của bạn, nên dòng `exec "$@"` không có tác dụng gì (vô hại). Dòng đó chỉ thật sự cần khi bạn tự đặt `ENTRYPOINT ["/docker-entrypoint.sh"]` với image khác; khi ấy thiếu `exec`, shell là PID 1 và nginx không nhận được SIGTERM, hậu quả bạn đã thấy ở Phần 9.
+
+Stage 1 (build) giữ nguyên như Phần 4. Đừng quên đưa `docker-entrypoint.sh` ra khỏi `.dockerignore` nếu bạn đang ignore `*.sh`.
+
+### Bước 5: Không cache config.js
+
+```nginx
+location = /config.js {
+  add_header Cache-Control "no-cache, no-store, must-revalidate";
+  expires -1;
+}
+```
+
+Nếu `config.js` bị cache ở trình duyệt hoặc CDN, đổi ConfigMap xong người dùng vẫn nhận giá trị cũ, và bạn quay về đúng vấn đề ban đầu với một lớp khó hiểu hơn. `no-store` là bắt buộc; [Phần 12](/blog/k8s-fe-12-cache-cdn-zero-downtime/) sẽ đặt nó trong bức tranh cache tổng thể.
+
+### Bước 6: Khai báo trong Kubernetes
+
+```yaml
+envFrom:
+  - configMapRef:
+      name: frontend-config # chứa API_BASE_URL, FEATURE_NEW_CHECKOUT...
+```
+
+Từ đây, ConfigMap ở Phần 8 hoạt động đúng với SPA: biến vào Pod → entrypoint đọc → `config.js` → trình duyệt. Đổi ConfigMap vẫn cần `kubectl rollout restart` (biến env chỉ đọc lúc start), nhưng không cần build.
+
+### Kết quả đạt được
+
+- Một image duy nhất chạy được ở mọi môi trường.
+- Image đã QA ở staging chính là image lên production.
+- Đổi API URL chỉ cần sửa ConfigMap + `kubectl rollout restart`, không build lại.
+- Feature flag bật/tắt trong vài giây.
+- Thời gian CI/CD giảm đáng kể: một lần build, nhiều lần deploy.
+
+### Các giải pháp thay thế
+
+| Cách                                      | Ưu / nhược                                                                                                                                                                  |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config.js` runtime (ở trên)              | Đơn giản, hiệu quả, không phụ thuộc gì. **Khuyến nghị.**                                                                                                                    |
+| `envsubst` thay placeholder trong file JS | Hoạt động (đặt `__API_URL__` trong code, `envsubst` hoặc `sed` lúc start) nhưng mong manh: minifier đổi cách nối chuỗi là hỏng, và phải quét toàn bộ `dist/` mỗi lần start. |
+| Gọi `/api/config` lúc app khởi động       | Linh hoạt nhất (config đổi không cần restart), nhưng thêm một round-trip mạng trước khi render, và phải xử lý trạng thái "chưa có config".                                  |
+| Build riêng cho từng môi trường           | Đơn giản nhất nhưng đánh mất tính "test cái gì thì deploy cái đó". Chỉ chấp nhận được với dự án nhỏ, một môi trường.                                                        |
+
+Với Next.js, biến server-side đọc runtime được sẵn nên không cần pattern này ở phía server, nhưng `NEXT_PUBLIC_*` vẫn là build-time; [Phần 11](/blog/k8s-fe-11-nextjs-ssr-and-micro-frontends/) bàn cách truyền config từ server component xuống client.
+
+### Thực hành 10.1: một image, hai môi trường
+
+Áp dụng đủ 6 bước vào app Vite ở Phần 4. Build image, rồi chạy **hai container từ cùng một image** với hai biến khác nhau:
+
+```bash
+docker build -t my-app:v2 .
+docker run -d -p 8081:80 -e API_BASE_URL=https://api-dev.test my-app:v2
+docker run -d -p 8082:80 -e API_BASE_URL=https://api-prod.test my-app:v2
+```
+
+Mở console trình duyệt ở `localhost:8081` và `localhost:8082`, gõ `window.__APP_CONFIG__`. Hai giá trị phải khác nhau. Kiểm tra thêm `docker logs <container>` để thấy dòng `[entrypoint] Da sinh config.js`, và `curl -I localhost:8081/config.js` để thấy header `Cache-Control: no-store`.
+
+> **Kết quả mong đợi:** `API_BASE_URL` khác nhau ở hai cổng dù image giống hệt. Khoảnh khắc này là lúc bạn thật sự hiểu vấn đề. Nếu cả hai đều ra `http://localhost:3000`, script chưa chạy: kiểm tra `chmod +x`, đuôi `.sh`, và CRLF.
+
+---
+
+## Project 1: Deploy React SPA từ A đến Z
+
+Tất cả những gì học từ Phần 5 tới Phần 9 gom vào một bộ manifest bạn có thể dùng làm khuôn cho mọi SPA sau này.
+
+### Cấu trúc thư mục dự án
+
+```text
+my-frontend/
+├── src/
+├── public/
+├── package.json
+├── Dockerfile
+├── .dockerignore
+├── nginx.conf
+├── docker-entrypoint.sh
+└── k8s/
+    ├── namespace.yaml
+    ├── configmap.yaml
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── ingress.yaml
+    ├── pdb.yaml
+    └── hpa.yaml
+```
+
+Manifest nằm cạnh source trong cùng repo: sửa app và sửa hạ tầng đi cùng một pull request, và ai clone repo đều dựng lại được từ đầu. Khi có nhiều môi trường, thư mục này tiến hoá thành Helm chart hoặc Kustomize overlay ở Phần 15.
+
+### 1. Namespace
+
+```yaml
+# k8s/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: web
+  labels:
+    name: web
+```
+
+### 2. ConfigMap
+
+```yaml
+# k8s/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: web
+data:
+  API_BASE_URL: 'https://api.congty.com'
+  FEATURE_NEW_CHECKOUT: 'true'
+  SENTRY_ENVIRONMENT: 'production'
+```
+
+Đúng ba key mà `docker-entrypoint.sh` đọc. Thêm biến mới là sửa ba chỗ: script, `config.ts`, ConfigMap.
+
+### 3. Deployment hoàn chỉnh (bản production-ready)
+
+```yaml
+# k8s/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: web
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/component: web
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frontend
+        app.kubernetes.io/component: web
+    spec:
+      terminationGracePeriodSeconds: 30
+      # Trải Pod ra nhiều node để 1 node chết không sập toàn bộ
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: frontend
+      containers:
+        - name: web
+          image: ghcr.io/my-org/frontend:v1.4.2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          envFrom:
+            - configMapRef:
+                name: frontend-config
+          resources:
+            requests:
+              cpu: 25m
+              memory: 48Mi
+            limits:
+              cpu: 300m
+              memory: 192Mi
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ['/bin/sh', '-c', 'sleep 5 && nginx -s quit']
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ['ALL']
+```
+
+So với Deployment tối giản ở Phần 6, bản này thêm những gì và vì sao:
+
+- **`revisionHistoryLimit: 5`**: giữ 5 ReplicaSet cũ để `rollout undo`, thay vì mặc định 10, đỡ rác.
+- **Label chuẩn `app.kubernetes.io/*`**: công cụ bên thứ ba (Grafana dashboard, cost tool, ArgoCD) nhận diện được app.
+- **`maxSurge: 1, maxUnavailable: 0`**: mỗi lượt tạo thêm một Pod mới, chờ ready, rồi mới tắt một Pod cũ. Không lúc nào thiếu Pod.
+- **`topologySpreadConstraints`**: ba Pod trải trên ba node khác nhau; `ScheduleAnyway` để cluster ít node (như kind một worker) vẫn xếp được thay vì Pending.
+- **Cổng có tên `http`** và probe dùng `port: http`: đổi cổng container sau này chỉ sửa một chỗ.
+- **`envFrom`** đưa ConfigMap vào entrypoint, khép kín pattern ở nửa đầu bài.
+- **Resources** theo gợi ý cho SPA nginx ở Phần 9, **probe** theo Phần 8, **preStop** theo Phần 9.
+- **`securityContext`** chặn leo thang đặc quyền và bỏ mọi capability; đây là mức cơ bản, Phần 18 làm cứng thêm.
+
+> **Ghi chú:** Image nginx chính thức chạy master process bằng root, cần vài capability để đổi user cho worker và bind cổng 80. Nếu sau khi apply Pod rơi vào `CrashLoopBackOff` với log `setgid() failed` hoặc `bind() to 0.0.0.0:80 failed (13: Permission denied)`, thêm `add: ["CHOWN", "SETGID", "SETUID", "NET_BIND_SERVICE"]` dưới `capabilities`, hoặc tốt hơn là chuyển sang image `nginxinc/nginx-unprivileged` (listen 8080, chạy non-root) và đổi `containerPort` thành 8080. Hành vi này phụ thuộc runtime và phiên bản image; kiểm tra bằng `kubectl logs` chứ đừng đoán.
+
+### 4. Service
+
+```yaml
+# k8s/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+`targetPort: http` trỏ tới **tên cổng** trong Deployment. Selector dùng đúng một label `app.kubernetes.io/name`, khớp `spec.selector` của Deployment.
+
+### 5. Ingress kèm HTTPS
+
+```yaml
+# k8s/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend
+  namespace: web
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: 'true'
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-Frame-Options: SAMEORIGIN";
+      more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ['app.congty.com']
+      secretName: frontend-tls
+  rules:
+    - host: app.congty.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port: { number: 3000 }
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port: { number: 80 }
+```
+
+Ba security header đặt ở Ingress thay vì trong `nginx.conf` của từng image để mọi app trong cluster nhận cùng một chính sách. Annotation `cert-manager.io/cluster-issuer` chỉ có tác dụng khi cluster đã cài cert-manager ([Phần 17](/blog/k8s-fe-17-cert-manager-and-observability/)); trên kind, bỏ khối `tls` và annotation đó, đổi `host` thành `app.local`. Path `/api` trỏ tới Service `backend` giả định đã tồn tại trong namespace `web`; chưa có backend thì xoá path này, hoặc deploy `kennethreitz/httpbin` làm backend giả.
+
+### 6. PodDisruptionBudget: bảo vệ khi bảo trì cluster
+
+```yaml
+# k8s/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+  namespace: web
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+```
+
+PDB đảm bảo khi admin drain node để nâng cấp, K8s không được phép hạ số Pod xuống dưới 2. Không có PDB, một lần bảo trì có thể khiến toàn bộ Pod bị di chuyển cùng lúc → downtime. PDB chỉ chặn **voluntary disruption** (drain, autoscaler thu node), không cứu được node chết đột ngột; với node chết, `topologySpreadConstraints` ở trên mới là thứ bảo vệ bạn.
+
+### 7. HPA: tự co giãn theo CPU
+
+```yaml
+# k8s/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend
+  namespace: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70 # % so với requests.cpu
+```
+
+HPA cần hai điều kiện: cluster có **metrics-server** (kind không có sẵn; không có thì cột TARGETS hiện `unknown` và HPA không làm gì), và container có khai `resources.requests.cpu` để tính phần trăm. Với SPA tĩnh, ba Pod nginx chịu được hàng nghìn request/giây nên HPA hiếm khi kích hoạt; nó nằm trong bộ manifest để làm khuôn cho Next.js SSR, nơi nó thật sự quan trọng. Chi tiết `behavior`, scale theo memory và cách test tải ở [Phần 14](/blog/k8s-fe-14-rollout-strategies-and-autoscaling/).
+
+### 8. Triển khai
+
+```bash
+docker build -t frontend:v1.4.2 .
+kind load docker-image frontend:v1.4.2 --name fe-lab
+# Trên kind, sửa image trong deployment.yaml thành frontend:v1.4.2 (không có ghcr.io/)
+
+kubectl apply -f k8s/namespace.yaml # namespace phải có trước
+kubectl apply -f k8s/ # rồi mới apply cả thư mục
+kubectl -n web get all
+kubectl -n web rollout status deploy/frontend
+# deployment "frontend" successfully rolled out
+kubectl -n web get ingress
+```
+
+`kubectl apply -f k8s/` áp dụng file theo thứ tự bảng chữ cái, nên `namespace.yaml` chạy sau `deployment.yaml` và lần apply đầu tiên sẽ báo `namespaces "web" not found` cho vài file. Apply namespace riêng trước là cách đơn giản nhất; Helm và Kustomize sau này tự lo thứ tự này.
+
+### Checklist xác nhận thành công
+
+- `kubectl -n web get pods` → 3 Pod, cột READY là `1/1`.
+- `kubectl -n web get endpoints frontend` → có 3 IP.
+- `curl -H "Host: app.local" http://localhost/` → trả HTML.
+- Mở `/about`, F5 → không 404.
+- Console trình duyệt: `window.__APP_CONFIG__` → đúng giá trị ConfigMap.
+- `kubectl -n web logs deploy/frontend | head` → thấy dòng `[entrypoint] Da sinh config.js` với đúng giá trị.
+
+> **Kết quả mong đợi:** Cả sáu dòng đều đúng. Sai ở dòng nào, quay lại phần tương ứng: READY `0/1` là probe (Phần 8), endpoints rỗng là selector (Phần 7), 404 khi F5 là `try_files` (Phần 4), giá trị config sai là ConfigMap chưa `rollout restart` hoặc `config.js` bị cache.
+
+---
+
+## Sai lầm hay gặp khi deploy SPA lần đầu
+
+- **Quên `kind load docker-image`** hoặc để nguyên `ghcr.io/my-org/...` trong manifest khi test local → `ImagePullBackOff`. Với kind, `imagePullPolicy: IfNotPresent` là bắt buộc để K8s dùng image đã nạp.
+- **Sửa ConfigMap rồi chỉ F5** → giá trị cũ. Cần `kubectl -n web rollout restart deploy/frontend`, vì entrypoint chỉ chạy lúc container start.
+- **Trình duyệt cache `config.js` hoặc `index.html`** → sau rollout vẫn thấy giá trị cũ ở một số máy. Kiểm tra header bằng `curl -I`, xem Phần 12.
+- **Thêm biến mới vào ConfigMap nhưng quên sửa `docker-entrypoint.sh`** → biến vào Pod (`env` thấy) nhưng không vào `config.js`. `kubectl exec <pod> -- cat /usr/share/nginx/html/config.js` là lệnh phân xử.
+- **`securityContext` quá chặt với image nginx root** → `CrashLoopBackOff` với `setgid() failed`; xem ghi chú ở mục Deployment.
+- **Deploy rồi Ingress trả 404 của ingress-nginx** → thiếu header Host khi curl, hoặc `host` trong Ingress không khớp `/etc/hosts`.
+
+---
+
+## Tóm tắt
+
+- Vite, CRA, Next.js `NEXT_PUBLIC_*` đều **thay thế tĩnh** biến môi trường lúc build; ConfigMap không sửa được file JS đã build. Đây là khác biệt căn bản giữa frontend và backend trên K8s.
+- **Runtime config pattern**: `index.html` nạp `/config.js` trước bundle; `config.ts` đọc `window.__APP_CONFIG__` với fallback về `import.meta.env`; script trong `/docker-entrypoint.d/` sinh `config.js` từ env lúc container start; nginx đặt `no-store` cho `config.js`; K8s đưa ConfigMap vào bằng `envFrom`.
+- Kết quả: một image cho mọi môi trường, image QA ở staging chính là image lên production, đổi config chỉ cần `rollout restart`.
+- Không bao giờ để secret thật trong `VITE_*` / `NEXT_PUBLIC_*`; kiểm tra bằng `grep` trên `dist/`.
+- Bộ manifest production-ready gồm namespace, ConfigMap, Deployment (RollingUpdate `maxUnavailable: 0`, topology spread, probe, preStop, securityContext), Service với named port, Ingress kèm TLS và security header, PDB `minAvailable: 2`, HPA. Apply namespace trước, rồi cả thư mục.
+- Xác nhận bằng sáu dòng checklist; mỗi dòng sai trỏ về đúng một phần trước đó của series.
+
+## Đọc thêm
+
+- [Env Variables and Modes](https://vite.dev/guide/env-and-mode) trong docs Vite: vì sao `VITE_*` là build-time
+- [ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/) trong docs Kubernetes
+- [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/) trong docs Kubernetes
+- Bài [Vite env vars và modes](/blog/vite-08-env-vars-modes/) trong blog này về `.env.*` và `import.meta.env` ở tầng build
+
+[Phần 11](/blog/k8s-fe-11-nextjs-ssr-and-micro-frontends/) là Project 2: Next.js SSR, nơi tiến trình Node.js phải luôn chạy, khởi động chậm, cần `startupProbe`, và ISR cache không chia sẻ giữa các Pod; rồi cách đặt nhiều app trên một domain và micro-frontend.

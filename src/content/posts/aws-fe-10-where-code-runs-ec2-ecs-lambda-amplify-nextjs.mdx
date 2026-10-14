@@ -1,0 +1,284 @@
+---
+title: 'AWS cho Frontend Developer · Phần 10 — Nơi code chạy: EC2, ECS, Lambda, Amplify và deploy Next.js'
+description: 'So sánh EC2, ECS Fargate, Lambda, App Runner và Amplify Hosting; ba kiểu render CSR/SSG/SSR lên AWS thế nào; bốn con đường deploy Next.js kèm Dockerfile chạy được; và ba kiến trúc tham chiếu từ SPA tĩnh tới SSR.'
+pubDate: 2026-10-26
+lang: vi
+tags: [aws, nextjs, docker, serverless, devops]
+series: aws-fe
+seriesOrder: 10
+draft: false
+---
+
+Frontend thuần tĩnh chỉ cần S3 và CloudFront, không có máy chủ nào chạy. Nhưng khi bạn làm Next.js hoặc Nuxt có SSR, API route, ISR, thì code của bạn phải **chạy ở đâu đó** mỗi khi có request — và AWS có tới năm nơi để chọn, mỗi nơi một cách đóng gói, một cách tính tiền, một kiểu lỗi riêng.
+
+Bài này trả lời câu hỏi target đứng sau ALB ở [Phần 9](/blog/aws-fe-09-alb-gateway-to-backend/) thực ra là gì. Đọc xong bạn phân biệt được EC2, ECS Fargate, Lambda, App Runner và Amplify Hosting; biết CSR, SSG, SSR cần hạ tầng gì; có trong tay một Dockerfile Next.js chạy được trên ECS; và chọn được một trong bốn con đường deploy Next.js phù hợp với team mình thay vì đi theo bài blog nào đó.
+
+---
+
+## So sánh các nơi chạy code
+
+| Dịch vụ             | Là gì                                           | Ưu                                                                                | Nhược / lưu ý cho frontend                                          |
+| ------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| **EC2**             | Máy chủ ảo. Bạn tự cài mọi thứ                  | Toàn quyền kiểm soát                                                              | Tự vá lỗi bảo mật, tự cấu hình, tự scale. Frontend ít khi cần       |
+| **ECS Fargate**     | Chạy Docker container, AWS lo máy chủ           | Không quản lý server, scale dễ, hợp Node.js SSR                                   | Phải biết Docker. Task khởi động ~30–60s                            |
+| **Lambda**          | Hàm chạy theo sự kiện, tính tiền theo mili giây | Không dùng không trả tiền, tự scale                                               | Cold start 100ms–2s. Tối đa 15 phút/lần chạy. Payload giới hạn 6 MB |
+| **App Runner**      | Đưa container hoặc repo, AWS lo phần còn lại    | Đơn giản nhất cho container: HTTPS, scale, deploy có sẵn                          | Ít tuỳ biến, đắt hơn Fargate khi tải cao                            |
+| **Amplify Hosting** | Nền tảng chuyên cho frontend, kết nối Git       | Dễ nhất cho frontend: CI/CD, preview theo PR, SSR Next.js, domain + HTTPS tự động | Ít kiểm soát chi tiết. Chi phí build tính theo phút                 |
+
+Cách chọn nhanh, theo thứ tự câu hỏi:
+
+1. **Có SSR không?** Không → S3 + CloudFront, bài này không cần đọc tiếp phần compute.
+2. **Team có DevOps không?** Không → Amplify Hosting. Có → xem câu 3.
+3. **Backend đang chạy ở đâu?** Đã có ECS → đưa Next.js vào ECS cho đồng nhất pipeline, log, alarm. Đang serverless → OpenNext trên Lambda.
+4. **Tải có thất thường không?** Rất thất thường (0 request ban đêm, bùng nổ giờ cao điểm) → Lambda rẻ hơn hẳn. Tải đều → Fargate rẻ và dễ đoán hơn.
+5. **EC2** chỉ khi có lý do cụ thể: cần GPU, cần tiến trình nền dài, hoặc có sẵn hệ thống quản trị EC2.
+
+### ECS Fargate trong năm khái niệm
+
+Bạn sẽ gặp ECS nhiều nhất trong công ty, nên cần năm từ để nói chuyện được với DevOps:
+
+| Khái niệm           | Tương đương với thứ bạn biết                                                                                                 |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| **ECR**             | Docker Hub riêng của tài khoản AWS. Image của bạn được `docker push` lên đây                                                 |
+| **Task definition** | "Docker Compose service" viết bằng JSON: image nào, cổng nào, CPU/RAM, biến môi trường, secret, log đi đâu                   |
+| **Task**            | Một container (hoặc nhóm container) đang chạy từ task definition. Tương đương `docker run`                                   |
+| **Service**         | Giữ đúng N task luôn chạy, đăng ký chúng vào target group của ALB, thay task hỏng, rolling deploy khi có task definition mới |
+| **Cluster**         | Hộp chứa logic cho service và task. Với Fargate, bạn không quản lý máy nào trong cluster                                     |
+
+Vòng đời deploy một backend hay Next.js SSR lên ECS gọn lại thành: build image → push ECR → đăng ký task definition mới (revision tăng) → cập nhật service → ECS chạy task mới, chờ ALB health check khoẻ → dừng task cũ sau deregistration delay.
+
+```bash
+# Đăng nhập ECR rồi push image (thay account id và region của bạn)
+aws ecr get-login-password --region ap-southeast-1 \
+  | docker login --username AWS --password-stdin 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com
+
+docker build -t web:$(git rev-parse --short HEAD) .
+docker tag web:$(git rev-parse --short HEAD) 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/web:$(git rev-parse --short HEAD)
+docker push 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/web:$(git rev-parse --short HEAD)
+
+# Ép service lấy task definition mới nhất (sau khi đăng ký revision mới)
+aws ecs update-service --cluster prod --service web --force-new-deployment
+```
+
+> **Ghi chú:** tag image bằng commit SHA chứ không phải `latest`. `latest` làm bạn không biết production đang chạy code nào, và rollback trở thành đoán mò. Cùng nguyên tắc với "gắn tag có chủ đích" ở [Docker phần 2](/blog/docker-02-images-and-dockerfile/).
+
+---
+
+## Ba kiểu render và cách chúng lên AWS
+
+| Kiểu               | Cơ chế                                 | Hạ tầng AWS cần                                  | Phù hợp                                                        |
+| ------------------ | -------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------- |
+| **CSR** (SPA)      | Trả HTML rỗng + JS. Trình duyệt render | S3 + CloudFront. Không cần server                | Dashboard, app nội bộ, chỗ không cần SEO                       |
+| **SSG** (tĩnh hoá) | Build sinh sẵn HTML cho từng trang     | S3 + CloudFront. Không cần server                | Blog, tài liệu, landing page. SEO tốt, rẻ nhất, nhanh nhất     |
+| **SSR**            | Server render HTML cho từng request    | Cần compute: Amplify, ECS, Lambda, hoặc OpenNext | Thương mại điện tử, nội dung cá nhân hoá, SEO cho dữ liệu động |
+
+Điểm phải nhớ: **CSR và SSG là cùng một hạ tầng**. Khác biệt chỉ ở nội dung file HTML mà build tool sinh ra. Mọi thứ bạn học ở [Phần 4](/blog/aws-fe-04-s3-where-your-build-lives/) và [Phần 7](/blog/aws-fe-07-cloudfront-cache-strategy-invalidation-spa-routing/) áp dụng nguyên xi cho SSG, chỉ khác là SSG có nhiều file HTML thay vì một `index.html`, và mỗi file HTML đó cũng phải `no-cache, must-revalidate`.
+
+SSR là nơi mọi thứ đổi khác: có một tiến trình Node chạy 24/7 (hoặc một hàm Lambda thức dậy mỗi request), có health check, có timeout, có cold start, có biến môi trường lúc chạy. Toàn bộ [Phần 9](/blog/aws-fe-09-alb-gateway-to-backend/) đột nhiên áp dụng cho chính frontend của bạn.
+
+> **Ghi chú:** rất nhiều dự án dùng SSR mà không thực sự cần. Nếu nội dung không đổi theo từng người dùng, hãy cân nhắc SSG + ISR: bạn tiết kiệm được toàn bộ tầng compute, chi phí gần như bằng 0, và tốc độ luôn thắng vì HTML đã nằm sẵn ở edge. Câu hỏi đúng không phải "framework hỗ trợ SSR không" mà là "trang này có gì khác nhau giữa hai người dùng".
+
+ISR (Incremental Static Regeneration) nằm ở giữa: trang được sinh tĩnh nhưng tự sinh lại nền sau N giây. Nó vẫn cần một tiến trình để sinh lại, nên hạ tầng của ISR là hạ tầng SSR (Amplify hoặc OpenNext), chỉ khác là phần lớn request được trả từ cache.
+
+---
+
+## Deploy Next.js lên AWS — bốn con đường
+
+| Cách                     | Cách hoạt động                                                                     | Độ khó     | Chọn khi                                                |
+| ------------------------ | ---------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------- |
+| **Amplify Hosting**      | Kết nối GitHub, Amplify tự nhận diện Next.js, tự dựng CloudFront + Lambda phía sau | Dễ nhất    | Mặc định nên chọn nếu team không có DevOps              |
+| **OpenNext + CDK/SST**   | Đóng gói Next.js thành Lambda + S3 + CloudFront                                    | Trung bình | Muốn serverless, kiểm soát hạ tầng, tối ưu chi phí      |
+| **Docker → ECS Fargate** | `next build` + `next start` trong container, sau ALB                               | Trung bình | Team đã dùng ECS cho backend, muốn đồng nhất            |
+| **`output: 'export'`**   | Xuất HTML tĩnh hoàn toàn                                                           | Dễ         | Không dùng SSR, API route, ISR. Chỉ cần S3 + CloudFront |
+
+### Con đường 1: Amplify Hosting
+
+Bạn kết nối repo, chọn nhánh, Amplify phát hiện Next.js và tự sinh file build spec. Nó dựng sẵn CloudFront, Lambda cho phần server, S3 cho asset, cấp domain `*.amplifyapp.com` kèm HTTPS, và bật preview cho mỗi pull request bằng một ô tick. Build spec mặc định trông như sau, bạn sửa khi cần thêm bước:
+
+```yaml
+# amplify.yml
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - npm ci
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    baseDirectory: .next
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
+```
+
+Hai điều cần biết trước khi tin tưởng nó hoàn toàn: biến `NEXT_PUBLIC_*` khai báo trong Environment variables của Amplify và được nhúng lúc build như mọi nơi khác ([Phần 12](/blog/aws-fe-12-env-vars-build-time-runtime-secrets/)); còn biến server-side muốn đọc lúc runtime thì Amplify yêu cầu bạn ghi chúng vào `.env.production` trong bước build (kiểm tra docs Amplify hiện tại cho cú pháp chính xác). Và chi phí build tính theo phút: một repo build 8 phút, 30 lần/ngày là con số đáng nhìn lại cuối tháng.
+
+### Con đường 2: OpenNext + CDK hoặc SST
+
+OpenNext là adapter mã nguồn mở đọc output của `next build` và chia nó thành các phần deploy được trên AWS: một hàm Lambda cho server (SSR, API route, ISR revalidate), asset tĩnh vào S3, và một CloudFront distribution nối tất cả lại. SST (hoặc CDK construct tương đương) là lớp khai báo hạ tầng đứng trên OpenNext để bạn không phải tự viết từng resource.
+
+Bạn chọn con đường này khi muốn trả tiền theo request thật (tải thất thường, dự án cá nhân, MVP) và vẫn giữ toàn quyền với CloudFront, cache, domain. Đổi lại bạn nhận cold start của Lambda (100ms–2s cho request đầu tiên sau khi hàm ngủ) và một lớp tooling phải theo dõi phiên bản, vì Next.js đổi nhanh và adapter phải chạy theo.
+
+### Con đường 3: Docker → ECS Fargate
+
+Đây là con đường "đồng nhất với backend": Next.js chỉ là thêm một service trong cluster đã có, dùng lại pipeline, ALB, log, alarm. Điều kiện tiên quyết trong `next.config.js`:
+
+```js
+// next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  // Sinh thư mục .next/standalone chứa server.js + đúng node_modules cần thiết
+  output: 'standalone',
+};
+
+module.exports = nextConfig;
+```
+
+Dockerfile ba giai đoạn, chạy được ngay:
+
+```dockerfile
+# Giai đoạn 1: cài dependency
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Giai đoạn 2: build
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+# Biến build-time phải có mặt Ở ĐÂY, lúc build
+ARG NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+RUN npm run build
+
+# Giai đoạn 3: chạy — image nhỏ, không có source code
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+# Cần "output: 'standalone'" trong next.config.js
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+EXPOSE 3000
+# QUAN TRỌNG: lắng nghe 0.0.0.0, không phải localhost,
+# nếu không ALB health check sẽ luôn fail
+ENV HOSTNAME=0.0.0.0 PORT=3000
+CMD ["node", "server.js"]
+```
+
+Build và thử ở local trước khi đụng tới AWS:
+
+```bash
+docker build --build-arg NEXT_PUBLIC_API_URL=https://api.example.com -t web:dev .
+docker run --rm -p 3000:3000 web:dev
+curl -s http://localhost:3000/api/healthz   # phải trả 200 ngay lập tức
+```
+
+Đừng quên `.dockerignore` với `node_modules`, `.next`, `.git`, `.env*` — thiếu nó, `COPY . .` chép cả `node_modules` của máy bạn vào image và build chậm gấp nhiều lần.
+
+> **Cạm bẫy:** ba lỗi hay gặp khi container hoá frontend:
+>
+> 1. **Lắng nghe sai địa chỉ.** `localhost` bên trong container không cho ALB gọi vào. Phải là `0.0.0.0` — với Next.js standalone là biến `HOSTNAME=0.0.0.0`.
+> 2. **Quên biến build-time.** `NEXT_PUBLIC_*` được nhúng vào bundle lúc `next build`. Truyền nó vào task definition lúc runtime là vô nghĩa: bundle đã chứa giá trị rỗng từ lúc build. Phải đi qua `ARG` + `ENV` ở giai đoạn builder như Dockerfile trên.
+> 3. **Không có endpoint health.** ALB gọi `/` mà trang chủ redirect hoặc render chậm → health check fail → 503. Tạo `app/api/healthz/route.ts` trả 200 ngay lập tức và trỏ target group vào đó.
+
+Trên ECS, task definition khai `containerPort: 3000`, log driver `awslogs` để `console.log` đổ vào CloudWatch, CPU/RAM tối thiểu 0.5 vCPU / 1 GB cho Next.js (bản 0.25 vCPU thường bị cold render quá chậm và fail health check khi khởi động). Cách viết Dockerfile gọn và an toàn hơn nữa ở [Docker phần 7](/blog/docker-07-optimizing-securing-images/); cùng bài toán nhưng deploy lên Kubernetes ở [K8s phần 11](/blog/k8s-fe-11-nextjs-ssr-and-micro-frontends/).
+
+### Con đường 4: `output: 'export'`
+
+Nếu app không dùng SSR, API route, ISR, middleware động, `next build` với `output: 'export'` sinh thư mục `out/` toàn HTML/JS/CSS tĩnh. Bạn deploy nó y hệt một SPA ở [Phần 4](/blog/aws-fe-04-s3-where-your-build-lives/):
+
+```js
+// next.config.js
+const nextConfig = {
+  output: 'export',
+  // Sinh /about/index.html thay vì /about.html — khớp với cách
+  // CloudFront Function thêm index.html cho path kết thúc bằng /
+  trailingSlash: true,
+  // next/image cần server để tối ưu; export tĩnh phải tắt
+  images: { unoptimized: true },
+};
+```
+
+Hai điểm hay vấp: `next/image` mặc định cần server tối ưu ảnh nên phải `unoptimized: true` (hoặc dùng loader ngoài); và route động (`/products/[id]`) phải khai `generateStaticParams` để build biết sinh trang nào — không có, trang đó không tồn tại trong `out/` và F5 sẽ 403 như mọi SPA.
+
+---
+
+## Kiến trúc tham chiếu — ba mức độ
+
+### Mức 1: SPA tĩnh (đơn giản nhất, rẻ nhất)
+
+```text
+Route 53 ──► CloudFront ──► S3 (build tĩnh)
+                 │
+                 └─ "/api/*" ──► API Gateway ──► Lambda ──► DynamoDB
+```
+
+Chi phí gần như bằng 0 khi ít truy cập. Không có máy chủ nào chạy 24/7. Đây là kiến trúc cho portfolio, MVP, dự án cá nhân, và cho phần lớn dashboard nội bộ. API Gateway và Lambda ở [Phần 11](/blog/aws-fe-11-api-gateway-and-cognito/).
+
+### Mức 2: SPA + backend container (phổ biến nhất ở công ty)
+
+```text
+Route 53 ──► CloudFront ──┬─ "*"      ──► S3 (build tĩnh)
+                          └─ "/api/*" ──► ALB ──► ECS Fargate ──► RDS
+                                                       │
+                                                  ElastiCache
+```
+
+Chi phí khoảng 30–80 USD/tháng cho môi trường nhỏ, vì ALB + Fargate + RDS luôn chạy. Frontend và API cùng một tên miền qua CloudFront nên không có CORS, cookie `httpOnly` dùng được thẳng.
+
+### Mức 3: SSR
+
+```text
+Route 53 ──► CloudFront ──┬─ "/_next/static/*" ──► S3 (cache 1 năm)
+                          ├─ "/api/*"           ──► ALB → ECS (backend)
+                          └─ "*"                ──► ALB → ECS (Next.js server)
+```
+
+Điểm mấu chốt: **tách asset tĩnh của Next.js ra behavior riêng để cache mạnh**, đừng để mọi thứ đi qua server. `next build` đặt toàn bộ JS/CSS có hash nội dung trong `.next/static/`, và trình duyệt gọi chúng ở path `/_next/static/...`. Pipeline của bạn upload thư mục đó lên S3 dưới prefix `_next/static/` với `max-age=31536000, immutable`, rồi behavior `/_next/static/*` trỏ vào S3 với `CachingOptimized`. Server Next.js chỉ còn lo HTML và route động; edge lo phần nặng nhất. Không tách, mỗi file JS đều là một request tới container, tăng chi phí và làm health check chậm hơn khi tải cao.
+
+Behavior `*` trỏ vào Next.js server nên dùng Cache Policy `CachingDisabled` (hoặc policy tôn trọng `Cache-Control` do Next.js trả), và Origin Request Policy `AllViewer` để server nhận đủ cookie, header cho cá nhân hoá. Đừng bật cache tĩnh cho HTML SSR — bạn sẽ trả trang của user A cho user B, đúng lỗi "cache key quá hẹp" ở [Phần 6](/blog/aws-fe-06-cloudfront-cdn-behaviors-cache-key/).
+
+---
+
+## Thực hành — container hoá Next.js (45 phút)
+
+Nguồn tài liệu không có lab riêng cho chương này; bài tập sau đủ để bạn tự vấp ba lỗi kinh điển.
+
+**1.** Tạo app: `npx create-next-app@latest my-ssr --ts --app`. Thêm `output: 'standalone'` vào `next.config.js` và tạo `app/api/healthz/route.ts` trả `Response.json({ ok: true })`.
+
+**2.** Tạo `Dockerfile` và `.dockerignore` như mục trên. Build với `--build-arg NEXT_PUBLIC_API_URL=https://api.example.com`. Chạy `docker run --rm -p 3000:3000 web:dev`, mở `http://localhost:3000`.
+
+**3.** Cố tình bỏ `ENV HOSTNAME=0.0.0.0`, build lại, chạy lại. `curl localhost:3000` từ máy bạn giờ thất bại dù container báo "Ready" — đó chính là thứ ALB nhìn thấy. Thêm lại.
+
+**4.** In `process.env.NEXT_PUBLIC_API_URL` ra một component client. Chạy container với `-e NEXT_PUBLIC_API_URL=https://khac.example.com` và xem giá trị **không đổi**: nó đã được nhúng lúc build.
+
+**5.** (Nếu có tài khoản AWS) Push image lên ECR, tạo task definition với `containerPort: 3000`, service 1 task sau ALB từ Lab 5.1, health check path `/api/healthz`. Mở DNS của ALB và thấy trang Next.js.
+
+> **Kết quả mong đợi:** image chạy được ở local với `0.0.0.0`, health check trả 200 tức thì, và bạn tự chứng minh được biến `NEXT_PUBLIC_*` không đổi được lúc runtime — tiền đề cho [Phần 12](/blog/aws-fe-12-env-vars-build-time-runtime-secrets/). Nếu đã deploy ECS, xoá service, ALB và ECR image sau khi xong để không tốn tiền.
+
+---
+
+## Tóm tắt
+
+- Năm nơi chạy code: EC2 (tự lo tất cả), ECS Fargate (container, phổ biến ở công ty), Lambda (theo sự kiện, cold start, tối đa 15 phút), App Runner (container đơn giản nhất), Amplify Hosting (dễ nhất cho frontend, tính tiền build theo phút).
+- CSR và SSG dùng cùng hạ tầng S3 + CloudFront, không cần server. Chỉ SSR và ISR cần compute. Đừng SSR nếu nội dung không khác nhau giữa các user.
+- Bốn con đường Next.js: Amplify (mặc định khi không có DevOps), OpenNext + CDK/SST (serverless), Docker → ECS (đồng nhất với backend), `output: 'export'` (tĩnh hoàn toàn).
+- Dockerfile Next.js: `output: 'standalone'`, ba giai đoạn, `ARG` + `ENV` cho `NEXT_PUBLIC_*` ở giai đoạn build, `HOSTNAME=0.0.0.0`, endpoint `/api/healthz`.
+- Ba lỗi container hoá: lắng nghe `localhost`, truyền biến build-time lúc runtime, không có endpoint health.
+- Kiến trúc SSR phải tách `/_next/static/*` ra behavior S3 cache một năm; server chỉ lo HTML và route động.
+- Tag image theo commit SHA, không dùng `latest`.
+
+Phần tiếp theo — **[Phần 11 — API Gateway và Cognito](/blog/aws-fe-11-api-gateway-and-cognito/)** — khi nào dùng API Gateway thay ALB, và xác thực người dùng với Cognito: token nào dùng để làm gì, lưu ở đâu, refresh thế nào.
+
+## Đọc thêm
+
+- [Amazon ECS — Developer Guide](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/)
+- [AWS Lambda — Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/)
+- [AWS Amplify Hosting — User Guide](https://docs.aws.amazon.com/amplify/latest/userguide/)

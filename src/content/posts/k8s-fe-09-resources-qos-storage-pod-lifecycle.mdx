@@ -1,0 +1,313 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 9 — Resources, QoS, storage và vòng đời Pod'
+description: 'requests và limits khác nhau thế nào, đơn vị m và Mi, gợi ý số cho SPA và Next.js, QoS quyết định Pod nào bị giết trước, volume nào FE thật sự cần, và chuỗi sự kiện khi Pod bị xoá gây 502 lúc deploy cùng cách chặn bằng preStop.'
+pubDate: 2026-10-24
+lang: vi
+tags: [kubernetes, performance, debugging, devops, frontend]
+series: k8s-fe
+seriesOrder: 9
+draft: false
+---
+
+Ba câu hỏi bạn sẽ bị hỏi ngay tuần đầu deploy lên cluster công ty: "Pod của bạn xin bao nhiêu CPU, RAM?", "Sao Pod nginx của bạn bị `OOMKilled`?", và "Sao mỗi lần deploy lại có vài request 502?". Cả ba đều nằm trong ba mục cuối của phần Kubernetes core: **resources** (hai con số `requests` và `limits`, và QoS class quyết định Pod nào chết trước khi node hết RAM), **volume** (phần rất nhỏ mà frontend thật sự cần), và **vòng đời Pod** (chuỗi sự kiện chính xác khi Pod bị xoá, chỗ sinh ra race condition 502). Đọc xong bạn điền được `resources` cho SPA và Next.js với số có căn cứ, giải thích được exit code 137, và viết được `preStop` hook đúng.
+
+## Resources: hai con số, hai ý nghĩa hoàn toàn khác nhau
+
+| Trường     | Ý nghĩa                                                                                                                                      |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `requests` | **Mức đảm bảo.** Scheduler dùng số này để chọn node: node phải còn dư ít nhất chừng này mới nhận Pod. Pod luôn được cấp tối thiểu chừng này. |
+| `limits`   | **Mức trần.** Vượt CPU limit → bị bóp (throttle, chậm lại). Vượt memory limit → bị giết ngay (`OOMKilled`).                                  |
+
+```yaml
+resources:
+  requests:
+    cpu: 50m # 50 milicore = 0.05 core = 5% của 1 CPU
+    memory: 64Mi
+  limits:
+    cpu: 300m
+    memory: 256Mi
+```
+
+Hai con số này đi qua hai cơ chế khác nhau trong hệ thống. `requests` chỉ là **con số để xếp lịch**: scheduler cộng `requests` của mọi Pod trên node, so với dung lượng node còn trống, và không bao giờ xếp quá. Nó không giới hạn gì lúc chạy. `limits` được ghi thẳng xuống cgroup của container trong kernel Linux: CPU quota để bóp, memory limit để kernel gọi OOM killer khi vượt.
+
+### Đơn vị
+
+- **CPU:** `1000m` = 1 core, `100m` = 0.1 core, `0.5` cũng hợp lệ và bằng `500m`. CPU là tài nguyên **nén được**: vượt trần thì tiến trình chỉ chạy chậm lại, không chết.
+- **Memory:** `Mi` là mebibyte (1024²), `M` là megabyte (1000²); `128Mi` ≈ 134 MB. Nên dùng `Mi` / `Gi` cho khớp với cách kernel và `kubectl top` báo cáo. Memory **không nén được**: vượt trần là chết, không có "chậm lại".
+
+### Gợi ý giá trị cho ứng dụng frontend
+
+| Loại app                | requests            | limits               |
+| ----------------------- | ------------------- | -------------------- |
+| SPA tĩnh + nginx        | cpu 20m, mem 32Mi   | cpu 200m, mem 128Mi  |
+| Next.js SSR nhỏ         | cpu 100m, mem 256Mi | cpu 1000m, mem 512Mi |
+| Next.js SSR traffic cao | cpu 250m, mem 512Mi | cpu 2000m, mem 1Gi   |
+| BFF / API Gateway Node  | cpu 100m, mem 128Mi | cpu 500m, mem 512Mi  |
+
+Đây chỉ là điểm khởi đầu. Cách chỉnh đúng là đo:
+
+```bash
+# Cần metrics-server (kind: cài theo Phần 14, cloud managed thường có sẵn)
+kubectl top pods -n web
+# NAME                        CPU(cores)   MEMORY(bytes)
+# frontend-7d9f8b6c4-2xk9p    2m           9Mi
+# nextjs-5c6d7e8f9-abc12      180m         310Mi
+```
+
+Chạy dưới tải thật (hoặc tải giả bằng vòng lặp `curl` / công cụ như `hey`) rồi đặt **`requests` ≈ mức dùng trung bình**, **`limits` ≈ 2–3 lần mức đỉnh**. SPA nginx tiêu thụ gần như không gì; con số 32Mi ở trên đã dư. Next.js thì ngược lại: RAM tăng theo số route đã render và theo cache, nên phải đo sau vài giờ chạy chứ không phải ngay sau khi start.
+
+Hai lưu ý riêng cho tiến trình Node.js:
+
+- **Heap của V8 không biết cgroup limit.** Node có thể để heap phình quá `limits.memory` rồi bị kernel giết trước khi garbage collector kịp dọn. Đặt `NODE_OPTIONS=--max-old-space-size=<số MB>` khoảng 75–80% của limit (limit `512Mi` → `--max-old-space-size=400`) để V8 thu gom rác sớm hơn thay vì chờ OOM.
+- **Node.js chạy một thread cho JS**, nên `limits.cpu` lớn hơn `1000m` không làm một tiến trình render nhanh hơn; nó chỉ có ích cho worker thread, GC song song và các tác vụ I/O. Muốn xử lý nhiều request hơn thì tăng replica ([Phần 14](/blog/k8s-fe-14-rollout-strategies-and-autoscaling/) với HPA), không tăng CPU limit.
+
+---
+
+## QoS class: thứ tự bị giết khi node hết RAM
+
+K8s gán cho mỗi Pod một **QoS class** dựa hoàn toàn vào cách bạn khai báo resources. Khi node cạn RAM, kubelet trục xuất (evict) Pod theo thứ tự class này:
+
+| Class          | Điều kiện                                                       | Ưu tiên sống sót |
+| -------------- | --------------------------------------------------------------- | ---------------- |
+| **Guaranteed** | `requests` = `limits` cho **cả** CPU và memory, ở mọi container | Cao nhất         |
+| **Burstable**  | Có `requests` nhưng khác `limits` (hoặc chỉ khai một phần)      | Trung bình       |
+| **BestEffort** | Không khai báo gì cả                                            | Bị giết đầu tiên |
+
+```bash
+kubectl get pod <pod> -o jsonpath='{.status.qosClass}'
+```
+
+Trong nhóm Burstable, Pod đang dùng **vượt `requests` nhiều nhất** bị chọn trước. Nên `requests` không chỉ để xếp lịch; nó còn là "mức bạn hứa", và Pod giữ đúng lời hứa được ưu tiên sống.
+
+> **Luôn khai báo resources.** Pod không khai báo gì rơi vào BestEffort và là nạn nhân đầu tiên khi node thiếu RAM. Tệ hơn, một Pod không có limit có thể ngốn hết RAM của node và kéo chết mọi Pod khác trên node đó, kể cả Pod của team khác. Nhiều cluster công ty cài `LimitRange` để tự điền giá trị mặc định khi bạn quên, và `ResourceQuota` để chặn tổng tài nguyên của cả namespace; nếu Pod của bạn bị từ chối với lỗi `exceeded quota`, đó là lý do.
+
+```yaml
+# Ví dụ LimitRange mà DevOps hay đặt sẵn trong namespace
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: web
+spec:
+  limits:
+    - type: Container
+      defaultRequest: { cpu: 50m, memory: 64Mi } # điền vào nếu Pod thiếu requests
+      default: { cpu: 500m, memory: 256Mi } # điền vào nếu Pod thiếu limits
+```
+
+### Về CPU limit: có nên đặt không
+
+Có trường phái khuyên **không đặt CPU limit** (chỉ đặt `requests`) cho app Node.js. Lý do nằm ở cách kernel bóp CPU: với limit `300m`, cứ mỗi chu kỳ 100ms container chỉ được chạy 30ms; một request render nặng cần 50ms CPU sẽ chạy 30ms, bị treo 70ms, rồi chạy tiếp, dù node đang rảnh. Hiện tượng đó gọi là CPU throttling, làm tăng độ trễ đuôi (p99) rất khó chịu và khó nhìn ra vì CPU trung bình vẫn thấp. Trong khi `requests` đã đủ đảm bảo công bằng giữa các Pod khi tranh chấp thật.
+
+Memory limit thì **luôn phải đặt**, vì memory không nén được và một Pod rò rỉ sẽ kéo cả node. Hãy trao đổi với team DevOps về chính sách CPU limit của cluster: nhiều nơi bắt buộc có limit để dễ tính chi phí, và khi đó bạn đặt limit rộng (3–5 lần requests) rồi theo dõi metric throttling.
+
+### Thực hành 9.1: nhìn thấy OOMKilled
+
+1. Tạo Pod cố tình dùng quá RAM với image `polinux/stress` (image này chỉ để test, cấp phát bộ nhớ theo tham số):
+
+   ```yaml
+   apiVersion: v1
+   kind: Pod
+   metadata:
+     name: oom-test
+   spec:
+     containers:
+       - name: stress
+         image: polinux/stress
+         command: ['stress']
+         args: ['--vm', '1', '--vm-bytes', '150M', '--vm-hang', '1']
+         resources:
+           requests: { memory: 50Mi }
+           limits: { memory: 100Mi }
+   ```
+
+2. `kubectl apply -f oom-test.yaml` rồi `kubectl get pod oom-test -w`. Trong vài giây STATUS chuyển thành `OOMKilled`, rồi `CrashLoopBackOff`, cột RESTARTS tăng dần.
+3. `kubectl describe pod oom-test`, tìm khối `Last State`:
+
+   ```text
+   Last State:  Terminated
+     Reason:    OOMKilled
+     Exit Code: 137
+   ```
+
+4. Sửa `limits.memory` thành `300Mi`, xoá Pod và apply lại: Pod chạy ổn định. Dọn dẹp: `kubectl delete pod oom-test`.
+
+> **Kết quả mong đợi:** Thấy `OOMKilled` với exit code 137 ở bước 3. Ghi nhớ cặp số này, nó xuất hiện trong mọi sự cố "Next.js tự chết" mà bạn sẽ gặp sau này.
+
+---
+
+## Volume và storage: phần FE cần biết
+
+Mặc định filesystem của container là **ephemeral**: container chết là mất sạch, bạn đã thấy điều đó ở Phần 3 khi sửa `index.html` rồi xoá container. Volume là cách gắn thêm không gian lưu trữ vào Pod.
+
+| Loại volume             | Đặc điểm và ứng dụng cho frontend                                                                                                                            |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `emptyDir`              | Thư mục rỗng, sống cùng Pod (sống sót khi container restart, mất khi Pod bị xoá), chia sẻ giữa các container trong Pod. Dùng cho cache Next.js, thư mục tạm. |
+| `configMap` / `secret`  | Mount cấu hình thành file. Dùng nhiều nhất với frontend: `nginx.conf`, `config.js`, chứng chỉ. Đã học ở [Phần 8](/blog/k8s-fe-08-configmap-secret-probes/).  |
+| `persistentVolumeClaim` | Ổ đĩa bền vững do cloud cấp (EBS, Persistent Disk). Frontend gần như không cần.                                                                              |
+| `hostPath`              | Mount thư mục của node. Tránh dùng: rủi ro bảo mật, phá vỡ tính di động (Pod chuyển node là mất dữ liệu).                                                    |
+
+```yaml
+spec:
+  containers:
+    - name: web
+      image: my-nextjs:v1
+      volumeMounts:
+        - name: cache
+          mountPath: /app/.next/cache
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: cache
+      emptyDir:
+        sizeLimit: 512Mi # vượt mức này Pod bị evict, đừng để cache phình vô hạn
+    - name: tmp
+      emptyDir: {}
+```
+
+Hai chi tiết đáng biết về `emptyDir`:
+
+- Thêm `medium: Memory` thì thư mục nằm trên RAM (tmpfs), rất nhanh nhưng **tính vào memory limit** của container. Đừng đặt cache Next.js lên đó với limit 512Mi.
+- `emptyDir` là thứ bạn sẽ cần khi bật `readOnlyRootFilesystem: true` ở [Phần 18](/blog/k8s-fe-18-security-cost-when-not-k8s/): nginx vẫn phải ghi vào `/var/cache/nginx`, `/var/run` và `/tmp`, nên ba thư mục đó phải là `emptyDir`.
+
+Về PVC, lý do frontend "gần như không cần" nằm ở `accessModes`: ổ đĩa cloud phổ biến là `ReadWriteOnce`, chỉ gắn được vào **một node** tại một thời điểm. Ba Pod frontend trải trên ba node không thể cùng mount một PVC, nên mọi thứ bạn định "lưu vào đĩa" đều sẽ hỏng ngay khi scale.
+
+> **Nguyên tắc thiết kế cho frontend:** app frontend phải **stateless hoàn toàn**. Không ghi file cần giữ lại, không lưu session trên đĩa. Upload của người dùng đẩy lên object storage (S3, R2, GCS); session để ở Redis hoặc trong cookie đã ký; ISR cache của Next.js đưa về Redis qua custom cache handler hoặc chấp nhận mỗi Pod một bản ([Phần 11](/blog/k8s-fe-11-nextjs-ssr-and-micro-frontends/)); log ghi ra stdout. Có vậy mới scale ngang tự do được, và xoá Pod bất cứ lúc nào cũng không mất gì.
+
+---
+
+## Vòng đời Pod và lý do Pod chết
+
+### Phase, condition và trạng thái container
+
+`kubectl get pods` gộp nhiều thứ vào một cột STATUS, nên cần tách ra để đọc đúng:
+
+- **Phase** của Pod chỉ có năm giá trị: `Pending` (chưa có node hoặc đang pull image), `Running`, `Succeeded`, `Failed`, `Unknown`. Những chữ như `CrashLoopBackOff`, `ImagePullBackOff`, `OOMKilled`, `ContainerCreating` **không phải phase**; chúng là lý do (reason) của trạng thái container, kubectl in ra vì hữu ích hơn.
+- **Condition** là bốn cờ true/false: `PodScheduled`, `Initialized` (init container xong), `ContainersReady`, `Ready`. `READY 0/1` nghĩa là `ContainersReady` false, thường do readiness probe.
+- **Trạng thái container** có ba dạng: `Waiting` (kèm reason), `Running`, `Terminated` (kèm exit code và reason). `kubectl describe pod` in cả `State` hiện tại và `Last State` của lần chạy trước.
+- **`restartPolicy`** của Pod: `Always` (mặc định; Deployment bắt buộc dùng), `OnFailure`, `Never` (cho Job). Với `Always`, mọi lần container thoát, dù exit 0, kubelet đều khởi động lại với thời gian chờ tăng dần 10s, 20s, 40s… tối đa 5 phút; đó chính là "BackOff" trong `CrashLoopBackOff`.
+
+Exit code là manh mối đầu tiên khi container chết:
+
+| Exit code     | Nghĩa                                                                                   |
+| ------------- | --------------------------------------------------------------------------------------- |
+| `0`           | Kết thúc bình thường. Với web server đây **là lỗi**: tiến trình chính đã thoát.         |
+| `1`           | App tự thoát vì lỗi (exception chưa bắt, thiếu env var). Đọc `kubectl logs --previous`. |
+| `126` / `127` | Lệnh không có quyền thực thi / không tìm thấy. Sai `CMD`, thiếu `chmod +x`.             |
+| `137`         | 128 + 9 = bị SIGKILL: `OOMKilled`, hoặc hết `terminationGracePeriodSeconds`.            |
+| `143`         | 128 + 15 = nhận SIGTERM và thoát đúng cách. Bình thường khi Pod bị xoá.                 |
+| `139`         | Segfault trong native module. Hiếm với JS, gặp khi `node_modules` build sai platform.   |
+
+### Chuỗi sự kiện khi Pod bị xoá
+
+Đây là phần rất quan trọng cho zero-downtime, và là chỗ nhiều người tưởng K8s "tự lo":
+
+```text
+1. Pod bị đánh dấu Terminating (kubectl delete, rollout, scale down, node drain)
+2. SONG SONG hai việc xảy ra:
+   a) Pod bị gỡ khỏi Service endpoints  -> ngừng nhận request mới
+   b) preStop hook chạy, sau đó kubelet gửi SIGTERM vào container
+3. Chờ tối đa terminationGracePeriodSeconds (mặc định 30s)
+4. Container vẫn chưa thoát -> gửi SIGKILL (giết cứng, exit 137)
+```
+
+### Race condition gây lỗi 502 khi deploy
+
+Bước 2a và 2b xảy ra **đồng thời**, và việc cập nhật endpoints cần vài trăm mili giây để lan tới mọi kube-proxy và Ingress Controller. Nếu container thoát ngay lập tức khi nhận SIGTERM (nginx mặc định là vậy với `SIGTERM`, Node.js cũng thoát ngay nếu bạn không bắt tín hiệu), sẽ có một khoảng ngắn load balancer vẫn gửi request tới Pod đã chết → người dùng thấy 502. Mỗi lần rollout ba Pod là ba cơ hội cho lỗi này.
+
+Giải pháp chuẩn: thêm `preStop` hook **ngủ vài giây** để chờ endpoints cập nhật xong, rồi mới tắt app một cách tử tế:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 30
+  containers:
+    - name: web
+      lifecycle:
+        preStop:
+          exec:
+            # Với nginx: chờ 5s cho endpoints lan truyền, rồi quit mềm
+            # (nginx -s quit: ngừng nhận kết nối mới, trả nốt request đang dở)
+            command: ['/bin/sh', '-c', 'sleep 5 && nginx -s quit']
+            # Với app Node.js tự xử lý SIGTERM, chỉ cần: ["sh", "-c", "sleep 5"]
+```
+
+Vì sao `sleep` là đủ: trong 5 giây đó Pod vẫn Running, vẫn trả lời request cũ và mới; khi endpoints đã lan truyền xong, không còn request mới tới nữa, lúc đó SIGTERM mới được gửi và app tắt trong yên tĩnh. Với image nginx chính thức, `nginx -s quit` (graceful) tốt hơn để nginx tự nhận `SIGTERM` (dừng ngay, cắt request đang dở).
+
+`terminationGracePeriodSeconds` tính từ lúc Pod bị đánh dấu Terminating, **bao gồm** thời gian chạy `preStop`. Nếu `preStop` ngủ 5 giây và app cần 10 giây để trả nốt request đang dở, grace period phải lớn hơn 15; mặc định 30 là đủ cho frontend, nhưng đừng giảm xuống 5 "cho deploy nhanh".
+
+Với app Node.js (Express, BFF, custom server), bạn phải tự bắt SIGTERM, vì hành vi mặc định của Node là thoát ngay:
+
+```js
+// server.js
+const server = app.listen(3000, '0.0.0.0');
+
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, closing server');
+  server.close(() => process.exit(0)); // ngừng nhận kết nối mới, chờ request đang dở
+  setTimeout(() => process.exit(1), 10_000).unref(); // chốt chặn nếu có request treo
+});
+```
+
+> **Cạm bẫy PID 1:** tín hiệu chỉ tới được tiến trình có PID 1 trong container. Nếu `CMD` là `npm start` hay `sh -c "node server.js"`, PID 1 là `npm` hoặc `sh`, và chúng **không chuyển tiếp** SIGTERM cho Node. Kết quả: handler ở trên không bao giờ chạy, container chờ hết 30 giây rồi bị SIGKILL, mỗi lần deploy chậm thêm 30 giây và request đang dở bị cắt. Sửa bằng `CMD ["node", "server.js"]` trực tiếp, hoặc `exec node server.js` trong script entrypoint, hoặc dùng `tini` làm init. Đây cũng là lý do [Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/) nhấn mạnh dòng `exec "$@"` trong `docker-entrypoint.sh`.
+
+### Bảng tra cứu: vì sao Pod của tôi chết
+
+| Dấu hiệu                  | Nguyên nhân thường gặp                                            | Lệnh chẩn đoán                                  |
+| ------------------------- | ----------------------------------------------------------------- | ----------------------------------------------- |
+| `CrashLoopBackOff`        | App lỗi khi khởi động, thiếu env var, liveness quá gắt, `CMD` sai | `kubectl logs --previous <pod>`                 |
+| `OOMKilled` (exit 137)    | Vượt memory limit, memory leak                                    | `kubectl describe pod` xem `Last State`         |
+| Exit code 0 + `Completed` | Tiến trình chạy background thay vì foreground                     | Kiểm tra `CMD`, thiếu `daemon off;`             |
+| `Pending` mãi             | Cluster hết tài nguyên, PVC chưa bind, taint không khớp           | `kubectl describe pod` xem Events               |
+| `Evicted`                 | Node hết disk hoặc RAM, K8s trục xuất Pod (BestEffort đi trước)   | `kubectl describe node <node>`                  |
+| `READY 0/1` nhưng Running | Readiness probe đang fail                                         | `kubectl describe pod` xem Conditions và Events |
+| `Terminating` kẹt lâu     | Tiến trình không phản hồi SIGTERM (PID 1 sai), hoặc có finalizer  | `kubectl get pod -o yaml` xem `finalizers`      |
+
+### Thực hành 9.2: đo race condition lúc rollout
+
+1. Dùng Deployment `my-frontend` 3 replica và Service `my-frontend-svc` từ Phần 7, **chưa** có `preStop`. Mở terminal 1, chạy vòng lặp gọi Service liên tục từ trong cluster:
+
+   ```bash
+   kubectl run loadgen --rm -it --image=curlimages/curl -- sh -c \
+     'while true; do curl -s -o /dev/null -w "%{http_code}\n" --max-time 2 http://my-frontend-svc; sleep 0.1; done'
+   ```
+
+2. Terminal 2: `kubectl rollout restart deploy/my-frontend` rồi `kubectl rollout status deploy/my-frontend`.
+3. Nhìn terminal 1 trong lúc rollout: mọi dòng phải là `200`. Dòng `000` (không nối được) hoặc `502` là request rơi vào Pod đang chết.
+4. Thêm `preStop` với `sleep 5 && nginx -s quit` và `terminationGracePeriodSeconds: 30` vào Deployment, apply, lặp lại bước 2–3.
+
+> **Kết quả mong đợi:** Sau bước 4 không còn dòng nào khác `200`. Trên cluster kind một máy, bước 3 có thể cũng không thấy lỗi vì endpoints lan truyền gần như tức thì; trên cloud nhiều node, hoặc khi đi qua Ingress Controller, khác biệt rõ hơn nhiều. [Phần 12](/blog/k8s-fe-12-cache-cdn-zero-downtime/) gom bài này với readiness, `maxUnavailable: 0` và PodDisruptionBudget thành checklist zero-downtime đầy đủ.
+
+---
+
+## Kết thúc Phần 2: bạn phải làm được
+
+Đây là bài cuối của chặng Kubernetes core. Trước khi sang chặng deploy thực tế, tự kiểm tra:
+
+- Vẽ lại được kiến trúc cluster và giải thích luồng `kubectl apply` đi qua apiserver, etcd, controller, scheduler, kubelet.
+- Dựng cluster kind 3 node có Ingress.
+- Viết Deployment + Service + Ingress từ đầu không cần copy.
+- Giải thích khác biệt readiness và liveness probe.
+- Chẩn đoán được `CrashLoopBackOff`, `ImagePullBackOff`, endpoints rỗng.
+- Dùng ConfigMap/Secret để tách cấu hình khỏi image.
+
+Còn gạch đầu dòng nào chưa làm được, quay lại đúng bài đó trước khi sang Phần 10.
+
+---
+
+## Tóm tắt
+
+- `requests` là mức đảm bảo để scheduler xếp Pod; `limits` là mức trần ghi vào cgroup. CPU vượt trần thì bị bóp, memory vượt trần thì `OOMKilled` (exit 137).
+- Đơn vị: `1000m` = 1 core; dùng `Mi`/`Gi` cho memory. Bắt đầu từ bảng gợi ý, rồi đo bằng `kubectl top` dưới tải thật: requests ≈ trung bình, limits ≈ 2–3 lần đỉnh. Node.js đặt thêm `--max-old-space-size` dưới limit.
+- QoS: Guaranteed (requests = limits) sống lâu nhất, BestEffort (không khai gì) chết đầu tiên. Luôn khai báo resources; memory limit là bắt buộc, CPU limit thì trao đổi với DevOps vì throttling làm tăng p99.
+- Frontend chỉ cần `emptyDir` (cache, tmp) và mount ConfigMap/Secret. PVC là `ReadWriteOnce`, không chia sẻ được giữa các node. App phải stateless: file lên object storage, session ở Redis hoặc cookie.
+- Phase chỉ có 5 giá trị; `CrashLoopBackOff` hay `OOMKilled` là reason của container. Exit 0 với web server là lỗi (tiến trình chạy nền); 137 là SIGKILL; 143 là SIGTERM sạch.
+- Khi Pod bị xoá, gỡ khỏi endpoints và gửi SIGTERM diễn ra **song song** → race condition 502. Chặn bằng `preStop` ngủ 5 giây rồi `nginx -s quit`, `terminationGracePeriodSeconds` ≥ 30, và app Node phải là PID 1 để nhận SIGTERM.
+
+## Đọc thêm
+
+- [Resource Management for Pods and Containers](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
+- [Configure Quality of Service for Pods](https://kubernetes.io/docs/tasks/configure-pod-container/quality-service-pod/)
+- [Volumes](https://kubernetes.io/docs/concepts/storage/volumes/) trong docs Kubernetes
+- [Pod Lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/): phase, condition, hook và termination
+
+Sang chặng deploy thực tế: [Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/) giải bài toán quan trọng nhất của cả series với frontend developer, biến môi trường build-time và runtime, rồi deploy một React SPA hoàn chỉnh với đủ namespace, ConfigMap, Deployment, Service, Ingress, PDB.

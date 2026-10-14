@@ -1,0 +1,407 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 5 — K8s là gì, kiến trúc cluster, cluster local và kubectl'
+description: 'Bốn vấn đề docker run không giải được, tám năng lực của K8s và vòng lặp reconciliation; control plane và node, chuyện gì xảy ra khi kubectl apply; dựng cluster kind 3 node có Ingress; kubectl theo ba nhóm đọc, ghi, debug.'
+pubDate: 2026-10-12
+lang: vi
+tags: [kubernetes, devops, docker, debugging, frontend]
+series: k8s-fe
+seriesOrder: 5
+draft: false
+---
+
+import DockerDiagram from '~/components/blog/DockerDiagram.astro';
+
+Bạn đã có image frontend trên `ghcr.io` từ [Phần 4](/blog/k8s-fe-04-dockerfile-registry-compose/) và chạy được nó bằng `docker run`. Bài này trả lời câu hỏi "vậy thì thiếu gì mà phải thêm cả một hệ thống tên là Kubernetes?", rồi mở nắp xem bên trong cluster có những bộ phận nào và chúng làm gì khi bạn gõ `kubectl apply`. Nửa sau là thực hành: dựng cluster kind 3 node có sẵn Ingress trên máy bạn, và học `kubectl` theo ba nhóm lệnh đọc, ghi, debug.
+
+Đọc xong, bạn có một cluster thật đang chạy trong Docker Desktop, biết Pod `Pending` khác `ContainerCreating` ở chỗ nào trong chuỗi xử lý, và có ba lệnh debug quan trọng nhất trong tay. Đây là bài mở đầu chặng Kubernetes core (phần 5–9): tuần 2–3 của lộ trình, khoảng 20 giờ, mục tiêu là dùng thành thạo 10 tài nguyên K8s quan trọng nhất.
+
+## K8s là gì và giải quyết vấn đề gì
+
+### Câu chuyện dẫn dắt
+
+Bạn đã có image frontend. Bạn chạy `docker run` trên một server. Mọi thứ ổn. Rồi:
+
+- Container crash lúc 2 giờ sáng → website chết cho tới khi có người vào SSH khởi động lại.
+- Traffic tăng gấp 10 vào dịp sale → một container không chịu nổi, cần 20 cái, trên 5 server khác nhau. Ai copy image sang 5 server, ai chia request?
+- Deploy version mới → phải dừng cũ, chạy mới, người dùng thấy lỗi trong 30 giây. Mỗi ngày deploy 5 lần là 5 lần lỗi.
+- Một server hỏng ổ cứng → toàn bộ container trên đó biến mất, phải dựng thủ công ở server khác, trong khi khách hàng đang đợi.
+
+Bạn có thể tự viết script cho từng vấn đề: một cron kiểm tra container còn sống, một script `scp` image sang 5 máy, một nginx upstream trỏ vào 5 IP, một quy trình "bật cái mới, chờ, tắt cái cũ". Nhiều công ty đã làm đúng như thế trước 2015. Kubernetes là phiên bản đã được chuẩn hoá của toàn bộ đống script đó.
+
+**Kubernetes là hệ điều hành cho cụm máy chủ.** Như hệ điều hành trên laptop lo việc xếp tiến trình vào CPU và cấp RAM để bạn chỉ cần "mở app", K8s lo việc xếp container vào máy chủ và cấp tài nguyên để bạn chỉ cần "khai báo app". Nó giải quyết cả bốn vấn đề trên một cách tự động.
+
+### Kubernetes làm gì cho bạn
+
+| Năng lực              | Nghĩa là                                                                     |
+| --------------------- | ---------------------------------------------------------------------------- |
+| **Self-healing**      | Container chết → tự khởi động lại. Node chết → tự chuyển Pod sang node khác. |
+| **Scaling**           | Đổi `replicas: 3` thành `replicas: 20`, hoặc để HPA tự đổi theo CPU.         |
+| **Rolling update**    | Thay version mới từng Pod một, luôn giữ đủ Pod phục vụ → zero downtime.      |
+| **Rollback**          | Một lệnh để quay về version trước trong khoảng 30 giây.                      |
+| **Service discovery** | Các service tìm nhau bằng tên, không cần IP.                                 |
+| **Load balancing**    | Tự chia đều request cho các Pod.                                             |
+| **Config & Secret**   | Tách cấu hình khỏi image, đổi config không cần build lại.                    |
+| **Bin packing**       | Tự xếp Pod vào node còn dư tài nguyên, tối ưu chi phí máy chủ.               |
+
+Bốn dòng đầu là bốn vấn đề của câu chuyện dẫn dắt. Bốn dòng sau là thứ bạn nhận thêm "miễn phí" khi đã ở trên K8s, và là nội dung của phần 7 (discovery, load balancing), phần 8 (config), phần 9 (bin packing qua `requests`).
+
+### Vòng lặp reconciliation: linh hồn của K8s
+
+Mọi năng lực ở trên đều là hệ quả của một cơ chế duy nhất:
+
+```text
+Bạn khai báo (desired state)
+        |
+        v
++----------------------------+
+|      Vòng lặp vô tận       |
+|                            |
+|  So sánh: mong muốn        |
+|           vs thực tế       |
+|            |               |
+|       Khác nhau?           |
+|         /     \            |
+|       Có       Không       |
+|        |         |         |
+|   Hành động     Chờ        |
+|   sửa cho khớp             |
++----------------------------+
+```
+
+Ví dụ: bạn khai báo 3 replica. Một Pod bị giết. K8s thấy thực tế = 2, mong muốn = 3 → tạo Pod mới. Bạn không làm gì cả. Node chết kéo theo 2 Pod → thực tế = 1 → tạo 2 Pod mới trên node khác. Bạn đổi `replicas` thành 20 → thực tế = 3 → tạo 17 Pod. Bạn đổi image → mong muốn là "3 Pod chạy v2" nhưng thực tế là "3 Pod chạy v1" → thay dần từng cái.
+
+Đây là khác biệt cơ bản giữa K8s và `docker run`. `docker run` là một lệnh: chạy xong là hết trách nhiệm. `kubectl apply` là một lời hứa: K8s giữ trạng thái đó cho tới khi bạn đổi ý. Vòng lặp này không chạy một lần rồi thôi; nó chạy mãi, vài giây một vòng, cho từng loại tài nguyên, do các **controller** đảm nhiệm.
+
+> **Ghi chú, liên hệ frontend:** đây chính xác là mô hình của React. Bạn khai báo `state`, React tự diff và patch DOM. K8s khai báo `spec`, controller tự diff và patch cluster. Hiểu React là bạn đã hiểu 50% triết lý K8s. Hệ quả tương tự nhau: sửa DOM bằng tay (`document.getElementById(...).innerHTML = ...`) sẽ bị React ghi đè ở lần render sau; sửa cluster bằng tay (`kubectl edit`) sẽ bị lần `kubectl apply` sau ghi đè.
+
+---
+
+## Kiến trúc cluster: Control Plane và Node
+
+Một cluster gồm hai loại máy: vài máy làm **control plane** (bộ não) và nhiều máy làm **worker node** (nơi container thật sự chạy).
+
+```text
++=================== CONTROL PLANE (bộ não) ===================+
+|                                                              |
+|  kube-apiserver     <- cửa ngõ duy nhất, mọi lệnh đi qua đây |
+|  etcd               <- cơ sở dữ liệu lưu toàn bộ trạng thái  |
+|  kube-scheduler     <- quyết định Pod mới chạy ở node nào    |
+|  controller-manager <- chạy các vòng lặp reconciliation      |
+|                                                              |
++=========================+====================================+
+                          |
+         +----------------+----------------+
+         |                                 |
++--- WORKER NODE 1 ----+        +--- WORKER NODE 2 ----+
+|  kubelet             |        |  kubelet             |
+|  kube-proxy          |        |  kube-proxy          |
+|  container runtime   |        |  container runtime   |
+|  +-------+ +-------+ |        |  +-------+           |
+|  | Pod A | | Pod B | |        |  | Pod C |           |
+|  +-------+ +-------+ |        |  +-------+           |
++----------------------+        +----------------------+
+```
+
+<DockerDiagram
+  kind="k8s-cluster"
+  caption="kubectl chỉ nói chuyện với control plane; control plane lên lịch Pod xuống các worker node, nơi kubelet, kube-proxy và container runtime thật sự chạy container."
+/>
+
+### Vai trò từng thành phần
+
+| Thành phần             | Nhiệm vụ                                                                                                                                       |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| **kube-apiserver**     | REST API của cluster. `kubectl` nói chuyện với nó. Mọi thành phần khác cũng vậy. Là điểm vào duy nhất.                                         |
+| **etcd**               | Database key-value lưu toàn bộ trạng thái cluster. Mất etcd = mất cluster. (Bạn không cần đụng vào.)                                           |
+| **kube-scheduler**     | Pod mới chưa có node → scheduler chọn node phù hợp dựa trên tài nguyên còn trống, affinity, taint.                                             |
+| **controller-manager** | Chứa các controller (Deployment controller, ReplicaSet controller...) chạy vòng lặp reconciliation.                                            |
+| **kubelet**            | "Đại lý" trên mỗi node. Nhận lệnh từ apiserver, ra lệnh cho container runtime chạy container, báo cáo sức khoẻ ngược lại. Chính nó chạy probe. |
+| **kube-proxy**         | Cấu hình luật mạng trên node để Service hoạt động (định tuyến traffic tới Pod đúng).                                                           |
+| **Container runtime**  | containerd hoặc CRI-O: phần mềm thực sự chạy container. Docker Engine cũng dùng containerd bên dưới.                                           |
+
+Điểm đáng nhớ với FE dev: **mọi thứ đi qua apiserver, và mọi thứ là API.** `kubectl get pods` chỉ là một `GET /api/v1/namespaces/web/pods` có xác thực. Đó là lý do `kubectl` có thể xuất `-o json` và các công cụ như Lens, k9s, ArgoCD đều nhìn thấy đúng một cluster. Trên cluster managed (EKS, GKE, AKS), toàn bộ control plane do cloud vận hành và bạn chỉ thấy worker node; với kind ở local, cả control plane lẫn worker là các container Docker trên máy bạn.
+
+### Chuyện gì xảy ra khi bạn gõ kubectl apply
+
+Đây là chuỗi sự kiện khi bạn apply một Deployment 3 replica. Biết chuỗi này là biết Pod đang kẹt ở bước nào khi debug:
+
+1. `kubectl` đọc file YAML, gửi tới apiserver (kèm token xác thực từ kubeconfig).
+2. apiserver xác thực, kiểm tra quyền (RBAC), validate schema, rồi ghi vào etcd. Lỗi cú pháp YAML hay sai trường dừng ở đây, bạn thấy ngay trên terminal.
+3. Deployment controller thấy có Deployment mới → tạo ReplicaSet.
+4. ReplicaSet controller thấy cần 3 Pod mà đang có 0 → tạo 3 Pod object (chưa có node).
+5. Scheduler thấy 3 Pod chưa gán node → chọn node và gán. Không node nào đủ CPU/RAM hoặc khớp điều kiện → Pod đứng ở `Pending`.
+6. kubelet trên node đó thấy có Pod dành cho mình → pull image, mount volume, khởi động container. Kẹt ở đây là `ContainerCreating` (đang pull) hoặc `ImagePullBackOff` (pull thất bại).
+7. kubelet báo cáo trạng thái `Running` về apiserver → ghi vào etcd. Từ đây kubelet bắt đầu chạy probe.
+8. Bạn chạy `kubectl get pods` và thấy 3 Pod `Running`.
+
+> **Ghi chú:** toàn bộ quá trình này thường mất 5–30 giây, phần lớn là pull image (đây là chỗ image 25 MB của phần 4 phát huy tác dụng). Khi debug, biết chuỗi này giúp bạn xác định đang kẹt ở bước nào: Pod `Pending` = kẹt ở scheduler (bước 5, thiếu tài nguyên); `ContainerCreating` = kẹt ở kubelet (bước 6, đang pull image hoặc mount volume). Cả hai đều trả lời bằng `kubectl describe pod` và đọc phần Events.
+
+Để ý bước 2: `kubectl` chỉ gửi YAML và nhận về "đã ghi". Nó không chờ Pod chạy. `kubectl apply` trả về thành công không có nghĩa app đã lên; muốn chờ, dùng `kubectl rollout status` (phần 6).
+
+---
+
+## Dựng cluster local: kind / minikube / Docker Desktop
+
+| Công cụ            | Ưu điểm                                                            | Nhược điểm                            |
+| ------------------ | ------------------------------------------------------------------ | ------------------------------------- |
+| **kind**           | Nhanh nhất, nhẹ nhất, tạo multi-node dễ. Chuẩn dùng cho CI.        | Cần cấu hình thêm để dùng Ingress.    |
+| **minikube**       | Nhiều addon sẵn (ingress, dashboard, metrics-server) chỉ một lệnh. | Nặng hơn, khởi động chậm hơn.         |
+| **Docker Desktop** | Bật một checkbox là xong.                                          | Single-node, ít tuỳ biến, ăn RAM.     |
+| **k3d / k3s**      | Rất nhẹ, hợp máy yếu và IoT.                                       | Một số component bị lược bỏ/thay thế. |
+
+Khuyến nghị cho series này: **dùng kind** (Kubernetes in Docker). Mỗi node là một container Docker, nên tạo cluster 3 node mất khoảng một phút, xoá đi làm lại không tiếc, và có multi-node để bạn thấy Pod được trải ra nhiều máy. Cluster kind chạy bên trong Docker Desktop (macOS/Windows) hoặc Docker Engine (Linux) bạn đã cài ở phần 3.
+
+### Cài đặt
+
+```bash
+# macOS
+brew install kind kubectl helm
+
+# Linux
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+# Windows (PowerShell, cần Chocolatey)
+choco install kind kubernetes-cli kubernetes-helm
+```
+
+`helm` chưa dùng ngay, phần 15 mới cần; cài luôn cho tiện. Kiểm tra: `kind version` và `kubectl version --client`. Trên Windows, hãy làm trong WSL2 và dùng bản Linux; Docker Desktop đã chia sẻ daemon với WSL.
+
+### Tạo cluster có sẵn cấu hình Ingress
+
+```yaml
+# kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP
+  - role: worker
+  - role: worker
+```
+
+File này làm ba việc: một node control-plane, hai node worker, và hai chi tiết cho Ingress. `node-labels: "ingress-ready=true"` gắn label lên node control-plane để manifest ingress-nginx dành cho kind biết đặt controller ở node đó; `extraPortMappings` map cổng 80 và 443 của máy bạn vào node đó (giống `-p 80:80` của Docker) để `http://localhost` đi thẳng tới Ingress Controller. Không có hai dòng này, Ingress ở phần 7 không có đường vào từ máy bạn.
+
+```bash
+# Tạo cluster 3 node
+kind create cluster --name fe-lab --config kind-config.yaml
+
+# Kiểm tra
+kubectl cluster-info
+kubectl get nodes
+
+# Cài NGINX Ingress Controller (manifest riêng cho kind)
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+
+# Chờ ingress sẵn sàng
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout=120s
+```
+
+`kind create cluster` cũng tự ghi thông tin kết nối vào `~/.kube/config` và chuyển context hiện tại sang `kind-fe-lab`, nên `kubectl` dùng được ngay. `kubectl wait` chặn terminal cho tới khi Pod controller `Ready` (hoặc hết 120 giây); đây cũng là lệnh bạn dùng trong CI để "chờ thứ gì đó lên".
+
+> **Kết quả mong đợi:** `kubectl get nodes` trả về 3 node ở trạng thái `Ready`:
+
+```text
+NAME                   STATUS   ROLES           AGE   VERSION
+fe-lab-control-plane   Ready    control-plane   2m    v1.3x.x
+fe-lab-worker          Ready    <none>          2m    v1.3x.x
+fe-lab-worker2         Ready    <none>          2m    v1.3x.x
+```
+
+Và `docker ps` cho thấy đúng 3 container tên `fe-lab-*`: đó là 3 node của bạn. Cột `STATUS` còn `NotReady` trong 30 giây đầu là bình thường (plugin mạng đang khởi động); quá một phút thì `kubectl describe node <ten>` đọc `Conditions`.
+
+Lỗi hay gặp khi tạo cluster: `port is already allocated` cho cổng 80 hoặc 443 → máy bạn có nginx, Apache hay một container khác đang chiếm cổng; tắt nó hoặc đổi `hostPort` trong config (rồi nhớ dùng `http://localhost:<hostPort>` ở phần 7). Docker Desktop cấp quá ít RAM → node `NotReady` mãi; tăng lên 4 GB trở lên trong Settings → Resources. Muốn làm lại từ đầu: `kind delete cluster --name fe-lab`.
+
+### Nạp image local vào kind (mẹo cực hữu ích)
+
+kind chạy trong Docker riêng nên không thấy image trên máy bạn. Thay vì phải push lên registry mỗi lần test, hãy nạp trực tiếp:
+
+```bash
+docker build -t my-app:v1 .
+kind load docker-image my-app:v1 --name fe-lab
+```
+
+Khi đó trong manifest phải đặt `imagePullPolicy: IfNotPresent` (hoặc `Never`) để K8s không cố pull từ Internet, vì image `my-app:v1` không tồn tại trên registry nào. Quên bước `kind load` là nguyên nhân thứ 5 của `ImagePullBackOff` ở local (bốn nguyên nhân kia ở phần 4). Với image thật trên `ghcr.io` thì không cần nạp: kind pull như cluster bình thường.
+
+---
+
+## kubectl: cây gậy thần của bạn
+
+### Cú pháp tổng quát
+
+```text
+kubectl [ĐỘNG TỪ] [LOẠI TÀI NGUYÊN] [TÊN] [CỜ]
+
+kubectl  get   pods   my-app-abc   -n production   -o yaml
+   |      |     |         |             |             |
+ công cụ  động  loại   tên cụ thể   namespace     định dạng
+          từ
+```
+
+Loại tài nguyên có tên tắt: `po` (pods), `deploy` (deployments), `svc` (services), `ing` (ingresses), `cm` (configmaps), `ns` (namespaces), `rs` (replicasets), `ep` (endpoints). Tra toàn bộ bằng `kubectl api-resources`, cột `SHORTNAMES`. Thiếu `-n` thì kubectl dùng namespace `default`, hoặc namespace bạn đặt trong context (bên dưới).
+
+### Nhóm lệnh ĐỌC (an toàn, dùng thoải mái)
+
+```bash
+kubectl get pods                            # liệt kê Pod trong namespace hiện tại
+kubectl get pods -o wide                    # thêm cột IP và node
+kubectl get pods -A                         # tất cả namespace
+kubectl get pods -w                         # theo dõi thay đổi realtime (Ctrl+C để thoát)
+kubectl get all                             # Pod, Service, Deployment, ReplicaSet
+kubectl get deploy,svc,ing                  # nhiều loại cùng lúc
+kubectl describe pod my-app-abc             # CHI TIẾT + EVENTS -> lệnh debug số 1
+kubectl get pod my-app-abc -o yaml          # toàn bộ định nghĩa, kể cả status
+kubectl logs my-app-abc                     # log của Pod
+kubectl logs -f my-app-abc                  # theo dõi realtime
+kubectl logs --tail=100 my-app-abc          # 100 dòng cuối
+kubectl logs --previous my-app-abc          # log của container ĐÃ CHẾT -> vàng!
+kubectl logs -l app=my-app                  # log của mọi Pod có label này
+kubectl get events --sort-by=.metadata.creationTimestamp   # dòng thời gian sự cố
+kubectl top pods                            # CPU/RAM thực tế (cần metrics-server)
+```
+
+Đọc output của `kubectl get pods` cho đúng:
+
+```text
+NAME                        READY   STATUS    RESTARTS   AGE
+my-app-7d9f8b6c5-x2k9p      1/1     Running   0          3m
+my-app-7d9f8b6c5-q7v4n      0/1     Running   2          3m
+```
+
+`READY 1/1` là "1 container ready trên 1 container trong Pod"; `0/1` với `STATUS Running` nghĩa là container đang chạy nhưng readiness probe chưa pass, Pod không nhận traffic. `RESTARTS` tăng dần là container đã chết và được kubelet khởi động lại; con số này khác 0 luôn đáng xem `logs --previous`. Tên Pod là tên Deployment + hash của ReplicaSet + hash ngẫu nhiên, phần 6 giải thích.
+
+### Ba lệnh debug quan trọng nhất
+
+1. `kubectl describe pod <ten>`: phần **Events** ở cuối nói cho bạn biết chính xác K8s đang gặp vấn đề gì: `Failed to pull image`, `0/3 nodes are available`, `Readiness probe failed: HTTP probe failed with statuscode: 404`, `Back-off restarting failed container`. Đọc từ dưới lên vì sự kiện mới nhất ở cuối.
+2. `kubectl logs --previous <ten>`: khi Pod crash-loop, log hiện tại vô dụng vì container vừa mới sinh ra; log của lần chết trước mới chứa nguyên nhân.
+3. `kubectl get events -A --sort-by=.metadata.creationTimestamp`: xem toàn cảnh cluster theo thời gian, kể cả sự kiện của node và của các Pod đã bị xoá.
+
+Phần Events của `describe` chỉ giữ khoảng một giờ. Sự cố xảy ra đêm qua thì Events đã trống; đó là lý do phần 17 nói về thu gom log và metric ra ngoài cluster.
+
+### Nhóm lệnh GHI (thay đổi cluster)
+
+```bash
+kubectl apply -f deployment.yaml            # tạo hoặc cập nhật (declarative - NÊN DÙNG)
+kubectl apply -f ./k8s/                     # áp dụng cả thư mục
+kubectl delete -f deployment.yaml           # xoá theo file
+kubectl delete pod my-app-abc               # xoá 1 Pod (Deployment sẽ tạo lại ngay)
+
+kubectl scale deploy/my-app --replicas=5
+kubectl set image deploy/my-app web=ghcr.io/org/app:v2.0.0
+kubectl rollout status deploy/my-app        # theo dõi tiến trình update
+kubectl rollout undo deploy/my-app          # ROLLBACK
+kubectl rollout restart deploy/my-app       # khởi động lại toàn bộ Pod
+kubectl edit deploy/my-app                  # sửa trực tiếp (chỉ để thử nghiệm)
+```
+
+`apply` là idempotent: chạy lần đầu tạo, chạy lại với file không đổi thì báo `unchanged`, đổi file rồi chạy thì cập nhật. `kubectl create` chỉ tạo và fail nếu đã tồn tại; trong series này bạn gần như chỉ dùng `apply`. Muốn xem `apply` sẽ đổi gì trước khi làm thật: `kubectl diff -f deployment.yaml`.
+
+> **Nguyên tắc vàng trên production:** chỉ thay đổi cluster thông qua file YAML trong Git rồi `kubectl apply`. Dùng `kubectl edit`, `kubectl scale` hay `kubectl set image` trực tiếp sẽ tạo ra **configuration drift**: cluster thật khác với Git, và lần deploy sau từ Git sẽ âm thầm ghi đè thay đổi của bạn (ví dụ `replicas` bạn vừa scale lên 10 tụt về 3 giữa giờ cao điểm). Ba lệnh đó dùng để học và để chữa cháy, sau đó phải sửa lại file trong Git. Phần 16 nói về GitOps, nơi nguyên tắc này được ép bằng công cụ.
+
+### Nhóm lệnh DEBUG (dùng hằng ngày)
+
+```bash
+# Chui vào Pod
+kubectl exec -it my-app-abc -- sh
+kubectl exec my-app-abc -- env                               # xem biến môi trường
+kubectl exec my-app-abc -- ls /usr/share/nginx/html
+kubectl exec my-app-abc -- cat /etc/nginx/conf.d/default.conf
+
+# Chuyển tiếp cổng: truy cập Service nội bộ từ máy bạn
+kubectl port-forward pod/my-app-abc 8080:80
+kubectl port-forward svc/my-app-svc 8080:80
+# -> mở http://localhost:8080 trên máy bạn
+
+# Copy file ra/vào Pod
+kubectl cp my-app-abc:/etc/nginx/nginx.conf ./nginx.conf
+
+# Tạo Pod tạm để test mạng nội bộ - THỦ THUẬT RẤT HỮU ÍCH
+kubectl run tmp --rm -it --image=curlimages/curl -- sh
+# rồi bên trong gõ: curl http://api-service:3000/health
+```
+
+Dấu `--` ngăn cách cờ của kubectl với lệnh chạy bên trong container; thiếu nó, kubectl hiểu `-it` hay `sh` là cờ của mình. `port-forward` mở một đường hầm từ máy bạn vào cluster, bỏ qua Service DNS và Ingress; nó là cách nhanh nhất để trả lời "app trong Pod có chạy không" trước khi hỏi "Service/Ingress có đúng không". Pod tạm `curlimages/curl` (hoặc `nicolaka/netshoot` có sẵn `dig`, `nslookup`, `nc`) là cách bạn đứng "bên trong cluster" để gọi thử một Service bằng tên nội bộ, y như phần 2 mô tả.
+
+### Cấu hình môi trường làm việc thoải mái hơn
+
+```bash
+# Alias tiết kiệm hàng nghìn ký tự mỗi ngày
+alias k=kubectl
+source <(kubectl completion zsh)       # hoặc bash
+complete -o default -F __start_kubectl k
+
+# Đặt namespace mặc định, khỏi gõ -n mãi
+kubectl config set-context --current --namespace=my-namespace
+
+# Xem context (cluster) đang dùng - KIỂM TRA TRƯỚC MỌI LỆNH NGUY HIỂM
+kubectl config current-context
+kubectl config get-contexts
+kubectl config use-context kind-fe-lab
+```
+
+Thêm hai dòng alias và completion vào `~/.zshrc` (hoặc `~/.bashrc`). Từ giờ cheat sheet ở phần 19 viết `k get po` là ý này.
+
+**Context là gì.** File `~/.kube/config` (kubeconfig) chứa ba danh sách: `clusters` (địa chỉ apiserver + CA), `users` (token/cert của bạn), và `contexts` (một cặp cluster + user + namespace mặc định). `current-context` là cặp đang dùng. Khi công ty cấp cho bạn quyền vào cluster staging và production, bạn sẽ có ba context trong cùng file: `kind-fe-lab`, `staging`, `prod`. Mọi lệnh `kubectl` đi tới context hiện tại, không có xác nhận gì thêm.
+
+> **Nguy hiểm:** sự cố kinh điển của người mới là gõ lệnh xoá trong khi context đang trỏ vào production thay vì local. `kubectl delete ns web` trong context sai xoá sạch mọi thứ trong namespace đó của production, không hỏi lại. Hãy cài `kubectx` (chuyển context bằng một từ) và `kube-ps1` (hiển thị context ngay trên dòng nhắc terminal) để lúc nào cũng thấy mình đang ở đâu. Trước mọi lệnh `delete`, `scale`, `rollout`, liếc dòng nhắc một lần.
+
+---
+
+## Thực hành 2.3 và 2.4
+
+**Dựng cluster (2.3):**
+
+1. Cài `kind`, `kubectl`, `helm` theo mục cài đặt. Tạo `kind-config.yaml`, chạy `kind create cluster --name fe-lab --config kind-config.yaml`.
+2. Cài ingress-nginx và `kubectl wait` như trên. Chạy `kubectl get pods -n ingress-nginx`: Pod `ingress-nginx-controller-*` phải `1/1 Running`.
+3. Chạy `kubectl get pods -A` và đọc lướt: `kube-system` chứa các thành phần control plane (`etcd-*`, `kube-apiserver-*`, `kube-scheduler-*`, `coredns-*`, `kube-proxy-*`). Bạn vừa nhìn thấy kiến trúc ở trên bằng mắt thật.
+4. Chạy `kubectl config current-context` → phải là `kind-fe-lab`. Cài `kubectx` và `kube-ps1` nếu muốn.
+
+**Vòng đầu tiên với kubectl (2.4):**
+
+1. `kubectl create deployment nginx-test --image=nginx:alpine --replicas=3`. (Đây là lần hiếm hoi dùng lệnh imperative, để chưa phải viết YAML; phần 6 bạn viết file thật.)
+2. `kubectl get pods -o wide`: ghi lại IP và node của từng Pod. Để ý 3 Pod nằm rải trên `fe-lab-worker` và `fe-lab-worker2`, không nằm trên control-plane (node đó có taint không cho workload thường lên).
+3. `kubectl delete pod <ten-mot-pod>` rồi ngay lập tức `kubectl get pods -w`. Quan sát K8s tạo Pod mới trong vài giây, với tên khác và có thể IP khác. Đây là self-healing. Bấm `Ctrl+C` để thoát chế độ watch.
+4. `kubectl describe pod <ten>` và đọc kỹ phần Events ở cuối: `Scheduled` (scheduler gán node nào), `Pulled` (image kéo mất bao lâu), `Created`, `Started`. Đó chính là các bước 5–7 của chuỗi `kubectl apply`.
+5. `kubectl port-forward deploy/nginx-test 8080:80` rồi mở `http://localhost:8080` trên trình duyệt. Ctrl+C để đóng.
+6. `kubectl exec -it <ten> -- sh`, gõ `env`, `hostname -i` (IP của Pod), `cat /etc/resolv.conf` (thấy `search default.svc.cluster.local ...` như phần 2 hứa). `exit`.
+7. Cố tình sai: `kubectl create deployment broken --image=nginx:khong-ton-tai`. Sau vài giây `kubectl get pods` cho thấy `ErrImagePull` rồi `ImagePullBackOff`. `kubectl describe pod <ten-broken>` và tìm dòng `Failed to pull image ... not found`. Bạn vừa thấy nguyên nhân số 1 của lỗi này ở phần 4.
+8. Dọn dẹp: `kubectl delete deployment nginx-test broken`.
+
+> **Kết quả mong đợi:** bước 3, sau khi xoá một Pod, `kubectl get pods -w` in dòng Pod cũ `Terminating` và một dòng Pod mới đi từ `Pending` → `ContainerCreating` → `Running` trong vài giây, tổng số Pod quay về 3. Bước 7, `STATUS` là `ImagePullBackOff` và Events có dòng `Failed to pull image`. Nếu bước 2 chỉ thấy 1 node hoặc bước 1 Pod `Pending` mãi, quay lại kiểm tra `kubectl get nodes` và RAM của Docker Desktop.
+
+---
+
+## Tóm tắt
+
+- `docker run` không giải quyết được bốn chuyện: container chết lúc 2 giờ sáng, scale lên 20 bản trên 5 máy, deploy không downtime, server hỏng. Kubernetes là hệ điều hành cho cụm máy chủ, tự động hoá cả bốn.
+- Mọi năng lực của K8s (self-healing, scaling, rolling update, rollback, discovery, load balancing, config, bin packing) đều là hệ quả của vòng lặp reconciliation: so sánh khai báo với thực tế, sửa cho khớp, lặp mãi. Giống React diff state với DOM.
+- Control plane gồm apiserver (cửa ngõ duy nhất), etcd (database), scheduler (chọn node), controller-manager (các vòng lặp). Mỗi worker node có kubelet (đại lý, chạy probe), kube-proxy (mạng cho Service), container runtime.
+- Chuỗi `kubectl apply`: apiserver ghi etcd → Deployment controller tạo ReplicaSet → ReplicaSet tạo Pod → scheduler gán node → kubelet pull image và chạy. `Pending` là kẹt ở scheduler, `ContainerCreating` là kẹt ở kubelet.
+- kind cho cluster 3 node trong Docker; `kind-config.yaml` với `ingress-ready=true` và `extraPortMappings` 80/443 là bắt buộc để Ingress dùng được từ `localhost`. `kind load docker-image` + `imagePullPolicy: IfNotPresent` để dùng image local.
+- kubectl có ba nhóm: đọc (`get`, `describe`, `logs`, `events`, `top`), ghi (`apply`, `delete`, `scale`, `set image`, `rollout`), debug (`exec`, `port-forward`, `cp`, `run tmp`). Ba lệnh debug quan trọng nhất: `describe pod` đọc Events, `logs --previous`, `get events --sort-by`.
+- Trên production chỉ thay đổi cluster qua YAML trong Git rồi `apply`; sửa tay tạo drift. Kiểm tra `current-context` trước mọi lệnh nguy hiểm.
+
+## Đọc thêm
+
+- [Kubernetes Components và Cluster Architecture](https://kubernetes.io/docs/concepts/) — mục Overview → Kubernetes Components là bản gốc của sơ đồ control plane / node.
+- [kubectl Quick Reference](https://kubernetes.io/docs/reference/kubectl/quick-reference/) — cheat sheet chính thức, bổ sung cho ba nhóm lệnh ở trên.
+- [kind](https://kind.sigs.k8s.io/) — mục Ingress và Loading an Image Into Your Cluster là hai trang bạn sẽ mở lại.
+- [minikube](https://minikube.sigs.k8s.io/docs/) — nếu bạn chọn minikube thay kind; các addon `ingress` và `metrics-server` thay cho các bước cài thủ công trong series.
+- Nếu muốn đối chiếu với một cách trình bày khác về cùng nội dung, bài [Kubernetes fundamentals](/blog/docker-09-kubernetes-fundamentals/) của series Docker trên blog này đi từ góc nhìn của người đã quen Compose.

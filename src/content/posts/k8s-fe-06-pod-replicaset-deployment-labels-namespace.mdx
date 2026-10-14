@@ -1,0 +1,380 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 6 — Pod, ReplicaSet, Deployment, label và namespace'
+description: 'Pod là gì và các trạng thái của nó, init container và sidecar, quan hệ Deployment → ReplicaSet → Pod, manifest Deployment hoàn chỉnh cho frontend, rolling update và rollback, rồi label, selector, annotation và namespace.'
+pubDate: 2026-10-15
+lang: vi
+tags: [kubernetes, devops, deployment, debugging, frontend]
+series: k8s-fe
+seriesOrder: 6
+draft: false
+---
+
+import DockerDiagram from '~/components/blog/DockerDiagram.astro';
+
+Ở [Phần 5](/blog/k8s-fe-05-architecture-local-cluster-kubectl/) bạn đã tạo Deployment bằng một lệnh `kubectl create` và thấy Pod tự hồi sinh sau khi bị xoá. Bài này viết file YAML thật cho ba tầng tài nguyên đứng sau phép màu đó: Pod (đơn vị chạy nhỏ nhất), ReplicaSet (giữ đúng số lượng) và Deployment (quản lý version và cách cập nhật). Rồi tới thứ dán ba tầng đó lại với nhau và với Service ở phần 7: label và selector. Cuối cùng là namespace, cách chia ngăn cluster thành dev / staging / production.
+
+Đọc xong, bạn viết được một Deployment cho frontend từ đầu không cần copy, hiểu vì sao tên Pod trông như `my-frontend-7d9f8b6c5-x2k9p`, tự tay làm một rolling update rồi rollback, và không mắc lỗi số 1 của người mới: selector không khớp label. Bảng trạng thái Pod trong bài là thứ bạn sẽ tra lại nhiều nhất trong hai tuần tới.
+
+## Pod: đơn vị nhỏ nhất
+
+### Định nghĩa
+
+Pod là đơn vị triển khai nhỏ nhất của K8s. Bạn không chạy container trực tiếp; bạn chạy Pod, và Pod bọc một hoặc nhiều container. Các container trong cùng Pod:
+
+- Dùng chung một địa chỉ IP, gọi nhau qua `localhost:port`.
+- Dùng chung network namespace, nên không được trùng port với nhau.
+- Có thể dùng chung volume.
+- Luôn được lên lịch chung một node và sinh/tử cùng nhau.
+
+Vì sao K8s không dừng ở container mà thêm một lớp Pod? Vì có những cặp tiến trình cần đi cùng nhau như hình với bóng (app + agent thu log, app + proxy) và cần chia sẻ IP, filesystem. Pod là cái tên cho "nhóm container luôn đi cùng nhau".
+
+Nhưng với frontend: **99% trường hợp một Pod = một container.** Đừng phức tạp hoá. Multi-container chỉ dùng cho sidecar pattern (cuối mục này). Nếu bạn thấy mình muốn nhét nginx và Node vào cùng một Pod, câu trả lời gần như luôn là hai Deployment riêng nối bằng Service.
+
+### Manifest Pod đơn giản nhất
+
+```yaml
+# pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-frontend
+  labels:
+    app: my-frontend
+spec:
+  containers:
+    - name: web
+      image: nginx:1.27-alpine
+      ports:
+        - containerPort: 80
+          name: http
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          memory: 128Mi
+```
+
+```bash
+kubectl apply -f pod.yaml
+kubectl get pod my-frontend -o wide
+kubectl delete -f pod.yaml
+```
+
+Bốn khối quen thuộc từ phần 3. Trong `spec.containers`, mỗi phần tử là một container với `name` (để `kubectl logs -c web` khi Pod có nhiều container), `image`, `ports` (chỉ để khai báo và đặt tên, không "mở" gì cả, giống `EXPOSE` của Dockerfile), và `resources` (phần 9). Đặt tên port `http` để Service và probe tham chiếu bằng tên thay vì số; đổi số port sau này chỉ sửa một chỗ.
+
+> **Cạm bẫy:** trong thực tế bạn gần như không bao giờ tạo Pod trực tiếp. Pod trần không tự phục hồi: node chết hay bạn `kubectl delete` là mất luôn, không ai tạo lại. Luôn dùng Deployment (mục sau). Pod trần chỉ dùng để học và để debug tạm, kiểu `kubectl run tmp --rm -it --image=curlimages/curl -- sh` ở phần 5.
+
+### Các trạng thái của Pod
+
+Cột `STATUS` của `kubectl get pods` là thứ bạn nhìn đầu tiên mỗi khi có chuyện. Bảng này ánh xạ mỗi trạng thái sang nguyên nhân và lệnh tiếp theo:
+
+| Trạng thái            | Ý nghĩa và cách xử lý                                                                                                                                        |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Pending**           | Chưa được xếp lên node nào. Thường do thiếu CPU/RAM trong cluster, hoặc không tìm được node khớp `nodeSelector`. → `kubectl describe` đọc Events.            |
+| **ContainerCreating** | Đang pull image hoặc mount volume. Nếu kẹt lâu → image quá to, sai credential, hoặc ConfigMap/Secret được mount không tồn tại.                               |
+| **Running**           | Đang chạy. Nhưng chú ý cột `READY`: `0/1` nghĩa là container chạy nhưng readiness probe chưa pass, Pod không nhận traffic.                                   |
+| **CrashLoopBackOff**  | Container khởi động rồi chết, lặp đi lặp lại; K8s chờ lâu dần giữa các lần thử (10s, 20s, 40s... tối đa 5 phút). → `kubectl logs --previous`.                |
+| **ImagePullBackOff**  | Không tải được image. Sai tên/tag hoặc thiếu `imagePullSecrets`; ở kind là quên `kind load`.                                                                 |
+| **OOMKilled**         | Vượt `limits.memory` → bị kernel giết. Tăng limit hoặc sửa memory leak. Thấy trong `describe` ở `Last State`, exit code 137.                                 |
+| **Completed**         | Tiến trình kết thúc bình thường (exit 0). Với web server đây là lỗi: server phải chạy mãi. Thường do thiếu `daemon off;` hoặc CMD chạy một script rồi thoát. |
+| **Terminating**       | Đang tắt. Nếu kẹt quá lâu → có finalizer hoặc tiến trình không phản hồi `SIGTERM` (phần 2 và phần 9).                                                        |
+| **Error**             | Container thoát với exit code khác 0 và Pod có `restartPolicy: Never` (Job). Với Deployment bạn sẽ thấy `CrashLoopBackOff` thay vì `Error`.                  |
+
+Một chi tiết giúp bạn đọc `describe` nhanh hơn: Pod có **phase** (`Pending`, `Running`, `Succeeded`, `Failed`) còn từng container có **state** (`Waiting` kèm `Reason` như `CrashLoopBackOff`, `Running`, `Terminated` kèm exit code). Cột `STATUS` của `kubectl get` là tổng hợp hai thứ đó. Khi thấy `CrashLoopBackOff`, trong `describe` hãy tìm khối `Last State: Terminated`, `Reason` và `Exit Code`: 137 là bị giết (OOM hoặc SIGKILL), 1 thường là app ném lỗi, 127 là "command not found" (sai CMD hoặc thiếu shell).
+
+### Init container và sidecar (biết để đọc hiểu code người khác)
+
+```yaml
+spec:
+  # Chạy TRƯỚC container chính, phải xong mới tới lượt container chính
+  initContainers:
+    - name: wait-for-api
+      image: curlimages/curl
+      command:
+        [
+          'sh',
+          '-c',
+          'until curl -sf http://api-svc:3000/health; do echo waiting; sleep 2; done',
+        ]
+  containers:
+    - name: web # container chính
+      image: my-app:v1
+    - name: log-shipper # sidecar: chạy song song suốt đời Pod
+      image: fluent-bit:latest
+```
+
+Init container chạy tuần tự, mỗi cái phải thoát với exit 0 thì cái sau mới chạy, xong hết mới tới `containers`. Pod đứng ở `Init:0/1` trong lúc đó; `kubectl logs <pod> -c wait-for-api` để xem nó đang chờ gì. Sidecar là container thứ hai trong `containers`, sống song song với container chính và chia sẻ IP + volume với nó.
+
+Ứng dụng cho frontend: dùng init container để sinh file `config.js` runtime (xem [Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/), dù cách đặt script vào `/docker-entrypoint.d/` của image nginx thường gọn hơn), hoặc chờ backend sẵn sàng trước khi nhận traffic như ví dụ trên. Sidecar bạn sẽ gặp khi team dùng service mesh (Istio, Linkerd chèn một proxy vào mọi Pod) hoặc agent thu log; bạn không viết chúng, nhưng sẽ thấy `READY 2/2` và cần biết đó là gì.
+
+---
+
+## ReplicaSet và Deployment
+
+### Quan hệ ba tầng
+
+```text
+Deployment  (bạn viết cái này)
+    |  quản lý version và chiến lược update
+    v
+ReplicaSet  (K8s tự tạo, mỗi version một cái)
+    |  đảm bảo đúng số lượng Pod
+    v
+Pod, Pod, Pod  (K8s tự tạo)
+```
+
+<DockerDiagram
+  kind="k8s-objects"
+  caption="Deployment quản lý ReplicaSet, ReplicaSet quản lý Pod. Bạn chỉ khai báo tầng trên cùng; hai tầng dưới là hệ quả."
+/>
+
+Khi bạn đổi image từ v1 sang v2, Deployment tạo ReplicaSet mới cho v2 và giảm dần ReplicaSet cũ về 0. ReplicaSet cũ được giữ lại (không có Pod nào) chính là thứ cho phép bạn `rollout undo`: rollback chỉ là "tăng ReplicaSet cũ lên 3, giảm cái mới về 0", không cần build hay pull gì.
+
+Tên Pod giải thích cấu trúc này: `my-frontend-7d9f8b6c5-x2k9p` là tên Deployment (`my-frontend`) + hash của Pod template trong ReplicaSet (`7d9f8b6c5`) + chuỗi ngẫu nhiên cho từng Pod (`x2k9p`). Hai Pod cùng đoạn giữa là cùng version; sau khi rollout, đoạn giữa đổi. `kubectl get rs` cho thấy cả ReplicaSet mới lẫn cũ với cột `DESIRED`, `CURRENT`, `READY`.
+
+Bạn không bao giờ tạo ReplicaSet trực tiếp và không sửa nó. Mọi thứ đi qua Deployment.
+
+### Deployment hoàn chỉnh cho frontend
+
+```yaml
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-frontend
+  namespace: production
+  labels:
+    app: my-frontend
+spec:
+  replicas: 3
+
+  # SELECTOR: Deployment dùng cái này để "nhận" Pod của mình
+  selector:
+    matchLabels:
+      app: my-frontend
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1 # được tạo thêm tối đa 1 Pod vượt replicas
+      maxUnavailable: 0 # KHÔNG cho phép Pod nào thiếu -> zero downtime
+
+  # TEMPLATE: khuôn để đúc ra từng Pod
+  template:
+    metadata:
+      labels:
+        app: my-frontend # PHẢI khớp selector ở trên
+    spec:
+      containers:
+        - name: web
+          image: ghcr.io/my-org/my-frontend:v1.2.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false
+```
+
+Đọc `spec` của Deployment theo ba khối:
+
+- **`replicas` + `selector`:** muốn bao nhiêu Pod, và nhận diện Pod của mình bằng label nào.
+- **`strategy`:** cách thay Pod cũ bằng Pod mới. `maxSurge: 1` cho phép tạm thời có 4 Pod (3 + 1) trong lúc rollout; `maxUnavailable: 0` bắt buộc lúc nào cũng có đủ 3 Pod sẵn sàng. Với `replicas: 3`, rollout diễn ra như sau: tạo 1 Pod v2 → chờ nó `Ready` (readiness probe pass) → xoá 1 Pod v1 → tạo 1 Pod v2 → ... cho tới khi 3 Pod v2. Không có giây nào dưới 3 Pod phục vụ. Mặc định của K8s là `maxSurge: 25%` và `maxUnavailable: 25%`, nghĩa là với 3 Pod nó được phép xuống còn 2, hơi rủi ro cho frontend nên ta ghi rõ.
+- **`template`:** toàn bộ phần này chính là một Pod spec như mục trước, cộng `metadata.labels`. Mọi thứ về container (image, port, probe, resources, securityContext) nằm ở đây. Khi bạn thắc mắc "trường X đặt ở đâu", câu trả lời gần như luôn là `spec.template.spec.containers[0]`.
+
+Vài dòng đáng chú ý: `imagePullPolicy: IfNotPresent` để kind dùng image đã `kind load` (phần 5) và để cluster thật không pull lại image đã có mỗi lần Pod khởi động. Hai probe cùng gọi `/healthz` mà nginx.conf ở phần 4 đã có; readiness kiểm tra sớm và dày (3 giây, mỗi 5 giây) để Pod nhận traffic nhanh, liveness chờ lâu hơn (15 giây) để không giết container chưa kịp khởi động; phần 8 đi sâu. Khối `securityContext` ở đây cố tình để `runAsNonRoot: false` và `readOnlyRootFilesystem: false` vì image `nginx` chính thức chạy bằng root và cần ghi vào `/var/cache/nginx`; phần 18 chuyển sang `nginx-unprivileged` và bật cả hai lên `true`.
+
+> **Lỗi số 1 của người mới viết Deployment:** `spec.selector.matchLabels` và `spec.template.metadata.labels` bắt buộc phải khớp nhau. Nếu lệch, `kubectl apply` báo lỗi validation `selector does not match template labels`, hoặc tệ hơn ở phiên bản cũ là Deployment tạo Pod rồi không nhận ra chúng → tạo vô hạn Pod. Ngoài ra **selector là immutable**: không sửa được sau khi tạo, muốn đổi phải xoá Deployment làm lại (`kubectl delete deploy my-frontend` rồi `apply`). Vì vậy hãy chọn label selector tối giản và ổn định (`app: my-frontend`), còn label hay đổi như `version` chỉ đặt trong template, không đưa vào selector.
+
+### Các lệnh vận hành Deployment
+
+```bash
+kubectl apply -f deployment.yaml
+kubectl get deploy my-frontend
+# NAME          READY   UP-TO-DATE   AVAILABLE   AGE
+# my-frontend   3/3     3            3           2m
+
+kubectl rollout status deploy/my-frontend             # theo dõi update, thoát khi xong
+kubectl rollout history deploy/my-frontend            # lịch sử version
+kubectl rollout history deploy/my-frontend --revision=2
+kubectl rollout undo deploy/my-frontend               # về version trước
+kubectl rollout undo deploy/my-frontend --to-revision=2
+kubectl rollout pause deploy/my-frontend              # tạm dừng giữa chừng (canary thủ công)
+kubectl rollout resume deploy/my-frontend
+kubectl rollout restart deploy/my-frontend            # restart mọi Pod, giữ nguyên version
+```
+
+Đọc output của `kubectl get deploy`: `READY 3/3` là số Pod ready trên số mong muốn; `UP-TO-DATE` là số Pod đã ở template mới nhất (trong lúc rollout con số này tăng dần từ 0 lên 3); `AVAILABLE` là số Pod đã ready đủ lâu để tính là khả dụng. Trong lúc rollout bạn có thể thấy `READY 4/3` thoáng qua do `maxSurge`.
+
+`rollout status` chặn terminal cho tới khi rollout hoàn tất hoặc thất bại; đây là lệnh CI dùng để biết deploy xong chưa (phần 16), kèm `--timeout=5m` để không treo mãi khi Pod mới không bao giờ ready. `rollout restart` không đổi image mà chỉ đổi một annotation trong template để ép rolling update; dùng khi đổi ConfigMap và muốn Pod đọc lại (phần 8). `rollout undo` tạo một revision mới có nội dung giống revision cũ, nên `history` chỉ tăng chứ không giảm.
+
+> **Mẹo:** thêm annotation để lịch sử rollout có ghi chú dễ hiểu thay vì cột `CHANGE-CAUSE` toàn `<none>`:
+
+```bash
+kubectl annotate deploy/my-frontend kubernetes.io/change-cause="Deploy v1.2.0 - fix login bug"
+```
+
+Hai trường nữa đáng đặt trong `spec` khi lên production: `revisionHistoryLimit: 5` giới hạn số ReplicaSet cũ được giữ (mặc định 10), và `progressDeadlineSeconds: 300` để Deployment tự báo `ProgressDeadlineExceeded` khi rollout kẹt quá 5 phút thay vì im lặng.
+
+### Các loại workload khác (biết để phân biệt)
+
+| Loại            | Dùng khi nào                                                                |
+| --------------- | --------------------------------------------------------------------------- |
+| **Deployment**  | App stateless. Frontend luôn dùng cái này.                                  |
+| **StatefulSet** | App cần danh tính cố định và ổ đĩa riêng: PostgreSQL, Kafka, Redis cluster. |
+| **DaemonSet**   | Chạy đúng 1 Pod trên MỖI node: agent thu log, monitoring, kube-proxy.       |
+| **Job**         | Chạy một lần rồi kết thúc: migration database, xử lý batch.                 |
+| **CronJob**     | Job theo lịch: dọn cache, sinh sitemap hằng đêm, warm-up ISR.               |
+
+Với frontend, chỉ có hai khả năng bạn chạm vào ngoài Deployment: một `Job` để chạy script kiểm tra sau deploy (smoke test), hoặc `CronJob` cho việc định kỳ như sinh sitemap. Còn lại là để biết đồng nghiệp đang nói gì.
+
+---
+
+## Thực hành 2.6
+
+1. Sửa Deployment ở trên: `namespace: default` (hoặc bỏ dòng namespace), `image: nginx:1.26-alpine`, giữ `replicas: 3`. Tạm bỏ hai khối probe nếu muốn (image nginx gốc không có `/healthz`; hoặc đổi `path` thành `/`). Apply.
+2. Chạy `kubectl get rs`: thấy 1 ReplicaSet với `DESIRED 3 CURRENT 3 READY 3`. Chạy `kubectl get pods`: 3 Pod cùng đoạn hash giữa.
+3. Mở terminal thứ hai chạy `kubectl get pods -w`.
+4. Terminal đầu: `kubectl set image deploy/my-frontend web=nginx:1.27-alpine`.
+5. Quan sát terminal 2: Pod mới sinh (hash giữa khác), chờ `Running 1/1`, rồi Pod cũ `Terminating`, lặp lại ba lần. Đây là rolling update với `maxSurge: 1, maxUnavailable: 0`. Chạy `kubectl rollout status deploy/my-frontend` ở terminal đầu để thấy dòng `successfully rolled out`.
+6. `kubectl get rs`: giờ có 2 ReplicaSet, cái cũ `DESIRED 0`. `kubectl rollout history deploy/my-frontend`: 2 revision.
+7. `kubectl rollout undo deploy/my-frontend`: quan sát terminal 2 chạy quá trình ngược lại. `kubectl get rs` cho thấy ReplicaSet cũ lại có 3 Pod. `kubectl describe deploy my-frontend | grep Image` xác nhận image về `1.26`.
+8. Cố tình làm sai: sửa file, đổi `template.metadata.labels.app` thành `my-frontend-2` nhưng giữ selector, apply. Đọc thông báo lỗi. Sửa lại cho khớp.
+9. Dọn dẹp: `kubectl delete -f deployment.yaml`.
+
+> **Kết quả mong đợi:** ở bước 5, không lúc nào số Pod `Running 1/1` xuống dưới 3. Ở bước 6, `kubectl get rs` có hai dòng, một dòng `3 3 3` và một dòng `0 0 0`. Ở bước 8, `kubectl apply` từ chối với lỗi nhắc tới `selector` và `template labels`; cluster không thay đổi gì.
+
+---
+
+## Label, Selector, Annotation, Namespace
+
+### Label: chất keo dán của Kubernetes
+
+Label là cặp `key: value` gắn lên tài nguyên. K8s không có khái niệm "liên kết cứng" kiểu khoá ngoại; mọi quan hệ đều thông qua **label selector**. Service tìm Pod bằng label. Deployment nhận Pod bằng label. HPA tìm Deployment bằng tên nhưng nhắm Pod qua label. NetworkPolicy chọn Pod bằng label. PodDisruptionBudget cũng vậy.
+
+Hệ quả: một Pod có label `app: my-frontend` sẽ được **mọi** Service có selector `app: my-frontend` chọn, dù Pod đó do Deployment nào tạo. Điều này linh hoạt (blue-green ở phần 14 chỉ là đổi selector của Service) và cũng nguy hiểm (một Pod debug bạn tự tạo với label trùng sẽ nhận traffic thật).
+
+```yaml
+metadata:
+  labels:
+    app: my-frontend # tên ứng dụng
+    version: v1.2.0 # phiên bản
+    component: web # vai trò
+    environment: production # môi trường
+    team: frontend # đội sở hữu
+```
+
+```bash
+# Lọc theo label
+kubectl get pods -l app=my-frontend
+kubectl get pods -l 'environment in (staging,production)'
+kubectl get pods -l app=my-frontend,version=v1.2.0
+kubectl get pods -l 'app!=my-frontend'
+kubectl get pods --show-labels
+
+# Gắn / gỡ label
+kubectl label pod my-pod tier=frontend
+kubectl label pod my-pod tier-          # dấu trừ ở cuối = gỡ bỏ
+```
+
+`-l` dùng được với mọi lệnh: `kubectl logs -l app=my-frontend` gom log của cả 3 Pod, `kubectl delete pods -l app=my-frontend` xoá cả loạt (Deployment tạo lại ngay), `kubectl get all -l team=frontend` xem mọi thứ của một team. Key label tối đa 63 ký tự, chỉ chữ, số, `-`, `_`, `.`; có thể có tiền tố dạng domain như `app.kubernetes.io/name`.
+
+> **Ghi chú, bộ label chuẩn khuyến nghị của K8s:** dùng tiền tố `app.kubernetes.io/` để công cụ bên thứ ba (Helm, ArgoCD, dashboard, ingress-nginx) hiểu được: `app.kubernetes.io/name`, `/instance`, `/version`, `/component`, `/part-of`, `/managed-by`. Manifest production ở phần 10 dùng bộ này; các ví dụ học ở phần 6–9 dùng `app:` ngắn gọn cho dễ đọc. Chọn một trong hai và nhất quán trong cả repo; trộn lẫn là selector không khớp.
+
+Selector trong Deployment còn có dạng `matchExpressions` cho điều kiện phức tạp (`key: environment, operator: In, values: [staging, production]`), nhưng frontend hiếm khi cần; `matchLabels` là đủ.
+
+### Annotation: metadata không dùng để lọc
+
+Annotation cũng là key-value nhưng **không thể dùng làm selector**. Dùng để chứa thông tin cấu hình cho công cụ khác hoặc ghi chú dài. Phần lớn annotation bạn viết là "lệnh" cho một controller cụ thể đọc: ingress-nginx đọc `nginx.ingress.kubernetes.io/*`, cert-manager đọc `cert-manager.io/*`.
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: '50m'
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    kubernetes.io/change-cause: 'Deploy v1.2.0'
+    description: 'Frontend chính, liên hệ team-fe@congty.com'
+```
+
+Quy tắc chọn: nếu bạn sẽ `kubectl get -l` hay một selector nào đó cần nó, dùng label; nếu là dữ liệu cho công cụ đọc hoặc ghi chú cho người, dùng annotation. Giá trị annotation phải là chuỗi (nhớ nháy cho `"50m"`, `"true"`), và có thể dài (cả một đoạn cấu hình nginx với `|`, như ở phần 7).
+
+### Namespace: chia ngăn logic
+
+```bash
+kubectl get namespaces
+kubectl create namespace staging
+kubectl get pods -n staging
+kubectl get pods --all-namespaces      # hoặc -A
+
+# Đặt namespace mặc định cho session
+kubectl config set-context --current --namespace=staging
+```
+
+Namespace dùng để:
+
+- Tách môi trường: `dev`, `staging`, `production`, cùng một cluster.
+- Tách team: `team-fe`, `team-be`.
+- Áp quota tài nguyên (`ResourceQuota`: namespace này tối đa 8 CPU) và RBAC theo nhóm (team FE chỉ được sửa Deployment trong `web`, phần 18).
+
+Cluster mới có sẵn vài namespace: `default` (nơi mọi thứ rơi vào khi bạn quên `-n`), `kube-system` (control plane, CoreDNS, kube-proxy: đừng đụng), `kube-public`, `kube-node-lease`, và sau phần 5 là `ingress-nginx`. Tên tài nguyên chỉ cần duy nhất trong namespace: `staging` và `production` đều có Deployment tên `my-frontend` là bình thường, và đó chính là cách dùng một bộ YAML cho nhiều môi trường (phần 15). Một số tài nguyên không thuộc namespace nào: Node, PersistentVolume, Namespace, ClusterRole; `kubectl api-resources --namespaced=false` liệt kê chúng.
+
+Nên tạo namespace bằng file YAML trong `k8s/namespace.yaml` và apply nó trước các file khác (phần 10 làm đúng vậy), thay vì `kubectl create namespace` bằng tay, để môi trường dựng lại được từ Git.
+
+> **Cạm bẫy DNS giữa namespace:** trong cùng namespace, gọi `http://api-service` là đủ. Khác namespace, bắt buộc phải ghi `http://api-service.ten-namespace`. Rất nhiều lỗi "không gọi được API" chỉ là thiếu phần namespace này, và thông điệp lỗi là `Could not resolve host` như phần 2 đã cho bạn thấy. Kiểm tra bằng `kubectl exec <pod> -- cat /etc/resolv.conf` để xem Pod đang ở namespace nào theo dòng `search`.
+
+> **Nguy hiểm:** namespace **không phải** ranh giới bảo mật mặc định. Mặc định mọi Pod ở mọi namespace đều gọi được nhau; `staging` gọi thẳng vào database của `production` được nếu biết tên. Muốn chặn phải dùng NetworkPolicy (phần 18). Và `kubectl delete namespace production` xoá **mọi thứ** bên trong (Deployment, Service, Secret, PVC) không hỏi lại; kết hợp với sai context ở phần 5, đây là cách nhanh nhất để có một ngày rất tệ.
+
+---
+
+## Thực hành 2.7
+
+1. Tạo namespace `staging` bằng file YAML (`apiVersion: v1`, `kind: Namespace`, `metadata.name: staging`) và apply.
+2. Apply lại Deployment ở Thực hành 2.6 với `namespace: staging`. Chạy `kubectl get pods` (không `-n`) → trống; `kubectl get pods -n staging` → 3 Pod. Đặt `kubectl config set-context --current --namespace=staging` rồi `kubectl get pods` → 3 Pod.
+3. `kubectl get pods --show-labels` để thấy cột `LABELS` có `app=my-frontend` và `pod-template-hash=...` (label K8s tự thêm để ReplicaSet nhận Pod của mình).
+4. `kubectl label pod <mot-pod> debug=true`, rồi `kubectl get pods -l debug=true` → đúng 1 Pod. Gỡ bằng `kubectl label pod <mot-pod> debug-`.
+5. Thí nghiệm quan trọng: `kubectl label pod <mot-pod> app-` (gỡ label `app` khỏi một Pod). Chạy ngay `kubectl get pods`: bạn thấy **4** Pod. ReplicaSet không còn "nhìn thấy" Pod đã mất label nên tạo Pod mới cho đủ 3; Pod cũ vẫn chạy nhưng mồ côi. Đây là minh hoạ rõ nhất cho "mọi quan hệ đều qua label". Xoá Pod mồ côi bằng `kubectl delete pod <ten>`.
+6. Thêm annotation `kubectl annotate deploy/my-frontend description="lab phan 6"` rồi `kubectl describe deploy my-frontend | grep -A2 Annotations`.
+7. Dọn dẹp: `kubectl config set-context --current --namespace=default`, rồi `kubectl delete namespace staging` (chỉ vì đây là lab; hãy nhìn context trước khi gõ).
+
+> **Kết quả mong đợi:** bước 2 chứng minh namespace cô lập cách nhìn của `kubectl`; bước 5 cho thấy 4 Pod sau khi gỡ label và ReplicaSet lập tức bù thêm một Pod. Nếu bước 5 bạn không thấy Pod thứ 4 trong vài giây, chạy `kubectl get rs` để xem `CURRENT` đã về 3 chưa.
+
+---
+
+## Tóm tắt
+
+- Pod là đơn vị nhỏ nhất, bọc 1 hay nhiều container chung IP, chung volume, chung node. Với frontend, một Pod = một container; init container và sidecar chỉ cần đọc hiểu.
+- Bảng trạng thái Pod: `Pending` (scheduler), `ContainerCreating` (kubelet pull/mount), `Running 0/1` (readiness fail), `CrashLoopBackOff` (`logs --previous`), `ImagePullBackOff` (image/secret/kind load), `OOMKilled` (exit 137), `Completed` (server thoát: thiếu `daemon off;`), `Terminating` kẹt (SIGTERM).
+- Không tạo Pod trần. Deployment quản lý version và chiến lược; ReplicaSet giữ số lượng; mỗi version một ReplicaSet, ReplicaSet cũ giữ lại để `rollout undo` tức thì. Tên Pod = deployment + hash template + id.
+- `selector.matchLabels` phải khớp `template.metadata.labels`, và selector là immutable. `maxSurge: 1, maxUnavailable: 0` cho rolling update không lúc nào thiếu Pod.
+- `rollout status / history / undo / restart` là bốn lệnh vận hành hằng ngày; annotation `change-cause` để lịch sử có nghĩa; `revisionHistoryLimit` và `progressDeadlineSeconds` cho production.
+- Label là chất keo: Service, Deployment, HPA, NetworkPolicy đều chọn Pod qua label. Gỡ label khỏi Pod là Pod mồ côi và ReplicaSet tạo Pod mới. Annotation là metadata cho công cụ và người, không lọc được.
+- Namespace chia môi trường và team, cho phép trùng tên tài nguyên giữa các namespace; DNS khác namespace cần `.ten-namespace`; namespace không chặn mạng (cần NetworkPolicy) và xoá namespace là xoá tất cả bên trong.
+
+## Đọc thêm
+
+- [Pods](https://kubernetes.io/docs/concepts/workloads/pods/) — vòng đời Pod, phase và container state, init container.
+- [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/) — rolling update, rollback, `progressDeadlineSeconds`, các trạng thái của Deployment.
+- [Kubernetes Concepts](https://kubernetes.io/docs/concepts/) — mục Overview → Working with Kubernetes Objects có Labels and Selectors, Annotations, Namespaces và Recommended Labels.
+- Bước tiếp theo là [Phần 7 — Service và Ingress](/blog/k8s-fe-07-service-and-ingress/): Deployment đã có 3 Pod, giờ cần một địa chỉ ổn định để gọi chúng.

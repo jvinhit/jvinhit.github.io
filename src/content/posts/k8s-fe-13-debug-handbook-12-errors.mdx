@@ -1,0 +1,374 @@
+---
+title: 'Kubernetes cho Frontend Developer · Phần 13 — Sổ tay debug: 12 lỗi thường gặp'
+description: 'Quy trình chẩn đoán 7 bước và 12 lỗi hay gặp: ImagePullBackOff, CrashLoopBackOff, READY 0/1, Pending, 502, 503, 404 khi F5, trang trắng, sai API URL, OOMKilled, ConfigMap không đổi, CORS. Mỗi lỗi có triệu chứng, lệnh chẩn đoán, cách sửa.'
+pubDate: 2026-11-05
+lang: vi
+tags: [kubernetes, debugging, devops, frontend, nginx]
+series: k8s-fe
+seriesOrder: 13
+draft: false
+---
+
+Bạn deploy, một thứ gì đó không chạy, và màn hình chỉ có một chữ `CrashLoopBackOff` hoặc một trang 502 trắng. Điểm khác biệt giữa người mới và người đã quen K8s không phải là biết nhiều hơn, mà là **hỏi đúng câu hỏi theo đúng thứ tự**: Pod ở trạng thái gì, Events nói gì, log nói gì, Service có thấy Pod không, bên trong container có đúng thứ mình nghĩ không. Bài này là sổ tay để mở ra lúc sự cố: một quy trình chẩn đoán 7 bước luôn đi theo thứ tự, rồi 12 lỗi frontend developer gặp nhiều nhất, mỗi lỗi có triệu chứng, lệnh chẩn đoán kèm output thật, nguyên nhân thường gặp và cách sửa. Mười hai lỗi này chiếm phần lớn thời gian debug của bạn trong năm đầu; tự xử lý được chúng là mốc "không cần hỏi ai" mà series hướng tới.
+
+## Quy trình chẩn đoán chuẩn: luôn theo thứ tự này
+
+```bash
+1. kubectl get pods                       # -> Pod ở trạng thái gì?
+2. kubectl describe pod <ten>             # -> đọc phần Events ở CUỐI
+3. kubectl logs <ten>                     # -> log hiện tại
+4. kubectl logs --previous <ten>          # -> log lần chết trước (nếu crash)
+5. kubectl get endpoints <svc>            # -> Service có tìm thấy Pod không?
+6. kubectl exec -it <ten> -- sh           # -> vào trong kiểm tra env, file, curl
+7. kubectl get events -A --sort-by=.metadata.creationTimestamp
+```
+
+Vì sao thứ tự này quan trọng: mỗi bước loại trừ một tầng, từ ngoài vào trong. Bước 1 cho biết vấn đề ở tầng **K8s** (Pod không lên nổi) hay tầng **app** (Pod Running mà vẫn lỗi). Bước 2 là lệnh đáng giá nhất: Events ở cuối output kể lại chính xác K8s đã làm gì và vướng ở đâu, dòng mới nhất nằm dưới cùng. Bước 3 và 4 chỉ có ý nghĩa khi Pod đã từng chạy; với `CrashLoopBackOff`, log hiện tại thường rỗng vì container vừa mới sinh ra, `--previous` mới chứa nguyên nhân. Bước 5 tách bạch "Pod hỏng" với "mạng hỏng". Bước 6 là lúc kiểm chứng giả thuyết bằng mắt. Bước 7 để nhìn toàn cảnh khi lỗi không nằm ở Pod của bạn (node hết tài nguyên, Ingress Controller restart).
+
+Hai thói quen tiết kiệm thời gian:
+
+- Lọc Events theo một object thay vì đọc cả namespace: `kubectl get events --field-selector involvedObject.name=<pod> --sort-by=.metadata.creationTimestamp`.
+- Kiểm tra context trước mọi lệnh: `kubectl config current-context`. Debug nửa giờ rồi nhận ra mình đang nhìn cluster staging là chuyện có thật.
+
+---
+
+## Bảng tổng quan 12 lỗi
+
+| #   | Triệu chứng                        | Câu hỏi đầu tiên                                    |
+| --- | ---------------------------------- | --------------------------------------------------- |
+| 1   | `ImagePullBackOff`                 | Tên image, tag, credential có đúng không?           |
+| 2   | `CrashLoopBackOff`                 | `logs --previous` nói gì? Exit code bao nhiêu?      |
+| 3   | `Running` nhưng `READY 0/1`        | Readiness probe fail vì đâu?                        |
+| 4   | `Pending` mãi                      | Events có `0/N nodes are available` không?          |
+| 5   | 502 Bad Gateway                    | Service tới được Pod không? `targetPort` đúng chưa? |
+| 6   | 503 Service Unavailable            | Endpoints có rỗng không?                            |
+| 7   | 404 khi F5 trên route SPA          | `nginx.conf` trong Pod có `try_files` không?        |
+| 8   | Trang trắng, console báo 404 asset | Asset đang được tải từ đường dẫn nào?               |
+| 9   | App gọi sai API URL                | `config.js` trong Pod chứa gì?                      |
+| 10  | `OOMKilled`                        | Limit bao nhiêu, Pod dùng bao nhiêu?                |
+| 11  | Đổi ConfigMap không có tác dụng    | Đã `rollout restart` chưa?                          |
+| 12  | Lỗi CORS trên production           | Status code thật của response là gì?                |
+
+---
+
+## Lỗi 1: ImagePullBackOff
+
+**Triệu chứng:** `kubectl get pods` hiện `ErrImagePull` rồi chuyển sang `ImagePullBackOff`; Pod không bao giờ lên `Running`.
+
+**Chẩn đoán:**
+
+```bash
+kubectl describe pod <pod> | tail -15
+#   Failed to pull image "ghcr.io/my-org/frontend:v1.4.3":
+#     ... manifest unknown            -> sai tag
+#     ... unauthorized / denied       -> image private, thiếu hoặc sai imagePullSecrets
+#     ... no such host / i/o timeout  -> node không ra được registry
+kubectl get pod <pod> -o jsonpath='{.spec.containers[0].image}'
+```
+
+**Nguyên nhân:** có đúng bốn, kiểm tra theo thứ tự: (1) sai tên image hoặc tag (lỗi đánh máy, tag chưa được CI push xong), (2) image private mà thiếu `imagePullSecrets`, hoặc Secret nằm **khác namespace** với Pod, (3) token trong Secret hết hạn, (4) node không có mạng ra registry. Với kind còn nguyên nhân thứ năm: quên `kind load docker-image`, hoặc có load nhưng `imagePullPolicy: Always` khiến K8s vẫn cố pull từ Internet.
+
+**Cách sửa:** `docker pull <image>` từ laptop để xác nhận image tồn tại và tên đúng từng ký tự; `kubectl get secret <ten> -n <namespace>` để chắc Secret có mặt đúng chỗ; tạo lại Secret khi token hết hạn (Phần 4); trên kind đặt `imagePullPolicy: IfNotPresent`. Phòng ngừa: pipeline chỉ `set image` sau khi `docker push` thành công, và dùng tag bất biến để không bao giờ phải đoán "tag này trỏ tới đâu".
+
+---
+
+## Lỗi 2: CrashLoopBackOff
+
+**Triệu chứng:** Pod lên rồi chết, RESTARTS tăng dần, khoảng cách giữa các lần restart tăng 10s, 20s, 40s… tối đa 5 phút.
+
+**Chẩn đoán:**
+
+```bash
+kubectl logs --previous <pod>          # log của lần chết trước - nơi có nguyên nhân thật
+kubectl describe pod <pod> | grep -A6 "Last State"
+#   Last State:  Terminated
+#     Reason:    Error            (hoặc OOMKilled, Completed)
+#     Exit Code: 1                (0, 127, 137, 143 - xem Phần 9)
+```
+
+**Nguyên nhân thường gặp:**
+
+- Thiếu biến môi trường bắt buộc: log có `API_URL is required` hoặc `Cannot read properties of undefined`. App SSR/BFF hay gặp nhất.
+- `CMD` sai: exit 127 (không tìm thấy lệnh) hoặc 126 (không có quyền thực thi, thiếu `chmod +x`).
+- Tiến trình chạy nền thay vì foreground: exit 0, reason `Completed`, log không có lỗi. nginx thiếu `daemon off;`.
+- Liveness probe quá gắt: Events có `Liveness probe failed` ngay trước `Killing`, còn log app dừng giữa chừng lúc đang khởi động. Xem [Phần 8](/blog/k8s-fe-08-configmap-secret-probes/).
+- nginx lỗi cú pháp config từ ConfigMap: log có `[emerg] ... in /etc/nginx/conf.d/default.conf:12`.
+
+**Cách sửa:** theo đúng thông báo trong `--previous`. Khi log trống hoàn toàn và không đoán được, tạm ghi đè lệnh khởi động để giữ container sống rồi vào trong xem:
+
+```bash
+kubectl -n web patch deploy frontend --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/command","value":["sleep","3600"]}]'
+kubectl -n web exec -it deploy/frontend -- sh
+# bên trong: chạy tay lệnh CMD gốc, ví dụ: nginx -t  hoặc  node server.js
+```
+
+Xong nhớ `kubectl rollout undo` để bỏ patch.
+
+---
+
+## Lỗi 3: Pod Running nhưng READY 0/1
+
+**Triệu chứng:** STATUS là `Running`, READY `0/1` mãi, Service không có endpoint của Pod này, Ingress trả 503 nếu mọi Pod đều vậy.
+
+**Chẩn đoán:**
+
+```bash
+kubectl describe pod <pod> | grep -i -A2 "readiness"
+#   Readiness probe failed: HTTP probe failed with statuscode: 404
+#   Readiness probe failed: Get "http://10.244.1.5:80/healthz": dial tcp ... connection refused
+#   Readiness probe failed: ... context deadline exceeded
+kubectl exec <pod> -- wget -qO- http://localhost:80/healthz
+```
+
+**Nguyên nhân:** `statuscode: 404` là đường dẫn `/healthz` không tồn tại (thiếu `location /healthz` trong `nginx.conf`, hoặc Next.js chưa có `app/api/health/route.ts`). `connection refused` là sai `port` trong probe, app listen `127.0.0.1` thay vì `0.0.0.0`, hoặc `initialDelaySeconds` quá ngắn. `context deadline exceeded` là app trả lời chậm hơn `timeoutSeconds` (mặc định 1 giây).
+
+**Cách sửa:** so `port` của probe với cổng app thật sự listen (`kubectl exec <pod> -- netstat -tlnp`); thêm endpoint health; với Next.js đặt `HOSTNAME=0.0.0.0` (Phần 11); tăng `timeoutSeconds` lên 2–3. Dấu hiệu đặc trưng của lỗi HOSTNAME: `wget localhost` **bên trong** container thành công nhưng probe từ kubelet vẫn `connection refused`.
+
+---
+
+## Lỗi 4: Pod Pending mãi
+
+**Triệu chứng:** STATUS `Pending` quá 30 giây, không có container nào được tạo, `kubectl logs` báo container chưa start.
+
+**Chẩn đoán:**
+
+```bash
+kubectl describe pod <pod> | tail -8
+#   0/3 nodes are available: 3 Insufficient memory.
+#   0/3 nodes are available: 1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: },
+#     2 node(s) didn't match Pod's node affinity/selector.
+#   persistentvolumeclaim "data" not found
+kubectl top nodes
+kubectl describe node <node> | grep -A6 "Allocated resources"
+```
+
+**Nguyên nhân:** cluster hết CPU/RAM theo `requests` (không phải theo mức dùng thật, xem Phần 9); `nodeSelector`/affinity không khớp node nào; taint không có toleration; PVC chưa bind hoặc không tồn tại. Trong rollout với `maxSurge`, Pod thừa bị Pending vì thiếu chỗ cho đúng một Pod là chuyện rất hay gặp.
+
+**Cách sửa:** giảm `requests` về mức đo được thật, hoặc thêm node (cluster autoscaler); sửa selector; xoá tham chiếu PVC nếu frontend không cần. Nếu Pod kẹt ở `ContainerCreating` thay vì `Pending`, đó là kubelet: đang pull image lớn, hoặc `configmap "frontend-config" not found` do ConfigMap chưa tạo hoặc sai namespace.
+
+---
+
+## Lỗi 5: 502 Bad Gateway
+
+**Triệu chứng:** Trình duyệt nhận trang 502 của nginx (Ingress Controller). Ingress đã đến được Service, nhưng Service không tới được Pod.
+
+**Chẩn đoán:**
+
+```bash
+kubectl get endpoints frontend -n web           # có IP -> vấn đề ở bước sau
+kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller --tail=50 | grep -i upstream
+#   connect() failed (111: Connection refused) while connecting to upstream, upstream: "10.244.1.5:8080"
+kubectl -n web port-forward pod/<pod> 8080:80   # bỏ qua Service, gọi thẳng Pod
+```
+
+**Nguyên nhân:** `targetPort` không khớp `containerPort` (dòng log ở trên cho thấy upstream `:8080` trong khi nginx listen 80); app listen `127.0.0.1`; Pod đang crash giữa chừng; hoặc 502 chỉ xuất hiện **đúng lúc deploy** vì Pod cũ bị tắt khi vẫn còn nhận request.
+
+**Cách sửa:** đối chiếu ba con số `containerPort`, `targetPort`, cổng app listen ([Phần 7](/blog/k8s-fe-07-service-and-ingress/)); `HOSTNAME=0.0.0.0`; nếu chỉ 502 lúc deploy, áp dụng checklist zero-downtime ở [Phần 12](/blog/k8s-fe-12-cache-cdn-zero-downtime/) (preStop, readiness, grace period). Nếu `port-forward` thẳng vào Pod mà chạy tốt, lỗi chắc chắn nằm ở Service; nếu vẫn hỏng, lỗi ở container.
+
+---
+
+## Lỗi 6: 503 Service Unavailable
+
+**Triệu chứng:** Trang 503 của Ingress Controller. Khác 502: không có endpoint nào để chuyển tới.
+
+**Chẩn đoán:**
+
+```bash
+kubectl get endpoints frontend -n web
+# NAME       ENDPOINTS   AGE
+# frontend   <none>      5m          <- đây là toàn bộ câu chuyện
+kubectl get pods -n web --show-labels
+kubectl get svc frontend -n web -o jsonpath='{.spec.selector}'
+kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller --tail=50 | grep -i endpoint
+#   Service "web/frontend" does not have any active Endpoint
+```
+
+**Nguyên nhân:** selector của Service không khớp label Pod (đổi label ở Deployment mà quên Service, hoặc `app.kubernetes.io/name` với `app`); tất cả Pod đang fail readiness (lỗi 3 nhân lên); Service bị xoá; hoặc Ingress ghi sai tên Service (`frontend-svc` khi Service tên `frontend`).
+
+**Cách sửa:** sửa selector cho khớp `--show-labels`; sửa readiness; kiểm tra `backend.service.name` trong Ingress khớp `kubectl get svc`. Nhớ cặp phân biệt: **503 là không có ai, 502 là có nhưng không nối được.**
+
+---
+
+## Lỗi 7: 404 khi F5 trên route SPA
+
+**Triệu chứng:** Bấm link nội bộ tới `/users/123` chạy tốt, F5 tại đó hoặc mở link trực tiếp thì 404.
+
+**Chẩn đoán:**
+
+```bash
+kubectl exec <pod> -- cat /etc/nginx/conf.d/default.conf | grep try_files
+curl -sI -H "Host: app.local" http://localhost/users/123 | head -3
+```
+
+Phân biệt 404 của ai: body có chữ `nginx` kèm phiên bản và không có HTML của app là 404 từ nginx trong Pod (thiếu fallback) hoặc từ Ingress Controller (không khớp path/host); body là `index.html` của app kèm 404 là React Router không có route đó.
+
+**Nguyên nhân:** thiếu `try_files $uri $uri/ /index.html;` trong `nginx.conf`; ConfigMap mount đè `default.conf` bằng bản không có dòng đó; Ingress `rewrite-target` cắt path khiến app nhận đường dẫn khác; app đặt dưới sub-path mà thiếu `basename`.
+
+**Cách sửa:** thêm `try_files`, build lại image hoặc sửa ConfigMap rồi `rollout restart`; kiểm tra file thật trong Pod thay vì file trong repo, vì hai thứ có thể khác nhau (Phần 4).
+
+---
+
+## Lỗi 8: Trang trắng, console báo 404 asset
+
+**Triệu chứng:** HTML tải được nhưng trang trắng; Network tab đầy `404` cho `/assets/index-xxx.js` hoặc `/app/assets/...`.
+
+**Chẩn đoán:**
+
+```bash
+# Nhìn Network tab: URL nào 404? Rồi kiểm tra file có trong Pod không
+kubectl exec <pod> -- ls /usr/share/nginx/html/assets | head
+kubectl exec <pod> -- grep -o 'src="[^"]*"' /usr/share/nginx/html/index.html
+curl -sI -H "Host: app.local" http://localhost/assets/index-xxx.js | head -1
+```
+
+**Nguyên nhân:** (a) sai base path: app nằm dưới `/app` nhưng build không có `base: '/app/'`, asset trỏ về `/assets/...` và rơi vào app khác (Phần 11); (b) `index.html` bị cache trỏ tới bundle cũ đã bị xoá sau deploy (tên file trong `index.html` trình duyệt đang giữ khác tên file trong Pod); (c) annotation `rewrite-target` áp cho cả `/` nên đường dẫn asset bị cắt; (d) `root` trong `nginx.conf` không phải thư mục chứa `dist`.
+
+**Cách sửa:** (a) build với base path đúng; (b) `Cache-Control: no-cache` cho `index.html`, purge CDN, giữ asset cũ ([Phần 12](/blog/k8s-fe-12-cache-cdn-zero-downtime/)); (c) tách Ingress; (d) sửa `root`. Cách phân biệt (a) với (b): (a) lỗi ở **mọi** người dùng ngay sau deploy, (b) chỉ ở người dùng đã mở app trước đó và F5 mạnh là hết.
+
+---
+
+## Lỗi 9: App gọi sai API URL
+
+**Triệu chứng:** Production gọi `api-staging.congty.com`, hoặc `localhost:3000`, dù ConfigMap đã đúng.
+
+**Chẩn đoán:**
+
+```bash
+kubectl exec <pod> -- env | grep API                      # biến vào Pod chưa?
+kubectl exec <pod> -- cat /usr/share/nginx/html/config.js # entrypoint sinh đúng chưa?
+# Trong console trình duyệt: window.__APP_CONFIG__       # trình duyệt nhận đúng chưa?
+curl -sI -H "Host: app.local" http://localhost/config.js | grep -i cache-control
+```
+
+**Nguyên nhân:** biến bị nhúng lúc build (`VITE_*`), ConfigMap không thể đổi ([Phần 10](/blog/k8s-fe-10-env-vars-and-react-spa-deploy/)). Nếu đã dùng runtime config: `env` đúng nhưng `config.js` sai là entrypoint không chạy (thiếu `chmod +x`, đuôi file không phải `.sh`, CRLF); `config.js` đúng nhưng app vẫn sai là code đọc `import.meta.env` thay vì `config.ts`, hoặc `config.js` bị cache thiếu `no-store`.
+
+**Cách sửa:** áp dụng runtime config pattern đủ 6 bước; ba lệnh chẩn đoán ở trên chỉ đúng chỗ đứt trong chuỗi ConfigMap → env → `config.js` → trình duyệt.
+
+---
+
+## Lỗi 10: OOMKilled
+
+**Triệu chứng:** Pod restart với `Last State: Terminated, Reason: OOMKilled, Exit Code: 137`; với Next.js thường xảy ra sau vài giờ hoặc khi traffic tăng.
+
+**Chẩn đoán:**
+
+```bash
+kubectl describe pod <pod> | grep -B2 -A3 OOMKilled
+kubectl top pod <pod> -n web              # mức dùng hiện tại so với limit
+kubectl get pod <pod> -o jsonpath='{.spec.containers[0].resources.limits.memory}'
+```
+
+**Nguyên nhân:** vượt `limits.memory`. Với Next.js thường do limit quá thấp so với số route và cache; hoặc memory leak (mức dùng tăng đều theo thời gian chứ không theo tải); hoặc V8 để heap phình quá limit trước khi GC. Với SPA nginx thì `OOMKilled` gần như không xảy ra; nếu có, nghi ngờ thứ khác (sidecar, buffer upload).
+
+**Cách sửa:** tăng limit theo số đo thật (Phần 9); thêm `NODE_OPTIONS=--max-old-space-size=<~80% limit tính bằng MB>` để Node tự giới hạn heap dưới mức limit; nếu leak, chụp heap snapshot ở staging rồi sửa code, tăng limit chỉ là hoãn.
+
+---
+
+## Lỗi 11: Đổi ConfigMap không có tác dụng
+
+**Triệu chứng:** `kubectl apply` ConfigMap thành công, `kubectl get configmap -o yaml` thấy giá trị mới, app vẫn dùng giá trị cũ.
+
+**Chẩn đoán:**
+
+```bash
+kubectl exec <pod> -- env | grep <KEY>                    # vẫn cũ -> Pod chưa restart
+kubectl get pod <pod> -o jsonpath='{.metadata.creationTimestamp}'  # Pod tạo trước hay sau khi sửa?
+kubectl get pod <pod> -o yaml | grep -B2 subPath           # mount qua subPath?
+```
+
+**Nguyên nhân:** biến môi trường chỉ nạp lúc Pod khởi động; file mount qua `subPath` không tự cập nhật; ConfigMap sửa ở namespace khác với Pod (`apply` không có `-n` rơi vào `default`).
+
+**Cách sửa:** `kubectl rollout restart deploy/frontend`; bỏ `subPath` nếu cần cập nhật nóng (và nhớ nginx phải reload); lâu dài, dùng annotation hash config trong Pod template (Helm `checksum/config`, Kustomize `configMapGenerator`) để đổi config là tự rolling update ([Phần 8](/blog/k8s-fe-08-configmap-secret-probes/)).
+
+---
+
+## Lỗi 12: Lỗi CORS trên production
+
+**Triệu chứng:** Console báo `Access to fetch at 'https://api.congty.com/...' from origin 'https://app.congty.com' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header`. Ở local chạy tốt vì Vite proxy đưa API về cùng origin.
+
+**Chẩn đoán:**
+
+```bash
+# Nhìn Network tab TRƯỚC: status code của request là gì?
+curl -sI -X OPTIONS -H "Origin: https://app.congty.com" \
+  -H "Access-Control-Request-Method: POST" https://api.congty.com/users
+curl -sI -H "Origin: https://app.congty.com" https://api.congty.com/users | grep -i access-control
+```
+
+**Nguyên nhân:** frontend và API khác origin, và backend (hoặc Ingress) không trả header CORS. Nhưng một cạm bẫy lớn: trình duyệt in lỗi CORS cho **mọi** response thiếu header, kể cả trang 502/503 của Ingress Controller và 401 từ middleware xác thực chặn cả request preflight `OPTIONS`. Rất nhiều "lỗi CORS" thực ra là lỗi 5 hoặc 6 ở trên đội lốt.
+
+**Cách sửa:** tốt nhất là đưa API về cùng domain qua path `/api` trên Ingress ([Phần 7](/blog/k8s-fe-07-service-and-ingress/)), hết CORS tận gốc. Nếu buộc phải khác origin: bật CORS ở backend (đúng origin, không dùng `*` khi có cookie, `Access-Control-Allow-Credentials: true`), đảm bảo `OPTIONS` trả 2xx trước mọi middleware auth; hoặc dùng annotation `enable-cors` của ingress-nginx. Đọc [bài CORS](/blog/cors-explained-deep-dive/) để hiểu preflight và credentials tận gốc.
+
+---
+
+## Bộ lệnh debug cấp tốc: lưu lại dùng hằng ngày
+
+```bash
+# Xem toàn cảnh một namespace
+kubectl -n web get all
+
+# Pod nào không khỏe trong toàn cluster
+kubectl get pods -A --field-selector=status.phase!=Running
+
+# Xem 20 event gần nhất
+kubectl get events -A --sort-by=.metadata.creationTimestamp | tail -20
+
+# So sánh cấu hình mong muốn với thực tế
+kubectl -n web get deploy frontend -o yaml | less
+
+# Kiểm tra mạng nội bộ từ bên trong cluster
+kubectl -n web run netcheck --rm -it --image=nicolaka/netshoot -- bash
+# bên trong: curl -v http://frontend/healthz ; dig frontend.web.svc.cluster.local
+
+# Debug container không có shell (distroless) bằng ephemeral container
+kubectl -n web debug <pod> -it --image=busybox --target=web
+
+# Xem mức dùng tài nguyên thật
+kubectl top pods -n web
+kubectl top nodes
+
+# Kiểm tra YAML mà không thực sự apply; xem diff so với cluster
+kubectl apply -f k8s/ --dry-run=server
+kubectl diff -f k8s/
+
+# Lấy đúng một trường thay vì đọc cả YAML
+kubectl get pod <pod> -o jsonpath='{.status.containerStatuses[0].lastState}'
+
+# Quên cú pháp một trường
+kubectl explain deployment.spec.strategy
+```
+
+### Khi nào chuyển cho DevOps
+
+Không phải lỗi nào cũng thuộc về bạn. Chuyển ngay, kèm output của `describe` và `events`, khi thấy: node `NotReady`; Ingress Controller restart liên tục; DNS trong cluster không phân giải cho **mọi** Pod (không riêng Pod của bạn); `exceeded quota` của namespace; PVC không bind vì storage class; certificate kẹt `Pending` do DNS hoặc firewall. Bạn vẫn là người thu thập bằng chứng, chỉ không phải người sửa.
+
+---
+
+## Kết thúc Phần 3: bạn phải làm được
+
+- Giải thích và triển khai runtime config pattern.
+- Deploy hoàn chỉnh một SPA có Ingress, probe, PDB.
+- Deploy Next.js SSR với `startupProbe` đúng.
+- Cấu hình cache-control đúng chuẩn cho từng loại file.
+- Tự chẩn đoán 502, 503, 404, `CrashLoopBackOff` mà không cần hỏi ai.
+
+Đạt đủ năm dòng là bạn đã vượt qua phần khó nhất với frontend developer. Phần 4 (từ Phần 14) là vận hành chuyên nghiệp: chiến lược rollout, autoscaling, Helm, CI/CD, GitOps, HTTPS tự động, observability và bảo mật.
+
+---
+
+## Tóm tắt
+
+- Debug theo đúng thứ tự 7 bước: trạng thái Pod → Events → log → log lần trước → endpoints → vào trong container → events toàn cluster. Mỗi bước loại trừ một tầng.
+- `kubectl describe pod` đọc Events ở cuối, `kubectl logs --previous` khi crash loop, `kubectl get endpoints` khi Service "không chạy": ba lệnh này giải quyết phần lớn sự cố.
+- Nhóm lỗi K8s: `ImagePullBackOff` (4 nguyên nhân, kiểm tra theo thứ tự), `CrashLoopBackOff` (exit code + `--previous`), `READY 0/1` (readiness), `Pending` (Events `0/N nodes`), `OOMKilled` (137, limit), ConfigMap không đổi (`rollout restart`).
+- Nhóm lỗi mạng: 502 là Service không tới được Pod (`targetPort`, `0.0.0.0`), 503 là không có endpoint (selector, readiness). Nhiều "lỗi CORS" thực ra là 502/503 đội lốt; nhìn status code trước.
+- Nhóm lỗi frontend: 404 khi F5 (`try_files`), trang trắng 404 asset (base path hoặc `index.html` cache), sai API URL (build-time env, kiểm tra chuỗi env → `config.js` → trình duyệt).
+- Kiểm tra file thật trong Pod bằng `kubectl exec ... cat`, không tin file trong repo. Kiểm tra context trước mọi lệnh.
+
+## Đọc thêm
+
+- [kubectl Quick Reference](https://kubernetes.io/docs/reference/kubectl/quick-reference/)
+- [Monitoring, Logging, and Debugging](https://kubernetes.io/docs/tasks/debug/) trong docs Kubernetes: debug Pod, Service và cluster
+- [ingress-nginx Troubleshooting](https://kubernetes.github.io/ingress-nginx/troubleshooting/): đọc log controller và xác minh cấu hình sinh ra
+- Bài [Kubernetes in practice: debugging](/blog/docker-10-kubernetes-in-practice-debugging/) trong blog này cho một lộ trình debug khác cùng chủ đề

@@ -1,0 +1,337 @@
+---
+title: 'AWS cho Frontend Developer · Phần 9 — ALB: cửa ngõ vào backend'
+description: 'ALB đứng giữa CloudFront và backend: listener, rule, target group, health check quyết định web sống hay chết, chuỗi timeout 30s/60s, bảng mã lỗi 502/503/504 đọc là biết lỗi của ai, và X-Forwarded-Proto gây mixed content.'
+pubDate: 2026-10-23
+lang: vi
+tags: [aws, alb, networking, debugging, devops]
+series: aws-fe
+seriesOrder: 9
+draft: false
+---
+
+Khi frontend gọi `fetch('/api/orders')`, request đó phải tới được một máy chủ đang chạy code backend. Ở local, `server.proxy` trong `vite.config.ts` lo việc này trong cùng một tiến trình. Trên AWS, thứ đứng giữa là **ALB** (Application Load Balancer): nó nhận request từ CloudFront hoặc từ Internet, giải mã TLS, xét rule, rồi chọn một bản sao backend còn khoẻ để chuyển tiếp.
+
+Phần lớn lỗi "API không gọi được" sinh ra ở đúng chặng này: health check fail nên ALB trả 503, backend chạy quá 60 giây nên ALB cắt bằng 504, Security Group chặn nên request treo. Đọc xong bài này bạn nhìn mã lỗi là đoán được nguyên nhân, biết health check phải viết thế nào, thuộc chuỗi timeout 30s/60s, và tự tay tạo ra được cả ba lỗi 502/503/504 trong lab cuối bài.
+
+---
+
+## Load balancer để làm gì
+
+Nếu bạn đã cấu hình `upstream` trong Nginx ([Nginx phần 3](/blog/nginx-03-reverse-proxy-and-load-balancing/)) thì ALB là phiên bản managed của ý tưởng đó, cộng thêm việc AWS tự lo scale và chịu lỗi cho chính cái load balancer. Nó giải quyết năm việc:
+
+- **Chia tải.** Nhiều bản sao backend cùng chạy, ALB rải request qua từng bản → chịu được nhiều người dùng hơn một máy đơn lẻ.
+- **Chịu lỗi.** Một bản sao chết, ALB ngừng gửi request tới nó. Người dùng không thấy gì bất thường.
+- **Điểm kết thúc TLS.** ALB giữ chứng chỉ ACM, backend chỉ chạy HTTP nội bộ trên cổng 3000. Bạn không phải cài chứng chỉ vào container.
+- **Định tuyến.** Theo path, host, header, query. Một ALB đưa `/api/*` tới service này và `admin.example.com` tới service khác.
+- **Deploy không downtime.** Thêm bản mới → chờ nó khoẻ → rút bản cũ. ECS rolling deploy dựa hoàn toàn vào cơ chế này.
+
+### Ba loại load balancer
+
+| Loại    | Tầng         | Đặc điểm                                                       | Frontend gặp khi                                |
+| ------- | ------------ | -------------------------------------------------------------- | ----------------------------------------------- |
+| **ALB** | Lớp 7 (HTTP) | Hiểu HTTP: định tuyến theo path/host/header, WebSocket, HTTP/2 | Hầu hết mọi trường hợp. Nội dung của cả bài này |
+| **NLB** | Lớp 4 (TCP)  | Cực nhanh, giữ nguyên IP nguồn, có IP tĩnh                     | Throughput rất cao, gRPC, game server           |
+| **CLB** | Cũ           | Classic Load Balancer, đã lỗi thời                             | Hệ thống legacy                                 |
+
+> **Ghi chú:** khi tạo ALB, AWS bắt bạn chọn ít nhất **hai subnet ở hai Availability Zone khác nhau**. ALB trải qua nhiều AZ để một AZ sập thì web vẫn sống. Bạn ít khi phải động vào, nhưng nên biết vì sao form tạo ALB không cho bấm Next khi mới chọn một subnet.
+
+---
+
+## Giải phẫu một ALB
+
+Một ALB gồm bốn lớp lồng nhau: listener lắng nghe trên cổng, rule quyết định request đi đâu, target group là nhóm đích, và health check quyết định target nào trong nhóm được nhận request.
+
+```text
+                     ┌──────────── ALB ────────────┐
+Internet/CloudFront  │ LISTENER :443 (HTTPS)        │
+       └────────────►│  ├─ Chứng chỉ ACM (cùng region)
+                     │  ├─ RULE 1 (ưu tiên 10)      │
+                     │  │   IF path = /api/*         │
+                     │  │   THEN forward → api-tg ───┼──┐
+                     │  ├─ RULE 2 (ưu tiên 20)      │  │
+                     │  │   IF host = admin.ex.com   │  │
+                     │  │   THEN forward → admin-tg ─┼──┼─┐
+                     │  └─ DEFAULT ACTION           │  │ │
+                     │      fixed-response 404      │  │ │
+                     │ LISTENER :80 (HTTP)          │  │ │
+                     │  └─ redirect → HTTPS :443    │  │ │
+                     └──────────────────────────────┘  │ │
+┌── TARGET GROUP "api-tg" ──────────────────────────────┘ │
+│ Protocol: HTTP  Port: 3000                              │
+│ Health check: GET /healthz, mong đợi 200, mỗi 30s       │
+│ ┌────────┐ ┌────────┐ ┌───────────┐                     │
+│ │ Task A │ │ Task B │ │ Task C    │ ← unhealthy:        │
+│ │healthy │ │healthy │ │ UNHEALTHY │   không nhận request│
+│ └────────┘ └────────┘ └───────────┘                     │
+└─────────────────────────────────────────────────────────┘
+   (TARGET GROUP "admin-tg" tương tự, nhận từ RULE 2)
+```
+
+| Thành phần         | Vai trò                                                                                                                       |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| **Listener**       | Lắng nghe trên một cổng + giao thức. Thường có hai: cổng 80 chỉ redirect sang 443, cổng 443 xử lý thật với chứng chỉ ACM      |
+| **Rule**           | Điều kiện → hành động. Xét theo ưu tiên, số nhỏ xét trước. Điều kiện: path, host, header, query string, HTTP method, IP nguồn |
+| **Target Group**   | Nhóm đích cùng loại. Chứa các target (IP của ECS task, EC2 instance, hoặc Lambda) và định nghĩa health check dùng chung       |
+| **Health check**   | ALB gọi định kỳ từng target để biết nó còn sống. Target unhealthy bị loại khỏi vòng quay cho tới khi khoẻ lại                 |
+| **Default action** | Hành động khi không rule nào khớp. Nên để `fixed-response 404` thay vì forward bừa vào một target group                       |
+
+### Rule: điều kiện và hành động
+
+Hành động của một rule không chỉ có `forward`:
+
+- **forward** tới một hoặc nhiều target group theo trọng số — nền của blue/green và canary ở tầng ALB.
+- **redirect** — listener 80 redirect sang `https://#{host}:443/#{path}?#{query}` với mã 301, cấu hình một lần, không viết code.
+- **fixed-response** — trả thẳng một mã và body cố định. Dùng cho default action hoặc tạm "đóng cửa" một path khi bảo trì.
+
+Thứ tự ưu tiên quan trọng y như thứ tự behavior trong CloudFront ([Phần 6](/blog/aws-fe-06-cloudfront-cdn-behaviors-cache-key/)): rule cụ thể phải có số ưu tiên nhỏ hơn rule chung, nếu không nó không bao giờ được xét.
+
+### ALB đứng sau CloudFront thế nào
+
+Trong kiến trúc chuẩn của series, trình duyệt không gọi thẳng ALB. CloudFront có behavior `/api/*` với origin là DNS name của ALB (`my-alb-123.ap-southeast-1.elb.amazonaws.com`), Cache Policy `CachingDisabled`, Origin Request Policy `AllViewer`, bật đủ bảy HTTP method. Hai chi tiết hay sai:
+
+1. **Origin Protocol Policy nên là HTTPS only**, và chứng chỉ trên listener 443 phải hợp lệ với hostname CloudFront dùng để gọi origin. Chứng chỉ này tạo ở **cùng region với ALB**, ngược với chứng chỉ cho CloudFront (bắt buộc `us-east-1`). Sai chỗ này CloudFront trả 502.
+2. **Đừng để ALB mở toang cho Internet nếu mọi thứ đã đi qua CloudFront.** Security Group của ALB chỉ cho phép 443 từ managed prefix list `com.amazonaws.global.cloudfront.origin-facing`; chắc hơn nữa, CloudFront gắn một custom header bí mật khi gọi origin và ALB rule trả `fixed-response 403` nếu thiếu.
+
+---
+
+## Health check — thứ quyết định web sống hay chết
+
+Đây là phần frontend hay bị ảnh hưởng nhất mà không hiểu vì sao. Bảy tham số này quyết định target của bạn có bao giờ được nhận traffic hay không.
+
+| Tham số                  | Mặc định | Ý nghĩa                                                                                                                       |
+| ------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| **Path**                 | `/`      | Nên đổi thành `/healthz` hoặc `/health`: endpoint nhẹ, không truy vấn DB nặng, không đi qua middleware auth                   |
+| **Success codes**        | `200`    | Có thể để `200-299`. Nếu app redirect `/` sang `/login` (302) thì health check fail — lỗi rất hay gặp với app có auth         |
+| **Interval**             | 30 giây  | Tần suất ALB gọi                                                                                                              |
+| **Timeout**              | 5 giây   | Chờ bao lâu thì coi một lần gọi là fail                                                                                       |
+| **Healthy threshold**    | 5 lần    | Bao nhiêu lần đúng liên tiếp thì coi là khoẻ. Khi deploy, target mới mất 5 × 30 = 150 giây mới nhận traffic                   |
+| **Unhealthy threshold**  | 2 lần    | Bao nhiêu lần sai liên tiếp thì loại ra                                                                                       |
+| **Deregistration delay** | 300 giây | Khi gỡ target, ALB chờ tối đa 5 phút cho request đang chạy hoàn tất. Lý do deploy lâu. Giảm xuống 30–60 giây nếu request ngắn |
+
+Với giá trị mặc định, một lần deploy ECS rolling gồm chờ task mới healthy (150 giây) cộng chờ task cũ deregister (300 giây): bảy phút rưỡi pipeline "đứng im". Giảm healthy threshold xuống 2–3 và deregistration delay xuống 30 giây là hai nút vặn hợp lý cho API thông thường.
+
+> **Nguy hiểm:** **503 Service Unavailable = không có target nào khoẻ mạnh.** Khi trang trắng và mọi API trả 503, gần như chắc chắn health check đang fail toàn bộ. Nguyên nhân theo thứ tự hay gặp:
+>
+> 1. Security Group của backend không cho phép cổng từ Security Group của ALB ([Phần 3](/blog/aws-fe-03-cors-vpc-security-group/)).
+> 2. App chỉ lắng nghe `127.0.0.1` thay vì `0.0.0.0` → bên ngoài container không gọi vào được.
+> 3. Health check path trả 302 (redirect tới login) hoặc 404 trong khi chỉ chấp nhận 200.
+> 4. App khởi động chậm hơn thời gian chờ → bị đánh dấu unhealthy và bị ECS giết trước khi kịp sẵn sàng.
+> 5. Sai cổng: app chạy 8080, target group khai 3000.
+
+### Viết endpoint health check cho đúng
+
+Endpoint health phải trả lời trong vài mili giây, không phụ thuộc DB, không đi qua auth, và tiến trình phải lắng nghe trên mọi interface:
+
+```js
+// server.js — Express
+import express from 'express';
+
+const app = express();
+
+// Đặt TRƯỚC mọi middleware auth/redirect
+app.get('/healthz', (_req, res) => {
+  res.status(200).json({ ok: true, uptime: process.uptime() });
+});
+
+const port = Number(process.env.PORT ?? 3000);
+// 0.0.0.0 chứ không phải 'localhost' — ALB gọi từ ngoài container vào
+app.listen(port, '0.0.0.0', () => console.log(`listening on ${port}`));
+```
+
+Với Next.js trong container, tạo route handler `app/api/healthz/route.ts` trả `Response.json({ ok: true })` và trỏ health check vào đó thay vì `/`: trang chủ có thể render chậm, gọi API ngoài, hoặc redirect theo locale. Health check chỉ nên trả lời "tiến trình có nhận được HTTP không"; còn "DB có sống không" là việc của alarm ở [Phần 14](/blog/aws-fe-14-monitoring-and-debug-handbook/).
+
+Lệnh xem trạng thái từng target, nên thuộc:
+
+```bash
+aws elbv2 describe-target-health \
+  --target-group-arn arn:aws:elasticloadbalancing:ap-southeast-1:123456789012:targetgroup/api-tg/abc123
+```
+
+Cột `TargetHealth.Reason` nói thẳng nguyên nhân: `Target.ResponseCodeMismatch` (trả sai mã), `Target.Timeout` (thường là Security Group), `Target.FailedHealthChecks`, hoặc `Elb.RegistrationInProgress` (đang chờ đủ healthy threshold).
+
+---
+
+## Timeout — chuỗi số mà frontend phải thuộc
+
+Một request đi qua ba chỗ có timeout riêng, mỗi chỗ một giá trị mặc định khác nhau:
+
+```text
+  Browser           CloudFront            ALB                Backend
+    │                   │                  │                    │
+    │ (tuỳ browser)     │ 30s mặc định     │ 60s mặc định       │ do bạn đặt
+    │                   │ origin response  │ idle timeout       │ (server / DB
+    │                   │ timeout          │                    │  query timeout)
+    ▼                   ▼                  ▼                    ▼
+
+  Nguyên tắc vàng:  Backend timeout < ALB idle timeout < CloudFront origin timeout
+                       (vd 50s)            (60s)            (nên tăng lên 60s+)
+```
+
+Vì sao phải theo thứ tự đó: nếu backend không tự cắt, ALB cắt ở 60 giây và trả 504 trong khi backend vẫn chạy tiếp cho một response không ai nhận. Nếu CloudFront cắt ở 30 giây trước cả ALB, bạn thấy 504 từ CloudFront còn ALB log ghi request thành công — hai nguồn log mâu thuẫn. Origin response timeout của CloudFront chỉnh được trong cài đặt origin; tăng lên ít nhất bằng ALB idle timeout.
+
+| Tình huống frontend          | Ảnh hưởng và cách xử lý                                                                                                                                                 |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Xuất báo cáo mất 90 giây** | Bị cắt ở 60 giây → 504. Không tăng timeout. Đổi sang bất đồng bộ: POST tạo job → trả 202 kèm `jobId` → frontend poll trạng thái hoặc nhận kết quả qua WebSocket         |
+| **Server-Sent Events (SSE)** | Kết nối im lặng quá 60 giây bị ALB đóng. Server gửi comment giữ nhịp (`: ping\n\n`) mỗi 20–30 giây. Behavior CloudFront cho SSE dùng `CachingDisabled` và tắt nén       |
+| **WebSocket**                | ALB hỗ trợ, nhưng idle timeout vẫn áp dụng. Gửi ping/pong định kỳ. Client phải có logic tự kết nối lại                                                                  |
+| **Upload file lớn**          | Không đi qua ALB. Dùng presigned URL lên thẳng S3 ([Phần 5](/blog/aws-fe-05-s3-presigned-url-and-versioning/)): backend rảnh, không đụng giới hạn body size lẫn timeout |
+
+Mẫu job bất đồng bộ phía frontend, để bạn không phải nghĩ lại mỗi lần:
+
+```ts
+async function exportReport(params: Record<string, string>) {
+  const created = await fetch('/api/reports', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (created.status !== 202) throw new Error('Không tạo được job');
+  const { jobId } = await created.json();
+
+  // Poll mỗi 2 giây, tối đa 5 phút — mỗi request chỉ mất vài chục ms
+  for (let i = 0; i < 150; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const job = await (await fetch(`/api/reports/${jobId}`)).json();
+    if (job.status === 'done') return job.downloadUrl; // thường là presigned GET URL
+    if (job.status === 'failed') throw new Error(job.error);
+  }
+  throw new Error('Job quá lâu');
+}
+```
+
+---
+
+## Sticky session — và vì sao nên tránh
+
+Sticky session dùng cookie do ALB đặt để buộc một user luôn quay về đúng một target. Nghe tiện, vì backend giữ session trong bộ nhớ vẫn chạy được. Nhưng nó gây ra:
+
+- **Tải không đều** — một target ôm hết những user nặng, target khác rảnh.
+- **Deploy làm user mất phiên đăng nhập** nếu session lưu trong bộ nhớ của target vừa bị thay. Triệu chứng kinh điển: "cứ deploy xong là user bị văng ra màn hình login".
+- **Khó scale** — thêm target mới không giúp được user đang dính vào target cũ.
+
+Cách đúng là làm backend **stateless**: session lưu ở Redis (ElastiCache) hoặc dùng JWT ([Phần 11](/blog/aws-fe-11-api-gateway-and-cognito/)). Khi đó mọi target đều phục vụ được mọi user, và bạn tắt sticky session hoàn toàn. Thấy cookie tên `AWSALB` trong DevTools nghĩa là ai đó đã bật nó — hãy hỏi vì sao.
+
+---
+
+## Bảng mã lỗi ALB — đọc là biết lỗi của ai
+
+ALB tự sinh một số mã lỗi khi không chuyển tiếp được request. Chúng khác với mã lỗi backend trả về, và phân biệt được hai loại này là kỹ năng debug quan trọng nhất của bài.
+
+| Mã      | Nghĩa                                                                                                                   | Frontend nên làm gì                                                                                      |
+| ------- | ----------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| **502** | ALB kết nối được target nhưng nhận response hỏng: target chết giữa chừng, trả header sai chuẩn, hoặc lỗi TLS tới target | Báo backend. Xem log của target ở CloudWatch cùng thời điểm; thường có stack trace hoặc dấu hiệu restart |
+| **503** | Không có target khoẻ mạnh nào                                                                                           | Sự cố hạ tầng. Xem mục health check. Thường xảy ra ngay sau một lần deploy hỏng                          |
+| **504** | Target không trả lời trong thời gian idle timeout                                                                       | Backend xử lý quá lâu, hoặc Security Group chặn im lặng. Xem metric `TargetResponseTime`                 |
+| **460** | Client tự ngắt trước khi ALB kịp trả lời                                                                                | User rời trang, hoặc frontend gọi `AbortController.abort()`. Không phải lỗi thật, đừng đặt alarm         |
+| **463** | Header `X-Forwarded-For` có quá nhiều IP                                                                                | Cấu hình proxy chồng chéo. Báo DevOps                                                                    |
+| **400** | Request sai chuẩn HTTP                                                                                                  | Kiểm tra header có ký tự lạ, URL quá dài, body không khớp `Content-Length`                               |
+
+> **Ghi chú:** mẹo phân biệt nhanh ba mã 5xx của ALB:
+>
+> - **502** = "tôi hỏi được nhưng nó trả lời bậy" → lỗi code backend.
+> - **503** = "không có ai để hỏi" → lỗi triển khai / health check.
+> - **504** = "tôi hỏi mà nó im lặng quá lâu" → backend chậm hoặc bị firewall chặn.
+
+Làm sao biết mã 5xx đang nhìn là của ALB hay của backend? Response của ALB có header `Server: awselb/2.0`, body là trang HTML ngắn (không phải JSON của app), và trong ALB access log cột `target_status_code` là `-`. Nếu body là JSON đúng định dạng lỗi của app, đó là backend trả 500 và ALB chỉ chuyển tiếp — trường hợp dễ nhất, vì log backend chắc chắn có.
+
+Nhớ dấu hiệu từ [Phần 3](/blog/aws-fe-03-cors-vpc-security-group/): **timeout ≈ nghi firewall** (gói tin bị vứt lặng lẽ), **connection refused ≈ tiến trình không chạy hoặc sai cổng** (có máy trả lời nhưng không ai lắng nghe). ALB dịch cả hai thành mã khác nhau: firewall chặn → target unhealthy → 503, hoặc request treo → 504; sai cổng → `Target.FailedHealthChecks` gần như ngay lập tức.
+
+---
+
+## X-Forwarded-Proto — nguyên nhân mixed content
+
+Backend đứng sau ALB luôn nhận request **HTTP thuần**, vì ALB đã giải mã TLS. Nếu framework sinh URL tuyệt đối dựa vào protocol nó nhìn thấy (link phân trang, redirect sau login, URL trong email, `og:url`), nó sinh ra `http://` — trình duyệt chặn vì mixed content, hoặc redirect vòng vèo giữa `http` và `https`.
+
+ALB gửi kèm hai header để backend biết sự thật:
+
+- `X-Forwarded-Proto: https` — user thực sự dùng giao thức gì.
+- `X-Forwarded-For: 203.0.113.9` — IP thật của user. Không đọc header này thì `request.ip` là IP nội bộ của ALB, rate limit và log của bạn thấy "một user" gọi tất cả request.
+
+```js
+// Express — bắt buộc khi chạy sau ALB/CloudFront
+// 1 = tin đúng một hop proxy (ALB). Đặt 2 nếu có CloudFront trước ALB.
+app.set('trust proxy', 1);
+// Sau dòng này, req.protocol trả 'https', req.ip trả IP thật của user
+
+// NestJS (Express adapter)
+const app = await NestFactory.create(AppModule);
+app.set('trust proxy', 1);
+```
+
+```ts
+// Next.js — thường tự xử lý, nhưng nếu tự sinh link tuyệt đối thì đọc header
+import { headers } from 'next/headers';
+
+const h = await headers();
+const proto = h.get('x-forwarded-proto') ?? 'https';
+const host = h.get('x-forwarded-host') ?? h.get('host');
+const absoluteUrl = `${proto}://${host}/products/123`;
+```
+
+> **Cạm bẫy:** `app.set('trust proxy', true)` tin **mọi** giá trị `X-Forwarded-For`, kể cả do client tự gửi. Nếu ALB mở thẳng ra Internet, kẻ xấu gửi `X-Forwarded-For: 1.2.3.4` là qua mặt được rate limit theo IP. Dùng số hop (`1` hoặc `2`) để Express chỉ tin phần header do proxy tin cậy thêm vào.
+
+Cùng logic áp dụng cho cookie `Secure`: nhiều thư viện session chỉ đặt cờ `Secure` khi thấy kết nối là HTTPS. Không có `trust proxy`, cookie đăng nhập không được đặt và user "đăng nhập xong reload là mất session" — một triệu chứng trong bảng tra cứu ở [Phần 14](/blog/aws-fe-14-monitoring-and-debug-handbook/).
+
+---
+
+## Lab 5.1 — Quan sát ALB thật (60 phút)
+
+Mục tiêu: tự tạo ra cả ba lỗi 502/503/504 và giải thích được từng cái. Sau lab này, khi production báo lỗi, bạn biết ngay nên hỏi ai.
+
+**1.** Viết một API Node.js tối giản với ba route:
+
+```js
+// server.js
+import express from 'express';
+
+const app = express();
+app.set('trust proxy', 1);
+
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+// Cố tình chậm hơn ALB idle timeout (60s)
+app.get('/api/slow', async (_req, res) => {
+  await new Promise((r) => setTimeout(r, 70_000));
+  res.json({ done: true });
+});
+
+// Trả lại toàn bộ header nhận được
+app.get('/api/echo', (req, res) => {
+  res.json({ ip: req.ip, protocol: req.protocol, headers: req.headers });
+});
+
+app.listen(3000, '0.0.0.0', () => console.log('up on 3000'));
+```
+
+**2.** Đóng gói Docker (Dockerfile Node chuẩn ở [Docker phần 2](/blog/docker-02-images-and-dockerfile/)), đẩy lên ECR, chạy trên ECS Fargate sau ALB — hoặc EC2 nếu bạn quen hơn. Target group: protocol HTTP, port 3000, health check path `/healthz`. Cách dựng ECS ở [Phần 10](/blog/aws-fe-10-where-code-runs-ec2-ecs-lambda-amplify-nextjs/).
+
+**3.** Gọi `/api/echo` từ trình duyệt. Trong JSON trả về, tìm `x-forwarded-for` (IP của bạn) và `x-forwarded-proto` (`https`). Thử bỏ dòng `trust proxy`, deploy lại: `protocol` thành `http`.
+
+**4.** Gọi `/api/slow`, bấm đồng hồ. Khoảng 60 giây sau bạn nhận **504**. Bạn vừa tự tạo ra lỗi 504 đầu tiên. Xem CloudWatch metric `TargetResponseTime` và `HTTPCode_ELB_504_Count` của ALB.
+
+**5.** Vào target group, đổi health check path thành `/khong-ton-tai`. Chờ 1–2 phút (unhealthy threshold × interval), gọi API — nhận **503**. Chạy `aws elbv2 describe-target-health`, đọc `Reason`. Đổi lại path và xem nó hồi phục.
+
+**6.** Vào Security Group của backend, xoá rule inbound cho phép cổng 3000 từ SG của ALB. Gọi API — quan sát nó **treo rồi mới 504**, thay vì lỗi ngay. Đó là dấu hiệu firewall. Thêm rule lại.
+
+**7.** (Thêm) Muốn thấy **502**: sửa `/api/echo` thành `process.exit(1)` ngay khi nhận request, deploy, gọi một lần. Target chết giữa chừng → 502; ECS tự khởi động task mới.
+
+> **Kết quả mong đợi:** bạn tạo được cả ba lỗi 502/503/504, giải thích được nguyên nhân từng cái, và phân biệt được "treo rồi lỗi" (firewall) với "lỗi ngay" (sai cổng, tiến trình không chạy). Xoá ALB, ECS service và target group sau lab — ALB tính tiền theo giờ dù không có request nào.
+
+---
+
+## Tóm tắt
+
+- ALB là load balancer lớp 7: chia tải, chịu lỗi, kết thúc TLS, định tuyến theo path/host/header, nền của deploy không downtime. Cần hai subnet ở hai AZ.
+- Cấu trúc: listener (80 redirect, 443 xử lý) → rule theo ưu tiên → target group → health check. Default action nên là `fixed-response 404`.
+- Health check quyết định 503: path riêng, nhẹ, trả 200, không redirect; app lắng nghe `0.0.0.0`; Security Group backend mở cổng từ SG của ALB; đúng cổng.
+- Chuỗi timeout: backend < ALB idle (60s) < CloudFront origin (mặc định 30s, nên tăng). Việc lâu hơn 60 giây chuyển sang job bất đồng bộ; SSE/WebSocket cần ping; upload lớn đi presigned URL.
+- 502 = backend trả lời bậy, 503 = không có target khoẻ, 504 = target im lặng quá lâu. Timeout ≈ firewall, connection refused ≈ sai cổng hoặc tiến trình chết.
+- Backend sau ALB nhận HTTP thuần; bật `trust proxy` để đọc `X-Forwarded-Proto` và `X-Forwarded-For`. Tránh sticky session; backend stateless với Redis hoặc JWT.
+
+Phần tiếp theo — **[Phần 10 — Nơi code chạy: EC2, ECS, Lambda, Amplify và deploy Next.js](/blog/aws-fe-10-where-code-runs-ec2-ecs-lambda-amplify-nextjs/)** — trả lời câu hỏi target đứng sau ALB thực ra là gì, và Next.js SSR lên AWS bằng bốn con đường nào.
+
+## Đọc thêm
+
+- [Application Load Balancer — User Guide](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/)
+- [Amazon ECS — Developer Guide](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/)
+- [Amazon CloudFront — Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/)

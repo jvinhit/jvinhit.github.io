@@ -1,0 +1,252 @@
+---
+title: 'Cloudflare cho Frontend Developer · Phần 7 — Rules: chuyển hướng và biến đổi ở edge'
+description: 'Sáu loại rule của Cloudflare và khi nào dùng loại nào, Redirect Rule gom www về tên miền gốc, Transform Rule thêm security header và viết lại đường dẫn, thứ tự thực thi so với WAF, Workers và cache, 301 với 302, kèm lab ba rule đầu tiên.'
+pubDate: 2026-10-16
+lang: vi
+tags: [cloudflare, devops, security, performance, frontend]
+series: cloudflare-fe
+seriesOrder: 7
+draft: false
+---
+
+Việc gần như dự án nào cũng cần: `www.example.com` phải chuyển về `example.com` (hoặc ngược lại), response phải có vài security header để Lighthouse và đội security thôi nhắc, và đường dẫn cũ `/tai-lieu` phải dẫn sang `/docs` mà không mất thứ hạng Google. Trước đây bạn làm những việc này bằng cách sửa `.htaccess` trên Hostinger, hoặc nhờ ai đó sửa nginx trên VPS — mỗi lần đổi là một lần SSH, một lần reload, một lần hồi hộp.
+
+**Rules** cho phép bạn làm đúng những việc đó ở edge: nhanh hơn, không đụng vào máy chủ, và không tốn tài nguyên origin vì request bị chuyển hướng hoặc bị chặn trước khi tới origin. Bài này đi qua các loại rule, viết ba rule mà dự án nào cũng cần, và quan trọng nhất là **thứ tự thực thi** — thứ giải thích những câu hỏi kiểu "vì sao Worker của tôi không chạy với đường dẫn này?".
+
+> Thuật ngữ giữ tiếng Anh: rule, expression, redirect, rewrite, transform, header, apex (tên miền gốc, không có `www`). Tên các mục trong dashboard giữ nguyên để bạn tìm được.
+
+## Các loại rule
+
+Cloudflare tách rules thành nhiều loại chuyên biệt, mỗi loại làm đúng một việc:
+
+| Loại                       | Làm gì                                      | Ví dụ dùng cho frontend                                                                                             | Ở đâu trong dashboard         |
+| -------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| **Redirect Rules**         | Trả 301/302 ngay tại edge                   | www → không-www, đổi cấu trúc URL cũ sang mới                                                                       | Rules → Redirect Rules        |
+| **Transform Rules**        | Sửa URL, sửa header request/response        | Thêm security header, viết lại đường dẫn, ẩn header lộ thông tin                                                    | Rules → Transform Rules       |
+| **Cache Rules**            | Quyết định cache hay không, bao lâu         | [Phần 6](/blog/cloudflare-fe-06-cache-old-version-after-deploy/)                                                    | Caching → Cache Rules         |
+| **Configuration Rules**    | Bật/tắt tính năng Cloudflare theo đường dẫn | Tắt Rocket Loader cho trang cụ thể                                                                                  | Rules → Configuration Rules   |
+| **WAF Custom Rules**       | Chặn / thử thách / cho qua                  | Chặn truy cập `/admin` từ ngoài nước — [phần 10](/blog/cloudflare-fe-10-security-and-performance/)                  | Security → WAF → Custom rules |
+| **Page Rules** (thế hệ cũ) | Gộp nhiều chức năng vào một chỗ             | Gói Free có 3 rule. Cloudflare đang chuyển dần sang các loại rule chuyên biệt ở trên — dự án mới nên dùng loại mới. | Rules → Page Rules            |
+
+Mọi rule, bất kể loại, có cùng ba phần: **tên** (để bạn nhớ nó làm gì), **điều kiện** (request nào thì áp dụng — viết bằng biểu thức trên hostname, đường dẫn, header, quốc gia…), và **hành động** (làm gì). Dashboard có trình dựng điều kiện bằng dropdown, và nút "Edit expression" để viết tay. Gói Free cho một số lượng rule nhất định cho mỗi loại (hàng chục, không phải hàng nghìn) — đủ cho dự án thông thường; con số cụ thể hiện trên trang của từng loại rule, đừng thiết kế hệ thống dựa vào con số bạn nhớ từ bài viết.
+
+### Ngôn ngữ biểu thức — đọc được trước khi viết
+
+Điều kiện của mọi loại rule dùng chung một ngôn ngữ biểu thức. Vài trường và hàm bạn sẽ dùng đi dùng lại:
+
+| Trường / hàm                    | Nghĩa                             | Ví dụ                                                     |
+| ------------------------------- | --------------------------------- | --------------------------------------------------------- |
+| `http.host`                     | Hostname của request              | `http.host eq "www.example.com"`                          |
+| `http.request.uri.path`         | Đường dẫn, không có query         | `starts_with(http.request.uri.path, "/api/")`             |
+| `http.request.uri.query`        | Query string, không có dấu `?`    | `http.request.uri.query contains "utm_"`                  |
+| `http.request.full_uri`         | Cả URL: scheme, host, path, query | dùng làm nguồn cho hàm thay thế                           |
+| `http.request.method`           | GET, POST…                        | `http.request.method eq "POST"`                           |
+| `ip.geoip.country`              | Mã quốc gia hai chữ               | `ip.geoip.country ne "VN"`                                |
+| `http.user_agent`               | User-Agent                        | `lower(http.user_agent) contains "curl"`                  |
+| `concat(a, b, ...)`             | Nối chuỗi                         | `concat("https://example.com", http.request.uri.path)`    |
+| `lower(s)`                      | Chữ thường                        | so sánh không phân biệt hoa thường                        |
+| `substring(s, start)`           | Cắt chuỗi từ vị trí `start`       | `substring(http.request.uri.path, 5)` bỏ 5 ký tự đầu      |
+| `regex_replace(s, regex, repl)` | Thay bằng regex                   | `regex_replace(http.request.uri.path, "^/blog/", "/wp/")` |
+
+Toán tử: `eq`, `ne`, `contains`, `starts_with`, `ends_with`, `in`, kết hợp bằng `and`, `or`, `not`. Dropdown trong dashboard hiện đúng các toán tử này bằng tiếng Anh thường ("equals", "starts with"). Lưu ý: các tính năng regex (toán tử `matches`, hàm `regex_replace`) thuộc gói trả phí tại thời điểm viết — với gói Free, `starts_with` kết hợp `concat`/`substring` giải quyết được hầu hết nhu cầu; kiểm tra docs Rules language cho gói của bạn trước khi viết rule phụ thuộc regex.
+
+---
+
+## Chuyển hướng www sang tên miền gốc
+
+Việc gần như dự án nào cũng cần. Làm bằng Redirect Rule (Rules → Redirect Rules → Create rule):
+
+| Trường           | Giá trị                                                |
+| ---------------- | ------------------------------------------------------ |
+| Tên rule         | `www to apex`                                          |
+| Điều kiện        | Hostname equals `www.example.com`                      |
+| Loại URL đích    | Dynamic (biểu thức)                                    |
+| Biểu thức        | `concat("https://example.com", http.request.uri.path)` |
+| Mã trạng thái    | 301 (Permanent Redirect)                               |
+| Giữ query string | Bật                                                    |
+
+Vì sao là Dynamic chứ không phải Static `https://example.com`: static sẽ ném mọi đường dẫn về trang chủ — `www.example.com/blog/post-1` thành `example.com/`, mất bài, mất thứ hạng. `concat` giữ nguyên đường dẫn, và "Giữ query string" giữ nguyên `?utm_source=...`. Không cần viết `http://` → `https://` vào rule này: **Always Use HTTPS** ở [phần 5](/blog/cloudflare-fe-05-ssl-tls-modes-and-redirect-loop/) đã lo, và nó chạy trước.
+
+> **Ghi chú:** bản ghi DNS cho `www` vẫn phải tồn tại và để **đám mây cam** — nếu không, request tới `www` sẽ không bao giờ đến được Cloudflare để mà chuyển hướng. Người dùng sẽ thấy "không tìm thấy máy chủ" (thiếu bản ghi) hoặc trang của origin mà không qua rule (bản ghi xám). Bảng DNS ở [phần 3](/blog/cloudflare-fe-03-hostinger-cloudflare-setup-a-to-z/) đã có sẵn dòng `CNAME www → example.com ● Proxied` chính vì lý do này.
+
+Kiểm tra bằng `curl`, đừng bằng trình duyệt:
+
+```bash
+curl -sI https://www.example.com/blog/post-1?ref=x | grep -iE "^(HTTP|location)"
+# HTTP/2 301
+# location: https://example.com/blog/post-1?ref=x
+```
+
+Trình duyệt **cache 301 vĩnh viễn**: nếu bạn tạo rule sai, thử trên Chrome, rồi sửa rule — Chrome vẫn đưa bạn tới đích cũ mà không hỏi lại Cloudflare, và bạn tưởng rule mới không chạy. Thử bằng `curl`, hoặc tab ẩn danh mới mỗi lần, hoặc tạm dùng 302 lúc còn chỉnh sửa rồi mới đổi sang 301.
+
+### Chiều ngược lại (gốc → www)
+
+Nếu bạn muốn `example.com` chuyển sang `www.example.com`, chỉ cần đảo điều kiện và đích: Hostname equals `example.com`, biểu thức `concat("https://www.example.com", http.request.uri.path)`. Chọn hướng nào cũng được — điều quan trọng là **chọn một và nhất quán**, vì Google coi hai địa chỉ này là hai trang khác nhau, cookie đặt trên `www` không tự sang apex, và cache ở edge lưu hai bản. Đã có rule ở Cloudflare thì **bỏ quy tắc tương ứng ở origin** (`.htaccess`, plugin WordPress), nếu không hai bên đá nhau và bạn gặp `ERR_TOO_MANY_REDIRECTS` phiên bản www ↔ apex ở phần 5.
+
+### 301, 302, 307, 308 — chọn mã nào
+
+| Mã  | Nghĩa                                | Trình duyệt cache? | Method khi theo redirect  | Dùng khi                                                      |
+| --- | ------------------------------------ | ------------------ | ------------------------- | ------------------------------------------------------------- |
+| 301 | Chuyển vĩnh viễn                     | Có, rất lâu        | Có thể đổi POST thành GET | www → apex, URL cũ → URL mới, đã chắc chắn                    |
+| 302 | Chuyển tạm thời                      | Không (mặc định)   | Có thể đổi POST thành GET | Trang bảo trì, A/B, đang thử rule, chuyển hướng theo quốc gia |
+| 307 | Tạm thời, giữ nguyên method và body  | Không              | Giữ nguyên                | Chuyển hướng endpoint API tạm thời                            |
+| 308 | Vĩnh viễn, giữ nguyên method và body | Có                 | Giữ nguyên                | Đổi endpoint API vĩnh viễn                                    |
+
+Với trang HTML, 301 và 302 là đủ: 301 khi bạn muốn Google chuyển thứ hạng sang URL mới và trình duyệt khỏi hỏi lại; 302 khi đích có thể đổi. Với API mà frontend gọi bằng `fetch` có `POST` và body, dùng 307/308 — 301/302 có thể làm trình duyệt gửi lại bằng GET không có body, và bạn debug mất nửa ngày.
+
+---
+
+## Thêm security header bằng Transform Rule
+
+**Response Header Transform Rule** (Rules → Transform Rules → Modify Response Header), áp dụng cho mọi request (điều kiện: All incoming requests, hoặc `http.host eq "example.com"`), hành động **Set static** cho từng header:
+
+| Header                      | Giá trị                                                                                                                         |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `X-Content-Type-Options`    | `nosniff`                                                                                                                       |
+| `X-Frame-Options`           | `DENY`                                                                                                                          |
+| `Referrer-Policy`           | `strict-origin-when-cross-origin`                                                                                               |
+| `Permissions-Policy`        | `camera=(), microphone=(), geolocation=()`                                                                                      |
+| `Strict-Transport-Security` | Nên bật qua mục HSTS ở SSL/TLS thay vì đặt tay — xem cảnh báo [phần 5](/blog/cloudflare-fe-05-ssl-tls-modes-and-redirect-loop/) |
+
+Từng dòng làm gì, để bạn không copy mù:
+
+- `X-Content-Type-Options: nosniff` — trình duyệt không được "đoán" kiểu file; một file `.txt` do người dùng upload không bị chạy như JavaScript.
+- `X-Frame-Options: DENY` — trang của bạn không được nhúng vào `iframe` ở bất kỳ đâu, chặn clickjacking. Nếu bạn cần nhúng vào chính site mình, dùng `SAMEORIGIN`. Nếu dự án có widget cho site khác nhúng, đừng đặt header này cho đường dẫn widget — thêm điều kiện `not starts_with(http.request.uri.path, "/embed/")`.
+- `Referrer-Policy: strict-origin-when-cross-origin` — khi người dùng bấm link ra ngoài, site kia chỉ thấy `https://example.com` chứ không thấy `/reset-password?token=...`.
+- `Permissions-Policy` — tắt camera, micro, định vị cho toàn site (và cho mọi iframe bên thứ ba trong site). Nếu app của bạn thật sự dùng camera, bỏ mục đó ra.
+
+Bạn cũng có thể **xoá header** ở đây (hành động Remove), ví dụ gỡ `X-Powered-By` (lộ "Express" hay "PHP/8.1") hoặc `Server` của origin để bớt lộ thông tin công nghệ. Lưu ý `server: cloudflare` là do Cloudflare thêm sau cùng, không gỡ được và cũng không cần.
+
+`Content-Security-Policy` cố tình không có trong bảng: nó phụ thuộc vào từng script, font, ảnh bạn dùng, và một CSP sai làm trắng trang ngay. Viết nó trong code (hoặc `_headers` ở [phần 8](/blog/cloudflare-fe-08-cloudflare-pages-free-hosting/)) sau khi đọc [Content Security Policy](/blog/web-security-03-content-security-policy/), bắt đầu bằng `Content-Security-Policy-Report-Only`.
+
+Kiểm tra:
+
+```bash
+curl -sI https://example.com | grep -iE "x-content-type|x-frame|referrer-policy|permissions-policy"
+```
+
+Header do Transform Rule đặt được thêm ở bước cuối trước khi trả về trình duyệt, nên nó có mặt cả trên response lấy từ cache (`cf-cache-status: HIT`) — bạn không cần purge sau khi tạo rule.
+
+---
+
+## Viết lại đường dẫn bằng Transform Rule
+
+Ví dụ: bạn muốn `example.com/blog/*` thực chất lấy nội dung từ `/wp/*` ở origin, mà người dùng không thấy. **URL Rewrite** (Rules → Transform Rules → Rewrite URL):
+
+| Trường     | Giá trị                                                            |
+| ---------- | ------------------------------------------------------------------ |
+| Điều kiện  | URI Path starts with `/blog/`                                      |
+| Rewrite to | Dynamic: `regex_replace(http.request.uri.path, "^/blog/", "/wp/")` |
+
+Khác với redirect, **rewrite không đổi URL trên thanh địa chỉ** — người dùng không biết gì. Trình duyệt hỏi `/blog/hello`, Cloudflare hỏi origin `/wp/hello`, trả về dưới tên `/blog/hello`.
+
+| Tiêu chí                   | Redirect                    | Rewrite                                         |
+| -------------------------- | --------------------------- | ----------------------------------------------- |
+| URL trên thanh địa chỉ     | Đổi                         | Giữ nguyên                                      |
+| Số round-trip              | Hai (301 rồi request mới)   | Một                                             |
+| Trình duyệt / Google biết? | Có                          | Không                                           |
+| Dùng khi                   | Muốn mọi người dùng URL mới | Muốn giấu cấu trúc origin, hoặc gộp nhiều nguồn |
+
+Không có regex ở gói Free thì cùng ví dụ viết bằng `concat` và `substring`: `concat("/wp/", substring(http.request.uri.path, 6))` — bỏ 6 ký tự `/blog/` rồi nối lại. Một ứng dụng frontend rất thực tế của rewrite: **SPA fallback ở edge** khi origin là một host tĩnh bạn không cấu hình được. Điều kiện `starts_with(http.request.uri.path, "/app/") and not http.request.uri.path contains "."` (đường dẫn app, không phải file có đuôi), rewrite Static sang `/app/index.html`. F5 ở `/app/orders/42` được origin trả `index.html` với mã 200, React Router lo phần còn lại — không cần `.htaccess`, không cần `_redirects`.
+
+Rewrite chỉ đổi đường dẫn và query, **không đổi hostname** — không dùng nó để "proxy" `/api/*` sang `backend.example.net`. Việc đó là của Workers ([phần 9](/blog/cloudflare-fe-09-workers-code-at-the-edge/)) hoặc `_redirects` với mã 200 trên Pages.
+
+### Configuration Rules — bật tắt tính năng theo đường dẫn
+
+Loại rule ít người để ý nhưng rất hợp với frontend: bật hoặc tắt một tính năng Cloudflare cho một phần site. Ví dụ điển hình: Rocket Loader ([phần 10](/blog/cloudflare-fe-10-security-and-performance/) khuyên tắt hẳn cho SPA) vẫn có ích cho trang landing WordPress cũ ở `/` — tạo Configuration Rule với điều kiện `starts_with(http.request.uri.path, "/app/")`, hành động Rocket Loader = Off. Tương tự với Email Obfuscation, Automatic HTTPS Rewrites, hay SSL mode riêng cho một subdomain có origin khác. Rule này thay thế phần lớn lý do người ta từng cần Page Rules.
+
+---
+
+## Thứ tự thực thi
+
+Đây là mục quan trọng nhất bài. Mọi thứ ở edge chạy theo đúng thứ tự này, và mỗi bước có thể kết thúc request sớm:
+
+```text
+Request tới edge
+        │
+        ▼
+① WAF / chặn theo IP, quốc gia, bot        → có thể dừng tại đây
+        │
+        ▼
+② Redirect Rules                           → có thể trả 301 ngay
+        │
+        ▼
+③ Transform Rules (request)                → sửa URL, header đi xuống
+        │
+        ▼
+④ Workers                                  → code của bạn
+        │
+        ▼
+⑤ Cache Rules → tra cache                  → có thể trả từ cache
+        │
+        ▼
+⑥ Xuống origin
+        │
+        ▼
+⑦ Transform Rules (response)               → sửa header đi lên
+        │
+        ▼
+Trả về trình duyệt
+```
+
+Hiểu thứ tự này giúp bạn giải thích những hiện tượng lạ:
+
+- **"Vì sao Worker của tôi không chạy với đường dẫn này?"** — có thể vì một Redirect Rule đã cắt ngang ở bước ②. Worker ở bước ④ không bao giờ thấy request.
+- **"Tôi rewrite `/blog/*` thành `/wp/*` mà Worker vẫn thấy `/blog/`?"** — không, Worker ở ④ thấy URL **sau** rewrite ở ③. Nếu Worker của bạn kiểm tra `pathname.startsWith('/blog/')`, nó sẽ không khớp.
+- **"Cache Rule bypass `/api/*` mà request vẫn HIT?"** — kiểm tra xem có rewrite nào ở ③ đổi đường dẫn khiến `/api/` không còn là `/api/` khi tới ⑤.
+- **"Tôi chặn quốc gia X bằng WAF nhưng vẫn muốn redirect họ sang trang thông báo?"** — không được: WAF ở ① chặn trước khi Redirect ở ② chạy. Dùng Redirect Rule với điều kiện `ip.geoip.country` thay vì WAF nếu muốn chuyển hướng.
+- **"Security header có mặt cả trên response HIT?"** — có, vì ⑦ chạy sau cache. Ngược lại, header do **origin** đặt bị lưu cùng bản cache: sửa header ở origin thì phải purge mới thấy.
+
+Trong cùng một loại rule, các rule được duyệt **từ trên xuống** theo thứ tự bạn sắp trong dashboard. Với Redirect Rules, rule khớp đầu tiên thắng và dừng — đặt rule cụ thể (`/old-page`) lên trên rule chung (`www to apex`). Với Transform Rules, nhiều rule có thể cùng áp dụng lên một request, rule sau có thể ghi đè header của rule trước. Nếu một rule không chạy như mong đợi, kéo nó lên đầu danh sách trước khi nghi ngờ điều kiện.
+
+---
+
+## Lab 7.1 — Ba rule đầu tiên (30 phút)
+
+1. Tạo Redirect Rule chuyển `www` về tên miền gốc như bảng ở trên. Kiểm tra bằng `curl -sI https://www.example.com | grep -i location` — phải thấy `location: https://example.com/`.
+2. Tạo Response Header Transform Rule thêm ba security header (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`). Kiểm tra bằng `curl -sI https://example.com` — ba header có mặt, kể cả khi `cf-cache-status: HIT`.
+3. Tạo Redirect Rule chuyển `/old-page` sang `/new-page` với mã 301 (điều kiện URI Path equals `/old-page`, đích Static `https://example.com/new-page`), kiểm tra lại bằng `curl -sI https://example.com/old-page`.
+4. Thử đổi mã từ 301 sang 302 và quan sát khác biệt trong header trả về: dòng đầu đổi từ `HTTP/2 301` thành `HTTP/2 302`, `location` giữ nguyên. Tự trả lời: khi nào nên dùng 301, khi nào 302?
+
+```bash
+curl -sI https://www.example.com/abc?x=1 | grep -iE "^(HTTP|location)"
+curl -sI https://example.com | grep -iE "x-content-type|x-frame|referrer"
+curl -sI https://example.com/old-page | grep -iE "^(HTTP|location)"
+```
+
+> **Kết quả mong đợi:** lệnh 1 ra `301` và `location: https://example.com/abc?x=1` (đường dẫn và query được giữ). Lệnh 2 ra đủ ba header. Lệnh 3 ra `301` với `location: https://example.com/new-page`; sau khi đổi rule, ra `302`. Câu trả lời cho bước 4: 301 khi đích là vĩnh viễn và bạn muốn trình duyệt lẫn Google ghi nhớ; 302 khi đích còn có thể đổi, hoặc khi bạn đang thử rule và không muốn trình duyệt cache kết quả sai.
+
+Sau lab, kéo rule `/old-page` lên **trên** rule `www to apex` và gọi `https://www.example.com/old-page`: bạn sẽ thấy rule nào thắng phụ thuộc thứ tự — một minh hoạ nhỏ cho mục thứ tự thực thi.
+
+---
+
+## Sai lầm hay gặp ở chương này
+
+- **Redirect Static thay vì Dynamic cho www → apex.** Mọi trang con bị ném về trang chủ; Google mất index. Dùng `concat(...)` với `http.request.uri.path` và bật giữ query string.
+- **Bản ghi `www` thiếu hoặc xám.** Rule không bao giờ được chạm tới. Thêm CNAME `www` cam.
+- **Thử 301 trên trình duyệt rồi sửa rule.** Trình duyệt cache 301 cũ. Dùng `curl`, tab ẩn danh, hoặc 302 trong lúc thử.
+- **Giữ cả rule ở Cloudflare lẫn quy tắc ở origin theo hai hướng ngược nhau.** Vòng lặp www ↔ apex. Chọn một nơi.
+- **Đặt HSTS bằng Transform Rule.** Bật ở SSL/TLS → HSTS để quản lý tập trung và không gửi hai giá trị khác nhau.
+- **Đặt `X-Frame-Options: DENY` toàn site khi có trang cần nhúng.** Widget của bạn trắng trang ở site đối tác. Thêm điều kiện loại trừ đường dẫn embed.
+- **Viết rule phụ thuộc regex rồi thấy dashboard từ chối.** Regex là gói trả phí; dùng `starts_with` + `concat`/`substring`.
+- **Rewrite rồi ngạc nhiên vì Worker hoặc Cache Rule không khớp nữa.** Chúng chạy sau rewrite và thấy đường dẫn mới.
+
+---
+
+## Tóm tắt
+
+- Rules làm việc của `.htaccess`/nginx nhưng ở edge: Redirect (301/302), Transform (sửa URL, sửa header), Cache, Configuration (bật tắt tính năng theo đường dẫn), WAF Custom; Page Rules là thế hệ cũ.
+- Mọi rule = tên + điều kiện (biểu thức trên `http.host`, `http.request.uri.path`, `ip.geoip.country`…) + hành động. Regex thuộc gói trả phí; `starts_with`, `concat`, `substring` đủ cho gói Free.
+- www → apex: Redirect Rule với đích Dynamic `concat("https://example.com", http.request.uri.path)`, 301, giữ query string; bản ghi `www` phải tồn tại và cam. Chọn một hướng, bỏ quy tắc ở origin.
+- 301 vĩnh viễn (trình duyệt cache lâu), 302 tạm thời, 307/308 khi cần giữ method và body cho API. Thử rule bằng `curl`, không bằng trình duyệt.
+- Security header đặt bằng Response Header Transform: `nosniff`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`; HSTS bật ở SSL/TLS; CSP viết trong code. Có thể gỡ `X-Powered-By`, `Server` của origin.
+- Rewrite đổi đường dẫn ở origin mà không đổi URL trên thanh địa chỉ; không đổi được hostname — việc đó là của Workers.
+- Thứ tự: WAF → Redirect → Transform request → Workers → Cache → origin → Transform response. Bước trước có thể kết thúc request; bước sau thấy kết quả của bước trước.
+
+Phần tiếp theo: [Phần 8 — Cloudflare Pages: host frontend miễn phí](/blog/cloudflare-fe-08-cloudflare-pages-free-hosting/) — deploy SPA từ Git, preview URL cho mỗi pull request, file `_redirects` và `_headers` làm cùng việc với Rules nhưng nằm trong repo.
+
+## Đọc thêm
+
+- [Cloudflare Rules docs](https://developers.cloudflare.com/rules/) — Redirect Rules, Transform Rules, Configuration Rules, Rules language và thứ tự thực thi.
+- [Cloudflare WAF docs](https://developers.cloudflare.com/waf/) — Custom rules, bước ① trong sơ đồ thứ tự.
+- [Cloudflare Cache docs](https://developers.cloudflare.com/cache/) — Cache Rules, bước ⑤.
