@@ -8,7 +8,8 @@
  * fan-out cho mọi listener. Vite dedupe module nên hai script trên cùng
  * trang dùng chung instance này (state nằm ở module scope).
  *
- * Thuần TS — không đụng DOM. Firebase qua `love-firebase.ts` (cùng project,
+ * Không đọc/sửa phần tử DOM (riêng `startPresence` nghe sự kiện
+ * visibilitychange/pagehide của trang). Firebase qua `love-firebase.ts` (cùng project,
  * cùng hai tài khoản với love board — quyết định đã chốt ở requirement).
  */
 import { profileForUid, type LoveProfile } from '~/lib/love-config';
@@ -19,6 +20,12 @@ import {
   type User,
 } from '~/lib/love-firebase';
 import { writeErrorMessage } from '~/lib/love-board';
+import {
+  deviceLabel,
+  HEARTBEAT_MS,
+  vnTimestamp,
+  type PresenceState,
+} from '~/lib/pregnancy-presence';
 import {
   settingsFromDoc,
   type PregnancySettings,
@@ -233,6 +240,162 @@ export function watchCollection<T>(
     },
     (err) => onError(readErrorMessage(firebaseErrorCode(err)))
   );
+}
+
+// ---- ai đang xem / thiết bị nào ---------------------------------------------
+
+const DEVICE_KEY = 'by-device-id';
+let deviceIdCache: string | null = null;
+
+/**
+ * Id ngẫu nhiên cho máy này (nhớ trong localStorage) — để phân biệt hai
+ * thiết bị của cùng một người và đánh dấu "máy này" trong Cài đặt. Không
+ * suy ra được gì về người dùng. localStorage bị chặn → id theo phiên.
+ */
+export function getDeviceId(): string {
+  if (deviceIdCache) return deviceIdCache;
+  let id = '';
+  try {
+    id = localStorage.getItem(DEVICE_KEY) ?? '';
+  } catch {
+    // dùng id theo phiên bên dưới
+  }
+  if (!/^[a-z0-9]{8,16}$/.test(id)) {
+    id = Math.random().toString(36).slice(2, 12).padEnd(10, '0');
+    try {
+      localStorage.setItem(DEVICE_KEY, id);
+    } catch {
+      // không nhớ được → mỗi phiên là một "thiết bị", chấp nhận
+    }
+  }
+  deviceIdCache = id;
+  return id;
+}
+
+function isStandalone(): boolean {
+  return (
+    window.matchMedia('(display-mode: standalone)').matches ||
+    (navigator as Navigator & { standalone?: boolean }).standalone === true
+  );
+}
+
+/** Nhãn thiết bị của máy đang chạy. */
+export function currentDeviceLabel(): string {
+  return deviceLabel(
+    navigator.userAgent,
+    navigator.platform,
+    navigator.maxTouchPoints,
+    isStandalone()
+  );
+}
+
+const ACCESS_LOGGED_KEY = 'by-access-logged';
+
+/**
+ * Ghi lại phiên hiện tại để chủ site xem trong Firebase console (trang KHÔNG
+ * hiển thị): (1) một dòng lịch sử `pregnancyAccessLog` mỗi phiên tab
+ * (sessionStorage chống ghi lặp khi chuyển trang trong khu), (2) heartbeat
+ * `pregnancyPresence/<tên>__<deviceId>` mỗi phút khi tab hiện, 'away' khi
+ * ẩn tab / đóng trang. Thời gian dùng serverTimestamp() — console hiện đúng
+ * giờ, không phụ thuộc đồng hồ điện thoại.
+ *
+ * Mọi lỗi ghi được nuốt im lặng: đây là tính năng phụ, không được làm phiền
+ * việc chính. Gặp `permission-denied` (rules chưa dán) thì dừng hẳn để khỏi
+ * bắn lỗi mỗi phút. Trả hàm dừng.
+ */
+export function startPresence(ctx: SessionContext): () => void {
+  const { fb, user, me } = ctx;
+  const deviceId = getDeviceId();
+  const device = currentDeviceLabel();
+  const who = `${me.emoji} ${me.name}`;
+  const ref = fb.dbApi.doc(
+    fb.db,
+    'pregnancyPresence',
+    `${me.name}__${deviceId}`
+  );
+  let stopped = false;
+
+  const onError = (err: unknown) => {
+    if (firebaseErrorCode(err) === 'permission-denied') stop();
+  };
+
+  const write = (state: PresenceState) => {
+    if (stopped) return;
+    fb.dbApi
+      .setDoc(ref, {
+        who,
+        uid: user.uid,
+        deviceId,
+        device,
+        page: window.location.pathname,
+        state,
+        lastSeenAt: fb.dbApi.serverTimestamp(),
+      })
+      .catch(onError);
+  };
+
+  // Lịch sử: một dòng cho mỗi phiên tab của mỗi tài khoản.
+  const loggedKey = `${ACCESS_LOGGED_KEY}:${user.uid}`;
+  let alreadyLogged = false;
+  try {
+    alreadyLogged = sessionStorage.getItem(loggedKey) === '1';
+  } catch {
+    // sessionStorage bị chặn → ghi mỗi lần mở trang, chấp nhận
+  }
+  if (!alreadyLogged) {
+    // ID đọc được ngay trong console và tự xếp theo thời gian.
+    const logId = `${vnTimestamp(Date.now())} · ${me.name} · ${deviceId}`;
+    fb.dbApi
+      .setDoc(fb.dbApi.doc(fb.db, 'pregnancyAccessLog', logId), {
+        who,
+        uid: user.uid,
+        deviceId,
+        device,
+        page: window.location.pathname,
+        at: fb.dbApi.serverTimestamp(),
+      })
+      .then(() => {
+        try {
+          sessionStorage.setItem(loggedKey, '1');
+        } catch {
+          // như trên
+        }
+      })
+      .catch(onError);
+  }
+
+  write(document.visibilityState === 'visible' ? 'online' : 'away');
+  const timer = window.setInterval(() => {
+    if (document.visibilityState === 'visible') write('online');
+  }, HEARTBEAT_MS);
+  const onVisibility = () =>
+    write(document.visibilityState === 'visible' ? 'online' : 'away');
+  // Chuyển trang TRONG khu (inline script trong layout đặt by-navigating):
+  // trang mới sẽ ghi 'online' ngay, nên đừng ghi 'away' làm người kia thấy
+  // chớp offline.
+  const onPageHide = () => {
+    if (!document.documentElement.classList.contains('by-navigating')) {
+      write('away');
+    }
+  };
+  document.addEventListener('visibilitychange', onVisibility);
+  window.addEventListener('pagehide', onPageHide);
+
+  function stop(): void {
+    if (stopped) return;
+    stopped = true;
+    window.clearInterval(timer);
+    document.removeEventListener('visibilitychange', onVisibility);
+    window.removeEventListener('pagehide', onPageHide);
+  }
+
+  // Gọi khi auth đã về null → lần ghi 'away' này thường bị rules từ chối
+  // (đã mất quyền) và bị nuốt; trạng thái tự hết "online" sau
+  // ONLINE_WINDOW_MS. Vẫn thử ghi cho trường hợp dừng vì lý do khác.
+  return () => {
+    write('away');
+    stop();
+  };
 }
 
 // ---- ghi khi mạng chậm -------------------------------------------------------
