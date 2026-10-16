@@ -158,4 +158,6 @@ declare module 'https://www.gstatic.com/firebasejs/12.12.0/firebase-firestore.js
    */
   export function arrayUnion(...elements: unknown[]): unknown;
   export function arrayRemove(...elements: unknown[]): unknown;
+  /** Sentinel xóa một field (spec 009: bỏ `checkedAt.<id>` khi bỏ tick). */
+  export function deleteField(): unknown;
 }

@@ -651,16 +651,23 @@ export function splitAppointments(list: Appointment[]): {
   return { upcoming, done };
 }
 
-/** Lịch hẹn sắp tới trong `withinDays` ngày kể từ hôm nay (cả hôm nay). */
-export function upcomingWithin(
+/**
+ * Lịch hẹn chưa khám, chia theo hôm nay cho thẻ "Sắp tới" trên dashboard
+ * (AC-16): `ahead` từ hôm nay trở đi (gần nhất trước), `overdue` đã qua ngày
+ * mà chưa đánh dấu đã khám — để còn nhắc, không lặng lẽ biến mất.
+ */
+export function pendingAppointments(
   list: Appointment[],
-  todayKey: string,
-  withinDays: number
-): Appointment[] {
-  return splitAppointments(list).upcoming.filter((a) => {
+  todayKey: string
+): { ahead: Appointment[]; overdue: Appointment[] } {
+  const ahead: Appointment[] = [];
+  const overdue: Appointment[] = [];
+  for (const a of splitAppointments(list).upcoming) {
     const gap = diffDays(todayKey, a.date);
-    return gap !== null && gap >= 0 && gap <= withinDays;
-  });
+    if (gap === null) continue;
+    (gap >= 0 ? ahead : overdue).push(a);
+  }
+  return { ahead, overdue };
 }
 
 // ---------------------------------------------------------------------------
@@ -713,6 +720,11 @@ export interface ChecklistState {
   /** id mục mẫu hoặc mục tự do đã tick. */
   checked: string[];
   custom: CustomChecklistItem[];
+  /**
+   * Lúc tick (ms) theo id mục — cho khung "vừa tick" trên dashboard. Chỉ có
+   * từ khi field này được thêm; mục tick trước đó không có giờ.
+   */
+  checkedAt: Record<string, number>;
 }
 
 export function checklistStateFromDoc(
@@ -741,7 +753,14 @@ export function checklistStateFromDoc(
     }
   }
   custom.sort((a, b) => a.createdAtMs - b.createdAtMs);
-  return { checked, custom };
+  const checkedAt: Record<string, number> = {};
+  const rawCheckedAt = data?.checkedAt;
+  if (typeof rawCheckedAt === 'object' && rawCheckedAt !== null) {
+    for (const [id, ms] of Object.entries(rawCheckedAt)) {
+      if (typeof ms === 'number' && Number.isFinite(ms)) checkedAt[id] = ms;
+    }
+  }
+  return { checked, custom, checkedAt };
 }
 
 // ---------------------------------------------------------------------------
