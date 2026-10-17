@@ -40,6 +40,64 @@ export const NEWBORN_TOPICS: readonly GuideTopic[] = [
           'Không pha loãng/đặc hơn, không thêm đường, mật ong, ngũ cốc; không cho bé dưới 1 tuổi uống sữa bò tươi hay mật ong.',
         ],
       },
+      {
+        title: 'Khó khăn hay gặp tuần đầu',
+        items: [
+          'Nứt, đau đầu ti: gần như luôn do khớp ngậm nông — chỉnh lại cách ngậm trước; sau bú thoa vài giọt sữa hoặc kem lanolin, để khô thoáng.',
+          'Căng sữa ngày 3–5: cho bú thường xuyên, vắt bớt chút cho mềm quầng vú trước khi bé ngậm, chườm mát sau bú.',
+          'Thấy "ít sữa": đa số là đủ nếu tã và cân của bé đạt; muốn tăng sữa thì cho bú/hút thường xuyên hơn, kể cả ban đêm — không cần lợi sữa đặc biệt.',
+          'Bệnh viện thường có chuyên viên tư vấn sữa mẹ (IBCLC) — nhờ họ xem một cữ bú trước khi ra viện.',
+        ],
+      },
+      {
+        title: 'Vắt và trữ sữa',
+        items: [
+          'Rửa tay, tiệt trùng bộ hút; ghi ngày giờ trên túi, trữ mỗi túi 60–120 ml cho đỡ phí.',
+          'Nhiệt độ phòng (dưới 25°C): dùng trong 4 giờ. Ngăn mát: 4 ngày. Ngăn đá: tốt nhất trong 6 tháng, tối đa 12 tháng.',
+          'Rã đông trong ngăn mát hoặc ngâm nước ấm, dùng trong 24 giờ, không đông đá lại; không hâm bằng lò vi sóng (nóng không đều, bỏng miệng bé).',
+          'Sữa bé bú dở dùng trong 2 giờ rồi bỏ.',
+        ],
+      },
+    ],
+  },
+  {
+    id: 'khoc-tro-phan',
+    emoji: '🍼',
+    title: 'Khóc, ợ hơi, trớ, phân',
+    intro:
+      'Những thứ làm bố mẹ mới lo nhất thường lại bình thường — còn vài dấu hiệu nhỏ thì cần đi khám ngay.',
+    blocks: [
+      {
+        title: 'Bé khóc',
+        items: [
+          'Kiểm tra lần lượt: đói, tã bẩn, nóng/lạnh (sờ gáy), buồn ngủ, cần ợ hơi, muốn được ôm.',
+          'Dỗ theo "5S": quấn chặt tay, bế nghiêng hoặc úp trên tay (chỉ khi bế, không khi ngủ), tiếng "suỵt" hoặc ồn trắng, đung đưa nhẹ, cho ngậm (vú hoặc ti giả).',
+          'Khóc dạ đề (colic): bé khỏe, tăng cân tốt nhưng khóc trên 3 giờ/ngày, trên 3 ngày/tuần, thường chiều tối, đỡ dần sau 3–4 tháng.',
+          'Thấy mình sắp mất kiểm soát: đặt bé nằm ngửa an toàn trong cũi, ra ngoài hít thở vài phút, gọi người thay. KHÔNG BAO GIỜ lắc bé.',
+        ],
+      },
+      {
+        title: 'Ợ hơi, trớ, nấc',
+        items: [
+          'Cho ợ hơi giữa và sau cữ: bế đứng tựa vai hoặc ngồi đỡ cằm, vỗ/xoa lưng nhẹ vài phút; không ợ được cũng không sao.',
+          'Trớ một ít sữa sau bú là bình thường nếu bé vẫn tăng cân và vui vẻ: bế đứng 20–30 phút sau bú, không cho bú quá no.',
+          'Nấc, hắt hơi, khò khè mũi, thở không đều lúc ngủ (có khoảng ngưng ngắn dưới 10 giây) là bình thường ở trẻ sơ sinh.',
+        ],
+      },
+      {
+        title: 'Phân của bé',
+        items: [
+          'Ngày 1–3: phân su xanh đen, dính như hắc ín; ngày 3–5: chuyển màu xanh nâu; sau đó vàng hoa cà hoa cải (bú mẹ) hoặc vàng nâu, đặc hơn (sữa công thức).',
+          'Bé bú mẹ tháng đầu đi nhiều lần/ngày; sau 6 tuần có thể vài ngày mới đi một lần nếu phân vẫn mềm — không phải táo bón.',
+          'Đối chiếu màu phân với thẻ màu phân trong sổ theo dõi/sổ tiêm chủng mỗi ngày tháng đầu: phân trắng, vàng nhạt như phấn hoặc màu đất sét → khám ngay (nghi teo đường mật, phẫu thuật càng sớm càng tốt).',
+        ],
+      },
+    ],
+    warning: [
+      'Nôn vọt sau mọi cữ bú, hoặc nôn ra dịch xanh lá/vàng mật.',
+      'Phân trắng, bạc màu, hoặc có máu, nhầy máu.',
+      'Khóc thét không dỗ được kèm sốt, bỏ bú, lừ đừ, bụng chướng.',
+      'Ngưng thở trên 15–20 giây, hoặc kèm tím tái.',
     ],
   },
   {
@@ -163,6 +221,42 @@ export const NEWBORN_TOPICS: readonly GuideTopic[] = [
           'Theo dõi tại điểm tiêm 30 phút; về nhà theo dõi 24–48 giờ: sốt nhẹ, quấy, sưng chỗ tiêm là bình thường — chườm mát, bú nhiều, hạ sốt theo cân nặng nếu ≥ 38,5°C.',
           'Sốt cao không hạ, co giật, tím tái, khó thở, phát ban toàn thân, khóc thét kéo dài trên 3 giờ → đi viện ngay.',
           'Giữ sổ tiêm chủng cùng chỗ với giấy tờ của bé; chụp ảnh lưu vào Nhật ký.',
+        ],
+      },
+    ],
+  },
+  {
+    id: 'sang-loc-giay-to',
+    emoji: '📋',
+    title: 'Sàng lọc sơ sinh & giấy tờ cho bé',
+    intro:
+      'Vài việc chỉ làm được trong những ngày đầu (sàng lọc), vài việc có hạn chót (khai sinh, hồ sơ thai sản). Gom một chỗ để bố đi làm cho nhanh.',
+    blocks: [
+      {
+        title: 'Ngay sau sinh, tại viện',
+        items: [
+          'Vitamin K1 tiêm bắp phòng xuất huyết não, viêm gan B mũi sơ sinh trong 24 giờ đầu — hỏi lại nếu chưa thấy làm.',
+          'Lấy máu gót chân sau 48–72 giờ để sàng lọc bệnh bẩm sinh (suy giáp bẩm sinh, thiếu men G6PD, tăng sản thượng thận…); bệnh viện tư thường có gói cơ bản và gói mở rộng.',
+          'Đo thính lực (OAE) và đo SpO2 tay – chân để tầm soát tim bẩm sinh trước khi ra viện.',
+          'Thiếu men G6PD: tránh long não, băng phiến (kể cả trong tủ đồ của bé), một số thuốc và lá thuốc — đưa danh sách bác sĩ cho mỗi lần khám.',
+        ],
+      },
+      {
+        title: 'Khai sinh, BHYT',
+        items: [
+          'Kiểm tra giấy chứng sinh trước khi rời viện: họ tên, ngày sinh, số CCCD của mẹ, ngày giờ sinh, giới tính, cân nặng đúng hết.',
+          'Đăng ký khai sinh trong 60 ngày kể từ ngày sinh — làm online trên ứng dụng VNeID hoặc Cổng Dịch vụ công quốc gia (thủ tục liên thông khai sinh + đăng ký thường trú + cấp thẻ BHYT cho trẻ dưới 6 tuổi), hoặc tại UBND phường.',
+          'Bé được cấp số định danh cá nhân cùng lúc khai sinh; thẻ BHYT trẻ dưới 6 tuổi miễn phí — có thẻ rồi thì mang theo mỗi lần đi khám.',
+          'Chụp giấy chứng sinh, giấy khai sinh, thẻ BHYT, sổ tiêm chủng lưu vào Nhật ký và album chung của hai bố mẹ.',
+        ],
+      },
+      {
+        title: 'Chế độ thai sản (BHXH)',
+        items: [
+          'Mẹ có đóng BHXH: nộp bản sao giấy khai sinh (hoặc giấy chứng sinh) cho HR sớm — hỏi HR hạn chót, thường tính từ ngày đi làm lại.',
+          'Trợ cấp một lần khi sinh: 2 lần mức lương cơ sở/mức tham chiếu cho mỗi con; nếu mẹ không đóng BHXH mà bố có đóng thì bố nhận.',
+          'Bố nộp hồ sơ nghỉ khi vợ sinh (5–14 ngày làm việc tùy sinh thường/mổ, sinh đôi) trong 30 ngày đầu.',
+          'Quy định có thể thay đổi theo Luật BHXH mới — xác nhận lại với HR hoặc tổng đài BHXH 1900 9068.',
         ],
       },
     ],

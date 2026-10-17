@@ -162,6 +162,22 @@ export const FOODS: readonly Food[] = [
     reason:
       'Iod cho tuyến giáp và não bé; rong biển ăn vừa phải (không quá 1–2 lần/tuần).',
   },
+  {
+    id: 'soy-milk',
+    name: 'Sữa đậu nành, sữa hạt (nấu chín, ít đường)',
+    group: 'eat',
+    reason:
+      'Thêm đạm và chất lỏng; đậu nành ở lượng ăn uống bình thường không hại bé. Chọn loại bổ sung canxi nếu dùng thay sữa bò.',
+    aliases: ['đậu nành', 'sữa hạt', 'sữa óc chó', 'sữa yến mạch'],
+  },
+  {
+    id: 'honey',
+    name: 'Mật ong (cho mẹ)',
+    group: 'eat',
+    reason:
+      'Mẹ ăn được, ngâm chanh gừng đỡ ho, đỡ nghén; chỉ bé dưới 1 tuổi mới tuyệt đối không ăn mật ong.',
+    aliases: ['mật ong chanh'],
+  },
 
   // ---- hạn chế ------------------------------------------------------------
   {
@@ -284,6 +300,38 @@ export const FOODS: readonly Food[] = [
     group: 'limit',
     reason: 'Dưới 5 g muối/ngày; ăn mặn tăng phù và huyết áp.',
     aliases: ['dưa muối', 'cà muối', 'kim chi'],
+  },
+  {
+    id: 'balut',
+    name: 'Trứng vịt lộn (hột vịt lộn)',
+    group: 'limit',
+    reason:
+      'Nhiều đạm nhưng cũng nhiều cholesterol và không "bổ" hơn trứng thường; tối đa 1–2 quả/tuần, luộc chín kỹ, ăn kèm rau răm thì chỉ vài lá.',
+    aliases: ['hột vịt lộn', 'trứng lộn'],
+  },
+  {
+    id: 'bird-nest',
+    name: 'Yến sào, tổ yến',
+    group: 'limit',
+    reason:
+      'Chưa có bằng chứng giúp bé "trắng, thông minh"; đắt và dễ gặp hàng giả. Nếu ăn: nguồn rõ ràng, chưng chín, 1–2 lần/tuần, tốt nhất sau tam cá nguyệt 1.',
+    aliases: ['yến', 'nước yến', 'yến chưng'],
+  },
+  {
+    id: 'maternity-milk',
+    name: 'Sữa bầu (sữa bột cho mẹ mang thai)',
+    group: 'limit',
+    reason:
+      'Không bắt buộc: ăn uống đủ thì sữa tươi tiệt trùng là đủ. Có ích khi nghén, kém ăn; để ý lượng đường, đừng uống thay bữa — dễ tăng cân nhanh.',
+    aliases: ['sữa bột bầu', 'sữa cho bà bầu'],
+  },
+  {
+    id: 'ice',
+    name: 'Kem, nước đá, đồ uống lạnh',
+    group: 'limit',
+    reason:
+      'Lạnh không làm hại bé; vấn đề là đá và kem bán dạo không sạch (nhiễm khuẩn) và nhiều đường. Dùng đá từ nước sạch, kem đóng gói.',
+    aliases: ['đá', 'trà đá', 'đồ lạnh', 'kem que'],
   },
 
   // ---- tránh --------------------------------------------------------------
